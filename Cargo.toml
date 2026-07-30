@@ -5,6 +5,7 @@ members = [
     "crates/rayline-hf",
     "crates/rayline-metrics",
     "crates/rayline-llama",
+    "crates/rayline-subscriptions",
     "crates/rayline-local-router",
     "crates/rayline-adapter",
     "crates/rayline-injector",

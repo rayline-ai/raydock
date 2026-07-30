@@ -559,6 +559,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "fs_extra"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1435,10 +1445,13 @@ dependencies = [
  "rayline-llama",
  "rayline-local-router",
  "rayline-metrics",
+ "rayline-subscriptions",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "tokio",
  "toml_edit",
  "url",
@@ -1463,6 +1476,7 @@ dependencies = [
  "rayline-local-router",
  "rayline-metrics",
  "rayline-proxy",
+ "rayline-subscriptions",
  "reqwest",
  "serde",
  "serde_json",
@@ -1552,6 +1566,7 @@ version = "0.2.8"
 dependencies = [
  "anyhow",
  "async-compression",
+ "base64",
  "brotli",
  "bytes",
  "dirs",
@@ -1563,6 +1578,7 @@ dependencies = [
  "rayline-adapter",
  "rayline-authcache",
  "rayline-metrics",
+ "rayline-subscriptions",
  "rcgen",
  "reqwest",
  "rustls",
@@ -1578,6 +1594,25 @@ dependencies = [
  "tracing-subscriber",
  "x509-parser",
  "zstd",
+]
+
+[[package]]
+name = "rayline-subscriptions"
+version = "0.2.6"
+dependencies = [
+ "fs2",
+ "futures",
+ "libc",
+ "reqwest",
+ "security-framework",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "zeroize",
 ]
 
 [[package]]

@@ -23,6 +23,9 @@ const DEFAULT_PROXY_PORT: u16 = 20810;
 /// binds its own proxy instead of restarting the shared proxy a normal session
 /// may be using. Override with `RAYLINE_ISOLATED_PROXY_PORT`.
 const DEFAULT_ISOLATED_PROXY_PORT: u16 = 20812;
+/// Pool-aware cloud launches use their own proxy so an existing non-pooled
+/// Claude session is never silently moved onto subscription credentials.
+const DEFAULT_SUBSCRIPTION_PROXY_PORT: u16 = 20815;
 const NODE_CA_BUNDLE_FILENAME: &str = "node-ca-bundle.pem";
 pub(crate) const ROUTING_MODE_PROXY: &str = "proxy";
 pub(crate) const ROUTING_MODE_PROXY_SUBAGENTS: &str = "proxy-subagents";
@@ -105,6 +108,11 @@ pub struct RunRequest {
     /// plane; the proxy scope is derived from `routes.main` (passthrough sentinel
     /// → subagents-only, else route-all). Distinct from `router_config_path`.
     pub config_path: Option<PathBuf>,
+    /// Local multi-subscription pool for Anthropic passthrough message requests.
+    pub subscription_pool: Option<String>,
+    /// Registry containing `subscription_pool`. Defaults to the Rayline config
+    /// directory when the pool is selected.
+    pub subscription_config_path: Option<PathBuf>,
     pub root_env_explicit: bool,
 }
 
@@ -196,6 +204,7 @@ pub enum RunError {
     Login(String),
     KeyProvision(String),
     NotLoggedIn(String),
+    Subscription(String),
 }
 
 impl std::fmt::Display for RunError {
@@ -221,6 +230,7 @@ impl std::fmt::Display for RunError {
             Self::Login(message) => formatter.write_str(message),
             Self::KeyProvision(message) => formatter.write_str(message),
             Self::NotLoggedIn(message) => formatter.write_str(message),
+            Self::Subscription(message) => formatter.write_str(message),
         }
     }
 }
@@ -816,6 +826,24 @@ async fn run_command_from_home(
         },
         ..request.clone()
     };
+    if request.subscription_pool.is_some() && request.routing_mode != RoutingMode::ProxySubagents {
+        return Err(RunError::Subscription(
+            "a Claude subscription pool requires a subscription passthrough main route; use the default pool launch or a config whose routes.main is subscription"
+                .to_owned(),
+        ));
+    }
+    let subscription_context = if let Some(pool_id) = request.subscription_pool.as_deref() {
+        let (config_path, pool) = crate::subscriptions::resolve_pool(
+            request.subscription_config_path.as_deref(),
+            pool_id,
+        )
+        .map_err(RunError::Subscription)?;
+        let control_config_dir = crate::subscriptions::resolve_control_config_dir(&pool)
+            .map_err(RunError::Subscription)?;
+        Some((config_path, control_config_dir))
+    } else {
+        None
+    };
 
     let inherited_anthropic_model = env::var_os("ANTHROPIC_MODEL").is_some();
     let model = request
@@ -845,11 +873,17 @@ async fn run_command_from_home(
     // isolation state and inspect the matching config dir for a daemon conflict.
     let mut isolated = request.isolated;
     let mut requested_proxy_port = if is_proxy_routing_mode(request.routing_mode) {
-        Some(resolve_proxy_port(isolated)?)
+        Some(resolve_proxy_port(
+            isolated,
+            request.subscription_pool.is_some(),
+        )?)
     } else {
         None
     };
-    let mut inspect_dir = claude_config_dir(home, isolated);
+    let mut inspect_dir = subscription_context
+        .as_ref()
+        .map(|(_, control_config_dir)| control_config_dir.clone())
+        .unwrap_or_else(|| claude_config_dir(home, isolated));
     let mut daemon_request = RequestSpec {
         env_name: &env_name,
         routing_mode: request.routing_mode,
@@ -867,7 +901,9 @@ async fn run_command_from_home(
         // conflict prompt. Users who want that shape should request it directly
         // with `--local-router --isolated` so the isolated proxy sidecar is
         // configured deliberately.
-        allow_isolated: !isolated && local_start_request.is_none(),
+        allow_isolated: subscription_context.is_none()
+            && !isolated
+            && local_start_request.is_none(),
     }
     .resolve()?;
     let preserve_spawned_by_pid = match preflight {
@@ -878,7 +914,10 @@ async fn run_command_from_home(
             // different env/mode. No further isolated escape from here.
             isolated = true;
             requested_proxy_port = if is_proxy_routing_mode(request.routing_mode) {
-                Some(resolve_proxy_port(true)?)
+                Some(resolve_proxy_port(
+                    true,
+                    request.subscription_pool.is_some(),
+                )?)
             } else {
                 None
             };
@@ -924,6 +963,8 @@ async fn run_command_from_home(
             print_flag,
             isolated_needs_claude_login(request.routing_mode),
         )?;
+    } else if let Some((_, control_config_dir)) = subscription_context.as_ref() {
+        command.env(CLAUDE_CONFIG_DIR_ENV, control_config_dir);
     }
     match request.routing_mode {
         RoutingMode::Override => {
@@ -961,10 +1002,11 @@ async fn run_command_from_home(
                 (settings.is_some() && !enable_local_router) || provider_cloud_fallback;
             if local_start_request.is_none()
                 && !isolated
+                && request.subscription_pool.is_none()
                 && cloud_launch_replaces_local_proxy
                 && crate::router::resolve_rld_bin(home).is_ok()
             {
-                let proxy_port = resolve_proxy_port(false)?;
+                let proxy_port = resolve_proxy_port(false, false)?;
                 match crate::router::stop_serve_daemon_from_home(home, proxy_port).await {
                     Ok(true) => eprintln!("Local routing is off — stopped the on-device model."),
                     Ok(false) => {}
@@ -985,13 +1027,23 @@ async fn run_command_from_home(
                 set_model_env.then_some(model.as_str()),
                 &auto_compact_window,
                 isolated,
+                subscription_context
+                    .as_ref()
+                    .map(|(config_path, _)| config_path.as_path()),
             )
             .await?;
             configure_route_statusline(home, isolated, request.route_statusline_enabled);
         }
     }
     if request.diagnose {
-        diag_print_postamble_for_mode(request.routing_mode, &router_url, isolated, home).await;
+        diag_print_postamble_for_mode(
+            request.routing_mode,
+            &router_url,
+            isolated,
+            request.subscription_pool.is_some(),
+            home,
+        )
+        .await;
     }
     if let Some(caller_cwd) = env::var_os("RAYLINE_CALLER_CWD") {
         let caller_cwd = PathBuf::from(caller_cwd);
@@ -1142,7 +1194,7 @@ async fn start_local_router(
     if start_request.enable_proxy {
         eprintln!(
             "Proxy routing decisions: tail -f {}",
-            crate::router::proxy_log_path(home, false).display()
+            crate::router::proxy_log_path(home, false, false).display()
         );
     }
     let status = crate::router::start_from_home(home, start_request)
@@ -1195,17 +1247,19 @@ async fn configure_proxy_env(
     model: Option<&str>,
     auto_compact_window: &str,
     isolated: bool,
+    subscription_config_path: Option<&Path>,
 ) -> Result<(), RunError> {
-    let proxy_port = resolve_proxy_port(isolated)?;
+    let subscription_instance = request.subscription_pool.is_some();
+    let proxy_port = resolve_proxy_port(isolated, subscription_instance)?;
     let proxy_routing_mode = proxy_routing_mode_name(request.routing_mode);
     if let Some(start_request) = local_start_request {
-        if isolated {
+        if isolated || subscription_instance {
             let mut start_request = start_request.clone();
             start_request.enable_proxy = false;
             start_local_router(home, &start_request).await?;
             eprintln!(
                 "Proxy routing decisions: tail -f {}",
-                crate::router::proxy_log_path(home, true).display()
+                crate::router::proxy_log_path(home, isolated, subscription_instance).display()
             );
             let status = crate::router::start_local_proxy_from_home(
                 home,
@@ -1220,7 +1274,9 @@ async fn configure_proxy_env(
                     force_restart: request.diagnose,
                     diagnose: request.diagnose,
                     upstream_ca_path: request.upstream_ca_path.clone(),
-                    isolated: true,
+                    isolated,
+                    subscription_config_path: subscription_config_path.map(Path::to_owned),
+                    subscription_pool: request.subscription_pool.clone(),
                 },
             )
             .await
@@ -1233,6 +1289,8 @@ async fn configure_proxy_env(
             start_request.enable_proxy = true;
             start_request.proxy_port = proxy_port;
             start_request.proxy_routing_mode = proxy_routing_mode.to_owned();
+            start_request.subscription_config_path = subscription_config_path.map(Path::to_owned);
+            start_request.subscription_pool = request.subscription_pool.clone();
             start_local_router(home, &start_request).await?;
         }
     } else {
@@ -1250,12 +1308,21 @@ async fn configure_proxy_env(
             // allowlist (`routes.subagents`) routes the named types to the hosted
             // router and passes the rest through.
             request.router_config_path.as_deref(),
+            subscription_config_path,
+            request.subscription_pool.as_deref(),
         )
         .await
         .map_err(|error| RunError::Router(error.to_string()))?;
     }
 
-    let proxy_url = format!("http://127.0.0.1:{proxy_port}");
+    let proxy_url = if request.subscription_pool.is_some() {
+        format!(
+            "http://rayline:{}@127.0.0.1:{proxy_port}",
+            new_subscription_launch_id()
+        )
+    } else {
+        format!("http://127.0.0.1:{proxy_port}")
+    };
     command.env("HTTPS_PROXY", &proxy_url);
     command.env("https_proxy", &proxy_url);
     command.env("NODE_EXTRA_CA_CERTS", node_ca_bundle_value(home, request));
@@ -1282,6 +1349,14 @@ async fn configure_proxy_env(
     command.env("no_proxy", no_proxy);
     configure_proxy_auth_env(command, request.routing_mode);
     Ok(())
+}
+
+fn new_subscription_launch_id() -> String {
+    use rand::Rng as _;
+
+    let mut bytes = [0_u8; 16];
+    rand::rng().fill(&mut bytes);
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn should_set_model_env(
@@ -1321,9 +1396,14 @@ fn resolve_injector_port(explicit: Option<u16>) -> Result<u16, RunError> {
     }
 }
 
-fn resolve_proxy_port(isolated: bool) -> Result<u16, RunError> {
+fn resolve_proxy_port(isolated: bool, subscription_pool: bool) -> Result<u16, RunError> {
     let (env_var, default_port) = if isolated {
         ("RAYLINE_ISOLATED_PROXY_PORT", DEFAULT_ISOLATED_PROXY_PORT)
+    } else if subscription_pool {
+        (
+            "RAYLINE_SUBSCRIPTION_PROXY_PORT",
+            DEFAULT_SUBSCRIPTION_PROXY_PORT,
+        )
     } else {
         ("RAYLINE_PROXY_PORT", DEFAULT_PROXY_PORT)
     };
@@ -2143,17 +2223,21 @@ async fn diag_print_postamble_for_mode(
     routing_mode: RoutingMode,
     router_url: &str,
     isolated: bool,
+    subscription_pool: bool,
     home: &Path,
 ) {
     match routing_mode {
         RoutingMode::Proxy | RoutingMode::ProxySubagents => {
             let default_port = if isolated {
                 DEFAULT_ISOLATED_PROXY_PORT
+            } else if subscription_pool {
+                DEFAULT_SUBSCRIPTION_PROXY_PORT
             } else {
                 DEFAULT_PROXY_PORT
             };
-            let proxy_port = resolve_proxy_port(isolated).unwrap_or(default_port);
-            diag_print_postamble(proxy_port, router_url, isolated, home).await;
+            let proxy_port =
+                resolve_proxy_port(isolated, subscription_pool).unwrap_or(default_port);
+            diag_print_postamble(proxy_port, router_url, isolated, subscription_pool, home).await;
         }
         RoutingMode::Override => {
             diag_print_section("Logs to send back");
@@ -2170,7 +2254,13 @@ async fn diag_print_postamble_for_mode(
     }
 }
 
-async fn diag_print_postamble(proxy_port: u16, router_url: &str, isolated: bool, home: &Path) {
+async fn diag_print_postamble(
+    proxy_port: u16,
+    router_url: &str,
+    isolated: bool,
+    subscription_pool: bool,
+    home: &Path,
+) {
     let proxy_url = format!("http://127.0.0.1:{proxy_port}");
     let proxy_ca = crate::router::default_proxy_ca_cert_path(home);
     let verify_path = proxy_ca.is_file().then_some(proxy_ca.as_path());
@@ -2188,7 +2278,7 @@ async fn diag_print_postamble(proxy_port: u16, router_url: &str, isolated: bool,
     diag_print_section("Logs to send back");
     eprintln!(
         "  proxy log : {}",
-        crate::router::proxy_log_path(home, isolated).display()
+        crate::router::proxy_log_path(home, isolated, subscription_pool).display()
     );
     eprintln!("  claude    : stderr below (--debug enabled)");
     eprintln!();

@@ -1,0 +1,106 @@
+{
+  "accounts": [
+    {
+      "id": "af",
+      "usage": {
+        "five_hour": {
+          "utilization": 0,
+          "resets_at": "2030-01-01T01:00:00Z"
+        },
+        "seven_day": {
+          "utilization": 100,
+          "resets_at": "2030-01-07T01:00:00Z"
+        },
+        "extra_usage": {
+          "is_enabled": false,
+          "disabled_reason": "out_of_credits"
+        },
+        "limits": [
+          {
+            "kind": "weekly_scoped",
+            "group": "fable_weekly",
+            "percent": 100,
+            "resets_at": "2030-01-07T01:00:00Z",
+            "scope": {
+              "model": {
+                "id": null,
+                "display_name": "Fable"
+              }
+            },
+            "is_active": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "memex",
+      "usage": {
+        "five_hour": {
+          "utilization": 100,
+          "resets_at": "2030-01-01T01:00:00Z"
+        },
+        "seven_day": {
+          "utilization": 21,
+          "resets_at": "2030-01-07T01:00:00Z"
+        },
+        "extra_usage": {
+          "is_enabled": false
+        },
+        "limits": [
+          {
+            "kind": "weekly_scoped",
+            "group": "fable_weekly",
+            "percent": 38,
+            "resets_at": "2030-01-07T01:00:00Z",
+            "scope": {
+              "model": {
+                "id": null,
+                "display_name": "Fable"
+              }
+            },
+            "is_active": false
+          }
+        ]
+      }
+    },
+    {
+      "id": "ws",
+      "usage": {
+        "five_hour": {
+          "utilization": 8,
+          "resets_at": "2030-01-01T01:00:00Z"
+        },
+        "seven_day": {
+          "utilization": 32,
+          "resets_at": "2030-01-07T01:00:00Z"
+        },
+        "extra_usage": {
+          "is_enabled": false,
+          "future_billing_field": "retained"
+        },
+        "limits": [
+          {
+            "kind": "weekly_scoped",
+            "group": "fable_weekly",
+            "percent": 47,
+            "resets_at": "2030-01-07T01:00:00Z",
+            "scope": {
+              "model": {
+                "id": null,
+                "display_name": "Fable"
+              }
+            },
+            "is_active": true,
+            "severity": "informational",
+            "future_limit_field": {
+              "retained": true
+            }
+          }
+        ],
+        "future_usage_field": {
+          "retained": true
+        }
+      }
+    }
+  ]
+}

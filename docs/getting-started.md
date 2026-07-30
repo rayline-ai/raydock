@@ -229,9 +229,39 @@ The default depends on the router, because the two are used differently:
 | `rayline claude --local` | local | proxy | subagents |
 | `rayline claude --local --route all` | local | proxy | all |
 | `rayline claude --route subagents` | cloud | proxy | subagents |
+| `rayline claude --subscription-pool default` | cloud | proxy | subagents |
 
 `rayline claude --via env --local` and `rayline claude --via env --route subagents`
 are rejected: the env mechanism is cloud-only and can't route selectively.
+
+### Several Claude subscriptions, one Claude config
+
+Register existing Claude profile directories as credential sources while
+keeping one shared control directory for settings, sessions, MCP configuration,
+and daemon state:
+
+```bash
+rayline subscriptions add primary \
+  --claude-config-dir ~/.claude \
+  --control-config-dir ~/.claude
+rayline subscriptions add work --claude-config-dir ~/.claude-work
+rayline subscriptions list
+rayline subscriptions status
+rayline claude --subscription-pool default
+```
+
+The default registry is `~/.config/rayline/subscriptions.json`. Override it
+with `--subscription-config <path>`. Pool mode implies `--route subagents` so
+the main thread uses the local subscription pool while routed subagents retain
+normal Rayline routing. It requires proxy mode and is rejected with `--via env`,
+`--isolated`, or explicit `--route all`.
+
+Rayline polls each registered account's five-hour, weekly, and model-scoped
+limits. It retries only explicit pre-stream quota or entitlement rejections;
+generic rate limits, provider overload, and ambiguous network failures are not
+replayed. See
+[Multi-Subscription Claude Routing](multi-claude-subscription-routing.md) for
+the full behavior and security model.
 
 ### Deprecated flags
 

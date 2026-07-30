@@ -13,7 +13,7 @@
 //! trust store), so corporate TLS-MITM roots validate without the MCP child
 //! needing to trust them.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::env;
 use std::fs::{self, OpenOptions};
@@ -30,6 +30,7 @@ pub use rayline_authcache::{
 };
 
 use anyhow::{Context, Result, anyhow};
+use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -39,6 +40,9 @@ use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rayline_metrics::{MetricsUpdate, REQUEST_ID_HEADER, SharedMetricsSink, new_request_id};
+use rayline_subscriptions::{
+    HeaderSnapshot, ResponseClassification, SubscriptionPoolRuntime, classify_response,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     PublicKeyData,
@@ -67,6 +71,7 @@ const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 /// and unresolved, so main-thread traffic is never delayed.
 const AGENT_TYPE_RESOLVE_MAX_ATTEMPTS: usize = 6;
 const AGENT_TYPE_RESOLVE_RETRY_DELAY: Duration = Duration::from_millis(40);
+const MAX_SUBSCRIPTION_ERROR_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct ProxyOptions {
@@ -111,6 +116,14 @@ pub struct ProxyOptions {
     /// id. The proxy still records Anthropic passthrough traffic.
     pub local_router_owns_metrics: bool,
     pub metrics: Option<SharedMetricsSink>,
+    /// Local-only Claude subscription pool used for Anthropic `/v1/messages`
+    /// passthrough legs. Credentials are read and refreshed by the daemon and
+    /// never sent to Rayline's hosted router.
+    pub subscription_pool: Option<Arc<SubscriptionPoolRuntime>>,
+    /// Shared Claude Code config directory used only to resolve local session
+    /// metadata (for selective subagent routing). Credential source profiles
+    /// remain separate and are never used as Claude's runtime config.
+    pub claude_config_dir: Option<PathBuf>,
 }
 
 impl ProxyOptions {
@@ -139,6 +152,8 @@ impl ProxyOptions {
             selective_subagent_ids: Vec::new(),
             local_router_owns_metrics: false,
             metrics: None,
+            subscription_pool: None,
+            claude_config_dir: None,
         }
     }
 
@@ -363,7 +378,8 @@ async fn handle_forward_proxy(
     is_anthropic: bool,
 ) -> Response<BoxBody> {
     let result = if is_anthropic {
-        forward_anthropic_request(state, req).await
+        let launch_id = proxy_launch_id(req.headers());
+        forward_anthropic_request(state, req, launch_id.as_deref()).await
     } else {
         forward_absolute_request(state, req).await
     };
@@ -412,7 +428,7 @@ async fn forward_absolute_request(
         parts.uri,
         status.as_u16()
     );
-    response_from_reqwest(resp, status, None, None, None, None).await
+    response_from_reqwest(resp, status, None, None, None, None, false).await
 }
 
 fn healthz_response(state: &AppState) -> Response<BoxBody> {
@@ -432,12 +448,39 @@ fn healthz_response(state: &AppState) -> Response<BoxBody> {
     )
 }
 
+fn proxy_launch_id(headers: &HeaderMap) -> Option<String> {
+    let value = headers
+        .get(hyper::header::PROXY_AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let (scheme, encoded) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let decoded = std::str::from_utf8(&decoded).ok()?;
+    let (username, launch_id) = decoded.split_once(':')?;
+    if username != "rayline"
+        || launch_id.is_empty()
+        || launch_id.len() > 128
+        || !launch_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(launch_id.to_owned())
+}
+
 async fn handle_connect(state: AppState, req: Request<Incoming>, authority: String) -> Result<()> {
+    let launch_id = proxy_launch_id(req.headers());
     let upgraded = hyper::upgrade::on(req)
         .await
         .context("upgrade CONNECT stream")?;
     if is_anthropic_authority(&authority) {
-        intercept_anthropic_tls(state, upgraded).await
+        intercept_anthropic_tls(state, upgraded, launch_id).await
     } else {
         blind_tunnel(state, upgraded, &authority).await
     }
@@ -446,6 +489,7 @@ async fn handle_connect(state: AppState, req: Request<Incoming>, authority: Stri
 async fn intercept_anthropic_tls(
     state: AppState,
     upgraded: hyper::upgrade::Upgraded,
+    launch_id: Option<String>,
 ) -> Result<()> {
     let config = state.ca.server_config_for_host(ANTHROPIC_HOST)?;
     let acceptor = TlsAcceptor::from(config);
@@ -456,7 +500,10 @@ async fn intercept_anthropic_tls(
     let io = TokioIo::new(tls);
     let svc = service_fn(move |req| {
         let state = state.clone();
-        async move { Ok::<_, Infallible>(handle_anthropic_request(state, req).await) }
+        let launch_id = launch_id.clone();
+        async move {
+            Ok::<_, Infallible>(handle_anthropic_request(state, req, launch_id.as_deref()).await)
+        }
     });
     auto::Builder::new(TokioExecutor::new())
         .serve_connection(io, svc)
@@ -484,8 +531,12 @@ async fn blind_tunnel(
     Ok(())
 }
 
-async fn handle_anthropic_request(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
-    match forward_anthropic_request(state, req).await {
+async fn handle_anthropic_request(
+    state: AppState,
+    req: Request<Incoming>,
+    launch_id: Option<&str>,
+) -> Response<BoxBody> {
+    match forward_anthropic_request(state, req, launch_id).await {
         Ok(resp) => resp,
         Err(e) => {
             warn!("proxy forward error: {e}");
@@ -533,6 +584,7 @@ fn emit_if_agent_type_unresolved(
 async fn forward_anthropic_request(
     state: AppState,
     req: Request<Incoming>,
+    launch_id: Option<&str>,
 ) -> Result<Response<BoxBody>> {
     let (parts, body) = req.into_parts();
     let path_and_query = parts
@@ -546,7 +598,11 @@ async fn forward_anthropic_request(
         .unwrap_or_else(|| "<none>".to_owned());
     let agent_id_present = agent_id != "<none>";
     let agent_type = if agent_id_present {
-        resolve_claude_code_agent_type_with_retry(&agent_id).await
+        resolve_claude_code_agent_type_with_retry(
+            &agent_id,
+            state.opts.claude_config_dir.as_deref(),
+        )
+        .await
     } else {
         None
     };
@@ -638,6 +694,38 @@ async fn forward_anthropic_request(
     let body_was_rewritten = routed.body_was_rewritten;
     let bytes = routed.body;
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
+
+    if decision.target == RouteTarget::Anthropic
+        && parts.method == Method::POST
+        && parts.uri.path() == "/v1/messages"
+        && let (Some(pool), Some(requested_model)) =
+            (state.opts.subscription_pool.as_ref(), body_model.as_deref())
+    {
+        if decision.reason == "selective_main_passthrough"
+            && let Some(path) = state.opts.route_status_path.clone()
+        {
+            state.route_status_generation.fetch_add(1, Ordering::SeqCst);
+            let _guard = state.route_status_io.lock().await;
+            RouteStatus::clear(&path).await;
+        }
+        return forward_subscription_request(SubscriptionForward {
+            state: &state,
+            pool,
+            launch_id: launch_id.unwrap_or("shared"),
+            requested_model,
+            original_headers: &parts.headers,
+            method,
+            upstream_url: &upstream_url,
+            body: &bytes,
+            body_was_rewritten,
+            request_id: &request_id,
+            metrics: proxy_owns_metrics
+                .then(|| state.opts.metrics.clone())
+                .flatten(),
+        })
+        .await;
+    }
+
     let mut outbound = state
         .http
         .request(method.clone(), &upstream_url)
@@ -790,8 +878,293 @@ async fn forward_anthropic_request(
             .flatten(),
         Some(request_id),
         Some(approximate_input_tokens(&bytes)),
+        false,
     )
     .await
+}
+
+struct SubscriptionForward<'a> {
+    state: &'a AppState,
+    pool: &'a SubscriptionPoolRuntime,
+    launch_id: &'a str,
+    requested_model: &'a str,
+    original_headers: &'a HeaderMap,
+    method: reqwest::Method,
+    upstream_url: &'a str,
+    body: &'a Bytes,
+    body_was_rewritten: bool,
+    request_id: &'a str,
+    metrics: Option<SharedMetricsSink>,
+}
+
+struct BufferedUpstream {
+    status: reqwest::StatusCode,
+    headers: reqwest::header::HeaderMap,
+    body: Bytes,
+}
+
+async fn forward_subscription_request(
+    request: SubscriptionForward<'_>,
+) -> Result<Response<BoxBody>> {
+    let mut excluded = HashSet::new();
+    let mut final_failover_response = None;
+
+    while excluded.len() < request.pool.account_count() {
+        let selected = match request
+            .pool
+            .select(request.launch_id, request.requested_model, &excluded)
+            .await
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                return match final_failover_response {
+                    Some(response) => {
+                        buffered_upstream_response(response, request.metrics, request.request_id)
+                    }
+                    None => {
+                        warn!(
+                            "subscription pool={} has no eligible account for model={}: {}",
+                            request.pool.pool_id(),
+                            request.requested_model,
+                            error
+                        );
+                        Ok(subscription_exhausted_response(
+                            request.pool.pool_id(),
+                            request.requested_model,
+                        ))
+                    }
+                };
+            }
+        };
+        let account_id = selected.account_id.clone();
+        let mut access_token = selected.access_token;
+        let mut refreshed_after_unauthorized = false;
+
+        loop {
+            let mut outbound = request
+                .state
+                .http
+                .request(request.method.clone(), request.upstream_url)
+                .body(request.body.to_vec());
+            for (name, value) in request.original_headers.iter() {
+                if request.body_was_rewritten && *name == hyper::header::CONTENT_LENGTH {
+                    continue;
+                }
+                if name.as_str().eq_ignore_ascii_case(REQUEST_ID_HEADER)
+                    || is_hop_by_hop(name)
+                    || is_subscription_auth_header(name)
+                {
+                    continue;
+                }
+                outbound = outbound.header(name.as_str(), value.as_bytes());
+            }
+            outbound = outbound
+                .header(REQUEST_ID_HEADER, request.request_id)
+                .bearer_auth(access_token.expose());
+
+            let response = match outbound.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    if let Some(metrics) = request.metrics.as_ref() {
+                        metrics.record(MetricsUpdate::RequestErrored {
+                            request_id: request.request_id.to_owned(),
+                            status_code: None,
+                            error: format!("Anthropic subscription request failed: {error}"),
+                        });
+                    }
+                    // A network failure may have happened after Anthropic accepted
+                    // the request. Never replay it against another subscription.
+                    return Err(error.into());
+                }
+            };
+            let status = response.status();
+            let headers = subscription_header_snapshot(response.headers());
+            request.pool.observe_response_headers(
+                &account_id,
+                request.requested_model,
+                &headers,
+            )?;
+
+            if status.is_success() {
+                debug!(
+                    "subscription pool={} account={} model={} status={}",
+                    request.pool.pool_id(),
+                    account_id,
+                    request.requested_model,
+                    status.as_u16()
+                );
+                return response_from_reqwest(
+                    response,
+                    status,
+                    None,
+                    request.metrics,
+                    Some(request.request_id.to_owned()),
+                    Some(approximate_input_tokens(request.body)),
+                    true,
+                )
+                .await;
+            }
+
+            let buffered = buffer_subscription_response(response).await?;
+            match classify_response(status.as_u16(), &headers, Some(&buffered.body)) {
+                ResponseClassification::RefreshCredential if !refreshed_after_unauthorized => {
+                    refreshed_after_unauthorized = true;
+                    match request
+                        .pool
+                        .refresh_after_unauthorized(&account_id, &access_token)
+                        .await
+                    {
+                        Ok(refreshed) => {
+                            access_token = refreshed;
+                            continue;
+                        }
+                        Err(error) => {
+                            warn!(
+                                "subscription pool={} account={} refresh failed: {}",
+                                request.pool.pool_id(),
+                                account_id,
+                                error
+                            );
+                            final_failover_response = Some(buffered);
+                        }
+                    }
+                }
+                ResponseClassification::RefreshCredential => {
+                    let _ = request.pool.mark_credential_unavailable(
+                        &account_id,
+                        "Anthropic rejected the refreshed OAuth credential",
+                    );
+                    final_failover_response = Some(buffered);
+                }
+                ResponseClassification::FailoverQuota { .. } => {
+                    final_failover_response = Some(buffered);
+                }
+                ResponseClassification::EntitlementRejected { .. } => {
+                    request
+                        .pool
+                        .mark_entitlement_unavailable(&account_id, request.requested_model)?;
+                    final_failover_response = Some(buffered);
+                }
+                ResponseClassification::TransientRateLimit
+                | ResponseClassification::ProviderOverloaded
+                | ResponseClassification::PassThrough
+                | ResponseClassification::Success => {
+                    return buffered_upstream_response(
+                        buffered,
+                        request.metrics,
+                        request.request_id,
+                    );
+                }
+            }
+
+            warn!(
+                "subscription pool={} account={} unavailable for model={}; trying another account",
+                request.pool.pool_id(),
+                account_id,
+                request.requested_model
+            );
+            request
+                .pool
+                .clear_affinity(request.launch_id, request.requested_model, &account_id);
+            excluded.insert(account_id.clone());
+            break;
+        }
+    }
+
+    match final_failover_response {
+        Some(response) => buffered_upstream_response(response, request.metrics, request.request_id),
+        None => Ok(subscription_exhausted_response(
+            request.pool.pool_id(),
+            request.requested_model,
+        )),
+    }
+}
+
+fn subscription_exhausted_response(pool_id: &str, requested_model: &str) -> Response<BoxBody> {
+    json_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "rate_limit_error",
+                "message": format!(
+                    "Claude subscription pool {pool_id:?} has no remaining included allowance for model {requested_model:?}"
+                )
+            }
+        }),
+    )
+}
+
+fn is_subscription_auth_header(name: &HeaderName) -> bool {
+    name == hyper::header::AUTHORIZATION || name.as_str().eq_ignore_ascii_case("x-api-key")
+}
+
+fn subscription_header_snapshot(headers: &reqwest::header::HeaderMap) -> HeaderSnapshot {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str(), value.to_owned()))
+        })
+        .collect()
+}
+
+async fn buffer_subscription_response(response: reqwest::Response) -> Result<BufferedUpstream> {
+    use futures::StreamExt as _;
+
+    let status = response.status();
+    let headers = response.headers().clone();
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > MAX_SUBSCRIPTION_ERROR_BYTES {
+            return Err(anyhow!(
+                "Anthropic subscription error response exceeded {MAX_SUBSCRIPTION_ERROR_BYTES} bytes"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(BufferedUpstream {
+        status,
+        headers,
+        body: Bytes::from(body),
+    })
+}
+
+fn buffered_upstream_response(
+    response: BufferedUpstream,
+    metrics: Option<SharedMetricsSink>,
+    request_id: &str,
+) -> Result<Response<BoxBody>> {
+    let mut builder = Response::builder().status(response.status);
+    for (name, value) in &response.headers {
+        if is_hop_by_hop_str(name.as_str()) || name == reqwest::header::CONTENT_LENGTH {
+            continue;
+        }
+        builder = builder.header(name.as_str(), value.as_bytes());
+    }
+    if let Some(metrics) = metrics {
+        metrics.record(MetricsUpdate::RequestErrored {
+            request_id: request_id.to_owned(),
+            status_code: Some(response.status.as_u16()),
+            error: format!(
+                "Anthropic subscription request returned HTTP {}",
+                response.status.as_u16()
+            ),
+        });
+    }
+    builder
+        .header(hyper::header::CONTENT_LENGTH, response.body.len())
+        .body(full_body(response.body))
+        .map_err(Into::into)
+}
+
+fn is_unified_limit_header(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .starts_with("anthropic-ratelimit-unified-")
 }
 
 fn proxy_owns_metrics_for_route(opts: &ProxyOptions, target: RouteTarget) -> bool {
@@ -820,7 +1193,7 @@ async fn forward_local_redirect(
     let resp = outbound.send().await?;
     let status = resp.status();
     debug!("local redirect {location} -> status={}", status.as_u16());
-    response_from_reqwest(resp, status, None, None, None, None).await
+    response_from_reqwest(resp, status, None, None, None, None, false).await
 }
 
 fn stash_router_auth_for_local_redirect(state: &AppState, location: Option<&str>) {
@@ -842,6 +1215,7 @@ async fn response_from_reqwest(
     metrics: Option<SharedMetricsSink>,
     request_id: Option<String>,
     estimated_input_tokens: Option<u64>,
+    strip_unified_limits: bool,
 ) -> Result<Response<BoxBody>> {
     let content_type = resp
         .headers()
@@ -856,7 +1230,9 @@ async fn response_from_reqwest(
         .map(str::to_owned);
     let mut headers_out = HeaderMap::new();
     for (k, v) in resp.headers().iter() {
-        if is_hop_by_hop_str(k.as_str()) {
+        if is_hop_by_hop_str(k.as_str())
+            || (strip_unified_limits && is_unified_limit_header(k.as_str()))
+        {
             continue;
         }
         if k == reqwest::header::LOCATION {
@@ -2267,21 +2643,23 @@ fn subagent_filter_allows(
         })
 }
 
-fn resolve_claude_code_agent_type(agent_id: &str) -> Option<String> {
-    let filename = format!("agent-{agent_id}.meta.json");
-    resolve_claude_code_agent_type_from_roots(
-        &filename,
-        &claude_projects_roots(),
-        env::current_dir().ok().as_deref(),
-    )
-}
-
 /// Resolve the subagent type, briefly retrying to absorb the race between
 /// Claude Code writing `agent-<id>.meta.json` and the subagent's first request
 /// reaching the proxy. Returns as soon as the type resolves; only loops while
 /// it is still unresolved, up to a bounded total wait.
-async fn resolve_claude_code_agent_type_with_retry(agent_id: &str) -> Option<String> {
-    retry_until_some(|| resolve_claude_code_agent_type(agent_id)).await
+async fn resolve_claude_code_agent_type_with_retry(
+    agent_id: &str,
+    config_dir: Option<&Path>,
+) -> Option<String> {
+    let filename = format!("agent-{agent_id}.meta.json");
+    retry_until_some(|| {
+        resolve_claude_code_agent_type_from_roots(
+            &filename,
+            &claude_projects_roots_from(config_dir.map(Path::to_owned), claude_home_dir()),
+            env::current_dir().ok().as_deref(),
+        )
+    })
+    .await
 }
 
 /// Call `resolve` up to `AGENT_TYPE_RESOLVE_MAX_ATTEMPTS` times, returning the
@@ -2299,13 +2677,6 @@ where
         }
     }
     None
-}
-
-fn claude_projects_roots() -> Vec<PathBuf> {
-    claude_projects_roots_from(
-        env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from),
-        claude_home_dir(),
-    )
 }
 
 /// Resolve the user's home directory cross-platform. `HOME` alone is wrong on
@@ -3407,6 +3778,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_basic_auth_carries_only_a_valid_opaque_launch_id() {
+        use base64::Engine as _;
+
+        let mut headers = HeaderMap::new();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("rayline:launch_abc-123");
+        headers.insert(
+            hyper::header::PROXY_AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {encoded}")).unwrap(),
+        );
+        assert_eq!(proxy_launch_id(&headers).as_deref(), Some("launch_abc-123"));
+
+        let invalid = base64::engine::general_purpose::STANDARD.encode("rayline:launch/unsafe");
+        headers.insert(
+            hyper::header::PROXY_AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {invalid}")).unwrap(),
+        );
+        assert_eq!(proxy_launch_id(&headers), None);
+    }
+
     fn classify(method: Method, target: &str) -> ProxyAction {
         classify_proxy_request(&method, &target.parse::<Uri>().unwrap())
     }
@@ -3551,6 +3942,8 @@ mod tests {
             selective_subagent_ids: Vec::new(),
             local_router_owns_metrics: false,
             metrics: None,
+            subscription_pool: None,
+            claude_config_dir: None,
         };
         let state = AppState {
             opts: Arc::new(opts),

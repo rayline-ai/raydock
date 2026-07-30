@@ -24,6 +24,7 @@ dirs.workspace = true
 minisign-verify = "0.2.5"
 rand = "0.9"
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 tar = "0.4"
@@ -33,6 +34,7 @@ rayline-hf = { path = "../rayline-hf" }
 rayline-llama = { path = "../rayline-llama" }
 rayline-local-router = { path = "../rayline-local-router" }
 rayline-metrics = { path = "../rayline-metrics" }
+rayline-subscriptions = { path = "../rayline-subscriptions" }
 zstd = "0.13"
 toml_edit = "0.25.15"
 
@@ -41,3 +43,6 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 opener = "0.6"
+
+[dev-dependencies]
+tempfile = "3"

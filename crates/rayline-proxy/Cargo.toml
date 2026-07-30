@@ -16,6 +16,7 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 async-compression = { version = "0.4", features = ["tokio", "gzip", "brotli", "zstd", "deflate"] }
+base64 = "0.22"
 brotli = "8"
 bytes.workspace = true
 dirs.workspace = true
@@ -37,6 +38,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tracing.workspace = true
 rayline-metrics = { path = "../rayline-metrics" }
 rayline-authcache = { path = "../rayline-authcache" }
+rayline-subscriptions = { path = "../rayline-subscriptions" }
 x509-parser = "0.18"
 zstd = "0.13"
 

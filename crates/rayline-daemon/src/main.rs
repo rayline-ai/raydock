@@ -73,6 +73,8 @@ const ANTHROPIC_URL_ENV: &str = "RAYLINE_ANTHROPIC_URL";
 const PROXY_ROUTING_MODE_ENV: &str = "RAYLINE_PROXY_ROUTING_MODE";
 const METRICS_PORT_ENV: &str = "RAYLINE_METRICS_PORT";
 const METRICS_URL_ENV: &str = "RAYLINE_METRICS_URL";
+const SUBSCRIPTION_CONFIG_ENV: &str = "RAYLINE_SUBSCRIPTION_CONFIG";
+const SUBSCRIPTION_POOL_ENV: &str = "RAYLINE_SUBSCRIPTION_POOL";
 
 /// Per-line marker for structured progress events emitted to stderr. The
 /// The launcher parses these to render a live progress bar while
@@ -257,6 +259,14 @@ struct ServeArgs {
     /// serves; local availability is advertised as unavailable.
     #[arg(long, env = NO_LOCAL_MODEL_ENV)]
     no_local_model: bool,
+
+    /// Multi-subscription registry used by Anthropic passthrough routes.
+    #[arg(long, env = SUBSCRIPTION_CONFIG_ENV)]
+    subscription_config: Option<PathBuf>,
+
+    /// Pool name in --subscription-config (defaults to "default").
+    #[arg(long, env = SUBSCRIPTION_POOL_ENV)]
+    subscription_pool: Option<String>,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -331,6 +341,14 @@ struct ProxyArgs {
     /// self-hosts metrics (i.e. when --metrics-url is not set).
     #[arg(long, env = METRICS_PORT_ENV, default_value_t = rayline_metrics::DEFAULT_METRICS_PORT, hide = true)]
     metrics_port: u16,
+
+    /// Multi-subscription registry used by Anthropic passthrough routes.
+    #[arg(long, env = SUBSCRIPTION_CONFIG_ENV)]
+    subscription_config: Option<PathBuf>,
+
+    /// Pool name in --subscription-config (defaults to "default").
+    #[arg(long, env = SUBSCRIPTION_POOL_ENV)]
+    subscription_pool: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -691,6 +709,16 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
         opts.local_router_owns_metrics = args.decision_plane == DecisionPlaneArg::Local;
         opts.metrics = Some(metrics_sink.clone());
+        if let Some(subscription) = load_subscription_pool(
+            args.subscription_config.as_deref(),
+            args.subscription_pool.as_deref(),
+            rayline_proxy::DEFAULT_ANTHROPIC_URL,
+        )
+        .await?
+        {
+            opts.subscription_pool = Some(subscription.runtime);
+            opts.claude_config_dir = Some(subscription.control_config_dir);
+        }
         Some(opts)
     } else {
         None
@@ -832,6 +860,16 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
     opts.routing_mode = args.proxy_routing_mode.into();
     opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
     opts.local_router_owns_metrics = args.local_router_owns_metrics;
+    if let Some(subscription) = load_subscription_pool(
+        args.subscription_config.as_deref(),
+        args.subscription_pool.as_deref(),
+        &opts.anthropic_url,
+    )
+    .await?
+    {
+        opts.subscription_pool = Some(subscription.runtime);
+        opts.claude_config_dir = Some(subscription.control_config_dir);
+    }
     // Forward to a serve daemon when one owns metrics; otherwise self-host so
     // `rayline top` works for cloud-only and isolated proxy sessions too.
     opts.metrics = match proxy_metrics_plan(args.metrics_url.as_deref(), args.metrics_port) {
@@ -866,6 +904,105 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
         opts.ca_cert_path.display()
     );
     rayline_proxy::serve(opts).await
+}
+
+async fn load_subscription_pool(
+    config_path: Option<&Path>,
+    pool_id: Option<&str>,
+    anthropic_base_url: &str,
+) -> Result<Option<LoadedSubscriptionPool>> {
+    let Some(config_path) = config_path else {
+        if pool_id.is_some() {
+            return Err(anyhow!(
+                "--subscription-pool requires --subscription-config"
+            ));
+        }
+        return Ok(None);
+    };
+    let metadata = std::fs::symlink_metadata(config_path)
+        .with_context(|| format!("inspect subscription pool config {}", config_path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(anyhow!(
+            "subscription pool config {} must be a regular file, not a symlink",
+            config_path.display()
+        ));
+    }
+    if metadata.len() > 1024 * 1024 {
+        return Err(anyhow!(
+            "subscription pool config {} exceeds 1 MiB",
+            config_path.display()
+        ));
+    }
+    let bytes = std::fs::read(config_path).with_context(|| {
+        format!(
+            "read subscription pool config from {}",
+            config_path.display()
+        )
+    })?;
+    let config: rayline_subscriptions::SubscriptionPoolsConfig = serde_json::from_slice(&bytes)
+        .with_context(|| {
+            format!(
+                "parse subscription pool config from {}",
+                config_path.display()
+            )
+        })?;
+    config
+        .validate()
+        .context("validate subscription pool config")?;
+    let pool_id = pool_id.unwrap_or("default");
+    let pool = config
+        .pools
+        .get(pool_id)
+        .cloned()
+        .ok_or_else(|| anyhow!("subscription pool {pool_id:?} does not exist"))?;
+    let control_config_dir = expand_home_path(&pool.control_config_dir)?
+        .canonicalize()
+        .with_context(|| {
+            format!(
+                "resolve subscription control config directory {}",
+                pool.control_config_dir.display()
+            )
+        })?;
+    if !control_config_dir.is_dir() {
+        return Err(anyhow!(
+            "subscription control config directory {} is not a directory",
+            control_config_dir.display()
+        ));
+    }
+    let options = rayline_subscriptions::SubscriptionRuntimeOptions {
+        anthropic_base_url: anthropic_base_url.to_owned(),
+        ..Default::default()
+    };
+    let runtime =
+        rayline_subscriptions::SubscriptionPoolRuntime::start(pool_id, pool, options).await?;
+    let _ = runtime.spawn_monitor();
+    info!(
+        "subscription pool={} ready accounts={}",
+        runtime.pool_id(),
+        runtime.account_count()
+    );
+    Ok(Some(LoadedSubscriptionPool {
+        runtime,
+        control_config_dir,
+    }))
+}
+
+struct LoadedSubscriptionPool {
+    runtime: Arc<rayline_subscriptions::SubscriptionPoolRuntime>,
+    control_config_dir: PathBuf,
+}
+
+fn expand_home_path(path: &Path) -> Result<PathBuf> {
+    let raw = path.to_string_lossy();
+    if raw == "~" {
+        return dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"));
+    }
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|home| home.join(suffix))
+            .ok_or_else(|| anyhow!("home directory not found"));
+    }
+    Ok(path.to_owned())
 }
 
 /// How a proxy-mode launch wires up metrics. A serve daemon, when present, owns

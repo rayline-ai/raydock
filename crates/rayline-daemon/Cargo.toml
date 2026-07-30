@@ -37,6 +37,7 @@ rayline-local-router = { path = "../rayline-local-router" }
 rayline-adapter = { path = "../rayline-adapter" }
 rayline-injector = { path = "../rayline-injector" }
 rayline-proxy = { path = "../rayline-proxy" }
+rayline-subscriptions = { path = "../rayline-subscriptions" }
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls-native-roots"] }
 
 [build-dependencies]
