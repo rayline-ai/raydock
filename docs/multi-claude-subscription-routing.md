@@ -2,7 +2,7 @@
 
 Status: **Implemented locally — synthetic and basic live acceptance complete**
 
-Last updated: 2026-07-29
+Last updated: 2026-07-31
 
 ## Summary
 
@@ -43,7 +43,10 @@ new shared `crates/rayline-subscriptions` crate. It includes:
 - startup and background per-account usage polling
 - normalized global and model-scoped claims
 - Fable, Sonnet, Opus, and Haiku model-family normalization
-- minimum-applicable-headroom selection with bounded launch/model affinity
+- minimum-applicable-headroom selection with active-lease-aware new-launch
+  balancing, a launch primary, and model-family overrides
+- private launch-scoped assignment snapshots and `rld statusline` subscription
+  and JSON components
 - `included_only` overage handling
 - a dedicated pool proxy state directory and default proxy/metrics ports, so a
   pooled launch cannot silently reconfigure an ordinary Rayline proxy
@@ -78,6 +81,12 @@ rayline subscriptions list
 rayline subscriptions status
 ```
 
+The default status view is a compact routing summary: it shows remaining
+five-hour, weekly, and Fable capacity, which model families are available, the
+most relevant reset, and active launch counts when a pool daemon is running.
+Use `rayline subscriptions status --verbose` for every normalized provider
+claim and placement counter, or `--json` for the complete structured payload.
+
 Then start Claude Code:
 
 ```bash
@@ -99,6 +108,41 @@ loaded credentials in memory and does not reopen Keychain for every request.
 During development, rebuilding an unsigned debug binary changes the identity
 macOS authorizes and can trigger the prompts again; finish rebuilding before
 running interactive acceptance tests.
+
+`rayline subscriptions status` first asks the running subscription-pool daemon
+for its already-loaded allowance snapshot and live placement counters. That
+path does not reopen Keychain. If no pool daemon is reachable, the command
+falls back to a standalone allowance poll, labels live placement unavailable,
+and may need Keychain access. Pool launches use port `20816` by default; set
+`RAYLINE_SUBSCRIPTION_METRICS_PORT` consistently for a custom port.
+
+### Show the serving subscription in Claude's status line
+
+Pool launches export a launch-scoped status identifier. The proxy uses it to
+write the current serving account, model-family override, failover reason, and
+remaining bottleneck headroom without storing credentials. Compose that data
+into an existing `~/.claude/bin/statusline` script with:
+
+```bash
+input=$(cat)
+subscription=$(
+  printf '%s' "$input" |
+    rld statusline --component subscription 2>/dev/null
+)
+[ -z "$subscription" ] || printf '%s' "$subscription"
+```
+
+For custom formatting, use
+`rld statusline --component subscription --json`. The status-line reader only
+reads a bounded local sidecar; it does not open Keychain, load OAuth
+credentials, or contact Anthropic. See
+[Session-Aware Claude Subscription Placement and Status](claude-session-aware-subscription-placement.md#rld-statusline-contract)
+for the JSON schema and composition examples.
+
+The default `rld statusline` output composes that subscription fragment with
+the latest Rayline-selected model for the same launch. Pooled launches never
+read or overwrite the legacy global route sidecar, so concurrent Claude
+processes cannot display one another's router decision.
 
 ## Live Acceptance
 
@@ -611,6 +655,12 @@ family. Matching should be case-insensitive and version-aware.
 
 ### Selection policy
 
+The selector is intentionally conservative. The follow-up
+[Session-Aware Claude Subscription Placement and Status](claude-session-aware-subscription-placement.md)
+design is now implemented: new launches use active-lease-aware balancing,
+retain a primary account, and expose model overrides and router decisions
+through a launch-scoped status snapshot.
+
 Selection proceeds in this order:
 
 1. Exclude accounts with unhealthy or unavailable credentials.
@@ -620,11 +670,12 @@ Selection proceeds in this order:
 4. Preserve the affinity account if it remains eligible and is below the soft
    switch threshold.
 5. Otherwise prefer eligible accounts below the soft threshold, ordered by
-   effective headroom, health, and cache affinity.
+   effective headroom divided by the applicable active lease count.
 6. If every eligible account is above the soft threshold but still has
    included allowance, choose the account with the most effective headroom.
    A soft threshold must not strand usable capacity.
-7. Use a stable tie-breaker to prevent oscillation.
+7. Use a launch-specific stable tie-breaker to distribute equal-capacity new
+   launches without oscillating an existing assignment.
 
 The selector should not round robin. Reusing an account for the same launch and
 model family improves prompt-cache locality and makes status easier to reason

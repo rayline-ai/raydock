@@ -1,12 +1,17 @@
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 
 use rayline_subscriptions::{
-    ClaimScope, CredentialSourceConfig, SUBSCRIPTION_CONFIG_SCHEMA, SubscriptionAccountConfig,
+    AccountRuntimeStatus, ClaimScope, CredentialHealth, CredentialSourceConfig, LimitClaim,
+    ModelFamily, PoolRuntimeStatus, SUBSCRIPTION_CONFIG_SCHEMA, SubscriptionAccountConfig,
     SubscriptionPoolConfig, SubscriptionPoolRuntime, SubscriptionPoolsConfig,
     SubscriptionRuntimeOptions,
 };
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+
+const DEFAULT_SUBSCRIPTION_METRICS_PORT: u16 = 20816;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubscriptionCommand {
@@ -30,6 +35,7 @@ pub enum SubscriptionCommand {
         pool_id: String,
         config_path: Option<PathBuf>,
         json: bool,
+        verbose: bool,
     },
 }
 
@@ -58,7 +64,8 @@ pub async fn run(command: &SubscriptionCommand) -> Result<String, String> {
             pool_id,
             config_path,
             json,
-        } => status(pool_id, config_path.as_deref(), *json).await,
+            verbose,
+        } => status(pool_id, config_path.as_deref(), *json, *verbose).await,
     }
 }
 
@@ -230,20 +237,71 @@ fn list(config_path: Option<&Path>, json: bool) -> Result<String, String> {
     Ok(output)
 }
 
-async fn status(pool_id: &str, config_path: Option<&Path>, json: bool) -> Result<String, String> {
+async fn status(
+    pool_id: &str,
+    config_path: Option<&Path>,
+    json: bool,
+    verbose: bool,
+) -> Result<String, String> {
     let (_, pool) = resolve_pool(config_path, pool_id)?;
-    let runtime =
-        SubscriptionPoolRuntime::start(pool_id, pool, SubscriptionRuntimeOptions::default())
+    let status = match live_pool_status(pool_id).await {
+        Some(status) => status,
+        None => {
+            let runtime = SubscriptionPoolRuntime::start(
+                pool_id,
+                pool,
+                SubscriptionRuntimeOptions::default(),
+            )
             .await
             .map_err(|error| error.to_string())?;
-    let status = runtime.status();
+            runtime.status_without_live_placement()
+        }
+    };
     if json {
         return serde_json::to_string_pretty(&status)
             .map(|value| format!("{value}\n"))
             .map_err(|error| format!("encode subscription status: {error}"));
     }
+    if verbose {
+        return Ok(render_verbose_status(&status));
+    }
+    let color = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    Ok(render_compact_status(&status, color))
+}
+
+fn render_verbose_status(status: &PoolRuntimeStatus) -> String {
     let mut output = format!("Subscription pool: {}\n", status.pool_id);
-    for account in status.accounts {
+    if let Some(placement) = &status.placement {
+        output.push_str(&format!(
+            "Live placement (lease TTL {}s):\n",
+            placement.active_lease_ttl_seconds
+        ));
+        for account in &placement.accounts {
+            let model_leases = account
+                .active_model_leases
+                .iter()
+                .map(|(model, count)| format!("{model}={count}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            output.push_str(&format!(
+                "  {}  launches={}  models={}  primaries={}  overrides={}\n",
+                account.id,
+                account.active_launch_leases,
+                if model_leases.is_empty() {
+                    "none"
+                } else {
+                    &model_leases
+                },
+                account.primary_assignments,
+                account.model_overrides
+            ));
+        }
+    } else {
+        output.push_str(
+            "Live placement: unavailable (no running pool daemon was found); allowance is a standalone snapshot.\n",
+        );
+    }
+    for account in &status.accounts {
         output.push_str(&format!(
             "\n{}  credential={:?}  usage={}\n",
             account.id,
@@ -254,10 +312,10 @@ async fn status(pool_id: &str, config_path: Option<&Path>, json: bool) -> Result
                 "stale"
             }
         ));
-        if let Some(subscription_type) = account.subscription_type {
+        if let Some(subscription_type) = &account.subscription_type {
             output.push_str(&format!("  plan: {subscription_type}\n"));
         }
-        for claim in account.claims {
+        for claim in &account.claims {
             let utilization = claim
                 .utilization
                 .map(|value| format!("{:.1}%", value * 100.0))
@@ -280,11 +338,420 @@ async fn status(pool_id: &str, config_path: Option<&Path>, json: bool) -> Result
                 claim.resets_at.as_deref().unwrap_or("unknown")
             ));
         }
-        if let Some(error) = account.last_error {
+        if let Some(error) = &account.last_error {
             output.push_str(&format!("  warning: {error}\n"));
         }
     }
-    Ok(output)
+    output
+}
+
+#[derive(Clone, Copy)]
+enum StatusTone {
+    Dim,
+    Good,
+    Warning,
+    Bad,
+}
+
+impl StatusTone {
+    fn ansi(self) -> &'static str {
+        match self {
+            Self::Dim => "2",
+            Self::Good => "32",
+            Self::Warning => "33",
+            Self::Bad => "31",
+        }
+    }
+}
+
+struct StatusCell {
+    text: String,
+    tone: StatusTone,
+}
+
+struct CompactStatusRow {
+    account: String,
+    plan: String,
+    five_hour: StatusCell,
+    seven_day: StatusCell,
+    fable: StatusCell,
+    availability: StatusCell,
+    reset: String,
+    active: Option<String>,
+}
+
+fn render_compact_status(status: &PoolRuntimeStatus, color: bool) -> String {
+    let mut output = format!(
+        "Subscription pool: {}\n",
+        status_paint(&status.pool_id, "1", color)
+    );
+    match &status.placement {
+        Some(placement) => output.push_str(&format!(
+            "Snapshot: live allowance + placement · active lease TTL {}\n\n",
+            compact_duration(placement.active_lease_ttl_seconds)
+        )),
+        None => output.push_str("Snapshot: standalone allowance · live placement unavailable\n\n"),
+    }
+
+    let rows = status
+        .accounts
+        .iter()
+        .map(|account| {
+            let active = status.placement.as_ref().map(|placement| {
+                placement
+                    .accounts
+                    .iter()
+                    .find(|entry| entry.id == account.id)
+                    .map(|entry| entry.active_launch_leases)
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            compact_status_row(account, active)
+        })
+        .collect::<Vec<_>>();
+
+    let account_width = rows
+        .iter()
+        .map(|row| row.account.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("ACCOUNT".len());
+    let plan_width = rows
+        .iter()
+        .map(|row| row.plan.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("PLAN".len());
+    let availability_width = rows
+        .iter()
+        .map(|row| row.availability.text.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("AVAILABLE".len());
+    let reset_width = rows
+        .iter()
+        .map(|row| row.reset.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("LIMIT RESET".len());
+
+    let reset_header = if status.placement.is_some() {
+        format!("{:<reset_width$}", "LIMIT RESET")
+    } else {
+        "LIMIT RESET".to_owned()
+    };
+    let header = format!(
+        "{:<account_width$}  {:<plan_width$}  {:>9}  {:>9}  {:>11}  {:<availability_width$}  {reset_header}{}",
+        "ACCOUNT",
+        "PLAN",
+        "5H LEFT",
+        "7D LEFT",
+        "FABLE LEFT",
+        "AVAILABLE",
+        if status.placement.is_some() {
+            "  ACTIVE"
+        } else {
+            ""
+        },
+    );
+    output.push_str(&status_paint(&header, "1", color));
+    output.push('\n');
+
+    for row in rows {
+        output.push_str(&status_paint(
+            &format!("{:<account_width$}", row.account),
+            "1",
+            color,
+        ));
+        output.push_str("  ");
+        output.push_str(&format!("{:<plan_width$}", row.plan));
+        output.push_str("  ");
+        output.push_str(&render_status_cell(&row.five_hour, 9, true, color));
+        output.push_str("  ");
+        output.push_str(&render_status_cell(&row.seven_day, 9, true, color));
+        output.push_str("  ");
+        output.push_str(&render_status_cell(&row.fable, 11, true, color));
+        output.push_str("  ");
+        output.push_str(&render_status_cell(
+            &row.availability,
+            availability_width,
+            false,
+            color,
+        ));
+        output.push_str("  ");
+        let rendered_reset = if row.active.is_some() {
+            format!("{:<reset_width$}", row.reset)
+        } else {
+            row.reset
+        };
+        output.push_str(&status_paint(&rendered_reset, "2", color));
+        if let Some(active) = row.active {
+            output.push_str("  ");
+            output.push_str(&format!("{active:>6}"));
+        }
+        output.push('\n');
+    }
+
+    output.push('\n');
+    output.push_str(&status_paint(
+        "Tip: use --verbose to show every normalized claim and placement detail.\n",
+        "2",
+        color,
+    ));
+    output
+}
+
+fn compact_status_row(account: &AccountRuntimeStatus, active: Option<String>) -> CompactStatusRow {
+    let five_hour = current_claim(account, |claim| {
+        claim.key == "five_hour" && claim.scope == ClaimScope::Global
+    });
+    let seven_day = current_claim(account, |claim| {
+        claim.key == "seven_day" && claim.scope == ClaimScope::Global
+    });
+    let fable_family = ModelFamily::from_display_name("Fable");
+    let fable = account
+        .claims
+        .iter()
+        .filter(|claim| {
+            !claim.reset_has_passed()
+                && matches!(&claim.scope, ClaimScope::Model(model) if model == &fable_family)
+        })
+        .max_by(|left, right| claim_pressure(left).total_cmp(&claim_pressure(right)));
+    let fresh = account.usage_snapshot_fresh;
+
+    CompactStatusRow {
+        account: account.id.clone(),
+        plan: account
+            .subscription_type
+            .clone()
+            .unwrap_or_else(|| "—".to_owned()),
+        five_hour: limit_status_cell(five_hour, "?", fresh),
+        seven_day: limit_status_cell(seven_day, "?", fresh),
+        fable: limit_status_cell(fable, "—", fresh),
+        availability: allowance_status_cell(account, five_hour, seven_day, fable),
+        reset: important_reset(five_hour, seven_day, fable),
+        active,
+    }
+}
+
+fn current_claim(
+    account: &AccountRuntimeStatus,
+    predicate: impl Fn(&LimitClaim) -> bool,
+) -> Option<&LimitClaim> {
+    account
+        .claims
+        .iter()
+        .find(|claim| !claim.reset_has_passed() && predicate(claim))
+}
+
+fn claim_pressure(claim: &LimitClaim) -> f64 {
+    if claim.is_hard_exhausted() {
+        2.0
+    } else {
+        claim.utilization.unwrap_or(-1.0)
+    }
+}
+
+fn limit_status_cell(claim: Option<&LimitClaim>, missing: &str, fresh: bool) -> StatusCell {
+    let Some(claim) = claim else {
+        return StatusCell {
+            text: missing.to_owned(),
+            tone: StatusTone::Dim,
+        };
+    };
+    if claim.is_hard_exhausted() {
+        return StatusCell {
+            text: "exhausted".to_owned(),
+            tone: if fresh {
+                StatusTone::Bad
+            } else {
+                StatusTone::Dim
+            },
+        };
+    }
+    let Some(utilization) = claim.utilization else {
+        return StatusCell {
+            text: "?".to_owned(),
+            tone: StatusTone::Dim,
+        };
+    };
+    let remaining = 1.0 - utilization.clamp(0.0, 1.0);
+    let tone = if !fresh {
+        StatusTone::Dim
+    } else if remaining <= 0.1 {
+        StatusTone::Bad
+    } else if remaining <= 0.3 {
+        StatusTone::Warning
+    } else {
+        StatusTone::Good
+    };
+    StatusCell {
+        text: format!("{:.0}%", remaining * 100.0),
+        tone,
+    }
+}
+
+fn allowance_status_cell(
+    account: &AccountRuntimeStatus,
+    five_hour: Option<&LimitClaim>,
+    seven_day: Option<&LimitClaim>,
+    fable: Option<&LimitClaim>,
+) -> StatusCell {
+    let (text, tone) = match account.credential_health {
+        CredentialHealth::Refreshing => ("refreshing", StatusTone::Warning),
+        CredentialHealth::Unavailable => ("credential unavailable", StatusTone::Bad),
+        CredentialHealth::Quarantined => ("quarantined", StatusTone::Bad),
+        CredentialHealth::Healthy if !account.usage_snapshot_fresh => {
+            ("usage stale", StatusTone::Warning)
+        }
+        CredentialHealth::Healthy if !account.complete_global_snapshot => {
+            ("usage incomplete", StatusTone::Warning)
+        }
+        CredentialHealth::Healthy
+            if [five_hour, seven_day]
+                .into_iter()
+                .flatten()
+                .any(LimitClaim::is_hard_exhausted) =>
+        {
+            ("none", StatusTone::Bad)
+        }
+        CredentialHealth::Healthy if fable.is_some_and(LimitClaim::is_hard_exhausted) => {
+            ("non-Fable", StatusTone::Warning)
+        }
+        CredentialHealth::Healthy => ("all", StatusTone::Good),
+    };
+    StatusCell {
+        text: text.to_owned(),
+        tone,
+    }
+}
+
+fn important_reset(
+    five_hour: Option<&LimitClaim>,
+    seven_day: Option<&LimitClaim>,
+    fable: Option<&LimitClaim>,
+) -> String {
+    let claims = [("5h", five_hour), ("7d", seven_day), ("Fable", fable)]
+        .into_iter()
+        .filter_map(|(label, claim)| claim.map(|claim| (label, claim)))
+        .collect::<Vec<_>>();
+    let exhausted = claims
+        .iter()
+        .copied()
+        .filter(|(_, claim)| claim.is_hard_exhausted())
+        .collect::<Vec<_>>();
+    let selected = if exhausted.is_empty() {
+        claims.into_iter().max_by(|(_, left), (_, right)| {
+            left.utilization
+                .unwrap_or(-1.0)
+                .total_cmp(&right.utilization.unwrap_or(-1.0))
+        })
+    } else {
+        exhausted.into_iter().min_by_key(|(_, claim)| {
+            claim
+                .resets_at
+                .as_deref()
+                .and_then(parse_reset_timestamp)
+                .map(|timestamp| timestamp.unix_timestamp())
+                .unwrap_or(i64::MAX)
+        })
+    };
+    let Some((label, claim)) = selected else {
+        return "—".to_owned();
+    };
+    let Some(timestamp) = claim.resets_at.as_deref().and_then(parse_reset_timestamp) else {
+        return format!("{label} unknown");
+    };
+    let timestamp = timestamp.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{label} {} {:02} {:02}:{:02}Z",
+        month_abbreviation(timestamp.month()),
+        timestamp.day(),
+        timestamp.hour(),
+        timestamp.minute()
+    )
+}
+
+fn parse_reset_timestamp(value: &str) -> Option<OffsetDateTime> {
+    let value = value.trim();
+    if let Ok(timestamp) = value.parse::<i64>() {
+        let seconds = if timestamp.unsigned_abs() >= 100_000_000_000 {
+            timestamp / 1000
+        } else {
+            timestamp
+        };
+        return OffsetDateTime::from_unix_timestamp(seconds).ok();
+    }
+    OffsetDateTime::parse(value, &Rfc3339).ok()
+}
+
+fn month_abbreviation(month: time::Month) -> &'static str {
+    match month {
+        time::Month::January => "Jan",
+        time::Month::February => "Feb",
+        time::Month::March => "Mar",
+        time::Month::April => "Apr",
+        time::Month::May => "May",
+        time::Month::June => "Jun",
+        time::Month::July => "Jul",
+        time::Month::August => "Aug",
+        time::Month::September => "Sep",
+        time::Month::October => "Oct",
+        time::Month::November => "Nov",
+        time::Month::December => "Dec",
+    }
+}
+
+fn compact_duration(seconds: u64) -> String {
+    if seconds.is_multiple_of(60 * 60) {
+        format!("{}h", seconds / (60 * 60))
+    } else if seconds.is_multiple_of(60) {
+        format!("{}m", seconds / 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn render_status_cell(cell: &StatusCell, width: usize, right: bool, color: bool) -> String {
+    let padded = if right {
+        format!("{:>width$}", cell.text)
+    } else {
+        format!("{:<width$}", cell.text)
+    };
+    status_paint(&padded, cell.tone.ansi(), color)
+}
+
+fn status_paint(text: &str, ansi: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[{ansi}m{text}\x1b[0m")
+    } else {
+        text.to_owned()
+    }
+}
+
+async fn live_pool_status(pool_id: &str) -> Option<PoolRuntimeStatus> {
+    let port = std::env::var("RAYLINE_SUBSCRIPTION_METRICS_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(DEFAULT_SUBSCRIPTION_METRICS_PORT);
+    live_pool_status_at(pool_id, port).await
+}
+
+async fn live_pool_status_at(pool_id: &str, port: u16) -> Option<PoolRuntimeStatus> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(300))
+        .build()
+        .ok()?;
+    let response = client
+        .get(format!("http://127.0.0.1:{port}/v1/subscriptions/status"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let status = response.json::<PoolRuntimeStatus>().await.ok()?;
+    (status.pool_id == pool_id).then_some(status)
 }
 
 fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -367,6 +834,151 @@ fn write_config(path: &Path, config: &SubscriptionPoolsConfig) -> Result<(), Str
 mod tests {
     use super::*;
 
+    fn claim(key: &str, scope: ClaimScope, utilization: f64, resets_at: &str) -> LimitClaim {
+        LimitClaim {
+            key: key.to_owned(),
+            scope,
+            utilization: Some(utilization),
+            status: rayline_subscriptions::ClaimStatus::Allowed,
+            resets_at: Some(resets_at.to_owned()),
+            source: rayline_subscriptions::LimitSource::UsageEndpoint,
+        }
+    }
+
+    fn status_account(
+        id: &str,
+        five_hour: f64,
+        seven_day: f64,
+        fable: f64,
+    ) -> AccountRuntimeStatus {
+        AccountRuntimeStatus {
+            id: id.to_owned(),
+            config_dir: PathBuf::from(format!("/private/{id}")),
+            credential_health: CredentialHealth::Healthy,
+            subscription_type: Some("max".to_owned()),
+            usage_snapshot_fresh: true,
+            complete_global_snapshot: true,
+            claims: vec![
+                claim(
+                    "five_hour",
+                    ClaimScope::Global,
+                    five_hour,
+                    "2030-01-01T13:40:00Z",
+                ),
+                claim(
+                    "seven_day",
+                    ClaimScope::Global,
+                    seven_day,
+                    "2030-01-02T02:00:00Z",
+                ),
+                claim(
+                    "fable_weekly",
+                    ClaimScope::Model(ModelFamily::from_display_name("Fable")),
+                    fable,
+                    "2030-01-03T21:00:00Z",
+                ),
+            ],
+            extra_usage: rayline_subscriptions::ExtraUsageState::default(),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn compact_status_prioritizes_remaining_capacity_and_availability() {
+        let status = PoolRuntimeStatus {
+            pool_id: "default".to_owned(),
+            accounts: vec![
+                status_account("af", 0.0, 1.0, 1.0),
+                status_account("mx", 0.81, 0.75, 1.0),
+                status_account("ws", 0.03, 0.77, 0.70),
+            ],
+            placement: None,
+        };
+
+        let output = render_compact_status(&status, false);
+        assert!(output.contains("Snapshot: standalone allowance"));
+        assert!(output.contains("5H LEFT"));
+        assert!(output.contains("FABLE LEFT"));
+        assert!(output.contains("AVAILABLE"));
+        let account_fields = |id: &str| {
+            output
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(id))
+                .expect("account row")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            account_fields("af"),
+            [
+                "af",
+                "max",
+                "100%",
+                "exhausted",
+                "exhausted",
+                "none",
+                "7d",
+                "Jan",
+                "02",
+                "02:00Z",
+            ]
+        );
+        assert_eq!(
+            &account_fields("mx")[..6],
+            ["mx", "max", "19%", "25%", "exhausted", "non-Fable"]
+        );
+        assert_eq!(
+            &account_fields("ws")[..6],
+            ["ws", "max", "97%", "23%", "30%", "all"]
+        );
+        assert!(output.contains("7d Jan 02 02:00Z"));
+        assert!(output.contains("Fable Jan 03 21:00Z"));
+        assert!(!output.contains("credential=Healthy"));
+        assert!(!output.contains("session [unknown]"));
+    }
+
+    #[test]
+    fn verbose_status_preserves_normalized_claim_details() {
+        let status = PoolRuntimeStatus {
+            pool_id: "default".to_owned(),
+            accounts: vec![status_account("af", 0.0, 1.0, 1.0)],
+            placement: None,
+        };
+
+        let output = render_verbose_status(&status);
+        assert!(output.contains("af  credential=Healthy  usage=fresh"));
+        assert!(output.contains("seven_day [global]: 100.0% (Exhausted)"));
+        assert!(output.contains("fable_weekly [model=fable]: 100.0% (Exhausted)"));
+        assert!(!output.contains("5H LEFT"));
+    }
+
+    #[test]
+    fn compact_live_status_adds_active_session_count() {
+        let status = PoolRuntimeStatus {
+            pool_id: "default".to_owned(),
+            accounts: vec![status_account("ws", 0.03, 0.77, 0.70)],
+            placement: Some(rayline_subscriptions::PoolPlacementRuntimeStatus {
+                active_lease_ttl_seconds: 900,
+                accounts: vec![rayline_subscriptions::AccountPlacementRuntimeStatus {
+                    id: "ws".to_owned(),
+                    active_launch_leases: 3,
+                    active_model_leases: Default::default(),
+                    primary_assignments: 3,
+                    model_overrides: 0,
+                }],
+            }),
+        };
+
+        let output = render_compact_status(&status, false);
+        assert!(output.contains("Snapshot: live allowance + placement · active lease TTL 15m"));
+        assert!(output.contains("ACTIVE"));
+        assert!(
+            output
+                .lines()
+                .any(|line| line.starts_with("ws") && line.ends_with("     3"))
+        );
+    }
+
     #[test]
     fn add_keeps_one_control_dir_and_only_registers_credential_sources() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -433,5 +1045,61 @@ mod tests {
                 & 0o777,
             0o600
         );
+    }
+
+    #[tokio::test]
+    async fn live_pool_status_reads_daemon_placement_without_credentials() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind status fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "pool_id": "default",
+            "accounts": [{
+                "id": "a",
+                "config_dir": "/private/profile",
+                "credential_health": "healthy",
+                "subscription_type": "max",
+                "usage_snapshot_fresh": true,
+                "complete_global_snapshot": true,
+                "claims": [],
+                "extra_usage": {"enabled": false, "in_use": false},
+                "last_error": null
+            }],
+            "placement": {
+                "active_lease_ttl_seconds": 900,
+                "accounts": [{
+                    "id": "a",
+                    "active_launch_leases": 3,
+                    "active_model_leases": {"sonnet": 2, "fable": 1},
+                    "primary_assignments": 3,
+                    "model_overrides": 1
+                }]
+            }
+        }))
+        .expect("status JSON");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept status request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write status headers");
+            stream.write_all(&body).await.expect("write status body");
+        });
+
+        let status = live_pool_status_at("default", port)
+            .await
+            .expect("live pool status");
+        let placement = status.placement.expect("live placement");
+        assert_eq!(placement.accounts[0].active_launch_leases, 3);
+        assert_eq!(placement.accounts[0].active_model_leases["fable"], 1);
     }
 }

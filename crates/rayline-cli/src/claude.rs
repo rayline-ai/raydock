@@ -1316,11 +1316,14 @@ async fn configure_proxy_env(
     }
 
     let proxy_url = if request.subscription_pool.is_some() {
-        format!(
-            "http://rayline:{}@127.0.0.1:{proxy_port}",
-            new_subscription_launch_id()
-        )
+        let launch_id = new_subscription_launch_id();
+        command.env(
+            rayline_subscriptions::RAYLINE_STATUS_ID_ENV,
+            rayline_subscriptions::derive_status_id(&launch_id),
+        );
+        format!("http://rayline:{launch_id}@127.0.0.1:{proxy_port}")
     } else {
+        command.env_remove(rayline_subscriptions::RAYLINE_STATUS_ID_ENV);
         format!("http://127.0.0.1:{proxy_port}")
     };
     command.env("HTTPS_PROXY", &proxy_url);

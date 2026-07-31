@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
+use futures::future::join_all;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -660,10 +661,14 @@ async fn subscription_pool_fails_over_only_the_exhausted_model_pool() {
     opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
     opts.subscription_pool = Some(runtime);
     opts.claude_config_dir = Some(control_dir);
+    let session_status_dir = temp.path().join("session-status");
+    opts.session_status_dir = Some(session_status_dir.clone());
     let ca_cert_path = opts.ca_cert_path.clone();
     spawn_proxy(opts).await;
 
-    let client = proxied_client_with_launch(proxy_port, &ca_cert_path, "launch_one");
+    // This stable launch id places the initial equal-capacity tie on account A,
+    // whose fake response exhausts only the Fable claim.
+    let client = proxied_client_with_launch(proxy_port, &ca_cert_path, "test_a_fable_2");
     let fable = client
         .post("https://api.anthropic.com/v1/messages")
         .header("authorization", "Bearer control-profile-token")
@@ -683,6 +688,45 @@ async fn subscription_pool_fails_over_only_the_exhausted_model_pool() {
         fable.json::<serde_json::Value>().await.unwrap()["account"],
         "token-b"
     );
+    let status_id = rayline_subscriptions::derive_status_id("test_a_fable_2");
+    let status_path = session_status_dir.join(format!("{status_id}.json"));
+    let status_raw = std::fs::read_to_string(&status_path).unwrap();
+    assert!(!status_raw.contains("token-a"));
+    assert!(!status_raw.contains("token-b"));
+    let status: rayline_subscriptions::SessionStatusSnapshot =
+        serde_json::from_str(&status_raw).unwrap();
+    assert_eq!(status.assignment.primary_account_id, "a");
+    assert_eq!(status.assignment.current_account_id, "b");
+    assert_eq!(status.assignment.current_model_family, "fable");
+    assert_eq!(
+        status.assignment.kind,
+        rayline_subscriptions::SessionAssignmentKind::ModelOverride
+    );
+    assert_eq!(
+        status.assignment.reason,
+        rayline_subscriptions::SessionAssignmentReason::QuotaFailover
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(&session_status_dir)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&status_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
 
     let fable_again = client
         .post("https://api.anthropic.com/v1/messages")
@@ -735,6 +779,80 @@ async fn subscription_pool_fails_over_only_the_exhausted_model_pool() {
         message_requests
             .iter()
             .all(|request| request.header("x-api-key").is_none())
+    );
+}
+
+#[tokio::test]
+async fn concurrent_new_launches_balance_across_equal_subscriptions() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_a = temp.path().join("account-a");
+    let account_b = temp.path().join("account-b");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_a, "token-a");
+    write_subscription_credential(&account_b, "token-b");
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        subscription_pool_config(&control_dir, &account_a, &account_b),
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime);
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    let requests = (0..20).map(|index| {
+        let client = proxied_client_with_launch(
+            proxy_port,
+            &ca_cert_path,
+            &format!("balanced_launch_{index}"),
+        );
+        async move {
+            client
+                .post("https://api.anthropic.com/v1/messages")
+                .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()["account"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    });
+    let accounts = join_all(requests).await;
+    let account_a_count = accounts
+        .iter()
+        .filter(|account| *account == "token-a")
+        .count();
+    let account_b_count = accounts
+        .iter()
+        .filter(|account| *account == "token-b")
+        .count();
+    assert_eq!(account_a_count + account_b_count, 20);
+    assert!(
+        account_a_count.abs_diff(account_b_count) <= 2,
+        "active leases should keep equal subscriptions balanced: a={account_a_count}, b={account_b_count}"
     );
 }
 
@@ -845,7 +963,9 @@ async fn generic_rate_limit_does_not_rotate_subscription_accounts() {
     let ca_cert_path = opts.ca_cert_path.clone();
     spawn_proxy(opts).await;
 
-    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "generic_limit_launch")
+    // Exercise the generic 429 response on account A; equal-capacity launches
+    // are intentionally distributed by their stable launch hash.
+    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "test_a_generic-limit_5")
         .post("https://api.anthropic.com/v1/messages")
         .body(r#"{"model":"claude-generic-limit","messages":[]}"#)
         .send()
@@ -992,7 +1112,8 @@ async fn subscription_pool_quarantines_invalid_grant_and_uses_next_account() {
     let ca_cert_path = opts.ca_cert_path.clone();
     spawn_proxy(opts).await;
 
-    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "invalid_grant_launch")
+    // Account A owns the invalid credential in this fixture.
+    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "test_a_sonnet_0")
         .post("https://api.anthropic.com/v1/messages")
         .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
         .send()
@@ -1227,6 +1348,45 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
     let ca_dir = tempfile::tempdir().unwrap();
     let status_dir = tempfile::tempdir().unwrap();
     let status_path = status_dir.path().join("route-status.json");
+    let session_status_dir = status_dir.path().join("session-status");
+    std::fs::create_dir_all(&session_status_dir).unwrap();
+    let launch_id = "route_status_launch";
+    let session_status_path = session_status_dir.join(format!(
+        "{}.json",
+        rayline_subscriptions::derive_status_id(launch_id)
+    ));
+    std::fs::write(
+        &session_status_path,
+        serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "pool_id": "default",
+            "assignment": {
+                "primary_account_id": "a",
+                "current_account_id": "a",
+                "current_model_family": "sonnet",
+                "kind": "primary",
+                "reason": "balanced_new_launch",
+                "assigned_at_unix": 100,
+                "last_seen_at_unix": 100
+            },
+            "capacity": {
+                "usage_snapshot_fresh": true,
+                "effective_headroom": 0.8,
+                "bottleneck": null,
+                "applicable": []
+            },
+            "placement": {
+                "strategy": "balanced_sessions",
+                "score": 0.8,
+                "active_global_leases": 1,
+                "active_model_leases": 1
+            },
+            "route": null,
+            "updated_at_unix": 100
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let mut opts = proxy_options(
         proxy_port,
         ca_dir.path(),
@@ -1235,10 +1395,11 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
         &[&router, &anthropic],
     );
     opts.route_status_path = Some(status_path.clone());
+    opts.session_status_dir = Some(session_status_dir);
     let ca_cert_path = opts.ca_cert_path.clone();
     spawn_proxy(opts).await;
 
-    let client = proxied_client(proxy_port, &ca_cert_path);
+    let client = proxied_client_with_launch(proxy_port, &ca_cert_path, launch_id);
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
         .header("authorization", "Bearer claude-oauth")
@@ -1267,6 +1428,22 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
     assert_eq!(parsed["task_class"], "debugging");
     assert_eq!(parsed["route_id"], "route-it");
     assert!(parsed["ts"].as_u64().unwrap() > 0);
+
+    let mut launch_status = None;
+    for _ in 0..50 {
+        if let Ok(raw) = std::fs::read_to_string(&session_status_path) {
+            let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if !parsed["route"].is_null() {
+                launch_status = Some(parsed);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let launch_status = launch_status.expect("launch-scoped route should be merged");
+    assert_eq!(launch_status["assignment"]["current_account_id"], "a");
+    assert_eq!(launch_status["route"]["selected_model"], "glm-4.6");
+    assert_eq!(launch_status["route"]["route_id"], "route-it");
 }
 
 #[tokio::test]

@@ -14,6 +14,7 @@ mod oauth;
 mod response;
 mod runtime;
 mod selection;
+mod status;
 mod usage;
 
 pub use config::{
@@ -35,10 +36,17 @@ pub use response::{
     normalize_unified_headers,
 };
 pub use runtime::{
-    AccountRuntimeStatus, PoolRuntimeStatus, SelectedSubscription, SubscriptionPoolRuntime,
-    SubscriptionRuntimeError, SubscriptionRuntimeOptions,
+    AccountPlacementRuntimeStatus, AccountRuntimeStatus, PoolPlacementRuntimeStatus,
+    PoolRuntimeStatus, SelectedSubscription, SubscriptionPoolRuntime, SubscriptionRuntimeError,
+    SubscriptionRuntimeOptions,
 };
 pub use selection::{
-    AccountEvaluation, IneligibilityReason, SelectionDecision, SelectionRequest, select_account,
+    AccountEvaluation, AccountPlacementLoad, IneligibilityReason, SelectionDecision,
+    SelectionRequest, select_account,
+};
+pub use status::{
+    RAYLINE_STATUS_ID_ENV, SESSION_STATUS_SCHEMA, SessionAssignmentKind, SessionAssignmentReason,
+    SessionAssignmentStatus, SessionCapacityStatus, SessionLimitStatus, SessionPlacementStatus,
+    SessionRouteStatus, SessionStatusSnapshot, derive_status_id, is_valid_status_id,
 };
 pub use usage::{ScopedLimit, UsageBucket, UsageSnapshot};

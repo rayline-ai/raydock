@@ -250,6 +250,10 @@ rayline subscriptions status
 rayline claude --subscription-pool default
 ```
 
+The status command defaults to a compact capacity table. Add `--verbose` to
+inspect every normalized limit claim and live placement detail, or `--json` for
+machine-readable output.
+
 The default registry is `~/.config/rayline/subscriptions.json`. Override it
 with `--subscription-config <path>`. Pool mode implies `--route subagents` so
 the main thread uses the local subscription pool while routed subagents retain

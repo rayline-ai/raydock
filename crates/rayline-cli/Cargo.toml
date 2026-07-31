@@ -29,6 +29,7 @@ serde_json.workspace = true
 sha2 = "0.10"
 tar = "0.4"
 tokio.workspace = true
+time = { workspace = true, features = ["parsing"] }
 url = "2"
 rayline-hf = { path = "../rayline-hf" }
 rayline-llama = { path = "../rayline-llama" }

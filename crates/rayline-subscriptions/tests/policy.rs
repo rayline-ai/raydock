@@ -47,6 +47,8 @@ fn select(
         &SelectionRequest {
             model: ModelFamily::from_requested_model(model),
             affinity_account_id: affinity_account_id.map(str::to_owned),
+            launch_id: "policy-test-launch".to_owned(),
+            placement_loads: BTreeMap::new(),
         },
         &PoolPolicy::default(),
     )

@@ -1,26 +1,30 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::future::join_all;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use crate::oauth::unix_now_ms;
 use crate::{
-    AccountLimitState, CredentialDocument, CredentialError, CredentialHealth, CredentialStore,
-    Entitlement, ExtraUsageState, HeaderSnapshot, LimitClaim, ModelFamily, OAuthRefreshClient,
-    OAuthRefreshError, PoolPolicy, SecretString, SelectionRequest, SubscriptionPoolConfig,
-    UsageSnapshot, normalize_unified_extra_usage, normalize_unified_headers, select_account,
+    AccountLimitState, AccountPlacementLoad, CredentialDocument, CredentialError, CredentialHealth,
+    CredentialStore, Entitlement, ExtraUsageState, HeaderSnapshot, LimitClaim, ModelFamily,
+    OAuthRefreshClient, OAuthRefreshError, PoolPolicy, SESSION_STATUS_SCHEMA, SecretString,
+    SelectionRequest, SessionAssignmentKind, SessionAssignmentReason, SessionAssignmentStatus,
+    SessionCapacityStatus, SessionLimitStatus, SessionPlacementStatus, SessionStatusSnapshot,
+    SubscriptionPoolConfig, UsageSnapshot, normalize_unified_extra_usage,
+    normalize_unified_headers, select_account,
 };
 
 const DEFAULT_USAGE_PATH: &str = "/api/oauth/usage";
 const USAGE_BETA: &str = "oauth-2025-04-20";
 const MAX_USAGE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AFFINITY_ENTRIES: usize = 4096;
+const DEFAULT_ACTIVE_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug)]
 pub struct SubscriptionRuntimeOptions {
@@ -31,6 +35,7 @@ pub struct SubscriptionRuntimeOptions {
     pub poll_interval: Duration,
     pub near_limit_poll_interval: Duration,
     pub refresh_margin: Duration,
+    pub active_lease_ttl: Duration,
     pub home_dir: Option<PathBuf>,
 }
 
@@ -44,6 +49,7 @@ impl Default for SubscriptionRuntimeOptions {
             poll_interval: Duration::from_secs(5 * 60),
             near_limit_poll_interval: Duration::from_secs(45),
             refresh_margin: Duration::from_secs(120),
+            active_lease_ttl: DEFAULT_ACTIVE_LEASE_TTL,
             home_dir: std::env::var_os("HOME").map(PathBuf::from),
         }
     }
@@ -53,10 +59,11 @@ pub struct SubscriptionPoolRuntime {
     pool_id: String,
     policy: PoolPolicy,
     accounts: Vec<Arc<AccountWorker>>,
-    affinities: Mutex<HashMap<AffinityKey, String>>,
+    placement: Mutex<PlacementState>,
     monitor_started: AtomicBool,
     poll_interval: Duration,
     near_limit_poll_interval: Duration,
+    active_lease_ttl: Duration,
 }
 
 impl SubscriptionPoolRuntime {
@@ -111,10 +118,11 @@ impl SubscriptionPoolRuntime {
             pool_id,
             policy: config.policy,
             accounts,
-            affinities: Mutex::new(HashMap::new()),
+            placement: Mutex::new(PlacementState::default()),
             monitor_started: AtomicBool::new(false),
             poll_interval: options.poll_interval,
             near_limit_poll_interval: options.near_limit_poll_interval,
+            active_lease_ttl: options.active_lease_ttl,
         });
         join_all(runtime.accounts.iter().map(|account| account.load()))
             .await
@@ -175,12 +183,6 @@ impl SubscriptionPoolRuntime {
             launch_id: launch_id.to_owned(),
             model: model.clone(),
         };
-        let affinity = self
-            .affinities
-            .lock()
-            .expect("subscription affinity lock poisoned")
-            .get(&key)
-            .cloned();
         let mut excluded = excluded_accounts.clone();
 
         loop {
@@ -190,46 +192,78 @@ impl SubscriptionPoolRuntime {
                 .map(|account| account.state())
                 .filter(|state| !excluded.contains(&state.account_id))
                 .collect::<Vec<_>>();
-            let decision = select_account(
-                &states,
-                &SelectionRequest {
-                    model: model.clone(),
-                    affinity_account_id: affinity
-                        .as_ref()
-                        .filter(|account| !excluded.contains(*account))
-                        .cloned(),
-                },
-                &self.policy,
-            );
-            let Some(account_id) = decision.selected_account_id else {
-                return Err(SubscriptionRuntimeError::NoEligibleAccount {
-                    pool: self.pool_id.clone(),
-                    model: model.to_string(),
-                });
+            let (account_id, placement_score, active_global_leases, active_model_leases) = {
+                let now = Instant::now();
+                let mut placement = self
+                    .placement
+                    .lock()
+                    .expect("subscription placement lock poisoned");
+                placement.prune_active_leases(now, self.active_lease_ttl);
+                let affinity_account_id = placement
+                    .preferred_account(&key)
+                    .filter(|account| !excluded.contains(*account))
+                    .map(ToOwned::to_owned);
+                let placement_loads = placement.loads_for(&key);
+                let decision = select_account(
+                    &states,
+                    &SelectionRequest {
+                        model: model.clone(),
+                        affinity_account_id,
+                        launch_id: launch_id.to_owned(),
+                        placement_loads,
+                    },
+                    &self.policy,
+                );
+                let Some(account_id) = decision.selected_account_id else {
+                    return Err(SubscriptionRuntimeError::NoEligibleAccount {
+                        pool: self.pool_id.clone(),
+                        model: model.to_string(),
+                    });
+                };
+                let evaluation = decision
+                    .evaluations
+                    .iter()
+                    .find(|evaluation| evaluation.account_id == account_id);
+                let placement_score = evaluation.and_then(|evaluation| evaluation.placement_score);
+                let active_global_leases = evaluation
+                    .map(|evaluation| evaluation.active_global_leases)
+                    .unwrap_or_default();
+                let active_model_leases = evaluation
+                    .map(|evaluation| evaluation.active_model_leases)
+                    .unwrap_or_default();
+                placement.reserve(key.clone(), account_id.clone(), now);
+                (
+                    account_id,
+                    placement_score,
+                    active_global_leases,
+                    active_model_leases,
+                )
             };
             let worker = self
                 .account(&account_id)
                 .ok_or_else(|| SubscriptionRuntimeError::UnknownAccount(account_id.clone()))?;
             match worker.access_token(false).await {
                 Ok(access_token) => {
-                    let mut affinities = self
-                        .affinities
+                    let assignment_reason = self
+                        .placement
                         .lock()
-                        .expect("subscription affinity lock poisoned");
-                    if affinities.len() >= MAX_AFFINITY_ENTRIES
-                        && !affinities.contains_key(&key)
-                        && let Some(oldest) = affinities.keys().next().cloned()
-                    {
-                        affinities.remove(&oldest);
-                    }
-                    affinities.insert(key, account_id.clone());
+                        .expect("subscription placement lock poisoned")
+                        .commit(key, account_id.clone(), Instant::now());
                     return Ok(SelectedSubscription {
                         account_id,
                         access_token,
                         model,
+                        assignment_reason,
+                        placement_score,
+                        active_global_leases,
+                        active_model_leases,
                     });
                 }
                 Err(error) => {
+                    self.placement
+                        .lock()
+                        .expect("subscription placement lock poisoned")
+                        .rollback_provisional(&key, &account_id);
                     worker.set_last_error(error.to_string());
                     worker.set_credential_health(CredentialHealth::Unavailable);
                     excluded.insert(account_id);
@@ -308,16 +342,144 @@ impl SubscriptionPoolRuntime {
             launch_id: launch_id.to_owned(),
             model: ModelFamily::from_requested_model(requested_model),
         };
-        let mut affinities = self
-            .affinities
+        self.placement
             .lock()
-            .expect("subscription affinity lock poisoned");
-        if affinities.get(&key).map(String::as_str) == Some(account_id) {
-            affinities.remove(&key);
-        }
+            .expect("subscription placement lock poisoned")
+            .clear_model_assignment(&key, account_id);
+    }
+
+    pub fn session_status(
+        &self,
+        launch_id: &str,
+        requested_model: &str,
+        current_account_id: &str,
+        reason: SessionAssignmentReason,
+    ) -> Result<SessionStatusSnapshot, SubscriptionRuntimeError> {
+        let model = ModelFamily::from_requested_model(requested_model);
+        let key = AffinityKey {
+            launch_id: launch_id.to_owned(),
+            model: model.clone(),
+        };
+        let state = self
+            .account(current_account_id)
+            .ok_or_else(|| SubscriptionRuntimeError::UnknownAccount(current_account_id.to_owned()))?
+            .state();
+        let now = now_unix_seconds();
+        let (primary_account_id, assigned_at_unix, last_seen_at_unix, placement_load) = {
+            let placement = self
+                .placement
+                .lock()
+                .expect("subscription placement lock poisoned");
+            let primary_account_id = placement
+                .primaries
+                .get(launch_id)
+                .map(|entry| entry.account_id.clone())
+                .unwrap_or_else(|| current_account_id.to_owned());
+            let lease = placement.active_leases.get(&key);
+            (
+                primary_account_id,
+                lease.map(|lease| lease.assigned_at_unix).unwrap_or(now),
+                lease.map(|lease| lease.last_seen_at_unix).unwrap_or(now),
+                placement.status_load_for(&key, current_account_id),
+            )
+        };
+
+        let applicable = state
+            .claims
+            .iter()
+            .filter(|claim| claim.applies_to(&model) && !claim.reset_has_passed())
+            .filter_map(|claim| {
+                let used_fraction = claim.utilization?.clamp(0.0, 1.0);
+                Some(SessionLimitStatus {
+                    key: claim.key.clone(),
+                    scope: match &claim.scope {
+                        crate::ClaimScope::Global => "global".to_owned(),
+                        crate::ClaimScope::Model(family) => format!("model:{family}"),
+                        crate::ClaimScope::Surface(surface) => format!("surface:{surface}"),
+                        crate::ClaimScope::Unknown => "unknown".to_owned(),
+                    },
+                    used_fraction,
+                    remaining_fraction: 1.0 - used_fraction,
+                    resets_at: claim.resets_at.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let bottleneck = applicable
+            .iter()
+            .min_by(|left, right| left.remaining_fraction.total_cmp(&right.remaining_fraction))
+            .cloned();
+        let effective_headroom = (state.usage_snapshot_fresh && state.complete_global_snapshot)
+            .then(|| {
+                applicable
+                    .iter()
+                    .map(|limit| limit.remaining_fraction)
+                    .reduce(f64::min)
+                    .unwrap_or(1.0)
+            });
+        let placement_score =
+            (state.usage_snapshot_fresh && state.complete_global_snapshot).then(|| {
+                applicable
+                    .iter()
+                    .map(|limit| {
+                        let active_leases = if limit.scope == "global" {
+                            placement_load.active_global_leases
+                        } else if limit.scope.starts_with("model:") {
+                            placement_load.active_model_leases
+                        } else {
+                            0
+                        };
+                        limit.remaining_fraction / (1 + active_leases) as f64
+                    })
+                    .reduce(f64::min)
+                    .unwrap_or_else(|| 1.0 / (1 + placement_load.active_global_leases) as f64)
+            });
+        let kind = if primary_account_id == current_account_id {
+            SessionAssignmentKind::Primary
+        } else {
+            SessionAssignmentKind::ModelOverride
+        };
+
+        Ok(SessionStatusSnapshot {
+            schema: SESSION_STATUS_SCHEMA,
+            pool_id: self.pool_id.clone(),
+            assignment: SessionAssignmentStatus {
+                primary_account_id,
+                current_account_id: current_account_id.to_owned(),
+                current_model_family: model.to_string(),
+                kind,
+                reason,
+                assigned_at_unix,
+                last_seen_at_unix,
+            },
+            capacity: SessionCapacityStatus {
+                usage_snapshot_fresh: state.usage_snapshot_fresh,
+                effective_headroom,
+                bottleneck,
+                applicable,
+            },
+            placement: SessionPlacementStatus {
+                strategy: "balanced_sessions".to_owned(),
+                score: placement_score,
+                active_global_leases: placement_load.active_global_leases,
+                active_model_leases: placement_load.active_model_leases,
+            },
+            route: None,
+            updated_at_unix: now,
+        })
     }
 
     pub fn status(&self) -> PoolRuntimeStatus {
+        let placement = {
+            let mut placement = self
+                .placement
+                .lock()
+                .expect("subscription placement lock poisoned");
+            placement.prune_active_leases(Instant::now(), self.active_lease_ttl);
+            placement.runtime_status(
+                self.accounts.iter().map(|account| account.id.as_str()),
+                self.active_lease_ttl,
+            )
+        };
         PoolRuntimeStatus {
             pool_id: self.pool_id.clone(),
             accounts: self
@@ -325,7 +487,14 @@ impl SubscriptionPoolRuntime {
                 .iter()
                 .map(|account| account.status())
                 .collect(),
+            placement: Some(placement),
         }
+    }
+
+    pub fn status_without_live_placement(&self) -> PoolRuntimeStatus {
+        let mut status = self.status();
+        status.placement = None;
+        status
     }
 
     fn account(&self, account_id: &str) -> Option<&Arc<AccountWorker>> {
@@ -363,6 +532,10 @@ pub struct SelectedSubscription {
     pub account_id: String,
     pub access_token: SecretString,
     pub model: ModelFamily,
+    pub assignment_reason: SessionAssignmentReason,
+    pub placement_score: Option<f64>,
+    pub active_global_leases: usize,
+    pub active_model_leases: usize,
 }
 
 impl std::fmt::Debug for SelectedSubscription {
@@ -372,17 +545,22 @@ impl std::fmt::Debug for SelectedSubscription {
             .field("account_id", &self.account_id)
             .field("access_token", &"[REDACTED]")
             .field("model", &self.model)
+            .field("assignment_reason", &self.assignment_reason)
+            .field("placement_score", &self.placement_score)
+            .field("active_global_leases", &self.active_global_leases)
+            .field("active_model_leases", &self.active_model_leases)
             .finish()
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PoolRuntimeStatus {
     pub pool_id: String,
     pub accounts: Vec<AccountRuntimeStatus>,
+    pub placement: Option<PoolPlacementRuntimeStatus>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AccountRuntimeStatus {
     pub id: String,
     pub config_dir: PathBuf,
@@ -393,6 +571,21 @@ pub struct AccountRuntimeStatus {
     pub claims: Vec<LimitClaim>,
     pub extra_usage: ExtraUsageState,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PoolPlacementRuntimeStatus {
+    pub active_lease_ttl_seconds: u64,
+    pub accounts: Vec<AccountPlacementRuntimeStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AccountPlacementRuntimeStatus {
+    pub id: String,
+    pub active_launch_leases: usize,
+    pub active_model_leases: BTreeMap<String, usize>,
+    pub primary_assignments: usize,
+    pub model_overrides: usize,
 }
 
 struct AccountWorker {
@@ -775,6 +968,291 @@ async fn read_bounded_usage_response(response: reqwest::Response) -> Result<Vec<
     Ok(bytes)
 }
 
+#[derive(Default)]
+struct PlacementState {
+    primaries: HashMap<String, AffinityEntry>,
+    model_overrides: HashMap<AffinityKey, AffinityEntry>,
+    active_leases: HashMap<AffinityKey, ActiveLease>,
+    sequence: u64,
+}
+
+impl PlacementState {
+    fn runtime_status<'a>(
+        &self,
+        account_ids: impl Iterator<Item = &'a str>,
+        active_lease_ttl: Duration,
+    ) -> PoolPlacementRuntimeStatus {
+        let mut accounts = account_ids
+            .map(|id| {
+                (
+                    id.to_owned(),
+                    AccountPlacementRuntimeStatus {
+                        id: id.to_owned(),
+                        active_launch_leases: 0,
+                        active_model_leases: BTreeMap::new(),
+                        primary_assignments: 0,
+                        model_overrides: 0,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut active_launches = HashSet::<(String, String)>::new();
+        for (key, lease) in &self.active_leases {
+            active_launches.insert((key.launch_id.clone(), lease.account_id.clone()));
+            let account = accounts.entry(lease.account_id.clone()).or_insert_with(|| {
+                AccountPlacementRuntimeStatus {
+                    id: lease.account_id.clone(),
+                    active_launch_leases: 0,
+                    active_model_leases: BTreeMap::new(),
+                    primary_assignments: 0,
+                    model_overrides: 0,
+                }
+            });
+            *account
+                .active_model_leases
+                .entry(key.model.to_string())
+                .or_default() += 1;
+        }
+        for (_, account_id) in active_launches {
+            if let Some(account) = accounts.get_mut(&account_id) {
+                account.active_launch_leases += 1;
+            }
+        }
+        for primary in self.primaries.values() {
+            if let Some(account) = accounts.get_mut(&primary.account_id) {
+                account.primary_assignments += 1;
+            }
+        }
+        for model_override in self.model_overrides.values() {
+            if let Some(account) = accounts.get_mut(&model_override.account_id) {
+                account.model_overrides += 1;
+            }
+        }
+        PoolPlacementRuntimeStatus {
+            active_lease_ttl_seconds: active_lease_ttl.as_secs(),
+            accounts: accounts.into_values().collect(),
+        }
+    }
+
+    fn preferred_account(&self, key: &AffinityKey) -> Option<&str> {
+        self.active_leases
+            .get(key)
+            .map(|lease| lease.account_id.as_str())
+            .or_else(|| {
+                self.model_overrides
+                    .get(key)
+                    .map(|entry| entry.account_id.as_str())
+            })
+            .or_else(|| {
+                self.primaries
+                    .get(&key.launch_id)
+                    .map(|entry| entry.account_id.as_str())
+            })
+    }
+
+    fn prune_active_leases(&mut self, now: Instant, ttl: Duration) {
+        self.active_leases.retain(|_, lease| {
+            now.checked_duration_since(lease.last_seen)
+                .is_some_and(|age| age <= ttl)
+        });
+    }
+
+    fn loads_for(&self, current: &AffinityKey) -> BTreeMap<String, AccountPlacementLoad> {
+        self.collect_loads(&current.model, Some(current))
+    }
+
+    fn status_load_for(&self, current: &AffinityKey, account_id: &str) -> AccountPlacementLoad {
+        self.collect_loads(&current.model, None)
+            .remove(account_id)
+            .unwrap_or_default()
+    }
+
+    fn collect_loads(
+        &self,
+        model: &ModelFamily,
+        excluded: Option<&AffinityKey>,
+    ) -> BTreeMap<String, AccountPlacementLoad> {
+        let mut loads = BTreeMap::<String, AccountPlacementLoad>::new();
+        let mut global_leases = HashSet::<(String, String)>::new();
+
+        for (key, lease) in &self.active_leases {
+            if excluded == Some(key) {
+                continue;
+            }
+            global_leases.insert((key.launch_id.clone(), lease.account_id.clone()));
+            if key.model == *model {
+                loads
+                    .entry(lease.account_id.clone())
+                    .or_default()
+                    .active_model_leases += 1;
+            }
+        }
+        for (_, account_id) in global_leases {
+            loads.entry(account_id).or_default().active_global_leases += 1;
+        }
+        loads
+    }
+
+    fn reserve(&mut self, key: AffinityKey, account_id: String, now: Instant) {
+        let now_unix = now_unix_seconds();
+        match self.active_leases.get_mut(&key) {
+            Some(existing) if existing.account_id == account_id => {
+                existing.last_seen = now;
+                existing.last_seen_at_unix = now_unix;
+            }
+            _ => {
+                self.active_leases.insert(
+                    key,
+                    ActiveLease {
+                        account_id,
+                        last_seen: now,
+                        assigned_at_unix: now_unix,
+                        last_seen_at_unix: now_unix,
+                        provisional: true,
+                    },
+                );
+            }
+        }
+    }
+
+    fn commit(
+        &mut self,
+        key: AffinityKey,
+        account_id: String,
+        now: Instant,
+    ) -> SessionAssignmentReason {
+        self.sequence = self.sequence.saturating_add(1);
+        let sequence = self.sequence;
+        let now_unix = now_unix_seconds();
+        let assigned_at_unix = self
+            .active_leases
+            .get(&key)
+            .filter(|lease| lease.account_id == account_id)
+            .map(|lease| lease.assigned_at_unix)
+            .unwrap_or(now_unix);
+        let primary_account = self
+            .primaries
+            .get(&key.launch_id)
+            .map(|entry| entry.account_id.clone());
+
+        let assignment_reason = match primary_account {
+            None => {
+                self.primaries.insert(
+                    key.launch_id.clone(),
+                    AffinityEntry {
+                        account_id: account_id.clone(),
+                        last_seen_sequence: sequence,
+                    },
+                );
+                self.model_overrides.remove(&key);
+                SessionAssignmentReason::BalancedNewLaunch
+            }
+            Some(primary) if primary == account_id => {
+                if let Some(entry) = self.primaries.get_mut(&key.launch_id) {
+                    entry.last_seen_sequence = sequence;
+                }
+                self.model_overrides.remove(&key);
+                SessionAssignmentReason::PrimaryAffinity
+            }
+            Some(_) => {
+                self.model_overrides.insert(
+                    key.clone(),
+                    AffinityEntry {
+                        account_id: account_id.clone(),
+                        last_seen_sequence: sequence,
+                    },
+                );
+                SessionAssignmentReason::ModelOverride
+            }
+        };
+
+        self.active_leases.insert(
+            key,
+            ActiveLease {
+                account_id,
+                last_seen: now,
+                assigned_at_unix,
+                last_seen_at_unix: now_unix,
+                provisional: false,
+            },
+        );
+        self.enforce_affinity_bound();
+        assignment_reason
+    }
+
+    fn rollback_provisional(&mut self, key: &AffinityKey, account_id: &str) {
+        if self
+            .active_leases
+            .get(key)
+            .is_some_and(|lease| lease.provisional && lease.account_id.as_str() == account_id)
+        {
+            self.active_leases.remove(key);
+        }
+    }
+
+    fn clear_model_assignment(&mut self, key: &AffinityKey, account_id: &str) {
+        if self
+            .active_leases
+            .get(key)
+            .is_some_and(|lease| lease.account_id == account_id)
+        {
+            self.active_leases.remove(key);
+        }
+        if self
+            .model_overrides
+            .get(key)
+            .is_some_and(|entry| entry.account_id == account_id)
+        {
+            self.model_overrides.remove(key);
+        }
+    }
+
+    fn enforce_affinity_bound(&mut self) {
+        while self.primaries.len() + self.model_overrides.len() > MAX_AFFINITY_ENTRIES {
+            let oldest_primary = self
+                .primaries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen_sequence)
+                .map(|(launch_id, entry)| (launch_id.clone(), entry.last_seen_sequence));
+            let oldest_override = self
+                .model_overrides
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen_sequence)
+                .map(|(key, entry)| (key.clone(), entry.last_seen_sequence));
+
+            match (oldest_primary, oldest_override) {
+                (Some((launch_id, primary_sequence)), Some((key, override_sequence))) => {
+                    if primary_sequence <= override_sequence {
+                        self.primaries.remove(&launch_id);
+                    } else {
+                        self.model_overrides.remove(&key);
+                    }
+                }
+                (Some((launch_id, _)), None) => {
+                    self.primaries.remove(&launch_id);
+                }
+                (None, Some((key, _))) => {
+                    self.model_overrides.remove(&key);
+                }
+                (None, None) => break,
+            }
+        }
+    }
+}
+
+struct AffinityEntry {
+    account_id: String,
+    last_seen_sequence: u64,
+}
+
+struct ActiveLease {
+    account_id: String,
+    last_seen: Instant,
+    assigned_at_unix: i64,
+    last_seen_at_unix: i64,
+    provisional: bool,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct AffinityKey {
     launch_id: String,
@@ -832,6 +1310,10 @@ fn duration_ms(duration: Duration) -> i64 {
     duration.as_millis().try_into().unwrap_or(i64::MAX)
 }
 
+fn now_unix_seconds() -> i64 {
+    unix_now_ms() / 1000
+}
+
 fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut output = error.to_string();
     let mut source = error.source();
@@ -867,6 +1349,10 @@ mod tests {
             account_id: "account".to_owned(),
             access_token: SecretString::new("secret"),
             model: ModelFamily::from_requested_model("sonnet"),
+            assignment_reason: SessionAssignmentReason::BalancedNewLaunch,
+            placement_score: Some(0.5),
+            active_global_leases: 1,
+            active_model_leases: 1,
         };
         let debug = format!("{selected:?}");
         assert!(!debug.contains("secret"));
@@ -896,5 +1382,86 @@ mod tests {
         let json = serde_json::to_string(&status).expect("status JSON");
         assert!(!json.contains("accessToken"));
         assert!(!json.contains("refreshToken"));
+    }
+
+    fn affinity_key(launch_id: &str, model: &str) -> AffinityKey {
+        AffinityKey {
+            launch_id: launch_id.to_owned(),
+            model: ModelFamily::from_requested_model(model),
+        }
+    }
+
+    #[test]
+    fn placement_keeps_primary_and_scopes_override_to_one_model() {
+        let mut placement = PlacementState::default();
+        let now = Instant::now();
+        let sonnet = affinity_key("launch", "sonnet");
+        placement.reserve(sonnet.clone(), "a".to_owned(), now);
+        assert_eq!(
+            placement.commit(sonnet.clone(), "a".to_owned(), now),
+            SessionAssignmentReason::BalancedNewLaunch
+        );
+
+        let fable = affinity_key("launch", "fable");
+        placement.reserve(fable.clone(), "b".to_owned(), now);
+        assert_eq!(
+            placement.commit(fable.clone(), "b".to_owned(), now),
+            SessionAssignmentReason::ModelOverride
+        );
+        assert_eq!(placement.preferred_account(&sonnet), Some("a"));
+        assert_eq!(placement.preferred_account(&fable), Some("b"));
+
+        placement.clear_model_assignment(&fable, "b");
+        assert_eq!(placement.preferred_account(&fable), Some("a"));
+        assert_eq!(placement.preferred_account(&sonnet), Some("a"));
+    }
+
+    #[test]
+    fn placement_counts_global_launches_once_and_model_leases_separately() {
+        let mut placement = PlacementState::default();
+        let now = Instant::now();
+        for key in [
+            affinity_key("launch-one", "sonnet"),
+            affinity_key("launch-one", "fable"),
+            affinity_key("launch-two", "sonnet"),
+        ] {
+            placement.reserve(key.clone(), "a".to_owned(), now);
+            placement.commit(key, "a".to_owned(), now);
+        }
+
+        let loads = placement.loads_for(&affinity_key("new-launch", "sonnet"));
+        let account = loads.get("a").expect("account load");
+        assert_eq!(account.active_global_leases, 2);
+        assert_eq!(account.active_model_leases, 2);
+
+        let status = placement.runtime_status(["a", "b"].into_iter(), Duration::from_secs(900));
+        assert_eq!(status.active_lease_ttl_seconds, 900);
+        let account_a = status
+            .accounts
+            .iter()
+            .find(|account| account.id == "a")
+            .expect("account a placement");
+        assert_eq!(account_a.active_launch_leases, 2);
+        assert_eq!(account_a.active_model_leases["sonnet"], 2);
+        assert_eq!(account_a.active_model_leases["fable"], 1);
+        assert_eq!(account_a.primary_assignments, 2);
+        assert_eq!(account_a.model_overrides, 0);
+    }
+
+    #[test]
+    fn expired_active_lease_stops_contributing_without_losing_affinity() {
+        let mut placement = PlacementState::default();
+        let now = Instant::now();
+        let key = affinity_key("launch", "sonnet");
+        placement.reserve(key.clone(), "a".to_owned(), now);
+        placement.commit(key.clone(), "a".to_owned(), now);
+
+        placement.prune_active_leases(now + Duration::from_secs(901), Duration::from_secs(900));
+        assert!(
+            placement
+                .loads_for(&affinity_key("other", "sonnet"))
+                .is_empty()
+        );
+        assert_eq!(placement.preferred_account(&key), Some("a"));
     }
 }
