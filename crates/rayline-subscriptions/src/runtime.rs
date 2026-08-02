@@ -198,6 +198,14 @@ impl SubscriptionPoolRuntime {
                 .map(|account| account.state())
                 .filter(|state| !excluded.contains(&state.account_id))
                 .collect::<Vec<_>>();
+            if !states
+                .iter()
+                .any(|state| state.credential_health == CredentialHealth::Healthy)
+            {
+                return Err(SubscriptionRuntimeError::NoUsableCredentials {
+                    pool: self.pool_id.clone(),
+                });
+            }
             let (account_id, placement_score, active_global_leases, active_model_leases) = {
                 let now = Instant::now();
                 let mut placement = self
@@ -776,43 +784,114 @@ impl AccountWorker {
             .take()
             .ok_or_else(|| SubscriptionRuntimeError::CredentialUnavailable(self.id.clone()))?;
         self.set_credential_health(CredentialHealth::Refreshing);
-        let refresh_result = self.refresh_client.refresh_document(&mut document).await;
-        match refresh_result {
-            Ok(()) => {
-                let save_result = self.store.save_if_unchanged(&mut document);
-                if let Err(source) = save_result {
-                    let reload_result = self.store.load();
-                    *self
-                        .credential
-                        .lock()
-                        .expect("subscription credential lock poisoned") = reload_result.ok();
-                    self.set_credential_health(CredentialHealth::Unavailable);
-                    self.set_last_error(source.to_string());
-                    return Err(source.into());
+        let mut reloaded_after_invalid_grant = false;
+        loop {
+            match self.refresh_client.refresh_document(&mut document).await {
+                Ok(()) => return self.persist_refreshed_credential(document),
+                Err(OAuthRefreshError::InvalidGrant) if !reloaded_after_invalid_grant => {
+                    match self.reload_changed_credential(&document).await {
+                        Ok(Some(latest)) => {
+                            document = latest;
+                            self.update_subscription_type(&document);
+                            if document.expires_at_unix_ms().is_ok_and(|expires_at| {
+                                expires_at > unix_now_ms().saturating_add(self.refresh_margin_ms)
+                            }) {
+                                return self.activate_credential(document);
+                            }
+                            reloaded_after_invalid_grant = true;
+                        }
+                        Ok(None) => {
+                            return self.fail_refresh(document, OAuthRefreshError::InvalidGrant);
+                        }
+                        Err(error) => {
+                            *self
+                                .credential
+                                .lock()
+                                .expect("subscription credential lock poisoned") = Some(document);
+                            self.set_credential_health(CredentialHealth::Unavailable);
+                            self.set_last_error(format!(
+                                "Claude OAuth refresh token was rejected and the credential source could not be reloaded: {error}"
+                            ));
+                            return Err(error);
+                        }
+                    }
                 }
-                let access_token = document.access_token()?;
-                *self
-                    .credential
-                    .lock()
-                    .expect("subscription credential lock poisoned") = Some(document);
-                self.set_credential_health(CredentialHealth::Healthy);
-                self.clear_last_error();
-                Ok(access_token)
-            }
-            Err(error) => {
-                *self
-                    .credential
-                    .lock()
-                    .expect("subscription credential lock poisoned") = Some(document);
-                if matches!(error, OAuthRefreshError::InvalidGrant) {
-                    self.set_credential_health(CredentialHealth::Quarantined);
-                } else {
-                    self.set_credential_health(CredentialHealth::Unavailable);
-                }
-                self.set_last_error(error.to_string());
-                Err(error.into())
+                Err(error) => return self.fail_refresh(document, error),
             }
         }
+    }
+
+    async fn reload_changed_credential(
+        &self,
+        stale: &CredentialDocument,
+    ) -> Result<Option<CredentialDocument>, SubscriptionRuntimeError> {
+        let store = self.store.clone();
+        let latest = tokio::task::spawn_blocking(move || store.load())
+            .await
+            .map_err(SubscriptionRuntimeError::BackgroundTask)?
+            .map_err(|source| SubscriptionRuntimeError::CredentialSource {
+                account: self.id.clone(),
+                source,
+            })?;
+        Ok((!stale.has_same_version(&latest)).then_some(latest))
+    }
+
+    fn persist_refreshed_credential(
+        &self,
+        mut document: CredentialDocument,
+    ) -> Result<SecretString, SubscriptionRuntimeError> {
+        if let Err(source) = self.store.save_if_unchanged(&mut document) {
+            let reload_result = self.store.load();
+            *self
+                .credential
+                .lock()
+                .expect("subscription credential lock poisoned") = reload_result.ok();
+            self.set_credential_health(CredentialHealth::Unavailable);
+            self.set_last_error(source.to_string());
+            return Err(source.into());
+        }
+        self.activate_credential(document)
+    }
+
+    fn activate_credential(
+        &self,
+        document: CredentialDocument,
+    ) -> Result<SecretString, SubscriptionRuntimeError> {
+        let access_token = document.access_token()?;
+        self.update_subscription_type(&document);
+        *self
+            .credential
+            .lock()
+            .expect("subscription credential lock poisoned") = Some(document);
+        self.set_credential_health(CredentialHealth::Healthy);
+        self.clear_last_error();
+        Ok(access_token)
+    }
+
+    fn fail_refresh(
+        &self,
+        document: CredentialDocument,
+        error: OAuthRefreshError,
+    ) -> Result<SecretString, SubscriptionRuntimeError> {
+        *self
+            .credential
+            .lock()
+            .expect("subscription credential lock poisoned") = Some(document);
+        if matches!(error, OAuthRefreshError::InvalidGrant) {
+            self.set_credential_health(CredentialHealth::Quarantined);
+        } else {
+            self.set_credential_health(CredentialHealth::Unavailable);
+        }
+        self.set_last_error(error.to_string());
+        Err(error.into())
+    }
+
+    fn update_subscription_type(&self, document: &CredentialDocument) {
+        *self
+            .subscription_type
+            .write()
+            .expect("subscription type lock poisoned") =
+            document.subscription_type().map(str::to_owned);
     }
 
     fn current_access_token(&self) -> Result<SecretString, SubscriptionRuntimeError> {
@@ -826,6 +905,9 @@ impl AccountWorker {
     }
 
     async fn refresh_usage(&self) {
+        if self.state().credential_health == CredentialHealth::Quarantined {
+            return;
+        }
         let mut access_token = match self.access_token(false).await {
             Ok(access_token) => access_token,
             Err(error) => {

@@ -1066,6 +1066,93 @@ async fn subscription_pool_refreshes_a_rejected_token_and_persists_rotation() {
 }
 
 #[tokio::test]
+async fn subscription_pool_recovers_when_another_process_rotates_the_credential() {
+    init_tracing();
+    let anthropic = spawn_fake_subscription_anthropic().await;
+    let oauth = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: Bytes::from_static(br#"{"error":"invalid_grant"}"#),
+        },
+    )
+    .await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_dir = temp.path().join("account");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_dir, "token-stale");
+    let pool = rayline_subscriptions::SubscriptionPoolConfig {
+        control_config_dir: control_dir.clone(),
+        accounts: vec![rayline_subscriptions::SubscriptionAccountConfig {
+            id: "only".to_owned(),
+            credential_source: rayline_subscriptions::CredentialSourceConfig {
+                claude_config_dir: account_dir.clone(),
+            },
+        }],
+        policy: Default::default(),
+    };
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        pool,
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            token_url: format!("https://localhost:{}/oauth/token", oauth.port),
+            trusted_ca_pem: Some(oauth.cert_pem.as_bytes().to_vec()),
+            request_timeout: Duration::from_secs(2),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Simulate a standalone Claude process rotating the profile credential
+    // after the pool daemon cached its original token pair.
+    write_subscription_credential(&account_dir, "token-current");
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime.clone());
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "rotated_elsewhere")
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["account"],
+        "token-current"
+    );
+    assert_eq!(
+        runtime.status().accounts[0].credential_health,
+        rayline_subscriptions::CredentialHealth::Healthy
+    );
+    assert_eq!(
+        oauth
+            .captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path_and_query == "/oauth/token")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
 async fn subscription_pool_quarantines_invalid_grant_and_uses_next_account() {
     init_tracing();
     let anthropic = spawn_fake_subscription_anthropic().await;
@@ -1134,6 +1221,40 @@ async fn subscription_pool_quarantines_invalid_grant_and_uses_next_account() {
     assert_eq!(
         invalid.credential_health,
         rayline_subscriptions::CredentialHealth::Quarantined
+    );
+    runtime.refresh_all_usage().await;
+    assert_eq!(
+        oauth
+            .captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path_and_query == "/oauth/token")
+            .count(),
+        1,
+        "a quarantined credential must not trigger repeated refresh attempts"
+    );
+
+    runtime
+        .mark_credential_unavailable("b", "synthetic credential failure")
+        .unwrap();
+    let unavailable = proxied_client_with_launch(proxy_port, &ca_cert_path, "no_credentials")
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-fable-5","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let unavailable_body = unavailable.json::<serde_json::Value>().await.unwrap();
+    assert!(
+        unavailable_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("no usable OAuth credential"))
+    );
+    assert!(
+        !unavailable_body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("allowance"))
     );
 }
 

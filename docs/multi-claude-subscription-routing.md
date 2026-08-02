@@ -104,7 +104,11 @@ tokens remain in the original Claude credential backends.
 
 On macOS, the first Rayline process that opens each Claude Keychain item may
 trigger one Keychain approval per registered account. A running `rld` keeps the
-loaded credentials in memory and does not reopen Keychain for every request.
+loaded credentials in memory and does not reopen Keychain for every request. If
+Anthropic rejects a cached refresh token because another Claude process rotated
+that profile's credential, `rld` reopens only that source once and adopts the
+newer version. An unchanged rejected credential is quarantined without repeated
+background Keychain reads.
 During development, rebuilding an unsigned debug binary changes the identity
 macOS authorizes and can trigger the prompts again; finish rebuilding before
 running interactive acceptance tests.
@@ -527,7 +531,9 @@ The worker should refresh asynchronously when expiry is between roughly 30 and
 120 seconds away. If a request sees a token within the immediate refresh
 window, it waits for the one shared refresh operation. A rotated refresh token
 is written back using compare-and-swap semantics where the credential backend
-allows it.
+allows it. An `invalid_grant` first triggers a versioned reload of that source:
+if standalone Claude has written a newer token pair, the worker adopts it and
+remains healthy; only an unchanged rejected token is quarantined.
 
 ### Launch affinity
 
@@ -741,7 +747,8 @@ forwarded.
 | Generic `429` without unified quota evidence | Do not rotate accounts; pass it through for Claude Code's normal provider backoff |
 | `529` or overloaded response | Do not rotate accounts; this is provider-wide, not account-specific |
 | First `401` | Refresh the selected worker once and retry the same account |
-| Repeated `401` or refresh `invalid_grant` | Quarantine that credential source and select another account if safe |
+| Refresh `invalid_grant` after another process changed the credential | Reload that source once, adopt the newer token, and retry the same account |
+| Repeated `401` or `invalid_grant` with an unchanged credential | Quarantine that credential source and select another account if safe |
 | Explicit pre-stream entitlement or `credits_required` rejection | Mark the relevant model/account unavailable under policy and select another eligible account |
 | Network disconnect or timeout after send | Do not replay on another account because processing is ambiguous |
 | `200` or any response body/SSE bytes forwarded | Never replay |
@@ -757,6 +764,9 @@ real unified 429 response intact. Claude Code can then stop retrying and show
 its standard reset message. If every account is already known to be exhausted
 before any upstream attempt, Rayline returns a bounded local pool-exhaustion
 429 instead; there is no current provider response to preserve in that case.
+If no account has a usable OAuth credential, Rayline instead returns a local
+503 that points to `rayline subscriptions status --verbose`; it does not report
+credential failure as exhausted allowance.
 
 ## Response Headers and Claude UI
 

@@ -960,10 +960,19 @@ async fn forward_subscription_request(
                             request.requested_model,
                             error
                         );
-                        Ok(subscription_exhausted_response(
-                            request.pool.pool_id(),
-                            request.requested_model,
-                        ))
+                        if matches!(
+                            error,
+                            rayline_subscriptions::SubscriptionRuntimeError::NoUsableCredentials { .. }
+                        ) {
+                            Ok(subscription_credentials_unavailable_response(
+                                request.pool.pool_id(),
+                            ))
+                        } else {
+                            Ok(subscription_exhausted_response(
+                                request.pool.pool_id(),
+                                request.requested_model,
+                            ))
+                        }
                     }
                 };
             }
@@ -1179,6 +1188,21 @@ fn subscription_exhausted_response(pool_id: &str, requested_model: &str) -> Resp
                 "type": "rate_limit_error",
                 "message": format!(
                     "Claude subscription pool {pool_id:?} has no remaining included allowance for model {requested_model:?}"
+                )
+            }
+        }),
+    )
+}
+
+fn subscription_credentials_unavailable_response(pool_id: &str) -> Response<BoxBody> {
+    json_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "api_error",
+                "message": format!(
+                    "Claude subscription pool {pool_id:?} has no usable OAuth credential; run `rayline subscriptions status --verbose` for the account-specific error"
                 )
             }
         }),

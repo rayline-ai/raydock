@@ -243,6 +243,10 @@ impl CredentialDocument {
         self.oauth_object().ok()?.get("subscriptionType")?.as_str()
     }
 
+    pub(crate) fn has_same_version(&self, other: &Self) -> bool {
+        self.version == other.version
+    }
+
     pub(crate) fn apply_refresh(
         &mut self,
         access_token: String,
