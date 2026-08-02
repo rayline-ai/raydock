@@ -12,7 +12,9 @@ use zeroize::{Zeroize, Zeroizing};
 const CREDENTIAL_FILE_NAME: &str = ".credentials.json";
 const CREDENTIAL_LOCK_FILE_NAME: &str = ".credentials.json.rayline.lock";
 const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
+#[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE_PREFIX: &str = "Claude Code-credentials-";
+#[cfg(target_os = "macos")]
 const CLAUDE_LEGACY_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 #[derive(Clone)]
@@ -45,6 +47,7 @@ impl Eq for SecretString {}
 #[derive(Clone, Debug)]
 pub struct CredentialStore {
     config_dir: PathBuf,
+    #[cfg(target_os = "macos")]
     allow_legacy_keychain: bool,
 }
 
@@ -60,12 +63,14 @@ impl CredentialStore {
                 source,
             }
         })?;
+        #[cfg(target_os = "macos")]
         let allow_legacy_keychain = std::env::var_os("HOME")
             .map(PathBuf::from)
             .and_then(|home| home.join(".claude").canonicalize().ok())
             .is_some_and(|default| default == config_dir);
         Ok(Self {
             config_dir,
+            #[cfg(target_os = "macos")]
             allow_legacy_keychain,
         })
     }
