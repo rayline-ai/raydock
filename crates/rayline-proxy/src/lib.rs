@@ -4476,6 +4476,8 @@ mod tests {
                 effective_headroom: Some(0.8),
                 bottleneck: None,
                 applicable: Vec::new(),
+                eligible_accounts: 2,
+                total_accounts: 2,
             },
             placement: rayline_subscriptions::SessionPlacementStatus {
                 strategy: "balanced_sessions".to_owned(),

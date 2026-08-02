@@ -370,8 +370,19 @@ impl SubscriptionPoolRuntime {
             .account(current_account_id)
             .ok_or_else(|| SubscriptionRuntimeError::UnknownAccount(current_account_id.to_owned()))?
             .state();
+        let account_states = self
+            .accounts
+            .iter()
+            .map(|account| account.state())
+            .collect::<Vec<_>>();
         let now = now_unix_seconds();
-        let (primary_account_id, assigned_at_unix, last_seen_at_unix, placement_load) = {
+        let (
+            primary_account_id,
+            assigned_at_unix,
+            last_seen_at_unix,
+            placement_load,
+            eligible_accounts,
+        ) = {
             let placement = self
                 .placement
                 .lock()
@@ -382,11 +393,26 @@ impl SubscriptionPoolRuntime {
                 .map(|entry| entry.account_id.clone())
                 .unwrap_or_else(|| current_account_id.to_owned());
             let lease = placement.active_leases.get(&key);
+            let decision = select_account(
+                &account_states,
+                &SelectionRequest {
+                    model: model.clone(),
+                    affinity_account_id: None,
+                    launch_id: launch_id.to_owned(),
+                    placement_loads: placement.loads_for(&key),
+                },
+                &self.policy,
+            );
             (
                 primary_account_id,
                 lease.map(|lease| lease.assigned_at_unix).unwrap_or(now),
                 lease.map(|lease| lease.last_seen_at_unix).unwrap_or(now),
                 placement.status_load_for(&key, current_account_id),
+                decision
+                    .evaluations
+                    .iter()
+                    .filter(|evaluation| evaluation.eligible)
+                    .count(),
             )
         };
 
@@ -462,6 +488,8 @@ impl SubscriptionPoolRuntime {
                 effective_headroom,
                 bottleneck,
                 applicable,
+                eligible_accounts,
+                total_accounts: account_states.len(),
             },
             placement: SessionPlacementStatus {
                 strategy: "balanced_sessions".to_owned(),

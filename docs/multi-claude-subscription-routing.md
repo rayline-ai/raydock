@@ -120,7 +120,8 @@ and may need Keychain access. Pool launches use port `20816` by default; set
 
 Pool launches export a launch-scoped status identifier. The proxy uses it to
 write the current serving account, model-family override, failover reason, and
-remaining bottleneck headroom without storing credentials. Compose that data
+remaining bottleneck headroom plus model-aware eligible/total pool counts
+without storing credentials. Compose that data
 into an existing `~/.claude/bin/statusline` script with:
 
 ```bash
@@ -131,6 +132,13 @@ subscription=$(
 )
 [ -z "$subscription" ] || printf '%s' "$subscription"
 ```
+
+The compact fragment is shaped like `◈ af · 5h 99%L · 3/3`, or
+`◈ af→ws · F 70%L · 1/3` after a Fable-specific failover. `L` means allowance
+left and the final fraction is eligible subscriptions over configured
+subscriptions for the current model. For pooled launches this fragment should
+replace a `CLAUDE_CONFIG_DIR`-derived account badge and any per-profile usage
+poll; retain those only as a non-pooled fallback.
 
 For custom formatting, use
 `rld statusline --component subscription --json`. The status-line reader only

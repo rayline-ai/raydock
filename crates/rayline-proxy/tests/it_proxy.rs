@@ -683,6 +683,8 @@ async fn subscription_pool_fails_over_only_the_exhausted_model_pool() {
         status.assignment.reason,
         rayline_subscriptions::SessionAssignmentReason::QuotaFailover
     );
+    assert_eq!(status.capacity.eligible_accounts, 1);
+    assert_eq!(status.capacity.total_accounts, 2);
 
     #[cfg(unix)]
     {

@@ -69,6 +69,10 @@ pub struct SessionCapacityStatus {
     pub effective_headroom: Option<f64>,
     pub bottleneck: Option<SessionLimitStatus>,
     pub applicable: Vec<SessionLimitStatus>,
+    #[serde(default)]
+    pub eligible_accounts: usize,
+    #[serde(default)]
+    pub total_accounts: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -119,5 +123,18 @@ mod tests {
         assert!(!is_valid_status_id("../status"));
         assert!(!is_valid_status_id(&"A".repeat(64)));
         assert!(!is_valid_status_id(&"0".repeat(63)));
+    }
+
+    #[test]
+    fn older_capacity_snapshots_default_pool_counts() {
+        let capacity: SessionCapacityStatus = serde_json::from_value(serde_json::json!({
+            "usage_snapshot_fresh": true,
+            "effective_headroom": 0.8,
+            "bottleneck": null,
+            "applicable": []
+        }))
+        .expect("capacity snapshot");
+        assert_eq!(capacity.eligible_accounts, 0);
+        assert_eq!(capacity.total_accounts, 0);
     }
 }

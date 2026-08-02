@@ -28,6 +28,9 @@ const MAX_ACCOUNT_LABEL_BYTES: usize = 32;
 
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
 const ZAP: &str = "⚡";
 const SUBSCRIPTION: &str = "◈";
 
@@ -144,24 +147,71 @@ fn render_subscription(snapshot: Option<&SessionStatusSnapshot>) -> String {
     };
     let assignment = &snapshot.assignment;
     let account_label = display_account_label(&assignment.current_account_id);
-    let override_marker = if assignment.kind == SessionAssignmentKind::ModelOverride {
-        " ↪"
+    let assignment_label = if assignment.kind == SessionAssignmentKind::ModelOverride {
+        format!(
+            "{}→{account_label}",
+            display_account_label(&assignment.primary_account_id)
+        )
     } else {
-        ""
+        account_label.to_owned()
     };
-    let remaining = if snapshot.capacity.usage_snapshot_fresh {
-        snapshot
-            .capacity
-            .effective_headroom
-            .map(|headroom| format!(" · {:.0}% left", headroom.clamp(0.0, 1.0) * 100.0))
-            .unwrap_or_default()
+    let allowance = if snapshot.capacity.usage_snapshot_fresh {
+        snapshot.capacity.effective_headroom.map_or_else(
+            || format!(" {DIM}· allowance ?{RESET}"),
+            |headroom| {
+                let headroom = headroom.clamp(0.0, 1.0);
+                let color = if headroom <= 0.1 {
+                    RED
+                } else if headroom <= 0.3 {
+                    YELLOW
+                } else {
+                    GREEN
+                };
+                let label = compact_limit_label(snapshot.capacity.bottleneck.as_ref());
+                format!(
+                    " {DIM}· {label} {RESET}{color}{:.0}%L{RESET}",
+                    headroom * 100.0
+                )
+            },
+        )
     } else {
-        " · usage stale".to_owned()
+        format!(" {DIM}· stale{RESET}")
     };
-    format!(
-        "{SUBSCRIPTION} {}{override_marker} {DIM}· {}{}{RESET}",
-        account_label, assignment.current_model_family, remaining
-    )
+    let pool = if snapshot.capacity.total_accounts > 1 {
+        format!(
+            " {DIM}· {}/{}{RESET}",
+            snapshot
+                .capacity
+                .eligible_accounts
+                .min(snapshot.capacity.total_accounts),
+            snapshot.capacity.total_accounts
+        )
+    } else {
+        String::new()
+    };
+    format!("{SUBSCRIPTION} {assignment_label}{allowance}{pool}")
+}
+
+fn compact_limit_label(limit: Option<&rayline_subscriptions::SessionLimitStatus>) -> String {
+    let Some(limit) = limit else {
+        return "cap".to_owned();
+    };
+    if let Some(model) = limit.scope.strip_prefix("model:") {
+        return match model.to_ascii_lowercase().as_str() {
+            "fable" => "F".to_owned(),
+            _ => model
+                .chars()
+                .next()
+                .map(|initial| initial.to_uppercase().collect())
+                .unwrap_or_else(|| "model".to_owned()),
+        };
+    }
+    match limit.key.as_str() {
+        "five_hour" | "session" => "5h".to_owned(),
+        "seven_day" | "weekly" => "7d".to_owned(),
+        key if key.contains("fable") => "F".to_owned(),
+        _ => "cap".to_owned(),
+    }
 }
 
 fn display_account_label(value: &str) -> &str {
@@ -179,6 +229,29 @@ fn write_statusline_output(value: &str) {
     let stdout = std::io::stdout();
     let mut output = stdout.lock();
     let _ = output.write_all(value.as_bytes());
+}
+
+fn compose_text_output(
+    component: StatuslineComponent,
+    route_fragment: String,
+    subscription_fragment: String,
+) -> String {
+    let route_fragment = if component == StatuslineComponent::Subscription {
+        String::new()
+    } else {
+        route_fragment
+    };
+    let subscription_fragment = if component == StatuslineComponent::Route {
+        String::new()
+    } else {
+        subscription_fragment
+    };
+    match (route_fragment.is_empty(), subscription_fragment.is_empty()) {
+        (false, false) => format!("{route_fragment} · {subscription_fragment}"),
+        (false, true) => route_fragment,
+        (true, false) => subscription_fragment,
+        (true, true) => String::new(),
+    }
 }
 
 fn now_unix() -> i64 {
@@ -290,12 +363,7 @@ pub fn run(
         render(global_route.as_ref(), session.as_ref(), now)
     };
     let subscription_fragment = render_subscription(subscription);
-    let output = match (route_fragment.is_empty(), subscription_fragment.is_empty()) {
-        (false, false) => format!("{route_fragment} · {subscription_fragment}"),
-        (false, true) => route_fragment,
-        (true, false) => subscription_fragment,
-        (true, true) => String::new(),
-    };
+    let output = compose_text_output(component, route_fragment, subscription_fragment);
     write_statusline_output(&output);
 }
 
@@ -304,7 +372,7 @@ mod tests {
     use super::*;
     use rayline_subscriptions::{
         SessionAssignmentReason, SessionAssignmentStatus, SessionCapacityStatus,
-        SessionPlacementStatus,
+        SessionLimitStatus, SessionPlacementStatus,
     };
     use serde_json::json;
 
@@ -319,11 +387,16 @@ mod tests {
     }
 
     fn subscription_status(kind: SessionAssignmentKind) -> SessionStatusSnapshot {
+        let primary_account_id = if kind == SessionAssignmentKind::Primary {
+            "personal"
+        } else {
+            "work"
+        };
         SessionStatusSnapshot {
             schema: SESSION_STATUS_SCHEMA,
             pool_id: "default".to_owned(),
             assignment: SessionAssignmentStatus {
-                primary_account_id: "work".to_owned(),
+                primary_account_id: primary_account_id.to_owned(),
                 current_account_id: "personal".to_owned(),
                 current_model_family: "fable".to_owned(),
                 kind,
@@ -334,8 +407,16 @@ mod tests {
             capacity: SessionCapacityStatus {
                 usage_snapshot_fresh: true,
                 effective_headroom: Some(0.42),
-                bottleneck: None,
+                bottleneck: Some(SessionLimitStatus {
+                    key: "fable_weekly".to_owned(),
+                    scope: "model:fable".to_owned(),
+                    used_fraction: 0.58,
+                    remaining_fraction: 0.42,
+                    resets_at: None,
+                }),
                 applicable: Vec::new(),
+                eligible_accounts: 2,
+                total_accounts: 3,
             },
             placement: SessionPlacementStatus {
                 strategy: "balanced_sessions".to_owned(),
@@ -366,14 +447,14 @@ mod tests {
     }
 
     #[test]
-    fn subscription_fragment_shows_account_model_and_headroom() {
+    fn subscription_fragment_shows_assignment_bottleneck_and_pool_reserve() {
         let line = render_subscription(Some(&subscription_status(
             SessionAssignmentKind::ModelOverride,
         )));
-        assert!(line.contains("personal"));
-        assert!(line.contains("fable"));
-        assert!(line.contains("42% left"));
-        assert!(line.contains('↪'));
+        assert!(line.contains("work→personal"));
+        assert!(line.contains("F"));
+        assert!(line.contains("42%L"));
+        assert!(line.contains("2/3"));
     }
 
     #[test]
@@ -415,7 +496,8 @@ mod tests {
     #[test]
     fn primary_subscription_omits_override_marker() {
         let line = render_subscription(Some(&subscription_status(SessionAssignmentKind::Primary)));
-        assert!(!line.contains('↪'));
+        assert!(line.contains("◈ personal"));
+        assert!(!line.contains('→'));
     }
 
     #[test]
@@ -437,5 +519,25 @@ mod tests {
     fn nothing_available_is_empty() {
         assert_eq!(render(None, None, NOW), "");
         assert_eq!(render_subscription(None), "");
+    }
+
+    #[test]
+    fn component_filtering_keeps_subscription_and_route_output_separate() {
+        assert_eq!(
+            compose_text_output(
+                StatuslineComponent::Subscription,
+                "route".to_owned(),
+                "subscription".to_owned(),
+            ),
+            "subscription"
+        );
+        assert_eq!(
+            compose_text_output(
+                StatuslineComponent::Route,
+                "route".to_owned(),
+                "subscription".to_owned(),
+            ),
+            "route"
+        );
     }
 }

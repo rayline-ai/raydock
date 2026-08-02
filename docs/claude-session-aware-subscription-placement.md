@@ -521,6 +521,8 @@ The initial schema is:
   "capacity": {
     "usage_snapshot_fresh": true,
     "effective_headroom": 0.47,
+    "eligible_accounts": 2,
+    "total_accounts": 3,
     "bottleneck": {
       "key": "fable_weekly",
       "scope": "model:fable",
@@ -583,7 +585,11 @@ appear in status output.
 - `migration_guard`
 
 The snapshot describes only the current account. Aggregate pool status remains
-available from `rayline subscriptions status --json`.
+available from `rayline subscriptions status --json`. The two account-count
+fields are the model-aware pool reserve: `eligible_accounts` is the number of
+configured subscriptions the selector can currently use for this model, while
+`total_accounts` is the configured pool size. They deliberately do not sum or
+average percentages across plans.
 
 ### Write timing
 
@@ -636,20 +642,23 @@ route and subscription fields; missing data produces `{}`.
 Examples:
 
 ```text
-sub:ws · 5h 72% left · 7d 59% left
+◈ ws · 5h 72%L · 3/3
 ```
 
 ```text
-sub:memex/Fable · primary ws · Fable 47% left
+◈ ws→memex · F 47%L · 2/3
 ```
 
 ```text
-sub:ws · usage stale
+◈ ws · stale · 3/3
 ```
 
-The renderer should prefer the bottleneck and at most two compact global
-claims. Narrow status lines should keep the serving account even when limit
-details are omitted.
+`L` means allowance left. The renderer shows only the effective bottleneck:
+`5h`, `7d`, or a compact model label such as `F` for Fable. The final fraction
+is eligible subscriptions over configured subscriptions for the current model.
+Narrow status lines keep the serving account first, and an arrow appears only
+when the current model is being served by a subscription other than the
+session's primary assignment.
 
 ### Custom Claude status-line integration
 
@@ -677,8 +686,11 @@ fi
 ```
 
 For the current local script, this fragment replaces the leading account badge
-derived from `CLAUDE_CONFIG_DIR`. The remaining worktree, effort, route, session
-ID, and `cc-usage` segments can stay composed as they are.
+derived from `CLAUDE_CONFIG_DIR`. The remaining worktree, effort, route, and
+session ID segments can stay composed as they are. Skip a separate `cc-usage`
+row for pooled launches: it follows the shared control directory, can report the
+wrong serving subscription, and may reopen Keychain. Keep it only as a fallback
+for non-pooled Claude launches.
 
 The status script should not run:
 
