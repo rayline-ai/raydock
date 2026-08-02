@@ -36,6 +36,7 @@ pub struct SubscriptionRuntimeOptions {
     pub near_limit_poll_interval: Duration,
     pub refresh_margin: Duration,
     pub active_lease_ttl: Duration,
+    pub trusted_ca_pem: Option<Vec<u8>>,
     pub home_dir: Option<PathBuf>,
 }
 
@@ -50,6 +51,7 @@ impl Default for SubscriptionRuntimeOptions {
             near_limit_poll_interval: Duration::from_secs(45),
             refresh_margin: Duration::from_secs(120),
             active_lease_ttl: DEFAULT_ACTIVE_LEASE_TTL,
+            trusted_ca_pem: None,
             home_dir: std::env::var_os("HOME").map(PathBuf::from),
         }
     }
@@ -73,13 +75,17 @@ impl SubscriptionPoolRuntime {
         options: SubscriptionRuntimeOptions,
     ) -> Result<Arc<Self>, SubscriptionRuntimeError> {
         let pool_id = pool_id.into();
-        let http = reqwest::Client::builder()
+        let mut http = reqwest::Client::builder()
             .timeout(options.request_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(SubscriptionRuntimeError::HttpClient)?;
+            .redirect(reqwest::redirect::Policy::none());
+        if let Some(pem) = options.trusted_ca_pem.as_deref() {
+            let certificate = reqwest::Certificate::from_pem(pem)
+                .map_err(SubscriptionRuntimeError::HttpClient)?;
+            http = http.add_root_certificate(certificate);
+        }
+        let http = http.build().map_err(SubscriptionRuntimeError::HttpClient)?;
         let refresh_client =
-            OAuthRefreshClient::new(http.clone(), &options.token_url, &options.oauth_client_id);
+            OAuthRefreshClient::new(http.clone(), &options.token_url, &options.oauth_client_id)?;
         let refresh_margin_ms = duration_ms(options.refresh_margin);
         let usage_url = format!(
             "{}{}",

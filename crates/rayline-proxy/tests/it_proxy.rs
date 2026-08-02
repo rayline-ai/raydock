@@ -206,29 +206,6 @@ async fn spawn_fake_subscription_anthropic() -> FakeHttpServer {
                             );
                         }
 
-                        if path == "/oauth/token" {
-                            if body_json["refresh_token"] == "refresh-token-invalid" {
-                                return Ok::<_, Infallible>(
-                                    Response::builder()
-                                        .status(StatusCode::BAD_REQUEST)
-                                        .header("content-type", "application/json")
-                                        .body(Full::new(Bytes::from_static(
-                                            br#"{"error":"invalid_grant"}"#,
-                                        )))
-                                        .unwrap(),
-                                );
-                            }
-                            return Ok::<_, Infallible>(
-                                Response::builder()
-                                    .status(StatusCode::OK)
-                                    .header("content-type", "application/json")
-                                    .body(Full::new(Bytes::from_static(
-                                        br#"{"access_token":"token-refreshed","refresh_token":"refresh-rotated","expires_in":3600,"refresh_token_expires_in":7200,"scope":"user:inference user:profile"}"#,
-                                    )))
-                                    .unwrap(),
-                            );
-                        }
-
                         if path == "/v1/messages" && authorization == "Bearer token-stale" {
                             return Ok::<_, Infallible>(
                                 Response::builder()
@@ -852,7 +829,7 @@ async fn concurrent_new_launches_balance_across_equal_subscriptions() {
     assert_eq!(account_a_count + account_b_count, 20);
     assert!(
         account_a_count.abs_diff(account_b_count) <= 2,
-        "active leases should keep equal subscriptions balanced: a={account_a_count}, b={account_b_count}"
+        "active leases should keep equal subscriptions balanced"
     );
 }
 
@@ -991,6 +968,17 @@ async fn generic_rate_limit_does_not_rotate_subscription_accounts() {
 async fn subscription_pool_refreshes_a_rejected_token_and_persists_rotation() {
     init_tracing();
     let anthropic = spawn_fake_subscription_anthropic().await;
+    let oauth = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::OK,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: Bytes::from_static(
+                br#"{"access_token":"token-refreshed","refresh_token":"refresh-rotated","expires_in":3600,"refresh_token_expires_in":7200,"scope":"user:inference user:profile"}"#,
+            ),
+        },
+    )
+    .await;
     let temp = tempfile::tempdir().unwrap();
     let control_dir = temp.path().join("control");
     let account_dir = temp.path().join("account");
@@ -1011,7 +999,8 @@ async fn subscription_pool_refreshes_a_rejected_token_and_persists_rotation() {
         pool,
         rayline_subscriptions::SubscriptionRuntimeOptions {
             anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
-            token_url: format!("http://127.0.0.1:{}/oauth/token", anthropic.port),
+            token_url: format!("https://localhost:{}/oauth/token", oauth.port),
+            trusted_ca_pem: Some(oauth.cert_pem.as_bytes().to_vec()),
             request_timeout: Duration::from_secs(2),
             ..Default::default()
         },
@@ -1063,7 +1052,7 @@ async fn subscription_pool_refreshes_a_rejected_token_and_persists_rotation() {
         "refresh-rotated"
     );
     assert_eq!(
-        anthropic
+        oauth
             .captured
             .lock()
             .unwrap()
@@ -1078,6 +1067,15 @@ async fn subscription_pool_refreshes_a_rejected_token_and_persists_rotation() {
 async fn subscription_pool_quarantines_invalid_grant_and_uses_next_account() {
     init_tracing();
     let anthropic = spawn_fake_subscription_anthropic().await;
+    let oauth = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: Bytes::from_static(br#"{"error":"invalid_grant"}"#),
+        },
+    )
+    .await;
     let temp = tempfile::tempdir().unwrap();
     let control_dir = temp.path().join("control");
     let invalid_dir = temp.path().join("invalid");
@@ -1090,7 +1088,8 @@ async fn subscription_pool_quarantines_invalid_grant_and_uses_next_account() {
         subscription_pool_config(&control_dir, &invalid_dir, &healthy_dir),
         rayline_subscriptions::SubscriptionRuntimeOptions {
             anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
-            token_url: format!("http://127.0.0.1:{}/oauth/token", anthropic.port),
+            token_url: format!("https://localhost:{}/oauth/token", oauth.port),
+            trusted_ca_pem: Some(oauth.cert_pem.as_bytes().to_vec()),
             request_timeout: Duration::from_secs(2),
             ..Default::default()
         },

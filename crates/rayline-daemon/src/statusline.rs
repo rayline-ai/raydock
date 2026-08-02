@@ -6,7 +6,7 @@
 //! credential-free sidecars and this command renders them best-effort.
 
 use std::fmt;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 const ROUTE_STALE_AFTER_SECONDS: i64 = 300;
 const SESSION_STALE_AFTER_SECONDS: i64 = 24 * 60 * 60;
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
+const MAX_ACCOUNT_LABEL_BYTES: usize = 32;
 
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
@@ -142,6 +143,7 @@ fn render_subscription(snapshot: Option<&SessionStatusSnapshot>) -> String {
         return String::new();
     };
     let assignment = &snapshot.assignment;
+    let account_label = display_account_label(&assignment.current_account_id);
     let override_marker = if assignment.kind == SessionAssignmentKind::ModelOverride {
         " ↪"
     } else {
@@ -158,8 +160,25 @@ fn render_subscription(snapshot: Option<&SessionStatusSnapshot>) -> String {
     };
     format!(
         "{SUBSCRIPTION} {}{override_marker} {DIM}· {}{}{RESET}",
-        assignment.current_account_id, assignment.current_model_family, remaining
+        account_label, assignment.current_model_family, remaining
     )
+}
+
+fn display_account_label(value: &str) -> &str {
+    let valid = !value.is_empty()
+        && value.len() <= MAX_ACCOUNT_LABEL_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if valid { value } else { "subscription" }
+}
+
+/// Write the requested status fragment to Claude Code's status-line protocol.
+/// This is user-facing IPC output, not application logging.
+fn write_statusline_output(value: &str) {
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    let _ = output.write_all(value.as_bytes());
 }
 
 fn now_unix() -> i64 {
@@ -260,7 +279,7 @@ pub fn run(
             }
         };
         if let Ok(serialized) = serde_json::to_string(&output) {
-            print!("{serialized}");
+            write_statusline_output(&serialized);
         }
         return;
     }
@@ -271,12 +290,13 @@ pub fn run(
         render(global_route.as_ref(), session.as_ref(), now)
     };
     let subscription_fragment = render_subscription(subscription);
-    match (route_fragment.is_empty(), subscription_fragment.is_empty()) {
-        (false, false) => print!("{route_fragment} · {subscription_fragment}"),
-        (false, true) => print!("{route_fragment}"),
-        (true, false) => print!("{subscription_fragment}"),
-        (true, true) => {}
-    }
+    let output = match (route_fragment.is_empty(), subscription_fragment.is_empty()) {
+        (false, false) => format!("{route_fragment} · {subscription_fragment}"),
+        (false, true) => route_fragment,
+        (true, false) => subscription_fragment,
+        (true, true) => String::new(),
+    };
+    write_statusline_output(&output);
 }
 
 #[cfg(test)]
@@ -396,6 +416,15 @@ mod tests {
     fn primary_subscription_omits_override_marker() {
         let line = render_subscription(Some(&subscription_status(SessionAssignmentKind::Primary)));
         assert!(!line.contains('↪'));
+    }
+
+    #[test]
+    fn subscription_renderer_rejects_untrusted_account_labels() {
+        let mut snapshot = subscription_status(SessionAssignmentKind::Primary);
+        snapshot.assignment.current_account_id = "\x1b[31mprivate-account".to_owned();
+        let line = render_subscription(Some(&snapshot));
+        assert!(line.contains("subscription"));
+        assert!(!line.contains("private-account"));
     }
 
     #[test]

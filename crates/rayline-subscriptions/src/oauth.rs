@@ -14,7 +14,7 @@ const MAX_REFRESH_RESPONSE_BYTES: usize = 1024 * 1024;
 #[derive(Clone)]
 pub struct OAuthRefreshClient {
     http: reqwest::Client,
-    token_url: String,
+    token_url: reqwest::Url,
     client_id: String,
 }
 
@@ -23,12 +23,17 @@ impl OAuthRefreshClient {
         http: reqwest::Client,
         token_url: impl Into<String>,
         client_id: impl Into<String>,
-    ) -> Self {
-        Self {
-            http,
-            token_url: token_url.into(),
-            client_id: client_id.into(),
+    ) -> Result<Self, OAuthRefreshError> {
+        let token_url = reqwest::Url::parse(&token_url.into())
+            .map_err(|_| OAuthRefreshError::InvalidTokenUrl)?;
+        if token_url.scheme() != "https" {
+            return Err(OAuthRefreshError::InsecureTokenUrl);
         }
+        Ok(Self {
+            http,
+            token_url,
+            client_id: client_id.into(),
+        })
     }
 
     pub(crate) async fn refresh_document(
@@ -48,7 +53,7 @@ impl OAuthRefreshClient {
         };
         let response = self
             .http
-            .post(&self.token_url)
+            .post(self.token_url.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .json(&request)
             .send()
@@ -118,7 +123,6 @@ impl std::fmt::Debug for OAuthRefreshClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("OAuthRefreshClient")
-            .field("token_url", &self.token_url)
             .field("client_id", &self.client_id)
             .finish_non_exhaustive()
     }
@@ -148,6 +152,10 @@ struct RefreshErrorResponse {
 
 #[derive(Debug, Error)]
 pub enum OAuthRefreshError {
+    #[error("Claude OAuth token URL is invalid")]
+    InvalidTokenUrl,
+    #[error("Claude OAuth token URL must use HTTPS")]
+    InsecureTokenUrl,
     #[error("Claude OAuth credential cannot be refreshed: {0}")]
     Credential(#[from] CredentialError),
     #[error("Claude OAuth credential has no scopes")]
@@ -193,5 +201,15 @@ mod tests {
             parse_scopes("user:inference  user:profile "),
             vec!["user:inference", "user:profile"]
         );
+    }
+
+    #[test]
+    fn rejects_cleartext_refresh_endpoint() {
+        let result = OAuthRefreshClient::new(
+            reqwest::Client::new(),
+            "http://127.0.0.1/oauth/token",
+            DEFAULT_CLAUDE_OAUTH_CLIENT_ID,
+        );
+        assert!(matches!(result, Err(OAuthRefreshError::InsecureTokenUrl)));
     }
 }
