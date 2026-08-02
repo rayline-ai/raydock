@@ -134,21 +134,25 @@ fn add(
         .map(Path::to_owned)
         .map_or_else(default_config_path, Ok)?;
     let source = canonical_directory(claude_config_dir, "credential source")?;
-    let control = match control_config_dir {
-        Some(path) => canonical_directory(path, "control config directory")?,
-        None => {
-            let default = dirs::home_dir()
-                .map(|home| home.join(".claude"))
-                .ok_or_else(|| "home directory not found".to_owned())?;
-            canonical_directory(&default, "control config directory")?
-        }
-    };
     let mut config = if path.exists() {
         load_config(Some(&path))?.1
     } else {
         SubscriptionPoolsConfig {
             schema: SUBSCRIPTION_CONFIG_SCHEMA,
             pools: Default::default(),
+        }
+    };
+    let control = match control_config_dir {
+        Some(path) => canonical_directory(path, "control config directory")?,
+        None if config.pools.contains_key(pool_id) => {
+            let existing = &config.pools[pool_id].control_config_dir;
+            canonical_directory(existing, "control config directory")?
+        }
+        None => {
+            let default = dirs::home_dir()
+                .map(|home| home.join(".claude"))
+                .ok_or_else(|| "home directory not found".to_owned())?;
+            canonical_directory(&default, "control config directory")?
         }
     };
     let pool = config
