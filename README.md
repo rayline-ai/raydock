@@ -141,6 +141,11 @@ fail over a pre-stream quota rejection without moving unrelated model families.
 See [Multi-Subscription Claude Routing](docs/multi-claude-subscription-routing.md)
 for the routing, credential, and safety contracts.
 
+On macOS, the native [Rayline Status menu-bar app](apps/rayline-status/README.md)
+shows the live pool at a glance, including remaining allowance, reset times,
+run-out forecasts, and active sessions. Its background refresh is live-only and
+does not fall back to opening credential stores.
+
 ## Use Rayline From Code or Agents
 
 You can also send your own Anthropic API traffic through Rayline — from a script

@@ -40,6 +40,7 @@ pub enum SubscriptionCommand {
         config_path: Option<PathBuf>,
         json: bool,
         verbose: bool,
+        live_only: bool,
     },
 }
 
@@ -69,7 +70,8 @@ pub async fn run(command: &SubscriptionCommand) -> Result<String, String> {
             config_path,
             json,
             verbose,
-        } => status(pool_id, config_path.as_deref(), *json, *verbose).await,
+            live_only,
+        } => status(pool_id, config_path.as_deref(), *json, *verbose, *live_only).await,
     }
 }
 
@@ -250,10 +252,16 @@ async fn status(
     config_path: Option<&Path>,
     json: bool,
     verbose: bool,
+    live_only: bool,
 ) -> Result<String, String> {
     let (_, pool) = resolve_pool(config_path, pool_id)?;
     let status = match live_pool_status(pool_id).await {
         Some(status) => status,
+        None if live_only => {
+            return Err(format!(
+                "subscription pool {pool_id:?} has no running daemon; start Claude through Rayline or omit --live-only to read a standalone snapshot"
+            ));
+        }
         None => {
             let runtime = SubscriptionPoolRuntime::start(
                 pool_id,

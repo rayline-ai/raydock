@@ -92,6 +92,8 @@ noisy estimate near the start of a window. Forecasts are planning hints rather
 than guarantees: a workload change immediately changes the real burn rate.
 Use `rayline subscriptions status --verbose` for every normalized provider
 claim and placement counter, or `--json` for the complete structured payload.
+Background consumers should add `--live-only`; when no pool daemon is running,
+it fails instead of opening credential stores to build a standalone snapshot.
 
 Then start Claude Code:
 

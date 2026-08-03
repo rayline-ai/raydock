@@ -194,6 +194,7 @@ Options:
   --config <path>     Subscription registry path
   --verbose, -v       Show every normalized limit claim and placement detail
   --json              Emit the complete machine-readable status
+  --live-only         Fail when no pool daemon is running instead of reading credentials
 ";
 
 const CODEX_HELP: &str = "\
@@ -1010,6 +1011,7 @@ where
     let mut control_config_dir = None;
     let mut json = false;
     let mut verbose = false;
+    let mut live_only = false;
     let mut account_id = None;
 
     if matches!(command, "add" | "remove") {
@@ -1046,6 +1048,7 @@ where
             }
             "--json" => json = true,
             "--verbose" | "-v" => verbose = true,
+            "--live-only" if command == "status" => live_only = true,
             _ => return None,
         }
     }
@@ -1086,6 +1089,7 @@ where
                 config_path,
                 json,
                 verbose,
+                live_only,
             })
         }
         _ => None,
@@ -2529,6 +2533,28 @@ mod tests {
                 config_path: None,
                 json: false,
                 verbose: true,
+                live_only: false,
+            })
+        );
+    }
+
+    #[test]
+    fn subscriptions_status_parses_live_only_flag() {
+        let dispatch = rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "subscriptions",
+            "status",
+            "--json",
+            "--live-only",
+        ]));
+        assert_eq!(
+            dispatch,
+            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Status {
+                pool_id: "default".to_owned(),
+                config_path: None,
+                json: true,
+                verbose: false,
+                live_only: true,
             })
         );
     }

@@ -133,3 +133,24 @@ jobs:
       - name: Build release binaries
         shell: bash
         run: cargo build --release -p rayline-cli -p rayline-daemon --locked
+
+      - name: Lint native macOS app
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        run: >-
+          xcrun swift-format lint --recursive --strict
+          apps/rayline-status/Sources
+          apps/rayline-status/Tests
+          apps/rayline-status/Package.swift
+
+      - name: Test native macOS app
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        run: swift test --package-path apps/rayline-status -Xswiftc -warnings-as-errors
+
+      - name: Package native macOS app
+        if: matrix.platform == 'macos-arm64'
+        shell: bash
+        run: |
+          apps/rayline-status/scripts/build-app.sh
+          codesign --verify --deep --strict "apps/rayline-status/dist/Rayline Status.app"

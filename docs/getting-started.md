@@ -254,6 +254,11 @@ The status command defaults to a compact capacity table. Add `--verbose` to
 inspect every normalized limit claim and live placement detail, or `--json` for
 machine-readable output.
 
+macOS users can build the native
+[Rayline Status menu-bar app](../apps/rayline-status/README.md) for the same live
+pool view. It refreshes with `subscriptions status --json --live-only`, so an
+absent daemon produces a visible error instead of a background Keychain read.
+
 The default registry is `~/.config/rayline/subscriptions.json`. Override it
 with `--subscription-config <path>`. Pool mode implies `--route subagents` so
 the main thread uses the local subscription pool while routed subagents retain
