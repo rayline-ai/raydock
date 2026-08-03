@@ -55,21 +55,34 @@ struct StatusMenuView: View {
       footer
     }
     .frame(width: TableLayout.width)
-    .overlay(alignment: .bottom) {
-      if let hoverDetail {
-        HoverDetailCard(detail: hoverDetail)
-          .padding(.horizontal, 8)
-          .padding(.bottom, 27)
-          .allowsHitTesting(false)
-          .transition(.opacity)
-      }
-    }
     .onDisappear {
       hoverDetail = nil
     }
   }
 
   private var header: some View {
+    HStack(spacing: 8) {
+      if let hoverDetail {
+        HoverInspectionHeader(detail: hoverDetail)
+      } else {
+        poolHeader
+      }
+      Button {
+        Task { await store.refresh() }
+      } label: {
+        Image(systemName: "arrow.clockwise")
+          .font(.caption)
+      }
+      .buttonStyle(.borderless)
+      .disabled(store.isRefreshing)
+      .help("Refresh now")
+    }
+    .frame(height: 25)
+    .padding(.horizontal, 10)
+    .padding(.vertical, 7)
+  }
+
+  private var poolHeader: some View {
     HStack(spacing: 8) {
       ZStack {
         RoundedRectangle(cornerRadius: 6)
@@ -95,18 +108,7 @@ struct StatusMenuView: View {
         }
         .foregroundStyle(readinessColor(presentation))
       }
-      Button {
-        Task { await store.refresh() }
-      } label: {
-        Image(systemName: "arrow.clockwise")
-          .font(.caption)
-      }
-      .buttonStyle(.borderless)
-      .disabled(store.isRefreshing)
-      .help("Refresh now")
     }
-    .padding(.horizontal, 10)
-    .padding(.vertical, 7)
   }
 
   @ViewBuilder
@@ -379,90 +381,134 @@ private struct QuotaCell: View {
   }
 }
 
-private struct HoverDetailCard: View {
+private struct HoverInspectionHeader: View {
   let detail: HoverDetail
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 5) {
-      HStack(spacing: 5) {
-        Image(systemName: accountStateSymbol)
-          .font(.system(size: 10, weight: .semibold))
-          .foregroundStyle(color(for: detail.account.availability))
-        Text(detail.account.id)
-          .font(.system(.caption, design: .rounded, weight: .bold))
-        Text(detail.account.availability.label)
-          .font(.caption2)
-          .foregroundStyle(.secondary)
-        Spacer()
-        if let limit = detail.limit {
-          Text("\(limit.kind.title.uppercased()) · \(remainingText(limit))")
+    HStack(spacing: 7) {
+      Image(systemName: eventSymbol)
+        .font(.system(size: 12, weight: .semibold))
+        .foregroundStyle(eventColor)
+        .frame(width: 18)
+
+      VStack(alignment: .leading, spacing: 1) {
+        HStack(spacing: 4) {
+          Text(detail.account.id)
+            .font(.system(.caption, design: .rounded, weight: .bold))
+          Text("·")
+            .foregroundStyle(.tertiary)
+          Text(contextLabel)
             .font(.system(size: 9, weight: .semibold, design: .monospaced))
-            .foregroundStyle(eventColor(limit.forecast))
+            .foregroundStyle(.secondary)
         }
+
+        Text(timingText)
+          .font(.system(size: 9, weight: .medium, design: .monospaced))
+          .foregroundStyle(eventColor)
+          .lineLimit(1)
+          .minimumScaleFactor(0.72)
       }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+    .accessibilityElement(children: .combine)
+    .accessibilityLabel("\(detail.account.id), \(contextLabel), \(timingText)")
+  }
 
-      if let limit = detail.limit {
-        limitTiming(limit)
-      } else {
-        accountTiming
+  private var contextLabel: String {
+    guard let limit = detail.limit else {
+      let active =
+        detail.account.activeLaunches == 1 ? "1 ACTIVE" : "\(detail.account.activeLaunches) ACTIVE"
+      return "\(detail.account.availability.label.uppercased()) · \(active)"
+    }
+    return "\(limit.kind.title.uppercased()) · \(remainingText(limit))"
+  }
+
+  private var timingText: String {
+    if let limit = detail.limit {
+      return limitTiming(limit)
+    }
+    return accountTiming
+  }
+
+  private var accountTiming: String {
+    let exhausted = detail.account.limits
+      .filter(\.exhausted)
+      .compactMap { limit in limit.reset.map { (limit.kind, $0) } }
+      .min { $0.1 < $1.1 }
+    if let exhausted {
+      return "\(exhausted.0.title) available again \(compactDate(exhausted.1)) UTC"
+    }
+
+    let risk = detail.account.limits
+      .compactMap { limit -> (LimitKind, Date)? in
+        guard case .runsOut(let date) = limit.forecast else { return nil }
+        return (limit.kind, date)
       }
+      .min { $0.1 < $1.1 }
+    if let risk {
+      return "\(risk.0.title) may hit limit \(compactDate(risk.1)) UTC"
     }
-    .padding(.horizontal, 9)
-    .padding(.vertical, 8)
-    .frame(maxWidth: .infinity, alignment: .leading)
-    .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 8))
-    .overlay {
-      RoundedRectangle(cornerRadius: 8)
-        .stroke(cardAccent.opacity(0.5), lineWidth: 1)
+
+    let nextReset = detail.account.limits
+      .compactMap { limit in limit.reset.map { (limit.kind, $0) } }
+      .min { $0.1 < $1.1 }
+    if let nextReset {
+      return "\(nextReset.0.title) resets \(compactDate(nextReset.1)) UTC"
     }
-    .shadow(color: .black.opacity(0.28), radius: 10, y: 4)
+
+    return "Timing unavailable"
   }
 
-  private func limitTiming(_ limit: LimitPresentation) -> some View {
-    VStack(alignment: .leading, spacing: 3) {
-      Label(limitEvent(limit), systemImage: eventSymbol(limit.forecast))
-        .font(.system(size: 10, weight: .semibold, design: .rounded))
-        .foregroundStyle(eventColor(limit.forecast))
-      Label("Resets \(fullDate(limit.reset))", systemImage: "arrow.clockwise")
-        .font(.system(size: 9, design: .monospaced))
-        .foregroundStyle(.secondary)
-    }
-  }
-
-  private var accountTiming: some View {
-    VStack(alignment: .leading, spacing: 3) {
-      Label(nextEventDescription(for: detail.account), systemImage: accountEventSymbol)
-        .font(.system(size: 10, weight: .semibold, design: .rounded))
-        .foregroundStyle(cardAccent)
-        .lineLimit(2)
-      Text("Hover 5H, 7D, or Fable for full timing")
-        .font(.system(size: 9, design: .monospaced))
-        .foregroundStyle(.secondary)
+  private func limitTiming(_ limit: LimitPresentation) -> String {
+    let reset = compactDate(limit.reset)
+    switch limit.forecast {
+    case .exhausted: return "Limit reached · resets \(reset) UTC"
+    case .noBurn: return "No current burn · resets \(reset) UTC"
+    case .resetFirst: return "Safe until reset · \(reset) UTC"
+    case .runsOut(let date):
+      return "Hits \(compactDate(date)) · resets \(reset) UTC"
+    case .learning: return "Learning rate · resets \(reset) UTC"
+    case .stale: return "Usage is stale · reset \(reset) UTC"
+    case .unavailable: return "Prediction unavailable · reset \(reset) UTC"
     }
   }
 
-  private var cardAccent: Color {
-    guard let limit = detail.limit else { return color(for: detail.account.availability) }
-    return eventColor(limit.forecast)
-  }
-
-  private var accountEventSymbol: String {
-    if detail.account.limits.contains(where: \.exhausted) { return "arrow.clockwise" }
-    if detail.account.limits.contains(where: { limit in
-      if case .runsOut = limit.forecast { return true }
-      return false
-    }) {
-      return "exclamationmark.triangle.fill"
+  private var eventSymbol: String {
+    guard let limit = detail.limit else {
+      if detail.account.limits.contains(where: \.exhausted) { return "arrow.clockwise" }
+      if detail.account.limits.contains(where: { limit in
+        if case .runsOut = limit.forecast { return true }
+        return false
+      }) {
+        return "exclamationmark.triangle.fill"
+      }
+      return "checkmark.circle.fill"
     }
-    return "checkmark"
+    switch limit.forecast {
+    case .exhausted: return "xmark.circle.fill"
+    case .runsOut: return "exclamationmark.triangle.fill"
+    case .noBurn, .resetFirst: return "checkmark.circle.fill"
+    case .learning: return "ellipsis.circle.fill"
+    case .stale, .unavailable: return "questionmark.circle.fill"
+    }
   }
 
-  private var accountStateSymbol: String {
-    switch detail.account.availability {
-    case .all: "checkmark.circle.fill"
-    case .nonFable: "exclamationmark.circle.fill"
-    case .none: "xmark.circle.fill"
-    case .unknown: "questionmark.circle.fill"
+  private var eventColor: Color {
+    guard let limit = detail.limit else {
+      if detail.account.limits.contains(where: \.exhausted) { return Palette.exhaustRed }
+      if detail.account.limits.contains(where: { limit in
+        if case .runsOut = limit.forecast { return true }
+        return false
+      }) {
+        return Palette.signalAmber
+      }
+      return color(for: detail.account.availability)
+    }
+    switch limit.forecast {
+    case .exhausted: return Palette.exhaustRed
+    case .runsOut: return Palette.signalAmber
+    case .noBurn, .resetFirst: return Palette.capacityMint
+    case .learning, .stale, .unavailable: return Palette.slate
     }
   }
 
@@ -470,37 +516,6 @@ private struct HoverDetailCard: View {
     if limit.exhausted { return "OUT" }
     guard let remaining = limit.remainingFraction else { return "—" }
     return String(format: "%.0f%% LEFT", remaining * 100)
-  }
-
-  private func limitEvent(_ limit: LimitPresentation) -> String {
-    switch limit.forecast {
-    case .exhausted: "Limit reached; available again after reset"
-    case .noBurn: "No current consumption"
-    case .resetFirst: "On pace to last until reset"
-    case .runsOut(let date): "Projected to hit limit \(fullDate(date))"
-    case .learning: "Learning the current consumption rate"
-    case .stale: "Usage data is stale"
-    case .unavailable: "Run-out prediction unavailable"
-    }
-  }
-
-  private func eventSymbol(_ forecast: DepletionForecast) -> String {
-    switch forecast {
-    case .exhausted: "xmark.circle.fill"
-    case .runsOut: "exclamationmark.triangle.fill"
-    case .noBurn, .resetFirst: "checkmark.circle.fill"
-    case .learning: "ellipsis.circle.fill"
-    case .stale, .unavailable: "questionmark.circle.fill"
-    }
-  }
-
-  private func eventColor(_ forecast: DepletionForecast) -> Color {
-    switch forecast {
-    case .exhausted: Palette.exhaustRed
-    case .runsOut: Palette.signalAmber
-    case .noBurn, .resetFirst: Palette.capacityMint
-    case .learning, .stale, .unavailable: Palette.slate
-    }
   }
 }
 
@@ -578,7 +593,21 @@ private func fullDate(_ date: Date?) -> String {
 }
 
 @MainActor
+private func compactDate(_ date: Date?) -> String {
+  guard let date else { return "unknown" }
+  return DateText.compact.string(from: date)
+}
+
+@MainActor
 private enum DateText {
+  static let compact: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "MMM d HH:mm"
+    return formatter
+  }()
+
   static let full: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
