@@ -744,7 +744,7 @@ forwarded.
 | Upstream result | Pool action |
 | --- | --- |
 | `429` with unified `rejected` plus a representative, overage, or disabled claim | Mark the exact account claim exhausted and try the next eligible account before forwarding |
-| Generic `429` without unified quota evidence | Do not rotate accounts; pass it through for Claude Code's normal provider backoff |
+| Generic `429` without unified quota evidence | Do not update allowance state or rotate accounts; pass it through for Claude Code's normal provider backoff |
 | `529` or overloaded response | Do not rotate accounts; this is provider-wide, not account-specific |
 | First `401` | Refresh the selected worker once and retry the same account |
 | Refresh `invalid_grant` after another process changed the credential | Reload that source once, adopt the newer token, and retry the same account |
@@ -752,6 +752,12 @@ forwarded.
 | Explicit pre-stream entitlement or `credits_required` rejection | Mark the relevant model/account unavailable under policy and select another eligible account |
 | Network disconnect or timeout after send | Do not replay on another account because processing is ambiguous |
 | `200` or any response body/SSE bytes forwarded | Never replay |
+
+Response headers update allowance state only after the response has been
+classified. Successful responses remain useful live observations, and a `429`
+updates hard-exhaustion state only when the complete unified rejection evidence
+above is present. Partial claim headers on transient or provider-capacity errors
+must not override the usage snapshot.
 
 The observed `credits_required` detail and
 `seven_day_overage_included`/Fable mapping need a sanitized live fixture before

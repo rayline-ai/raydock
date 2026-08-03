@@ -1037,14 +1037,14 @@ async fn forward_subscription_request(
             };
             let status = response.status();
             let headers = subscription_header_snapshot(response.headers());
-            request.pool.observe_response_headers(
-                &account_id,
-                request.requested_model,
-                &headers,
-            )?;
-            write_subscription_status(&request, &account_id, assignment_reason).await;
 
             if status.is_success() {
+                request.pool.observe_response_headers(
+                    &account_id,
+                    request.requested_model,
+                    &headers,
+                )?;
+                write_subscription_status(&request, &account_id, assignment_reason).await;
                 debug!(
                     "subscription pool={} account={} model={} status={}",
                     request.pool.pool_id(),
@@ -1099,6 +1099,16 @@ async fn forward_subscription_request(
                     pending_assignment_reason = Some(SessionAssignmentReason::CredentialFailover);
                 }
                 ResponseClassification::FailoverQuota { .. } => {
+                    // Only a classified quota rejection is authoritative enough
+                    // to mark response-header claims exhausted. Transient 429s
+                    // can carry partial unified headers and must not poison the
+                    // account's allowance snapshot.
+                    request.pool.observe_response_headers(
+                        &account_id,
+                        request.requested_model,
+                        &headers,
+                    )?;
+                    write_subscription_status(&request, &account_id, assignment_reason).await;
                     final_failover_response = Some(buffered);
                     pending_assignment_reason = Some(SessionAssignmentReason::QuotaFailover);
                 }

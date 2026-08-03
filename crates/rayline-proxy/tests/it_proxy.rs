@@ -241,6 +241,23 @@ async fn spawn_fake_subscription_anthropic() -> FakeHttpServer {
                                     .status(StatusCode::TOO_MANY_REQUESTS)
                                     .header("content-type", "application/json")
                                     .header("x-should-retry", "true")
+                                    // A provider-capacity 429 may still carry a
+                                    // partial claim snapshot. The overall
+                                    // allowed status means this is not quota
+                                    // evidence and must not poison pool state.
+                                    .header("anthropic-ratelimit-unified-status", "allowed")
+                                    .header(
+                                        "anthropic-ratelimit-unified-representative-claim",
+                                        "7d",
+                                    )
+                                    .header(
+                                        "anthropic-ratelimit-unified-7d-status",
+                                        "rejected",
+                                    )
+                                    .header(
+                                        "anthropic-ratelimit-unified-reset",
+                                        "2030-01-07T00:00:00Z",
+                                    )
                                     .body(Full::new(Bytes::from_static(
                                         br#"{"type":"error","error":{"type":"rate_limit_error","message":"transient"}}"#,
                                     )))
@@ -857,6 +874,7 @@ async fn exhausted_subscription_pool_preserves_the_final_real_unified_rejection(
     )
     .await
     .unwrap();
+    let runtime_for_assertion = Arc::clone(&runtime);
 
     let proxy_port = free_port();
     let mut opts = proxy_options(
@@ -903,6 +921,18 @@ async fn exhausted_subscription_pool_preserves_the_final_real_unified_rejection(
             .count(),
         2
     );
+    assert!(
+        runtime_for_assertion
+            .status()
+            .accounts
+            .iter()
+            .all(|account| {
+                account.claims.iter().any(|claim| {
+                    claim.key == "seven_day_overage_included" && claim.is_hard_exhausted()
+                })
+            }),
+        "a classified unified rejection must persist the exhausted model claim"
+    );
 }
 
 #[tokio::test]
@@ -927,6 +957,7 @@ async fn generic_rate_limit_does_not_rotate_subscription_accounts() {
     )
     .await
     .unwrap();
+    let runtime_for_assertion = Arc::clone(&runtime);
 
     let proxy_port = free_port();
     let mut opts = proxy_options(
@@ -963,6 +994,19 @@ async fn generic_rate_limit_does_not_rotate_subscription_accounts() {
     assert_eq!(
         message_requests[0].header("authorization").as_deref(),
         Some("Bearer token-a")
+    );
+    let account_a = runtime_for_assertion
+        .status()
+        .accounts
+        .into_iter()
+        .find(|account| account.id == "a")
+        .unwrap();
+    assert!(
+        !account_a
+            .claims
+            .iter()
+            .any(|claim| claim.is_hard_exhausted()),
+        "a transient provider 429 must not exhaust an account's local allowance state"
     );
 }
 
