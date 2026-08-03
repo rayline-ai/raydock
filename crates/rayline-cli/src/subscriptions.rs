@@ -383,6 +383,7 @@ struct CompactStatusRow {
     five_hour: StatusCell,
     seven_day: StatusCell,
     fable: StatusCell,
+    fable_reset: String,
     five_hour_forecast: StatusCell,
     seven_day_forecast: StatusCell,
     fable_forecast: StatusCell,
@@ -447,6 +448,12 @@ fn render_compact_status_at(
         .max()
         .unwrap_or_default()
         .max("AVAILABLE".len());
+    let fable_reset_width = rows
+        .iter()
+        .map(|row| row.fable_reset.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max("FABLE RESET".len());
     let reset_width = rows
         .iter()
         .map(|row| row.reset.chars().count())
@@ -460,12 +467,13 @@ fn render_compact_status_at(
         "LIMIT RESET".to_owned()
     };
     let header = format!(
-        "{:<account_width$}  {:<plan_width$}  {:>9}  {:>9}  {:>11}  {:<availability_width$}  {reset_header}{}",
+        "{:<account_width$}  {:<plan_width$}  {:>9}  {:>9}  {:>11}  {:<fable_reset_width$}  {:<availability_width$}  {reset_header}{}",
         "ACCOUNT",
         "PLAN",
         "5H LEFT",
         "7D LEFT",
         "FABLE LEFT",
+        "FABLE RESET",
         "AVAILABLE",
         if status.placement.is_some() {
             "  ACTIVE"
@@ -490,6 +498,12 @@ fn render_compact_status_at(
         output.push_str(&render_status_cell(&row.seven_day, 9, true, color));
         output.push_str("  ");
         output.push_str(&render_status_cell(&row.fable, 11, true, color));
+        output.push_str("  ");
+        output.push_str(&status_paint(
+            &format!("{:<fable_reset_width$}", row.fable_reset),
+            "2",
+            color,
+        ));
         output.push_str("  ");
         output.push_str(&render_status_cell(
             &row.availability,
@@ -600,6 +614,7 @@ fn compact_status_row(
         five_hour: limit_status_cell(five_hour, "?", fresh),
         seven_day: limit_status_cell(seven_day, "?", fresh),
         fable: limit_status_cell(fable, "—", fresh),
+        fable_reset: claim_reset(fable),
         five_hour_forecast: forecast_status_cell(five_hour, fresh, 5 * 60 * 60, now),
         seven_day_forecast: forecast_status_cell(seven_day, fresh, 7 * 24 * 60 * 60, now),
         fable_forecast: forecast_status_cell(fable, fresh, 7 * 24 * 60 * 60, now),
@@ -778,6 +793,23 @@ fn important_reset(
     let timestamp = timestamp.to_offset(time::UtcOffset::UTC);
     format!(
         "{label} {} {:02} {:02}:{:02}Z",
+        month_abbreviation(timestamp.month()),
+        timestamp.day(),
+        timestamp.hour(),
+        timestamp.minute()
+    )
+}
+
+fn claim_reset(claim: Option<&LimitClaim>) -> String {
+    let Some(claim) = claim else {
+        return "—".to_owned();
+    };
+    let Some(timestamp) = claim.resets_at.as_deref().and_then(parse_reset_timestamp) else {
+        return "unknown".to_owned();
+    };
+    let timestamp = timestamp.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{} {:02} {:02}:{:02}Z",
         month_abbreviation(timestamp.month()),
         timestamp.day(),
         timestamp.hour(),
@@ -1012,6 +1044,7 @@ mod tests {
         assert!(output.contains("Snapshot: standalone allowance"));
         assert!(output.contains("5H LEFT"));
         assert!(output.contains("FABLE LEFT"));
+        assert!(output.contains("FABLE RESET"));
         assert!(output.contains("AVAILABLE"));
         let account_fields = |id: &str| {
             output
@@ -1029,6 +1062,9 @@ mod tests {
                 "100%",
                 "exhausted",
                 "exhausted",
+                "Jan",
+                "03",
+                "21:00Z",
                 "none",
                 "7d",
                 "Jan",
@@ -1037,13 +1073,18 @@ mod tests {
             ]
         );
         assert_eq!(
-            &account_fields("mx")[..6],
-            ["mx", "max", "19%", "25%", "exhausted", "non-Fable"]
+            &account_fields("mx")[..5],
+            ["mx", "max", "19%", "25%", "exhausted"]
         );
         assert_eq!(
-            &account_fields("ws")[..6],
-            ["ws", "max", "97%", "23%", "30%", "all"]
+            &account_fields("ws")[..5],
+            ["ws", "max", "97%", "23%", "30%"]
         );
+        assert_eq!(
+            &account_fields("mx")[5..9],
+            ["Jan", "03", "21:00Z", "non-Fable"]
+        );
+        assert_eq!(&account_fields("ws")[5..9], ["Jan", "03", "21:00Z", "all"]);
         assert!(output.contains("7d Jan 02 02:00Z"));
         assert!(output.contains("Fable Jan 03 21:00Z"));
         assert!(!output.contains("credential=Healthy"));
@@ -1069,6 +1110,19 @@ mod tests {
         assert!(output.contains("risk ~Jan 04 18Z"));
         assert!(output.contains("reset first"));
         assert!(output.contains("current-window average"));
+    }
+
+    #[test]
+    fn fable_reset_distinguishes_missing_claim_from_unknown_reset() {
+        assert_eq!(claim_reset(None), "—");
+        let mut fable = claim(
+            "fable_weekly",
+            ClaimScope::Model(ModelFamily::from_display_name("Fable")),
+            0.5,
+            "2030-01-03T21:00:00Z",
+        );
+        fable.resets_at = None;
+        assert_eq!(claim_reset(Some(&fable)), "unknown");
     }
 
     #[test]
