@@ -10,6 +10,13 @@ private enum Palette {
   static let slate = Color(red: 0.55, green: 0.58, blue: 0.66)
 }
 
+private enum TableLayout {
+  static let width: CGFloat = 370
+  static let fiveHour: CGFloat = 48
+  static let sevenDay: CGFloat = 48
+  static let fable: CGFloat = 58
+}
+
 struct MenuBarStatusLabel: View {
   @ObservedObject var store: SubscriptionStore
 
@@ -41,52 +48,47 @@ struct StatusMenuView: View {
       Divider()
       footer
     }
-    .frame(width: 620)
+    .frame(width: TableLayout.width)
   }
 
   private var header: some View {
-    HStack(spacing: 10) {
+    HStack(spacing: 8) {
       ZStack {
-        RoundedRectangle(cornerRadius: 7)
+        RoundedRectangle(cornerRadius: 6)
           .fill(Palette.railBlue.opacity(0.14))
         Image(systemName: "arrow.triangle.branch")
-          .font(.system(size: 15, weight: .semibold))
+          .font(.system(size: 13, weight: .semibold))
           .foregroundStyle(Palette.railBlue)
       }
-      .frame(width: 30, height: 30)
-
-      VStack(alignment: .leading, spacing: 1) {
-        Text("Claude pool")
-          .font(.system(.headline, design: .rounded, weight: .semibold))
-        Text("\(store.presentation?.poolID ?? "default") · UTC")
-          .font(.caption.monospaced())
-          .foregroundStyle(.secondary)
-      }
-
+      .frame(width: 25, height: 25)
+      Text("Claude pool")
+        .font(.system(.subheadline, design: .rounded, weight: .semibold))
+      Text("\(store.presentation?.poolID ?? "default") · UTC")
+        .font(.caption2.monospaced())
+        .foregroundStyle(.secondary)
       Spacer()
       if let presentation = store.presentation {
         HStack(spacing: 4) {
-          Text("\(presentation.availableAccountCount) / \(presentation.totalAccountCount)")
-            .font(.caption.monospacedDigit().weight(.semibold))
-          Text("ready")
-            .font(.caption)
+          Circle()
+            .fill(readinessColor(presentation))
+            .frame(width: 5, height: 5)
+          Text("\(presentation.availableAccountCount)/\(presentation.totalAccountCount) ready")
+            .font(.caption2.monospacedDigit().weight(.medium))
         }
         .foregroundStyle(readinessColor(presentation))
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .background(readinessColor(presentation).opacity(0.11), in: Capsule())
       }
       Button {
         Task { await store.refresh() }
       } label: {
         Image(systemName: "arrow.clockwise")
+          .font(.caption)
       }
       .buttonStyle(.borderless)
       .disabled(store.isRefreshing)
       .help("Refresh now")
     }
-    .padding(.horizontal, 12)
-    .padding(.vertical, 9)
+    .padding(.horizontal, 10)
+    .padding(.vertical, 7)
   }
 
   @ViewBuilder
@@ -97,30 +99,31 @@ struct StatusMenuView: View {
           ErrorBanner(message: error)
           Divider()
         }
-        HStack(alignment: .top, spacing: 0) {
-          ForEach(Array(presentation.accounts.enumerated()), id: \.element.id) { index, account in
-            if index > 0 {
-              Divider()
-            }
-            AccountLane(account: account)
-              .frame(maxWidth: .infinity)
+        ColumnHeader()
+        Divider()
+        ForEach(Array(presentation.accounts.enumerated()), id: \.element.id) { index, account in
+          SubscriptionRow(account: account, alternate: index.isMultiple(of: 2) == false)
+          if index < presentation.accounts.count - 1 {
+            Divider()
+              .opacity(0.55)
           }
         }
       }
     } else if store.isRefreshing {
-      VStack(spacing: 10) {
+      VStack(spacing: 8) {
         ProgressView()
         Text("Reading live pool status…")
+          .font(.caption)
           .foregroundStyle(.secondary)
       }
-      .frame(maxWidth: .infinity, minHeight: 180)
+      .frame(maxWidth: .infinity, minHeight: 130)
     } else {
-      VStack(spacing: 10) {
+      VStack(spacing: 8) {
         Image(systemName: "exclamationmark.triangle")
-          .font(.title)
+          .font(.title2)
           .foregroundStyle(Palette.signalAmber)
         Text("Status unavailable")
-          .font(.headline)
+          .font(.subheadline.weight(.semibold))
         Text(store.errorMessage ?? "Start Claude through Rayline, then refresh.")
           .font(.caption)
           .foregroundStyle(.secondary)
@@ -130,31 +133,31 @@ struct StatusMenuView: View {
           Task { await store.refresh() }
         }
       }
-      .frame(maxWidth: .infinity, minHeight: 180)
+      .frame(maxWidth: .infinity, minHeight: 130)
       .padding()
     }
   }
 
   private var footer: some View {
-    HStack(spacing: 10) {
+    HStack(spacing: 8) {
       Circle()
         .fill(store.errorMessage == nil ? Palette.capacityMint : Palette.signalAmber)
-        .frame(width: 5, height: 5)
+        .frame(width: 4, height: 4)
       Text(updatedText)
-        .font(.caption2.monospaced())
+        .font(.system(size: 9, design: .monospaced))
         .foregroundStyle(.secondary)
       Spacer()
-      Text("Refreshes every minute")
-        .font(.caption2)
+      Text("refresh 1m")
+        .font(.system(size: 9, design: .monospaced))
         .foregroundStyle(.tertiary)
       Button("Quit") {
         NSApplication.shared.terminate(nil)
       }
       .buttonStyle(.borderless)
-      .font(.caption)
+      .font(.caption2)
     }
-    .padding(.horizontal, 12)
-    .padding(.vertical, 7)
+    .padding(.horizontal, 10)
+    .padding(.vertical, 5)
   }
 
   private func readinessColor(_ presentation: PoolPresentation) -> Color {
@@ -163,158 +166,135 @@ struct StatusMenuView: View {
   }
 
   private var updatedText: String {
-    guard let date = store.lastUpdated else { return "Waiting for first refresh" }
-    return "Updated \(date.formatted(.relative(presentation: .named)))"
+    guard let date = store.lastUpdated else { return "waiting for refresh" }
+    return "updated \(date.formatted(.relative(presentation: .named)))"
   }
 }
 
-private struct AccountLane: View {
+private struct ColumnHeader: View {
+  var body: some View {
+    HStack(spacing: 8) {
+      Text("SUBSCRIPTION")
+        .frame(maxWidth: .infinity, alignment: .leading)
+      Text("5H")
+        .frame(width: TableLayout.fiveHour, alignment: .trailing)
+      Text("7D")
+        .frame(width: TableLayout.sevenDay, alignment: .trailing)
+      Text("FABLE")
+        .frame(width: TableLayout.fable, alignment: .trailing)
+    }
+    .font(.system(size: 8, weight: .semibold, design: .monospaced))
+    .foregroundStyle(.tertiary)
+    .padding(.horizontal, 10)
+    .padding(.vertical, 4)
+  }
+}
+
+private struct SubscriptionRow: View {
+  let account: AccountPresentation
+  let alternate: Bool
+
+  var body: some View {
+    HStack(spacing: 8) {
+      AccountCell(account: account)
+        .frame(maxWidth: .infinity, alignment: .leading)
+      QuotaCell(limit: limit(.fiveHour))
+        .frame(width: TableLayout.fiveHour, alignment: .trailing)
+      QuotaCell(limit: limit(.sevenDay))
+        .frame(width: TableLayout.sevenDay, alignment: .trailing)
+      QuotaCell(limit: limit(.fable))
+        .frame(width: TableLayout.fable, alignment: .trailing)
+    }
+    .padding(.horizontal, 10)
+    .frame(height: 34)
+    .background(alternate ? Color.primary.opacity(0.025) : .clear)
+    .help(accountHelp)
+  }
+
+  private func limit(_ kind: LimitKind) -> LimitPresentation? {
+    account.limits.first { $0.kind == kind }
+  }
+
+  private var accountHelp: String {
+    let active =
+      account.activeLaunches == 1
+      ? "1 active session" : "\(account.activeLaunches) active sessions"
+    let warning = account.warning.map { "\n\($0)" } ?? ""
+    return
+      "\(account.id) · \(account.availability.label) · \(active)\n\(nextEventDescription(for: account))\(warning)"
+  }
+}
+
+private struct AccountCell: View {
   let account: AccountPresentation
 
   var body: some View {
-    VStack(alignment: .leading, spacing: 10) {
-      accountHeader
-      ZStack(alignment: .leading) {
-        Rectangle()
-          .fill(availabilityColor.opacity(0.23))
-          .frame(width: 1)
-          .padding(.vertical, 9)
-          .offset(x: 3)
-        VStack(spacing: 10) {
-          ForEach(account.limits) { limit in
-            CompactLimitRow(limit: limit)
-          }
-        }
-      }
-      if let warning = account.warning {
-        Text(warning)
-          .font(.caption2)
-          .foregroundStyle(Palette.signalAmber)
-          .lineLimit(1)
-      }
-    }
-    .padding(.horizontal, 12)
-    .padding(.vertical, 10)
-  }
-
-  private var accountHeader: some View {
-    HStack(spacing: 6) {
+    HStack(spacing: 5) {
+      Image(systemName: stateSymbol)
+        .font(.system(size: 11, weight: .semibold))
+        .foregroundStyle(color(for: account.availability))
+        .help(account.availability.label)
+        .accessibilityLabel(account.availability.label)
       Text(account.id)
-        .font(.system(.headline, design: .rounded, weight: .bold))
+        .font(.system(.subheadline, design: .rounded, weight: .bold))
+        .lineLimit(1)
       Text(account.plan.uppercased())
-        .font(.system(size: 9, weight: .medium, design: .monospaced))
+        .font(.system(size: 8, weight: .medium, design: .monospaced))
         .foregroundStyle(.secondary)
       if account.activeLaunches > 0 {
-        Label("\(account.activeLaunches)", systemImage: "bolt.fill")
-          .labelStyle(.titleAndIcon)
-          .font(.caption2.monospacedDigit())
-          .foregroundStyle(Palette.railBlue)
+        HStack(spacing: 2) {
+          Image(systemName: "bolt.fill")
+          Text("\(account.activeLaunches)")
+        }
+        .font(.system(size: 8, weight: .medium, design: .monospaced))
+        .foregroundStyle(Palette.railBlue)
       }
-      Spacer(minLength: 4)
-      HStack(spacing: 4) {
-        Circle()
-          .fill(availabilityColor)
-          .frame(width: 5, height: 5)
-        Text(availabilityText)
-          .font(.caption2.weight(.medium))
-      }
-      .foregroundStyle(availabilityColor)
     }
   }
 
-  private var availabilityText: String {
+  private var stateSymbol: String {
     switch account.availability {
-    case .all: "ready"
-    case .nonFable: "no Fable"
-    case .none: "blocked"
-    case .unknown: "unknown"
-    }
-  }
-
-  private var availabilityColor: Color {
-    switch account.availability {
-    case .all: Palette.capacityMint
-    case .nonFable: Palette.signalAmber
-    case .none: Palette.exhaustRed
-    case .unknown: Palette.slate
+    case .all: "checkmark.circle.fill"
+    case .nonFable: "exclamationmark.circle.fill"
+    case .none: "xmark.circle.fill"
+    case .unknown: "questionmark.circle.fill"
     }
   }
 }
 
-private struct CompactLimitRow: View {
-  let limit: LimitPresentation
+private struct QuotaCell: View {
+  let limit: LimitPresentation?
 
   var body: some View {
-    HStack(alignment: .top, spacing: 7) {
-      Circle()
-        .fill(limitColor)
-        .frame(width: 7, height: 7)
-        .overlay(Circle().stroke(.background, lineWidth: 1.5))
-        .padding(.top, 4)
-      VStack(spacing: 3) {
-        HStack(alignment: .firstTextBaseline) {
-          Text(limitLabel)
-            .font(.system(size: 10, weight: .semibold, design: .monospaced))
-            .foregroundStyle(.secondary)
-          Spacer()
-          Text(remainingText)
-            .font(.system(size: 13, weight: .semibold, design: .monospaced))
-            .foregroundStyle(limitColor)
-        }
-        ProgressView(value: progressValue)
-          .progressViewStyle(.linear)
-          .tint(limitColor)
-          .scaleEffect(x: 1, y: 0.65, anchor: .center)
-        Text(detailText)
-          .font(.system(size: 9, weight: .regular, design: .monospaced))
-          .foregroundStyle(detailColor)
-          .lineLimit(1)
-          .minimumScaleFactor(0.72)
-          .frame(maxWidth: .infinity, alignment: .leading)
+    HStack(spacing: 3) {
+      if isRisk {
+        Image(systemName: "exclamationmark.triangle.fill")
+          .font(.system(size: 7))
+          .foregroundStyle(Palette.signalAmber)
       }
+      Text(value)
+        .font(.system(size: 11, weight: .semibold, design: .monospaced))
+        .foregroundStyle(valueColor)
     }
+    .help(helpText)
+    .accessibilityLabel(helpText)
   }
 
-  private var limitLabel: String {
-    switch limit.kind {
-    case .fiveHour: "5H"
-    case .sevenDay: "7D"
-    case .fable: "FABLE"
-    }
-  }
-
-  private var progressValue: Double {
-    limit.exhausted ? 0 : min(max(limit.remainingFraction ?? 0, 0), 1)
-  }
-
-  private var remainingText: String {
+  private var value: String {
+    guard let limit else { return "—" }
     if limit.exhausted { return "OUT" }
     guard let remaining = limit.remainingFraction else { return "—" }
     return String(format: "%.0f%%", remaining * 100)
   }
 
-  private var detailText: String {
-    "\(forecastText) · ↻ \(resetText)"
+  private var isRisk: Bool {
+    guard let limit else { return false }
+    if case .runsOut = limit.forecast { return true }
+    return false
   }
 
-  private var resetText: String {
-    guard let reset = limit.reset else { return "—" }
-    return UTCDateText.compactString(from: reset)
-  }
-
-  private var forecastText: String {
-    switch limit.forecast {
-    case .exhausted: "exhausted"
-    case .noBurn: "idle"
-    case .resetFirst: "renews first"
-    case .runsOut(let date): "risk \(UTCDateText.compactString(from: date))"
-    case .learning: "learning"
-    case .stale: "stale"
-    case .unavailable: "forecast —"
-    }
-  }
-
-  private var limitColor: Color {
+  private var valueColor: Color {
+    guard let limit else { return Palette.slate }
     if limit.exhausted { return Palette.exhaustRed }
     guard let remaining = limit.remainingFraction else { return Palette.slate }
     if remaining <= 0.1 { return Palette.exhaustRed }
@@ -322,12 +302,11 @@ private struct CompactLimitRow: View {
     return Palette.capacityMint
   }
 
-  private var detailColor: Color {
-    switch limit.forecast {
-    case .exhausted: Palette.exhaustRed
-    case .runsOut: Palette.signalAmber
-    default: .secondary
-    }
+  private var helpText: String {
+    guard let limit else { return "Allowance unavailable" }
+    let allowance = limit.exhausted ? "exhausted" : "\(value) left"
+    return
+      "\(limit.kind.title): \(allowance)\n\(forecastDescription(limit.forecast))\nReset: \(fullDate(limit.reset))"
   }
 }
 
@@ -339,23 +318,78 @@ private struct ErrorBanner: View {
       .font(.caption)
       .foregroundStyle(Palette.signalAmber)
       .frame(maxWidth: .infinity, alignment: .leading)
-      .padding(.horizontal, 12)
-      .padding(.vertical, 7)
+      .padding(.horizontal, 10)
+      .padding(.vertical, 6)
       .background(Palette.signalAmber.opacity(0.08))
   }
 }
 
+private func color(for availability: AccountAvailability) -> Color {
+  switch availability {
+  case .all: Palette.capacityMint
+  case .nonFable: Palette.signalAmber
+  case .none: Palette.exhaustRed
+  case .unknown: Palette.slate
+  }
+}
+
 @MainActor
-private enum UTCDateText {
-  private static let formatter: DateFormatter = {
+private func forecastDescription(_ forecast: DepletionForecast) -> String {
+  switch forecast {
+  case .exhausted: "Exhausted until reset"
+  case .noBurn: "No current consumption"
+  case .resetFirst: "Expected to reset before depletion"
+  case .runsOut(let date): "Risk: projected to run out \(fullDate(date))"
+  case .learning: "Forecast is learning the current rate"
+  case .stale: "Forecast unavailable because usage is stale"
+  case .unavailable: "Forecast unavailable"
+  }
+}
+
+@MainActor
+private func nextEventDescription(for account: AccountPresentation) -> String {
+  let exhausted = account.limits
+    .filter(\.exhausted)
+    .compactMap { limit in limit.reset.map { (limit.kind, $0) } }
+    .min { $0.1 < $1.1 }
+  if let exhausted {
+    return "Next: \(exhausted.0.title) allowance resets \(fullDate(exhausted.1))"
+  }
+
+  let risk = account.limits
+    .compactMap { limit -> (LimitKind, Date)? in
+      guard case .runsOut(let date) = limit.forecast else { return nil }
+      return (limit.kind, date)
+    }
+    .min { $0.1 < $1.1 }
+  if let risk {
+    return "Next risk: \(risk.0.title) allowance may run out \(fullDate(risk.1))"
+  }
+
+  let nextReset = account.limits
+    .compactMap { limit in limit.reset.map { (limit.kind, $0) } }
+    .min { $0.1 < $1.1 }
+  if let nextReset {
+    return
+      "Next: \(nextReset.0.title) allowance resets \(fullDate(nextReset.1)); no earlier depletion projected"
+  }
+
+  return "Next event unavailable"
+}
+
+@MainActor
+private func fullDate(_ date: Date?) -> String {
+  guard let date else { return "unknown" }
+  return DateText.full.string(from: date)
+}
+
+@MainActor
+private enum DateText {
+  static let full: DateFormatter = {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = TimeZone(secondsFromGMT: 0)
-    formatter.dateFormat = "M/d HH:mm"
+    formatter.dateFormat = "MMM d, HH:mm 'UTC'"
     return formatter
   }()
-
-  static func compactString(from date: Date) -> String {
-    formatter.string(from: date)
-  }
 }
