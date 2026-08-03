@@ -17,6 +17,11 @@ private enum TableLayout {
   static let fable: CGFloat = 58
 }
 
+private struct HoverDetail {
+  let account: AccountPresentation
+  let limit: LimitPresentation?
+}
+
 struct MenuBarStatusLabel: View {
   @ObservedObject var store: SubscriptionStore
 
@@ -39,6 +44,7 @@ struct MenuBarStatusLabel: View {
 
 struct StatusMenuView: View {
   @ObservedObject var store: SubscriptionStore
+  @State private var hoverDetail: HoverDetail?
 
   var body: some View {
     VStack(spacing: 0) {
@@ -49,6 +55,18 @@ struct StatusMenuView: View {
       footer
     }
     .frame(width: TableLayout.width)
+    .overlay(alignment: .bottom) {
+      if let hoverDetail {
+        HoverDetailCard(detail: hoverDetail)
+          .padding(.horizontal, 8)
+          .padding(.bottom, 27)
+          .allowsHitTesting(false)
+          .transition(.opacity)
+      }
+    }
+    .onDisappear {
+      hoverDetail = nil
+    }
   }
 
   private var header: some View {
@@ -102,7 +120,16 @@ struct StatusMenuView: View {
         ColumnHeader()
         Divider()
         ForEach(Array(presentation.accounts.enumerated()), id: \.element.id) { index, account in
-          SubscriptionRow(account: account, alternate: index.isMultiple(of: 2) == false)
+          SubscriptionRow(
+            account: account,
+            alternate: index.isMultiple(of: 2) == false,
+            onHoverDetail: { detail in
+              if let detail {
+                hoverDetail = detail
+              } else if hoverDetail?.account.id == account.id {
+                hoverDetail = nil
+              }
+            })
           if index < presentation.accounts.count - 1 {
             Divider()
               .opacity(0.55)
@@ -147,6 +174,9 @@ struct StatusMenuView: View {
         .font(.system(size: 9, design: .monospaced))
         .foregroundStyle(.secondary)
       Spacer()
+      Text("hover limits")
+        .font(.system(size: 9, design: .monospaced))
+        .foregroundStyle(.tertiary)
       Text("refresh 1m")
         .font(.system(size: 9, design: .monospaced))
         .foregroundStyle(.tertiary)
@@ -193,22 +223,41 @@ private struct ColumnHeader: View {
 private struct SubscriptionRow: View {
   let account: AccountPresentation
   let alternate: Bool
+  let onHoverDetail: (HoverDetail?) -> Void
+
+  @State private var isHovered = false
+  @State private var hoveredLimit: LimitKind?
 
   var body: some View {
     HStack(spacing: 8) {
       AccountCell(account: account)
         .frame(maxWidth: .infinity, alignment: .leading)
-      QuotaCell(limit: limit(.fiveHour))
-        .frame(width: TableLayout.fiveHour, alignment: .trailing)
-      QuotaCell(limit: limit(.sevenDay))
-        .frame(width: TableLayout.sevenDay, alignment: .trailing)
-      QuotaCell(limit: limit(.fable))
-        .frame(width: TableLayout.fable, alignment: .trailing)
+      QuotaCell(limit: limit(.fiveHour)) { hovering in
+        updateLimitHover(.fiveHour, hovering: hovering)
+      }
+      .frame(width: TableLayout.fiveHour, alignment: .trailing)
+      QuotaCell(limit: limit(.sevenDay)) { hovering in
+        updateLimitHover(.sevenDay, hovering: hovering)
+      }
+      .frame(width: TableLayout.sevenDay, alignment: .trailing)
+      QuotaCell(limit: limit(.fable)) { hovering in
+        updateLimitHover(.fable, hovering: hovering)
+      }
+      .frame(width: TableLayout.fable, alignment: .trailing)
     }
     .padding(.horizontal, 10)
     .frame(height: 34)
     .background(alternate ? Color.primary.opacity(0.025) : .clear)
     .help(accountHelp)
+    .onHover { hovering in
+      isHovered = hovering
+      if hovering {
+        publishHoverDetail()
+      } else {
+        hoveredLimit = nil
+        onHoverDetail(nil)
+      }
+    }
   }
 
   private func limit(_ kind: LimitKind) -> LimitPresentation? {
@@ -222,6 +271,22 @@ private struct SubscriptionRow: View {
     let warning = account.warning.map { "\n\($0)" } ?? ""
     return
       "\(account.id) · \(account.availability.label) · \(active)\n\(nextEventDescription(for: account))\(warning)"
+  }
+
+  private func updateLimitHover(_ kind: LimitKind, hovering: Bool) {
+    hoveredLimit = hovering ? kind : nil
+    if hovering {
+      onHoverDetail(HoverDetail(account: account, limit: limit(kind)))
+    } else if isHovered {
+      onHoverDetail(HoverDetail(account: account, limit: nil))
+    } else {
+      onHoverDetail(nil)
+    }
+  }
+
+  private func publishHoverDetail() {
+    let focusedLimit = hoveredLimit.flatMap(limit)
+    onHoverDetail(HoverDetail(account: account, limit: focusedLimit))
   }
 }
 
@@ -264,6 +329,7 @@ private struct AccountCell: View {
 
 private struct QuotaCell: View {
   let limit: LimitPresentation?
+  let onHoverChange: (Bool) -> Void
 
   var body: some View {
     HStack(spacing: 3) {
@@ -276,8 +342,11 @@ private struct QuotaCell: View {
         .font(.system(size: 11, weight: .semibold, design: .monospaced))
         .foregroundStyle(valueColor)
     }
+    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+    .contentShape(Rectangle())
     .help(helpText)
     .accessibilityLabel(helpText)
+    .onHover(perform: onHoverChange)
   }
 
   private var value: String {
@@ -307,6 +376,131 @@ private struct QuotaCell: View {
     let allowance = limit.exhausted ? "exhausted" : "\(value) left"
     return
       "\(limit.kind.title): \(allowance)\n\(forecastDescription(limit.forecast))\nReset: \(fullDate(limit.reset))"
+  }
+}
+
+private struct HoverDetailCard: View {
+  let detail: HoverDetail
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 5) {
+      HStack(spacing: 5) {
+        Image(systemName: accountStateSymbol)
+          .font(.system(size: 10, weight: .semibold))
+          .foregroundStyle(color(for: detail.account.availability))
+        Text(detail.account.id)
+          .font(.system(.caption, design: .rounded, weight: .bold))
+        Text(detail.account.availability.label)
+          .font(.caption2)
+          .foregroundStyle(.secondary)
+        Spacer()
+        if let limit = detail.limit {
+          Text("\(limit.kind.title.uppercased()) · \(remainingText(limit))")
+            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+            .foregroundStyle(eventColor(limit.forecast))
+        }
+      }
+
+      if let limit = detail.limit {
+        limitTiming(limit)
+      } else {
+        accountTiming
+      }
+    }
+    .padding(.horizontal, 9)
+    .padding(.vertical, 8)
+    .frame(maxWidth: .infinity, alignment: .leading)
+    .background(.ultraThickMaterial, in: RoundedRectangle(cornerRadius: 8))
+    .overlay {
+      RoundedRectangle(cornerRadius: 8)
+        .stroke(cardAccent.opacity(0.5), lineWidth: 1)
+    }
+    .shadow(color: .black.opacity(0.28), radius: 10, y: 4)
+  }
+
+  private func limitTiming(_ limit: LimitPresentation) -> some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Label(limitEvent(limit), systemImage: eventSymbol(limit.forecast))
+        .font(.system(size: 10, weight: .semibold, design: .rounded))
+        .foregroundStyle(eventColor(limit.forecast))
+      Label("Resets \(fullDate(limit.reset))", systemImage: "arrow.clockwise")
+        .font(.system(size: 9, design: .monospaced))
+        .foregroundStyle(.secondary)
+    }
+  }
+
+  private var accountTiming: some View {
+    VStack(alignment: .leading, spacing: 3) {
+      Label(nextEventDescription(for: detail.account), systemImage: accountEventSymbol)
+        .font(.system(size: 10, weight: .semibold, design: .rounded))
+        .foregroundStyle(cardAccent)
+        .lineLimit(2)
+      Text("Hover 5H, 7D, or Fable for full timing")
+        .font(.system(size: 9, design: .monospaced))
+        .foregroundStyle(.secondary)
+    }
+  }
+
+  private var cardAccent: Color {
+    guard let limit = detail.limit else { return color(for: detail.account.availability) }
+    return eventColor(limit.forecast)
+  }
+
+  private var accountEventSymbol: String {
+    if detail.account.limits.contains(where: \.exhausted) { return "arrow.clockwise" }
+    if detail.account.limits.contains(where: { limit in
+      if case .runsOut = limit.forecast { return true }
+      return false
+    }) {
+      return "exclamationmark.triangle.fill"
+    }
+    return "checkmark"
+  }
+
+  private var accountStateSymbol: String {
+    switch detail.account.availability {
+    case .all: "checkmark.circle.fill"
+    case .nonFable: "exclamationmark.circle.fill"
+    case .none: "xmark.circle.fill"
+    case .unknown: "questionmark.circle.fill"
+    }
+  }
+
+  private func remainingText(_ limit: LimitPresentation) -> String {
+    if limit.exhausted { return "OUT" }
+    guard let remaining = limit.remainingFraction else { return "—" }
+    return String(format: "%.0f%% LEFT", remaining * 100)
+  }
+
+  private func limitEvent(_ limit: LimitPresentation) -> String {
+    switch limit.forecast {
+    case .exhausted: "Limit reached; available again after reset"
+    case .noBurn: "No current consumption"
+    case .resetFirst: "On pace to last until reset"
+    case .runsOut(let date): "Projected to hit limit \(fullDate(date))"
+    case .learning: "Learning the current consumption rate"
+    case .stale: "Usage data is stale"
+    case .unavailable: "Run-out prediction unavailable"
+    }
+  }
+
+  private func eventSymbol(_ forecast: DepletionForecast) -> String {
+    switch forecast {
+    case .exhausted: "xmark.circle.fill"
+    case .runsOut: "exclamationmark.triangle.fill"
+    case .noBurn, .resetFirst: "checkmark.circle.fill"
+    case .learning: "ellipsis.circle.fill"
+    case .stale, .unavailable: "questionmark.circle.fill"
+    }
+  }
+
+  private func eventColor(_ forecast: DepletionForecast) -> Color {
+    switch forecast {
+    case .exhausted: Palette.exhaustRed
+    case .runsOut: Palette.signalAmber
+    case .noBurn, .resetFirst: Palette.capacityMint
+    case .learning, .stale, .unavailable: Palette.slate
+    }
   }
 }
 
