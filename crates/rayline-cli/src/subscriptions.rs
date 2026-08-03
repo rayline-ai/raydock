@@ -1,3 +1,5 @@
+mod forecast;
+
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +12,8 @@ use rayline_subscriptions::{
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
+
+use self::forecast::{DepletionForecast, depletion_forecast};
 
 const DEFAULT_SUBSCRIPTION_METRICS_PORT: u16 = 20816;
 
@@ -379,12 +383,23 @@ struct CompactStatusRow {
     five_hour: StatusCell,
     seven_day: StatusCell,
     fable: StatusCell,
+    five_hour_forecast: StatusCell,
+    seven_day_forecast: StatusCell,
+    fable_forecast: StatusCell,
     availability: StatusCell,
     reset: String,
     active: Option<String>,
 }
 
 fn render_compact_status(status: &PoolRuntimeStatus, color: bool) -> String {
+    render_compact_status_at(status, color, OffsetDateTime::now_utc())
+}
+
+fn render_compact_status_at(
+    status: &PoolRuntimeStatus,
+    color: bool,
+    now: OffsetDateTime,
+) -> String {
     let mut output = format!(
         "Subscription pool: {}\n",
         status_paint(&status.pool_id, "1", color)
@@ -410,7 +425,7 @@ fn render_compact_status(status: &PoolRuntimeStatus, color: bool) -> String {
                     .unwrap_or_default()
                     .to_string()
             });
-            compact_status_row(account, active)
+            compact_status_row(account, active, now)
         })
         .collect::<Vec<_>>();
 
@@ -461,7 +476,7 @@ fn render_compact_status(status: &PoolRuntimeStatus, color: bool) -> String {
     output.push_str(&status_paint(&header, "1", color));
     output.push('\n');
 
-    for row in rows {
+    for row in &rows {
         output.push_str(&status_paint(
             &format!("{:<account_width$}", row.account),
             "1",
@@ -486,10 +501,10 @@ fn render_compact_status(status: &PoolRuntimeStatus, color: bool) -> String {
         let rendered_reset = if row.active.is_some() {
             format!("{:<reset_width$}", row.reset)
         } else {
-            row.reset
+            row.reset.clone()
         };
         output.push_str(&status_paint(&rendered_reset, "2", color));
-        if let Some(active) = row.active {
+        if let Some(active) = &row.active {
             output.push_str("  ");
             output.push_str(&format!("{active:>6}"));
         }
@@ -498,6 +513,55 @@ fn render_compact_status(status: &PoolRuntimeStatus, color: bool) -> String {
 
     output.push('\n');
     output.push_str(&status_paint(
+        "PROJECTED RUN-OUT  current-window average\n",
+        "1",
+        color,
+    ));
+    let forecast_account_width = account_width;
+    let five_hour_forecast_width =
+        forecast_width(rows.iter().map(|row| &row.five_hour_forecast), "5H");
+    let seven_day_forecast_width =
+        forecast_width(rows.iter().map(|row| &row.seven_day_forecast), "7D");
+    let forecast_header = format!(
+        "{:<forecast_account_width$}  {:<five_hour_forecast_width$}  {:<seven_day_forecast_width$}  {}",
+        "ACCOUNT", "5H", "7D", "FABLE"
+    );
+    output.push_str(&status_paint(&forecast_header, "1", color));
+    output.push('\n');
+    for row in &rows {
+        output.push_str(&status_paint(
+            &format!("{:<forecast_account_width$}", row.account),
+            "1",
+            color,
+        ));
+        output.push_str("  ");
+        output.push_str(&render_status_cell(
+            &row.five_hour_forecast,
+            five_hour_forecast_width,
+            false,
+            color,
+        ));
+        output.push_str("  ");
+        output.push_str(&render_status_cell(
+            &row.seven_day_forecast,
+            seven_day_forecast_width,
+            false,
+            color,
+        ));
+        output.push_str("  ");
+        output.push_str(&status_paint(
+            &row.fable_forecast.text,
+            row.fable_forecast.tone.ansi(),
+            color,
+        ));
+        output.push('\n');
+    }
+    output.push_str(&status_paint(
+        "risk = projected depletion before reset · reset first = renewal wins · learning = too little signal\n\n",
+        "2",
+        color,
+    ));
+    output.push_str(&status_paint(
         "Tip: use --verbose to show every normalized claim and placement detail.\n",
         "2",
         color,
@@ -505,7 +569,11 @@ fn render_compact_status(status: &PoolRuntimeStatus, color: bool) -> String {
     output
 }
 
-fn compact_status_row(account: &AccountRuntimeStatus, active: Option<String>) -> CompactStatusRow {
+fn compact_status_row(
+    account: &AccountRuntimeStatus,
+    active: Option<String>,
+    now: OffsetDateTime,
+) -> CompactStatusRow {
     let five_hour = current_claim(account, |claim| {
         claim.key == "five_hour" && claim.scope == ClaimScope::Global
     });
@@ -532,10 +600,51 @@ fn compact_status_row(account: &AccountRuntimeStatus, active: Option<String>) ->
         five_hour: limit_status_cell(five_hour, "?", fresh),
         seven_day: limit_status_cell(seven_day, "?", fresh),
         fable: limit_status_cell(fable, "—", fresh),
+        five_hour_forecast: forecast_status_cell(five_hour, fresh, 5 * 60 * 60, now),
+        seven_day_forecast: forecast_status_cell(seven_day, fresh, 7 * 24 * 60 * 60, now),
+        fable_forecast: forecast_status_cell(fable, fresh, 7 * 24 * 60 * 60, now),
         availability: allowance_status_cell(account, five_hour, seven_day, fable),
         reset: important_reset(five_hour, seven_day, fable),
         active,
     }
+}
+
+fn forecast_width<'a>(cells: impl Iterator<Item = &'a StatusCell>, header: &str) -> usize {
+    cells
+        .map(|cell| cell.text.chars().count())
+        .max()
+        .unwrap_or_default()
+        .max(header.len())
+}
+
+fn forecast_status_cell(
+    claim: Option<&LimitClaim>,
+    fresh: bool,
+    window_seconds: i64,
+    now: OffsetDateTime,
+) -> StatusCell {
+    let forecast = depletion_forecast(claim, fresh, window_seconds, now);
+    let (text, tone) = match forecast {
+        DepletionForecast::Exhausted => ("exhausted".to_owned(), StatusTone::Bad),
+        DepletionForecast::NoBurn => ("no burn".to_owned(), StatusTone::Good),
+        DepletionForecast::ResetFirst => ("reset first".to_owned(), StatusTone::Good),
+        DepletionForecast::RunsOutAt(timestamp) => {
+            let timestamp = timestamp.to_offset(time::UtcOffset::UTC);
+            (
+                format!(
+                    "risk ~{} {:02} {:02}Z",
+                    month_abbreviation(timestamp.month()),
+                    timestamp.day(),
+                    timestamp.hour()
+                ),
+                StatusTone::Warning,
+            )
+        }
+        DepletionForecast::Learning => ("learning".to_owned(), StatusTone::Dim),
+        DepletionForecast::Stale => ("stale".to_owned(), StatusTone::Dim),
+        DepletionForecast::Unavailable => ("—".to_owned(), StatusTone::Dim),
+    };
+    StatusCell { text, tone }
 }
 
 fn current_claim(
@@ -939,6 +1048,27 @@ mod tests {
         assert!(output.contains("Fable Jan 03 21:00Z"));
         assert!(!output.contains("credential=Healthy"));
         assert!(!output.contains("session [unknown]"));
+        assert!(output.contains("PROJECTED RUN-OUT"));
+    }
+
+    #[test]
+    fn compact_status_forecasts_only_depletion_before_reset() {
+        let now = OffsetDateTime::parse("2030-01-01T12:00:00Z", &Rfc3339).expect("now");
+        let mut account = status_account("af", 0.5, 0.25, 0.1);
+        account.claims[0].resets_at = Some("2030-01-01T15:00:00Z".to_owned());
+        account.claims[1].resets_at = Some("2030-01-07T10:00:00Z".to_owned());
+        account.claims[2].resets_at = Some("2030-01-07T10:00:00Z".to_owned());
+        let status = PoolRuntimeStatus {
+            pool_id: "default".to_owned(),
+            accounts: vec![account],
+            placement: None,
+        };
+
+        let output = render_compact_status_at(&status, false, now);
+        assert!(output.contains("risk ~Jan 01 14Z"));
+        assert!(output.contains("risk ~Jan 04 18Z"));
+        assert!(output.contains("reset first"));
+        assert!(output.contains("current-window average"));
     }
 
     #[test]

@@ -84,6 +84,11 @@ rayline subscriptions status
 The default status view is a compact routing summary: it shows remaining
 five-hour, weekly, and Fable capacity, which model families are available, the
 most relevant reset, and active launch counts when a pool daemon is running.
+It also projects each bucket's run-out from the current window's average burn.
+A timestamp is shown only when depletion is projected before reset;
+`reset first` means renewal is expected to win, and `learning` suppresses a
+noisy estimate near the start of a window. Forecasts are planning hints rather
+than guarantees: a workload change immediately changes the real burn rate.
 Use `rayline subscriptions status --verbose` for every normalized provider
 claim and placement counter, or `--json` for the complete structured payload.
 
