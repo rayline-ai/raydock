@@ -14,5 +14,8 @@ __pycache__/
 # Local design notes / superpowers specs — kept on disk, never committed
 /docs/superpowers/
 
+# Local agent scratch: plans, proposals, and nested worktrees
+/.claude/
+
 # local wrangler upload artifacts
 .wrangler/
