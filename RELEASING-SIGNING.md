@@ -1,7 +1,44 @@
 # Releasing and Signing
 
-This document covers the one-time key-generation setup required before shipping
-Rayline releases with minisign signature verification.
+This document covers the signing setup required before shipping Rayline
+releases. Minisign authenticates the downloaded release bytes. On macOS, Apple
+code signing also gives `rld` a stable identity so a user's Keychain approval
+survives binary updates.
+
+## macOS Developer ID signing
+
+`rld` reads and updates Claude OAuth credentials during token rotation. An
+ad-hoc signature has a designated requirement tied to one exact binary hash;
+macOS therefore treats every rebuilt `rld` as a new requester. Production macOS
+assets must be signed with a Developer ID Application certificate and the
+stable identifier `ai.rayline.rld`.
+
+Configure these secrets in the protected GitHub `release` environment:
+
+- `MACOS_DEVELOPER_ID_P12_BASE64`: base64 of the exported Developer ID `.p12`;
+- `MACOS_DEVELOPER_ID_P12_PASSWORD`: password protecting that `.p12`;
+- `MACOS_CODESIGN_IDENTITY`: full certificate name reported by
+  `security find-identity -v -p codesigning`.
+
+The release workflow imports the certificate into an ephemeral keychain, signs
+`target/release/rld` before packaging, verifies that its Team ID and designated
+requirement are stable, and deletes the temporary keychain. Never commit the
+certificate or its password.
+
+For a local development install, sign the already-built binary with a
+persistent Developer ID or Apple Development identity:
+
+```bash
+cargo build --release -p rayline-cli -p rayline-daemon --locked
+RAYLINE_CODESIGN_IDENTITY='Apple Development: Your Name (TEAMID)' \
+  scripts/sign-macos-rld.sh target/release/rld
+install -m 0755 target/release/rayline "$HOME/.rayline/bin/rayline"
+install -m 0755 target/release/rld "$HOME/.rayline/bin/rld"
+```
+
+Do not use `codesign -s -` or install an unsigned `cargo install` result for
+multi-subscription testing. Both produce an identity whose Keychain approval is
+invalidated by the next rebuild.
 
 ## Status (2026-06-23) — production key provisioned
 

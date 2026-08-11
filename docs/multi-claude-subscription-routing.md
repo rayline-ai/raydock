@@ -110,16 +110,20 @@ explicit `--route all`. Use `--subscription-config <path>` to override
 The registry contains paths and policy only. It is written mode `0600`; OAuth
 tokens remain in the original Claude credential backends.
 
-On macOS, the first Rayline process that opens each Claude Keychain item may
-trigger one Keychain approval per registered account. A running `rld` keeps the
-loaded credentials in memory and does not reopen Keychain for every request. If
-Anthropic rejects a cached refresh token because another Claude process rotated
-that profile's credential, `rld` reopens only that source once and adopts the
-newer version. An unchanged rejected credential is quarantined without repeated
-background Keychain reads.
-During development, rebuilding an unsigned debug binary changes the identity
-macOS authorizes and can trigger the prompts again; finish rebuilding before
-running interactive acceptance tests.
+On macOS, the first signed `rld` that opens each Claude Keychain item may trigger
+one Keychain approval per registered account. Choose **Always Allow** for the
+stable `ai.rayline.rld` identity. A running daemon keeps credentials in memory,
+but token rotation must reread and update the source safely; the stable
+Developer ID requirement lets those later accesses proceed without another
+popup. If Anthropic rejects a cached refresh token because another Claude
+process rotated that profile's credential, `rld` reopens only that source once
+and adopts the newer version. An unchanged rejected credential is quarantined
+without repeated background Keychain reads.
+
+Production installers and self-updates reject identity-unstable macOS `rld`
+binaries. For local development, sign with a persistent Developer ID or Apple
+Development identity using `scripts/sign-macos-rld.sh`; ad-hoc signing ties
+approval to one exact build hash and causes prompts again after rebuilding.
 
 `rayline subscriptions status` first asks the running subscription-pool daemon
 for its already-loaded allowance snapshot and live placement counters. That

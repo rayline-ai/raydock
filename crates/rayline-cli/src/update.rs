@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 const UPDATE_BASE_URL_ENV: &str = "RAYLINE_UPDATE_BASE_URL";
 const UPDATE_INSTALL_PATH_ENV: &str = "RAYLINE_UPDATE_INSTALL_PATH";
+const MACOS_RLD_SIGNING_IDENTIFIER: &str = "ai.rayline.rld";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateRequest {
@@ -469,6 +470,7 @@ async fn download_and_verify(
 
     verify_checksum(&sums, &launcher_name, &launcher_path)?;
     verify_checksum(&sums, &daemon_name, &daemon_path)?;
+    verify_macos_rld_signature(&daemon_path)?;
 
     Ok(UpdateArtifacts {
         launcher: launcher_path,
@@ -548,6 +550,93 @@ pub(crate) fn verify_checksum(
 fn sha256_file(path: &Path) -> Result<String, UpdateError> {
     let bytes = fs::read(path).map_err(UpdateError::from)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_rld_signature(path: &Path) -> Result<(), UpdateError> {
+    let verification = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "--verbose=2"])
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            UpdateError::Signature(format!(
+                "failed to verify the macOS rld code signature: {error}"
+            ))
+        })?;
+    if !verification.status.success() {
+        return Err(UpdateError::Signature(
+            "rld has an invalid macOS code signature — refusing to install".to_owned(),
+        ));
+    }
+
+    let details = codesign_metadata(path, &["-d", "--verbose=4"])?;
+    let requirement = codesign_metadata(path, &["-d", "-r-"])?;
+    validate_macos_rld_signature_metadata(&details, &requirement)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_macos_rld_signature(_path: &Path) -> Result<(), UpdateError> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn codesign_metadata(path: &Path, args: &[&str]) -> Result<String, UpdateError> {
+    let output = Command::new("/usr/bin/codesign")
+        .args(args)
+        .arg(path)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            UpdateError::Signature(format!("failed to inspect the rld code signature: {error}"))
+        })?;
+    if !output.status.success() {
+        return Err(UpdateError::Signature(
+            "could not inspect the macOS rld code signature".to_owned(),
+        ));
+    }
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(text)
+}
+
+fn validate_macos_rld_signature_metadata(
+    details: &str,
+    requirement: &str,
+) -> Result<(), UpdateError> {
+    let identifier = signature_field(details, "Identifier").unwrap_or_default();
+    if identifier != MACOS_RLD_SIGNING_IDENTIFIER {
+        return Err(UpdateError::Signature(format!(
+            "rld has macOS signing identifier '{identifier}', expected '{MACOS_RLD_SIGNING_IDENTIFIER}'"
+        )));
+    }
+
+    let team = signature_field(details, "TeamIdentifier").unwrap_or_default();
+    if team.is_empty() || team == "not set" {
+        return Err(UpdateError::Signature(
+            "rld is ad-hoc signed, so Keychain approval would not survive an update".to_owned(),
+        ));
+    }
+    if requirement.contains("# designated => cdhash ") {
+        return Err(UpdateError::Signature(
+            "rld's designated requirement is pinned to one build hash".to_owned(),
+        ));
+    }
+    if !details
+        .lines()
+        .any(|line| line.starts_with("Authority=Developer ID Application:"))
+    {
+        return Err(UpdateError::Signature(
+            "rld is not signed with a Developer ID Application certificate".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn signature_field<'a>(details: &'a str, field: &str) -> Option<&'a str> {
+    details
+        .lines()
+        .find_map(|line| line.strip_prefix(field)?.strip_prefix('='))
 }
 
 fn install_path() -> io::Result<PathBuf> {
@@ -1140,6 +1229,49 @@ mod tests {
             verify_signature(&sums, &sig, &[UNTRUSTED_PUBKEY, TEST_PUBKEY]).is_ok(),
             "must succeed when any pinned key matches"
         );
+    }
+
+    #[test]
+    fn stable_developer_id_rld_signature_is_accepted() {
+        let details = concat!(
+            "Identifier=ai.rayline.rld\n",
+            "Authority=Developer ID Application: Rayline Inc (TEAM123456)\n",
+            "TeamIdentifier=TEAM123456\n",
+        );
+        let requirement = concat!(
+            "# designated => identifier \"ai.rayline.rld\" and anchor apple generic ",
+            "and certificate leaf[subject.OU] = TEAM123456\n",
+        );
+
+        assert!(validate_macos_rld_signature_metadata(details, requirement).is_ok());
+    }
+
+    #[test]
+    fn ad_hoc_rld_signature_is_rejected() {
+        let details = concat!(
+            "Identifier=rld-08156cb81e3c6ef8\n",
+            "Signature=adhoc\n",
+            "TeamIdentifier=not set\n",
+        );
+        let requirement = "# designated => cdhash H\"0123456789abcdef\"\n";
+
+        let error = validate_macos_rld_signature_metadata(details, requirement)
+            .expect_err("ad-hoc signature must be rejected");
+        assert!(matches!(error, UpdateError::Signature(_)));
+    }
+
+    #[test]
+    fn wrong_rld_signing_identifier_is_rejected() {
+        let details = concat!(
+            "Identifier=example.unrelated.rld\n",
+            "Authority=Developer ID Application: Rayline Inc (TEAM123456)\n",
+            "TeamIdentifier=TEAM123456\n",
+        );
+        let requirement = "# designated => identifier \"example.unrelated.rld\"\n";
+
+        let error = validate_macos_rld_signature_metadata(details, requirement)
+            .expect_err("wrong signing identifier must be rejected");
+        assert!(matches!(error, UpdateError::Signature(_)));
     }
 
     // ── latest.txt version-pointer verification ──────────────────────────────

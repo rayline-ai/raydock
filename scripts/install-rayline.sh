@@ -60,6 +60,39 @@ need() {
   fi
 }
 
+verify_macos_rld_signature() {
+  binary="$1"
+  expected_identifier="ai.rayline.rld"
+
+  need codesign
+  if ! codesign --verify --strict --verbose=2 "$binary"; then
+    echo "error: rld has an invalid macOS code signature" >&2
+    exit 1
+  fi
+
+  signature_details="$(codesign -d --verbose=4 "$binary" 2>&1)"
+  designated_requirement="$(codesign -d -r- "$binary" 2>&1)"
+  actual_identifier="$(printf '%s\n' "$signature_details" | sed -n 's/^Identifier=//p' | head -1)"
+  team_identifier="$(printf '%s\n' "$signature_details" | sed -n 's/^TeamIdentifier=//p' | head -1)"
+
+  if [ "$actual_identifier" != "$expected_identifier" ]; then
+    echo "error: rld has unexpected macOS signing identifier: $actual_identifier" >&2
+    exit 1
+  fi
+  if [ -z "$team_identifier" ] || [ "$team_identifier" = "not set" ]; then
+    echo "error: rld is ad-hoc signed; refusing an identity-unstable install" >&2
+    exit 1
+  fi
+  if printf '%s\n' "$designated_requirement" | grep -Fq '# designated => cdhash '; then
+    echo "error: rld signature is pinned to one build hash" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$signature_details" | grep -Fq 'Authority=Developer ID Application:'; then
+    echo "error: rld is not signed with a Developer ID Application certificate" >&2
+    exit 1
+  fi
+}
+
 need curl
 need awk
 
@@ -146,6 +179,10 @@ fi
     exit 1
   fi
 )
+
+if [ "$os" = "Darwin" ]; then
+  verify_macos_rld_signature "$tmp_dir/$daemon_asset"
+fi
 
 mkdir -p "$INSTALL_DIR"
 install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/rayline"

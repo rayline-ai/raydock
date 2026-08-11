@@ -17,13 +17,23 @@ Prerequisites:
 From a Rayline Local source checkout:
 
 ```bash
-cargo install --path crates/rayline-daemon --locked --root ~/.rayline --force
-cargo install --path crates/rayline-cli --locked --root ~/.rayline --force
+cargo build --release -p rayline-cli -p rayline-daemon --locked
+
+# macOS only: use a persistent identity so Keychain approval survives rebuilds.
+RAYLINE_CODESIGN_IDENTITY='Apple Development: Your Name (TEAMID)' \
+  scripts/sign-macos-rld.sh target/release/rld
+
+install -m 0755 target/release/rayline "$HOME/.rayline/bin/rayline"
+install -m 0755 target/release/rld "$HOME/.rayline/bin/rld"
 export PATH="$HOME/.rayline/bin:$PATH"
 
 rayline --version
 rld --version
 ```
+
+On Linux, omit the signing command. Avoid `cargo install` for macOS acceptance
+testing: it installs an ad-hoc binary whose Keychain authorization is tied to
+that one build hash.
 
 The two versions should match. If you are testing an already installed release,
 skip this step and use the installed `rayline`.

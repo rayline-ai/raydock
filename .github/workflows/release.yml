@@ -27,6 +27,10 @@ jobs:
     name: Build ${{ matrix.platform_tag }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    # macOS release binaries are signed in this job before packaging. Keep the
+    # certificate alongside the existing minisign key in the protected release
+    # environment so unreviewed workflows cannot request it.
+    environment: release
     strategy:
       fail-fast: false
       matrix:
@@ -87,6 +91,54 @@ jobs:
           set -euo pipefail
           cargo build --release -p rayline-cli -p rayline-daemon --locked
 
+      - name: Import macOS Developer ID certificate
+        if: runner.os == 'macOS'
+        id: macos-signing
+        shell: bash
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          CERTIFICATE_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$CERTIFICATE_P12_BASE64" || -z "$CERTIFICATE_P12_PASSWORD" ]]; then
+            echo "macOS Developer ID certificate secrets are not configured" >&2
+            exit 1
+          fi
+
+          certificate_path="$RUNNER_TEMP/rayline-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/rayline-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 -D > "$certificate_path"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$CERTIFICATE_P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+
+          echo "certificate_path=$certificate_path" >> "$GITHUB_OUTPUT"
+          echo "keychain_path=$keychain_path" >> "$GITHUB_OUTPUT"
+
+      - name: Sign macOS rld with stable identity
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          RAYLINE_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          RAYLINE_CODESIGN_REQUIRE_DEVELOPER_ID: "1"
+          RAYLINE_CODESIGN_TIMESTAMP: always
+        run: |
+          set -euo pipefail
+          scripts/sign-macos-rld.sh target/release/rld
+
       - name: Package release assets
         shell: bash
         env:
@@ -124,6 +176,20 @@ jobs:
           name: release-${{ matrix.platform_tag }}
           path: dist/*
           if-no-files-found: error
+
+      - name: Remove temporary macOS signing keychain
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        env:
+          CERTIFICATE_PATH: ${{ steps.macos-signing.outputs.certificate_path }}
+          KEYCHAIN_PATH: ${{ steps.macos-signing.outputs.keychain_path }}
+        run: |
+          if [[ -n "$KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH" || true
+          fi
+          if [[ -n "$CERTIFICATE_PATH" ]]; then
+            rm -f "$CERTIFICATE_PATH"
+          fi
 
   sign:
     name: Sign release checksums

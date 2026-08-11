@@ -28,6 +28,12 @@ The release workflow uploads:
 - `rayline-<version>-windows_x86_64.zip` for Windows;
 - `SHA256SUMS` covering every uploaded binary and archive.
 
+macOS `rld` assets are signed before packaging with a Developer ID Application
+certificate and the stable identifier `ai.rayline.rld`. The installer and
+self-updater reject ad-hoc, unsigned, incorrectly identified, or non-Developer-ID
+macOS daemon assets even when their minisign-protected checksum is otherwise
+valid. See `RELEASING-SIGNING.md` for the protected environment secrets.
+
 Supported platform tags match the self-updater contract in
 `crates/rayline-cli/src/update.rs`:
 
@@ -104,6 +110,13 @@ After the release workflow completes, validate at least one installer path:
 scripts/install-rayline.sh --version 0.2.0 --install-dir /tmp/rayline-bin
 /tmp/rayline-bin/rayline --version
 /tmp/rayline-bin/rayline update --check
+```
+
+On macOS, also verify the daemon's stable designated requirement:
+
+```bash
+scripts/sign-macos-rld.sh --verify /tmp/rayline-bin/rld
+codesign -d -r- /tmp/rayline-bin/rld
 ```
 
 For installer validation against a staged asset directory:
