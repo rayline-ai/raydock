@@ -178,6 +178,22 @@ impl SubscriptionPoolRuntime {
         join_all(self.accounts.iter().map(|account| account.refresh_usage())).await;
     }
 
+    /// Re-reads every credential source, so a profile the user signed in to
+    /// again is picked up without restarting the daemon. One broken source
+    /// never fails the call: each account reports its own outcome, which is
+    /// what the daemon status endpoint shows the user.
+    pub async fn reload_credentials(&self) -> CredentialReloadSummary {
+        CredentialReloadSummary {
+            pool_id: self.pool_id.clone(),
+            accounts: join_all(
+                self.accounts
+                    .iter()
+                    .map(|account| account.reload_credential()),
+            )
+            .await,
+        }
+    }
+
     pub async fn select(
         &self,
         launch_id: &str,
@@ -616,6 +632,20 @@ pub struct AccountRuntimeStatus {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CredentialReloadSummary {
+    pub pool_id: String,
+    pub accounts: Vec<AccountCredentialReload>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AccountCredentialReload {
+    pub id: String,
+    pub previous_health: CredentialHealth,
+    pub health: CredentialHealth,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PoolPlacementRuntimeStatus {
     pub active_lease_ttl_seconds: u64,
     pub accounts: Vec<AccountPlacementRuntimeStatus>,
@@ -825,15 +855,32 @@ impl AccountWorker {
         &self,
         stale: &CredentialDocument,
     ) -> Result<Option<CredentialDocument>, SubscriptionRuntimeError> {
+        let latest = self.load_credential_from_store().await?;
+        Ok((!stale.has_same_version(&latest)).then_some(latest))
+    }
+
+    async fn load_credential_from_store(
+        &self,
+    ) -> Result<CredentialDocument, SubscriptionRuntimeError> {
         let store = self.store.clone();
-        let latest = tokio::task::spawn_blocking(move || store.load())
+        tokio::task::spawn_blocking(move || store.load())
             .await
             .map_err(SubscriptionRuntimeError::BackgroundTask)?
             .map_err(|source| SubscriptionRuntimeError::CredentialSource {
                 account: self.id.clone(),
                 source,
-            })?;
-        Ok((!stale.has_same_version(&latest)).then_some(latest))
+            })
+    }
+
+    /// Whether the store holds a different document than the one in memory.
+    /// The credential mutex is only held for the comparison, never across the
+    /// load, so a slow store cannot block a request that needs the token.
+    fn differs_from_loaded_credential(&self, latest: &CredentialDocument) -> bool {
+        self.credential
+            .lock()
+            .expect("subscription credential lock poisoned")
+            .as_ref()
+            .is_none_or(|current| !current.has_same_version(latest))
     }
 
     fn persist_refreshed_credential(
@@ -904,8 +951,93 @@ impl AccountWorker {
             .map_err(Into::into)
     }
 
+    /// Gives a quarantined account one way back into service: a credential
+    /// document the store received after the refresh token was rejected, which
+    /// is what a fresh sign-in writes. The rejected refresh token itself is
+    /// dead, so this never contacts the OAuth endpoint. Returns `true` only
+    /// when a new credential was activated and the caller may continue.
+    async fn heal_quarantined_credential(&self) -> bool {
+        let Ok(_permit) = self.refresh_gate.acquire().await else {
+            return false;
+        };
+        if self.state().credential_health != CredentialHealth::Quarantined {
+            return true;
+        }
+        let latest = match self.load_credential_from_store().await {
+            Ok(latest) => latest,
+            Err(error) => {
+                self.set_last_error(error.to_string());
+                return false;
+            }
+        };
+        if !self.differs_from_loaded_credential(&latest) {
+            return false;
+        }
+        match self.activate_credential(latest) {
+            Ok(_access_token) => true,
+            Err(error) => {
+                self.set_last_error(error.to_string());
+                false
+            }
+        }
+    }
+
+    async fn reload_credential(&self) -> AccountCredentialReload {
+        let previous_health = self.state().credential_health;
+        let (detail, activated) = self.reload_credential_source().await;
+        if activated {
+            self.refresh_usage().await;
+        }
+        AccountCredentialReload {
+            id: self.id.clone(),
+            previous_health,
+            health: self.state().credential_health,
+            detail,
+        }
+    }
+
+    /// Loads the credential source once and reports what it means for this
+    /// account. A source that cannot be read leaves health alone: the token
+    /// already in memory may still work, and a status call must not evict a
+    /// usable account. Returns whether a new credential became active.
+    async fn reload_credential_source(&self) -> (String, bool) {
+        let Ok(_permit) = self.refresh_gate.acquire().await else {
+            return (SubscriptionRuntimeError::RuntimeClosed.to_string(), false);
+        };
+        let latest = match self.load_credential_from_store().await {
+            Ok(latest) => latest,
+            Err(error) => {
+                let detail = format!("credential source could not be read: {error}");
+                self.set_last_error(detail.clone());
+                return (detail, false);
+            }
+        };
+        if !self.differs_from_loaded_credential(&latest) {
+            let detail = if self.state().credential_health == CredentialHealth::Healthy {
+                "unchanged"
+            } else {
+                "credential source unchanged; sign in to this profile again"
+            };
+            return (detail.to_owned(), false);
+        }
+        match self.activate_credential(latest) {
+            Ok(_access_token) => (
+                "reloaded a new credential from the credential source".to_owned(),
+                true,
+            ),
+            Err(error) => {
+                let detail =
+                    format!("credential source changed but could not be activated: {error}");
+                self.set_last_error(detail.clone());
+                (detail, false)
+            }
+        }
+    }
+
     async fn refresh_usage(&self) {
-        if self.state().credential_health == CredentialHealth::Quarantined {
+        if self.state().credential_health == CredentialHealth::Quarantined
+            && !self.heal_quarantined_credential().await
+        {
             return;
         }
         let mut access_token = match self.access_token(false).await {

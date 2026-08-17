@@ -32,4 +32,7 @@ security-framework = "3.7"
 libc = "0.2"
 
 [dev-dependencies]
+rcgen.workspace = true
+rustls.workspace = true
 tempfile = "3"
+tokio-rustls.workspace = true

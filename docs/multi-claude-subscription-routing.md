@@ -118,7 +118,9 @@ Developer ID requirement lets those later accesses proceed without another
 popup. If Anthropic rejects a cached refresh token because another Claude
 process rotated that profile's credential, `rld` reopens only that source once
 and adopts the newer version. An unchanged rejected credential is quarantined
-without repeated background Keychain reads.
+and its refresh token is never sent again. A quarantined account rereads only
+its own credential source, and only on the usage-poll tick, so signing in to
+that profile again restores it without a daemon restart.
 
 Production installers and self-updates reject identity-unstable macOS `rld`
 binaries. For local development, sign with a persistent Developer ID or Apple
@@ -547,6 +549,11 @@ allows it. An `invalid_grant` first triggers a versioned reload of that source:
 if standalone Claude has written a newer token pair, the worker adopts it and
 remains healthy; only an unchanged rejected token is quarantined.
 
+A quarantine is not permanent. The rejected refresh token is dead, so the
+worker never sends it again, but each usage poll rereads that one credential
+source. A new document there — which is what signing in to the profile again
+writes — is adopted, and the account returns to selection.
+
 ### Launch affinity
 
 Several Claude Code launches can share one proxy and still need independent
@@ -761,6 +768,7 @@ forwarded.
 | First `401` | Refresh the selected worker once and retry the same account |
 | Refresh `invalid_grant` after another process changed the credential | Reload that source once, adopt the newer token, and retry the same account |
 | Repeated `401` or `invalid_grant` with an unchanged credential | Quarantine that credential source and select another account if safe |
+| A quarantined source later holds a new credential document | Adopt it on the next usage poll and return that account to selection |
 | Explicit pre-stream entitlement or `credits_required` rejection | Mark the relevant model/account unavailable under policy and select another eligible account |
 | Network disconnect or timeout after send | Do not replay on another account because processing is ambiguous |
 | `200` or any response body/SSE bytes forwarded | Never replay |

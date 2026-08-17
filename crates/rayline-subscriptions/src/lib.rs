@@ -36,9 +36,9 @@ pub use response::{
     normalize_unified_headers,
 };
 pub use runtime::{
-    AccountPlacementRuntimeStatus, AccountRuntimeStatus, PoolPlacementRuntimeStatus,
-    PoolRuntimeStatus, SelectedSubscription, SubscriptionPoolRuntime, SubscriptionRuntimeError,
-    SubscriptionRuntimeOptions,
+    AccountCredentialReload, AccountPlacementRuntimeStatus, AccountRuntimeStatus,
+    CredentialReloadSummary, PoolPlacementRuntimeStatus, PoolRuntimeStatus, SelectedSubscription,
+    SubscriptionPoolRuntime, SubscriptionRuntimeError, SubscriptionRuntimeOptions,
 };
 pub use selection::{
     AccountEvaluation, AccountPlacementLoad, IneligibilityReason, SelectionDecision,
