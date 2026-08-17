@@ -149,6 +149,13 @@ Subscription pool: default
 With no daemon running there is nothing to correct, so the command reports that
 the next launch reads the credential sources anyway and exits successfully.
 
+Only that one case is a success. A daemon that is running but did not reload
+still holds the credential the user asked it to replace, so the command says
+what happened and exits non-zero: the reload timed out, the daemon answered with
+an error status, its answer could not be read, or it serves another pool. The
+endpoint takes no pool selector, so a daemon serving another pool reloads that
+pool; the message names the pool that was reloaded.
+
 ### Show the serving subscription in Claude's status line
 
 Pool launches export a launch-scoped status identifier. The proxy uses it to

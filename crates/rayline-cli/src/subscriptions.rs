@@ -3,6 +3,7 @@ mod forecast;
 use std::fs::{self, OpenOptions};
 use std::io::{self, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rayline_subscriptions::{
     AccountRuntimeStatus, ClaimScope, CredentialHealth, CredentialReloadSummary,
@@ -922,42 +923,95 @@ async fn live_pool_status_at(pool_id: &str, port: u16) -> Option<PoolRuntimeStat
 /// profile the user signed in to again is adopted without restarting Claude
 /// Code. Credential work stays in the daemon; this command only reports it.
 async fn reload(pool_id: &str, config_path: Option<&Path>) -> Result<String, String> {
-    reload_at(pool_id, config_path, subscription_metrics_port()).await
+    reload_at(
+        pool_id,
+        config_path,
+        subscription_metrics_port(),
+        RELOAD_TIMEOUT,
+    )
+    .await
 }
 
-async fn reload_at(pool_id: &str, config_path: Option<&Path>, port: u16) -> Result<String, String> {
+async fn reload_at(
+    pool_id: &str,
+    config_path: Option<&Path>,
+    port: u16,
+    timeout: Duration,
+) -> Result<String, String> {
     // Reject a pool the user never registered before reporting on a daemon.
     resolve_pool(config_path, pool_id)?;
-    match reload_pool_credentials_at(pool_id, port).await {
-        Some(summary) => Ok(render_reload_summary(&summary)),
+    match reload_pool_credentials_at(pool_id, port, timeout).await {
+        ReloadOutcome::Reloaded(summary) => Ok(render_reload_summary(&summary)),
         // No daemon means no in-memory credential to correct: the next launch
         // reads the sources anyway, so the user's goal already holds.
-        None => Ok(format!(
+        ReloadOutcome::NoDaemon => Ok(format!(
             "no running subscription daemon for pool {pool_id:?}; credentials are read fresh at the next launch\n"
         )),
+        ReloadOutcome::Failed(error) => Err(error),
     }
 }
 
 /// A reload performs OAuth and usage round-trips for every account, so it needs
 /// a far longer budget than the status snapshot's 300ms read.
-const RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn reload_pool_credentials_at(pool_id: &str, port: u16) -> Option<CredentialReloadSummary> {
-    let client = reqwest::Client::builder()
-        .timeout(RELOAD_TIMEOUT)
-        .build()
-        .ok()?;
-    let response = client
+/// What the daemon did with the reload. Only `NoDaemon` may read as success:
+/// every other outcome leaves a running daemon still holding the credential the
+/// user asked it to replace, so reporting "no daemon" there would be false and
+/// would hide that the pool is still broken.
+enum ReloadOutcome {
+    Reloaded(CredentialReloadSummary),
+    NoDaemon,
+    Failed(String),
+}
+
+async fn reload_pool_credentials_at(pool_id: &str, port: u16, timeout: Duration) -> ReloadOutcome {
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
+        Ok(client) => client,
+        Err(error) => return ReloadOutcome::Failed(format!("build the reload client: {error}")),
+    };
+    let response = match client
         .post(format!("http://127.0.0.1:{port}/v1/subscriptions/reload"))
         .send()
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+    {
+        Ok(response) => response,
+        // Nothing is listening, so no daemon holds a credential to correct.
+        Err(error) if error.is_connect() => return ReloadOutcome::NoDaemon,
+        Err(error) if error.is_timeout() => {
+            return ReloadOutcome::Failed(format!(
+                "the reload timed out after {timeout:?}; the subscription daemon on 127.0.0.1:{port} may still be reloading, so check `rayline subscriptions status`"
+            ));
+        }
+        Err(error) => {
+            return ReloadOutcome::Failed(format!(
+                "the reload could not reach the subscription daemon on 127.0.0.1:{port}: {error}"
+            ));
+        }
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return ReloadOutcome::Failed(format!(
+            "the subscription daemon answered the reload with HTTP {status}; its accounts still hold the credentials they had"
+        ));
     }
-    let summary = response.json::<CredentialReloadSummary>().await.ok()?;
-    // A daemon serving another pool cannot answer for this one.
-    (summary.pool_id == pool_id).then_some(summary)
+    let summary = match response.json::<CredentialReloadSummary>().await {
+        Ok(summary) => summary,
+        Err(error) => {
+            return ReloadOutcome::Failed(format!(
+                "could not read the reload answer from the subscription daemon: {error}"
+            ));
+        }
+    };
+    // The endpoint takes no pool selector, so a daemon serving another pool has
+    // already reloaded that one. Say so instead of claiming no daemon exists.
+    if summary.pool_id != pool_id {
+        let served = &summary.pool_id;
+        return ReloadOutcome::Failed(format!(
+            "the subscription daemon on 127.0.0.1:{port} serves pool {served:?}, not {pool_id:?}, and reloaded {served:?} instead; point RAYLINE_SUBSCRIPTION_METRICS_PORT at the daemon for {pool_id:?}"
+        ));
+    }
+    ReloadOutcome::Reloaded(summary)
 }
 
 fn render_reload_summary(summary: &CredentialReloadSummary) -> String {
@@ -1363,31 +1417,58 @@ mod tests {
         assert_eq!(placement.accounts[0].active_model_leases["fable"], 1);
     }
 
-    /// A registry with one pool named `default`, pointing at directories that
-    /// hold no credential document. `reload` must never read them: the running
-    /// daemon owns the credentials.
-    fn registry_with_default_pool(temp: &Path) -> PathBuf {
+    /// A registry with one pool, pointing at directories that hold no
+    /// credential document. `reload` must never read them: the running daemon
+    /// owns the credentials.
+    fn registry_with_pool(temp: &Path, pool_id: &str) -> PathBuf {
         let control = temp.join("control");
         let source = temp.join("source");
         fs::create_dir_all(&control).expect("control dir");
         fs::create_dir_all(&source).expect("source dir");
         let config_path = temp.join("subscriptions.json");
-        add("af", "default", Some(&config_path), &source, Some(&control)).expect("add account");
+        add("af", pool_id, Some(&config_path), &source, Some(&control)).expect("add account");
         config_path
     }
 
-    #[tokio::test]
-    async fn reload_posts_to_the_daemon_and_renders_every_transition() {
+    /// A loopback daemon that answers one request with `response_body`, and
+    /// hands back the request line it saw.
+    async fn fake_daemon(response: String) -> (u16, tokio::task::JoinHandle<String>) {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = registry_with_default_pool(temp.path());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("bind reload fixture");
+            .expect("bind daemon fixture");
         let port = listener.local_addr().expect("fixture address").port();
-        let body = serde_json::to_vec(&serde_json::json!({
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).await.expect("read request");
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+        (port, served)
+    }
+
+    /// A well-formed HTTP/1.1 response with `body` as its JSON payload.
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Long enough that a loopback fixture never races it, short enough that a
+    /// timeout test stays fast.
+    const TEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+    #[tokio::test]
+    async fn reload_posts_to_the_daemon_and_renders_every_transition() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_pool(temp.path(), "default");
+        let body = serde_json::json!({
             "pool_id": "default",
             "accounts": [
                 {
@@ -1403,25 +1484,11 @@ mod tests {
                     "detail": "unchanged"
                 }
             ]
-        }))
-        .expect("reload JSON");
-        let fixture = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.expect("accept reload request");
-            let mut request = [0_u8; 2048];
-            let read = stream.read(&mut request).await.expect("read request");
-            let response = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .await
-                .expect("write reload headers");
-            stream.write_all(&body).await.expect("write reload body");
-            String::from_utf8_lossy(&request[..read]).into_owned()
-        });
+        })
+        .to_string();
+        let (port, fixture) = fake_daemon(http_response("200 OK", &body)).await;
 
-        let output = reload_at("default", Some(&config_path), port)
+        let output = reload_at("default", Some(&config_path), port, TEST_TIMEOUT)
             .await
             .expect("reload output");
         let request = fixture.await.expect("fixture request");
@@ -1443,7 +1510,7 @@ mod tests {
     #[tokio::test]
     async fn reload_without_a_daemon_explains_the_next_launch_reads_credentials() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = registry_with_default_pool(temp.path());
+        let config_path = registry_with_pool(temp.path(), "default");
 
         // Claim a loopback port and release it, so nothing is listening.
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -1452,7 +1519,7 @@ mod tests {
         let port = closed.local_addr().expect("closed address").port();
         drop(closed);
 
-        let output = reload_at("default", Some(&config_path), port)
+        let output = reload_at("default", Some(&config_path), port, TEST_TIMEOUT)
             .await
             .expect("reload output");
 
@@ -1465,15 +1532,130 @@ mod tests {
     #[tokio::test]
     async fn reload_rejects_a_pool_that_is_not_registered() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let config_path = registry_with_default_pool(temp.path());
+        let config_path = registry_with_pool(temp.path(), "default");
 
-        let error = reload_at("missing", Some(&config_path), 1)
+        let error = reload_at("missing", Some(&config_path), 1, TEST_TIMEOUT)
             .await
             .expect_err("unknown pool");
 
         assert!(
             error.contains("subscription pool \"missing\" does not exist"),
             "reload should reject an unknown pool: {error}"
+        );
+    }
+
+    /// A daemon that is running but cannot reload must never be reported as an
+    /// absent daemon: it still holds the credential the user asked to replace.
+    #[tokio::test]
+    async fn reload_reports_a_daemon_that_answers_with_an_error_status() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_pool(temp.path(), "default");
+        let (port, _fixture) = fake_daemon(http_response(
+            "503 Service Unavailable",
+            "{\"ok\":false,\"error\":\"subscription pool unavailable\"}",
+        ))
+        .await;
+
+        let error = reload_at("default", Some(&config_path), port, TEST_TIMEOUT)
+            .await
+            .expect_err("an error status must not read as success");
+
+        assert!(
+            error.contains("503"),
+            "the message should name the answer the daemon gave: {error}"
+        );
+        assert!(
+            !error.contains("no running subscription daemon"),
+            "a running daemon must not be reported as absent: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_reports_an_answer_it_cannot_read() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_pool(temp.path(), "default");
+        let (port, _fixture) = fake_daemon(http_response("200 OK", "not json at all")).await;
+
+        let error = reload_at("default", Some(&config_path), port, TEST_TIMEOUT)
+            .await
+            .expect_err("an unreadable answer must not read as success");
+
+        assert!(
+            error.contains("could not read the reload answer"),
+            "the message should say the answer was unreadable: {error}"
+        );
+        assert!(
+            !error.contains("no running subscription daemon"),
+            "a running daemon must not be reported as absent: {error}"
+        );
+    }
+
+    /// The daemon endpoint takes no pool selector, so a daemon serving another
+    /// pool reloads *that* pool. The user must be told which pool was reloaded.
+    #[tokio::test]
+    async fn reload_reports_a_daemon_serving_another_pool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_pool(temp.path(), "work");
+        let body = serde_json::json!({
+            "pool_id": "default",
+            "accounts": [{
+                "id": "af",
+                "previous_health": "healthy",
+                "health": "healthy",
+                "detail": "unchanged"
+            }]
+        })
+        .to_string();
+        let (port, _fixture) = fake_daemon(http_response("200 OK", &body)).await;
+
+        let error = reload_at("work", Some(&config_path), port, TEST_TIMEOUT)
+            .await
+            .expect_err("a mismatched pool must not read as success");
+
+        assert!(
+            error.contains("\"default\"") && error.contains("\"work\""),
+            "the message should name both the served and the requested pool: {error}"
+        );
+        assert!(
+            !error.contains("no running subscription daemon"),
+            "a running daemon must not be reported as absent: {error}"
+        );
+    }
+
+    /// A slow reload across several accounts can outlast the timeout. The
+    /// daemon is still there and still holds the old credential.
+    #[tokio::test]
+    async fn reload_reports_a_timeout_rather_than_an_absent_daemon() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_pool(temp.path(), "default");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind silent fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        // Accept the connection and never answer, so the client times out.
+        let _silent = tokio::spawn(async move {
+            let held = listener.accept().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(held);
+        });
+
+        let error = reload_at(
+            "default",
+            Some(&config_path),
+            port,
+            Duration::from_millis(120),
+        )
+        .await
+        .expect_err("a timeout must not read as success");
+
+        assert!(
+            error.contains("timed out after 120ms"),
+            "the message should name the budget it exceeded: {error}"
+        );
+        assert!(
+            !error.contains("no running subscription daemon"),
+            "a running daemon must not be reported as absent: {error}"
         );
     }
 }
