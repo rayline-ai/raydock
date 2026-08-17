@@ -5,10 +5,10 @@ use std::io::{self, IsTerminal as _, Write};
 use std::path::{Path, PathBuf};
 
 use rayline_subscriptions::{
-    AccountRuntimeStatus, ClaimScope, CredentialHealth, CredentialSourceConfig, LimitClaim,
-    ModelFamily, PoolRuntimeStatus, SUBSCRIPTION_CONFIG_SCHEMA, SubscriptionAccountConfig,
-    SubscriptionPoolConfig, SubscriptionPoolRuntime, SubscriptionPoolsConfig,
-    SubscriptionRuntimeOptions,
+    AccountRuntimeStatus, ClaimScope, CredentialHealth, CredentialReloadSummary,
+    CredentialSourceConfig, LimitClaim, ModelFamily, PoolRuntimeStatus, SUBSCRIPTION_CONFIG_SCHEMA,
+    SubscriptionAccountConfig, SubscriptionPoolConfig, SubscriptionPoolRuntime,
+    SubscriptionPoolsConfig, SubscriptionRuntimeOptions,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -42,6 +42,10 @@ pub enum SubscriptionCommand {
         verbose: bool,
         live_only: bool,
     },
+    Reload {
+        pool_id: String,
+        config_path: Option<PathBuf>,
+    },
 }
 
 pub async fn run(command: &SubscriptionCommand) -> Result<String, String> {
@@ -72,6 +76,10 @@ pub async fn run(command: &SubscriptionCommand) -> Result<String, String> {
             verbose,
             live_only,
         } => status(pool_id, config_path.as_deref(), *json, *verbose, *live_only).await,
+        SubscriptionCommand::Reload {
+            pool_id,
+            config_path,
+        } => reload(pool_id, config_path.as_deref()).await,
     }
 }
 
@@ -882,12 +890,15 @@ fn status_paint(text: &str, ansi: &str, color: bool) -> String {
     }
 }
 
-async fn live_pool_status(pool_id: &str) -> Option<PoolRuntimeStatus> {
-    let port = std::env::var("RAYLINE_SUBSCRIPTION_METRICS_PORT")
+fn subscription_metrics_port() -> u16 {
+    std::env::var("RAYLINE_SUBSCRIPTION_METRICS_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_SUBSCRIPTION_METRICS_PORT);
-    live_pool_status_at(pool_id, port).await
+        .unwrap_or(DEFAULT_SUBSCRIPTION_METRICS_PORT)
+}
+
+async fn live_pool_status(pool_id: &str) -> Option<PoolRuntimeStatus> {
+    live_pool_status_at(pool_id, subscription_metrics_port()).await
 }
 
 async fn live_pool_status_at(pool_id: &str, port: u16) -> Option<PoolRuntimeStatus> {
@@ -905,6 +916,59 @@ async fn live_pool_status_at(pool_id: &str, port: u16) -> Option<PoolRuntimeStat
     }
     let status = response.json::<PoolRuntimeStatus>().await.ok()?;
     (status.pool_id == pool_id).then_some(status)
+}
+
+/// Asks the running pool daemon to re-read every credential source, so a
+/// profile the user signed in to again is adopted without restarting Claude
+/// Code. Credential work stays in the daemon; this command only reports it.
+async fn reload(pool_id: &str, config_path: Option<&Path>) -> Result<String, String> {
+    reload_at(pool_id, config_path, subscription_metrics_port()).await
+}
+
+async fn reload_at(pool_id: &str, config_path: Option<&Path>, port: u16) -> Result<String, String> {
+    // Reject a pool the user never registered before reporting on a daemon.
+    resolve_pool(config_path, pool_id)?;
+    match reload_pool_credentials_at(pool_id, port).await {
+        Some(summary) => Ok(render_reload_summary(&summary)),
+        // No daemon means no in-memory credential to correct: the next launch
+        // reads the sources anyway, so the user's goal already holds.
+        None => Ok(format!(
+            "no running subscription daemon for pool {pool_id:?}; credentials are read fresh at the next launch\n"
+        )),
+    }
+}
+
+/// A reload performs OAuth and usage round-trips for every account, so it needs
+/// a far longer budget than the status snapshot's 300ms read.
+const RELOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn reload_pool_credentials_at(pool_id: &str, port: u16) -> Option<CredentialReloadSummary> {
+    let client = reqwest::Client::builder()
+        .timeout(RELOAD_TIMEOUT)
+        .build()
+        .ok()?;
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/subscriptions/reload"))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let summary = response.json::<CredentialReloadSummary>().await.ok()?;
+    // A daemon serving another pool cannot answer for this one.
+    (summary.pool_id == pool_id).then_some(summary)
+}
+
+fn render_reload_summary(summary: &CredentialReloadSummary) -> String {
+    let mut output = format!("Subscription pool: {}\n", summary.pool_id);
+    for account in &summary.accounts {
+        output.push_str(&format!(
+            "  {}  {:?} → {:?}  {}\n",
+            account.id, account.previous_health, account.health, account.detail
+        ));
+    }
+    output
 }
 
 fn canonical_directory(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -1297,5 +1361,119 @@ mod tests {
         let placement = status.placement.expect("live placement");
         assert_eq!(placement.accounts[0].active_launch_leases, 3);
         assert_eq!(placement.accounts[0].active_model_leases["fable"], 1);
+    }
+
+    /// A registry with one pool named `default`, pointing at directories that
+    /// hold no credential document. `reload` must never read them: the running
+    /// daemon owns the credentials.
+    fn registry_with_default_pool(temp: &Path) -> PathBuf {
+        let control = temp.join("control");
+        let source = temp.join("source");
+        fs::create_dir_all(&control).expect("control dir");
+        fs::create_dir_all(&source).expect("source dir");
+        let config_path = temp.join("subscriptions.json");
+        add("af", "default", Some(&config_path), &source, Some(&control)).expect("add account");
+        config_path
+    }
+
+    #[tokio::test]
+    async fn reload_posts_to_the_daemon_and_renders_every_transition() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_default_pool(temp.path());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind reload fixture");
+        let port = listener.local_addr().expect("fixture address").port();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "pool_id": "default",
+            "accounts": [
+                {
+                    "id": "af",
+                    "previous_health": "quarantined",
+                    "health": "healthy",
+                    "detail": "reloaded a new credential from the credential source"
+                },
+                {
+                    "id": "ws",
+                    "previous_health": "healthy",
+                    "health": "healthy",
+                    "detail": "unchanged"
+                }
+            ]
+        }))
+        .expect("reload JSON");
+        let fixture = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept reload request");
+            let mut request = [0_u8; 2048];
+            let read = stream.read(&mut request).await.expect("read request");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write reload headers");
+            stream.write_all(&body).await.expect("write reload body");
+            String::from_utf8_lossy(&request[..read]).into_owned()
+        });
+
+        let output = reload_at("default", Some(&config_path), port)
+            .await
+            .expect("reload output");
+        let request = fixture.await.expect("fixture request");
+
+        assert!(
+            request.starts_with("POST /v1/subscriptions/reload "),
+            "reload must POST the daemon reload path: {request}"
+        );
+        assert!(
+            output.contains("af  Quarantined → Healthy  reloaded a new credential"),
+            "reload should render the healed account transition: {output}"
+        );
+        assert!(
+            output.contains("ws  Healthy → Healthy  unchanged"),
+            "reload should render every account: {output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_without_a_daemon_explains_the_next_launch_reads_credentials() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_default_pool(temp.path());
+
+        // Claim a loopback port and release it, so nothing is listening.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind closed port");
+        let port = closed.local_addr().expect("closed address").port();
+        drop(closed);
+
+        let output = reload_at("default", Some(&config_path), port)
+            .await
+            .expect("reload output");
+
+        assert_eq!(
+            output,
+            "no running subscription daemon for pool \"default\"; credentials are read fresh at the next launch\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_a_pool_that_is_not_registered() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_default_pool(temp.path());
+
+        let error = reload_at("missing", Some(&config_path), 1)
+            .await
+            .expect_err("unknown pool");
+
+        assert!(
+            error.contains("subscription pool \"missing\" does not exist"),
+            "reload should reject an unknown pool: {error}"
+        );
     }
 }

@@ -162,6 +162,7 @@ Commands:
   remove    Remove a profile from a pool
   list      List pools without reading credentials
   status    Poll and show each account's limit pools
+  reload    Ask the running pool daemon to re-read every credential source
 ";
 
 const SUBSCRIPTIONS_ADD_HELP: &str = "\
@@ -195,6 +196,19 @@ Options:
   --verbose, -v       Show every normalized limit claim and placement detail
   --json              Emit the complete machine-readable status
   --live-only         Fail when no pool daemon is running instead of reading credentials
+";
+
+const SUBSCRIPTIONS_RELOAD_HELP: &str = "\
+Usage: rayline subscriptions reload [OPTIONS]
+
+Ask the running pool daemon to re-read every account's credential source. Use it
+after signing in to a profile again, to end a quarantine without restarting
+Claude Code. With no daemon running there is nothing to correct: the next launch
+reads the credential sources anyway.
+
+Options:
+  --pool <name>       Pool name (default: default)
+  --config <path>     Subscription registry path
 ";
 
 const CODEX_HELP: &str = "\
@@ -1090,6 +1104,18 @@ where
                 json,
                 verbose,
                 live_only,
+            })
+        }
+        "reload"
+            if account_id.is_none()
+                && claude_config_dir.is_none()
+                && control_config_dir.is_none()
+                && !json
+                && !verbose =>
+        {
+            Some(subscriptions::SubscriptionCommand::Reload {
+                pool_id,
+                config_path,
             })
         }
         _ => None,
@@ -2383,6 +2409,7 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["subscriptions", "remove"] => Some(SUBSCRIPTIONS_REMOVE_HELP),
         ["subscriptions", "list"] => Some(SUBSCRIPTIONS_LIST_HELP),
         ["subscriptions", "status"] => Some(SUBSCRIPTIONS_STATUS_HELP),
+        ["subscriptions", "reload"] => Some(SUBSCRIPTIONS_RELOAD_HELP),
         ["codex"] => Some(CODEX_HELP),
         ["codex", "app"] => Some(CODEX_APP_HELP),
         ["codex", "configure"] => Some(CODEX_CONFIGURE_HELP),
@@ -2556,6 +2583,40 @@ mod tests {
                 verbose: false,
                 live_only: true,
             })
+        );
+    }
+
+    #[test]
+    fn subscriptions_reload_parses_pool_and_config() {
+        let dispatch = rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "subscriptions",
+            "reload",
+            "--pool",
+            "work",
+            "--config",
+            "/tmp/subscriptions.json",
+        ]));
+        assert_eq!(
+            dispatch,
+            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Reload {
+                pool_id: "work".to_owned(),
+                config_path: Some(PathBuf::from("/tmp/subscriptions.json")),
+            })
+        );
+    }
+
+    #[test]
+    fn subscriptions_reload_has_help() {
+        let help = rayline_help_for_argv(&argv(&["rayline", "subscriptions", "reload", "--help"]))
+            .expect("reload help");
+        assert!(help.contains("rayline subscriptions reload"));
+        assert!(help.contains("--pool"));
+        let index = rayline_help_for_argv(&argv(&["rayline", "subscriptions", "--help"]))
+            .expect("subscriptions help");
+        assert!(
+            index.contains("reload"),
+            "the subscriptions index should list reload: {index}"
         );
     }
 

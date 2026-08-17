@@ -34,7 +34,7 @@ The local implementation now spans the CLI, daemon, transparent proxy, and the
 new shared `crates/rayline-subscriptions` crate. It includes:
 
 - the versioned pool configuration model and validation
-- `subscriptions add`, `remove`, `list`, and `status`
+- `subscriptions add`, `remove`, `list`, `status`, and `reload`
 - one shared control `CLAUDE_CONFIG_DIR` with credential-only source profiles
 - macOS Keychain and profile-local credential-file backends
 - serialized OAuth refresh, refresh-token rotation, compare-and-swap writes,
@@ -133,6 +133,21 @@ path does not reopen Keychain. If no pool daemon is reachable, the command
 falls back to a standalone allowance poll, labels live placement unavailable,
 and may need Keychain access. Pool launches use port `20816` by default; set
 `RAYLINE_SUBSCRIPTION_METRICS_PORT` consistently for a custom port.
+
+`rayline subscriptions reload` is the one command that deliberately makes the
+daemon reread credentials. It asks the running daemon to reopen every account's
+credential source, so a profile you signed in to again is adopted at once
+instead of on the next usage-poll tick. The daemon does the reading, so the
+account may need Keychain access; the CLI only prints what changed:
+
+```text
+Subscription pool: default
+  af  Quarantined → Healthy  reloaded a new credential from the credential source
+  ws  Healthy → Healthy  unchanged
+```
+
+With no daemon running there is nothing to correct, so the command reports that
+the next launch reads the credential sources anyway and exits successfully.
 
 ### Show the serving subscription in Claude's status line
 
@@ -628,6 +643,7 @@ rayline subscriptions add af --claude-config-dir ~/.claude \
 rayline subscriptions add memex --claude-config-dir ~/.claude-memex
 rayline subscriptions add ws --claude-config-dir ~/.claude-ws
 rayline subscriptions status
+rayline subscriptions reload
 
 rayline claude \
   --subscription-pool default
@@ -768,7 +784,7 @@ forwarded.
 | First `401` | Refresh the selected worker once and retry the same account |
 | Refresh `invalid_grant` after another process changed the credential | Reload that source once, adopt the newer token, and retry the same account |
 | Repeated `401` or `invalid_grant` with an unchanged credential | Quarantine that credential source and select another account if safe |
-| A quarantined source later holds a new credential document | Adopt it on the next usage poll and return that account to selection |
+| A quarantined source later holds a new credential document | Adopt it on the next usage poll, or at once on `rayline subscriptions reload`, and return that account to selection |
 | Explicit pre-stream entitlement or `credits_required` rejection | Mark the relevant model/account unavailable under policy and select another eligible account |
 | Network disconnect or timeout after send | Do not replay on another account because processing is ambiguous |
 | `200` or any response body/SSE bytes forwarded | Never replay |
@@ -895,7 +911,7 @@ The likely implementation split follows existing crate responsibilities:
 
 ### `rayline-cli`
 
-- `subscriptions add/remove/list/status` commands
+- `subscriptions add/remove/list/status/reload` commands
 - `--subscription-pool`
 - validation that pooling requires `--via proxy`
 - launch ID creation and proxy configuration

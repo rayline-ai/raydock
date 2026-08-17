@@ -1173,6 +1173,16 @@ async fn handle_metrics_control(
                 serde_json::json!({"ok": false, "error": "subscription pool unavailable"}),
             ),
         },
+        (Method::POST, "/v1/subscriptions/reload") => match subscription_pool {
+            Some(pool) => json_response(
+                StatusCode::OK,
+                serde_json::json!(pool.reload_credentials().await),
+            ),
+            None => json_response(
+                StatusCode::NOT_FOUND,
+                serde_json::json!({"ok": false, "error": "subscription pool unavailable"}),
+            ),
+        },
         (Method::POST, "/v1/router/top/update") => {
             let body = match req.into_body().collect().await {
                 Ok(body) => body.to_bytes(),
@@ -1536,6 +1546,43 @@ mod tests {
             .await
             .expect("subscription status request");
         assert_eq!(subscriptions.status(), reqwest::StatusCode::NOT_FOUND);
+    }
+
+    /// `rayline subscriptions reload` needs a POST route on the same
+    /// loopback-only control server that serves the status snapshot. The route
+    /// must be registered: an unregistered path falls through to the generic
+    /// `not found` text body instead of the structured "pool unavailable"
+    /// answer, and non-POST methods keep that generic treatment.
+    #[tokio::test]
+    async fn metrics_control_serves_subscription_reload_on_loopback() {
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let listener = bind_metrics_control(0).await.expect("bind metrics control");
+        let address = listener.local_addr().expect("listener addr");
+        assert!(
+            address.ip().is_loopback(),
+            "the subscription control server must stay loopback-only: {address}"
+        );
+        let port = address.port();
+        spawn_metrics_control(metrics, listener, None);
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/subscriptions/reload");
+        let response = client.post(&url).send().await.expect("reload request");
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
+        let body: serde_json::Value = response.json().await.expect("json body");
+        assert_eq!(
+            body.get("error").and_then(serde_json::Value::as_str),
+            Some("subscription pool unavailable"),
+            "the reload route must answer with the pool-unavailable body: {body}"
+        );
+
+        let wrong_method = client.get(&url).send().await.expect("reload GET request");
+        assert_eq!(wrong_method.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(
+            wrong_method.text().await.expect("text body"),
+            "not found",
+            "a non-POST method keeps the server's existing method handling"
+        );
     }
 
     #[test]
