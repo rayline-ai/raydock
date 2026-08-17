@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AccountLimitState, BillingPolicy, CredentialHealth, Entitlement, ModelFamily, PoolPolicy,
+    AccountLimitState, BillingPolicy, CredentialHealth, Entitlement, LimitClaim, ModelFamily,
+    PoolPolicy,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -48,6 +49,60 @@ pub enum IneligibilityReason {
     ModelUnavailable,
     IncludedUsageInUse,
     ExhaustedClaim(String),
+}
+
+/// One line that says, per account, why the pool could not serve a request.
+/// The daemon puts this in the error it returns to Claude Code, so it names
+/// accounts and blockers and nothing else: no tokens, no request content.
+pub fn describe_ineligibility(
+    accounts: &[AccountLimitState],
+    evaluations: &[AccountEvaluation],
+) -> String {
+    let summary = evaluations
+        .iter()
+        .filter(|evaluation| !evaluation.reasons.is_empty())
+        .map(|evaluation| {
+            let account = accounts
+                .iter()
+                .find(|account| account.account_id == evaluation.account_id);
+            let reasons = evaluation
+                .reasons
+                .iter()
+                .map(|reason| describe_reason(reason, account))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}: {reasons}", evaluation.account_id)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if summary.is_empty() {
+        return "no account was eligible".to_owned();
+    }
+    summary
+}
+
+fn describe_reason(reason: &IneligibilityReason, account: Option<&AccountLimitState>) -> String {
+    match reason {
+        IneligibilityReason::CredentialRefreshing => "credential refreshing".to_owned(),
+        IneligibilityReason::CredentialUnavailable => "credential unavailable".to_owned(),
+        IneligibilityReason::CredentialQuarantined => {
+            "credential quarantined (sign in to this profile again)".to_owned()
+        }
+        IneligibilityReason::ModelUnavailable => "model not included in this plan".to_owned(),
+        IneligibilityReason::IncludedUsageInUse => "overage billing in use".to_owned(),
+        IneligibilityReason::ExhaustedClaim(key) => match reset_for_claim(account, key) {
+            Some(reset) => format!("allowance exhausted (resets {reset})"),
+            None => "allowance exhausted".to_owned(),
+        },
+    }
+}
+
+fn reset_for_claim<'a>(account: Option<&'a AccountLimitState>, key: &str) -> Option<&'a str> {
+    account?
+        .claims
+        .iter()
+        .find(|claim| claim.key == key)
+        .and_then(LimitClaim::parseable_reset_at)
 }
 
 pub fn select_account(
@@ -282,6 +337,56 @@ mod tests {
             .collect::<std::collections::HashSet<_>>();
 
         assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn ineligibility_detail_names_each_account_and_its_blocker() {
+        let mut exhausted = account("mx", 1.0, 0.2);
+        exhausted.claims[0].resets_at = Some("2026-08-17T21:00:00Z".to_owned());
+        let mut quarantined = account("af", 0.1, 0.1);
+        quarantined.credential_health = CredentialHealth::Quarantined;
+        let accounts = [exhausted, quarantined];
+
+        let decision = select_account(&accounts, &sonnet_request(), &PoolPolicy::default());
+
+        assert_eq!(decision.selected_account_id, None);
+        assert_eq!(
+            describe_ineligibility(&accounts, &decision.evaluations),
+            "mx: allowance exhausted (resets 2026-08-17T21:00:00Z); \
+             af: credential quarantined (sign in to this profile again)"
+        );
+    }
+
+    #[test]
+    fn ineligibility_detail_joins_blockers_and_drops_an_unreadable_reset() {
+        let mut blocked = account("ws", 1.0, 0.2);
+        blocked.claims[0].resets_at = Some("whenever".to_owned());
+        blocked.entitlements.insert(
+            ModelFamily::from_requested_model("sonnet"),
+            Entitlement::Unavailable,
+        );
+        let accounts = [blocked];
+
+        let decision = select_account(&accounts, &sonnet_request(), &PoolPolicy::default());
+
+        assert_eq!(
+            describe_ineligibility(&accounts, &decision.evaluations),
+            "ws: model not included in this plan, allowance exhausted"
+        );
+    }
+
+    #[test]
+    fn ineligibility_detail_is_never_empty() {
+        assert_eq!(describe_ineligibility(&[], &[]), "no account was eligible");
+    }
+
+    fn sonnet_request() -> SelectionRequest {
+        SelectionRequest {
+            model: ModelFamily::from_requested_model("sonnet"),
+            affinity_account_id: None,
+            launch_id: "launch-detail".to_owned(),
+            placement_loads: BTreeMap::new(),
+        }
     }
 
     #[test]

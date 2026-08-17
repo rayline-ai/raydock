@@ -33,6 +33,14 @@ impl LimitClaim {
                     .is_some_and(|utilization| utilization >= 1.0))
     }
 
+    /// The reset instant when the provider gave one we can make sense of.
+    /// Messages shown to a user must not repeat a value we could not read.
+    pub(crate) fn parseable_reset_at(&self) -> Option<&str> {
+        self.resets_at
+            .as_deref()
+            .filter(|resets_at| parse_reset_unix_seconds(resets_at).is_some())
+    }
+
     pub fn reset_has_passed(&self) -> bool {
         self.resets_at
             .as_deref()

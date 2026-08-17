@@ -42,7 +42,7 @@ pub use runtime::{
 };
 pub use selection::{
     AccountEvaluation, AccountPlacementLoad, IneligibilityReason, SelectionDecision,
-    SelectionRequest, select_account,
+    SelectionRequest, describe_ineligibility, select_account,
 };
 pub use status::{
     RAYLINE_STATUS_ID_ENV, SESSION_STATUS_SCHEMA, SessionAssignmentKind, SessionAssignmentReason,

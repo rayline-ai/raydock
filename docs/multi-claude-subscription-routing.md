@@ -810,12 +810,26 @@ marking the entire account exhausted.
 
 When attempted subscriptions reject the request, Rayline returns the final
 real unified 429 response intact. Claude Code can then stop retrying and show
-its standard reset message. If every account is already known to be exhausted
-before any upstream attempt, Rayline returns a bounded local pool-exhaustion
-429 instead; there is no current provider response to preserve in that case.
-If no account has a usable OAuth credential, Rayline instead returns a local
-503 that points to `rayline subscriptions status --verbose`; it does not report
-credential failure as exhausted allowance.
+its standard reset message. If no account can serve the request before any
+upstream attempt, Rayline returns a bounded local 429 instead; there is no
+current provider response to preserve in that case. That local 429 names every
+account and why it was passed over, because accounts are blocked for different
+reasons and only one of them is spent allowance. The message is one line,
+wrapped here to fit:
+
+```text
+Claude subscription pool "default" has no eligible account for model
+"claude-sonnet-4-5": af: credential quarantined (sign in to this profile
+again); mx: allowance exhausted (resets 2026-08-17T21:00:00Z); ws: credential
+unavailable
+```
+
+The detail carries account ids, blockers, and reset times only. It never
+carries tokens or request content. A quarantined account there means a
+sign-in, not a wait: run `rayline subscriptions reload` after signing in
+again. If no account has a usable OAuth credential at all, Rayline instead
+returns a local 503 that points to `rayline subscriptions status --verbose`;
+it does not report credential failure as exhausted allowance.
 
 ## Response Headers and Claude UI
 

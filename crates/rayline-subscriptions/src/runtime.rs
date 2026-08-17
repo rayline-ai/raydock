@@ -16,7 +16,7 @@ use crate::{
     OAuthRefreshClient, OAuthRefreshError, PoolPolicy, SESSION_STATUS_SCHEMA, SecretString,
     SelectionRequest, SessionAssignmentKind, SessionAssignmentReason, SessionAssignmentStatus,
     SessionCapacityStatus, SessionLimitStatus, SessionPlacementStatus, SessionStatusSnapshot,
-    SubscriptionPoolConfig, UsageSnapshot, normalize_unified_extra_usage,
+    SubscriptionPoolConfig, UsageSnapshot, describe_ineligibility, normalize_unified_extra_usage,
     normalize_unified_headers, select_account,
 };
 
@@ -248,6 +248,7 @@ impl SubscriptionPoolRuntime {
                     return Err(SubscriptionRuntimeError::NoEligibleAccount {
                         pool: self.pool_id.clone(),
                         model: model.to_string(),
+                        detail: describe_ineligibility(&states, &decision.evaluations),
                     });
                 };
                 let evaluation = decision
@@ -1529,8 +1530,13 @@ pub enum SubscriptionRuntimeError {
     CredentialUnavailable(String),
     #[error("subscription pool {pool:?} has no usable credentials")]
     NoUsableCredentials { pool: String },
-    #[error("subscription pool {pool:?} has no eligible account for model {model:?}")]
-    NoEligibleAccount { pool: String, model: String },
+    #[error("subscription pool {pool:?} has no eligible account for model {model:?}: {detail}")]
+    NoEligibleAccount {
+        pool: String,
+        model: String,
+        /// Why each account was passed over, one line, no credentials.
+        detail: String,
+    },
     #[error("unknown subscription account {0:?}")]
     UnknownAccount(String),
     #[error("subscription pool resolves more than one account to credential source {path}")]

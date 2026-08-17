@@ -960,18 +960,25 @@ async fn forward_subscription_request(
                             request.requested_model,
                             error
                         );
-                        if matches!(
-                            error,
-                            rayline_subscriptions::SubscriptionRuntimeError::NoUsableCredentials { .. }
-                        ) {
-                            Ok(subscription_credentials_unavailable_response(
-                                request.pool.pool_id(),
-                            ))
-                        } else {
-                            Ok(subscription_exhausted_response(
+                        match &error {
+                            rayline_subscriptions::SubscriptionRuntimeError::NoUsableCredentials { .. } => {
+                                Ok(subscription_credentials_unavailable_response(
+                                    request.pool.pool_id(),
+                                ))
+                            }
+                            rayline_subscriptions::SubscriptionRuntimeError::NoEligibleAccount {
+                                detail,
+                                ..
+                            } => Ok(subscription_exhausted_response(
                                 request.pool.pool_id(),
                                 request.requested_model,
-                            ))
+                                Some(detail),
+                            )),
+                            _ => Ok(subscription_exhausted_response(
+                                request.pool.pool_id(),
+                                request.requested_model,
+                                None,
+                            )),
                         }
                     }
                 };
@@ -1150,6 +1157,7 @@ async fn forward_subscription_request(
         None => Ok(subscription_exhausted_response(
             request.pool.pool_id(),
             request.requested_model,
+            None,
         )),
     }
 }
@@ -1189,16 +1197,30 @@ async fn write_subscription_status(
     .await;
 }
 
-fn subscription_exhausted_response(pool_id: &str, requested_model: &str) -> Response<BoxBody> {
+/// The local 429 for a pool that cannot serve the request at all. `detail` is
+/// the per-account explanation the selection error carries; without one the
+/// message stays generic, because nothing more is known here. The status stays
+/// 429 either way: Claude Code already handles that.
+fn subscription_exhausted_response(
+    pool_id: &str,
+    requested_model: &str,
+    detail: Option<&str>,
+) -> Response<BoxBody> {
+    let message = match detail {
+        Some(detail) => format!(
+            "Claude subscription pool {pool_id:?} has no eligible account for model {requested_model:?}: {detail}"
+        ),
+        None => format!(
+            "Claude subscription pool {pool_id:?} has no remaining included allowance for model {requested_model:?}"
+        ),
+    };
     json_response(
         StatusCode::TOO_MANY_REQUESTS,
         json!({
             "type": "error",
             "error": {
                 "type": "rate_limit_error",
-                "message": format!(
-                    "Claude subscription pool {pool_id:?} has no remaining included allowance for model {requested_model:?}"
-                )
+                "message": message
             }
         }),
     )
