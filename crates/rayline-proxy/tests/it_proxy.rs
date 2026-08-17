@@ -319,6 +319,52 @@ async fn spawn_fake_subscription_anthropic() -> FakeHttpServer {
     FakeHttpServer { port, captured }
 }
 
+/// A subscription Anthropic whose usage endpoint reports a five-hour allowance
+/// that is already spent, so every healthy account in the pool is exhausted
+/// before any request is attempted upstream.
+async fn spawn_fake_exhausted_subscription_anthropic() -> FakeHttpServer {
+    let port = free_port();
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let captured_for_task = captured.clone();
+    tokio::spawn(async move {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let listener = TcpListener::bind(addr).await.unwrap();
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let io = TokioIo::new(stream);
+            let captured = captured_for_task.clone();
+            tokio::spawn(async move {
+                let svc = service_fn(move |req: Request<Incoming>| {
+                    let captured = captured.clone();
+                    async move {
+                        let request = capture_request(req).await;
+                        let path = request.path_and_query.clone();
+                        captured.lock().unwrap().push(request);
+                        let body = if path == "/api/oauth/usage" {
+                            Bytes::from_static(
+                                br#"{"five_hour":{"utilization":100,"resets_at":"2030-01-01T21:00:00Z"},"seven_day":{"utilization":20},"extra_usage":{"is_enabled":false}}"#,
+                            )
+                        } else {
+                            Bytes::from_static(br#"{"ok":true}"#)
+                        };
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::OK)
+                                .header("content-type", "application/json")
+                                .body(Full::new(body))
+                                .unwrap(),
+                        )
+                    }
+                });
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(io, svc)
+                    .await;
+            });
+        }
+    });
+    FakeHttpServer { port, captured }
+}
+
 async fn spawn_fake_local_router(redirect_port: u16) -> FakeHttpServer {
     let port = free_port();
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -493,6 +539,14 @@ fn proxied_client_with_launch(
 }
 
 fn write_subscription_credential(config_dir: &Path, access_token: &str) {
+    write_subscription_credential_expiring_at(config_dir, access_token, 4_000_000_000_000);
+}
+
+fn write_subscription_credential_expiring_at(
+    config_dir: &Path,
+    access_token: &str,
+    expires_at_unix_ms: i64,
+) {
     std::fs::create_dir_all(config_dir).unwrap();
     std::fs::write(
         config_dir.join(".credentials.json"),
@@ -500,7 +554,7 @@ fn write_subscription_credential(config_dir: &Path, access_token: &str) {
             "claudeAiOauth": {
                 "accessToken": access_token,
                 "refreshToken": format!("refresh-{access_token}"),
-                "expiresAt": 4_000_000_000_000_i64,
+                "expiresAt": expires_at_unix_ms,
                 "scopes": ["user:inference", "user:profile"],
                 "subscriptionType": "max"
             }
@@ -932,6 +986,114 @@ async fn exhausted_subscription_pool_preserves_the_final_real_unified_rejection(
                 })
             }),
         "a classified unified rejection must persist the exhausted model claim"
+    );
+}
+
+/// A pool that cannot serve a request must say why, account by account. This
+/// pool has one account with a spent allowance and one whose refresh token the
+/// provider rejected. The synthesized 429 used to blame allowance for both,
+/// which hid the sign-in the user actually had to do.
+#[tokio::test]
+async fn synthesized_pool_429_names_every_blocked_account_and_its_reason() {
+    init_tracing();
+    let anthropic = spawn_fake_exhausted_subscription_anthropic().await;
+    let oauth = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::BAD_REQUEST,
+            headers: vec![("content-type".to_owned(), "application/json".to_owned())],
+            body: Bytes::from_static(br#"{"error":"invalid_grant"}"#),
+        },
+    )
+    .await;
+    let temp = tempfile::tempdir().unwrap();
+    let control_dir = temp.path().join("control");
+    let account_a = temp.path().join("account-a");
+    let account_b = temp.path().join("account-b");
+    std::fs::create_dir_all(&control_dir).unwrap();
+    write_subscription_credential(&account_a, "token-a");
+    // Long expired, so the first use of account b must refresh, and the fake
+    // token endpoint rejects that refresh token for good.
+    write_subscription_credential_expiring_at(&account_b, "token-b", 1_000_000_000_000);
+
+    let runtime = rayline_subscriptions::SubscriptionPoolRuntime::start(
+        "default",
+        subscription_pool_config(&control_dir, &account_a, &account_b),
+        rayline_subscriptions::SubscriptionRuntimeOptions {
+            anthropic_base_url: format!("http://127.0.0.1:{}", anthropic.port),
+            token_url: format!("https://localhost:{}/oauth/token", oauth.port),
+            trusted_ca_pem: Some(oauth.cert_pem.as_bytes().to_vec()),
+            request_timeout: Duration::from_secs(2),
+            home_dir: None,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let runtime_for_assertion = Arc::clone(&runtime);
+    assert_eq!(
+        runtime_for_assertion
+            .status()
+            .accounts
+            .into_iter()
+            .find(|account| account.id == "b")
+            .unwrap()
+            .credential_health,
+        rayline_subscriptions::CredentialHealth::Quarantined,
+        "a rejected refresh token should quarantine account b"
+    );
+
+    let proxy_port = free_port();
+    let mut opts = proxy_options(
+        proxy_port,
+        temp.path(),
+        "http://127.0.0.1:9".to_owned(),
+        format!("http://127.0.0.1:{}", anthropic.port),
+        &[],
+    );
+    opts.routing_mode = rayline_proxy::ProxyRoutingMode::SelectiveSubagents;
+    opts.subscription_pool = Some(runtime);
+    opts.claude_config_dir = Some(control_dir);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    let response = proxied_client_with_launch(proxy_port, &ca_cert_path, "blocked_launch")
+        .post("https://api.anthropic.com/v1/messages")
+        .body(r#"{"model":"claude-sonnet-4-6","messages":[]}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = response.json::<serde_json::Value>().await.unwrap();
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("a: allowance exhausted (resets 2030-01-01T21:00:00Z)"),
+        "the message should name the exhausted account and its reset: {message}"
+    );
+    assert!(
+        message.contains("b: credential quarantined (sign in to this profile again)"),
+        "the message should name the quarantined account and what to do: {message}"
+    );
+    assert!(
+        !message.contains("no remaining included allowance"),
+        "a credential blocker must not be reported as spent allowance: {message}"
+    );
+    assert!(
+        !message.contains("token-") && !message.contains("refresh-"),
+        "the message must carry no credential material: {message}"
+    );
+    assert_eq!(
+        anthropic
+            .captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.path_and_query == "/v1/messages")
+            .count(),
+        0,
+        "no account was eligible, so nothing should have been sent upstream"
     );
 }
 
