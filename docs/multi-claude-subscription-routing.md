@@ -156,6 +156,18 @@ an error status, its answer could not be read, or it serves another pool. The
 endpoint takes no pool selector, so a daemon serving another pool reloads that
 pool; the message names the pool that was reloaded.
 
+The daemon serves the reload as `POST /v1/subscriptions/reload` on the same
+loopback-only control port as the status snapshot, and it requires
+`content-type: application/json`. A request without that content type is
+rejected with `415` before any credential source is opened. The status route is
+an in-memory read, but a reload reopens every account's credential store, so the
+route needs one guard the read does not: a web page the user visits over `http`
+can POST to a fixed loopback port, and a cross-origin request may only carry a
+form or text content type unless a CORS preflight succeeds. This server answers
+no preflight and returns no CORS headers. The check is not authentication —
+every local process may still call the route, which is the trust level the
+loopback bind already grants.
+
 ### Show the serving subscription in Claude's status line
 
 Pool launches export a launch-scoped status identifier. The proxy uses it to

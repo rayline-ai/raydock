@@ -1147,11 +1147,34 @@ async fn serve_metrics_control(
     }
 }
 
+/// The metrics control server is loopback-only and unauthenticated, on a fixed
+/// well-known port. That is safe for reads, but a state-changing route needs one
+/// more guard: any web page the user visits over http can POST to loopback. A
+/// cross-origin request may only carry a form or text content type without a
+/// CORS preflight, and this server answers no preflight, so demanding
+/// `application/json` keeps a page from reaching such a route. It is not
+/// authentication — every local process can still call it, which is the trust
+/// level the loopback bind already grants.
+fn sends_json_content_type(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+}
+
 async fn handle_metrics_control(
     metrics: Arc<RouterMetrics>,
     subscription_pool: Option<Arc<rayline_subscriptions::SubscriptionPoolRuntime>>,
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
+    let sends_json = sends_json_content_type(req.headers());
     match (req.method().clone(), req.uri().path()) {
         (Method::GET, "/healthz") => json_response(
             StatusCode::OK,
@@ -1173,6 +1196,15 @@ async fn handle_metrics_control(
                 serde_json::json!({"ok": false, "error": "subscription pool unavailable"}),
             ),
         },
+        // Guarded before the pool is touched: a reload reopens every credential
+        // source, which on macOS is a Keychain access per account.
+        (Method::POST, "/v1/subscriptions/reload") if !sends_json => json_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            serde_json::json!({
+                "ok": false,
+                "error": "reload requires content-type: application/json",
+            }),
+        ),
         (Method::POST, "/v1/subscriptions/reload") => match subscription_pool {
             Some(pool) => json_response(
                 StatusCode::OK,
@@ -1567,7 +1599,12 @@ mod tests {
 
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{port}/v1/subscriptions/reload");
-        let response = client.post(&url).send().await.expect("reload request");
+        let response = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .expect("reload request");
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         let body: serde_json::Value = response.json().await.expect("json body");
         assert_eq!(
@@ -1583,6 +1620,51 @@ mod tests {
             "not found",
             "a non-POST method keeps the server's existing method handling"
         );
+    }
+
+    /// The reload endpoint is unauthenticated on a fixed, well-known loopback
+    /// port, and it makes the daemon reopen every credential source — a real
+    /// Keychain access per account on macOS. A browser cannot send
+    /// `application/json` cross-origin without a CORS preflight, and this server
+    /// answers no preflight, so requiring that content type stops any web page
+    /// from driving credential-store reads. The check must run before the pool
+    /// is touched.
+    #[tokio::test]
+    async fn metrics_control_rejects_a_reload_without_a_json_content_type() {
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let listener = bind_metrics_control(0).await.expect("bind metrics control");
+        let port = listener.local_addr().expect("listener addr").port();
+        spawn_metrics_control(metrics, listener, None);
+
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/subscriptions/reload");
+
+        for (label, request) in [
+            ("no content type", client.post(&url)),
+            (
+                "a CORS-safelisted content type",
+                client.post(&url).header("content-type", "text/plain"),
+            ),
+            (
+                "a form content type",
+                client
+                    .post(&url)
+                    .header("content-type", "application/x-www-form-urlencoded"),
+            ),
+        ] {
+            let response = request.send().await.expect("reload request");
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "{label} must be rejected before the pool is touched"
+            );
+            let body: serde_json::Value = response.json().await.expect("json body");
+            assert_eq!(
+                body.get("error").and_then(serde_json::Value::as_str),
+                Some("reload requires content-type: application/json"),
+                "{label} should say what the endpoint requires: {body}"
+            );
+        }
     }
 
     #[test]

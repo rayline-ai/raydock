@@ -972,6 +972,9 @@ async fn reload_pool_credentials_at(pool_id: &str, port: u16, timeout: Duration)
     };
     let response = match client
         .post(format!("http://127.0.0.1:{port}/v1/subscriptions/reload"))
+        // Required by the daemon, and set explicitly: reqwest sends no content
+        // type at all for a request with no body.
+        .header("content-type", "application/json")
         .send()
         .await
     {
@@ -1496,6 +1499,15 @@ mod tests {
         assert!(
             request.starts_with("POST /v1/subscriptions/reload "),
             "reload must POST the daemon reload path: {request}"
+        );
+        // The daemon rejects a reload without this header, because a browser
+        // cannot send it cross-origin without a preflight the daemon never
+        // answers. Relying on a reqwest default would break silently.
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "reload must send the content type the daemon requires: {request}"
         );
         assert!(
             output.contains("af  Quarantined → Healthy  reloaded a new credential"),
