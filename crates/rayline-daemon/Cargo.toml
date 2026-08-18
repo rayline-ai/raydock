@@ -28,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 dirs.workspace = true
 hyper.workspace = true
+libc = "0.2"
 hyper-util.workspace = true
 http-body-util.workspace = true
 rayline-hf = { path = "../rayline-hf" }

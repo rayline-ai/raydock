@@ -33,6 +33,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+mod fdlimit;
 mod statusline;
 
 // Pinned llama.cpp release. Kept to the newest build that is >=7 days old
@@ -393,6 +394,12 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+
+    #[cfg(unix)]
+    match fdlimit::raise_nofile_limit(fdlimit::TARGET_NOFILE) {
+        Ok((before, after)) => info!("open-file soft limit: {after} (was {before})"),
+        Err(err) => warn!("could not raise open-file limit: {err}"),
+    }
 
     let cli = Cli::parse();
     match cli.cmd {

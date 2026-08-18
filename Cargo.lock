@@ -1470,6 +1470,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "rayline-adapter",
  "rayline-hf",
  "rayline-injector",
