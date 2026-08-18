@@ -866,7 +866,17 @@ async fn run_command_from_home(
         } else {
             (model, set_model_env)
         };
-    let auto_compact_window = effective_auto_compact_window(request, settings.as_ref(), &model);
+    // When the launcher exports no ANTHROPIC_MODEL (proxy-subagents with no
+    // explicit model), the session runs the main model pinned in its own
+    // settings.json — derive the auto-compact window from that pin, not from
+    // the routing-mode fallback, so a 1M main model keeps the 1M window.
+    let session_config_dir = subscription_context
+        .as_ref()
+        .map(|(_, control_config_dir)| control_config_dir.clone())
+        .unwrap_or_else(|| claude_config_dir(home, request.isolated));
+    let window_model = auto_compact_window_model(set_model_env, &model, &session_config_dir);
+    let auto_compact_window =
+        effective_auto_compact_window(request, settings.as_ref(), &window_model);
 
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
     // config dir and, in proxy mode, a private proxy port. Resolve both per the
@@ -880,10 +890,7 @@ async fn run_command_from_home(
     } else {
         None
     };
-    let mut inspect_dir = subscription_context
-        .as_ref()
-        .map(|(_, control_config_dir)| control_config_dir.clone())
-        .unwrap_or_else(|| claude_config_dir(home, isolated));
+    let mut inspect_dir = session_config_dir;
     let mut daemon_request = RequestSpec {
         env_name: &env_name,
         routing_mode: request.routing_mode,
@@ -1455,6 +1462,35 @@ fn default_auto_compact_window(model: &str) -> &'static str {
         DEFAULT_AUTO_COMPACT_WINDOW_1M
     } else {
         DEFAULT_AUTO_COMPACT_WINDOW
+    }
+}
+
+/// The model the auto-compact window derives from. When the launcher exports
+/// ANTHROPIC_MODEL (`set_model_env`), that model governs the session. When it
+/// does not (proxy-subagents with no explicit model), Claude Code falls back
+/// to the main model pinned in the session's settings.json, so the window
+/// must derive from that pin rather than the routing-mode fallback model.
+fn auto_compact_window_model(
+    set_model_env: bool,
+    resolved_model: &str,
+    session_config_dir: &Path,
+) -> String {
+    if set_model_env {
+        return resolved_model.to_owned();
+    }
+    settings_main_model(session_config_dir).unwrap_or_else(|| resolved_model.to_owned())
+}
+
+/// Main model pinned in `<config_dir>/settings.json`, if any. Best-effort:
+/// missing or malformed settings yield `None`.
+fn settings_main_model(config_dir: &Path) -> Option<String> {
+    let raw = fs::read_to_string(config_dir.join("settings.json")).ok()?;
+    let settings: Value = serde_json::from_str(&raw).ok()?;
+    let model = settings.get("model")?.as_str()?.trim();
+    if model.is_empty() {
+        None
+    } else {
+        Some(model.to_owned())
     }
 }
 
@@ -2788,6 +2824,63 @@ mod local_provider_tests {
             false,
             Some(&non_provider_cfg),
         ));
+    }
+}
+
+#[cfg(test)]
+mod auto_compact_window_model_tests {
+    use super::*;
+
+    fn dir_with_settings(json: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("settings.json"), json).expect("write settings");
+        dir
+    }
+
+    // Regression: a proxy-subagents launch without --model/ANTHROPIC_MODEL
+    // runs the settings.json main model, so a pinned 1M model must produce
+    // the 1M window — not the 180k window of the routing fallback model.
+    #[test]
+    fn settings_pinned_1m_model_wins_over_routing_fallback() {
+        let dir = dir_with_settings(r#"{"model": "claude-fable-5[1m]"}"#);
+
+        let model = auto_compact_window_model(false, DEFAULT_PROXY_SUBAGENTS_MODEL, dir.path());
+
+        assert_eq!(model, "claude-fable-5[1m]");
+        assert_eq!(
+            default_auto_compact_window(&model),
+            DEFAULT_AUTO_COMPACT_WINDOW_1M
+        );
+    }
+
+    #[test]
+    fn exported_model_env_governs_regardless_of_settings() {
+        let dir = dir_with_settings(r#"{"model": "claude-fable-5[1m]"}"#);
+
+        let model = auto_compact_window_model(true, DEFAULT_PROXY_SUBAGENTS_MODEL, dir.path());
+
+        assert_eq!(model, DEFAULT_PROXY_SUBAGENTS_MODEL);
+    }
+
+    #[test]
+    fn missing_or_malformed_settings_fall_back_to_resolved_model() {
+        let missing = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            auto_compact_window_model(false, DEFAULT_PROXY_SUBAGENTS_MODEL, missing.path()),
+            DEFAULT_PROXY_SUBAGENTS_MODEL
+        );
+
+        let malformed = dir_with_settings("not json");
+        assert_eq!(
+            auto_compact_window_model(false, DEFAULT_PROXY_SUBAGENTS_MODEL, malformed.path()),
+            DEFAULT_PROXY_SUBAGENTS_MODEL
+        );
+
+        let blank_model = dir_with_settings(r#"{"model": "  "}"#);
+        assert_eq!(
+            auto_compact_window_model(false, DEFAULT_PROXY_SUBAGENTS_MODEL, blank_model.path()),
+            DEFAULT_PROXY_SUBAGENTS_MODEL
+        );
     }
 }
 
