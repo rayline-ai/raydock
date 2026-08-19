@@ -324,6 +324,14 @@ Usage: rayline top [--json] [--all]
 
 Show live LLM request metrics.
 
+The lower table rolls traffic up per conversation, so you see accumulated
+cost per Claude Code session instead of one line per request. Press v to
+switch it back to the recent-request list.
+
+Keys:
+  q  quit          p  pause        r  refresh now
+  s  cycle sort    a  all/llm      v  sessions/requests
+
 Options:
   --json      Print one snapshot as JSON
   --all       Include proxied Anthropic sideband traffic

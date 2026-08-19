@@ -153,6 +153,13 @@ rayline router top
 rayline router stop
 ```
 
+`rayline top` shows live requests on top and, below them, one line per Claude
+Code conversation with its accumulated tokens, cache hit rate, and agent mix.
+Press `v` to swap that lower table for the recent-request list, `a` to include
+proxied sideband traffic, and `q` to quit. Each request row folds its routing
+policy into one glyph: `→` passthrough, `↳` routed, `~` tunnel. The state
+column reads `·` started, `›` routed, `»` streaming, `✓` done, `✗` error.
+
 ## OpenClaw
 
 `rayline openclaw` runs OpenClaw against the Rayline router with a generated

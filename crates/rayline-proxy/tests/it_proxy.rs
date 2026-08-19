@@ -2074,3 +2074,96 @@ async fn wait_for_usage_updates(captured: &CapturedRequests) -> Vec<CapturedRequ
     }
     Vec::new()
 }
+
+/// End-to-end check of conversation attribution: two requests from one Claude
+/// Code session, one carrying only `metadata.user_id`, must land in a single
+/// session rollup with their token cost summed.
+#[tokio::test]
+async fn proxy_groups_requests_by_claude_code_session() {
+    init_tracing();
+    let anthropic = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::OK,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: Bytes::from_static(
+                br#"{"type":"message","usage":{"input_tokens":120,"output_tokens":7}}"#,
+            ),
+        },
+    )
+    .await;
+    let proxy_port = free_port();
+    let ca_dir = tempfile::tempdir().unwrap();
+    let mut opts = proxy_options(
+        proxy_port,
+        ca_dir.path(),
+        format!("https://127.0.0.1:{}", anthropic.port),
+        format!("https://127.0.0.1:{}", anthropic.port),
+        &[&anthropic],
+    );
+    let metrics = rayline_metrics::RouterMetrics::new("test-proxy");
+    opts.metrics = Some(metrics.clone() as rayline_metrics::SharedMetricsSink);
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+
+    let session_id = "28f8a688-6bd3-47a6-9aa3-3a91df07884c";
+    let client = proxied_client(proxy_port, &ca_cert_path);
+
+    // First leg: the dedicated header, as current Claude Code sends it.
+    client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-claude-code-session-id", session_id)
+        .header("anthropic-version", "2023-06-01")
+        .body(r#"{"model":"claude-opus-5"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    // Second leg: no header, session only in the metadata blob.
+    client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("anthropic-version", "2023-06-01")
+        .body(format!(
+            r#"{{"model":"claude-opus-5","metadata":{{"user_id":"{{\"session_id\":\"{session_id}\"}}"}}}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // Sideband traffic shares the session header but is not conversation cost.
+    client
+        .post("https://api.anthropic.com/api/oauth/token")
+        .header("x-claude-code-session-id", session_id)
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+
+    let snapshot = metrics.snapshot();
+    assert_eq!(
+        snapshot.sessions.len(),
+        1,
+        "both legs must resolve to the same conversation: {:?}",
+        snapshot.sessions
+    );
+    let session = &snapshot.sessions[0];
+    assert_eq!(session.session_id, session_id);
+    assert_eq!(
+        session.completed_requests, 2,
+        "sideband traffic must stay out of the rollup"
+    );
+    assert!(
+        session.models.contains(&"claude-opus-5".to_owned()),
+        "models: {:?}",
+        session.models
+    );
+    assert!(
+        snapshot
+            .recent
+            .iter()
+            .filter(|request| request.session_id.as_deref() == Some(session_id))
+            .count()
+            >= 2,
+        "request rows carry the conversation id too"
+    );
+}

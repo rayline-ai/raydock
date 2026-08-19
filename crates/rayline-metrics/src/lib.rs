@@ -11,6 +11,11 @@ pub const DEFAULT_METRICS_PORT: u16 = 20813;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// How many conversations to keep rollups for. A long-lived daemon serves many
+/// short sessions; without a bound the map would grow for the process lifetime.
+/// Least-recently-active sessions are dropped first.
+const SESSION_CAPACITY: usize = 64;
+
 pub type SharedMetricsSink = Arc<dyn MetricsSink>;
 
 pub trait MetricsSink: Send + Sync {
@@ -29,6 +34,11 @@ pub struct MetricsSnapshot {
     pub started_at_unix_ms: u64,
     pub active: Vec<RequestSnapshot>,
     pub recent: Vec<RequestSnapshot>,
+    /// Per-conversation rollups, most recently active first. One entry per
+    /// client session (Claude Code's `x-claude-code-session-id`), so `rayline
+    /// top` can report accumulated cost per conversation instead of per
+    /// request. Requests with no session identity are omitted.
+    pub sessions: Vec<SessionSnapshot>,
     pub totals: RouterTotals,
     pub llama_perf: Option<LlamaPerfSnapshot>,
 }
@@ -52,6 +62,9 @@ pub struct RouterTotals {
 #[derive(Clone, Debug, Serialize)]
 pub struct RequestSnapshot {
     pub request_id: String,
+    /// Client conversation this request belongs to, when the client advertises
+    /// one. Requests from one Claude Code session share this value.
+    pub session_id: Option<String>,
     pub route_id: Option<String>,
     pub source: String,
     pub state: String,
@@ -80,6 +93,39 @@ pub struct RequestSnapshot {
     pub cache_hit_ratio: Option<f64>,
 }
 
+/// Accumulated traffic for one client conversation.
+///
+/// Token counts cover requests this daemon has already finished, so they keep
+/// growing after a request drops out of the bounded `recent` ring.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    /// Requests this daemon has finished for the session, errors included.
+    pub completed_requests: u64,
+    pub errored_requests: u64,
+    /// Requests still in flight right now.
+    pub active_requests: usize,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub first_seen_unix_ms: u64,
+    pub last_activity_unix_ms: u64,
+    /// Distinct agent types seen in the session, first-seen order.
+    pub agent_types: Vec<String>,
+    /// Distinct models seen in the session, first-seen order.
+    pub models: Vec<String>,
+}
+
+impl RequestSnapshot {
+    /// Model to attribute the request to: what the router actually picked,
+    /// falling back to what the client asked for.
+    pub fn display_model(&self) -> Option<&str> {
+        self.selected_model
+            .as_deref()
+            .or(self.requested_model.as_deref())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LlamaPerfSnapshot {
     pub prefill_tokens_per_second: Option<f64>,
@@ -96,6 +142,9 @@ pub enum MetricsUpdate {
         requested_model: Option<String>,
         agent_id: Option<String>,
         agent_type: Option<String>,
+        /// Client conversation the request belongs to, when known.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     RouteDecided {
         request_id: String,
@@ -108,6 +157,9 @@ pub enum MetricsUpdate {
         task_class: Option<String>,
         agent_id: Option<String>,
         agent_type: Option<String>,
+        /// Client conversation the request belongs to, when known.
+        #[serde(default)]
+        session_id: Option<String>,
     },
     FirstToken {
         request_id: String,
@@ -151,10 +203,13 @@ pub struct RouterMetrics {
     started_at_unix_ms: u64,
     active: Mutex<HashMap<String, RequestRecord>>,
     recent: Mutex<VecDeque<RequestRecord>>,
+    sessions: Mutex<HashMap<String, SessionRecord>>,
+    session_touches: AtomicU64,
     totals: Mutex<RouterTotals>,
     llama_perf: Mutex<Option<LlamaPerfSnapshot>>,
     updates: broadcast::Sender<MetricsUpdate>,
     recent_capacity: usize,
+    session_capacity: usize,
 }
 
 impl RouterMetrics {
@@ -165,10 +220,13 @@ impl RouterMetrics {
             started_at_unix_ms: now_unix_ms(),
             active: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
+            sessions: Mutex::new(HashMap::new()),
+            session_touches: AtomicU64::new(0),
             totals: Mutex::new(RouterTotals::default()),
             llama_perf: Mutex::new(None),
             updates,
             recent_capacity: 200,
+            session_capacity: SESSION_CAPACITY,
         })
     }
 
@@ -195,18 +253,104 @@ impl RouterMetrics {
             .expect("metrics totals lock poisoned")
             .clone();
         totals.active_requests = active.len();
+        let sessions = self.session_snapshots(&active);
         MetricsSnapshot {
             ok: true,
             runtime: self.runtime.clone(),
             started_at_unix_ms: self.started_at_unix_ms,
             active,
             recent,
+            sessions,
             totals,
             llama_perf: self
                 .llama_perf
                 .lock()
                 .expect("metrics llama lock poisoned")
                 .clone(),
+        }
+    }
+
+    /// Roll up finished traffic per conversation and fold in the requests that
+    /// are still in flight. Most recently active session first.
+    fn session_snapshots(&self, active: &[RequestSnapshot]) -> Vec<SessionSnapshot> {
+        let sessions = self
+            .sessions
+            .lock()
+            .expect("metrics sessions lock poisoned");
+        let mut snapshots = sessions
+            .values()
+            .map(SessionRecord::snapshot)
+            .collect::<Vec<_>>();
+        drop(sessions);
+
+        for request in active {
+            let Some(session_id) = request.session_id.as_deref() else {
+                continue;
+            };
+            match snapshots
+                .iter_mut()
+                .find(|snapshot| snapshot.session_id == session_id)
+            {
+                Some(snapshot) => {
+                    snapshot.active_requests += 1;
+                    snapshot.last_activity_unix_ms = snapshot
+                        .last_activity_unix_ms
+                        .max(request.started_at_unix_ms);
+                    push_distinct(&mut snapshot.agent_types, request.agent_type.as_deref());
+                    push_distinct(&mut snapshot.models, request.display_model());
+                }
+                None => snapshots.push(SessionSnapshot {
+                    session_id: session_id.to_owned(),
+                    completed_requests: 0,
+                    errored_requests: 0,
+                    active_requests: 1,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    first_seen_unix_ms: request.started_at_unix_ms,
+                    last_activity_unix_ms: request.started_at_unix_ms,
+                    agent_types: request.agent_type.iter().cloned().collect(),
+                    models: request
+                        .display_model()
+                        .map(ToOwned::to_owned)
+                        .into_iter()
+                        .collect(),
+                }),
+            }
+        }
+        snapshots
+            .sort_by(|left, right| right.last_activity_unix_ms.cmp(&left.last_activity_unix_ms));
+        snapshots
+    }
+
+    /// Fold a finished request into its conversation rollup, evicting the
+    /// least-recently-active session once the map is over capacity.
+    fn record_session_completion(&self, record: &RequestRecord, now: u64) {
+        let Some(session_id) = record.session_id.clone() else {
+            return;
+        };
+        // Order evictions by a counter rather than the wall clock: bursty
+        // traffic finishes many requests inside one millisecond, and ties there
+        // would evict an arbitrary session instead of the coldest one.
+        let touch = self.session_touches.fetch_add(1, Ordering::Relaxed);
+        let mut sessions = self
+            .sessions
+            .lock()
+            .expect("metrics sessions lock poisoned");
+        let entry = sessions
+            .entry(session_id.clone())
+            .or_insert_with(|| SessionRecord::new(session_id, record.started_at_unix_ms));
+        entry.absorb(record, now);
+        entry.last_touch = touch;
+        while sessions.len() > self.session_capacity {
+            let Some(coldest) = sessions
+                .values()
+                .min_by_key(|session| session.last_touch)
+                .map(|session| session.session_id.clone())
+            else {
+                break;
+            };
+            sessions.remove(&coldest);
         }
     }
 
@@ -223,6 +367,7 @@ impl RouterMetrics {
                 requested_model,
                 agent_id,
                 agent_type,
+                session_id,
             } => {
                 let mut active = self.active.lock().expect("metrics active lock poisoned");
                 let record = active
@@ -230,6 +375,7 @@ impl RouterMetrics {
                     .or_insert_with(|| RequestRecord::new(request_id.clone(), now));
                 record.source = source.clone();
                 record.state = "started".to_owned();
+                merge_option(&mut record.session_id, session_id.clone());
                 merge_option(&mut record.requested_model, requested_model.clone());
                 merge_option(&mut record.agent_id, agent_id.clone());
                 merge_option(&mut record.agent_type, agent_type.clone());
@@ -245,6 +391,7 @@ impl RouterMetrics {
                 task_class,
                 agent_id,
                 agent_type,
+                session_id,
             } => {
                 let mut active = self.active.lock().expect("metrics active lock poisoned");
                 let record = active
@@ -252,6 +399,7 @@ impl RouterMetrics {
                     .or_insert_with(|| RequestRecord::new(request_id.clone(), now));
                 record.state = "routed".to_owned();
                 record.target = Some(target.clone());
+                merge_option(&mut record.session_id, session_id.clone());
                 merge_option(&mut record.route_id, route_id.clone());
                 merge_option(&mut record.endpoint_id, endpoint_id.clone());
                 merge_option(&mut record.selected_model, selected_model.clone());
@@ -463,6 +611,7 @@ impl RouterMetrics {
     }
 
     fn push_recent(&self, record: RequestRecord) {
+        self.record_session_completion(&record, now_unix_ms());
         {
             let mut totals = self.totals.lock().expect("metrics totals lock poisoned");
             totals.completed_requests = totals.completed_requests.saturating_add(1);
@@ -495,6 +644,7 @@ impl MetricsSink for RouterMetrics {
 #[derive(Clone, Debug)]
 struct RequestRecord {
     request_id: String,
+    session_id: Option<String>,
     route_id: Option<String>,
     source: String,
     state: String,
@@ -524,6 +674,7 @@ impl RequestRecord {
     fn new(request_id: String, now: u64) -> Self {
         Self {
             request_id,
+            session_id: None,
             route_id: None,
             source: "unknown".to_owned(),
             state: "started".to_owned(),
@@ -578,6 +729,7 @@ impl RequestRecord {
         });
         RequestSnapshot {
             request_id: self.request_id.clone(),
+            session_id: self.session_id.clone(),
             route_id: self.route_id.clone(),
             source: self.source.clone(),
             state: self.state.clone(),
@@ -607,6 +759,14 @@ impl RequestRecord {
         }
     }
 
+    /// Model to attribute the request to: what the router actually picked,
+    /// falling back to what the client asked for.
+    fn display_model(&self) -> Option<&str> {
+        self.selected_model
+            .as_deref()
+            .or(self.requested_model.as_deref())
+    }
+
     fn local_prefill_tps(&self) -> Option<f64> {
         if self.prompt_tps.is_some() {
             return self.prompt_tps;
@@ -620,6 +780,90 @@ impl RequestRecord {
         let evaluated = processed.saturating_sub(cache);
         (evaluated > 0).then(|| evaluated as f64 / (prompt_ms / 1000.0))
     }
+}
+
+#[derive(Clone, Debug)]
+struct SessionRecord {
+    session_id: String,
+    completed_requests: u64,
+    errored_requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    first_seen_unix_ms: u64,
+    last_activity_unix_ms: u64,
+    /// Eviction order. See `record_session_completion`.
+    last_touch: u64,
+    agent_types: Vec<String>,
+    models: Vec<String>,
+}
+
+impl SessionRecord {
+    fn new(session_id: String, first_seen_unix_ms: u64) -> Self {
+        Self {
+            session_id,
+            completed_requests: 0,
+            errored_requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            first_seen_unix_ms,
+            last_activity_unix_ms: first_seen_unix_ms,
+            last_touch: 0,
+            agent_types: Vec::new(),
+            models: Vec::new(),
+        }
+    }
+
+    fn absorb(&mut self, record: &RequestRecord, now: u64) {
+        if record.state == "error" {
+            self.errored_requests = self.errored_requests.saturating_add(1);
+        }
+        self.completed_requests = self.completed_requests.saturating_add(1);
+        self.input_tokens = self
+            .input_tokens
+            .saturating_add(record.input_tokens.unwrap_or(0));
+        self.output_tokens = self
+            .output_tokens
+            .saturating_add(record.output_tokens.unwrap_or(0));
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(record.prompt_cache_tokens.unwrap_or(0));
+        self.first_seen_unix_ms = self.first_seen_unix_ms.min(record.started_at_unix_ms);
+        self.last_activity_unix_ms = self
+            .last_activity_unix_ms
+            .max(record.completed_at_unix_ms.unwrap_or(now));
+        push_distinct(&mut self.agent_types, record.agent_type.as_deref());
+        push_distinct(&mut self.models, record.display_model());
+    }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        SessionSnapshot {
+            session_id: self.session_id.clone(),
+            completed_requests: self.completed_requests,
+            errored_requests: self.errored_requests,
+            active_requests: 0,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            cache_read_tokens: self.cache_read_tokens,
+            first_seen_unix_ms: self.first_seen_unix_ms,
+            last_activity_unix_ms: self.last_activity_unix_ms,
+            agent_types: self.agent_types.clone(),
+            models: self.models.clone(),
+        }
+    }
+}
+
+/// Append `value` unless it is empty or already present. Keeps the short
+/// per-session agent/model lists stable in first-seen order.
+fn push_distinct(list: &mut Vec<String>, value: Option<&str>) {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    if list.iter().any(|existing| existing == value) {
+        return;
+    }
+    list.push(value.to_owned());
 }
 
 fn merge_option<T>(slot: &mut Option<T>, value: Option<T>) {
@@ -647,6 +891,89 @@ pub fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn started(request_id: &str, session_id: Option<&str>) -> MetricsUpdate {
+        MetricsUpdate::RequestStarted {
+            request_id: request_id.to_owned(),
+            source: "proxy".to_owned(),
+            requested_model: Some("claude-opus-5".to_owned()),
+            agent_id: None,
+            agent_type: Some("general-purpose".to_owned()),
+            session_id: session_id.map(ToOwned::to_owned),
+        }
+    }
+
+    fn completed(request_id: &str, input: u64, output: u64) -> MetricsUpdate {
+        MetricsUpdate::RequestCompleted {
+            request_id: request_id.to_owned(),
+            status_code: Some(200),
+            input_tokens: Some(input),
+            output_tokens: Some(output),
+            selected_model: Some("claude-opus-5".to_owned()),
+        }
+    }
+
+    #[test]
+    fn accumulates_token_cost_per_session() {
+        let metrics = RouterMetrics::new("test-router");
+        metrics.record(started("req-1", Some("session-a")));
+        metrics.record(completed("req-1", 100, 10));
+        metrics.record(started("req-2", Some("session-a")));
+        metrics.record(completed("req-2", 200, 20));
+        metrics.record(started("req-3", Some("session-b")));
+        metrics.record(completed("req-3", 5, 1));
+        // Still in flight: counted as live, not as completed.
+        metrics.record(started("req-4", Some("session-a")));
+
+        let snapshot = metrics.snapshot();
+        let session = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "session-a")
+            .expect("session-a rollup");
+        assert_eq!(session.completed_requests, 2);
+        assert_eq!(session.active_requests, 1);
+        assert_eq!(session.input_tokens, 300);
+        assert_eq!(session.output_tokens, 30);
+        assert_eq!(session.agent_types, vec!["general-purpose".to_owned()]);
+        assert_eq!(session.models, vec!["claude-opus-5".to_owned()]);
+        assert_eq!(snapshot.sessions.len(), 2);
+    }
+
+    /// Requests with no conversation id (Codex, direct API clients) must not
+    /// invent a rollup — they would all collapse into one bogus session.
+    #[test]
+    fn skips_rollups_for_requests_without_a_session() {
+        let metrics = RouterMetrics::new("test-router");
+        metrics.record(started("req-1", None));
+        metrics.record(completed("req-1", 100, 10));
+
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.sessions.is_empty());
+        assert_eq!(snapshot.totals.input_tokens, 100);
+    }
+
+    /// A long-lived daemon serves many short conversations. Without a bound the
+    /// rollup map would grow for the whole process lifetime.
+    #[test]
+    fn evicts_least_recently_active_sessions_over_capacity() {
+        let metrics = RouterMetrics::new("test-router");
+        for index in 0..(SESSION_CAPACITY + 5) {
+            let request_id = format!("req-{index}");
+            metrics.record(started(&request_id, Some(&format!("session-{index}"))));
+            metrics.record(completed(&request_id, 1, 1));
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.sessions.len(), SESSION_CAPACITY);
+        assert!(
+            snapshot
+                .sessions
+                .iter()
+                .all(|session| session.session_id != "session-0"),
+            "the oldest session must be evicted first"
+        );
+    }
+
     #[test]
     fn records_request_lifecycle_in_memory() {
         let metrics = RouterMetrics::new("test-router");
@@ -656,6 +983,7 @@ mod tests {
             requested_model: Some("rayline-router".to_owned()),
             agent_id: Some("agent-1".to_owned()),
             agent_type: Some("Explore".to_owned()),
+            session_id: None,
         });
         metrics.record(MetricsUpdate::RouteDecided {
             request_id: "req-1".to_owned(),
@@ -668,6 +996,7 @@ mod tests {
             task_class: Some("subagent".to_owned()),
             agent_id: Some("agent-1".to_owned()),
             agent_type: Some("Explore".to_owned()),
+            session_id: None,
         });
 
         let active = metrics.snapshot();
@@ -704,6 +1033,7 @@ mod tests {
             requested_model: Some("rayline-router".to_owned()),
             agent_id: None,
             agent_type: None,
+            session_id: None,
         });
         metrics.record(MetricsUpdate::RequestCompleted {
             request_id: "req-1".to_owned(),
@@ -850,6 +1180,7 @@ mod tests {
             requested_model: Some("local-router".to_owned()),
             agent_id: None,
             agent_type: None,
+            session_id: None,
         });
         metrics.record(MetricsUpdate::RouteDecided {
             request_id: "req-1".to_owned(),
@@ -862,6 +1193,7 @@ mod tests {
             task_class: None,
             agent_id: None,
             agent_type: Some("Explore".to_owned()),
+            session_id: None,
         });
         metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
             prefill_tokens_per_second: Some(321.0),
@@ -888,6 +1220,7 @@ mod tests {
                 task_class: None,
                 agent_id: None,
                 agent_type: Some("Explore".to_owned()),
+                session_id: None,
             });
         }
         metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {

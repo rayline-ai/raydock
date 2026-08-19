@@ -66,6 +66,12 @@ pub const ANTHROPIC_HOST: &str = "api.anthropic.com";
 pub const DEFAULT_ANTHROPIC_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_ROUTER_URL: &str = "https://api.rayline.ai";
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
+/// Claude Code stamps every request of one conversation with the same session
+/// UUID. It is the only client-supplied handle that ties a main-agent request
+/// to its subagent requests, so `rayline top` groups per-conversation cost by
+/// it. Older clients omit the header; `metadata.user_id` carries the same UUID
+/// as a JSON blob and is used as the fallback.
+const CLAUDE_CODE_SESSION_ID_HEADER: &str = "x-claude-code-session-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 /// Claude Code writes `agent-<id>.meta.json` (which carries `agentType`)
 /// concurrently with — sometimes a few ms after — it fires the subagent's
@@ -615,6 +621,12 @@ async fn forward_anthropic_request(
         .map(|p| p.as_str())
         .unwrap_or("/");
     let bytes = body.collect().await?.to_bytes();
+    // Only the LLM call is conversation cost. Sideband legs (oauth refresh,
+    // telemetry, token counting) carry the same session header and would
+    // otherwise inflate every per-conversation rollup.
+    let session_id = (parts.method == Method::POST && parts.uri.path() == "/v1/messages")
+        .then(|| claude_code_session_id(&parts.headers, &bytes))
+        .flatten();
     let agent_id = claude_code_agent_id(&parts.headers)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| "<none>".to_owned());
@@ -685,6 +697,7 @@ async fn forward_anthropic_request(
             requested_model: body_model.clone(),
             agent_id: none_if_marker(&agent_id),
             agent_type: agent_type.clone(),
+            session_id: session_id.clone(),
         });
         metrics.record(MetricsUpdate::RouteDecided {
             request_id: request_id.clone(),
@@ -704,6 +717,7 @@ async fn forward_anthropic_request(
             task_class: None,
             agent_id: none_if_marker(&agent_id),
             agent_type: agent_type.clone(),
+            session_id: session_id.clone(),
         });
     }
     let route_status_generation = state.route_status_generation.load(Ordering::SeqCst);
@@ -838,6 +852,7 @@ async fn forward_anthropic_request(
                 task_class: route_status.task_class.clone(),
                 agent_id: none_if_marker(&agent_id),
                 agent_type: agent_type.clone(),
+                session_id: session_id.clone(),
             });
         }
         let pooled_launch_status = state.opts.subscription_pool.is_some()
@@ -2994,6 +3009,36 @@ fn normalize_model_name(model: &str) -> String {
     }
 }
 
+/// Conversation the request belongs to. Prefers the dedicated header and falls
+/// back to the `metadata.user_id` JSON blob Claude Code also sends. Purely
+/// observational: nothing about routing depends on it.
+fn claude_code_session_id(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    headers
+        .get(CLAUDE_CODE_SESSION_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| session_id_from_request_metadata(body))
+}
+
+/// Claude Code sends `metadata.user_id` as a JSON *string* holding a small
+/// object: `{"device_id":..., "account_uuid":..., "session_id":...}`.
+fn session_id_from_request_metadata(body: &[u8]) -> Option<String> {
+    let user_id = serde_json::from_slice::<Value>(body)
+        .ok()?
+        .pointer("/metadata/user_id")?
+        .as_str()?
+        .to_owned();
+    serde_json::from_str::<Value>(&user_id)
+        .ok()?
+        .get("session_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn claude_code_agent_id(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(CLAUDE_CODE_AGENT_ID_HEADER)
@@ -4712,6 +4757,51 @@ mod tests {
     /// `tests/fixtures/agent-test.meta.json` was sanitized from an actual capture
     /// (description scrubbed; agentType value kept verbatim).
     ///
+    /// Golden contract for the conversation id. Captured from
+    /// `claude-cli/2.1.235`: the header is authoritative, and `metadata.user_id`
+    /// carries the same UUID as a JSON *string* for clients that omit it.
+    /// Update this test if Claude Code changes either shape.
+    #[test]
+    fn golden_contract_pins_cc_session_id_shape() {
+        assert_eq!(
+            CLAUDE_CODE_SESSION_ID_HEADER, "x-claude-code-session-id",
+            "header constant must match the documented CC header name"
+        );
+        let session_id = "28f8a688-6bd3-47a6-9aa3-3a91df07884c";
+        let body = serde_json::json!({
+            "model": "claude-sonnet-5",
+            "metadata": {
+                "user_id": format!(
+                    "{{\"device_id\":\"7eb390\",\"account_uuid\":\"\",\"session_id\":\"{session_id}\"}}"
+                ),
+            },
+        })
+        .to_string();
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            claude_code_session_id(&headers, body.as_bytes()).as_deref(),
+            Some(session_id),
+            "metadata.user_id must resolve the session when the header is absent"
+        );
+
+        headers.insert(
+            HeaderName::from_static(CLAUDE_CODE_SESSION_ID_HEADER),
+            HeaderValue::from_static("28f8a688-6bd3-47a6-9aa3-3a91df07884c"),
+        );
+        assert_eq!(
+            claude_code_session_id(&headers, b"not json").as_deref(),
+            Some(session_id),
+            "the header alone must be enough"
+        );
+
+        assert_eq!(
+            claude_code_session_id(&HeaderMap::new(), b"{\"model\":\"x\"}"),
+            None,
+            "a request with no conversation id must stay unattributed"
+        );
+    }
+
     /// Path layout written to a temp dir:
     ///   <projects_root>/<project-dir>/<session-dir>/subagents/agent-<id>.meta.json
     ///

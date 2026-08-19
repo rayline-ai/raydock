@@ -47,6 +47,9 @@ pub const MAIN_MODEL_ENV: &str = "RAYLINE_MAIN_MODEL";
 pub const SUBAGENT_ENDPOINT_ENV: &str = "RAYLINE_SUBAGENT_ENDPOINT";
 pub const SUBAGENT_MODEL_ENV: &str = "RAYLINE_SUBAGENT_MODEL";
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
+/// Conversation id Claude Code stamps on every request of one session. Carried
+/// through to metrics so `rayline top` can roll up cost per conversation.
+const CLAUDE_CODE_SESSION_ID_HEADER: &str = "x-claude-code-session-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
 const OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
 const OPENAI_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
@@ -1151,6 +1154,10 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
         .get(RAYLINE_AGENT_TYPE_HEADER)
         .and_then(header_str)
         .unwrap_or("<none>");
+    let session_id = headers
+        .get(CLAUDE_CODE_SESSION_ID_HEADER)
+        .and_then(header_str)
+        .map(ToOwned::to_owned);
     info!(
         "local route {} requested={} selected={} policy={} task={} agent_id={} agent_type={} elapsed_ms={}",
         route_target_label(&decision.target),
@@ -1180,6 +1187,7 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             task_class: Some(decision.task_class.clone()),
             agent_id: (agent_id != "<none>").then(|| agent_id.to_owned()),
             agent_type: (agent_type != "<none>").then(|| agent_type.to_owned()),
+            session_id,
         });
     }
     match &decision.target {
@@ -1272,6 +1280,9 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
             task_class: Some(decision.task_class.clone()),
             agent_id: (subagent != "<none>").then(|| subagent.to_owned()),
             agent_type: (subagent != "<none>").then(|| subagent.to_owned()),
+            // Codex has no conversation header we have confirmed; leave the
+            // rollup unattributed rather than guess at one.
+            session_id: None,
         });
     }
 
@@ -7101,6 +7112,7 @@ mod tests {
             requested_model: Some("claude-opus".to_owned()),
             agent_id: None,
             agent_type: None,
+            session_id: None,
         });
 
         emit_completed_metrics(

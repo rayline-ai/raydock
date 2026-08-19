@@ -32,6 +32,8 @@ const TOP_TRACE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TOP_TRACE_LOOKBACK: Duration = Duration::from_secs(12 * 60 * 60);
 const TOP_TRACE_MATCH_WINDOW_MS: u64 = 120_000;
 const PROXIED_TRAFFIC_POLICY: &str = "selective_passthrough_path";
+/// Terminal width at which the request table shows its full column set.
+const TOP_WIDE_WIDTH: u16 = 120;
 pub const PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS: &str = "selective-subagents";
 pub const PROXY_ROUTING_MODE_PASSTHROUGH: &str = "passthrough";
 pub const DECISION_PLANE_HOSTED: &str = "hosted";
@@ -440,12 +442,29 @@ impl TraceUsage {
     }
 }
 
+/// Token deltas the Claude trace overlay applied to one row, so the same
+/// correction can be folded into the run totals and the session rollups.
+#[derive(Clone, Copy, Default)]
+struct TraceDelta {
+    input: i128,
+    output: i128,
+    cache_read: i128,
+}
+
+impl TraceDelta {
+    fn add(&mut self, other: Self) {
+        self.input += other.input;
+        self.output += other.output;
+        self.cache_read += other.cache_read;
+    }
+}
+
 fn enrich_top_snapshot_with_trace_usages(snapshot: &mut Value, usages: &[TraceUsage]) {
     if usages.is_empty() {
         return;
     }
-    let mut total_input_delta = 0i128;
-    let mut total_output_delta = 0i128;
+    let mut total = TraceDelta::default();
+    let mut per_session: BTreeMap<String, TraceDelta> = BTreeMap::new();
     let Some(rows) = snapshot.get_mut("recent").and_then(Value::as_array_mut) else {
         return;
     };
@@ -453,22 +472,51 @@ fn enrich_top_snapshot_with_trace_usages(snapshot: &mut Value, usages: &[TraceUs
         if value_str(row, "state") != "completed" {
             continue;
         }
-        let Some((input_delta, output_delta)) = enrich_top_row_with_trace_usage(row, usages) else {
+        let session_id = value_str(row, "session_id").to_owned();
+        let Some(delta) = enrich_top_row_with_trace_usage(row, usages) else {
             continue;
         };
-        total_input_delta += input_delta;
-        total_output_delta += output_delta;
+        total.add(delta);
+        if session_id != "-" {
+            per_session.entry(session_id).or_default().add(delta);
+        }
     }
     if let Some(totals) = snapshot.get_mut("totals").and_then(Value::as_object_mut) {
-        adjust_object_u64(totals, "input_tokens", total_input_delta);
-        adjust_object_u64(totals, "output_tokens", total_output_delta);
+        adjust_object_u64(totals, "input_tokens", total.input);
+        adjust_object_u64(totals, "output_tokens", total.output);
+    }
+    adjust_session_rollups(snapshot, &per_session);
+}
+
+/// The daemon counts tokens from what it saw on the wire; the Claude trace is
+/// authoritative. Apply the same per-row correction to the session rollups so
+/// the Sessions table agrees with the request rows it summarizes.
+fn adjust_session_rollups(snapshot: &mut Value, per_session: &BTreeMap<String, TraceDelta>) {
+    if per_session.is_empty() {
+        return;
+    }
+    let Some(sessions) = snapshot.get_mut("sessions").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for session in sessions {
+        let session_id = value_str(session, "session_id").to_owned();
+        let Some(delta) = per_session.get(&session_id) else {
+            continue;
+        };
+        let Some(object) = session.as_object_mut() else {
+            continue;
+        };
+        adjust_object_u64(object, "input_tokens", delta.input);
+        adjust_object_u64(object, "output_tokens", delta.output);
+        adjust_object_u64(object, "cache_read_tokens", delta.cache_read);
     }
 }
 
-fn enrich_top_row_with_trace_usage(row: &mut Value, usages: &[TraceUsage]) -> Option<(i128, i128)> {
+fn enrich_top_row_with_trace_usage(row: &mut Value, usages: &[TraceUsage]) -> Option<TraceDelta> {
     let usage = find_matching_trace_usage(row, usages)?;
     let old_input = row_u64(row, "input_tokens").unwrap_or(0);
     let old_output = row_u64(row, "output_tokens").unwrap_or(0);
+    let old_cache_read = row_u64(row, "prompt_cache_tokens").unwrap_or(0);
     let total_input = usage.total_input_tokens();
 
     set_row_u64(row, "input_tokens", total_input);
@@ -486,10 +534,11 @@ fn enrich_top_row_with_trace_usage(row: &mut Value, usages: &[TraceUsage]) -> Op
     }
     set_row_str(row, "metrics_overlay", "claude_trace");
 
-    Some((
-        total_input as i128 - old_input as i128,
-        usage.output_tokens as i128 - old_output as i128,
-    ))
+    Some(TraceDelta {
+        input: total_input as i128 - old_input as i128,
+        output: usage.output_tokens as i128 - old_output as i128,
+        cache_read: usage.cache_read_input_tokens as i128 - old_cache_read as i128,
+    })
 }
 
 fn find_matching_trace_usage<'a>(row: &Value, usages: &'a [TraceUsage]) -> Option<&'a TraceUsage> {
@@ -816,6 +865,40 @@ fn adjust_object_u64(obj: &mut serde_json::Map<String, Value>, key: &str, delta:
     obj.insert(key.to_owned(), Value::from(next));
 }
 
+/// What the operator has toggled in the live view.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TopControls {
+    paused: bool,
+    sort: TopSort,
+    view: TopView,
+    show_all: bool,
+}
+
+/// Which second table `rayline top` shows under the live requests. Sessions is
+/// the default: one line per conversation answers "what is this costing me"
+/// without scrolling a few hundred near-identical request rows.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TopView {
+    Sessions,
+    Requests,
+}
+
+impl TopView {
+    fn next(self) -> Self {
+        match self {
+            Self::Sessions => Self::Requests,
+            Self::Requests => Self::Sessions,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions",
+            Self::Requests => "requests",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TopSort {
     Started,
@@ -873,15 +956,18 @@ async fn run_top_tui(
     let mut snapshot = Value::Null;
     let mut last_error: Option<String> = None;
     let mut last_fetch: Option<Instant> = None;
-    let mut paused = false;
     let mut force_refresh = true;
     let mut needs_draw = true;
-    let mut sort = TopSort::Started;
-    let mut show_all = show_all;
+    let mut controls = TopControls {
+        paused: false,
+        sort: TopSort::Started,
+        view: TopView::Sessions,
+        show_all,
+    };
 
     loop {
         let should_refresh = force_refresh
-            || (!paused
+            || (!controls.paused
                 && last_fetch
                     .map(|last| last.elapsed() >= TOP_REFRESH_INTERVAL)
                     .unwrap_or(true));
@@ -902,14 +988,7 @@ async fn run_top_tui(
         }
 
         if needs_draw {
-            draw_top(
-                &mut stdout,
-                &snapshot,
-                last_error.as_deref(),
-                paused,
-                sort,
-                show_all,
-            )?;
+            draw_top(&mut stdout, &snapshot, last_error.as_deref(), controls)?;
             needs_draw = false;
         }
 
@@ -919,16 +998,20 @@ async fn run_top_tui(
                     KeyCode::Char('q') | KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('p') => {
-                        paused = !paused;
+                        controls.paused = !controls.paused;
                         needs_draw = true;
                     }
                     KeyCode::Char('r') => force_refresh = true,
                     KeyCode::Char('s') => {
-                        sort = sort.next();
+                        controls.sort = controls.sort.next();
                         needs_draw = true;
                     }
                     KeyCode::Char('a') => {
-                        show_all = !show_all;
+                        controls.show_all = !controls.show_all;
+                        needs_draw = true;
+                    }
+                    KeyCode::Char('v') => {
+                        controls.view = controls.view.next();
                         needs_draw = true;
                     }
                     _ => {}
@@ -946,16 +1029,14 @@ fn draw_top(
     stdout: &mut io::Stdout,
     snapshot: &Value,
     last_error: Option<&str>,
-    paused: bool,
-    sort: TopSort,
-    show_all: bool,
+    controls: TopControls,
 ) -> io::Result<()> {
     let (width, height) = terminal::size().map_err(io::Error::other)?;
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
     let mut y = 0;
     y = draw_title(stdout, y, width, "Rayline Local Router")?;
-    y = draw_top_summary(stdout, y, width, snapshot, paused, sort, show_all)?;
+    y = draw_top_summary(stdout, y, width, snapshot, controls)?;
     if let Some(error) = last_error {
         y = draw_colored_line(
             stdout,
@@ -967,8 +1048,7 @@ fn draw_top(
     }
     y = draw_line(stdout, y, width, "")?;
 
-    let active = sorted_top_rows(snapshot, "active", sort, show_all);
-    let recent = sorted_top_rows(snapshot, "recent", sort, show_all);
+    let active = sorted_top_rows(snapshot, "active", controls.sort, controls.show_all);
     let remaining = height.saturating_sub(y).saturating_sub(1);
     let active_budget = if remaining > 12 {
         remaining / 2
@@ -980,17 +1060,27 @@ fn draw_top(
         y,
         width,
         y.saturating_add(active_budget),
-        "Active",
-        &active,
+        TableSection::requests("Active", &active),
     )?;
     if y < height.saturating_sub(1) {
         y = draw_line(stdout, y, width, "")?;
     }
     let footer_y = height.saturating_sub(1);
-    y = draw_table_section(stdout, y, width, footer_y, "Recent", &recent)?;
+    let recent;
+    let section = match controls.view {
+        TopView::Sessions => {
+            recent = session_rows(snapshot);
+            TableSection::sessions(&recent)
+        }
+        TopView::Requests => {
+            recent = sorted_top_rows(snapshot, "recent", controls.sort, controls.show_all);
+            TableSection::requests("Recent", &recent)
+        }
+    };
+    y = draw_table_section(stdout, y, width, footer_y, section)?;
 
     let _ = y;
-    let footer = "q/Esc quit  p pause  r refresh  s sort  a all/llm  | daemon-memory metrics  | --json for scripts";
+    let footer = "q quit  p pause  r refresh  s sort  a all/llm  v sessions/requests  |  \u{b7} start \u{203a} routed \u{bb} stream \u{2713} done \u{2717} error  |  \u{2192} passthrough \u{21b3} routed  ~ tunnel";
     queue!(
         stdout,
         MoveTo(0, footer_y),
@@ -1007,10 +1097,14 @@ fn draw_top_summary(
     mut y: u16,
     width: u16,
     snapshot: &Value,
-    paused: bool,
-    sort: TopSort,
-    show_all: bool,
+    controls: TopControls,
 ) -> io::Result<u16> {
+    let TopControls {
+        paused,
+        sort,
+        view,
+        show_all,
+    } = controls;
     let totals = snapshot.get("totals").unwrap_or(&Value::Null);
     let active = visible_row_count(snapshot, "active", show_all);
     let recent = visible_row_count(snapshot, "recent", show_all);
@@ -1020,7 +1114,7 @@ fn draw_top_summary(
         y,
         width,
         &format!(
-            "current active={active}  recent={recent}  traffic={}{}  mode={}  sort={}  refresh={}ms",
+            "current active={active}  recent={recent}  traffic={}{}  mode={}  view={}  sort={}  refresh={}ms",
             if show_all { "all" } else { "llm" },
             if !show_all && hidden > 0 {
                 format!(" hidden-proxied={hidden}")
@@ -1028,6 +1122,7 @@ fn draw_top_summary(
                 String::new()
             },
             if paused { "paused" } else { "live" },
+            view.label(),
             sort.label(),
             TOP_REFRESH_INTERVAL.as_millis(),
         ),
@@ -1068,52 +1163,106 @@ fn llama_perf_summary(snapshot: &Value) -> String {
     )
 }
 
+/// One table to draw: what it is, and the rows it holds.
+struct TableSection<'a> {
+    kind: TableKind,
+    heading: String,
+    rows: &'a [Value],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TableKind {
+    Requests,
+    Sessions,
+}
+
+impl<'a> TableSection<'a> {
+    fn requests(title: &str, rows: &'a [Value]) -> Self {
+        Self {
+            kind: TableKind::Requests,
+            heading: format!("{title} requests ({})", rows.len()),
+            rows,
+        }
+    }
+
+    fn sessions(rows: &'a [Value]) -> Self {
+        Self {
+            kind: TableKind::Sessions,
+            heading: format!("Sessions ({})", rows.len()),
+            rows,
+        }
+    }
+}
+
+impl TableKind {
+    fn header(self, width: u16) -> String {
+        match self {
+            Self::Requests => top_table_header(width),
+            Self::Sessions => session_table_header(width),
+        }
+    }
+
+    fn empty_label(self) -> &'static str {
+        match self {
+            Self::Requests => "no requests",
+            Self::Sessions => "no conversations seen yet",
+        }
+    }
+
+    fn render(self, row: &Value, width: u16) -> (String, Option<Color>) {
+        match self {
+            Self::Requests => (top_table_row(row, width), top_row_color(row)),
+            Self::Sessions => (session_table_row(row, width), session_row_color(row)),
+        }
+    }
+}
+
 fn draw_table_section(
     stdout: &mut io::Stdout,
     mut y: u16,
     width: u16,
     bottom_exclusive: u16,
-    title: &str,
-    rows: &[Value],
+    section: TableSection<'_>,
 ) -> io::Result<u16> {
     if y >= bottom_exclusive {
         return Ok(y);
     }
 
-    y = draw_heading(
-        stdout,
-        y,
-        width,
-        &format!("{title} requests ({})", rows.len()),
-    )?;
+    y = draw_heading(stdout, y, width, &section.heading)?;
     if y >= bottom_exclusive {
         return Ok(y);
     }
 
-    y = draw_colored_line(stdout, y, width, Color::DarkGrey, &top_table_header(width))?;
-    if rows.is_empty() {
+    y = draw_colored_line(
+        stdout,
+        y,
+        width,
+        Color::DarkGrey,
+        &section.kind.header(width),
+    )?;
+    if section.rows.is_empty() {
         if y < bottom_exclusive {
-            y = draw_line(stdout, y, width, "no requests")?;
+            y = draw_line(stdout, y, width, section.kind.empty_label())?;
         }
         return Ok(y);
     }
 
     let available = bottom_exclusive.saturating_sub(y) as usize;
-    let rendered_rows = rows.len().min(available);
-    for row in rows.iter().take(rendered_rows) {
-        let rendered = top_table_row(row, width);
-        y = match top_row_color(row) {
+    let rendered_rows = section.rows.len().min(available);
+    for row in section.rows.iter().take(rendered_rows) {
+        let (rendered, color) = section.kind.render(row, width);
+        y = match color {
             Some(color) => draw_colored_line(stdout, y, width, color, &rendered)?,
             None => draw_line(stdout, y, width, &rendered)?,
         };
     }
-    if rows.len() > rendered_rows && y < bottom_exclusive {
+    if section.rows.len() > rendered_rows && y < bottom_exclusive {
         y = draw_colored_line(
             stdout,
             y,
             width,
             Color::DarkGrey,
-            &format!("... {} more", rows.len() - rendered_rows),
+            &format!("... {} more", section.rows.len() - rendered_rows),
         )?;
     }
     Ok(y)
@@ -1166,7 +1315,121 @@ fn draw_line(stdout: &mut io::Stdout, y: u16, width: u16, text: &str) -> io::Res
 }
 
 fn top_row_color(row: &Value) -> Option<Color> {
+    if value_str(row, "state") == "error" {
+        return Some(Color::Red);
+    }
     (value_str(row, "target") == "local").then_some(Color::DarkCyan)
+}
+
+fn session_row_color(row: &Value) -> Option<Color> {
+    (row_u64(row, "active_requests").unwrap_or(0) > 0).then_some(Color::Green)
+}
+
+/// Conversation rollups the daemon accumulates, most recently active first.
+/// Empty until the daemon has finished at least one request that carried a
+/// session id.
+fn session_rows(snapshot: &Value) -> Vec<Value> {
+    snapshot
+        .get("sessions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn session_table_header(width: u16) -> String {
+    if width < TOP_WIDE_WIDTH {
+        format!(
+            "{:<8} {:>5} {:>4} {:>8} {:>8} {:>6} {:>8} MODELS",
+            "SESSION", "REQ", "LIVE", "IN", "OUT", "CACHE", "IDLE"
+        )
+    } else {
+        format!(
+            "{:<8} {:>6} {:>5} {:>4} {:>4} {:>8} {:>8} {:>6} {:>8} {:>8} MODELS",
+            "SESSION", "AGENTS", "REQ", "LIVE", "ERR", "IN", "OUT", "CACHE", "AGE", "IDLE"
+        )
+    }
+}
+
+fn session_table_row(row: &Value, width: u16) -> String {
+    let session = truncate_cell(&short_session_id(value_str(row, "session_id")), 8);
+    let requests = tally_cell(row, "completed_requests");
+    let live = tally_cell(row, "active_requests");
+    let input_tokens = count_cell(row, "input_tokens");
+    let output_tokens = count_cell(row, "output_tokens");
+    let cache = session_cache_cell(row);
+    let idle = unix_ms_age_cell(row, "last_activity_unix_ms");
+    let models = session_list_cell(row, "models", short_model_name);
+
+    if width < TOP_WIDE_WIDTH {
+        return format!(
+            "{session:<8} {requests:>5} {live:>4} {input_tokens:>8} {output_tokens:>8} {cache:>6} {idle:>8} {models}"
+        );
+    }
+
+    let agents = session_list_len(row, "agent_types").to_string();
+    let errors = tally_cell(row, "errored_requests");
+    let age = unix_ms_age_cell(row, "first_seen_unix_ms");
+    format!(
+        "{session:<8} {agents:>6} {requests:>5} {live:>4} {errors:>4} {input_tokens:>8} {output_tokens:>8} {cache:>6} {age:>8} {idle:>8} {models}"
+    )
+}
+
+/// Plain integer for a count of requests. Compacting `1357` to `1.4k` hides
+/// exactly the digits an operator is checking.
+fn tally_cell(row: &Value, key: &str) -> String {
+    row_u64(row, key)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+fn session_list_len(row: &Value, key: &str) -> usize {
+    row.get(key)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
+}
+
+/// Share of the session's prompt tokens that were served from the cache.
+fn session_cache_cell(row: &Value) -> String {
+    let input_tokens = row_u64(row, "input_tokens").unwrap_or(0);
+    if input_tokens == 0 {
+        return "-".to_owned();
+    }
+    let cache_tokens = row_u64(row, "cache_read_tokens").unwrap_or(0);
+    format!(
+        "{}%",
+        format_compact_number(cache_tokens as f64 / input_tokens as f64 * 100.0, 0)
+    )
+}
+
+fn unix_ms_age_cell(row: &Value, key: &str) -> String {
+    let Some(value) = row_u64(row, key) else {
+        return "-".to_owned();
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(value);
+    format_ms(now.saturating_sub(value))
+}
+
+fn session_list_cell(row: &Value, key: &str, shorten: impl Fn(&str) -> String) -> String {
+    let entries = row
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(&shorten)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        "-".to_owned()
+    } else {
+        entries.join(", ")
+    }
 }
 
 fn sorted_top_rows(snapshot: &Value, key: &str, sort: TopSort, show_all: bool) -> Vec<Value> {
@@ -1198,31 +1461,34 @@ fn top_sort_value(row: &Value, sort: TopSort) -> f64 {
 }
 
 fn top_table_header(width: u16) -> String {
-    if width < 120 {
+    if width < TOP_WIDE_WIDTH {
         format!(
-            "{:<14} {:<10} {:<7} {:<10} {:>7} {:>7} {:>7} {:>6} {:>6} MODEL",
-            "REQ", "AGENT", "TARGET", "STATE", "OUT", "CACHE %", "TTFT", "PF", "TG"
+            "{:<10} {:<12} {:<1} {:<7} {:>7} {:>6} {:>8} {:>7} MODEL",
+            "REQ", "AGENT", "S", "ROUTE", "OUT", "CACHE", "TTFT", "TG"
         )
     } else {
         format!(
-            "{:<18} {:<12} {:<8} {:<10} {:>7} {:>7} {:>7} {:>8} {:>8} {:>6} {:>6} MODEL / POLICY",
-            "REQ", "AGENT", "TARGET", "STATE", "IN", "OUT", "CACHE %", "AGE", "TTFT", "PF", "TG"
+            "{:<10} {:<8} {:<13} {:<1} {:<7} {:>7} {:>7} {:>6} {:>8} {:>8} {:>7} {:>7} MODEL",
+            "REQ",
+            "SESSION",
+            "AGENT",
+            "S",
+            "ROUTE",
+            "IN",
+            "OUT",
+            "CACHE",
+            "AGE",
+            "TTFT",
+            "PF",
+            "TG"
         )
     }
 }
 
 fn top_table_row(row: &Value, width: u16) -> String {
-    let request_id = truncate_cell(
-        value_str(row, "request_id"),
-        if width < 120 { 14 } else { 18 },
-    );
-    let agent = truncate_cell(
-        value_str(row, "agent_type"),
-        if width < 120 { 10 } else { 12 },
-    );
-    let target_value = top_target_cell(row);
-    let target = truncate_cell(&target_value, 8);
-    let state = truncate_cell(value_str(row, "state"), 10);
+    let request_id = truncate_cell(&short_request_id(value_str(row, "request_id")), 10);
+    let state = state_glyph(value_str(row, "state"));
+    let route = truncate_cell(&top_route_cell(row), 7);
     let output_tokens = count_cell(row, "output_tokens");
     let ttft = ms_cell(row, "ttft_ms");
     let prefill_tps = rate_cell(row, "prefill_tps");
@@ -1230,16 +1496,97 @@ fn top_table_row(row: &Value, width: u16) -> String {
     let cache_hit = percent_cell(row, "cache_hit_ratio");
     let model = top_model_cell(row);
 
-    if width < 120 {
+    if width < TOP_WIDE_WIDTH {
+        let agent = truncate_cell(value_str(row, "agent_type"), 12);
         return format!(
-            "{request_id:<14} {agent:<10} {target:<7} {state:<10} {output_tokens:>7} {cache_hit:>7} {ttft:>7} {prefill_tps:>6} {generation_tps:>6} {model}"
+            "{request_id:<10} {agent:<12} {state:<1} {route:<7} {output_tokens:>7} {cache_hit:>6} {ttft:>8} {generation_tps:>7} {model}"
         );
     }
 
+    let agent = truncate_cell(value_str(row, "agent_type"), 13);
+    let session = truncate_cell(&short_session_id(value_str(row, "session_id")), 8);
     let input_tokens = count_cell(row, "input_tokens");
     let age = ms_cell(row, "duration_ms");
     format!(
-        "{request_id:<18} {agent:<12} {target:<8} {state:<10} {input_tokens:>7} {output_tokens:>7} {cache_hit:>7} {age:>8} {ttft:>8} {prefill_tps:>6} {generation_tps:>6} {model}"
+        "{request_id:<10} {session:<8} {agent:<13} {state:<1} {route:<7} {input_tokens:>7} {output_tokens:>7} {cache_hit:>6} {age:>8} {ttft:>8} {prefill_tps:>7} {generation_tps:>7} {model}"
+    )
+}
+
+/// Request ids are `req_<start-ms-hex>_<sequence-hex>`. The timestamp head is
+/// near-identical across concurrent requests, so only its tail plus the
+/// sequence carry information. Ids from other clients pass through untouched.
+fn short_request_id(request_id: &str) -> String {
+    let trimmed = request_id.strip_prefix("req_").unwrap_or(request_id);
+    let Some((head, sequence)) = trimmed.rsplit_once('_') else {
+        return trimmed.to_owned();
+    };
+    let head_tail = head
+        .chars()
+        .skip(head.chars().count().saturating_sub(4))
+        .collect::<String>();
+    format!("{head_tail}_{sequence}")
+}
+
+/// Conversation ids are UUIDs; the first block identifies one uniquely enough
+/// for a live view.
+fn short_session_id(session_id: &str) -> String {
+    match session_id.split_once('-') {
+        Some((head, _)) if !head.is_empty() => head.to_owned(),
+        _ => session_id.to_owned(),
+    }
+}
+
+/// Single glyph for the request lifecycle. Spelled-out states cost ten columns
+/// on every row and say the same thing.
+fn state_glyph(state: &str) -> char {
+    match state {
+        "started" => '\u{b7}',
+        "routed" => '\u{203a}',
+        "streaming" => '\u{bb}',
+        "completed" => '\u{2713}',
+        "error" => '\u{2717}',
+        _ => '?',
+    }
+}
+
+/// Glyph for how the route was decided. The policy names are long and repeat on
+/// nearly every row, so the whole decision folds into one narrow cell next to
+/// the target.
+fn policy_glyph(policy: &str) -> char {
+    match policy {
+        PROXIED_TRAFFIC_POLICY | "non_anthropic_connect" => '~',
+        "passthrough"
+        | "anthropic_passthrough"
+        | "selective_main_passthrough"
+        | "selective_subagent_passthrough" => '\u{2192}',
+        "selective_virtual_model"
+        | "selective_virtual_model_lookup"
+        | "selective_provider_model_lookup"
+        | "selective_model_list" => '?',
+        "-" => ' ',
+        _ => '\u{21b3}',
+    }
+}
+
+/// Where the request went, in one short word.
+fn short_target(row: &Value) -> String {
+    if is_proxied_traffic(row) {
+        return "tunnel".to_owned();
+    }
+    match value_str(row, "target") {
+        "anthropic" | "remote" => "cloud".to_owned(),
+        "blind_tunnel" => "tunnel".to_owned(),
+        target => target.to_owned(),
+    }
+}
+
+/// Routing decision plus destination, for example `→cloud` for a passthrough
+/// to the Anthropic API. Replaces the old TARGET column and `/ POLICY` suffix.
+fn top_route_cell(row: &Value) -> String {
+    format!(
+        "{}{}",
+        policy_glyph(value_str(row, "policy")),
+        short_target(row)
     )
 }
 
@@ -1276,14 +1623,23 @@ fn format_top_snapshot(snapshot: &Value, show_all: bool) -> String {
     if active == 0 {
         output.push_str("no active requests\n");
     }
+    let sessions = session_rows(snapshot);
+    if !sessions.is_empty() {
+        output.push_str(&format!("\nsessions: {}\n", sessions.len()));
+        for row in &sessions {
+            output.push_str(&format_session_row(row));
+        }
+    }
     output
 }
 
 fn format_top_row(row: &Value) -> String {
     let request_id = value_str(row, "request_id");
+    let session = short_session_id(value_str(row, "session_id"));
     let agent = value_str(row, "agent_type");
     let target = top_target_cell(row);
     let model = value_str(row, "selected_model");
+    let policy = top_policy_cell(row);
     let state = value_str(row, "state");
     let ttft = ms_cell(row, "ttft_ms");
     let output_tokens = count_cell(row, "output_tokens");
@@ -1291,7 +1647,21 @@ fn format_top_row(row: &Value) -> String {
     let generation_tps = rate_cell(row, "output_tps");
     let cache_hit = percent_cell(row, "cache_hit_ratio");
     format!(
-        "{request_id:<22} {agent:<12} {target:<10} {state:<10} out={output_tokens:<7} cache%={cache_hit:<7} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} {model}\n"
+        "{request_id:<22} {session:<10} {agent:<12} {target:<10} {state:<10} out={output_tokens:<7} cache%={cache_hit:<7} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} {model} / {policy}\n"
+    )
+}
+
+fn format_session_row(row: &Value) -> String {
+    let session = short_session_id(value_str(row, "session_id"));
+    let requests = tally_cell(row, "completed_requests");
+    let live = tally_cell(row, "active_requests");
+    let input_tokens = count_cell(row, "input_tokens");
+    let output_tokens = count_cell(row, "output_tokens");
+    let cache = session_cache_cell(row);
+    let idle = unix_ms_age_cell(row, "last_activity_unix_ms");
+    let models = session_list_cell(row, "models", short_model_name);
+    format!(
+        "{session:<10} requests={requests:<7} live={live:<5} in={input_tokens:<8} out={output_tokens:<8} cache%={cache:<6} idle={idle:<8} {models}\n"
     )
 }
 
@@ -1448,6 +1818,9 @@ fn format_compact_number(value: f64, plain_decimals: usize) -> String {
     }
 }
 
+/// Model the row should be attributed to. The routing policy used to be
+/// appended here; it now lives in the ROUTE glyph, which keeps the column
+/// narrow enough to survive without truncation.
 fn top_model_cell(row: &Value) -> String {
     let model = if is_proxied_traffic(row) {
         value_str(row, "endpoint_id")
@@ -1461,12 +1834,13 @@ fn top_model_cell(row: &Value) -> String {
         "-" => value_str(row, "requested_model"),
         selected => selected,
     };
-    let policy = top_policy_cell(row);
-    if policy == "-" {
-        model.to_owned()
-    } else {
-        format!("{model} / {policy}")
-    }
+    short_model_name(model)
+}
+
+/// Drop the vendor prefix every Claude model id carries. `claude-opus-5`
+/// reads as `opus-5`, which fits the column without truncation.
+fn short_model_name(model: &str) -> String {
+    model.strip_prefix("claude-").unwrap_or(model).to_owned()
 }
 
 fn truncate_cell(value: &str, width: usize) -> String {
@@ -1493,7 +1867,7 @@ fn fit_width(text: &str, width: usize) -> String {
         return output;
     }
     output.pop();
-    output.push('~');
+    output.push('\u{2026}');
     output
 }
 
@@ -4194,23 +4568,29 @@ mod tests {
 
     #[test]
     fn top_table_places_cache_percent_after_token_columns() {
-        let header = top_table_header(140);
-        let input = header.find("IN").expect("header includes input column");
-        let output = header.find("OUT").expect("header includes output column");
-        let cache = header
-            .find("CACHE %")
-            .expect("header includes cache percent column");
-        let age = header.rfind("AGE").expect("header includes age column");
-        assert!(input < output);
-        assert!(output < cache);
-        assert!(cache < age);
+        // Compare column order by token, not byte offset: ROUTE contains "OUT"
+        // and AGENT contains "AGE".
+        let columns = top_table_header(140)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let column = |name: &str| {
+            columns
+                .iter()
+                .position(|value| value == name)
+                .unwrap_or_else(|| panic!("header includes the {name} column"))
+        };
+        assert!(column("IN") < column("OUT"));
+        assert!(column("OUT") < column("CACHE"));
+        assert!(column("CACHE") < column("AGE"));
 
         let row = serde_json::json!({
-            "request_id": "req",
+            "request_id": "req_1a01b018c97_5f",
+            "session_id": "28f8a688-6bd3-47a6-9aa3-3a91df07884c",
             "agent_type": "main",
             "target": "local",
-            "state": "done",
-            "selected_model": "model",
+            "state": "streaming",
+            "selected_model": "claude-opus-5",
             "input_tokens": 10_200,
             "output_tokens": 1_200_000,
             "duration_ms": 10_200,
@@ -4224,10 +4604,122 @@ mod tests {
             .split_whitespace()
             .map(str::to_owned)
             .collect::<Vec<_>>();
+        // req, session, agent, state glyph, route, then the numeric columns.
+        assert_eq!(cells[0], "8c97_5f");
+        assert_eq!(cells[1], "28f8a688");
         assert_eq!(
-            &cells[4..11],
+            &cells[5..12],
             ["10.2k", "1.2M", "88%", "10.2s", "999ms", "12.0k", "1.2M"]
         );
+        assert_eq!(cells[12], "opus-5", "model keeps its own column, no policy");
+    }
+
+    /// The policy name used to be appended to every model cell, which pushed the
+    /// model itself past the right edge. It is a glyph now.
+    #[test]
+    fn top_table_row_folds_policy_into_a_route_glyph() {
+        let row = serde_json::json!({
+            "request_id": "req_1a01b018c97_5f",
+            "agent_type": "-",
+            "target": "anthropic",
+            "state": "streaming",
+            "selected_model": "claude-sonnet-5",
+            "policy": "anthropic_passthrough",
+        });
+
+        assert_eq!(top_route_cell(&row), "\u{2192}cloud");
+        let rendered = top_table_row(&row, 140);
+        assert!(rendered.contains("\u{2192}cloud"), "{rendered}");
+        assert!(!rendered.contains("passthrough"), "{rendered}");
+        assert!(rendered.ends_with("sonnet-5"), "{rendered}");
+    }
+
+    #[test]
+    fn top_row_ids_drop_their_boilerplate() {
+        assert_eq!(short_request_id("req_1a01b018c97_5f"), "8c97_5f");
+        assert_eq!(short_request_id("client-supplied"), "client-supplied");
+        assert_eq!(
+            short_session_id("28f8a688-6bd3-47a6-9aa3-3a91df07884c"),
+            "28f8a688"
+        );
+        assert_eq!(short_session_id("-"), "-");
+        assert_eq!(short_model_name("claude-opus-5"), "opus-5");
+        assert_eq!(short_model_name("qwen3-coder"), "qwen3-coder");
+    }
+
+    #[test]
+    fn session_table_rolls_up_conversation_cost() {
+        let row = serde_json::json!({
+            "session_id": "28f8a688-6bd3-47a6-9aa3-3a91df07884c",
+            "completed_requests": 212,
+            "errored_requests": 1,
+            "active_requests": 3,
+            "input_tokens": 55_680_700u64,
+            "output_tokens": 88_384u64,
+            "cache_read_tokens": 54_000_000u64,
+            "agent_types": ["general-purpose", "Explore"],
+            "models": ["claude-opus-5", "claude-sonnet-5"],
+        });
+
+        assert_eq!(session_cache_cell(&row), "97%");
+        let rendered = session_table_row(&row, 140);
+        assert!(rendered.starts_with("28f8a688"), "{rendered}");
+        assert!(rendered.contains("212"), "{rendered}");
+        assert!(rendered.ends_with("opus-5, sonnet-5"), "{rendered}");
+        assert_eq!(
+            session_row_color(&row),
+            Some(Color::Green),
+            "a session with live requests is highlighted"
+        );
+    }
+
+    /// The Claude trace is authoritative on token counts. A correction applied to
+    /// a request row must reach the session rollup, or the two tables disagree.
+    #[test]
+    fn trace_overlay_corrects_session_rollups() {
+        let session_id = "28f8a688-6bd3-47a6-9aa3-3a91df07884c";
+        let mut snapshot = serde_json::json!({
+            "recent": [{
+                "request_id": "req_1",
+                "session_id": session_id,
+                "state": "completed",
+                "target": "anthropic",
+                "selected_model": "claude-opus-5",
+                "agent_type": "-",
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "prompt_cache_tokens": 0,
+                "started_at_unix_ms": 1_000,
+                "completed_at_unix_ms": 2_000,
+            }],
+            "sessions": [{
+                "session_id": session_id,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+            }],
+            "totals": { "input_tokens": 0, "output_tokens": 0 },
+        });
+
+        enrich_top_snapshot_with_trace_usages(
+            &mut snapshot,
+            &[TraceUsage {
+                timestamp_ms: 2_000,
+                request_id: Some("upstream-1".to_owned()),
+                message_id: None,
+                agent_type: None,
+                model: Some("claude-opus-5".to_owned()),
+                input_tokens: 100,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 900,
+                output_tokens: 42,
+            }],
+        );
+
+        assert_eq!(snapshot["sessions"][0]["input_tokens"], 1_000);
+        assert_eq!(snapshot["sessions"][0]["output_tokens"], 42);
+        assert_eq!(snapshot["sessions"][0]["cache_read_tokens"], 900);
+        assert_eq!(snapshot["totals"]["input_tokens"], 1_000);
     }
 
     #[test]
@@ -4302,12 +4794,36 @@ mod tests {
 
         assert_eq!(top_target_cell(&row), "proxied");
         assert_eq!(top_policy_cell(&row), "proxied traffic");
-        assert_eq!(top_model_cell(&row), "/api/oauth/token / proxied traffic");
+        assert_eq!(top_model_cell(&row), "/api/oauth/token");
+        assert_eq!(top_route_cell(&row), "~tunnel");
 
         let rendered = top_table_row(&row, 140);
-        assert!(rendered.contains("proxied"));
-        assert!(rendered.contains("proxied traffic"));
+        assert!(rendered.contains("~tunnel"));
         assert!(rendered.contains("/api/oauth/token"));
+    }
+
+    /// Every route reason the proxy emits must map to a deliberate glyph. A new
+    /// reason falling into the catch-all should be a conscious choice.
+    #[test]
+    fn policy_glyphs_cover_every_proxy_route_reason() {
+        for (reason, glyph) in [
+            ("passthrough", '\u{2192}'),
+            ("anthropic_passthrough", '\u{2192}'),
+            ("selective_main_passthrough", '\u{2192}'),
+            ("selective_subagent_passthrough", '\u{2192}'),
+            ("selective_passthrough_path", '~'),
+            ("non_anthropic_connect", '~'),
+            ("selective_virtual_model", '?'),
+            ("selective_virtual_model_lookup", '?'),
+            ("selective_provider_model_lookup", '?'),
+            ("selective_model_list", '?'),
+            ("router_routed_path", '\u{21b3}'),
+            ("selective_subagent_header", '\u{21b3}'),
+            ("api_anthropic_intercept", '\u{21b3}'),
+            ("-", ' '),
+        ] {
+            assert_eq!(policy_glyph(reason), glyph, "policy {reason}");
+        }
     }
 
     #[test]
