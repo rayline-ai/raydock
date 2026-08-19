@@ -117,8 +117,8 @@ impl CredentialStore {
             CredentialOrigin::File(path) => write_file_atomic(path, &serialized)?,
             #[cfg(target_os = "macos")]
             CredentialOrigin::Keychain { service, account } => {
-                security_framework::passwords::set_generic_password(service, account, &serialized)
-                    .map_err(|error| CredentialError::KeychainWrite(error.to_string()))?;
+                keychain::write_password(service, account, &serialized)
+                    .map_err(CredentialError::KeychainWrite)?;
             }
         }
         document.version = credential_fingerprint(&serialized);
@@ -156,8 +156,11 @@ impl CredentialStore {
             CredentialOrigin::File(path) => read_credential_file(path),
             #[cfg(target_os = "macos")]
             CredentialOrigin::Keychain { service, account } => {
-                security_framework::passwords::get_generic_password(service, account)
-                    .map_err(|error| CredentialError::KeychainRead(error.to_string()))
+                keychain::read_password(service, account)
+                    .map_err(CredentialError::KeychainRead)?
+                    .ok_or_else(|| {
+                        CredentialError::KeychainRead(format!("item {service:?} not found"))
+                    })
             }
         }
     }
@@ -171,8 +174,7 @@ impl CredentialStore {
         }
 
         for service in services {
-            let Ok(bytes) = security_framework::passwords::get_generic_password(&service, &account)
-            else {
+            let Ok(Some(bytes)) = keychain::read_password(&service, &account) else {
                 continue;
             };
             let origin = CredentialOrigin::Keychain {
@@ -528,6 +530,147 @@ fn set_private_open_file_permissions(file: &File, path: &Path) -> Result<(), Cre
     Ok(())
 }
 
+/// Keychain access through /usr/bin/security, the same tool Claude Code uses.
+///
+/// Claude Code creates and maintains its credential items via the `security`
+/// CLI, which leaves them in the `apple-tool:` keychain partition. Touching
+/// those items through the native SecItem API from a locally built (ad-hoc
+/// signed) binary knocks them out of that partition, after which every
+/// `security` secret read — i.e. every Claude Code process start — prompts
+/// for the login keychain password, and "Always Allow" cannot repair a
+/// partition mismatch. Going through the same CLI keeps the items in the
+/// partition Claude Code relies on.
+#[cfg(target_os = "macos")]
+mod keychain {
+    use std::ffi::OsString;
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    use zeroize::Zeroizing;
+
+    /// errSecItemNotFound surfaces as exit code 44 from /usr/bin/security.
+    const EXIT_ITEM_NOT_FOUND: i32 = 44;
+
+    /// Overridable for tests only; a process able to set our environment can
+    /// already read the keychain as this user, so this adds no new exposure.
+    fn security_bin() -> OsString {
+        std::env::var_os("RAYLINE_SECURITY_CLI")
+            .unwrap_or_else(|| OsString::from("/usr/bin/security"))
+    }
+
+    /// Read the generic-password secret, or `None` when the item is missing.
+    pub(super) fn read_password(service: &str, account: &str) -> Result<Option<Vec<u8>>, String> {
+        let output = Command::new(security_bin())
+            .args(["find-generic-password", "-s", service, "-a", account, "-w"])
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|error| format!("failed to run security(1): {error}"))?;
+        if output.status.code() == Some(EXIT_ITEM_NOT_FOUND) {
+            return Ok(None);
+        }
+        if !output.status.success() {
+            // stderr carries only the OSStatus message, never the secret.
+            return Err(format!(
+                "security find-generic-password failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(Some(decode_find_output(output.stdout)))
+    }
+
+    /// Create or update (`-U`) the generic-password item. The command line is
+    /// fed through `security -i` on stdin so the secret never appears in the
+    /// process argument list.
+    pub(super) fn write_password(
+        service: &str,
+        account: &str,
+        secret: &[u8],
+    ) -> Result<(), String> {
+        let secret = std::str::from_utf8(secret)
+            .map_err(|_| "credential payload is not UTF-8".to_owned())?;
+        let mut line = Zeroizing::new(String::with_capacity(secret.len() + 64));
+        line.push_str("add-generic-password -U -s ");
+        push_quoted(&mut line, service)?;
+        line.push_str(" -a ");
+        push_quoted(&mut line, account)?;
+        line.push_str(" -w ");
+        push_quoted(&mut line, secret)?;
+        line.push('\n');
+
+        let mut child = Command::new(security_bin())
+            .arg("-i")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to run security(1): {error}"))?;
+        let stdin_result = child
+            .stdin
+            .take()
+            .ok_or_else(|| "security(1) stdin unavailable".to_owned())
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(line.as_bytes())
+                    .map_err(|error| format!("failed to write to security(1): {error}"))
+            });
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("failed to wait for security(1): {error}"))?;
+        stdin_result?;
+        if !output.status.success() {
+            return Err(format!(
+                "security add-generic-password failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Quote an argument for the `security -i` command parser, which accepts
+    /// double-quoted strings with backslash escapes (verified empirically
+    /// against macOS 15). Newlines would terminate the command line early, so
+    /// they are rejected; serialized JSON never contains raw control bytes.
+    pub(super) fn push_quoted(line: &mut String, value: &str) -> Result<(), String> {
+        if value.chars().any(|c| c == '\n' || c == '\r') {
+            return Err("keychain value must not contain newlines".to_owned());
+        }
+        line.push('"');
+        for c in value.chars() {
+            if c == '"' || c == '\\' {
+                line.push('\\');
+            }
+            line.push(c);
+        }
+        line.push('"');
+        Ok(())
+    }
+
+    /// `find-generic-password -w` prints printable-ASCII secrets raw and
+    /// anything else hex-encoded, each with a trailing newline. A JSON
+    /// document always starts with `{` or `[` — not a hex digit — so raw
+    /// output is never misread as hex.
+    pub(super) fn decode_find_output(mut stdout: Vec<u8>) -> Vec<u8> {
+        if stdout.last() == Some(&b'\n') {
+            stdout.pop();
+        }
+        let is_hex =
+            !stdout.is_empty() && stdout.len() % 2 == 0 && stdout.iter().all(u8::is_ascii_hexdigit);
+        if !is_hex {
+            return stdout;
+        }
+        stdout
+            .chunks(2)
+            .map(|pair| {
+                let hi = (pair[0] as char).to_digit(16).unwrap_or(0) as u8;
+                let lo = (pair[1] as char).to_digit(16).unwrap_or(0) as u8;
+                (hi << 4) | lo
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,6 +768,103 @@ mod tests {
 
         let store = CredentialStore::new(&dir).expect("store");
         assert!(!store.allow_legacy_keychain);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn find_output_decoding_handles_raw_and_hex() {
+        let raw: &[u8] = br#"{"v":2}"#;
+        assert_eq!(keychain::decode_find_output(b"{\"v\":2}\n".to_vec()), raw);
+        // `security find-generic-password -w` hex-encodes non-printable data;
+        // 7b2276223a327d is the hex spelling of {"v":2}.
+        assert_eq!(
+            keychain::decode_find_output(b"7b2276223a327d\n".to_vec()),
+            raw
+        );
+        assert_eq!(
+            keychain::decode_find_output(b"7b2276223a327d".to_vec()),
+            raw
+        );
+        assert_eq!(keychain::decode_find_output(Vec::new()), b"");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn security_quoting_escapes_and_rejects_newlines() {
+        let quote = |value: &str| {
+            let mut line = String::new();
+            keychain::push_quoted(&mut line, value).map(|()| line)
+        };
+        assert_eq!(quote(r#"a"b\c"#).expect("quote"), r#""a\"b\\c""#);
+        assert!(quote("a\nb").is_err());
+        assert!(quote("a\rb").is_err());
+    }
+
+    // Regression for the keychain popup storm: rayline must drive the real
+    // items only through the security CLI. One test covers every fake-CLI
+    // path so the RAYLINE_SECURITY_CLI override is set exactly once.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keychain_access_goes_through_the_security_cli() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fake = dir.path().join("security");
+        fs::write(
+            &fake,
+            concat!(
+                "#!/bin/sh\n",
+                "dir=\"$(dirname \"$0\")\"\n",
+                "if [ \"$1\" = \"-i\" ]; then cat > \"$dir/last-stdin\"; exit 0; fi\n",
+                "if [ \"$1\" = \"find-generic-password\" ]; then\n",
+                "  cat \"$dir/find-output\" 2>/dev/null\n",
+                "  exit \"$(cat \"$dir/find-exit\" 2>/dev/null || echo 0)\"\n",
+                "fi\n",
+                "exit 1\n",
+            ),
+        )
+        .expect("write fake security");
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).expect("chmod");
+        // SAFETY: tests in this workspace run single-threaded
+        // (`--test-threads=1`), so no other thread reads the environment
+        // concurrently with this mutation.
+        unsafe { std::env::set_var("RAYLINE_SECURITY_CLI", &fake) };
+
+        let result = (|| {
+            // Write path: the secret travels via `security -i` stdin, quoted
+            // for its parser — never through the argument list.
+            keychain::write_password("svc", "acct", br#"{"k":"a\"b"}"#)?;
+            let sent = fs::read_to_string(dir.path().join("last-stdin"))
+                .map_err(|error| error.to_string())?;
+            let expected = r#"add-generic-password -U -s "svc" -a "acct" -w "{\"k\":\"a\\\"b\"}""#;
+            if sent != format!("{expected}\n") {
+                return Err(format!("unexpected security -i command: {sent:?}"));
+            }
+
+            // Read path: raw output round-trips.
+            fs::write(dir.path().join("find-output"), b"{\"v\":2}\n")
+                .map_err(|error| error.to_string())?;
+            if keychain::read_password("svc", "acct")? != Some(br#"{"v":2}"#.to_vec()) {
+                return Err("raw read mismatch".to_owned());
+            }
+
+            // Missing item (exit 44) maps to None, not an error.
+            fs::write(dir.path().join("find-exit"), "44").map_err(|error| error.to_string())?;
+            if keychain::read_password("svc", "acct")?.is_some() {
+                return Err("missing item should read as None".to_owned());
+            }
+
+            // Any other failure surfaces as an error.
+            fs::write(dir.path().join("find-exit"), "51").map_err(|error| error.to_string())?;
+            if keychain::read_password("svc", "acct").is_ok() {
+                return Err("failing read should surface an error".to_owned());
+            }
+            Ok(())
+        })();
+
+        // SAFETY: same single-threaded test environment as the set_var above.
+        unsafe { std::env::remove_var("RAYLINE_SECURITY_CLI") };
+        result.expect("fake security CLI round trip");
     }
 
     #[test]

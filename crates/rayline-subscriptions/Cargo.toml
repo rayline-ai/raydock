@@ -25,9 +25,6 @@ tokio.workspace = true
 time = { workspace = true, features = ["parsing"] }
 zeroize = "1"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.7"
-
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
