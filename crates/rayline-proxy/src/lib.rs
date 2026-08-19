@@ -186,6 +186,10 @@ impl ProxyOptions {
 pub enum ProxyRoutingMode {
     All,
     SelectiveSubagents,
+    /// Route nothing to a router: every request passes through to Anthropic.
+    /// With a subscription pool configured, the pool then serves every
+    /// `POST /v1/messages` — main agent and subagents alike.
+    Passthrough,
 }
 
 impl ProxyRoutingMode {
@@ -193,6 +197,7 @@ impl ProxyRoutingMode {
         match self {
             Self::All => "all",
             Self::SelectiveSubagents => "selective-subagents",
+            Self::Passthrough => "passthrough",
         }
     }
 }
@@ -2762,6 +2767,10 @@ fn prepare_anthropic_route_with_subagent_filter(
     let agent_id = claude_code_agent_id(headers).map(ToOwned::to_owned);
     let agent_type = resolved_agent_type.map(ToOwned::to_owned);
 
+    if routing_mode == ProxyRoutingMode::Passthrough {
+        return anthropic_passthrough(body, "passthrough", agent_id, agent_type);
+    }
+
     if routing_mode == ProxyRoutingMode::All {
         return prepared_anthropic_route(
             classify_anthropic_request_for_mode(method, path, routing_mode),
@@ -2925,6 +2934,7 @@ fn is_router_routed_path(method: &Method, path: &str, routing_mode: ProxyRouting
             (&Method::GET, p) => is_virtual_model_lookup(p) || is_provider_model_lookup(p),
             _ => false,
         },
+        ProxyRoutingMode::Passthrough => false,
     }
 }
 
@@ -3844,6 +3854,50 @@ mod tests {
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["model"], "claude-sonnet-4-5");
         assert_eq!(body["messages"], json!([]));
+    }
+
+    #[test]
+    fn passthrough_mode_sends_subagent_messages_to_anthropic() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLAUDE_CODE_AGENT_ID_HEADER,
+            HeaderValue::from_static("agent-1"),
+        );
+        let prepared = prepare_anthropic_route(
+            &Method::POST,
+            "/v1/messages",
+            &headers,
+            Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#),
+            ProxyRoutingMode::Passthrough,
+        );
+
+        assert_eq!(prepared.decision.target, RouteTarget::Anthropic);
+        assert_eq!(prepared.decision.reason, "passthrough");
+        assert!(!prepared.body_was_rewritten);
+    }
+
+    #[test]
+    fn passthrough_mode_routes_nothing_to_the_router() {
+        let main = prepare_anthropic_route(
+            &Method::POST,
+            "/v1/messages",
+            &HeaderMap::new(),
+            Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#),
+            ProxyRoutingMode::Passthrough,
+        );
+        assert_eq!(main.decision.target, RouteTarget::Anthropic);
+
+        let listed = classify_anthropic_request_for_mode(
+            &Method::GET,
+            "/v1/models",
+            ProxyRoutingMode::Passthrough,
+        );
+        assert_eq!(listed.target, RouteTarget::Anthropic);
+        assert!(!is_router_routed_path(
+            &Method::POST,
+            "/v1/messages",
+            ProxyRoutingMode::Passthrough
+        ));
     }
 
     #[test]

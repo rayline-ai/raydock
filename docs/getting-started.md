@@ -210,6 +210,11 @@ What goes through the router versus straight to Anthropic:
 - **`all`**: route every request (main agent + subagents).
 - **`subagents`**: route only subagent traffic; the main agent stays on cloud
   Claude. This is the hybrid path — quality main agent, offloaded subagents.
+- **`none`**: route nothing; every request passes straight through to
+  Anthropic. With `--subscription-pool` this puts **all** traffic — main agent
+  and subagents — on the pool's Claude subscriptions. Requires the proxy and is
+  rejected with `--via env`, `--local`, or `--config` (there is no router to
+  honor them).
 
 The default depends on the router, because the two are used differently:
 
@@ -230,6 +235,7 @@ The default depends on the router, because the two are used differently:
 | `rayline claude --local --route all` | local | proxy | all |
 | `rayline claude --route subagents` | cloud | proxy | subagents |
 | `rayline claude --subscription-pool default` | cloud | proxy | subagents |
+| `rayline claude --subscription-pool default --route none` | subscriptions only | proxy | nothing |
 
 `rayline claude --via env --local` and `rayline claude --via env --route subagents`
 are rejected: the env mechanism is cloud-only and can't route selectively.
@@ -262,8 +268,9 @@ absent daemon produces a visible error instead of a background Keychain read.
 The default registry is `~/.config/rayline/subscriptions.json`. Override it
 with `--subscription-config <path>`. Pool mode implies `--route subagents` so
 the main thread uses the local subscription pool while routed subagents retain
-normal Rayline routing. It requires proxy mode and is rejected with `--via env`,
-`--isolated`, or explicit `--route all`.
+normal Rayline routing. Pass `--route none` to serve subagents from the pool
+too — no traffic reaches the hosted router. It requires proxy mode and is
+rejected with `--via env`, `--isolated`, or explicit `--route all`.
 
 Rayline polls each registered account's five-hour, weekly, and model-scoped
 limits. It retries only explicit pre-stream quota or entitlement rejections;

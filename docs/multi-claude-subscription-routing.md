@@ -103,7 +103,9 @@ rayline claude --subscription-pool default
 
 Selecting a pool implies proxy mode with a subscription-backed main thread
 (`--route subagents`) unless a router config derives the same passthrough-main
-shape. `--subscription-pool` is rejected with `--via env`, `--isolated`, and an
+shape. Add `--route none` for a subscription-only session: the proxy routes
+nothing to the hosted router, so the pool serves subagent traffic as well.
+`--subscription-pool` is rejected with `--via env`, `--isolated`, and an
 explicit `--route all`. Use `--subscription-config <path>` to override
 `~/.config/rayline/subscriptions.json`.
 

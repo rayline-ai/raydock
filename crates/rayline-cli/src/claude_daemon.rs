@@ -10,7 +10,8 @@ use serde_json::Value;
 
 use crate::claude::{
     AUTO_COMPACT_WINDOW_ENV, CLAUDE_CONFIG_DIR_ENV, RAYLINE_ENV_NAME_ENV, ROUTING_MODE_PROXY,
-    ROUTING_MODE_PROXY_SUBAGENTS, RoutingMode, RunError, is_proxy_routing_mode, routing_mode_name,
+    ROUTING_MODE_PROXY_PASSTHROUGH, ROUTING_MODE_PROXY_SUBAGENTS, RoutingMode, RunError,
+    is_proxy_routing_mode, routing_mode_name,
 };
 
 const STOP_COMMAND: &str = "claude daemon stop --any";
@@ -326,6 +327,7 @@ fn proxy_routing_mode_from_env(value: &str) -> Option<RoutingMode> {
     match value {
         ROUTING_MODE_PROXY => Some(RoutingMode::Proxy),
         ROUTING_MODE_PROXY_SUBAGENTS => Some(RoutingMode::ProxySubagents),
+        ROUTING_MODE_PROXY_PASSTHROUGH => Some(RoutingMode::ProxyPassthrough),
         _ => None,
     }
 }
@@ -553,6 +555,9 @@ fn format_daemon_conflict_error(
     // Proxy is the default routing mode, so only spell out non-default modes.
     let mode_flag = match request.routing_mode {
         RoutingMode::Proxy => String::new(),
+        // No deprecated `--routing-mode` alias exists for passthrough; spell
+        // the modern flag directly.
+        RoutingMode::ProxyPassthrough => "--route none ".to_owned(),
         RoutingMode::Override | RoutingMode::ProxySubagents => {
             format!(
                 "--routing-mode {} ",

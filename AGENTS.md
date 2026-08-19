@@ -19,7 +19,7 @@ handlers. Prefer focused modules over growing the existing large CLI/proxy files
 ## CLI Contracts
 
 - Use the current routing flags in new docs, tests, and examples:
-  `--local`, `--via proxy|env`, and `--route all|subagents`.
+  `--local`, `--via proxy|env`, and `--route all|subagents|none`.
 - Treat `--local-router`, `--no-proxy`, and `--routing-mode ...` as deprecated
   compatibility aliases only.
 - `--local` means local static routing without hosted auth.

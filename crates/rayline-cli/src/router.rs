@@ -33,6 +33,7 @@ const TOP_TRACE_LOOKBACK: Duration = Duration::from_secs(12 * 60 * 60);
 const TOP_TRACE_MATCH_WINDOW_MS: u64 = 120_000;
 const PROXIED_TRAFFIC_POLICY: &str = "selective_passthrough_path";
 pub const PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS: &str = "selective-subagents";
+pub const PROXY_ROUTING_MODE_PASSTHROUGH: &str = "passthrough";
 pub const DECISION_PLANE_HOSTED: &str = "hosted";
 pub const DECISION_PLANE_LOCAL: &str = "local";
 pub const ROUTER_API_MODE_ANTHROPIC: &str = "anthropic";

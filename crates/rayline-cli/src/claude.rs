@@ -29,6 +29,7 @@ const DEFAULT_SUBSCRIPTION_PROXY_PORT: u16 = 20815;
 const NODE_CA_BUNDLE_FILENAME: &str = "node-ca-bundle.pem";
 pub(crate) const ROUTING_MODE_PROXY: &str = "proxy";
 pub(crate) const ROUTING_MODE_PROXY_SUBAGENTS: &str = "proxy-subagents";
+pub(crate) const ROUTING_MODE_PROXY_PASSTHROUGH: &str = "proxy-passthrough";
 const ROUTING_MODE_OVERRIDE: &str = "override";
 pub(crate) const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
@@ -121,10 +122,17 @@ pub enum RoutingMode {
     Override,
     Proxy,
     ProxySubagents,
+    /// `--route none`: the proxy passes everything through to Anthropic and
+    /// routes nothing to a hosted or local router. With a subscription pool,
+    /// the pool serves every `/v1/messages` — subagents included.
+    ProxyPassthrough,
 }
 
 pub(crate) fn is_proxy_routing_mode(mode: RoutingMode) -> bool {
-    matches!(mode, RoutingMode::Proxy | RoutingMode::ProxySubagents)
+    matches!(
+        mode,
+        RoutingMode::Proxy | RoutingMode::ProxySubagents | RoutingMode::ProxyPassthrough
+    )
 }
 
 /// Whether an isolated session in this routing mode needs its own Claude Code
@@ -137,7 +145,9 @@ fn isolated_needs_claude_login(mode: RoutingMode) -> bool {
 
 fn default_model_for_routing_mode(mode: RoutingMode) -> &'static str {
     match mode {
-        RoutingMode::ProxySubagents => DEFAULT_PROXY_SUBAGENTS_MODEL,
+        RoutingMode::ProxySubagents | RoutingMode::ProxyPassthrough => {
+            DEFAULT_PROXY_SUBAGENTS_MODEL
+        }
         RoutingMode::Override | RoutingMode::Proxy => DEFAULT_MODEL,
     }
 }
@@ -163,7 +173,10 @@ fn implicit_local_engages(
     toggle_on: bool,
     config_present: bool,
 ) -> bool {
-    !config_present && !matches!(mode, RoutingMode::Override) && !isolated && toggle_on
+    !config_present
+        && !matches!(mode, RoutingMode::Override | RoutingMode::ProxyPassthrough)
+        && !isolated
+        && toggle_on
 }
 
 /// The routing mode after accounting for local engagement.
@@ -826,7 +839,12 @@ async fn run_command_from_home(
         },
         ..request.clone()
     };
-    if request.subscription_pool.is_some() && request.routing_mode != RoutingMode::ProxySubagents {
+    if request.subscription_pool.is_some()
+        && !matches!(
+            request.routing_mode,
+            RoutingMode::ProxySubagents | RoutingMode::ProxyPassthrough
+        )
+    {
         return Err(RunError::Subscription(
             "a Claude subscription pool requires a subscription passthrough main route; use the default pool launch or a config whose routes.main is subscription"
                 .to_owned(),
@@ -987,7 +1005,7 @@ async fn run_command_from_home(
             )
             .await?;
         }
-        RoutingMode::Proxy | RoutingMode::ProxySubagents => {
+        RoutingMode::Proxy | RoutingMode::ProxySubagents | RoutingMode::ProxyPassthrough => {
             // A prior local session may have left the shared `rld serve` daemon
             // running with its model loaded — wasting RAM/GPU and holding the
             // shared proxy port this non-isolated cloud launch is about to
@@ -1374,8 +1392,10 @@ fn should_set_model_env(
     request_model_explicit: bool,
     inherited_anthropic_model: bool,
 ) -> bool {
-    routing_mode != RoutingMode::ProxySubagents
-        || request_model_explicit
+    !matches!(
+        routing_mode,
+        RoutingMode::ProxySubagents | RoutingMode::ProxyPassthrough
+    ) || request_model_explicit
         || inherited_anthropic_model
 }
 
@@ -2163,6 +2183,7 @@ pub(crate) fn routing_mode_name(mode: RoutingMode) -> &'static str {
         RoutingMode::Override => ROUTING_MODE_OVERRIDE,
         RoutingMode::Proxy => ROUTING_MODE_PROXY,
         RoutingMode::ProxySubagents => ROUTING_MODE_PROXY_SUBAGENTS,
+        RoutingMode::ProxyPassthrough => ROUTING_MODE_PROXY_PASSTHROUGH,
     }
 }
 
@@ -2170,6 +2191,7 @@ fn proxy_routing_mode_name(mode: RoutingMode) -> &'static str {
     match mode {
         RoutingMode::Proxy => crate::router::PROXY_ROUTING_MODE_ALL,
         RoutingMode::ProxySubagents => crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS,
+        RoutingMode::ProxyPassthrough => crate::router::PROXY_ROUTING_MODE_PASSTHROUGH,
         // `Override` starts no proxy at all (it sets ANTHROPIC_BASE_URL directly),
         // so it never reaches this proxy-only translation — see the dispatch match
         // in `run` where `Override` takes the `configure_override_env` branch.
@@ -2266,7 +2288,7 @@ async fn diag_print_postamble_for_mode(
     home: &Path,
 ) {
     match routing_mode {
-        RoutingMode::Proxy | RoutingMode::ProxySubagents => {
+        RoutingMode::Proxy | RoutingMode::ProxySubagents | RoutingMode::ProxyPassthrough => {
             let default_port = if isolated {
                 DEFAULT_ISOLATED_PROXY_PORT
             } else if subscription_pool {

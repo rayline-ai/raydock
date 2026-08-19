@@ -1531,6 +1531,12 @@ where
     if subscription_pool.is_some() && route_scope.is_none() {
         routing_mode = crate::claude::RoutingMode::ProxySubagents;
     }
+    if matches!(route_scope, Some(RouteScope::None)) && config_path.is_some() {
+        eprintln!(
+            "Error: `--route none` routes nothing, so a `--config` routing file has no effect; drop one of them."
+        );
+        return None;
+    }
 
     Some(crate::claude::RunRequest {
         env_name,
@@ -1564,11 +1570,14 @@ enum ViaArg {
     Proxy,
 }
 
-/// What the proxy routes (the `--route` axis).
+/// What the proxy routes (the `--route` axis). `None` routes nothing to a
+/// router: everything passes through to Anthropic, and a configured
+/// subscription pool then serves all `/v1/messages` traffic.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteScope {
     All,
     Subagents,
+    None,
 }
 
 fn parse_via(value: &str) -> Option<ViaArg> {
@@ -1583,6 +1592,7 @@ fn parse_route_scope(value: &str) -> Option<RouteScope> {
     match value {
         "all" => Some(RouteScope::All),
         "subagents" => Some(RouteScope::Subagents),
+        "none" => Some(RouteScope::None),
         _ => None,
     }
 }
@@ -1643,6 +1653,13 @@ fn resolve_routing_mode(
         RouteScope::All
     });
 
+    if local_router && matches!(route_scope, Some(RouteScope::None)) {
+        eprintln!(
+            "Error: `--route none` routes nothing, so local inference is unreachable; drop `--local` or `--route none`."
+        );
+        return None;
+    }
+
     match via {
         Some(ViaArg::Env) => {
             // The env mechanism is cloud-only and cannot route selectively.
@@ -1658,11 +1675,18 @@ fn resolve_routing_mode(
                 );
                 return None;
             }
+            if matches!(route_scope, Some(RouteScope::None)) {
+                eprintln!(
+                    "Error: `--via env` wires Claude to the router directly; `--route none` needs the proxy."
+                );
+                return None;
+            }
             Some(RoutingMode::Override)
         }
         Some(ViaArg::Proxy) | None => Some(match scope {
             RouteScope::All => RoutingMode::Proxy,
             RouteScope::Subagents => RoutingMode::ProxySubagents,
+            RouteScope::None => RoutingMode::ProxyPassthrough,
         }),
     }
 }
@@ -1996,6 +2020,12 @@ where
     let proxy_routing_mode = match route_scope {
         RouteScope::All => crate::router::PROXY_ROUTING_MODE_ALL,
         RouteScope::Subagents => crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS,
+        RouteScope::None => {
+            eprintln!(
+                "Error: `router start` serves routed traffic; `--route none` does not apply."
+            );
+            return None;
+        }
     }
     .to_owned();
     Some(crate::router::RouterStartCliRequest {
@@ -2758,6 +2788,62 @@ mod tests {
         assert_eq!(
             resolve_routing_mode(false, Some(ViaArg::Env), Some(RouteScope::Subagents)),
             None
+        );
+    }
+
+    #[test]
+    fn resolve_route_none_is_proxy_passthrough() {
+        assert_eq!(
+            resolve_routing_mode(false, None, Some(RouteScope::None)),
+            Some(RoutingMode::ProxyPassthrough)
+        );
+        assert_eq!(
+            resolve_routing_mode(false, Some(ViaArg::Proxy), Some(RouteScope::None)),
+            Some(RoutingMode::ProxyPassthrough)
+        );
+    }
+
+    #[test]
+    fn resolve_route_none_rejects_env_and_local() {
+        // Passthrough needs the proxy, and there is no router to reach local.
+        assert_eq!(
+            resolve_routing_mode(false, Some(ViaArg::Env), Some(RouteScope::None)),
+            None
+        );
+        assert_eq!(
+            resolve_routing_mode(true, None, Some(RouteScope::None)),
+            None
+        );
+    }
+
+    // Regression for subagents burning cloud-router credits: a pool launch
+    // with `--route none` must put ALL traffic on the pool via passthrough.
+    #[test]
+    fn subscription_pool_route_none_is_proxy_passthrough() {
+        let request = claude_run(&[
+            "rayline",
+            "claude",
+            "--subscription-pool",
+            "team",
+            "--route",
+            "none",
+        ]);
+        assert_eq!(request.routing_mode, RoutingMode::ProxyPassthrough);
+        assert_eq!(request.subscription_pool.as_deref(), Some("team"));
+    }
+
+    #[test]
+    fn route_none_rejects_a_routing_config() {
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "claude",
+                "--route",
+                "none",
+                "--config",
+                "/tmp/routes.json",
+            ])),
+            RaylineDispatch::Unavailable
         );
     }
 
