@@ -324,6 +324,9 @@ Usage: rayline top [--json] [--all]
 
 Show live LLM request metrics.
 
+Combines every live local metrics instance. When a global environment is
+selected, only instances connected to that environment are included.
+
 The lower table rolls traffic up per conversation, so you see accumulated
 cost per Claude Code session instead of one line per request. Press v to
 switch it back to the recent-request list.
@@ -932,12 +935,12 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
                 .unwrap_or(RaylineDispatch::Unavailable),
             "local" => parse_local_dispatch(args, root_env, root_auth_token)
                 .unwrap_or(RaylineDispatch::Unavailable),
-            "router" => parse_router_dispatch(args, root_env_explicit)
+            "router" => parse_router_dispatch(args, root_env, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "status" => parse_status_request(args, root_env, root_auth_token, root_env_explicit)
                 .map(RaylineDispatch::Status)
                 .unwrap_or(RaylineDispatch::Unavailable),
-            "top" => parse_router_top_request(args, root_env_explicit)
+            "top" => parse_router_top_request(args, root_env, root_env_explicit)
                 .map(RaylineDispatch::RouterTop)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "update" => parse_update_request(args)
@@ -1922,6 +1925,7 @@ where
 
 fn parse_router_dispatch<'a, I>(
     mut args: std::iter::Peekable<I>,
+    root_env: Option<String>,
     root_env_explicit: bool,
 ) -> Option<RaylineDispatch>
 where
@@ -1929,9 +1933,8 @@ where
 {
     let first_arg = args.next()?;
     match first_arg.to_str()? {
-        "start" => {
-            parse_router_start_request(args, root_env_explicit).map(RaylineDispatch::RouterStart)
-        }
+        "start" => parse_router_start_request(args, root_env, root_env_explicit)
+            .map(RaylineDispatch::RouterStart),
         "status" => {
             if args.next().is_some() {
                 return None;
@@ -1943,7 +1946,8 @@ where
         "logs" => {
             parse_router_logs_request(args, root_env_explicit).map(RaylineDispatch::RouterLogs)
         }
-        "top" => parse_router_top_request(args, root_env_explicit).map(RaylineDispatch::RouterTop),
+        "top" => parse_router_top_request(args, root_env, root_env_explicit)
+            .map(RaylineDispatch::RouterTop),
         "stop" => {
             if args.next().is_some() {
                 return None;
@@ -1955,8 +1959,12 @@ where
         value if value.starts_with("--") => {
             let mut start_args = vec![first_arg];
             start_args.extend(args);
-            parse_router_start_request(start_args.into_iter().peekable(), root_env_explicit)
-                .map(RaylineDispatch::RouterStart)
+            parse_router_start_request(
+                start_args.into_iter().peekable(),
+                root_env,
+                root_env_explicit,
+            )
+            .map(RaylineDispatch::RouterStart)
         }
         _ => None,
     }
@@ -1964,6 +1972,7 @@ where
 
 fn parse_router_start_request<'a, I>(
     mut args: std::iter::Peekable<I>,
+    env_name: Option<String>,
     root_env_explicit: bool,
 ) -> Option<crate::router::RouterStartCliRequest>
 where
@@ -2037,6 +2046,7 @@ where
     }
     .to_owned();
     Some(crate::router::RouterStartCliRequest {
+        env_name,
         api_mode,
         proxy_routing_mode,
         config_path,
@@ -2100,6 +2110,7 @@ where
 
 fn parse_router_top_request<'a, I>(
     args: std::iter::Peekable<I>,
+    env_name: Option<String>,
     root_env_explicit: bool,
 ) -> Option<crate::router::RouterTopRequest>
 where
@@ -2118,6 +2129,7 @@ where
     }
 
     Some(crate::router::RouterTopRequest {
+        env_name,
         json,
         show_all,
         root_env_explicit,
@@ -3243,6 +3255,7 @@ mod tests {
                 "rayline", "--env", "foo", "router", "top", "--json"
             ])),
             RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
+                env_name: Some("foo".to_owned()),
                 json: true,
                 show_all: false,
                 root_env_explicit: true,
@@ -3261,6 +3274,7 @@ mod tests {
                 "rayline", "--env", "foo", "top", "--json", "--all"
             ])),
             RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
+                env_name: Some("foo".to_owned()),
                 json: true,
                 show_all: true,
                 root_env_explicit: true,
@@ -3330,12 +3344,23 @@ mod tests {
     fn router_start_dispatch_defaults_to_all_route() {
         match rayline_dispatch_for_argv(&argv(&["rayline", "router", "start"])) {
             RaylineDispatch::RouterStart(request) => {
+                assert_eq!(request.env_name, None);
                 assert_eq!(
                     request.proxy_routing_mode,
                     crate::router::PROXY_ROUTING_MODE_ALL
                 );
                 assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_ANTHROPIC);
                 assert_eq!(request.codex_auth_mode, crate::codex::CodexAuthMode::Auto);
+            }
+            other => panic!("expected RouterStart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn router_start_dispatch_carries_selected_environment() {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "--env", "dev", "router", "start"])) {
+            RaylineDispatch::RouterStart(request) => {
+                assert_eq!(request.env_name.as_deref(), Some("dev"));
             }
             other => panic!("expected RouterStart, got {other:?}"),
         }

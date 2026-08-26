@@ -1289,6 +1289,7 @@ async fn configure_proxy_env(
             let status = crate::router::start_local_proxy_from_home(
                 home,
                 &crate::router::LocalProxyStartRequest {
+                    env_name: Some(env_name.to_owned()),
                     router_url: start_request.router_url.clone(),
                     proxy_port,
                     proxy_routing_mode: proxy_routing_mode.to_owned(),
@@ -1321,6 +1322,7 @@ async fn configure_proxy_env(
     } else {
         crate::router::start_proxy_from_home(
             home,
+            Some(env_name),
             router_url,
             key,
             proxy_port,

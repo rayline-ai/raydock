@@ -65,6 +65,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
     )
     .await;
     let start_request = crate::router::RouterStartCliRequest {
+        env_name: request.env_name.clone(),
         api_mode: crate::router::ROUTER_API_MODE_CODEX.to_owned(),
         proxy_routing_mode: crate::router::PROXY_ROUTING_MODE_ALL.to_owned(),
         config_path: request.config_path.clone(),

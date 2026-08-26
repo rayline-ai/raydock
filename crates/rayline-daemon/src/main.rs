@@ -9,8 +9,9 @@
 // compatibility.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 use std::{convert::Infallible, net::SocketAddr};
@@ -75,6 +76,12 @@ const ANTHROPIC_URL_ENV: &str = "RAYLINE_ANTHROPIC_URL";
 const PROXY_ROUTING_MODE_ENV: &str = "RAYLINE_PROXY_ROUTING_MODE";
 const METRICS_PORT_ENV: &str = "RAYLINE_METRICS_PORT";
 const METRICS_URL_ENV: &str = "RAYLINE_METRICS_URL";
+const ENV_NAME_ENV: &str = "RAYLINE_ENV_NAME";
+const METRICS_ENV_HEADER: &str = "x-rayline-metrics-env";
+const METRICS_ROUTER_HEADER: &str = "x-rayline-metrics-router";
+const METRICS_OWNER_HEADER: &str = "x-rayline-metrics-owner";
+const METRICS_OWNER_FAILURE_THRESHOLD: u64 = 3;
+const METRICS_OWNER_WARNING_INTERVAL: u64 = 60;
 const SUBSCRIPTION_CONFIG_ENV: &str = "RAYLINE_SUBSCRIPTION_CONFIG";
 const SUBSCRIPTION_POOL_ENV: &str = "RAYLINE_SUBSCRIPTION_POOL";
 
@@ -92,6 +99,7 @@ const LLAMA_HEALTH_TIMEOUT: Duration = Duration::from_secs(1800);
 const DAEMON_VERSION: &str = env!("RAYLINE_DAEMON_VERSION");
 #[allow(dead_code)]
 const DAEMON_CHANNEL: &str = env!("RAYLINE_DAEMON_CHANNEL");
+static METRICS_OWNER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Parser)]
 #[command(
@@ -147,6 +155,11 @@ enum ModelsCmd {
 
 #[derive(clap::Args, Debug, Clone)]
 struct ServeArgs {
+    /// Environment identity returned by the metrics server. The launcher sets
+    /// this so scoped monitoring can verify the live responder, not stale meta.
+    #[arg(long, env = ENV_NAME_ENV, hide = true)]
+    env_name: Option<String>,
+
     /// HuggingFace repo holding the GGUF (e.g. `unsloth/Qwen3.5-35B-A3B-GGUF`).
     /// Required for the bundled-llama path; unused (and optional) when
     /// `--upstream-url` selects a custom endpoint.
@@ -285,6 +298,11 @@ struct ServeArgs {
 
 #[derive(clap::Args, Debug, Clone)]
 struct ProxyArgs {
+    /// Environment identity returned by the metrics server. The launcher sets
+    /// this so scoped monitoring can verify the live responder, not stale meta.
+    #[arg(long, env = ENV_NAME_ENV, hide = true)]
+    env_name: Option<String>,
+
     /// Transparent proxy listen port.
     #[arg(long, env = PROXY_PORT_ENV, default_value_t = rayline_proxy::DEFAULT_PORT)]
     proxy_port: u16,
@@ -769,7 +787,13 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         .as_ref()
         .and_then(|opts| opts.subscription_pool.clone());
     if let Some(listener) = metrics_listener {
-        spawn_metrics_control(metrics, listener, live_subscription_pool);
+        spawn_metrics_control(
+            metrics,
+            listener,
+            live_subscription_pool,
+            MetricsIdentity::new(args.env_name.clone(), hosted_router_url),
+            None,
+        );
     }
 
     // Stop the bundled llama-server on exit; a no-op in custom mode (no manager).
@@ -862,6 +886,7 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
         .as_deref()
         .unwrap_or(RAYLINE_ROUTER_DEFAULT_URL);
     let router_api_key = router_api_key()?;
+    let metrics_identity = MetricsIdentity::new(args.env_name.clone(), router_url);
     if router_api_key.is_empty() && !args.local_available {
         return Err(anyhow!(
             "{} is required for `{} proxy`",
@@ -908,10 +933,70 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
         opts.session_status_dir = Some(resolve_session_status_dir(None));
     }
     // Forward to a serve daemon when one owns metrics; otherwise self-host so
-    // `rayline top` works for cloud-only and isolated proxy sessions too.
-    opts.metrics = match proxy_metrics_plan(args.metrics_url.as_deref(), args.metrics_port) {
+    // `rayline top` works for cloud-only and isolated proxy sessions too. A
+    // local-router-owned sidecar cannot self-host a complete snapshot because
+    // its routed/local events are recorded in the separate serve process.
+    let metrics_plan = effective_proxy_metrics_plan(
+        args.metrics_url.as_deref(),
+        args.metrics_port,
+        args.proxy_port,
+        args.local_router_owns_metrics,
+    );
+    opts.metrics = match metrics_plan {
         ProxyMetricsPlan::Forward(url) => {
-            Some(Arc::new(HttpMetricsSink::new(&url)) as SharedMetricsSink)
+            // Keep a complete local mirror while the shared owner accepts
+            // forwarded updates, except when the separate local router owns
+            // routed metrics that this sidecar never observes. That mode must
+            // not expose its partial mirror as a complete fallback.
+            let metrics = RouterMetrics::new("rayline-proxy");
+            let forwarding = Arc::new(AtomicBool::new(true));
+            let standby_hidden = Arc::new(AtomicBool::new(true));
+            let fallback_available = if !forwarding_fallback_enabled(
+                args.metrics_port,
+                args.proxy_port,
+                args.local_router_owns_metrics,
+            ) {
+                if args.metrics_port != 0 && args.local_router_owns_metrics {
+                    warn!(
+                        "proxy metrics fallback disabled because the local router owns routed metrics"
+                    );
+                } else if args.metrics_port != 0 && args.metrics_port == args.proxy_port {
+                    warn!(
+                        "proxy metrics fallback disabled because metrics port {} conflicts with the proxy listener",
+                        args.metrics_port
+                    );
+                }
+                false
+            } else {
+                match bind_metrics_control(args.metrics_port).await {
+                    Ok(listener) => {
+                        spawn_metrics_control(
+                            metrics.clone(),
+                            listener,
+                            opts.subscription_pool.clone(),
+                            metrics_identity.clone(),
+                            Some(standby_hidden.clone()),
+                        );
+                        true
+                    }
+                    Err(error) => {
+                        warn!(
+                            "proxy metrics fallback disabled: could not bind metrics control on \
+                         127.0.0.1:{}: {error}",
+                            args.metrics_port
+                        );
+                        false
+                    }
+                }
+            };
+            Some(Arc::new(HttpMetricsSink::new(
+                &url,
+                metrics_identity,
+                metrics,
+                forwarding,
+                standby_hidden,
+                fallback_available,
+            )) as SharedMetricsSink)
         }
         ProxyMetricsPlan::SelfHost(metrics_port) => {
             let metrics = RouterMetrics::new("rayline-proxy");
@@ -920,7 +1005,13 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
             // data path. Degrade to no metrics for this session instead.
             match bind_metrics_control(metrics_port).await {
                 Ok(listener) => {
-                    spawn_metrics_control(metrics, listener, opts.subscription_pool.clone());
+                    spawn_metrics_control(
+                        metrics,
+                        listener,
+                        opts.subscription_pool.clone(),
+                        metrics_identity,
+                        None,
+                    );
                     Some(sink)
                 }
                 Err(error) => {
@@ -931,6 +1022,18 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
                     None
                 }
             }
+        }
+        ProxyMetricsPlan::Disabled => {
+            if args.local_router_owns_metrics {
+                warn!(
+                    "proxy metrics self-hosting disabled because the local router owns routed metrics"
+                );
+            } else {
+                warn!(
+                    "proxy metrics disabled because the configured metrics port conflicts with the proxy listener"
+                );
+            }
+            None
         }
     };
 
@@ -1049,45 +1152,357 @@ fn expand_home_path(path: &Path) -> Result<PathBuf> {
 enum ProxyMetricsPlan {
     Forward(String),
     SelfHost(u16),
+    Disabled,
 }
 
 fn proxy_metrics_plan(metrics_url: Option<&str>, metrics_port: u16) -> ProxyMetricsPlan {
     match metrics_url {
         Some(url) => ProxyMetricsPlan::Forward(url.to_owned()),
+        None if metrics_port == 0 => ProxyMetricsPlan::Disabled,
         None => ProxyMetricsPlan::SelfHost(metrics_port),
     }
 }
 
+fn effective_proxy_metrics_plan(
+    metrics_url: Option<&str>,
+    metrics_port: u16,
+    proxy_port: u16,
+    local_router_owns_metrics: bool,
+) -> ProxyMetricsPlan {
+    if metrics_url.is_none()
+        && (local_router_owns_metrics || (metrics_port != 0 && metrics_port == proxy_port))
+    {
+        ProxyMetricsPlan::Disabled
+    } else {
+        proxy_metrics_plan(metrics_url, metrics_port)
+    }
+}
+
+fn forwarding_fallback_enabled(
+    metrics_port: u16,
+    proxy_port: u16,
+    local_router_owns_metrics: bool,
+) -> bool {
+    metrics_port != 0 && metrics_port != proxy_port && !local_router_owns_metrics
+}
+
+fn should_warn_owner_failure(consecutive_failures: u64) -> bool {
+    consecutive_failures == 1
+        || consecutive_failures == METRICS_OWNER_FAILURE_THRESHOLD
+        || consecutive_failures.is_multiple_of(METRICS_OWNER_WARNING_INTERVAL)
+}
+
 struct HttpMetricsSink {
     updates: mpsc::Sender<MetricsUpdate>,
+    fallback: Arc<RouterMetrics>,
+    forwarding: Arc<AtomicBool>,
 }
 
 impl HttpMetricsSink {
-    fn new(base_url: &str) -> Self {
-        let client = reqwest::Client::new();
+    fn new(
+        base_url: &str,
+        identity: MetricsIdentity,
+        fallback: Arc<RouterMetrics>,
+        forwarding: Arc<AtomicBool>,
+        standby_hidden: Arc<AtomicBool>,
+        fallback_available: bool,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         let url = format!("{}/v1/router/top/update", base_url.trim_end_matches('/'));
+        let health_url = format!("{}/healthz", base_url.trim_end_matches('/'));
+        let identity_headers = identity.forwarding_headers();
         let (updates, mut rx) = mpsc::channel::<MetricsUpdate>(1024);
+        let worker_forwarding = forwarding.clone();
+        let worker_standby_hidden = standby_hidden.clone();
         tokio::spawn(async move {
-            while let Some(update) = rx.recv().await {
-                if let Err(error) = client.post(&url).json(&update).send().await {
-                    warn!("failed to forward metrics update: {error}");
+            let mut identity_headers = identity_headers;
+            let (mut expected_owner_id, mut expected_owner_pid) = match verify_metrics_owner(
+                &client,
+                &health_url,
+                &identity,
+            )
+            .await
+            {
+                Ok(owner) => {
+                    insert_metrics_owner_header(&mut identity_headers, &owner.owner_id);
+                    (Some(owner.owner_id), Some(owner.pid))
+                }
+                Err(error) if fallback_available => {
+                    worker_forwarding.store(false, Ordering::Release);
+                    worker_standby_hidden.store(false, Ordering::Release);
+                    warn!(
+                        "metrics owner at {health_url} was unavailable before forwarding began ({error}); activating local fallback"
+                    );
+                    return;
+                }
+                Err(error) => {
+                    warn!(
+                        "metrics owner at {health_url} could not be verified ({error}); forwarding without a local fallback"
+                    );
+                    (None, None)
+                }
+            };
+            let mut owner_check = tokio::time::interval(Duration::from_secs(1));
+            owner_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut consecutive_owner_failures = 0u64;
+            loop {
+                tokio::select! {
+                    maybe_update = rx.recv() => {
+                        let Some(update) = maybe_update else {
+                            break;
+                        };
+                        if !worker_forwarding.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let (failure, identity_rejected) = match client
+                            .post(&url)
+                            .headers(identity_headers.clone())
+                            .json(&update)
+                            .send()
+                            .await
+                        {
+                            Ok(response) if !response.status().is_success() => {
+                                (
+                                    Some(format!("HTTP {}", response.status())),
+                                    response.status() == StatusCode::CONFLICT,
+                                )
+                            }
+                            Err(error) => (Some(error.to_string()), false),
+                            Ok(_) => (None, false),
+                        };
+                        if let Some(failure) = failure {
+                            if fallback_available && identity_rejected {
+                                worker_forwarding.store(false, Ordering::Release);
+                                worker_standby_hidden.store(false, Ordering::Release);
+                                warn!(
+                                    "metrics owner at {url} rejected this proxy identity ({failure}); activating local fallback"
+                                );
+                                continue;
+                            }
+                            warn!("metrics forwarding to {url} failed ({failure})");
+                        }
+                    }
+                    _ = owner_check.tick(), if worker_forwarding.load(Ordering::Acquire) => {
+                        match verify_metrics_owner(&client, &health_url, &identity).await {
+                            Ok(owner) if expected_owner_id.as_deref().is_none_or(|expected| expected == owner.owner_id) => {
+                                if expected_owner_id.is_none() {
+                                    insert_metrics_owner_header(&mut identity_headers, &owner.owner_id);
+                                    expected_owner_id = Some(owner.owner_id);
+                                    expected_owner_pid = Some(owner.pid);
+                                }
+                                consecutive_owner_failures = 0;
+                            }
+                            Ok(owner) => {
+                                if fallback_available {
+                                    worker_forwarding.store(false, Ordering::Release);
+                                    worker_standby_hidden.store(false, Ordering::Release);
+                                    warn!(
+                                        "metrics owner at {health_url} changed from {} to {}; activating local fallback",
+                                        expected_owner_id.as_deref().unwrap_or("unknown"),
+                                        owner.owner_id,
+                                    );
+                                } else {
+                                    insert_metrics_owner_header(&mut identity_headers, &owner.owner_id);
+                                    expected_owner_id = Some(owner.owner_id);
+                                    expected_owner_pid = Some(owner.pid);
+                                }
+                            }
+                            Err(error) => {
+                                consecutive_owner_failures = consecutive_owner_failures.saturating_add(1);
+                                if consecutive_owner_failures >= METRICS_OWNER_FAILURE_THRESHOLD {
+                                    if fallback_available
+                                        && expected_owner_pid.is_some_and(|pid| !process_is_alive(pid))
+                                    {
+                                        worker_forwarding.store(false, Ordering::Release);
+                                        worker_standby_hidden.store(false, Ordering::Release);
+                                        warn!(
+                                            "metrics owner check for {health_url} failed {consecutive_owner_failures} consecutive times ({error}) and its process exited; activating local fallback"
+                                        );
+                                    } else if should_warn_owner_failure(consecutive_owner_failures) {
+                                        warn!(
+                                            "metrics owner check for {health_url} failed {consecutive_owner_failures} consecutive times ({error}), but its process is still present; keeping the local mirror hidden"
+                                        );
+                                    }
+                                } else if should_warn_owner_failure(consecutive_owner_failures) {
+                                    warn!(
+                                        "metrics owner check for {health_url} failed ({error}); keeping the local mirror hidden pending confirmation"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         });
-        Self { updates }
+        Self {
+            updates,
+            fallback,
+            forwarding,
+        }
     }
 }
 
 impl MetricsSink for HttpMetricsSink {
     fn record(&self, update: MetricsUpdate) {
+        // Mirror continuously so a confirmed owner loss preserves in-flight
+        // request context and completed history. The local snapshot remains
+        // hidden while forwarding is healthy, preventing double-counting.
+        self.fallback.record(update.clone());
+        if !self.forwarding.load(Ordering::Acquire) {
+            return;
+        }
         match self.updates.try_send(update) {
             Ok(()) => {}
             Err(mpsc::error::TrySendError::Full(_)) => {
-                warn!("dropping metrics update because forwarding queue is full");
+                // A busy but healthy owner is not an ownership change. Keep the
+                // complete local mirror hidden and let health verification make
+                // any later failover decision.
+                warn!("dropping forwarded metrics update because the queue is full");
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                warn!("dropping forwarded metrics update because the forwarding worker exited");
+            }
         }
     }
+}
+
+struct LiveMetricsOwner {
+    owner_id: String,
+    pid: u32,
+}
+
+async fn verify_metrics_owner(
+    client: &reqwest::Client,
+    health_url: &str,
+    identity: &MetricsIdentity,
+) -> Result<LiveMetricsOwner, String> {
+    let response = client
+        .get(health_url)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("HTTP {}", response.status()));
+    }
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|error| format!("invalid identity response: {error}"))?;
+    live_metrics_owner_from_value(&value, identity)
+}
+
+fn live_metrics_owner_from_value(
+    value: &serde_json::Value,
+    identity: &MetricsIdentity,
+) -> Result<LiveMetricsOwner, String> {
+    if value.get("runtime").and_then(serde_json::Value::as_str) != Some("rayline-router-metrics") {
+        return Err("owner identity response is not Rayline router metrics".to_owned());
+    }
+    if value.get("forwarding").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Err("metrics candidate is itself forwarding to another owner".to_owned());
+    }
+    if !identity.matches_value(value) {
+        return Err("owner identity changed".to_owned());
+    }
+    let owner_id = value
+        .get("owner_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|owner_id| !owner_id.is_empty())
+        .ok_or_else(|| "owner identity response is missing owner_id".to_owned())?;
+    let pid = value
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| "owner identity response is missing pid".to_owned())?;
+    Ok(LiveMetricsOwner {
+        owner_id: owner_id.to_owned(),
+        pid,
+    })
+}
+
+fn insert_metrics_owner_header(headers: &mut hyper::HeaderMap, owner_id: &str) {
+    if let Ok(value) = hyper::header::HeaderValue::from_str(owner_id) {
+        headers.insert(METRICS_OWNER_HEADER, value);
+    }
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: signal 0 performs an existence/permission check and does not
+    // deliver a signal or mutate the target process.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return !process_is_zombie(pid);
+    }
+    std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+fn process_is_zombie(pid: libc::pid_t) -> bool {
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| process_status_is_zombie(&output.stdout))
+}
+
+#[cfg(unix)]
+fn process_status_is_zombie(status: &[u8]) -> bool {
+    String::from_utf8_lossy(status).contains('Z')
+}
+
+#[cfg(windows)]
+fn process_is_alive(pid: u32) -> bool {
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(
+            desired_access: u32,
+            inherit_handle: i32,
+            process_id: u32,
+        ) -> *mut std::ffi::c_void;
+        fn GetExitCodeProcess(process: *mut std::ffi::c_void, exit_code: *mut u32) -> i32;
+        fn GetLastError() -> u32;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+
+    // SAFETY: OpenProcess is called with a numeric PID and query-only access;
+    // it does not mutate the target process. A null handle is handled below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        // SAFETY: GetLastError reads the calling thread's error state and has no
+        // pointer or lifetime preconditions. OpenProcess was the prior call.
+        let error = unsafe { GetLastError() };
+        // OpenProcess reports an exited/nonexistent PID as INVALID_PARAMETER.
+        // Access denial and unexpected failures stay conservative to avoid
+        // exposing a mirror that could double-count a live owner.
+        return error != ERROR_INVALID_PARAMETER;
+    }
+    let mut exit_code = 0u32;
+    // SAFETY: `handle` was returned by OpenProcess and `exit_code` points to a
+    // valid writable u32 for the duration of this call.
+    let queried = unsafe { GetExitCodeProcess(handle, &mut exit_code) } != 0;
+    // SAFETY: `handle` is a live owned Windows handle and is closed exactly once.
+    let _ = unsafe { CloseHandle(handle) };
+    !queried || exit_code == STILL_ACTIVE
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_alive(_pid: u32) -> bool {
+    // Stay conservative on unsupported targets without a non-mutating PID probe.
+    true
 }
 
 async fn bind_metrics_control(port: u16) -> Result<TcpListener> {
@@ -1099,13 +1514,103 @@ async fn bind_metrics_control(port: u16) -> Result<TcpListener> {
     Ok(listener)
 }
 
+#[derive(Clone, Debug, Default)]
+struct MetricsIdentity {
+    env_name: Option<String>,
+    router_url: Option<String>,
+}
+
+impl MetricsIdentity {
+    fn new(env_name: Option<String>, router_url: &str) -> Self {
+        Self {
+            env_name,
+            router_url: Some(router_url.trim_end_matches('/').to_owned()),
+        }
+    }
+
+    fn apply_to_snapshot(&self, snapshot: &mut serde_json::Value) {
+        let Some(object) = snapshot.as_object_mut() else {
+            return;
+        };
+        if let Some(env_name) = self.env_name.as_deref() {
+            object.insert("env_name".to_owned(), env_name.into());
+        }
+        if let Some(router_url) = self.router_url.as_deref() {
+            object.insert("router_url".to_owned(), router_url.into());
+        }
+    }
+
+    fn forwarding_headers(&self) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        if let Some(value) = self
+            .env_name
+            .as_deref()
+            .and_then(|value| hyper::header::HeaderValue::from_str(value).ok())
+        {
+            headers.insert(METRICS_ENV_HEADER, value);
+        }
+        if let Some(value) = self
+            .router_url
+            .as_deref()
+            .and_then(|value| hyper::header::HeaderValue::from_str(value).ok())
+        {
+            headers.insert(METRICS_ROUTER_HEADER, value);
+        }
+        headers
+    }
+
+    fn matches_forwarding_headers(&self, headers: &hyper::HeaderMap) -> bool {
+        let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
+        header(METRICS_ENV_HEADER) == self.env_name.as_deref()
+            && header(METRICS_ROUTER_HEADER) == self.router_url.as_deref()
+    }
+
+    fn has_forwarding_headers(headers: &hyper::HeaderMap) -> bool {
+        headers.contains_key(METRICS_ENV_HEADER) || headers.contains_key(METRICS_ROUTER_HEADER)
+    }
+
+    fn accepts_forwarding_headers(&self, headers: &hyper::HeaderMap) -> bool {
+        if Self::has_forwarding_headers(headers) {
+            self.matches_forwarding_headers(headers)
+        } else {
+            self.env_name.is_none()
+        }
+    }
+
+    fn matches_value(&self, value: &serde_json::Value) -> bool {
+        value.get("env_name").and_then(serde_json::Value::as_str) == self.env_name.as_deref()
+            && value.get("router_url").and_then(serde_json::Value::as_str)
+                == self.router_url.as_deref()
+    }
+}
+
 fn spawn_metrics_control(
     metrics: Arc<RouterMetrics>,
     listener: TcpListener,
     subscription_pool: Option<Arc<rayline_subscriptions::SubscriptionPoolRuntime>>,
+    identity: MetricsIdentity,
+    forwarding_owner: Option<Arc<AtomicBool>>,
 ) {
+    let owner_id: Arc<str> = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        now_unix_ms(),
+        METRICS_OWNER_COUNTER.fetch_add(1, Ordering::Relaxed),
+    )
+    .into();
+    let legacy_forwarding_updates_rejected = Arc::new(AtomicU64::new(0));
     tokio::spawn(async move {
-        if let Err(error) = serve_metrics_control(metrics, listener, subscription_pool).await {
+        if let Err(error) = serve_metrics_control(
+            metrics,
+            listener,
+            subscription_pool,
+            identity,
+            owner_id,
+            forwarding_owner,
+            legacy_forwarding_updates_rejected,
+        )
+        .await
+        {
             warn!("metrics control server exited: {error}");
         }
     });
@@ -1130,19 +1635,40 @@ async fn serve_metrics_control(
     metrics: Arc<RouterMetrics>,
     listener: TcpListener,
     subscription_pool: Option<Arc<rayline_subscriptions::SubscriptionPoolRuntime>>,
+    identity: MetricsIdentity,
+    owner_id: Arc<str>,
+    forwarding_owner: Option<Arc<AtomicBool>>,
+    legacy_forwarding_updates_rejected: Arc<AtomicU64>,
 ) -> Result<()> {
     loop {
         let (stream, _) = listener.accept().await?;
         let io = TokioIo::new(stream);
         let metrics = metrics.clone();
         let subscription_pool = subscription_pool.clone();
+        let identity = identity.clone();
+        let owner_id = owner_id.clone();
+        let forwarding_owner = forwarding_owner.clone();
+        let legacy_forwarding_updates_rejected = legacy_forwarding_updates_rejected.clone();
         tokio::spawn(async move {
             let svc = service_fn(move |req| {
                 let metrics = metrics.clone();
                 let subscription_pool = subscription_pool.clone();
+                let identity = identity.clone();
+                let owner_id = owner_id.clone();
+                let forwarding_owner = forwarding_owner.clone();
+                let legacy_forwarding_updates_rejected = legacy_forwarding_updates_rejected.clone();
                 async move {
                     Ok::<_, Infallible>(
-                        handle_metrics_control(metrics, subscription_pool, req).await,
+                        handle_metrics_control(
+                            metrics,
+                            subscription_pool,
+                            identity,
+                            owner_id,
+                            forwarding_owner,
+                            legacy_forwarding_updates_rejected,
+                            req,
+                        )
+                        .await,
                     )
                 }
             });
@@ -1181,22 +1707,63 @@ fn sends_json_content_type(headers: &hyper::HeaderMap) -> bool {
 async fn handle_metrics_control(
     metrics: Arc<RouterMetrics>,
     subscription_pool: Option<Arc<rayline_subscriptions::SubscriptionPoolRuntime>>,
+    identity: MetricsIdentity,
+    owner_id: Arc<str>,
+    forwarding_owner: Option<Arc<AtomicBool>>,
+    legacy_forwarding_updates_rejected: Arc<AtomicU64>,
     req: Request<Incoming>,
 ) -> Response<BoxBody> {
     let sends_json = sends_json_content_type(req.headers());
+    // Forwarders predating identity headers remain usable only with an
+    // unscoped owner. An explicitly environment-scoped owner must fail closed:
+    // a legacy proxy may belong to a different environment, and accepting its
+    // headerless updates would contaminate the scoped snapshot. Once either
+    // identity header is present, require the complete pair to match.
+    let has_forwarding_identity = MetricsIdentity::has_forwarding_headers(req.headers());
+    let forwarding_identity_matches = identity.accepts_forwarding_headers(req.headers());
+    let rejected_legacy_forwarding_update = req.method() == Method::POST
+        && req.uri().path() == "/v1/router/top/update"
+        && identity.env_name.is_some()
+        && !has_forwarding_identity;
+    let forwarding_owner_matches = req
+        .headers()
+        .get(METRICS_OWNER_HEADER)
+        .is_none_or(|header| header.as_bytes() == owner_id.as_bytes());
+    let snapshot_is_forwarded = forwarding_owner
+        .as_deref()
+        .is_some_and(|forwarding| forwarding.load(Ordering::Acquire));
     match (req.method().clone(), req.uri().path()) {
-        (Method::GET, "/healthz") => json_response(
-            StatusCode::OK,
-            // The pid says which process owns this port, so a launcher can tell
-            // its own serve from another process that bound it first (#82).
-            serde_json::json!({
+        (Method::GET, "/healthz") => {
+            let mut health = serde_json::json!({
                 "ok": true,
                 "runtime": "rayline-router-metrics",
                 "pid": std::process::id(),
+                "owner_id": owner_id.as_ref(),
+                "forwarding": snapshot_is_forwarded,
+                "legacy_forwarding_updates_rejected": legacy_forwarding_updates_rejected.load(Ordering::Relaxed),
+            });
+            identity.apply_to_snapshot(&mut health);
+            json_response(StatusCode::OK, health)
+        }
+        (Method::GET, "/v1/router/top/snapshot") if snapshot_is_forwarded => json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            serde_json::json!({
+                "ok": false,
+                "error": "metrics are available from the shared owner",
             }),
         ),
         (Method::GET, "/v1/router/top/snapshot") => {
-            json_response(StatusCode::OK, serde_json::json!(metrics.snapshot()))
+            let mut snapshot = serde_json::json!(metrics.snapshot());
+            identity.apply_to_snapshot(&mut snapshot);
+            if let Some(object) = snapshot.as_object_mut() {
+                object.insert(
+                    "legacy_forwarding_updates_rejected".to_owned(),
+                    legacy_forwarding_updates_rejected
+                        .load(Ordering::Relaxed)
+                        .into(),
+                );
+            }
+            json_response(StatusCode::OK, snapshot)
         }
         (Method::GET, "/v1/subscriptions/status") => match subscription_pool {
             Some(pool) => json_response(StatusCode::OK, serde_json::json!(pool.status())),
@@ -1224,6 +1791,13 @@ async fn handle_metrics_control(
                 serde_json::json!({"ok": false, "error": "subscription pool unavailable"}),
             ),
         },
+        (Method::POST, "/v1/router/top/update") if !sends_json => json_response(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            serde_json::json!({
+                "ok": false,
+                "error": "metrics update requires content-type: application/json",
+            }),
+        ),
         (Method::POST, "/v1/router/top/update") => {
             let body = match req.into_body().collect().await {
                 Ok(body) => body.to_bytes(),
@@ -1234,16 +1808,37 @@ async fn handle_metrics_control(
                     );
                 }
             };
-            match serde_json::from_slice::<MetricsUpdate>(&body) {
-                Ok(update) => {
-                    metrics.record(update);
-                    json_response(StatusCode::OK, serde_json::json!({"ok": true}))
+            let update = match serde_json::from_slice::<MetricsUpdate>(&body) {
+                Ok(update) => update,
+                Err(error) => {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        serde_json::json!({"ok": false, "error": error.to_string()}),
+                    );
                 }
-                Err(error) => json_response(
-                    StatusCode::BAD_REQUEST,
-                    serde_json::json!({"ok": false, "error": error.to_string()}),
-                ),
+            };
+            if !forwarding_identity_matches || !forwarding_owner_matches {
+                if rejected_legacy_forwarding_update
+                    && legacy_forwarding_updates_rejected.fetch_add(1, Ordering::Relaxed) == 0
+                {
+                    warn!(
+                        "rejected headerless metrics updates from a pre-upgrade proxy; restart older Rayline sessions to restore complete scoped metrics"
+                    );
+                }
+                return json_response(
+                    StatusCode::CONFLICT,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": if rejected_legacy_forwarding_update {
+                            "legacy metrics forwarder must be restarted before it can report to an environment-scoped daemon"
+                        } else {
+                            "metrics forwarding identity does not match this daemon"
+                        },
+                    }),
+                );
             }
+            metrics.record(update);
+            json_response(StatusCode::OK, serde_json::json!({"ok": true}))
         }
         _ => Response::builder()
             .status(StatusCode::NOT_FOUND)
@@ -1545,6 +2140,14 @@ async fn ensure_llama_binary(manager: &rayline_llama::LlamaServerManager, tag: &
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn process_status_parser_treats_zombies_as_exited() {
+        assert!(process_status_is_zombie(b"Z+\n"));
+        assert!(process_status_is_zombie(b"SsZ\n"));
+        assert!(!process_status_is_zombie(b"S+\n"));
+    }
+
     #[test]
     fn proxy_self_hosts_metrics_when_no_forwarding_url() {
         let plan = proxy_metrics_plan(None, 20814);
@@ -1560,6 +2163,522 @@ mod tests {
         );
     }
 
+    #[test]
+    fn proxy_disables_self_hosted_metrics_for_zero_port() {
+        assert_eq!(proxy_metrics_plan(None, 0), ProxyMetricsPlan::Disabled);
+    }
+
+    #[test]
+    fn router_owned_metrics_never_expose_an_incomplete_self_hosted_snapshot() {
+        assert_eq!(
+            effective_proxy_metrics_plan(None, 20814, 20810, true),
+            ProxyMetricsPlan::Disabled
+        );
+        assert_eq!(
+            effective_proxy_metrics_plan(Some("http://127.0.0.1:20813"), 0, 20810, true),
+            ProxyMetricsPlan::Forward("http://127.0.0.1:20813".to_owned())
+        );
+    }
+
+    #[test]
+    fn metrics_fallback_never_binds_the_proxy_listener() {
+        assert_eq!(
+            effective_proxy_metrics_plan(None, 20810, 20810, false),
+            ProxyMetricsPlan::Disabled
+        );
+        assert_eq!(
+            effective_proxy_metrics_plan(Some("http://127.0.0.1:20813"), 20810, 20810, false,),
+            ProxyMetricsPlan::Forward("http://127.0.0.1:20813".to_owned())
+        );
+        assert!(!forwarding_fallback_enabled(20810, 20810, false));
+        assert!(forwarding_fallback_enabled(20814, 20810, false));
+    }
+
+    #[test]
+    fn owner_failure_warnings_are_rate_limited_after_the_transition() {
+        assert!(should_warn_owner_failure(1));
+        assert!(!should_warn_owner_failure(2));
+        assert!(should_warn_owner_failure(3));
+        assert!(!should_warn_owner_failure(4));
+        assert!(should_warn_owner_failure(60));
+        assert!(should_warn_owner_failure(120));
+    }
+
+    #[test]
+    fn forwarded_metrics_headers_must_match_the_live_owner() {
+        let dev = MetricsIdentity::new(Some("dev".to_owned()), "https://api-dev.rayline.ai/");
+        let prod = MetricsIdentity::new(Some("prod".to_owned()), "https://api.rayline.ai/");
+
+        assert!(dev.matches_forwarding_headers(&dev.forwarding_headers()));
+        assert!(!dev.matches_forwarding_headers(&prod.forwarding_headers()));
+        assert!(!dev.matches_forwarding_headers(&hyper::HeaderMap::new()));
+        assert!(!MetricsIdentity::has_forwarding_headers(
+            &hyper::HeaderMap::new()
+        ));
+        assert!(MetricsIdentity::has_forwarding_headers(
+            &dev.forwarding_headers()
+        ));
+        assert!(!dev.accepts_forwarding_headers(&hyper::HeaderMap::new()));
+        let unscoped = MetricsIdentity::new(None, "https://api.rayline.ai/");
+        assert!(unscoped.accepts_forwarding_headers(&hyper::HeaderMap::new()));
+
+        let hidden_standby = serde_json::json!({
+            "runtime": "rayline-router-metrics",
+            "pid": 1,
+            "owner_id": "standby",
+            "forwarding": true,
+            "env_name": "dev",
+            "router_url": "https://api-dev.rayline.ai",
+        });
+        assert!(live_metrics_owner_from_value(&hidden_standby, &dev).is_err());
+
+        let mut primary = hidden_standby;
+        primary["forwarding"] = false.into();
+        assert_eq!(
+            live_metrics_owner_from_value(&primary, &dev)
+                .expect("primary owner")
+                .owner_id,
+            "standby",
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_failure_hands_the_unforwarded_update_to_local_fallback() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let owner = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind owner fixture");
+        let owner_port = owner.local_addr().expect("owner address").port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = owner.accept().await else {
+                    break;
+                };
+                let mut request = [0u8; 2048];
+                let Ok(read) = stream.read(&mut request).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                let is_health = request.starts_with("GET /healthz ");
+                let (status, body): (&str, &[u8]) = if is_health {
+                    (
+                        "200 OK",
+                        br#"{"ok":true,"runtime":"rayline-router-metrics","pid":1,"owner_id":"owner-a","env_name":"dev","router_url":"https://api-dev.rayline.ai"}"#,
+                    )
+                } else {
+                    ("409 Conflict", br#"{"ok":false}"#)
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+                if !is_health {
+                    break;
+                }
+            }
+        });
+
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let forwarding = Arc::new(AtomicBool::new(true));
+        let sink = HttpMetricsSink::new(
+            &format!("http://127.0.0.1:{owner_port}"),
+            MetricsIdentity::new(Some("dev".to_owned()), "https://api-dev.rayline.ai"),
+            metrics.clone(),
+            forwarding.clone(),
+            Arc::new(AtomicBool::new(true)),
+            true,
+        );
+        sink.record(MetricsUpdate::RequestStarted {
+            request_id: "unforwarded-request".to_owned(),
+            source: "proxy".to_owned(),
+            requested_model: None,
+            agent_id: None,
+            agent_type: None,
+            session_id: None,
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while forwarding.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("forwarder activates fallback");
+
+        let snapshot = serde_json::json!(metrics.snapshot());
+        assert_eq!(snapshot["active"][0]["request_id"], "unforwarded-request");
+    }
+
+    #[tokio::test]
+    async fn transient_update_failure_keeps_the_complete_mirror_hidden() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let owner = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind owner fixture");
+        let owner_port = owner.local_addr().expect("owner address").port();
+        let (update_seen, update_received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut update_seen = Some(update_seen);
+            loop {
+                let Ok((mut stream, _)) = owner.accept().await else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                let Ok(read) = stream.read(&mut request).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                let is_health = request.starts_with("GET /healthz ");
+                let (status, body): (&str, &[u8]) = if is_health {
+                    (
+                        "200 OK",
+                        br#"{"ok":true,"runtime":"rayline-router-metrics","pid":1,"owner_id":"owner-a","env_name":"dev","router_url":"https://api-dev.rayline.ai"}"#,
+                    )
+                } else {
+                    ("500 Internal Server Error", br#"{"ok":false}"#)
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+                if !is_health {
+                    if let Some(update_seen) = update_seen.take() {
+                        let _ = update_seen.send(());
+                    }
+                    break;
+                }
+            }
+        });
+
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let forwarding = Arc::new(AtomicBool::new(true));
+        let sink = HttpMetricsSink::new(
+            &format!("http://127.0.0.1:{owner_port}"),
+            MetricsIdentity::new(Some("dev".to_owned()), "https://api-dev.rayline.ai"),
+            metrics.clone(),
+            forwarding.clone(),
+            Arc::new(AtomicBool::new(true)),
+            true,
+        );
+        sink.record(MetricsUpdate::RequestStarted {
+            request_id: "transient-failure".to_owned(),
+            source: "proxy".to_owned(),
+            requested_model: None,
+            agent_id: None,
+            agent_type: None,
+            session_id: None,
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), update_received)
+            .await
+            .expect("owner receives update")
+            .expect("owner notification");
+        tokio::task::yield_now().await;
+        assert!(forwarding.load(Ordering::Acquire));
+        assert_eq!(metrics.snapshot().active.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn healthy_forwarding_keeps_the_complete_local_mirror_hidden() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let owner = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind owner fixture");
+        let owner_port = owner.local_addr().expect("owner address").port();
+        let (update_seen, update_received) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut update_seen = Some(update_seen);
+            loop {
+                let Ok((mut stream, _)) = owner.accept().await else {
+                    break;
+                };
+                let mut request = [0u8; 4096];
+                let Ok(read) = stream.read(&mut request).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                let body = if request.starts_with("GET /healthz ") {
+                    br#"{"ok":true,"runtime":"rayline-router-metrics","pid":1,"owner_id":"owner-a","env_name":"dev","router_url":"https://api-dev.rayline.ai"}"#
+                        .as_slice()
+                } else {
+                    if let Some(update_seen) = update_seen.take() {
+                        let _ = update_seen.send(());
+                    }
+                    br#"{"ok":true}"#.as_slice()
+                };
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+                if update_seen.is_none() {
+                    break;
+                }
+            }
+        });
+
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let forwarding = Arc::new(AtomicBool::new(true));
+        let sink = HttpMetricsSink::new(
+            &format!("http://127.0.0.1:{owner_port}"),
+            MetricsIdentity::new(Some("dev".to_owned()), "https://api-dev.rayline.ai"),
+            metrics.clone(),
+            forwarding.clone(),
+            Arc::new(AtomicBool::new(true)),
+            true,
+        );
+        sink.record(MetricsUpdate::RequestStarted {
+            request_id: "forwarded-only".to_owned(),
+            source: "proxy".to_owned(),
+            requested_model: None,
+            agent_id: None,
+            agent_type: None,
+            session_id: None,
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), update_received)
+            .await
+            .expect("owner receives update")
+            .expect("owner notification");
+        assert!(forwarding.load(Ordering::Acquire));
+        assert_eq!(metrics.snapshot().active.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovered_owner_does_not_expose_the_complete_standby_mirror() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let owner = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind owner fixture");
+        let owner_port = owner.local_addr().expect("owner address").port();
+        let (recovered, recovery_seen) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut health_checks = 0u8;
+            let mut recovered = Some(recovered);
+            loop {
+                let Ok((mut stream, _)) = owner.accept().await else {
+                    break;
+                };
+                let mut request = [0u8; 2048];
+                let Ok(read) = stream.read(&mut request).await else {
+                    continue;
+                };
+                let request = String::from_utf8_lossy(&request[..read]);
+                if !request.starts_with("GET /healthz ") {
+                    continue;
+                }
+                health_checks = health_checks.saturating_add(1);
+                let unavailable = (2..=4).contains(&health_checks);
+                let (status, body): (&str, &[u8]) = if unavailable {
+                    ("500 Internal Server Error", br#"{"ok":false}"#)
+                } else {
+                    (
+                        "200 OK",
+                        br#"{"ok":true,"runtime":"rayline-router-metrics","pid":1,"owner_id":"owner-a","env_name":"dev","router_url":"https://api-dev.rayline.ai"}"#,
+                    )
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+                if health_checks >= 5 {
+                    if let Some(recovered) = recovered.take() {
+                        let _ = recovered.send(());
+                    }
+                    break;
+                }
+            }
+        });
+
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let forwarding = Arc::new(AtomicBool::new(true));
+        let standby_hidden = Arc::new(AtomicBool::new(true));
+        let _sink = HttpMetricsSink::new(
+            &format!("http://127.0.0.1:{owner_port}"),
+            MetricsIdentity::new(Some("dev".to_owned()), "https://api-dev.rayline.ai"),
+            metrics,
+            forwarding.clone(),
+            standby_hidden.clone(),
+            true,
+        );
+
+        tokio::time::timeout(Duration::from_secs(6), recovery_seen)
+            .await
+            .expect("owner recovers")
+            .expect("recovery notification");
+        tokio::task::yield_now().await;
+        assert!(forwarding.load(Ordering::Acquire));
+        assert!(standby_hidden.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn forwarding_proxy_exposes_its_snapshot_only_after_failover() {
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let listener = bind_metrics_control(0).await.expect("bind metrics control");
+        let port = listener.local_addr().expect("listener addr").port();
+        let forwarding = Arc::new(AtomicBool::new(true));
+        spawn_metrics_control(
+            metrics,
+            listener,
+            None,
+            MetricsIdentity::new(Some("dev".to_owned()), "https://api-dev.rayline.ai"),
+            Some(forwarding.clone()),
+        );
+
+        let client = reqwest::Client::new();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let health: serde_json::Value = client
+            .get(format!("{base_url}/healthz"))
+            .send()
+            .await
+            .expect("health response")
+            .json()
+            .await
+            .expect("health json");
+        assert_eq!(health["forwarding"], true);
+        assert_eq!(health["env_name"], "dev");
+
+        let hidden = client
+            .get(format!("{base_url}/v1/router/top/snapshot"))
+            .send()
+            .await
+            .expect("forwarding snapshot response");
+        assert_eq!(hidden.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+
+        forwarding.store(false, Ordering::Release);
+        let visible = client
+            .get(format!("{base_url}/v1/router/top/snapshot"))
+            .send()
+            .await
+            .expect("fallback snapshot response");
+        assert_eq!(visible.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_control_rejects_updates_from_another_environment() {
+        let metrics = RouterMetrics::new("rayline-proxy");
+        let listener = bind_metrics_control(0).await.expect("bind metrics control");
+        let port = listener.local_addr().expect("listener addr").port();
+        let dev = MetricsIdentity::new(Some("dev".to_owned()), "https://api-dev.rayline.ai/");
+        spawn_metrics_control(metrics, listener, None, dev.clone(), None);
+
+        let client = reqwest::Client::new();
+        let update_url = format!("http://127.0.0.1:{port}/v1/router/top/update");
+        let health: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .expect("health response")
+            .json()
+            .await
+            .expect("health json");
+        let owner_id = health["owner_id"].as_str().expect("metrics owner id");
+        let update = MetricsUpdate::RequestStarted {
+            request_id: "req-1".to_owned(),
+            source: "proxy".to_owned(),
+            requested_model: None,
+            agent_id: None,
+            agent_type: None,
+            session_id: None,
+        };
+        let legacy = MetricsUpdate::RequestStarted {
+            request_id: "legacy-req".to_owned(),
+            source: "proxy".to_owned(),
+            requested_model: None,
+            agent_id: None,
+            agent_type: None,
+            session_id: None,
+        };
+        let prod = MetricsIdentity::new(Some("prod".to_owned()), "https://api.rayline.ai/");
+        let rejected = client
+            .post(&update_url)
+            .headers(prod.forwarding_headers())
+            .json(&update)
+            .send()
+            .await
+            .expect("foreign update response");
+        assert_eq!(rejected.status(), reqwest::StatusCode::CONFLICT);
+
+        let mut stale_owner_headers = dev.forwarding_headers();
+        insert_metrics_owner_header(&mut stale_owner_headers, "old-owner");
+        let stale_owner_rejected = client
+            .post(&update_url)
+            .headers(stale_owner_headers)
+            .json(&update)
+            .send()
+            .await
+            .expect("stale owner update response");
+        assert_eq!(stale_owner_rejected.status(), reqwest::StatusCode::CONFLICT);
+
+        let mut matching_headers = dev.forwarding_headers();
+        insert_metrics_owner_header(&mut matching_headers, owner_id);
+        let accepted = client
+            .post(&update_url)
+            .headers(matching_headers)
+            .json(&update)
+            .send()
+            .await
+            .expect("matching update response");
+        assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+
+        let malformed_legacy = client
+            .post(&update_url)
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .expect("malformed legacy update response");
+        assert_eq!(malformed_legacy.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let browser_legacy = client
+            .post(&update_url)
+            .header("content-type", "text/plain")
+            .body(serde_json::to_string(&legacy).expect("serialize legacy update"))
+            .send()
+            .await
+            .expect("browser legacy update response");
+        assert_eq!(
+            browser_legacy.status(),
+            reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+
+        let legacy_rejected = client
+            .post(&update_url)
+            .json(&legacy)
+            .send()
+            .await
+            .expect("legacy update response");
+        assert_eq!(legacy_rejected.status(), reqwest::StatusCode::CONFLICT);
+
+        let snapshot: serde_json::Value = client
+            .get(format!("http://127.0.0.1:{port}/v1/router/top/snapshot"))
+            .send()
+            .await
+            .expect("snapshot response")
+            .json()
+            .await
+            .expect("snapshot json");
+        let active = snapshot["active"].as_array().expect("active requests");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["request_id"], "req-1");
+        assert_eq!(snapshot["legacy_forwarding_updates_rejected"], 1);
+    }
+
     /// End-to-end cut-point for the self-host path: a proxy that is not forwarding
     /// stands up its own metrics-control server (the exact `bind_metrics_control` +
     /// `spawn_metrics_control` mechanism `run_proxy`'s `SelfHost` arm uses) and that
@@ -1569,7 +2688,13 @@ mod tests {
         let metrics = RouterMetrics::new("rayline-proxy");
         let listener = bind_metrics_control(0).await.expect("bind metrics control");
         let port = listener.local_addr().expect("listener addr").port();
-        spawn_metrics_control(metrics, listener, None);
+        spawn_metrics_control(
+            metrics,
+            listener,
+            None,
+            MetricsIdentity::new(Some("dev".to_owned()), "https://api-dev.rayline.ai/"),
+            None,
+        );
 
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
@@ -1580,6 +2705,8 @@ mod tests {
         for key in ["ok", "totals", "active", "recent"] {
             assert!(body.get(key).is_some(), "snapshot missing `{key}`: {body}");
         }
+        assert_eq!(body["env_name"], "dev");
+        assert_eq!(body["router_url"], "https://api-dev.rayline.ai");
 
         let subscriptions = client
             .get(format!("http://127.0.0.1:{port}/v1/subscriptions/status"))
@@ -1604,7 +2731,7 @@ mod tests {
             "the subscription control server must stay loopback-only: {address}"
         );
         let port = address.port();
-        spawn_metrics_control(metrics, listener, None);
+        spawn_metrics_control(metrics, listener, None, MetricsIdentity::default(), None);
 
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{port}/v1/subscriptions/reload");
@@ -1643,7 +2770,7 @@ mod tests {
         let metrics = RouterMetrics::new("rayline-proxy");
         let listener = bind_metrics_control(0).await.expect("bind metrics control");
         let port = listener.local_addr().expect("listener addr").port();
-        spawn_metrics_control(metrics, listener, None);
+        spawn_metrics_control(metrics, listener, None, MetricsIdentity::default(), None);
 
         let client = reqwest::Client::new();
         let url = format!("http://127.0.0.1:{port}/v1/subscriptions/reload");

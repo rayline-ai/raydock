@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +22,8 @@ pub const DEFAULT_LOCAL_ROUTER_PORT: u16 = 20811;
 /// non-isolated cloud-only session can both expose metrics at once.
 const DEFAULT_ISOLATED_METRICS_PORT: u16 = 20814;
 const DEFAULT_SUBSCRIPTION_METRICS_PORT: u16 = 20816;
+const FALLBACK_METRICS_PORT_START: u16 = 20817;
+const FALLBACK_METRICS_PORT_END: u16 = 20832;
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(1);
 const HEALTH_TIMEOUT_SECONDS: u64 = 240;
 const HEALTH_TIMEOUT_DOWNLOAD_SECONDS: u64 = 3600;
@@ -107,6 +109,7 @@ pub struct RouterStartRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalProxyStartRequest {
+    pub env_name: Option<String>,
     pub router_url: String,
     pub proxy_port: u16,
     pub proxy_routing_mode: String,
@@ -137,6 +140,7 @@ pub struct RouterLogsRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterTopRequest {
+    pub env_name: Option<String>,
     pub json: bool,
     pub show_all: bool,
     pub root_env_explicit: bool,
@@ -149,6 +153,9 @@ pub struct RouterStopRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RouterStartCliRequest {
+    /// Environment selected by the caller. Local-only names are retained even
+    /// when they have no hosted-environment configuration.
+    pub env_name: Option<String>,
     /// Inbound API surface to expose for user-facing clients. `anthropic`
     /// preserves the transparent Claude proxy startup; `codex` starts the same
     /// local router without the proxy and expects clients to use /v1/responses.
@@ -324,26 +331,28 @@ pub async fn render_top(request: &RouterTopRequest) -> io::Result<String> {
 }
 
 async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Result<String> {
-    let serve_meta = read_meta(&RouterPaths::new(home).meta_file);
-    let proxy_meta = read_meta(&RouterPaths::new(home).proxy_meta_file);
-    let isolated_proxy_meta = read_meta(&RouterPaths::new_isolated(home).proxy_meta_file);
-    let subscription_proxy_meta = read_meta(&RouterPaths::new_subscription(home).proxy_meta_file);
-    let candidates = metrics_port_candidates(
-        &serve_meta,
-        &proxy_meta,
-        &isolated_proxy_meta,
-        &subscription_proxy_meta,
-    );
+    let expected_router_url = match request.env_name.as_deref() {
+        Some(env_name) => match crate::status::resolve_hosted_environment(env_name, Some(home)) {
+            Ok(hosted) => Some(hosted.router_url),
+            Err(crate::status::HostedEnvironmentError::Unknown { .. }) => None,
+            Err(error) => return Err(io::Error::other(error)),
+        },
+        None => None,
+    };
     let client = reqwest::Client::builder()
         .timeout(HEALTH_TIMEOUT)
         .build()
         .map_err(io::Error::other)?;
-    let metrics_port = first_reachable_metrics_port(&client, &candidates).await;
-    let url = format!("http://127.0.0.1:{metrics_port}/v1/router/top/snapshot");
     let mut trace_cache = ClaudeTraceCache::new(home);
 
     if request.json {
-        let mut snapshot = fetch_top_snapshot(&client, &url).await?;
+        let mut snapshot = fetch_discovered_top_snapshot(
+            &client,
+            home,
+            request.env_name.as_deref(),
+            expected_router_url.as_deref(),
+        )
+        .await?;
         trace_cache.enrich_snapshot(&mut snapshot);
         filter_top_snapshot(&mut snapshot, request.show_all);
         return serde_json::to_string_pretty(&snapshot)
@@ -355,18 +364,50 @@ async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Re
     }
 
     if !io::stdout().is_terminal() {
-        let mut snapshot = fetch_top_snapshot(&client, &url).await?;
+        let mut snapshot = fetch_discovered_top_snapshot(
+            &client,
+            home,
+            request.env_name.as_deref(),
+            expected_router_url.as_deref(),
+        )
+        .await?;
         trace_cache.enrich_snapshot(&mut snapshot);
         return Ok(format_top_snapshot(&snapshot, request.show_all));
     }
 
-    run_top_tui(&client, &url, trace_cache, request.show_all).await?;
+    run_top_tui(
+        &client,
+        home,
+        request.env_name.as_deref(),
+        expected_router_url.as_deref(),
+        trace_cache,
+        request.show_all,
+    )
+    .await?;
     Ok(String::new())
 }
 
-async fn fetch_top_snapshot(client: &reqwest::Client, url: &str) -> io::Result<Value> {
+async fn fetch_discovered_top_snapshot(
+    client: &reqwest::Client,
+    home: &Path,
+    expected_env_name: Option<&str>,
+    expected_router_url: Option<&str>,
+) -> io::Result<Value> {
+    let candidates = discover_metrics_ports(home, expected_env_name, expected_router_url);
+    if candidates.is_empty() {
+        let environment = expected_env_name.unwrap_or("selected");
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no router metrics instances found for environment {environment}"),
+        ));
+    }
+    fetch_top_snapshot(client, &candidates, expected_env_name, expected_router_url).await
+}
+
+async fn fetch_one_top_snapshot(client: &reqwest::Client, port: u16) -> io::Result<Value> {
+    let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
     client
-        .get(url)
+        .get(&url)
         .send()
         .await
         .map_err(|error| {
@@ -380,6 +421,289 @@ async fn fetch_top_snapshot(client: &reqwest::Client, url: &str) -> io::Result<V
         .json::<Value>()
         .await
         .map_err(io::Error::other)
+}
+
+/// Fetch every advertised metrics endpoint concurrently and combine the live
+/// snapshots. Stale metadata is tolerated as long as at least one instance
+/// answers; a dead sidecar must not hide healthy shared or isolated traffic.
+async fn fetch_top_snapshot(
+    client: &reqwest::Client,
+    ports: &[u16],
+    expected_env_name: Option<&str>,
+    expected_router_url: Option<&str>,
+) -> io::Result<Value> {
+    let mut tasks = tokio::task::JoinSet::new();
+    for (index, &port) in ports.iter().enumerate() {
+        let client = client.clone();
+        tasks.spawn(async move { (index, port, fetch_one_top_snapshot(&client, port).await) });
+    }
+
+    let mut snapshots = Vec::new();
+    let mut first_error = None;
+    let mut legacy_identity_ports = Vec::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((index, port, Ok(snapshot)))
+                if snapshot_matches_environment(
+                    &snapshot,
+                    expected_env_name,
+                    expected_router_url,
+                ) =>
+            {
+                snapshots.push((index, port, snapshot));
+            }
+            Ok((_index, port, Ok(snapshot))) => {
+                if expected_env_name.is_some() && snapshot_lacks_live_identity(&snapshot) {
+                    legacy_identity_ports.push(port);
+                    continue;
+                }
+                first_error.get_or_insert_with(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "router metrics endpoint on :{port} does not match the selected environment"
+                        ),
+                    )
+                });
+            }
+            Ok((_index, _port, Err(error))) => {
+                first_error.get_or_insert(error);
+            }
+            Err(error) => {
+                first_error.get_or_insert_with(|| io::Error::other(error));
+            }
+        }
+    }
+    if !legacy_identity_ports.is_empty() {
+        legacy_identity_ports.sort_unstable();
+        legacy_identity_ports.dedup();
+        let ports = legacy_identity_ports
+            .iter()
+            .map(|port| format!(":{port}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "router metrics endpoint(s) {ports} were started by an older Rayline daemon without live environment identity; restart the corresponding Rayline session(s) after updating, then rerun this scoped top command"
+            ),
+        ));
+    }
+    if snapshots.is_empty() {
+        return Err(first_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "no router metrics endpoints are available",
+            )
+        }));
+    }
+    snapshots.sort_by_key(|(index, _, _)| *index);
+    Ok(merge_top_snapshots(
+        snapshots
+            .into_iter()
+            .map(|(_, port, snapshot)| (port, snapshot)),
+    ))
+}
+
+fn snapshot_lacks_live_identity(snapshot: &Value) -> bool {
+    snapshot.get("env_name").and_then(Value::as_str).is_none()
+        && snapshot.get("router_url").and_then(Value::as_str).is_none()
+}
+
+fn merge_top_snapshots(snapshots: impl IntoIterator<Item = (u16, Value)>) -> Value {
+    let snapshots = snapshots.into_iter().collect::<Vec<_>>();
+    let mut runtimes = BTreeSet::new();
+    let mut started_at_unix_ms = u64::MAX;
+    let mut ok = true;
+    let mut active = Vec::new();
+    let mut recent = Vec::new();
+    let mut sessions = BTreeMap::<String, Value>::new();
+    let mut totals = serde_json::Map::new();
+    let mut llama_perf = None;
+    let mut instances = Vec::new();
+    let mut legacy_forwarding_updates_rejected = 0u64;
+
+    for (port, snapshot) in &snapshots {
+        ok &= snapshot.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        if let Some(runtime) = snapshot.get("runtime").and_then(Value::as_str) {
+            runtimes.insert(runtime.to_owned());
+        }
+        if let Some(started) = snapshot.get("started_at_unix_ms").and_then(Value::as_u64) {
+            started_at_unix_ms = started_at_unix_ms.min(started);
+        }
+        let instance_legacy_rejections = snapshot
+            .get("legacy_forwarding_updates_rejected")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        legacy_forwarding_updates_rejected =
+            legacy_forwarding_updates_rejected.saturating_add(instance_legacy_rejections);
+        instances.push(serde_json::json!({
+            "metrics_port": port,
+            "runtime": snapshot.get("runtime").cloned().unwrap_or(Value::Null),
+            "started_at_unix_ms": snapshot
+                .get("started_at_unix_ms")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "legacy_forwarding_updates_rejected": instance_legacy_rejections,
+        }));
+
+        for key in ["active", "recent"] {
+            let destination = if key == "active" {
+                &mut active
+            } else {
+                &mut recent
+            };
+            if let Some(rows) = snapshot.get(key).and_then(Value::as_array) {
+                destination.extend(rows.iter().cloned().map(|mut row| {
+                    set_row_u64(&mut row, "metrics_port", u64::from(*port));
+                    row
+                }));
+            }
+        }
+
+        if let Some(rows) = snapshot.get("sessions").and_then(Value::as_array) {
+            for row in rows {
+                merge_top_session(&mut sessions, row, *port);
+            }
+        }
+        if let Some(source_totals) = snapshot.get("totals") {
+            for key in [
+                "active_requests",
+                "completed_requests",
+                "errored_requests",
+                "local_requests",
+                "remote_requests",
+                "input_tokens",
+                "output_tokens",
+                "routing_uncertain",
+            ] {
+                let sum = totals
+                    .get(key)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .saturating_add(totals_u64(source_totals, key));
+                totals.insert(key.to_owned(), Value::from(sum));
+            }
+        }
+        if snapshot
+            .get("llama_perf")
+            .filter(|candidate| !candidate.is_null())
+            .is_some_and(|candidate| {
+                llama_perf
+                    .as_ref()
+                    .and_then(|current: &Value| current.get("updated_at_unix_ms"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    <= candidate
+                        .get("updated_at_unix_ms")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+            })
+        {
+            llama_perf = snapshot.get("llama_perf").cloned();
+        }
+    }
+
+    active.sort_by_key(|row| std::cmp::Reverse(row_u64(row, "started_at_unix_ms").unwrap_or(0)));
+    recent.sort_by_key(|row| std::cmp::Reverse(row_u64(row, "started_at_unix_ms").unwrap_or(0)));
+    let mut sessions = sessions.into_values().collect::<Vec<_>>();
+    sessions
+        .sort_by_key(|row| std::cmp::Reverse(row_u64(row, "last_activity_unix_ms").unwrap_or(0)));
+
+    let runtime = if runtimes.len() == 1 {
+        runtimes.into_iter().next().unwrap_or_default()
+    } else {
+        "rayline-multi".to_owned()
+    };
+    serde_json::json!({
+        "ok": ok,
+        "runtime": runtime,
+        "started_at_unix_ms": (started_at_unix_ms != u64::MAX).then_some(started_at_unix_ms),
+        "active": active,
+        "recent": recent,
+        "sessions": sessions,
+        "totals": totals,
+        "llama_perf": llama_perf,
+        "instances": instances,
+        "legacy_forwarding_updates_rejected": legacy_forwarding_updates_rejected,
+    })
+}
+
+fn merge_top_session(sessions: &mut BTreeMap<String, Value>, row: &Value, port: u16) {
+    let Some(session_id) = row.get("session_id").and_then(Value::as_str) else {
+        return;
+    };
+    let existing = sessions.contains_key(session_id);
+    let destination = sessions
+        .entry(session_id.to_owned())
+        .or_insert_with(|| row.clone());
+    if existing {
+        for key in [
+            "completed_requests",
+            "errored_requests",
+            "active_requests",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+        ] {
+            let sum = row_u64(destination, key)
+                .unwrap_or(0)
+                .saturating_add(row_u64(row, key).unwrap_or(0));
+            set_row_u64(destination, key, sum);
+        }
+        let first_seen = row_u64(destination, "first_seen_unix_ms")
+            .unwrap_or(u64::MAX)
+            .min(row_u64(row, "first_seen_unix_ms").unwrap_or(u64::MAX));
+        if first_seen != u64::MAX {
+            set_row_u64(destination, "first_seen_unix_ms", first_seen);
+        }
+        let last_activity = row_u64(destination, "last_activity_unix_ms")
+            .unwrap_or(0)
+            .max(row_u64(row, "last_activity_unix_ms").unwrap_or(0));
+        set_row_u64(destination, "last_activity_unix_ms", last_activity);
+        for key in ["agent_types", "models"] {
+            merge_unique_string_array(destination, row, key);
+        }
+    }
+    append_unique_u64(destination, "metrics_ports", u64::from(port));
+}
+
+fn merge_unique_string_array(destination: &mut Value, source: &Value, key: &str) {
+    let values = source
+        .get(key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let Some(destination) = destination.as_object_mut() else {
+        return;
+    };
+    let entries = destination
+        .entry(key.to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(entries) = entries.as_array_mut() else {
+        return;
+    };
+    for value in values {
+        if !entries.contains(&value) {
+            entries.push(value);
+        }
+    }
+}
+
+fn append_unique_u64(row: &mut Value, key: &str, value: u64) {
+    let Some(row) = row.as_object_mut() else {
+        return;
+    };
+    let entries = row
+        .entry(key.to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(entries) = entries.as_array_mut() else {
+        return;
+    };
+    let value = Value::from(value);
+    if !entries.contains(&value) {
+        entries.push(value);
+    }
 }
 
 struct ClaudeTraceCache {
@@ -947,7 +1271,9 @@ impl Drop for TopTerminalGuard {
 
 async fn run_top_tui(
     client: &reqwest::Client,
-    url: &str,
+    home: &Path,
+    expected_env_name: Option<&str>,
+    expected_router_url: Option<&str>,
     mut trace_cache: ClaudeTraceCache,
     show_all: bool,
 ) -> io::Result<()> {
@@ -972,7 +1298,14 @@ async fn run_top_tui(
                     .map(|last| last.elapsed() >= TOP_REFRESH_INTERVAL)
                     .unwrap_or(true));
         if should_refresh {
-            match fetch_top_snapshot(client, url).await {
+            match fetch_discovered_top_snapshot(
+                client,
+                home,
+                expected_env_name,
+                expected_router_url,
+            )
+            .await
+            {
                 Ok(mut next_snapshot) => {
                     trace_cache.enrich_snapshot(&mut next_snapshot);
                     snapshot = next_snapshot;
@@ -1037,6 +1370,9 @@ fn draw_top(
     let mut y = 0;
     y = draw_title(stdout, y, width, "Rayline Local Router")?;
     y = draw_top_summary(stdout, y, width, snapshot, controls)?;
+    if let Some(warning) = legacy_forwarding_warning(snapshot) {
+        y = draw_colored_line(stdout, y, width, Color::Yellow, &warning)?;
+    }
     if let Some(error) = last_error {
         y = draw_colored_line(
             stdout,
@@ -1612,6 +1948,10 @@ fn format_top_snapshot(snapshot: &Value, show_all: bool) -> String {
             String::new()
         }
     );
+    if let Some(warning) = legacy_forwarding_warning(snapshot) {
+        output.push_str(&warning);
+        output.push('\n');
+    }
     if let Some(rows) = snapshot.get("active").and_then(Value::as_array) {
         for row in rows {
             if !show_all && is_proxied_traffic(row) {
@@ -1631,6 +1971,16 @@ fn format_top_snapshot(snapshot: &Value, show_all: bool) -> String {
         }
     }
     output
+}
+
+fn legacy_forwarding_warning(snapshot: &Value) -> Option<String> {
+    let rejected = snapshot
+        .get("legacy_forwarding_updates_rejected")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 0)?;
+    Some(format!(
+        "warning: quarantined {rejected} metrics update(s) from pre-upgrade proxies; restart older Rayline sessions to restore complete environment-scoped metrics"
+    ))
 }
 
 fn format_top_row(row: &Value) -> String {
@@ -2009,7 +2359,9 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
     let home = dirs::home_dir()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
     let bin_path = resolve_rld_bin(&home)?;
+    let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(&home));
     let mut start_request = RouterStartRequest::local_router_defaults(request.root_env_explicit);
+    start_request.env_name = Some(env_name.clone());
     // A pre-resolved hosted-RCR key (Codex run/app path) is injected as
     // `RAYLINE_ROUTER_API_KEY` for the daemon; `resolve_router_api_key` honors it
     // before the `enable_proxy` gate, so it reaches the cloud leg even in Codex
@@ -2083,6 +2435,7 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
             } else {
                 RouterStartRequest::defaults(request.root_env_explicit)
             };
+            start_request.env_name = Some(env_name.clone());
             start_request.enable_proxy = !codex_mode;
             start_request.proxy_routing_mode =
                 if crate::router_config::config_main_is_passthrough(path) {
@@ -2233,6 +2586,7 @@ pub async fn start_from_home_with_rld_bin(
 #[allow(clippy::too_many_arguments)]
 pub async fn start_proxy_from_home(
     home: &Path,
+    env_name: Option<&str>,
     router_url: &str,
     router_api_key: &str,
     proxy_port: u16,
@@ -2260,6 +2614,7 @@ pub async fn start_proxy_from_home(
         .map_err(|error| io::Error::other(format!("health client setup failed: {error}")))?;
     start_proxy_from_home_with_client(
         home,
+        env_name,
         router_url,
         router_api_key,
         proxy_port,
@@ -2294,6 +2649,7 @@ pub async fn start_local_proxy_from_home(
     };
     start_proxy_from_home_with_client(
         home,
+        request.env_name.as_deref(),
         &request.router_url,
         "",
         request.proxy_port,
@@ -2575,6 +2931,7 @@ async fn reconcile_serve_metrics_meta(
 #[allow(clippy::too_many_arguments)]
 async fn start_proxy_from_home_with_client(
     home: &Path,
+    env_name: Option<&str>,
     router_url: &str,
     router_api_key: &str,
     proxy_port: u16,
@@ -2598,12 +2955,13 @@ async fn start_proxy_from_home_with_client(
         stop_proxy(&paths, client, &mut output, true).await?;
     }
 
-    let metrics_url = serve_metrics_forward_url(home, client).await;
-    let self_hosted_metrics_port = metrics_url
-        .is_none()
-        .then(|| resolve_metrics_port(isolated, subscription_instance));
+    let metrics_url = serve_metrics_forward_url(home, env_name, router_url, client).await;
+    // Metrics allocation is a runtime fact and is deliberately omitted from
+    // config matching. It is selected immediately before spawn, after all
+    // asynchronous incumbent checks, under the cross-class allocation lock.
     let requested_meta = proxy_meta(
         home,
+        env_name,
         router_url,
         router_api_key,
         proxy_port,
@@ -2613,7 +2971,7 @@ async fn start_proxy_from_home_with_client(
         router_config_path,
         local_config,
         metrics_url.as_deref(),
-        self_hosted_metrics_port,
+        None,
         subscription_config_path,
         subscription_pool,
     );
@@ -2696,12 +3054,47 @@ async fn start_proxy_from_home_with_client(
             }
         }
 
+        // Availability probing and child metadata publication must be atomic
+        // across shared/isolated/subscription proxy classes. This scope has no
+        // awaits: another async start can never block the runtime while this
+        // synchronous flock is held. The spawned child's metadata reserves its
+        // selected port before the lock is released, closing the probe/bind race.
+        // A sidecar configured with `--local-router-owns-metrics` cannot build a
+        // complete local mirror: routed/local events and llama performance are
+        // recorded by the serve daemon. Do not advertise an incomplete standby.
+        let (metrics_port, _metrics_allocation_lock) = if local_config.is_some() {
+            (None, None)
+        } else {
+            let shared_paths = RouterPaths::new(home);
+            let allocation_lock = std::fs::create_dir_all(shared_paths.data_dir())
+                .and_then(|()| acquire_router_lock(&shared_paths.metrics_allocation_lock_file));
+            match allocation_lock {
+                Ok(lock) => {
+                    let allocated_metrics_ports = allocated_metrics_ports(home);
+                    let metrics_port = resolve_self_hosted_metrics_port(
+                        isolated,
+                        subscription_instance,
+                        proxy_port,
+                        &allocated_metrics_ports,
+                    );
+                    (metrics_port, Some(lock))
+                }
+                Err(error) => {
+                    output.push_str(&format!(
+                        "Metrics disabled: could not acquire the shared allocation lock ({error}).\n"
+                    ));
+                    (None, None)
+                }
+            }
+        };
         spawn_proxy(
             home,
+            env_name,
             router_url,
             router_api_key,
             proxy_port,
             proxy_routing_mode,
+            metrics_port,
             bin_path,
             diagnose,
             upstream_ca_path,
@@ -2726,7 +3119,15 @@ async fn start_proxy_from_home_with_client(
         &mut output,
     )
     .await?;
-    reconcile_self_hosted_metrics_meta(&paths, self_hosted_metrics_port, client, &mut output).await;
+    let self_hosted_metrics_port = parse_optional_port(started.meta.get("metrics_port"));
+    reconcile_self_hosted_metrics_meta(
+        &paths,
+        self_hosted_metrics_port,
+        started.pid,
+        client,
+        &mut output,
+    )
+    .await;
     Ok(output)
 }
 
@@ -2876,6 +3277,9 @@ fn spawn_router(
         // via `set_proxy_child_env`, which also scrubs proxy env not relevant here.
         command.env("RAYLINE_ROUTER_API_KEY", key);
     }
+    if let Some(env_name) = request.env_name.as_deref() {
+        command.env(crate::claude::RAYLINE_ENV_NAME_ENV, env_name);
+    }
     command.env("RUST_LOG", "info");
     command
         .stdin(Stdio::null())
@@ -2934,10 +3338,12 @@ fn spawn_router(
 #[allow(clippy::too_many_arguments)]
 fn spawn_proxy(
     home: &Path,
+    env_name: Option<&str>,
     router_url: &str,
     router_api_key: &str,
     proxy_port: u16,
     proxy_routing_mode: &str,
+    metrics_port: Option<u16>,
     bin_path: &Path,
     diagnose: bool,
     upstream_ca_path: Option<&Path>,
@@ -2951,10 +3357,14 @@ fn spawn_proxy(
     let subscription_instance = subscription_config_path.is_some();
     let paths = RouterPaths::for_proxy(home, isolated, subscription_instance);
     create_proxy_state_dir(&paths, subscription_instance)?;
-    let metrics_port = resolve_metrics_port(isolated, subscription_instance);
-    let self_hosted_metrics_port = metrics_url.is_none().then_some(metrics_port);
+    // Every advertised port is owned by this proxy, including forwarding
+    // proxies whose snapshot stays hidden until their warm local mirror takes
+    // over. `None` explicitly disables metrics when it would collide with the
+    // proxy listener.
+    let self_hosted_metrics_port = metrics_port;
     let requested_meta = proxy_meta(
         home,
+        env_name,
         router_url,
         router_api_key,
         proxy_port,
@@ -2973,7 +3383,10 @@ fn spawn_proxy(
         .append(true)
         .open(&paths.proxy_log_file)?;
     let proxy_port_arg = proxy_port.to_string();
-    let metrics_port_arg = metrics_port.to_string();
+    // Zero is the daemon's explicit "metrics disabled" sentinel. Omitting the
+    // flag would allow an inherited environment default to reintroduce the
+    // proxy-listener collision this launch already resolved.
+    let metrics_port_arg = metrics_port.unwrap_or(0).to_string();
     let ca_cert_path = proxy_ca_cert_path(home);
     let ca_key_path = proxy_ca_key_path(home);
     let ca_cert_arg = ca_cert_path.display().to_string();
@@ -3030,6 +3443,9 @@ fn spawn_proxy(
         command.args(["--metrics-url", metrics_url]);
     }
     set_proxy_child_env(&mut command, router_api_key, proxy_port);
+    if let Some(env_name) = env_name {
+        command.env(crate::claude::RAYLINE_ENV_NAME_ENV, env_name);
+    }
     command.env("RUST_LOG", if diagnose { "debug" } else { "info" });
     command
         .stdin(Stdio::null())
@@ -3174,6 +3590,9 @@ fn router_meta(
     router_api_key: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut meta = BTreeMap::new();
+    if let Some(env_name) = request.env_name.as_deref() {
+        meta.insert("env_name".to_owned(), env_name.to_owned());
+    }
     meta.insert("model_repo".to_owned(), request.model_repo.clone());
     meta.insert("model_file".to_owned(), request.model_file.clone());
     meta.insert(
@@ -3279,19 +3698,25 @@ fn router_meta(
 /// The serve daemon's metrics-control URL the proxy should forward to, or
 /// `None` when the proxy should self-host its own metrics instead.
 ///
-/// Forwarding is chosen only when a serve daemon is actually live. Stale serve
-/// meta left behind by a crashed daemon must not pin a cloud-only proxy to a
-/// dead endpoint — that would leave `rayline top` with no metrics. The empty
-/// fast-path skips the liveness probe entirely for the common cloud-only launch
-/// where no serve daemon has ever published meta.
-async fn serve_metrics_forward_url(home: &Path, client: &reqwest::Client) -> Option<String> {
+/// Forwarding is chosen only when a serve daemon is actually live and belongs
+/// to the same environment. Keeping unlike environments on separate metrics
+/// owners makes an explicitly scoped `rayline top` truthful. Stale serve meta
+/// left behind by a crashed daemon must not pin a cloud-only proxy to a dead
+/// endpoint; the empty fast-path skips the liveness probe entirely for the
+/// common cloud-only launch where no serve daemon has ever published meta.
+async fn serve_metrics_forward_url(
+    home: &Path,
+    env_name: Option<&str>,
+    router_url: &str,
+    client: &reqwest::Client,
+) -> Option<String> {
     let paths = RouterPaths::new(home);
     let serve_meta = read_meta(&paths.meta_file);
     if serve_meta.is_empty() {
         return None;
     }
     let serve_running = is_serve_daemon_running(&paths, client).await;
-    let url = serve_metrics_url(serve_running, &serve_meta)?;
+    let url = serve_metrics_url(serve_running, &serve_meta, env_name, router_url)?;
     // The meta can still name a port serve lost to another process, until
     // serve's launcher reconciles it (#82): forward only to a port serve owns.
     let port = parse_optional_port(serve_meta.get("metrics_port"))?;
@@ -3314,16 +3739,40 @@ async fn metrics_port_owned_by_serve(
     }
 }
 
-/// Pure decision: the serve metrics-control URL when a serve daemon is live and
-/// has published meta, else `None` so the proxy self-hosts.
-fn serve_metrics_url(serve_running: bool, serve_meta: &BTreeMap<String, String>) -> Option<String> {
-    if !serve_running || serve_meta.is_empty() {
+/// Pure decision: the serve metrics-control URL when a same-environment serve
+/// daemon is live and has published meta, else `None` so the proxy self-hosts.
+fn serve_metrics_url(
+    serve_running: bool,
+    serve_meta: &BTreeMap<String, String>,
+    env_name: Option<&str>,
+    router_url: &str,
+) -> Option<String> {
+    if !serve_running
+        || serve_meta.is_empty()
+        || !meta_matches_forwarding_identity(serve_meta, env_name, router_url)
+    {
         return None;
     }
     // No advertised port means serve runs without metrics (its bind failed), so
     // the proxy self-hosts rather than forwarding to a port serve does not own.
     let port = parse_optional_port(serve_meta.get("metrics_port"))?;
     Some(format!("http://127.0.0.1:{port}"))
+}
+
+/// Forwarding binds the proxy to one metrics owner for its full lifetime, so
+/// both environment and router identity must match exactly. Broader discovery
+/// may treat a loopback local router as belonging to a hosted environment, but
+/// forwarding that hosted proxy into the local owner's server would fail the
+/// receiver's identity check and make the proxy's metrics disappear.
+fn meta_matches_forwarding_identity(
+    meta: &BTreeMap<String, String>,
+    expected_env_name: Option<&str>,
+    expected_router_url: &str,
+) -> bool {
+    meta.get("env_name").map(String::as_str) == expected_env_name
+        && meta
+            .get("router_url")
+            .is_some_and(|actual| normalized_router_urls_match(actual, expected_router_url))
 }
 
 /// Once the proxy is healthy, make the advertised `metrics_port` reflect what the
@@ -3336,29 +3785,54 @@ fn serve_metrics_url(serve_running: bool, serve_meta: &BTreeMap<String, String>)
 async fn reconcile_self_hosted_metrics_meta(
     paths: &RouterPaths,
     self_hosted_metrics_port: Option<u16>,
+    expected_pid: i32,
     client: &reqwest::Client,
     output: &mut String,
 ) {
     let Some(port) = self_hosted_metrics_port else {
         return;
     };
-    if metrics_port_is_serving(client, port).await {
+    let meta = read_meta(&paths.proxy_meta_file);
+    if metrics_port_is_serving(client, port, expected_pid, &meta).await {
+        return;
+    }
+    // The health probe runs after the startup lock is released. A concurrent
+    // launcher may have replaced this proxy while the probe was in flight, so
+    // reacquire the lock and verify ownership before mutating current metadata.
+    let Ok(_lock) = acquire_router_lock(&paths.proxy_lock_file) else {
+        return;
+    };
+    if read_pid(&paths.proxy_pid_file) != Some(expected_pid) {
         return;
     }
     let mut meta = read_meta(&paths.proxy_meta_file);
+    let forwarding_standby = meta.contains_key("metrics_url");
     if meta.remove("metrics_port").is_some() {
-        let _ = std::fs::write(&paths.proxy_meta_file, format_meta(&meta));
-        output.push_str(&format!(
-            "warning: {} proxy could not self-host metrics on :{port}; `{} top` metrics are disabled for this session.\n",
+        let _ = atomic_write(&paths.proxy_meta_file, format_meta(&meta).as_bytes());
+        output.push_str(&metrics_bind_failure_warning(port, forwarding_standby));
+    }
+}
+
+fn metrics_bind_failure_warning(port: u16, forwarding_standby: bool) -> String {
+    if forwarding_standby {
+        format!(
+            "warning: {} proxy could not bind its local metrics standby on :{port}; `{} top` metrics cannot fail over for this session.\n",
             daemon_name(),
             cli_name(),
-        ));
+        )
+    } else {
+        format!(
+            "warning: {} proxy could not bind metrics control on :{port}; `{} top` metrics are unavailable for this session.\n",
+            daemon_name(),
+            cli_name(),
+        )
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn proxy_meta(
     home: &Path,
+    env_name: Option<&str>,
     router_url: &str,
     router_api_key: &str,
     proxy_port: u16,
@@ -3373,6 +3847,9 @@ fn proxy_meta(
     subscription_pool: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut meta = BTreeMap::new();
+    if let Some(env_name) = env_name {
+        meta.insert("env_name".to_owned(), env_name.to_owned());
+    }
     meta.insert("router_url".to_owned(), router_url.to_owned());
     meta.insert("proxy_port".to_owned(), proxy_port.to_string());
     meta.insert(
@@ -3401,9 +3878,10 @@ fn proxy_meta(
     if let Some(metrics_url) = metrics_url {
         meta.insert("metrics_url".to_owned(), metrics_url.to_owned());
     }
-    // Only recorded when the proxy self-hosts metrics (i.e. it is not forwarding
-    // to a serve daemon), so `rayline top` only ever discovers a port the proxy
-    // actually owns.
+    // Every advertised port is owned by this proxy. A forwarding proxy returns
+    // 503 from its snapshot route while the shared owner is healthy, then
+    // exposes its warm mirror when forwarding fails. Local-router-owned
+    // sidecars omit the port because they cannot construct a complete mirror.
     if let Some(metrics_port) = self_hosted_metrics_port {
         meta.insert("metrics_port".to_owned(), metrics_port.to_string());
     }
@@ -3481,6 +3959,7 @@ fn metadata_matches_config(
 fn format_meta(meta: &BTreeMap<String, String>) -> String {
     let mut output = String::new();
     for key in [
+        "env_name",
         "model_repo",
         "model_file",
         "model_revision",
@@ -3844,7 +4323,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
-    async fn first_reachable_metrics_port_skips_unreachable_and_picks_live_server() {
+    async fn fetch_top_snapshot_skips_unreachable_metrics_instances() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         // A port that is bound then released: probing it gets connection-refused.
@@ -3859,7 +4338,16 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
-                let body = b"{\"ok\":true}";
+                let body = br#"{
+                    "ok": true,
+                    "runtime": "rayline-proxy",
+                    "started_at_unix_ms": 100,
+                    "active": [],
+                    "recent": [],
+                    "sessions": [],
+                    "totals": {"completed_requests": 3},
+                    "llama_perf": null
+                }"#;
                 let head = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
                     body.len()
@@ -3875,23 +4363,57 @@ mod tests {
             .build()
             .unwrap();
 
-        let port = first_reachable_metrics_port(&client, &[closed_port, live_port]).await;
-        assert_eq!(port, live_port);
+        let snapshot = fetch_top_snapshot(&client, &[closed_port, live_port], None, None)
+            .await
+            .expect("one live metrics instance");
+        assert_eq!(snapshot["totals"]["completed_requests"], 3);
+        assert_eq!(snapshot["instances"][0]["metrics_port"], live_port);
     }
 
     #[tokio::test]
-    async fn first_reachable_metrics_port_falls_back_to_first_when_none_reachable() {
-        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_port = released.local_addr().unwrap().port();
-        drop(released);
+    async fn scoped_top_explains_that_legacy_daemons_need_a_restart() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = br#"{
+                    "ok": true,
+                    "runtime": "rayline-proxy",
+                    "active": [],
+                    "recent": [],
+                    "sessions": [],
+                    "totals": {}
+                }"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+            }
+        });
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
+        let error = fetch_top_snapshot(
+            &client,
+            &[port],
+            Some("dev"),
+            Some("https://api-dev.rayline.ai"),
+        )
+        .await
+        .expect_err("legacy scoped snapshot must request a restart");
 
-        let port = first_reachable_metrics_port(&client, &[closed_port]).await;
-        assert_eq!(port, closed_port);
+        assert!(error.to_string().contains("older Rayline daemon"));
+        assert!(error.to_string().contains("restart"));
+        assert!(error.to_string().contains(&format!(":{port}")));
     }
 
     #[test]
@@ -3922,11 +4444,97 @@ mod tests {
     }
 
     #[test]
-    fn proxy_meta_records_metrics_port_only_when_self_hosting() {
+    fn metrics_port_selection_uses_first_free_fallback() {
+        let selected = select_self_hosted_metrics_port(
+            rayline_metrics::DEFAULT_METRICS_PORT,
+            true,
+            None,
+            |port| port == FALLBACK_METRICS_PORT_START + 1,
+        );
+
+        assert_eq!(selected, Some(FALLBACK_METRICS_PORT_START + 1));
+    }
+
+    #[test]
+    fn only_valid_metrics_port_overrides_are_exact() {
+        assert!(!metrics_port_override_is_explicit(None));
+        assert!(!metrics_port_override_is_explicit(Some("")));
+        assert!(!metrics_port_override_is_explicit(Some("not-a-port")));
+        assert!(metrics_port_override_is_explicit(Some("0")));
+        assert!(metrics_port_override_is_explicit(Some("20817")));
+    }
+
+    #[test]
+    fn allocated_metrics_ports_include_published_live_daemons() {
+        let home = unique_test_dir("allocated-metrics-ports");
+        let shared = RouterPaths::new(&home);
+        let isolated = RouterPaths::new_isolated(&home);
+        std::fs::create_dir_all(shared.data_dir()).expect("create shared state");
+        std::fs::create_dir_all(isolated.data_dir()).expect("create isolated state");
+        let pid = i32::try_from(std::process::id()).expect("current pid fits i32");
+        let serve_meta = meta_with_metrics_port(20813);
+        write_pid_meta_atomic(&shared.pid_file, &shared.meta_file, pid, &serve_meta)
+            .expect("publish serve metadata");
+        let proxy_meta = meta_with_metrics_port(20814);
+        write_pid_meta_atomic(
+            &isolated.proxy_pid_file,
+            &isolated.proxy_meta_file,
+            pid,
+            &proxy_meta,
+        )
+        .expect("publish proxy metadata");
+
+        assert_eq!(
+            allocated_metrics_ports(&home),
+            BTreeSet::from([20813, 20814])
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn subscription_metrics_port_stays_fixed_during_replacement() {
+        let selected =
+            select_self_hosted_metrics_port(DEFAULT_SUBSCRIPTION_METRICS_PORT, false, None, |_| {
+                false
+            });
+
+        assert_eq!(selected, Some(DEFAULT_SUBSCRIPTION_METRICS_PORT));
+    }
+
+    #[test]
+    fn metrics_port_fallback_excludes_the_proxy_listener() {
+        let proxy_port = FALLBACK_METRICS_PORT_START;
+        let selected =
+            select_self_hosted_metrics_port(proxy_port, true, Some(proxy_port), |_| true);
+
+        assert_eq!(selected, Some(proxy_port + 1));
+
+        let selected = select_self_hosted_metrics_port(
+            rayline_metrics::DEFAULT_METRICS_PORT,
+            true,
+            Some(proxy_port),
+            |port| port >= proxy_port,
+        );
+        assert_eq!(selected, Some(proxy_port + 1));
+    }
+
+    #[test]
+    fn exact_metrics_port_collision_disables_metrics() {
+        let proxy_port = DEFAULT_SUBSCRIPTION_METRICS_PORT;
+        assert_eq!(
+            select_self_hosted_metrics_port(proxy_port, false, Some(proxy_port), |_| true),
+            None
+        );
+    }
+
+    #[test]
+    fn proxy_meta_records_owned_metrics_port_for_self_host_and_forwarding() {
         let home = Path::new("/tmp/rayline-test-home");
 
         let self_hosted = proxy_meta(
             home,
+            Some("dev"),
             "https://r",
             "key",
             20812,
@@ -3944,9 +4552,11 @@ mod tests {
             self_hosted.get("metrics_port").map(String::as_str),
             Some("20814")
         );
+        assert_eq!(self_hosted.get("env_name").map(String::as_str), Some("dev"));
 
         let forwarding = proxy_meta(
             home,
+            Some("dev"),
             "https://r",
             "key",
             20810,
@@ -3956,11 +4566,14 @@ mod tests {
             None,
             None,
             Some("http://127.0.0.1:20813"),
-            None,
+            Some(20814),
             None,
             None,
         );
-        assert_eq!(forwarding.get("metrics_port"), None);
+        assert_eq!(
+            forwarding.get("metrics_port").map(String::as_str),
+            Some("20814")
+        );
     }
 
     #[test]
@@ -3970,6 +4583,7 @@ mod tests {
         fs::write(&config_path, b"{\"schema\":1}").expect("write");
         let first = proxy_meta(
             temp.path(),
+            None,
             "https://r",
             "key",
             20810,
@@ -3996,6 +4610,7 @@ mod tests {
         fs::write(&config_path, b"{\"schema\":1,\"changed\":true}").expect("rewrite");
         let second = proxy_meta(
             temp.path(),
+            None,
             "https://r",
             "key",
             20810,
@@ -4018,6 +4633,15 @@ mod tests {
     fn meta_with_metrics_port(port: u16) -> BTreeMap<String, String> {
         let mut meta = BTreeMap::new();
         meta.insert("metrics_port".to_owned(), port.to_string());
+        meta
+    }
+
+    fn meta_with_metrics_port_and_router_url(
+        port: u16,
+        router_url: &str,
+    ) -> BTreeMap<String, String> {
+        let mut meta = meta_with_metrics_port(port);
+        meta.insert("router_url".to_owned(), router_url.to_owned());
         meta
     }
 
@@ -4063,7 +4687,7 @@ mod tests {
         let isolated = meta_with_metrics_port(20902);
         let subscription = meta_with_metrics_port(20903);
 
-        let ports = metrics_port_candidates(&serve, &proxy, &isolated, &subscription);
+        let ports = metrics_port_candidates(&serve, &proxy, &isolated, &subscription, None, None);
 
         assert_eq!(
             ports,
@@ -4081,7 +4705,7 @@ mod tests {
     fn metrics_port_candidates_fall_back_to_default_when_all_meta_empty() {
         let empty = BTreeMap::new();
 
-        let ports = metrics_port_candidates(&empty, &empty, &empty, &empty);
+        let ports = metrics_port_candidates(&empty, &empty, &empty, &empty, None, None);
 
         assert_eq!(ports, vec![rayline_metrics::DEFAULT_METRICS_PORT]);
     }
@@ -4093,16 +4717,53 @@ mod tests {
         // self-host instead so `rayline top` still works.
         let stale = meta_with_metrics_port(20813);
 
-        assert_eq!(serve_metrics_url(false, &stale), None);
+        assert_eq!(
+            serve_metrics_url(false, &stale, Some("dev"), "https://api-dev.rayline.ai"),
+            None
+        );
     }
 
     #[test]
     fn serve_metrics_url_forwards_when_serve_running() {
-        let serve = meta_with_metrics_port(20990);
+        let mut serve = meta_with_metrics_port_and_router_url(20990, "http://127.0.0.1:20991");
+        serve.insert("env_name".to_owned(), "dev".to_owned());
 
         assert_eq!(
-            serve_metrics_url(true, &serve),
+            serve_metrics_url(true, &serve, Some("dev"), "http://127.0.0.1:20991"),
             Some("http://127.0.0.1:20990".to_owned())
+        );
+    }
+
+    #[test]
+    fn serve_metrics_url_does_not_mix_environments_with_the_same_local_router() {
+        let mut serve = meta_with_metrics_port_and_router_url(20990, "http://127.0.0.1:20991");
+        serve.insert("env_name".to_owned(), "prod".to_owned());
+
+        assert_eq!(
+            serve_metrics_url(true, &serve, Some("dev"), "http://127.0.0.1:20991"),
+            None
+        );
+    }
+
+    #[test]
+    fn serve_metrics_url_does_not_forward_between_local_and_hosted_owners() {
+        let mut serve = meta_with_metrics_port_and_router_url(20990, "http://127.0.0.1:20991");
+        serve.insert("env_name".to_owned(), "dev".to_owned());
+
+        assert_eq!(
+            serve_metrics_url(true, &serve, Some("dev"), "https://api-dev.rayline.ai"),
+            None
+        );
+    }
+
+    #[test]
+    fn serve_metrics_url_rejects_a_stale_hosted_url_for_the_same_environment() {
+        let mut serve = meta_with_metrics_port_and_router_url(20990, "https://old.example.test");
+        serve.insert("env_name".to_owned(), "dev".to_owned());
+
+        assert_eq!(
+            serve_metrics_url(true, &serve, Some("dev"), "https://new.example.test"),
+            None
         );
     }
 
@@ -4110,7 +4771,10 @@ mod tests {
     fn serve_metrics_url_none_when_meta_empty() {
         let empty = BTreeMap::new();
 
-        assert_eq!(serve_metrics_url(true, &empty), None);
+        assert_eq!(
+            serve_metrics_url(true, &empty, Some("dev"), "https://api-dev.rayline.ai"),
+            None
+        );
     }
 
     #[test]
@@ -4121,7 +4785,10 @@ mod tests {
         let mut serve = BTreeMap::new();
         serve.insert("router_url".to_owned(), "https://api.rayline.ai".to_owned());
 
-        assert_eq!(serve_metrics_url(true, &serve), None);
+        assert_eq!(
+            serve_metrics_url(true, &serve, None, "https://api.rayline.ai"),
+            None
+        );
     }
 
     #[test]
@@ -4304,6 +4971,7 @@ mod tests {
         meta.insert("proxy_port".to_owned(), "20810".to_owned());
         meta.insert("metrics_port".to_owned(), "20814".to_owned());
         std::fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
+        std::fs::write(&paths.proxy_pid_file, "4242\n").unwrap();
 
         // A port bound then released: probing it gets connection-refused.
         let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4315,14 +4983,59 @@ mod tests {
             .build()
             .unwrap();
         let mut output = String::new();
-        reconcile_self_hosted_metrics_meta(&paths, Some(dead_port), &client, &mut output).await;
+        reconcile_self_hosted_metrics_meta(&paths, Some(dead_port), 4242, &client, &mut output)
+            .await;
 
         let after = read_meta(&paths.proxy_meta_file);
         assert!(
             !after.contains_key("metrics_port"),
             "a metrics port the proxy never bound must not stay advertised"
         );
-        assert!(output.contains("disabled"));
+        assert!(output.contains("metrics are unavailable"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn metrics_bind_warning_distinguishes_standby_from_only_endpoint() {
+        let standby = metrics_bind_failure_warning(20814, true);
+        assert!(standby.contains("local metrics standby"));
+        assert!(standby.contains("cannot fail over"));
+
+        let only_endpoint = metrics_bind_failure_warning(20814, false);
+        assert!(only_endpoint.contains("metrics control"));
+        assert!(only_endpoint.contains("metrics are unavailable"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_does_not_rewrite_a_replacement_proxys_metadata() {
+        let home = unique_test_dir("reconcile-metrics-replacement");
+        let paths = RouterPaths::new(&home);
+        std::fs::create_dir_all(paths.data_dir()).unwrap();
+        let meta = BTreeMap::from([
+            ("proxy_port".to_owned(), "20810".to_owned()),
+            ("metrics_port".to_owned(), "20814".to_owned()),
+        ]);
+        std::fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
+        std::fs::write(&paths.proxy_pid_file, "9999\n").unwrap();
+
+        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_port = released.local_addr().unwrap().port();
+        drop(released);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let mut output = String::new();
+        reconcile_self_hosted_metrics_meta(&paths, Some(dead_port), 4242, &client, &mut output)
+            .await;
+
+        assert_eq!(
+            read_meta(&paths.proxy_meta_file)
+                .get("metrics_port")
+                .map(String::as_str),
+            Some("20814"),
+        );
+        assert!(output.is_empty());
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -4496,6 +5209,11 @@ mod tests {
         std::fs::create_dir_all(paths.data_dir()).unwrap();
         let mut meta = BTreeMap::new();
         meta.insert("metrics_port".to_owned(), "20814".to_owned());
+        meta.insert("env_name".to_owned(), "dev".to_owned());
+        meta.insert(
+            "router_url".to_owned(),
+            "https://api-dev.rayline.ai".to_owned(),
+        );
         std::fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4504,7 +5222,7 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf).await;
-                let body = b"{\"ok\":true}";
+                let body = b"{\"ok\":true,\"runtime\":\"rayline-router-metrics\",\"pid\":4242,\"env_name\":\"dev\",\"router_url\":\"https://api-dev.rayline.ai\"}";
                 let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
                 let _ = stream.write_all(head.as_bytes()).await;
                 let _ = stream.write_all(body).await;
@@ -4517,11 +5235,45 @@ mod tests {
             .build()
             .unwrap();
         let mut output = String::new();
-        reconcile_self_hosted_metrics_meta(&paths, Some(live_port), &client, &mut output).await;
+        reconcile_self_hosted_metrics_meta(&paths, Some(live_port), 4242, &client, &mut output)
+            .await;
 
         let after = read_meta(&paths.proxy_meta_file);
         assert_eq!(after.get("metrics_port").map(String::as_str), Some("20814"));
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[tokio::test]
+    async fn metrics_reconciliation_rejects_a_foreign_healthy_responder() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+                let body = b"{\"ok\":true,\"runtime\":\"rayline-router-metrics\",\"pid\":9999,\"env_name\":\"prod\",\"router_url\":\"https://api.rayline.ai\"}";
+                let head = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len());
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        let expected_meta = BTreeMap::from([
+            ("env_name".to_owned(), "dev".to_owned()),
+            (
+                "router_url".to_owned(),
+                "https://api-dev.rayline.ai".to_owned(),
+            ),
+        ]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        assert!(!metrics_port_is_serving(&client, port, 4242, &expected_meta).await);
     }
 
     #[test]
@@ -4529,7 +5281,7 @@ mod tests {
         let empty = BTreeMap::new();
         let isolated = meta_with_metrics_port(20814);
 
-        let ports = metrics_port_candidates(&empty, &empty, &isolated, &empty);
+        let ports = metrics_port_candidates(&empty, &empty, &isolated, &empty, None, None);
 
         assert_eq!(ports, vec![20814, rayline_metrics::DEFAULT_METRICS_PORT]);
     }
@@ -4540,9 +5292,224 @@ mod tests {
         let proxy = meta_with_metrics_port(rayline_metrics::DEFAULT_METRICS_PORT);
         let empty = BTreeMap::new();
 
-        let ports = metrics_port_candidates(&serve, &proxy, &empty, &empty);
+        let ports = metrics_port_candidates(&serve, &proxy, &empty, &empty, None, None);
 
         assert_eq!(ports, vec![rayline_metrics::DEFAULT_METRICS_PORT]);
+    }
+
+    #[test]
+    fn metrics_port_candidates_scope_explicit_environment_and_combine_its_instances() {
+        let mut serve = meta_with_metrics_port_and_router_url(20812, "http://127.0.0.1:20990");
+        serve.insert("env_name".to_owned(), "dev".to_owned());
+        let shared = meta_with_metrics_port_and_router_url(20813, "https://api-dev.rayline.ai");
+        let mut isolated = meta_with_metrics_port_and_router_url(20814, "http://127.0.0.1:20990");
+        isolated.insert("env_name".to_owned(), "dev".to_owned());
+        let mut subscription =
+            meta_with_metrics_port_and_router_url(20816, "https://api.rayline.ai");
+        subscription.insert("env_name".to_owned(), "prod".to_owned());
+
+        let ports = metrics_port_candidates(
+            &serve,
+            &shared,
+            &isolated,
+            &subscription,
+            Some("dev"),
+            Some("https://api-dev.rayline.ai"),
+        );
+
+        assert_eq!(ports, vec![20812, 20813, 20814]);
+    }
+
+    #[test]
+    fn metrics_port_candidates_scope_local_only_environment_by_name() {
+        let mut lab = meta_with_metrics_port_and_router_url(20813, "http://127.0.0.1:20811");
+        lab.insert("env_name".to_owned(), "lab".to_owned());
+        let mut prod = meta_with_metrics_port_and_router_url(20814, "http://127.0.0.1:20811");
+        prod.insert("env_name".to_owned(), "prod".to_owned());
+        let empty = BTreeMap::new();
+
+        let ports = metrics_port_candidates(&lab, &empty, &prod, &empty, Some("lab"), None);
+
+        assert_eq!(ports, vec![20813]);
+    }
+
+    #[test]
+    fn legacy_loopback_metadata_is_probed_for_live_identity() {
+        let legacy = meta_with_metrics_port_and_router_url(20813, "http://127.0.0.1:20811");
+        let empty = BTreeMap::new();
+
+        let ports = metrics_port_candidates(
+            &legacy,
+            &empty,
+            &empty,
+            &empty,
+            Some("dev"),
+            Some("https://api-dev.rayline.ai"),
+        );
+
+        assert_eq!(ports, vec![20813]);
+    }
+
+    #[test]
+    fn discover_metrics_ports_reloads_runtime_metadata() {
+        let home = unique_test_dir("top-refresh-candidates");
+        let paths = RouterPaths::new(&home);
+        fs::create_dir_all(paths.data_dir()).unwrap();
+        let mut meta = meta_with_metrics_port_and_router_url(20901, "https://api-dev.rayline.ai");
+        meta.insert("env_name".to_owned(), "dev".to_owned());
+        fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
+
+        assert_eq!(
+            discover_metrics_ports(&home, Some("dev"), Some("https://api-dev.rayline.ai")),
+            vec![20901]
+        );
+
+        meta.insert("metrics_port".to_owned(), "20902".to_owned());
+        fs::write(&paths.proxy_meta_file, format_meta(&meta)).unwrap();
+        assert_eq!(
+            discover_metrics_ports(&home, Some("dev"), Some("https://api-dev.rayline.ai")),
+            vec![20902]
+        );
+        fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn scoped_top_requires_matching_live_snapshot_identity() {
+        let expected_url = Some("https://api-dev.rayline.ai");
+        let matching = serde_json::json!({
+            "env_name": "dev",
+            "router_url": "https://api-dev.rayline.ai/"
+        });
+        let wrong_environment = serde_json::json!({
+            "env_name": "prod",
+            "router_url": "https://api-dev.rayline.ai"
+        });
+        let legacy_without_identity = serde_json::json!({"ok": true});
+
+        assert!(snapshot_matches_environment(
+            &matching,
+            Some("dev"),
+            expected_url
+        ));
+        assert!(!snapshot_matches_environment(
+            &wrong_environment,
+            Some("dev"),
+            expected_url
+        ));
+        assert!(!snapshot_matches_environment(
+            &legacy_without_identity,
+            Some("dev"),
+            expected_url
+        ));
+        assert!(snapshot_matches_environment(
+            &legacy_without_identity,
+            None,
+            None
+        ));
+        let local_only = serde_json::json!({"env_name": "lab"});
+        assert!(snapshot_matches_environment(&local_only, Some("lab"), None));
+        assert!(!snapshot_matches_environment(
+            &local_only,
+            Some("prod"),
+            None
+        ));
+    }
+
+    #[test]
+    fn merge_top_snapshots_combines_instances_and_same_session_rollups() {
+        let shared = serde_json::json!({
+            "ok": true,
+            "runtime": "rayline-proxy",
+            "started_at_unix_ms": 50,
+            "active": [{"request_id": "active-shared", "started_at_unix_ms": 100}],
+            "recent": [{"request_id": "recent-shared", "started_at_unix_ms": 90}],
+            "sessions": [{
+                "session_id": "session-a",
+                "completed_requests": 2,
+                "errored_requests": 1,
+                "active_requests": 1,
+                "input_tokens": 10,
+                "output_tokens": 2,
+                "cache_read_tokens": 8,
+                "first_seen_unix_ms": 10,
+                "last_activity_unix_ms": 100,
+                "agent_types": ["Explore"],
+                "models": ["claude-opus-5"]
+            }],
+            "totals": {
+                "active_requests": 1,
+                "completed_requests": 2,
+                "errored_requests": 1,
+                "input_tokens": 10,
+                "output_tokens": 2
+            },
+            "legacy_forwarding_updates_rejected": 2,
+            "llama_perf": {"updated_at_unix_ms": 100}
+        });
+        let isolated = serde_json::json!({
+            "ok": true,
+            "runtime": "rayline-proxy",
+            "started_at_unix_ms": 60,
+            "active": [],
+            "recent": [{"request_id": "recent-isolated", "started_at_unix_ms": 110}],
+            "sessions": [{
+                "session_id": "session-a",
+                "completed_requests": 3,
+                "errored_requests": 0,
+                "active_requests": 0,
+                "input_tokens": 20,
+                "output_tokens": 4,
+                "cache_read_tokens": 16,
+                "first_seen_unix_ms": 5,
+                "last_activity_unix_ms": 110,
+                "agent_types": ["Explore", "Plan"],
+                "models": ["claude-sonnet-5"]
+            }],
+            "totals": {
+                "active_requests": 0,
+                "completed_requests": 3,
+                "errored_requests": 0,
+                "input_tokens": 20,
+                "output_tokens": 4
+            },
+            "legacy_forwarding_updates_rejected": 3,
+            "llama_perf": {"updated_at_unix_ms": 200}
+        });
+
+        let merged = merge_top_snapshots([(20813, shared), (20814, isolated)]);
+
+        assert_eq!(merged["runtime"], "rayline-proxy");
+        assert_eq!(merged["started_at_unix_ms"], 50);
+        assert_eq!(merged["instances"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["totals"]["completed_requests"], 5);
+        assert_eq!(merged["totals"]["input_tokens"], 30);
+        assert_eq!(merged["legacy_forwarding_updates_rejected"], 5);
+        assert_eq!(
+            merged["instances"][0]["legacy_forwarding_updates_rejected"],
+            2
+        );
+        assert_eq!(merged["active"][0]["metrics_port"], 20813);
+        assert_eq!(merged["recent"][0]["request_id"], "recent-isolated");
+        assert_eq!(merged["recent"][0]["metrics_port"], 20814);
+        assert_eq!(merged["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(merged["sessions"][0]["completed_requests"], 5);
+        assert_eq!(merged["sessions"][0]["input_tokens"], 30);
+        assert_eq!(merged["sessions"][0]["cache_read_tokens"], 24);
+        assert_eq!(merged["sessions"][0]["first_seen_unix_ms"], 5);
+        assert_eq!(merged["sessions"][0]["last_activity_unix_ms"], 110);
+        assert_eq!(
+            merged["sessions"][0]["metrics_ports"],
+            serde_json::json!([20813, 20814])
+        );
+        assert_eq!(
+            merged["sessions"][0]["agent_types"],
+            serde_json::json!(["Explore", "Plan"])
+        );
+        assert_eq!(
+            merged["sessions"][0]["models"],
+            serde_json::json!(["claude-opus-5", "claude-sonnet-5"])
+        );
+        assert_eq!(merged["llama_perf"]["updated_at_unix_ms"], 200);
     }
 
     #[test]
@@ -4755,7 +5722,8 @@ mod tests {
                 "active_requests": 2,
                 "completed_requests": 3,
                 "errored_requests": 0
-            }
+            },
+            "legacy_forwarding_updates_rejected": 2
         });
 
         assert_eq!(visible_row_count(&snapshot, "active", false), 1);
@@ -4765,6 +5733,8 @@ mod tests {
         let text = format_top_snapshot(&snapshot, false);
         assert!(text.contains("active: 1"));
         assert!(text.contains("hidden-proxied: 2"));
+        assert!(text.contains("quarantined 2 metrics update(s)"));
+        assert!(text.contains("restart older Rayline sessions"));
         assert!(text.contains("llm"));
         assert!(!text.contains("sideband"));
 
@@ -5825,7 +6795,12 @@ fn parse_optional_port(value: Option<&String>) -> Option<u16> {
 /// default. A malformed override falls back to the default — metrics are
 /// best-effort and must not block a launch.
 fn resolve_metrics_port(isolated: bool, subscription_pool: bool) -> u16 {
-    let (env_var, default_port) = if isolated {
+    let (env_var, default_port) = metrics_port_env_and_default(isolated, subscription_pool);
+    metrics_port_from_env(std::env::var(env_var).ok().as_deref(), default_port)
+}
+
+fn metrics_port_env_and_default(isolated: bool, subscription_pool: bool) -> (&'static str, u16) {
+    if isolated {
         (
             "RAYLINE_ISOLATED_METRICS_PORT",
             DEFAULT_ISOLATED_METRICS_PORT,
@@ -5840,8 +6815,7 @@ fn resolve_metrics_port(isolated: bool, subscription_pool: bool) -> u16 {
             "RAYLINE_METRICS_PORT",
             rayline_metrics::DEFAULT_METRICS_PORT,
         )
-    };
-    metrics_port_from_env(std::env::var(env_var).ok().as_deref(), default_port)
+    }
 }
 
 /// A metrics-port override's value, or `default_port` when it is unset, empty,
@@ -5912,18 +6886,102 @@ fn ephemeral_local_port() -> Option<u16> {
         .ok()
 }
 
-/// Ordered, de-duplicated list of metrics-control ports `rayline top` should try,
-/// most-authoritative first: the local-router `serve` daemon, then the
-/// ordinary shared proxy's self-hosted server, then the isolated proxy's and the
-/// subscription proxy's, with the default metrics port as a final fallback.
-/// The proxy only records its `metrics_port` in meta when it self-hosts (i.e.
-/// when it is not forwarding to a serve daemon), so a present entry always names
-/// a port the proxy owns.
+
+/// Pick a free fallback when the default metrics port is already owned by a
+/// different-environment serve daemon. Explicit port overrides remain exact:
+/// their bind failure is still best-effort and never blocks proxy traffic.
+fn resolve_self_hosted_metrics_port(
+    isolated: bool,
+    subscription_pool: bool,
+    proxy_port: u16,
+    allocated_ports: &BTreeSet<u16>,
+) -> Option<u16> {
+    let (env_var, _) = metrics_port_env_and_default(isolated, subscription_pool);
+    let preferred = resolve_metrics_port(isolated, subscription_pool);
+    let explicit = metrics_port_override_is_explicit(std::env::var(env_var).ok().as_deref());
+    // Subscription status/reload intentionally use one fixed control port. A
+    // replacement launch evaluates this while the incumbent still owns that
+    // port, so moving to a fallback here would make the new daemon invisible
+    // to those commands. The locked restart below releases the incumbent before
+    // the replacement binds the same preferred port.
+    select_self_hosted_metrics_port(
+        preferred,
+        !explicit && !subscription_pool,
+        Some(proxy_port),
+        |port| !allocated_ports.contains(&port) && metrics_port_is_available(port),
+    )
+}
+
+fn metrics_port_override_is_explicit(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value.parse::<u16>().is_ok())
+}
+
+/// Ports already published by live Rayline daemons. The cross-class allocator
+/// reads this while holding `metrics_allocation_lock_file`; `spawn_proxy` writes
+/// its pid/meta before that lock is released, so a second launcher excludes the
+/// reservation even if the child has not reached `bind` yet.
+fn allocated_metrics_ports(home: &Path) -> BTreeSet<u16> {
+    let shared = RouterPaths::new(home);
+    let mut ports = BTreeSet::new();
+    if read_pid(&shared.pid_file).is_some_and(process_exists)
+        && let Some(port) = parse_optional_port(read_meta(&shared.meta_file).get("metrics_port"))
+    {
+        ports.insert(port);
+    }
+    for paths in [
+        shared,
+        RouterPaths::new_isolated(home),
+        RouterPaths::new_subscription(home),
+    ] {
+        if read_pid(&paths.proxy_pid_file).is_some_and(process_exists)
+            && let Some(port) =
+                parse_optional_port(read_meta(&paths.proxy_meta_file).get("metrics_port"))
+        {
+            ports.insert(port);
+        }
+    }
+    ports
+}
+
+fn select_self_hosted_metrics_port(
+    preferred: u16,
+    allow_fallback: bool,
+    excluded_port: Option<u16>,
+    mut is_available: impl FnMut(u16) -> bool,
+) -> Option<u16> {
+    if Some(preferred) == excluded_port && !allow_fallback {
+        return None;
+    }
+    if !allow_fallback {
+        return Some(preferred);
+    }
+    if Some(preferred) != excluded_port && is_available(preferred) {
+        return Some(preferred);
+    }
+    (FALLBACK_METRICS_PORT_START..=FALLBACK_METRICS_PORT_END)
+        .find(|port| Some(*port) != excluded_port && is_available(*port))
+}
+
+fn metrics_port_is_available(port: u16) -> bool {
+    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_ok()
+}
+
+/// Ordered, de-duplicated list of metrics-control ports `rayline top` should
+/// combine: the local-router `serve` daemon, ordinary shared proxy, isolated
+/// proxy, and subscription proxy.
+/// Every new proxy records the local control port it owns; forwarding proxies
+/// keep the snapshot route unavailable until they need their warm standby.
+/// When an explicit environment supplies the expected name and router URL,
+/// exclude other environments. Without an explicit environment, retain the
+/// historical default-port fallback for older state that predates metrics
+/// metadata.
 fn metrics_port_candidates(
     serve_meta: &BTreeMap<String, String>,
     proxy_meta: &BTreeMap<String, String>,
     isolated_proxy_meta: &BTreeMap<String, String>,
     subscription_proxy_meta: &BTreeMap<String, String>,
+    expected_env_name: Option<&str>,
+    expected_router_url: Option<&str>,
 ) -> Vec<u16> {
     let mut ports = Vec::new();
     let mut push = |port: u16| {
@@ -5937,31 +6995,37 @@ fn metrics_port_candidates(
         isolated_proxy_meta,
         subscription_proxy_meta,
     ] {
+        if (expected_env_name.is_some() || expected_router_url.is_some())
+            && !meta_matches_environment(meta, expected_env_name, expected_router_url)
+        {
+            continue;
+        }
         if let Some(port) = parse_optional_port(meta.get("metrics_port")) {
             push(port);
         }
     }
-    push(rayline_metrics::DEFAULT_METRICS_PORT);
+    if expected_env_name.is_none() && expected_router_url.is_none() {
+        push(rayline_metrics::DEFAULT_METRICS_PORT);
+    }
     ports
 }
 
-/// Probe each candidate metrics port in precedence order and return the first
-/// whose snapshot endpoint answers. A stale meta entry (port recorded but the
-/// proxy gone) is skipped in favour of a live server. If none respond, fall back
-/// to the highest-precedence candidate so the downstream "not available" error
-/// names a sensible port. `candidates` is always non-empty in practice
-/// (`metrics_port_candidates` appends the default), but an empty slice degrades
-/// to the shared default rather than panicking.
-async fn first_reachable_metrics_port(client: &reqwest::Client, candidates: &[u16]) -> u16 {
-    for &port in candidates {
-        if metrics_port_is_serving(client, port).await {
-            return port;
-        }
-    }
-    candidates
-        .first()
-        .copied()
-        .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT)
+/// Re-read all runtime metadata on every call. The interactive top view calls
+/// this for each refresh so instances launched after the TUI opened appear
+/// without requiring a restart.
+fn discover_metrics_ports(
+    home: &Path,
+    expected_env_name: Option<&str>,
+    expected_router_url: Option<&str>,
+) -> Vec<u16> {
+    metrics_port_candidates(
+        &read_meta(&RouterPaths::new(home).meta_file),
+        &read_meta(&RouterPaths::new(home).proxy_meta_file),
+        &read_meta(&RouterPaths::new_isolated(home).proxy_meta_file),
+        &read_meta(&RouterPaths::new_subscription(home).proxy_meta_file),
+        expected_env_name,
+        expected_router_url,
+    )
 }
 
 /// The pid of the process whose metrics-control server answers on `port`, as
@@ -5978,10 +7042,112 @@ async fn metrics_port_owner_pid(client: &reqwest::Client, port: u16) -> Option<i
         .and_then(|pid| i32::try_from(pid).ok())
 }
 
-/// Whether a metrics-control server is answering snapshot requests on `port`.
-async fn metrics_port_is_serving(client: &reqwest::Client, port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
-    matches!(client.get(&url).send().await, Ok(response) if response.status().is_success())
+/// Match explicit environment identity when both sides advertise it, falling
+/// back to the normalized router URL for metadata written by older releases.
+fn meta_matches_environment(
+    meta: &BTreeMap<String, String>,
+    expected_env_name: Option<&str>,
+    expected_router_url: Option<&str>,
+) -> bool {
+    if let (Some(expected), Some(actual)) = (expected_env_name, meta.get("env_name")) {
+        if actual != expected {
+            return false;
+        }
+        return expected_router_url.is_none_or(|expected_router_url| {
+            meta.get("router_url").is_some_and(|actual_router_url| {
+                normalized_router_urls_match(actual_router_url, expected_router_url)
+                    || router_url_is_loopback(actual_router_url)
+                    || router_url_is_loopback(expected_router_url)
+            })
+        });
+    }
+    expected_router_url.is_some_and(|expected_router_url| {
+        meta.get("router_url").is_some_and(|actual| {
+            normalized_router_urls_match(actual, expected_router_url)
+                || router_url_is_loopback(actual)
+                || router_url_is_loopback(expected_router_url)
+        })
+    })
+}
+
+/// An explicitly scoped top command only trusts identity returned by the live
+/// metrics server. Metadata is discovery input, not proof of ownership: it may
+/// survive a crash while the fixed port is rebound by another environment.
+fn snapshot_matches_environment(
+    snapshot: &Value,
+    expected_env_name: Option<&str>,
+    expected_router_url: Option<&str>,
+) -> bool {
+    let actual_env_name = snapshot.get("env_name").and_then(Value::as_str);
+    if expected_env_name.is_some_and(|expected| actual_env_name != Some(expected)) {
+        return false;
+    }
+    let Some(expected_router_url) = expected_router_url else {
+        return expected_env_name.is_none() || actual_env_name.is_some();
+    };
+    snapshot
+        .get("router_url")
+        .and_then(Value::as_str)
+        .is_some_and(|actual_router_url| {
+            normalized_router_urls_match(actual_router_url, expected_router_url)
+                || (actual_env_name.is_some()
+                    && (router_url_is_loopback(actual_router_url)
+                        || router_url_is_loopback(expected_router_url)))
+        })
+}
+
+fn normalized_router_urls_match(left: &str, right: &str) -> bool {
+    left.trim_end_matches('/') == right.trim_end_matches('/')
+}
+
+fn router_url_is_loopback(value: &str) -> bool {
+    reqwest::Url::parse(value)
+        .ok()
+        .and_then(|url| url.host_str().map(ToOwned::to_owned))
+        .is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback())
+        })
+}
+
+/// Whether this exact proxy bound its local metrics control server. A forwarding
+/// proxy's snapshot route intentionally returns 503 until failover, so verify
+/// the health route's process and environment identity instead of accepting any
+/// Rayline responder that happened to win the port race.
+async fn metrics_port_is_serving(
+    client: &reqwest::Client,
+    port: u16,
+    expected_pid: i32,
+    expected_meta: &BTreeMap<String, String>,
+) -> bool {
+    let url = format!("http://127.0.0.1:{port}/healthz");
+    let Ok(response) = client.get(&url).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Ok(health) = response.json::<Value>().await else {
+        return false;
+    };
+    if health.get("runtime").and_then(Value::as_str) != Some("rayline-router-metrics") {
+        return false;
+    }
+    if health.get("pid").and_then(Value::as_u64) != u64::try_from(expected_pid).ok() {
+        return false;
+    }
+    let actual_env = health.get("env_name").and_then(Value::as_str);
+    if actual_env != expected_meta.get("env_name").map(String::as_str) {
+        return false;
+    }
+    let actual_router_url = health.get("router_url").and_then(Value::as_str);
+    match expected_meta.get("router_url") {
+        Some(expected_router_url) => actual_router_url
+            .is_some_and(|actual| normalized_router_urls_match(actual, expected_router_url)),
+        None => actual_router_url.is_none(),
+    }
 }
 
 fn value_display_or_empty(value: Option<&Value>) -> String {
@@ -6216,6 +7382,10 @@ struct RouterPaths {
     /// Separate advisory lock for the standalone proxy start path, so a proxy
     /// launch never serializes against a serve-daemon launch.
     proxy_lock_file: PathBuf,
+    /// Cross-class lock held while a proxy selects and binds a fallback metrics
+    /// port. Shared, isolated, and subscription proxies otherwise use separate
+    /// lifecycle locks and could race on the same probed-free port.
+    metrics_allocation_lock_file: PathBuf,
 }
 
 impl RouterPaths {
@@ -6258,6 +7428,7 @@ impl RouterPaths {
             proxy_meta_file: data_dir.join(format!("{prefix}-proxy.meta")),
             lock_file: data_dir.join(format!("{prefix}.lock")),
             proxy_lock_file: data_dir.join(format!("{prefix}-proxy.lock")),
+            metrics_allocation_lock_file: data_dir.join(format!("{prefix}-metrics.lock")),
         }
     }
 
