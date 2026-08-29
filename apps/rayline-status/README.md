@@ -2,9 +2,26 @@
 
 Rayline Status is a native SwiftUI menu-bar app for the default Claude
 subscription pool. The menu-bar label shows the number of fully available
-accounts, while the popover shows each account's five-hour, seven-day, and
-Fable allowance, reset time, projected run-out, availability, and active
-launch count.
+accounts. The popover shows one row per account, with a column for the
+five-hour, seven-day, and Fable allowance.
+
+Each cell reads as two lines: the share of the allowance still left, and a
+countdown (`1h 20m`, `3d 5h`). The countdown normally says when that window
+resets. When the forecast expects the allowance to empty first, the cell turns
+amber, adds a triangle, and the countdown switches to the projected time to
+empty, because that is the number that matters. Hover gives both. `OUT` means
+the allowance is already spent, so the countdown is the wait until it returns.
+
+The forecast measures real burn. The app keeps recent utilization samples in
+`~/Library/Application Support/ai.rayline.status/usage-history.json`, one
+series per account, limit, and window instance, and reads the rate off the
+trailing 45 minutes for the five-hour limit or 8 hours for the weekly ones.
+Below a 10-minute (or 45-minute) span it has nothing honest to say, so it falls
+back to assuming even burn since the window opened. The tooltip names which of
+the two produced the number.
+
+Hover a row or a cell to swap the header for the account's availability, the
+projected run-out, and the absolute UTC reset time.
 
 The app refreshes once per minute by running:
 

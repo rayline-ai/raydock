@@ -89,7 +89,7 @@ public struct AccountPlacementRuntimeStatus: Decodable, Sendable {
   }
 }
 
-public enum LimitKind: String, CaseIterable, Identifiable, Sendable {
+public enum LimitKind: String, Codable, CaseIterable, Identifiable, Sendable {
   case fiveHour
   case sevenDay
   case fable
@@ -108,6 +108,24 @@ public enum LimitKind: String, CaseIterable, Identifiable, Sendable {
     switch self {
     case .fiveHour: 5 * 60 * 60
     case .sevenDay, .fable: 7 * 24 * 60 * 60
+    }
+  }
+
+  /// How far back a measured burn rate looks. Short windows need a short
+  /// memory to stay honest about a burst; weekly windows need a long one to
+  /// stay steady.
+  var burnLookbackSeconds: TimeInterval {
+    switch self {
+    case .fiveHour: 45 * 60
+    case .sevenDay, .fable: 8 * 60 * 60
+    }
+  }
+
+  /// Shortest trailing span that is trusted as a rate.
+  var minimumBurnSpanSeconds: TimeInterval {
+    switch self {
+    case .fiveHour: 10 * 60
+    case .sevenDay, .fable: 45 * 60
     }
   }
 }
@@ -132,10 +150,23 @@ public struct LimitPresentation: Identifiable, Sendable {
   public let kind: LimitKind
   public let remainingFraction: Double?
   public let reset: Date?
+  /// Compact time left until `reset`, for example `1h 20m` or `3d 5h`.
+  public let resetCountdown: String?
   public let exhausted: Bool
   public let forecast: DepletionForecast
+  /// Compact time left before the allowance is projected to run out, for
+  /// example `1h 20m`. Nil unless the forecast projects a run-out.
+  public let runOutCountdown: String?
 
   public var id: String { kind.id }
+
+  /// When the allowance is projected to empty, if it is.
+  public var runOutDate: Date? {
+    guard case .runsOut(let date, _) = forecast else { return nil }
+    return date
+  }
+
+  public var isAtRisk: Bool { runOutDate != nil }
 }
 
 public struct AccountPresentation: Identifiable, Sendable {
@@ -159,7 +190,10 @@ public struct PoolPresentation: Sendable {
 }
 
 extension PoolRuntimeStatus {
-  public func presentation(at now: Date = Date()) -> PoolPresentation {
+  public func presentation(
+    at now: Date = Date(),
+    burnRates: [BurnRateKey: BurnRate] = [:]
+  ) -> PoolPresentation {
     let rows = accounts.map { account in
       let placement = placement?.accounts.first { $0.id == account.id }
       let claims = Dictionary(
@@ -175,17 +209,29 @@ extension PoolRuntimeStatus {
       let limits = LimitKind.allCases.map { kind in
         let claim = claims[kind] ?? nil
         let utilization = claim?.utilization.map { min(max($0, 0), 1) }
+        let reset = claim?.resetDate()
+        // The rate is looked up by the window the cell actually shows, so a
+        // second live claim of the same kind cannot lend it its rate.
+        let burnRate = reset.flatMap { window in
+          burnRates[BurnRateKey(account: account.id, kind: kind, window: window)]
+        }
+        let forecast = depletionForecast(
+          claim: claim,
+          snapshotFresh: account.usageSnapshotFresh,
+          windowSeconds: kind.windowSeconds,
+          burnRate: burnRate,
+          now: now
+        )
+        var runOut: Date?
+        if case .runsOut(let date, _) = forecast { runOut = date }
         return LimitPresentation(
           kind: kind,
           remainingFraction: utilization.map { 1 - $0 },
-          reset: claim?.resetDate(),
+          reset: reset,
+          resetCountdown: ResetCountdown.text(until: reset, from: now),
           exhausted: claim?.isHardExhausted(at: now) ?? false,
-          forecast: depletionForecast(
-            claim: claim,
-            snapshotFresh: account.usageSnapshotFresh,
-            windowSeconds: kind.windowSeconds,
-            now: now
-          )
+          forecast: forecast,
+          runOutCountdown: ResetCountdown.text(until: runOut, from: now)
         )
       }
       return AccountPresentation(
@@ -202,7 +248,9 @@ extension PoolRuntimeStatus {
 }
 
 extension AccountRuntimeStatus {
-  fileprivate func claim(for kind: LimitKind, at now: Date) -> LimitClaim? {
+  /// The claim the UI shows for this window. Usage history reuses it so a
+  /// measured series follows the same claim the popover reads.
+  func claim(for kind: LimitKind, at now: Date) -> LimitClaim? {
     switch kind {
     case .fiveHour:
       return claims.first {

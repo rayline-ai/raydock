@@ -2,19 +2,41 @@ import AppKit
 import RaylineStatusCore
 import SwiftUI
 
+/// Status colors carry the read-at-a-glance signal, so each one is tuned per
+/// appearance. The dark tints stay vivid; the light tints are darkened enough
+/// to keep small monospaced type legible on a white popover.
 private enum Palette {
-  static let railBlue = Color(red: 0.30, green: 0.55, blue: 1.00)
-  static let capacityMint = Color(red: 0.28, green: 0.78, blue: 0.56)
-  static let signalAmber = Color(red: 0.95, green: 0.66, blue: 0.23)
-  static let exhaustRed = Color(red: 0.94, green: 0.36, blue: 0.37)
-  static let slate = Color(red: 0.55, green: 0.58, blue: 0.66)
+  static let railBlue = adaptive(
+    light: (0.10, 0.40, 0.92), dark: (0.36, 0.60, 1.00))
+  static let capacityMint = adaptive(
+    light: (0.02, 0.52, 0.34), dark: (0.30, 0.82, 0.58))
+  static let signalAmber = adaptive(
+    light: (0.68, 0.43, 0.02), dark: (0.98, 0.72, 0.28))
+  static let exhaustRed = adaptive(
+    light: (0.80, 0.16, 0.18), dark: (0.98, 0.44, 0.44))
+  static let slate = adaptive(
+    light: (0.42, 0.45, 0.52), dark: (0.58, 0.61, 0.69))
+
+  private static func adaptive(
+    light: (Double, Double, Double), dark: (Double, Double, Double)
+  ) -> Color {
+    Color(
+      nsColor: NSColor(name: nil) { appearance in
+        let components = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light
+        return NSColor(
+          srgbRed: components.0, green: components.1, blue: components.2, alpha: 1)
+      })
+  }
 }
 
 private enum TableLayout {
-  static let width: CGFloat = 370
-  static let fiveHour: CGFloat = 48
-  static let sevenDay: CGFloat = 48
-  static let fable: CGFloat = 58
+  static let width: CGFloat = 384
+  static let gutter: CGFloat = 12
+  static let columnSpacing: CGFloat = 10
+  static let rowHeight: CGFloat = 46
+  static let fiveHour: CGFloat = 62
+  static let sevenDay: CGFloat = 62
+  static let fable: CGFloat = 66
 }
 
 private struct HoverDetail {
@@ -78,8 +100,8 @@ struct StatusMenuView: View {
       .help("Refresh now")
     }
     .frame(height: 25)
-    .padding(.horizontal, 10)
-    .padding(.vertical, 7)
+    .padding(.horizontal, TableLayout.gutter)
+    .padding(.vertical, 8)
   }
 
   private var poolHeader: some View {
@@ -124,7 +146,6 @@ struct StatusMenuView: View {
         ForEach(Array(presentation.accounts.enumerated()), id: \.element.id) { index, account in
           SubscriptionRow(
             account: account,
-            alternate: index.isMultiple(of: 2) == false,
             onHoverDetail: { detail in
               if let detail {
                 hoverDetail = detail
@@ -133,8 +154,7 @@ struct StatusMenuView: View {
               }
             })
           if index < presentation.accounts.count - 1 {
-            Divider()
-              .opacity(0.55)
+            RowSeparator()
           }
         }
       }
@@ -176,10 +196,7 @@ struct StatusMenuView: View {
         .font(.system(size: 9, design: .monospaced))
         .foregroundStyle(.secondary)
       Spacer()
-      Text("hover limits")
-        .font(.system(size: 9, design: .monospaced))
-        .foregroundStyle(.tertiary)
-      Text("refresh 1m")
+      Text("% left · resets in · ⚠ runs out")
         .font(.system(size: 9, design: .monospaced))
         .foregroundStyle(.tertiary)
       Button("Quit") {
@@ -188,8 +205,11 @@ struct StatusMenuView: View {
       .buttonStyle(.borderless)
       .font(.caption2)
     }
-    .padding(.horizontal, 10)
-    .padding(.vertical, 5)
+    .padding(.horizontal, TableLayout.gutter)
+    .padding(.vertical, 6)
+    .help(
+      "Each column shows allowance left and the time until that window resets. A cell at risk swaps the reset countdown for the projected time to empty, marked with ⚠. Hover a cell for the forecast. Refreshes every minute."
+    )
   }
 
   private func readinessColor(_ presentation: PoolPresentation) -> Color {
@@ -203,9 +223,18 @@ struct StatusMenuView: View {
   }
 }
 
+private struct RowSeparator: View {
+  var body: some View {
+    Rectangle()
+      .fill(Color.primary.opacity(0.07))
+      .frame(height: 0.5)
+      .padding(.horizontal, TableLayout.gutter)
+  }
+}
+
 private struct ColumnHeader: View {
   var body: some View {
-    HStack(spacing: 8) {
+    HStack(spacing: TableLayout.columnSpacing) {
       Text("SUBSCRIPTION")
         .frame(maxWidth: .infinity, alignment: .leading)
       Text("5H")
@@ -216,22 +245,22 @@ private struct ColumnHeader: View {
         .frame(width: TableLayout.fable, alignment: .trailing)
     }
     .font(.system(size: 8, weight: .semibold, design: .monospaced))
+    .tracking(0.6)
     .foregroundStyle(.tertiary)
-    .padding(.horizontal, 10)
-    .padding(.vertical, 4)
+    .padding(.horizontal, TableLayout.gutter)
+    .padding(.vertical, 5)
   }
 }
 
 private struct SubscriptionRow: View {
   let account: AccountPresentation
-  let alternate: Bool
   let onHoverDetail: (HoverDetail?) -> Void
 
   @State private var isHovered = false
   @State private var hoveredLimit: LimitKind?
 
   var body: some View {
-    HStack(spacing: 8) {
+    HStack(spacing: TableLayout.columnSpacing) {
       AccountCell(account: account)
         .frame(maxWidth: .infinity, alignment: .leading)
       QuotaCell(limit: limit(.fiveHour)) { hovering in
@@ -247,9 +276,14 @@ private struct SubscriptionRow: View {
       }
       .frame(width: TableLayout.fable, alignment: .trailing)
     }
-    .padding(.horizontal, 10)
-    .frame(height: 34)
-    .background(alternate ? Color.primary.opacity(0.025) : .clear)
+    .padding(.horizontal, TableLayout.gutter)
+    .frame(height: TableLayout.rowHeight)
+    .background(
+      RoundedRectangle(cornerRadius: 7, style: .continuous)
+        .fill(Color.primary.opacity(isHovered ? 0.055 : 0))
+        .padding(.horizontal, 5)
+    )
+    .animation(.easeOut(duration: 0.12), value: isHovered)
     .help(accountHelp)
     .onHover { hovering in
       isHovered = hovering
@@ -271,8 +305,10 @@ private struct SubscriptionRow: View {
       account.activeLaunches == 1
       ? "1 active session" : "\(account.activeLaunches) active sessions"
     let warning = account.warning.map { "\n\($0)" } ?? ""
+    let event = StatusText.nextEvent(for: account)
+    let next = StatusText.nextEventDescription(event, dateText: fullDate(event.date))
     return
-      "\(account.id) · \(account.availability.label) · \(active)\n\(nextEventDescription(for: account))\(warning)"
+      "\(account.id) · \(account.availability.label) · \(active)\n\(next)\(warning)"
   }
 
   private func updateLimitHover(_ kind: LimitKind, hovering: Bool) {
@@ -296,25 +332,24 @@ private struct AccountCell: View {
   let account: AccountPresentation
 
   var body: some View {
-    HStack(spacing: 5) {
+    HStack(spacing: 6) {
       Image(systemName: stateSymbol)
-        .font(.system(size: 11, weight: .semibold))
+        .font(.system(size: 12, weight: .semibold))
         .foregroundStyle(color(for: account.availability))
         .help(account.availability.label)
         .accessibilityLabel(account.availability.label)
       Text(account.id)
         .font(.system(.subheadline, design: .rounded, weight: .bold))
         .lineLimit(1)
-      Text(account.plan.uppercased())
-        .font(.system(size: 8, weight: .medium, design: .monospaced))
-        .foregroundStyle(.secondary)
+      Chip(text: account.plan.uppercased(), tint: nil)
       if account.activeLaunches > 0 {
-        HStack(spacing: 2) {
-          Image(systemName: "bolt.fill")
-          Text("\(account.activeLaunches)")
-        }
-        .font(.system(size: 8, weight: .medium, design: .monospaced))
-        .foregroundStyle(Palette.railBlue)
+        Chip(
+          text: "\(account.activeLaunches)", symbol: "bolt.fill", tint: Palette.railBlue
+        )
+        .help(
+          account.activeLaunches == 1
+            ? "1 active session" : "\(account.activeLaunches) active sessions"
+        )
       }
     }
   }
@@ -329,39 +364,75 @@ private struct AccountCell: View {
   }
 }
 
+private struct Chip: View {
+  let text: String
+  var symbol: String?
+  var tint: Color?
+
+  var body: some View {
+    HStack(spacing: 2) {
+      if let symbol {
+        Image(systemName: symbol)
+      }
+      Text(text)
+    }
+    .font(.system(size: 8, weight: .semibold, design: .rounded))
+    .monospacedDigit()
+    .foregroundStyle(tint ?? Color.secondary)
+    .padding(.horizontal, 4)
+    .padding(.vertical, 1.5)
+    .background(
+      Capsule().fill((tint ?? Color.primary).opacity(tint == nil ? 0.07 : 0.14))
+    )
+  }
+}
+
+/// One allowance: how much is left, and how long until that window resets.
 private struct QuotaCell: View {
   let limit: LimitPresentation?
   let onHoverChange: (Bool) -> Void
 
   var body: some View {
-    HStack(spacing: 3) {
-      if isRisk {
-        Image(systemName: "exclamationmark.triangle.fill")
-          .font(.system(size: 7))
-          .foregroundStyle(Palette.signalAmber)
+    VStack(alignment: .trailing, spacing: 2) {
+      HStack(alignment: .firstTextBaseline, spacing: 1) {
+        Text(value)
+          .font(.system(size: 14, weight: .semibold, design: .rounded))
+          .monospacedDigit()
+          .foregroundStyle(valueColor)
+        if let unit {
+          Text(unit)
+            .font(.system(size: 9, weight: .semibold, design: .rounded))
+            .foregroundStyle(valueColor.opacity(0.55))
+        }
       }
-      Text(value)
-        .font(.system(size: 11, weight: .semibold, design: .monospaced))
-        .foregroundStyle(valueColor)
+      HStack(spacing: 2) {
+        if isRisk {
+          Image(systemName: "exclamationmark.triangle.fill")
+            .font(.system(size: 7))
+        }
+        Text(countdown)
+          .font(.system(size: 9, weight: .medium, design: .monospaced))
+      }
+      .foregroundStyle(countdownColor)
+      .lineLimit(1)
+      .minimumScaleFactor(0.8)
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
     .contentShape(Rectangle())
     .help(helpText)
+    .accessibilityElement(children: .ignore)
     .accessibilityLabel(helpText)
     .onHover(perform: onHoverChange)
   }
 
-  private var value: String {
-    guard let limit else { return "—" }
-    if limit.exhausted { return "OUT" }
-    guard let remaining = limit.remainingFraction else { return "—" }
-    return String(format: "%.0f%%", remaining * 100)
-  }
+  private var value: String { StatusText.cellValue(limit) }
+
+  private var unit: String? { StatusText.cellUnit(limit) }
+
+  private var countdown: String { StatusText.cellCountdown(limit) }
 
   private var isRisk: Bool {
-    guard let limit else { return false }
-    if case .runsOut = limit.forecast { return true }
-    return false
+    limit?.isAtRisk ?? false
   }
 
   private var valueColor: Color {
@@ -373,11 +444,16 @@ private struct QuotaCell: View {
     return Palette.capacityMint
   }
 
+  private var countdownColor: Color {
+    isRisk ? Palette.signalAmber : Color.secondary
+  }
+
   private var helpText: String {
-    guard let limit else { return "Allowance unavailable" }
-    let allowance = limit.exhausted ? "exhausted" : "\(value) left"
-    return
-      "\(limit.kind.title): \(allowance)\n\(forecastDescription(limit.forecast))\nReset: \(fullDate(limit.reset))"
+    StatusText.tooltip(
+      limit,
+      resetDateText: fullDate(limit?.reset),
+      runOutDateText: fullDate(limit?.runOutDate)
+    )
   }
 }
 
@@ -420,57 +496,15 @@ private struct HoverInspectionHeader: View {
         detail.account.activeLaunches == 1 ? "1 ACTIVE" : "\(detail.account.activeLaunches) ACTIVE"
       return "\(detail.account.availability.label.uppercased()) · \(active)"
     }
-    return "\(limit.kind.title.uppercased()) · \(remainingText(limit))"
+    return "\(limit.kind.title.uppercased()) · \(StatusText.remainingSummary(limit))"
   }
 
   private var timingText: String {
-    if let limit = detail.limit {
-      return limitTiming(limit)
+    guard let limit = detail.limit else {
+      let event = StatusText.nextEvent(for: detail.account)
+      return StatusText.accountTiming(event, dateText: compactDate(event.date))
     }
-    return accountTiming
-  }
-
-  private var accountTiming: String {
-    let exhausted = detail.account.limits
-      .filter(\.exhausted)
-      .compactMap { limit in limit.reset.map { (limit.kind, $0) } }
-      .min { $0.1 < $1.1 }
-    if let exhausted {
-      return "\(exhausted.0.title) available again \(compactDate(exhausted.1)) UTC"
-    }
-
-    let risk = detail.account.limits
-      .compactMap { limit -> (LimitKind, Date)? in
-        guard case .runsOut(let date) = limit.forecast else { return nil }
-        return (limit.kind, date)
-      }
-      .min { $0.1 < $1.1 }
-    if let risk {
-      return "\(risk.0.title) may hit limit \(compactDate(risk.1)) UTC"
-    }
-
-    let nextReset = detail.account.limits
-      .compactMap { limit in limit.reset.map { (limit.kind, $0) } }
-      .min { $0.1 < $1.1 }
-    if let nextReset {
-      return "\(nextReset.0.title) resets \(compactDate(nextReset.1)) UTC"
-    }
-
-    return "Timing unavailable"
-  }
-
-  private func limitTiming(_ limit: LimitPresentation) -> String {
-    let reset = compactDate(limit.reset)
-    switch limit.forecast {
-    case .exhausted: return "Limit reached · resets \(reset) UTC"
-    case .noBurn: return "No current burn · resets \(reset) UTC"
-    case .resetFirst: return "Safe until reset · \(reset) UTC"
-    case .runsOut(let date):
-      return "Hits \(compactDate(date)) · resets \(reset) UTC"
-    case .learning: return "Learning rate · resets \(reset) UTC"
-    case .stale: return "Usage is stale · reset \(reset) UTC"
-    case .unavailable: return "Prediction unavailable · reset \(reset) UTC"
-    }
+    return StatusText.limitTiming(limit, resetDateText: compactDate(limit.reset))
   }
 
   private var eventSymbol: String {
@@ -512,11 +546,6 @@ private struct HoverInspectionHeader: View {
     }
   }
 
-  private func remainingText(_ limit: LimitPresentation) -> String {
-    if limit.exhausted { return "OUT" }
-    guard let remaining = limit.remainingFraction else { return "—" }
-    return String(format: "%.0f%% LEFT", remaining * 100)
-  }
 }
 
 private struct ErrorBanner: View {
@@ -540,50 +569,6 @@ private func color(for availability: AccountAvailability) -> Color {
   case .none: Palette.exhaustRed
   case .unknown: Palette.slate
   }
-}
-
-@MainActor
-private func forecastDescription(_ forecast: DepletionForecast) -> String {
-  switch forecast {
-  case .exhausted: "Exhausted until reset"
-  case .noBurn: "No current consumption"
-  case .resetFirst: "Expected to reset before depletion"
-  case .runsOut(let date): "Risk: projected to run out \(fullDate(date))"
-  case .learning: "Forecast is learning the current rate"
-  case .stale: "Forecast unavailable because usage is stale"
-  case .unavailable: "Forecast unavailable"
-  }
-}
-
-@MainActor
-private func nextEventDescription(for account: AccountPresentation) -> String {
-  let exhausted = account.limits
-    .filter(\.exhausted)
-    .compactMap { limit in limit.reset.map { (limit.kind, $0) } }
-    .min { $0.1 < $1.1 }
-  if let exhausted {
-    return "Next: \(exhausted.0.title) allowance resets \(fullDate(exhausted.1))"
-  }
-
-  let risk = account.limits
-    .compactMap { limit -> (LimitKind, Date)? in
-      guard case .runsOut(let date) = limit.forecast else { return nil }
-      return (limit.kind, date)
-    }
-    .min { $0.1 < $1.1 }
-  if let risk {
-    return "Next risk: \(risk.0.title) allowance may run out \(fullDate(risk.1))"
-  }
-
-  let nextReset = account.limits
-    .compactMap { limit in limit.reset.map { (limit.kind, $0) } }
-    .min { $0.1 < $1.1 }
-  if let nextReset {
-    return
-      "Next: \(nextReset.0.title) allowance resets \(fullDate(nextReset.1)); no earlier depletion projected"
-  }
-
-  return "Next event unavailable"
 }
 
 @MainActor

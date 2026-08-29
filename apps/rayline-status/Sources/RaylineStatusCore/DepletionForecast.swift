@@ -1,10 +1,18 @@
 import Foundation
 
+/// Where a projected run-out time came from.
+public enum BurnBasis: Equatable, Sendable {
+  /// Measured from recent samples. The value is the trailing span they cover.
+  case measured(TimeInterval)
+  /// Even burn since the window opened. Used when no measurement exists yet.
+  case windowAverage
+}
+
 public enum DepletionForecast: Equatable, Sendable {
   case exhausted
   case noBurn
   case resetFirst
-  case runsOut(Date)
+  case runsOut(Date, BurnBasis)
   case learning
   case stale
   case unavailable
@@ -14,6 +22,7 @@ func depletionForecast(
   claim: LimitClaim?,
   snapshotFresh: Bool,
   windowSeconds: TimeInterval,
+  burnRate: BurnRate? = nil,
   now: Date
 ) -> DepletionForecast {
   guard let claim else { return .unavailable }
@@ -26,6 +35,20 @@ func depletionForecast(
     return .unavailable
   }
 
+  // A measured rate answers the real question: at the pace of the last few
+  // minutes, when does this run out? It needs no warm-up heuristics, because
+  // it does not guess how the window was spent before the app was watching.
+  if let burnRate {
+    guard burnRate.fractionPerSecond > 0 else { return .resetFirst }
+    let remainingSeconds = ceil((1 - utilization) / burnRate.fractionPerSecond)
+    guard remainingSeconds.isFinite else { return .unavailable }
+    // Anchored to the sample the utilization came from, not to the display
+    // clock. Otherwise the projection is pushed later on every tick and never
+    // counts down.
+    let runOut = burnRate.measuredAt.addingTimeInterval(remainingSeconds)
+    return runOut >= reset ? .resetFirst : .runsOut(runOut, .measured(burnRate.span))
+  }
+
   let windowStart = reset.addingTimeInterval(-windowSeconds)
   let elapsed = now.timeIntervalSince(windowStart)
   guard elapsed > 0, elapsed <= windowSeconds else { return .learning }
@@ -34,5 +57,5 @@ func depletionForecast(
   let remainingSeconds = ceil(elapsed * (1 - utilization) / utilization)
   guard remainingSeconds.isFinite else { return .unavailable }
   let runOut = now.addingTimeInterval(remainingSeconds)
-  return runOut >= reset ? .resetFirst : .runsOut(runOut)
+  return runOut >= reset ? .resetFirst : .runsOut(runOut, .windowAverage)
 }
