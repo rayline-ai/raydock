@@ -143,12 +143,50 @@ fn isolated_needs_claude_login(mode: RoutingMode) -> bool {
     mode != RoutingMode::Override
 }
 
-fn default_model_for_routing_mode(mode: RoutingMode) -> &'static str {
+/// Whether the user asked for the hybrid shape: main thread on their own Claude
+/// subscription, only subagents routed. `--local` and `--route subagents` say so
+/// on the command line; a passthrough `routes.main` says so in a config file.
+///
+/// An *implicit* account-local downgrade (the `enable_local_router` toggle
+/// engaging without `--route`) says nothing of the kind — it only asks for local
+/// subagents. See [`effective_routing_mode`].
+///
+/// `--route none` ([`RoutingMode::ProxyPassthrough`]) is a separate, always
+/// explicit mode and does not need this signal: it passes *everything* through,
+/// so its main thread stays on the caller's model whatever this returns.
+fn hybrid_main_requested(
+    local_router: bool,
+    route_scope_explicit: bool,
+    config_main_passthrough: bool,
+) -> bool {
+    local_router || route_scope_explicit || config_main_passthrough
+}
+
+/// The main-thread model default for a launch.
+///
+/// A mode that passes the main thread through keeps the caller's own model.
+/// That is `ProxyPassthrough` always, and `ProxySubagents` only when the hybrid
+/// shape was *requested*. Every other launch defaults to the router sentinel:
+/// the main thread is the router's to place.
+///
+/// Decision 35(a): an implicit subagents downgrade is not such a request. It used
+/// to pin the main thread to `claude-sonnet-4-6`, which silently took a routed
+/// account off the router the moment it turned local subagents on.
+fn default_model_for_routing_mode(mode: RoutingMode, hybrid_main_requested: bool) -> &'static str {
+    if main_thread_passes_through(mode, hybrid_main_requested) {
+        DEFAULT_PROXY_SUBAGENTS_MODEL
+    } else {
+        DEFAULT_MODEL
+    }
+}
+
+/// Whether this launch leaves the main thread on the caller's own model instead
+/// of handing it to the router.
+fn main_thread_passes_through(mode: RoutingMode, hybrid_main_requested: bool) -> bool {
     match mode {
-        RoutingMode::ProxySubagents | RoutingMode::ProxyPassthrough => {
-            DEFAULT_PROXY_SUBAGENTS_MODEL
-        }
-        RoutingMode::Override | RoutingMode::Proxy => DEFAULT_MODEL,
+        RoutingMode::ProxyPassthrough => true,
+        RoutingMode::ProxySubagents => hybrid_main_requested,
+        RoutingMode::Override | RoutingMode::Proxy => false,
     }
 }
 
@@ -864,13 +902,21 @@ async fn run_command_from_home(
     };
 
     let inherited_anthropic_model = env::var_os("ANTHROPIC_MODEL").is_some();
+    let hybrid_main = hybrid_main_requested(
+        request.local_router,
+        request.route_scope_explicit,
+        config_main_passthrough,
+    );
     let model = request
         .model
         .clone()
         .or_else(|| env::var("ANTHROPIC_MODEL").ok())
-        .unwrap_or_else(|| default_model_for_routing_mode(request.routing_mode).to_owned());
+        .unwrap_or_else(|| {
+            default_model_for_routing_mode(request.routing_mode, hybrid_main).to_owned()
+        });
     let set_model_env = should_set_model_env(
         request.routing_mode,
+        hybrid_main,
         request.model.is_some(),
         inherited_anthropic_model,
     );
@@ -1389,15 +1435,19 @@ fn new_subscription_launch_id() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Whether the launch exports `ANTHROPIC_MODEL` at all.
+///
+/// Only a passing-through main thread leaves it alone, so the session keeps
+/// whatever model Claude Code would use on its own. An explicit `--model` or an
+/// inherited `ANTHROPIC_MODEL` still wins there.
 fn should_set_model_env(
     routing_mode: RoutingMode,
+    hybrid_main_requested: bool,
     request_model_explicit: bool,
     inherited_anthropic_model: bool,
 ) -> bool {
-    !matches!(
-        routing_mode,
-        RoutingMode::ProxySubagents | RoutingMode::ProxyPassthrough
-    ) || request_model_explicit
+    !main_thread_passes_through(routing_mode, hybrid_main_requested)
+        || request_model_explicit
         || inherited_anthropic_model
 }
 
@@ -3081,40 +3131,103 @@ mod main_thread_model_tests {
 
     #[test]
     fn override_and_proxy_default_to_the_router_sentinel() {
-        assert_eq!(
-            default_model_for_routing_mode(RoutingMode::Override),
-            DEFAULT_MODEL
-        );
-        assert_eq!(
-            default_model_for_routing_mode(RoutingMode::Proxy),
-            DEFAULT_MODEL
-        );
+        for hybrid in [false, true] {
+            assert_eq!(
+                default_model_for_routing_mode(RoutingMode::Override, hybrid),
+                DEFAULT_MODEL
+            );
+            assert_eq!(
+                default_model_for_routing_mode(RoutingMode::Proxy, hybrid),
+                DEFAULT_MODEL
+            );
+        }
     }
 
     #[test]
     fn override_and_proxy_always_export_the_model() {
-        assert!(should_set_model_env(RoutingMode::Override, false, false));
-        assert!(should_set_model_env(RoutingMode::Proxy, false, false));
-    }
-
-    #[test]
-    fn passthrough_keeps_the_callers_own_model_and_exports_nothing() {
-        assert_eq!(
-            default_model_for_routing_mode(RoutingMode::ProxyPassthrough),
-            DEFAULT_PROXY_SUBAGENTS_MODEL
-        );
-        assert!(!should_set_model_env(
-            RoutingMode::ProxyPassthrough,
+        assert!(should_set_model_env(
+            RoutingMode::Override,
+            false,
+            false,
+            false
+        ));
+        assert!(should_set_model_env(
+            RoutingMode::Proxy,
+            false,
             false,
             false
         ));
     }
 
     #[test]
-    fn an_explicit_model_or_an_inherited_one_still_wins_where_nothing_is_exported() {
-        for mode in [RoutingMode::ProxySubagents, RoutingMode::ProxyPassthrough] {
-            assert!(should_set_model_env(mode, true, false));
-            assert!(should_set_model_env(mode, false, true));
+    fn passthrough_keeps_the_callers_own_model_and_exports_nothing() {
+        // `--route none` passes everything through, so the hybrid signal cannot
+        // move it either way.
+        for hybrid in [false, true] {
+            assert_eq!(
+                default_model_for_routing_mode(RoutingMode::ProxyPassthrough, hybrid),
+                DEFAULT_PROXY_SUBAGENTS_MODEL
+            );
+            assert!(!should_set_model_env(
+                RoutingMode::ProxyPassthrough,
+                hybrid,
+                false,
+                false
+            ));
         }
+    }
+
+    #[test]
+    fn an_explicit_model_or_an_inherited_one_still_wins_where_nothing_is_exported() {
+        for (mode, hybrid) in [
+            (RoutingMode::ProxySubagents, true),
+            (RoutingMode::ProxyPassthrough, false),
+            (RoutingMode::ProxyPassthrough, true),
+        ] {
+            assert!(should_set_model_env(mode, hybrid, true, false));
+            assert!(should_set_model_env(mode, hybrid, false, true));
+        }
+    }
+
+    // Decision 35(a): the main thread belongs to the router unless the user
+    // asked for the hybrid shape. An implicit account-local downgrade is not
+    // such a request, and used to move the main thread off the router.
+
+    #[test]
+    fn hybrid_is_requested_by_local_by_route_scope_or_by_a_passthrough_main() {
+        assert!(hybrid_main_requested(true, false, false)); // --local
+        assert!(hybrid_main_requested(false, true, false)); // --route subagents
+        assert!(hybrid_main_requested(false, false, true)); // routes.main passthrough
+        assert!(!hybrid_main_requested(false, false, false)); // implicit downgrade
+    }
+
+    #[test]
+    fn implicit_subagents_downgrade_keeps_the_main_thread_on_the_router() {
+        assert_eq!(
+            default_model_for_routing_mode(RoutingMode::ProxySubagents, false),
+            DEFAULT_MODEL
+        );
+        // …and it is actually exported, or the downgrade still leaves the main
+        // thread on Claude Code's own model.
+        assert!(should_set_model_env(
+            RoutingMode::ProxySubagents,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_requested_hybrid_keeps_the_subagent_pin_and_exports_no_model() {
+        assert_eq!(
+            default_model_for_routing_mode(RoutingMode::ProxySubagents, true),
+            DEFAULT_PROXY_SUBAGENTS_MODEL
+        );
+        assert!(!should_set_model_env(
+            RoutingMode::ProxySubagents,
+            true,
+            false,
+            false
+        ));
     }
 }
