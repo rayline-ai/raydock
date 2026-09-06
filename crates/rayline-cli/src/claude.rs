@@ -3069,3 +3069,52 @@ mod implicit_local_routing_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod main_thread_model_tests {
+    use super::*;
+
+    // The main-thread model, per routing mode. `ProxyPassthrough` (`--route
+    // none`) is pinned here before it is touched: the proxy sends every request
+    // to Anthropic, so the main thread must keep the caller's own model and the
+    // launcher must export nothing.
+
+    #[test]
+    fn override_and_proxy_default_to_the_router_sentinel() {
+        assert_eq!(
+            default_model_for_routing_mode(RoutingMode::Override),
+            DEFAULT_MODEL
+        );
+        assert_eq!(
+            default_model_for_routing_mode(RoutingMode::Proxy),
+            DEFAULT_MODEL
+        );
+    }
+
+    #[test]
+    fn override_and_proxy_always_export_the_model() {
+        assert!(should_set_model_env(RoutingMode::Override, false, false));
+        assert!(should_set_model_env(RoutingMode::Proxy, false, false));
+    }
+
+    #[test]
+    fn passthrough_keeps_the_callers_own_model_and_exports_nothing() {
+        assert_eq!(
+            default_model_for_routing_mode(RoutingMode::ProxyPassthrough),
+            DEFAULT_PROXY_SUBAGENTS_MODEL
+        );
+        assert!(!should_set_model_env(
+            RoutingMode::ProxyPassthrough,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn an_explicit_model_or_an_inherited_one_still_wins_where_nothing_is_exported() {
+        for mode in [RoutingMode::ProxySubagents, RoutingMode::ProxyPassthrough] {
+            assert!(should_set_model_env(mode, true, false));
+            assert!(should_set_model_env(mode, false, true));
+        }
+    }
+}
