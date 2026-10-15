@@ -579,14 +579,11 @@ async fn run_command_from_home(
         .await?
     };
 
-    // Single `/v1/settings` fetch per launch, feeding BOTH the pinned-main-model
-    // auto-compact window and the account `enable_local_router` toggle. Skip it
-    // entirely when neither is needed: the window is already pinned by flag/env
-    // AND this machine has no `local_model` config (so the toggle is moot —
+    // `/v1/settings` fetch for the account `enable_local_router` toggle. Skip it
+    // when this machine has no `local_model` config (so the toggle is moot —
     // even an incomplete config needs the toggle, to decide whether to warn).
     let local_cfg = crate::local_model::read_from_home(home);
-    let need_settings =
-        !local_plane && (!auto_compact_window_is_explicit(request) || local_cfg.is_some());
+    let need_settings = !local_plane && local_cfg.is_some();
     let settings = if need_settings {
         fetch_router_settings(&env_name, &router_url, request.auth_token.as_deref(), &key).await
     } else {
@@ -838,7 +835,23 @@ async fn run_command_from_home(
         } else {
             (model, set_model_env)
         };
-    let auto_compact_window = effective_auto_compact_window(request, settings.as_ref(), &model);
+    // An explicit flag/env wins; otherwise the hosted router derives the window
+    // from the launch model's catalog context window. The local plane has no
+    // hosted router, so it keeps the model-aware default.
+    let auto_compact_window = match explicit_auto_compact_window(request) {
+        Some(window) => window,
+        None if local_plane => default_auto_compact_window(&model).to_owned(),
+        None => {
+            router_auto_compact_window(
+                &env_name,
+                &router_url,
+                request.auth_token.as_deref(),
+                &key,
+                &model,
+            )
+            .await?
+        }
+    };
 
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
     // config dir and, in proxy mode, a private proxy port. Resolve both per the
@@ -1335,36 +1348,15 @@ fn resolve_proxy_port(isolated: bool) -> Result<u16, RunError> {
     }
 }
 
-/// Resolve the auto-compact window, preferring an explicit flag/env, then the
-/// pinned main-model value from the (already-fetched) router settings, then a
-/// model-aware default. Pure: the single `/v1/settings` fetch happens in
-/// `run_command_from_home` and is threaded in here.
-fn effective_auto_compact_window(
-    request: &RunRequest,
-    settings: Option<&Value>,
-    model: &str,
-) -> String {
+/// The auto-compact window pinned by `--auto-compact-window` or
+/// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, if either is set.
+fn explicit_auto_compact_window(request: &RunRequest) -> Option<String> {
     if let Some(window) = request.auto_compact_window {
-        return window.to_string();
+        return Some(window.to_string());
     }
-    if let Ok(value) = env::var(AUTO_COMPACT_WINDOW_ENV) {
-        if !value.is_empty() {
-            return value;
-        }
-    }
-    if let Some(window) = settings.and_then(auto_compact_window_from_router_settings) {
-        return window;
-    }
-    default_auto_compact_window(model).to_owned()
-}
-
-/// True when the explicit flag/env already pins the auto-compact window, so the
-/// settings fetch is not needed for that purpose.
-fn auto_compact_window_is_explicit(request: &RunRequest) -> bool {
-    if request.auto_compact_window.is_some() {
-        return true;
-    }
-    matches!(env::var(AUTO_COMPACT_WINDOW_ENV), Ok(value) if !value.is_empty())
+    env::var(AUTO_COMPACT_WINDOW_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
 fn default_auto_compact_window(model: &str) -> &'static str {
@@ -1375,33 +1367,9 @@ fn default_auto_compact_window(model: &str) -> &'static str {
     }
 }
 
-fn positive_int_string(value: &Value) -> Option<String> {
-    if let Some(number) = value.as_u64().filter(|number| *number > 0) {
-        return Some(number.to_string());
-    }
-    if let Some(number) = value.as_i64().filter(|number| *number > 0) {
-        return Some(number.to_string());
-    }
-    let number = value.as_f64()?;
-    if number.is_finite() && number > 0.0 && number.fract() == 0.0 {
-        return Some(format!("{number:.0}"));
-    }
-    None
-}
-
-fn auto_compact_window_from_router_settings(result: &Value) -> Option<String> {
-    result
-        .get("settings")?
-        .get("rules")?
-        .get("main_model")?
-        .get("autoCompactWindow")
-        .and_then(positive_int_string)
-}
-
 /// Read the account-level `enable_local_router` toggle from a `GET /v1/settings`
-/// response. Mirrors `auto_compact_window_from_router_settings` so both values
-/// come from one fetch. Defaults to `false` (stay cloud) when the field is
-/// absent or not a bool — the safe default the design mandates.
+/// response. Defaults to `false` (stay cloud) when the field is absent or not a
+/// bool — the safe default the design mandates.
 fn enable_local_router_from_router_settings(result: &Value) -> bool {
     result
         .get("settings")
@@ -1410,16 +1378,57 @@ fn enable_local_router_from_router_settings(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Fetch the caller's router settings once per launch. Prefer account credentials
-/// when available, but fall back to the already-provisioned router key because
-/// the router accepts either bearer form. `None` on request failure or an error
-/// payload, so callers fall back to safe defaults.
+/// The hosted router's auto-compact window for the launch model:
+/// `GET /v1/settings?model=<model>` returns 95% of the model's catalog context
+/// window (or of the pinned main model's, for a virtual launch model). A failed
+/// request or a missing window fails the launch rather than guessing one.
+async fn router_auto_compact_window(
+    env_name: &str,
+    router_base: &str,
+    auth_token: Option<&str>,
+    router_key: &str,
+    model: &str,
+) -> Result<String, RunError> {
+    get_router_settings(env_name, router_base, auth_token, router_key, Some(model))
+        .await
+        .and_then(|body| {
+            body.get("autoCompactWindow")
+                .and_then(Value::as_u64)
+                .filter(|window| *window > 0)
+                .map(|window| window.to_string())
+                .ok_or_else(|| "the response has no autoCompactWindow".to_owned())
+        })
+        .map_err(|error| {
+            RunError::Router(format!(
+                "Couldn't read the auto-compact window for {model} from {router_base}/v1/settings: \
+                 {error}. Pass --auto-compact-window <tokens> to set it."
+            ))
+        })
+}
+
+/// Fetch the caller's router settings for the `enable_local_router` toggle.
+/// `None` on request failure or an error payload, so the toggle stays off.
 async fn fetch_router_settings(
     env_name: &str,
     router_base: &str,
     auth_token: Option<&str>,
     router_key: &str,
 ) -> Option<Value> {
+    get_router_settings(env_name, router_base, auth_token, router_key, None)
+        .await
+        .ok()
+}
+
+/// `GET /v1/settings`, with `?model=` when given. Prefer account credentials
+/// when available, but fall back to the already-provisioned router key because
+/// the router accepts either bearer form.
+async fn get_router_settings(
+    env_name: &str,
+    router_base: &str,
+    auth_token: Option<&str>,
+    router_key: &str,
+    model: Option<&str>,
+) -> Result<Value, String> {
     let token_request = crate::status::AuthTokenRequest {
         env_name: Some(env_name.to_owned()),
         // Honor an explicit `--auth-token` first; when account credentials are
@@ -1432,24 +1441,31 @@ async fn fetch_router_settings(
         Ok(crate::status::AuthTokenOutcome::NotLoggedIn) => router_key.to_owned(),
         Err(_) => router_key.to_owned(),
     };
-    let url = format!("{router_base}/v1/settings");
-    let response = reqwest::Client::builder()
+    let mut request = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .ok()?
-        .get(url)
-        .bearer_auth(bearer_token)
-        .send()
+        .map_err(|error| error.to_string())?
+        .get(format!("{router_base}/v1/settings"))
+        .bearer_auth(bearer_token);
+    if let Some(model) = model {
+        request = request.query(&[("model", model)]);
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body: Value = response
+        .json()
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+        .map_err(|error| format!("HTTP {status}: {error}"))?;
+    if let Some(error) = body.get("error") {
+        let message = error
+            .as_str()
+            .map_or_else(|| error.to_string(), ToOwned::to_owned);
+        return Err(format!("HTTP {status}: {message}"));
     }
-    let body: Value = response.json().await.ok()?;
-    if body.get("error").is_some() {
-        return None;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
     }
-    Some(body)
+    Ok(body)
 }
 
 /// Resolve a present `local_model` config into one that can actually engage,
@@ -2584,6 +2600,76 @@ fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
         return home.map_or(path.clone(), |home| home.join(rest));
     }
     path
+}
+
+#[cfg(test)]
+mod router_auto_compact_window_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A `/v1/settings` stub answering one request with `status` and `body`;
+    /// the join handle yields the request line it received.
+    async fn settings_stub(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request.lines().next().unwrap_or_default().to_owned()
+        });
+        (base, served)
+    }
+
+    async fn window(status: &'static str, body: &'static str) -> (Result<String, String>, String) {
+        let (base, served) = settings_stub(status, body).await;
+        let window =
+            router_auto_compact_window("dev", &base, Some("token"), "key", "claude-opus-4-8[1m]")
+                .await
+                .map_err(|error| error.to_string());
+        (window, served.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn asks_the_router_with_the_launch_model_and_returns_its_window() {
+        let (window, request_line) =
+            window("200 OK", r#"{"settings":{},"autoCompactWindow":950000}"#).await;
+        assert_eq!(window, Ok("950000".to_owned()));
+        assert!(
+            request_line.starts_with("GET /v1/settings?model=claude-opus-4-8%5B1m%5D "),
+            "{request_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fails_the_launch_when_the_router_has_no_window() {
+        for (status, body, reason) in [
+            (
+                "400 Bad Request",
+                r#"{"error":"Unknown model: claude-opus-4-8[1m]"}"#,
+                "Unknown model: claude-opus-4-8[1m]",
+            ),
+            (
+                "200 OK",
+                r#"{"settings":{}}"#,
+                "the response has no autoCompactWindow",
+            ),
+        ] {
+            let (window, _) = window(status, body).await;
+            let error = window.unwrap_err();
+            assert!(error.contains(reason), "{error}");
+            assert!(error.contains("--auto-compact-window <tokens>"), "{error}");
+        }
+    }
 }
 
 #[cfg(test)]
