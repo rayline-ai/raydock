@@ -89,6 +89,23 @@ normal Codex configuration. Because the desktop app is single-instance, if it is
 already running with a different configuration, `rayline codex app` prompts
 before restarting it.
 
+Use Claude Code inside the **Claude desktop app** on ARC. Desktop's Code sessions
+only reach a gateway through the app's third-party inference mode, so
+`rayline claude app` runs a dedicated local router (its own ports and state,
+separate from `rayline claude`) and writes a file to load with Desktop's
+**Developer → Configure Third-Party Inference… → Import configuration**:
+
+```bash
+rayline claude app                  # start the router, print the Desktop steps
+rayline claude app validate         # check Desktop's applied configuration
+rayline claude app install-service  # keep the router running across logins (macOS)
+rayline claude app off              # how to return Desktop to your subscription
+```
+
+Third-party mode applies to the whole Desktop app and signs it out of your
+claude.ai subscription while it is active. Your Rayline key stays in the router;
+Desktop stores only a placeholder.
+
 Check for CLI updates:
 
 ```bash

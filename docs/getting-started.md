@@ -153,6 +153,45 @@ rayline router top
 rayline router stop
 ```
 
+## Claude Desktop (Code)
+
+`rayline claude app` connects Claude Code inside the Claude desktop app to ARC.
+Desktop's Code sessions ignore `ANTHROPIC_BASE_URL`; they reach a gateway only
+through the app's third-party inference ("3P") mode, and Desktop accepts only
+model ids that look like Anthropic models. The launcher therefore:
+
+- runs a **dedicated** `rld` with its own state (`~/.rayline/claude-desktop`)
+  and ports (router 20831, adapter 20828, injector 20829, metrics 20833), so it
+  never touches the shared router on 20808–20814 or your Claude Code CLI config;
+- writes a router config whose explicit `model_routes` entry maps the Desktop
+  model id `claude-arc-desktop` (picker label **ARC**) to `arc-1.0` (override
+  with `--model`), stamping `x-rayline-client: claude-desktop`;
+- keeps your `rlk-` key in the router's environment only. Desktop gets
+  `http://127.0.0.1:20831` and a placeholder key through
+  `~/.rayline/claude-desktop/claude-desktop-import.json`, which you load with
+  **Developer → Configure Third-Party Inference… → Import configuration**,
+  then **Apply Changes** and **Save & Restart**. The launcher never writes
+  Desktop's own configuration.
+
+```bash
+rayline claude app                    # start or reuse the router; print the steps
+rayline --env dev claude app          # route to the dev environment instead
+rayline claude app status             # health, request totals, Desktop check
+rayline claude app validate           # Desktop's applied config vs. the router
+rayline claude app install-service    # LaunchAgent ai.rayline.claude-desktop
+rayline claude app stop
+rayline claude app off                # switch Desktop back to your subscription
+rayline claude app uninstall          # service + router state; Desktop untouched
+```
+
+3P mode applies to the whole Desktop app: it signs Desktop out of your
+claude.ai subscription, and Chat and Cowork are off while it is active. To
+switch back, open the account menu (it shows **Gateway**), choose **Sign out**,
+and sign in with your Anthropic account. Anthropic does not support routing
+Claude Code to non-Claude models through a gateway, so a Desktop update can
+change this behaviour; `scripts/smoke-claude-app.sh` checks the wire path with
+one headless Claude Code turn.
+
 ## OpenClaw
 
 `rayline openclaw` runs OpenClaw against the Rayline router with a generated

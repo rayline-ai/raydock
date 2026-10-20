@@ -7,6 +7,7 @@ use std::process::{Command, ExitCode};
 pub(crate) mod auth_callback_page;
 pub mod catalog;
 pub mod claude;
+pub mod claude_app;
 pub(crate) mod claude_daemon;
 pub mod codex;
 pub mod codex_app;
@@ -113,6 +114,7 @@ Print a valid account bearer token for scripts and integrations.
 const CLAUDE_HELP: &str = "\
 Usage: rayline claude [OPTIONS] [--] [CLAUDE_ARGS]...
        rayline claude run [OPTIONS] [--] [CLAUDE_ARGS]...
+       rayline claude app [COMMAND] [OPTIONS]
 
 Run Claude Code through Rayline hosted routing. Use --local for the
 local static router path.
@@ -143,6 +145,35 @@ Options:
   --router-config-path <path>       Local-router static router JSON config
                                     (refines `--local`'s subagent allowlist)
   --help                            Show this message and exit
+";
+
+const CLAUDE_APP_HELP: &str = "\
+Usage: rayline claude app [COMMAND] [OPTIONS]
+
+Run Claude Code inside the Claude desktop app on ARC. Starts a dedicated
+local router (its own ports and state in ~/.rayline/claude-desktop, separate
+from `rayline claude` and `rayline codex`) and writes a configuration file for
+Claude Desktop's Developer > Configure Third-Party Inference > Import
+configuration. Your Rayline key stays in the router; Desktop gets a
+placeholder.
+
+Third-party mode applies to the whole Desktop app and signs it out of your
+claude.ai subscription; `rayline claude app off` shows how to switch back.
+
+Commands:
+  start              Start or reuse the router and print setup steps (default)
+  status             Show router health, request totals and the Desktop check
+  validate           Check Desktop's applied configuration against the router
+  stop               Stop the router (and unload the login service)
+  install-service    Start the router at login (macOS LaunchAgent)
+  uninstall-service  Remove the login service
+  off                Show how to return Desktop to your subscription; stop
+  uninstall          Remove the service, the router state and its files
+
+Options:
+  --model <model>           Upstream ARC model (default: arc-1.0)
+  --desktop-config <path>   validate: check this file instead of Desktop's
+  --help                    Show this message and exit
 ";
 
 const CODEX_HELP: &str = "\
@@ -468,6 +499,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::ClaudeRun(request) => exec_claude(request).await,
+        RaylineDispatch::ClaudeApp(request) => claude_app::run(request).await,
         RaylineDispatch::CodexRun(request) => codex::run(request).await,
         RaylineDispatch::CodexApp(request) => codex_app::run(request).await,
         RaylineDispatch::Harness(request) => harness::run(request).await,
@@ -715,6 +747,7 @@ pub enum RaylineDispatch {
     AuthToken(status::AuthTokenRequest),
     AuthLogout(status::AuthLogoutRequest),
     ClaudeRun(claude::RunRequest),
+    ClaudeApp(claude_app::AppRequest),
     CodexRun(codex::RunRequest),
     CodexApp(codex_app::AppRunRequest),
     CodexConfigure(codex::ConfigureRequest),
@@ -837,8 +870,7 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
         return match arg {
             "auth" => parse_auth_dispatch(args, root_env, root_auth_token, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
-            "claude" => parse_claude_request(args, root_env, root_auth_token, root_env_explicit)
-                .map(RaylineDispatch::ClaudeRun)
+            "claude" => parse_claude_dispatch(args, root_env, root_auth_token, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "codex" => parse_codex_dispatch(args, root_env, root_auth_token, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
@@ -1449,6 +1481,74 @@ fn is_claude_management_subcommand(arg: &str) -> bool {
         arg,
         "login" | "logout" | "key" | "setup" | "hooks" | "telemetry"
     )
+}
+
+fn parse_claude_dispatch<'a, I>(
+    mut args: std::iter::Peekable<I>,
+    root_env: Option<String>,
+    root_auth_token: Option<String>,
+    root_env_explicit: bool,
+) -> Option<RaylineDispatch>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    if args.peek().and_then(|arg| arg.to_str()) == Some("app") {
+        let _ = args.next();
+        return parse_claude_app_request(args, root_env, root_auth_token, root_env_explicit)
+            .map(RaylineDispatch::ClaudeApp);
+    }
+    parse_claude_request(args, root_env, root_auth_token, root_env_explicit)
+        .map(RaylineDispatch::ClaudeRun)
+}
+
+fn parse_claude_app_request<'a, I>(
+    args: std::iter::Peekable<I>,
+    root_env: Option<String>,
+    root_auth_token: Option<String>,
+    root_env_explicit: bool,
+) -> Option<crate::claude_app::AppRequest>
+where
+    I: Iterator<Item = &'a OsString>,
+{
+    let mut action = None;
+    let mut model = None;
+    let mut desktop_config = None;
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        let arg_str = arg.to_str()?;
+        if let Some((option, value)) = arg_str.split_once('=') {
+            match option {
+                "--model" => {
+                    model = Some(value.to_owned());
+                    continue;
+                }
+                "--desktop-config" => {
+                    desktop_config = Some(PathBuf::from(value));
+                    continue;
+                }
+                _ => return None,
+            }
+        }
+        match arg_str {
+            "--model" => model = Some(args.next()?.to_str()?.to_owned()),
+            "--desktop-config" => desktop_config = Some(PathBuf::from(args.next()?)),
+            _ if arg_str.starts_with('-') => return None,
+            _ if action.is_none() => action = Some(crate::claude_app::AppAction::parse(arg_str)?),
+            _ => return None,
+        }
+    }
+    let action = action.unwrap_or(crate::claude_app::AppAction::Start);
+    if desktop_config.is_some() && !matches!(action, crate::claude_app::AppAction::Validate) {
+        return None;
+    }
+    Some(crate::claude_app::AppRequest {
+        action,
+        model,
+        desktop_config,
+        env_name: root_env,
+        auth_token: root_auth_token,
+        root_env_explicit,
+    })
 }
 
 fn parse_codex_dispatch<'a, I>(
@@ -2181,6 +2281,7 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["auth", "status"] => Some(AUTH_STATUS_HELP),
         ["auth", "token"] => Some(AUTH_TOKEN_HELP),
         ["claude"] | ["claude", "run"] => Some(CLAUDE_HELP),
+        ["claude", "app", ..] => Some(CLAUDE_APP_HELP),
         ["codex"] => Some(CODEX_HELP),
         ["codex", "app"] => Some(CODEX_APP_HELP),
         ["codex", "configure"] => Some(CODEX_CONFIGURE_HELP),
@@ -2289,6 +2390,7 @@ fn is_value_option(arg: &str) -> bool {
             | "--channel"
             | "--url"
             | "--base-url"
+            | "--desktop-config"
     )
 }
 
@@ -2999,6 +3101,113 @@ mod tests {
             }
             other => panic!("expected CodexRun, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn claude_app_dispatch_defaults_to_start() {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "claude", "app"])) {
+            RaylineDispatch::ClaudeApp(request) => {
+                assert_eq!(request.action, crate::claude_app::AppAction::Start);
+                assert_eq!(request.model, None);
+                assert!(!request.root_env_explicit);
+            }
+            other => panic!("expected ClaudeApp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_app_dispatch_parses_subcommands_env_and_model() {
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "--env",
+            "dev",
+            "claude",
+            "app",
+            "status",
+            "--model=rayline/arc-swift",
+        ])) {
+            RaylineDispatch::ClaudeApp(request) => {
+                assert_eq!(request.action, crate::claude_app::AppAction::Status);
+                assert_eq!(request.model.as_deref(), Some("rayline/arc-swift"));
+                assert_eq!(request.env_name.as_deref(), Some("dev"));
+                assert!(request.root_env_explicit);
+            }
+            other => panic!("expected ClaudeApp, got {other:?}"),
+        }
+        match rayline_dispatch_for_argv(&argv(&[
+            "rayline",
+            "claude",
+            "app",
+            "validate",
+            "--desktop-config",
+            "/tmp/d.json",
+        ])) {
+            RaylineDispatch::ClaudeApp(request) => {
+                assert_eq!(request.action, crate::claude_app::AppAction::Validate);
+                assert_eq!(
+                    request.desktop_config.as_deref(),
+                    Some(std::path::Path::new("/tmp/d.json"))
+                );
+            }
+            other => panic!("expected ClaudeApp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_app_dispatch_rejects_unknown_input() {
+        for args in [
+            &["rayline", "claude", "app", "bogus"][..],
+            &["rayline", "claude", "app", "start", "stop"][..],
+            &["rayline", "claude", "app", "--local"][..],
+            &[
+                "rayline",
+                "claude",
+                "app",
+                "start",
+                "--desktop-config",
+                "/x",
+            ][..],
+        ] {
+            assert_eq!(
+                rayline_dispatch_for_argv(&argv(args)),
+                RaylineDispatch::Unavailable,
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_without_app_still_runs_claude_code() {
+        // `app` after `--` or after other Claude args is Claude's, not ours.
+        match rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--", "app"])) {
+            RaylineDispatch::ClaudeRun(request) => {
+                assert_eq!(request.args, argv(&["app"]));
+            }
+            other => panic!("expected ClaudeRun, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_app_help_is_routed() {
+        for args in [
+            &["rayline", "claude", "app", "--help"][..],
+            &["rayline", "claude", "app", "status", "--help"][..],
+        ] {
+            assert_eq!(rayline_help_for_argv(&argv(args)), Some(CLAUDE_APP_HELP));
+        }
+        assert_eq!(
+            rayline_help_for_argv(&argv(&["rayline", "claude", "--help"])),
+            Some(CLAUDE_HELP)
+        );
+        // Without --help the bare command runs; it is not a help group.
+        assert_eq!(
+            rayline_help_for_argv(&argv(&["rayline", "claude", "app"])),
+            None
+        );
+        assert_eq!(
+            rayline_help_for_argv(&argv(&["rayline", "claude", "app", "status"])),
+            None
+        );
     }
 
     #[test]

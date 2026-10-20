@@ -334,6 +334,29 @@ routing there rather than duplicating those assertions here.
 
 ---
 
+## `rayline claude app` (Claude Desktop) Acceptance
+
+Wire smoke, in a throwaway HOME (one hosted ARC turn, a few cents): it starts
+the Desktop router, validates the generated import file, runs one headless
+Claude Code turn with the exact model id Desktop sends, and asserts the reply,
+the explicit alias route (`policy: model:claude-arc-desktop`) and the
+`arc-1.0` upstream route, then stops the router.
+
+```bash
+cargo build -p rayline-cli -p rayline-daemon --locked
+scripts/smoke-claude-app.sh
+```
+
+It copies only the prod `router_keys.prod.apiKey` from
+`~/.config/rayline/credentials.json` into the throwaway HOME and never prints it.
+
+Desktop UI checklist (per Desktop release, on a macOS user without other
+Desktop state): run `rayline claude app`; import the file; **Apply Changes**,
+**Save & Restart**; continue with the gateway; open **Code**, pick **ARC**, send
+"Reply with exactly PONG"; confirm `rayline claude app status` counts the
+request; sign out and back in with Anthropic to confirm the subscription
+returns.
+
 ## Troubleshooting
 
 If Claude reports a non-Rayline Local daemon conflict, stop only the isolated

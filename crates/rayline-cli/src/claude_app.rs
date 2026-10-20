@@ -1,0 +1,1402 @@
+//! `rayline claude app` — run Claude Code inside the **Claude desktop app**
+//! against ARC through Rayline Local.
+//!
+//! Claude Desktop's Code sessions ignore `ANTHROPIC_BASE_URL`; the only way to
+//! point them at a gateway is the app's third-party inference ("3P") mode,
+//! configured per machine through **Developer → Configure Third-Party
+//! Inference…**. Three facts shape this module:
+//!
+//! 1. Desktop only accepts model ids that look like Anthropic models, so the
+//!    app is configured with the compatibility alias [`DESKTOP_MODEL_ID`] and a
+//!    dedicated local router rewrites it to the upstream ARC model through an
+//!    explicit `model_routes` entry.
+//! 2. 3P mode applies to the whole app (it signs Desktop out of the claude.ai
+//!    subscription), so the router runs as its **own** instance — its own state
+//!    directory, ports, pid file and LaunchAgent — and never touches the shared
+//!    `rayline claude` / `rayline codex` router or any Claude Code CLI config.
+//! 3. The Rayline `rlk-` key stays inside the router process. Desktop receives a
+//!    loopback URL and a placeholder key only, through a JSON file the user loads
+//!    with Desktop's documented **Import configuration**; this module never
+//!    writes Desktop's own configuration.
+
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::io;
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, Stdio};
+use std::time::{Duration, Instant};
+
+use serde_json::{Value, json};
+
+/// The model id Claude Desktop sends. Desktop rejects ids that do not look like
+/// an Anthropic model, so this is a local compatibility alias; it never leaves
+/// the machine (the router rewrites it to [`DEFAULT_ARC_MODEL`]).
+pub const DESKTOP_MODEL_ID: &str = "claude-arc-desktop";
+/// The model-picker label Desktop shows for [`DESKTOP_MODEL_ID`].
+pub const DESKTOP_MODEL_LABEL: &str = "ARC";
+/// The hosted ARC model the alias is routed to unless `--model` overrides it.
+pub const DEFAULT_ARC_MODEL: &str = "arc-1.0";
+/// `x-rayline-client` value stamped on every upstream request.
+pub const CLIENT_HEADER_VALUE: &str = "claude-desktop";
+/// Non-secret value Desktop stores as its gateway key. The local router ignores
+/// inbound credentials and authenticates upstream with the real key.
+pub const PLACEHOLDER_GATEWAY_KEY: &str = "rayline-local-placeholder";
+/// launchd label of the optional login service.
+pub const SERVICE_LABEL: &str = "ai.rayline.claude-desktop";
+const STATE_DIR: &str = "claude-desktop";
+const ENDPOINT_ID: &str = "rayline-arc";
+const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
+const HEALTH_POLL: Duration = Duration::from_millis(250);
+const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Inherited variables with these prefixes are dropped before `rld` starts, so
+/// a developer shell (`RAYLINE_PROXY_PORT`, `ANTHROPIC_BASE_URL`, ...) can never
+/// reconfigure or leak into the Desktop instance.
+const SCRUBBED_ENV_PREFIXES: [&str; 3] = ["RAYLINE_", "ANTHROPIC_", "CLAUDE_"];
+
+/// The Desktop instance's port block. Disjoint from the shared router
+/// (20808-20811, metrics 20813) and the `--isolated` proxy (20814).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ports {
+    pub adapter: u16,
+    pub injector: u16,
+    pub router: u16,
+    pub metrics: u16,
+}
+
+pub const PORTS: Ports = Ports {
+    adapter: 20828,
+    injector: 20829,
+    router: 20831,
+    metrics: 20833,
+};
+
+impl Ports {
+    pub fn all(self) -> [u16; 4] {
+        [self.adapter, self.injector, self.router, self.metrics]
+    }
+}
+
+/// The URL Claude Desktop is pointed at.
+pub fn gateway_url(ports: Ports) -> String {
+    format!("http://127.0.0.1:{}", ports.router)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AppAction {
+    /// Start (or reuse) the instance and print the Desktop setup steps.
+    Start,
+    /// Foreground: exec `rld` for the login service. Not for direct use.
+    Serve,
+    Status,
+    Validate,
+    Stop,
+    InstallService,
+    UninstallService,
+    /// Print how to return Desktop to the claude.ai subscription; stop the router.
+    Off,
+    Uninstall,
+}
+
+impl AppAction {
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "start" => Self::Start,
+            "serve" => Self::Serve,
+            "status" => Self::Status,
+            "validate" => Self::Validate,
+            "stop" => Self::Stop,
+            "install-service" => Self::InstallService,
+            "uninstall-service" => Self::UninstallService,
+            "off" => Self::Off,
+            "uninstall" => Self::Uninstall,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppRequest {
+    pub action: AppAction,
+    /// Upstream ARC model id; `None` means [`DEFAULT_ARC_MODEL`].
+    pub model: Option<String>,
+    /// `validate`: check this file instead of Desktop's applied configuration.
+    pub desktop_config: Option<PathBuf>,
+    pub env_name: Option<String>,
+    pub auth_token: Option<String>,
+    pub root_env_explicit: bool,
+}
+
+/// Every file the Desktop instance owns. Nothing outside `dir` (plus the
+/// LaunchAgent plist) is ever written.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AppPaths {
+    pub dir: PathBuf,
+    pub router_config: PathBuf,
+    pub desktop_import: PathBuf,
+    pub pid_file: PathBuf,
+    pub log_file: PathBuf,
+    pub data_dir: PathBuf,
+    pub launch_agent: PathBuf,
+}
+
+impl AppPaths {
+    pub fn new(home: &Path) -> Self {
+        let dir = home.join(crate::DOT_CONFIG_DIR).join(STATE_DIR);
+        Self {
+            router_config: dir.join("router.json"),
+            desktop_import: dir.join("claude-desktop-import.json"),
+            pid_file: dir.join("rld.pid"),
+            log_file: dir.join("rld.log"),
+            data_dir: dir.join("data"),
+            launch_agent: home
+                .join("Library")
+                .join("LaunchAgents")
+                .join(format!("{SERVICE_LABEL}.plist")),
+            dir,
+        }
+    }
+}
+
+/// Router config: every route, and the Desktop alias explicitly, goes to the
+/// hosted ARC model. The key is referenced by env var name only.
+pub fn router_config_json(router_url: &str, arc_model: &str) -> Value {
+    let target = json!({ "endpoint": ENDPOINT_ID, "model": arc_model });
+    json!({
+        "endpoints": [{
+            "id": ENDPOINT_ID,
+            "protocol": "anthropic_messages",
+            "base_url": router_url,
+            "api_key_env": ROUTER_KEY_ENV,
+            "models": [arc_model],
+            "headers": { "x-rayline-client": CLIENT_HEADER_VALUE }
+        }],
+        "routes": {
+            "main": target,
+            "subagent": target,
+            "default": target,
+            "model_routes": { DESKTOP_MODEL_ID: target },
+            "subagents": {}
+        }
+    })
+}
+
+/// The configuration file the user loads with Desktop's **Import
+/// configuration**. Keys are Desktop's documented managed-configuration keys.
+pub fn desktop_import_json(gateway_url: &str) -> Value {
+    json!({
+        "inferenceProvider": "gateway",
+        "inferenceGatewayBaseUrl": gateway_url,
+        "inferenceCredentialKind": "static",
+        "inferenceGatewayApiKey": PLACEHOLDER_GATEWAY_KEY,
+        "modelDiscoveryEnabled": false,
+        "inferenceModels": [{ "name": DESKTOP_MODEL_ID, "labelOverride": DESKTOP_MODEL_LABEL }],
+        "coworkTabEnabled": false
+    })
+}
+
+/// Arguments for `rld serve` (after the binary).
+pub fn rld_args(paths: &AppPaths, ports: Ports) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
+        "serve",
+        "--no-local-model",
+        "--decision-plane",
+        "local",
+        "--adapter-port",
+        &ports.adapter.to_string(),
+        "--injector-port",
+        &ports.injector.to_string(),
+        "--local-router-port",
+        &ports.router.to_string(),
+        "--metrics-port",
+        &ports.metrics.to_string(),
+    ]
+    .iter()
+    .map(OsString::from)
+    .collect();
+    args.push("--router-config-path".into());
+    args.push(paths.router_config.clone().into_os_string());
+    args.push("--data-dir".into());
+    args.push(paths.data_dir.clone().into_os_string());
+    args
+}
+
+/// The parent environment minus every variable that could reconfigure `rld` or
+/// carry another tool's credentials.
+pub fn scrubbed_env<I>(vars: I) -> Vec<(OsString, OsString)>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    vars.into_iter()
+        .filter(|(name, _)| {
+            let name = name.to_string_lossy();
+            !SCRUBBED_ENV_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .collect()
+}
+
+fn rld_command(rld_bin: &Path, paths: &AppPaths, key: &str) -> Command {
+    let mut command = Command::new(rld_bin);
+    command.args(rld_args(paths, PORTS));
+    command.env_clear();
+    command.envs(scrubbed_env(std::env::vars_os()));
+    command.env(ROUTER_KEY_ENV, key);
+    command.env("RUST_LOG", "warn");
+    command
+}
+
+/// What `stop` may signal: only a process whose command line names this
+/// instance's router config.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StopTarget {
+    NotRunning,
+    Ours(i32),
+    /// The pid file names a live process that is not this instance (pid reuse
+    /// or a hand-edited file). It is left untouched.
+    Foreign(i32),
+}
+
+pub fn stop_target(
+    pid: Option<i32>,
+    paths: &AppPaths,
+    alive: impl Fn(i32) -> bool,
+    command_line: impl Fn(i32) -> Option<String>,
+) -> StopTarget {
+    let Some(pid) = pid.filter(|pid| *pid > 1) else {
+        return StopTarget::NotRunning;
+    };
+    if !alive(pid) {
+        return StopTarget::NotRunning;
+    }
+    match command_line(pid) {
+        Some(line) if command_line_is_ours(&line, paths) => StopTarget::Ours(pid),
+        _ => StopTarget::Foreign(pid),
+    }
+}
+
+pub fn command_line_is_ours(line: &str, paths: &AppPaths) -> bool {
+    line.contains(&*paths.router_config.to_string_lossy())
+}
+
+fn read_pid(path: &Path) -> Option<i32> {
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: kill(pid, 0) delivers no signal; it only reports whether the pid
+    // exists and is signalable by this user.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: i32) -> bool {
+    false
+}
+
+fn process_command_line(pid: i32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && !line.is_empty()).then_some(line)
+}
+
+#[cfg(unix)]
+fn terminate(pid: i32) -> io::Result<()> {
+    // SAFETY: `pid` was checked by `stop_target` to be this instance's rld.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate(_pid: i32) -> io::Result<()> {
+    Err(io::Error::other(
+        "stopping the router is not supported on this platform",
+    ))
+}
+
+/// Stop this instance's detached router, never anything else.
+pub fn stop_instance(paths: &AppPaths) -> io::Result<String> {
+    let target = stop_target(
+        read_pid(&paths.pid_file),
+        paths,
+        process_alive,
+        process_command_line,
+    );
+    match target {
+        StopTarget::NotRunning => {
+            let _ = fs::remove_file(&paths.pid_file);
+            Ok("The Claude Desktop router is not running.".to_owned())
+        }
+        StopTarget::Foreign(pid) => Err(io::Error::other(format!(
+            "pid {pid} in {} is not the Claude Desktop router; left it untouched",
+            paths.pid_file.display()
+        ))),
+        StopTarget::Ours(pid) => {
+            terminate(pid)?;
+            let deadline = Instant::now() + STOP_TIMEOUT;
+            while process_alive(pid) && Instant::now() < deadline {
+                std::thread::sleep(HEALTH_POLL);
+            }
+            if process_alive(pid) {
+                return Err(io::Error::other(format!(
+                    "the Claude Desktop router (pid {pid}) did not exit after SIGTERM"
+                )));
+            }
+            let _ = fs::remove_file(&paths.pid_file);
+            Ok(format!("Stopped the Claude Desktop router (pid {pid})."))
+        }
+    }
+}
+
+/// Ports of the block that something else is listening on.
+fn busy_ports(ports: Ports) -> Vec<u16> {
+    ports
+        .all()
+        .into_iter()
+        .filter(|port| TcpListener::bind(("127.0.0.1", *port)).is_err())
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Desktop configuration validation (read-only).
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Finding {
+    pub ok: bool,
+    pub message: String,
+}
+
+/// Desktop stores arrays natively in its config library and as JSON-encoded
+/// strings in macOS managed preferences; accept both.
+fn json_or_string(value: Option<&Value>) -> Option<Value> {
+    match value? {
+        Value::String(text) => serde_json::from_str(text).ok(),
+        other => Some(other.clone()),
+    }
+}
+
+fn bool_like(value: Option<&Value>) -> Option<bool> {
+    match value? {
+        Value::Bool(flag) => Some(*flag),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
+    }
+}
+
+/// Check a Desktop third-party configuration against this instance. Reads key
+/// names and non-secret values only; the gateway key is never echoed.
+pub fn validate_desktop_config(config: &Value, gateway_url: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut check = |ok: bool, message: String| findings.push(Finding { ok, message });
+    let provider = config.get("inferenceProvider").and_then(Value::as_str);
+    check(
+        provider == Some("gateway"),
+        format!(
+            "inferenceProvider is {} (want \"gateway\")",
+            provider.map_or("unset".to_owned(), |value| format!("\"{value}\""))
+        ),
+    );
+    let base_url = config
+        .get("inferenceGatewayBaseUrl")
+        .and_then(Value::as_str)
+        .map(|url| url.trim_end_matches('/'));
+    check(
+        base_url == Some(gateway_url),
+        format!(
+            "inferenceGatewayBaseUrl is {} (want {gateway_url})",
+            base_url.unwrap_or("unset")
+        ),
+    );
+    let has_key = config
+        .get("inferenceGatewayApiKey")
+        .and_then(Value::as_str)
+        .is_some_and(|key| !key.is_empty());
+    check(
+        has_key,
+        if has_key {
+            "inferenceGatewayApiKey is set (value not shown; any value works)".to_owned()
+        } else {
+            "inferenceGatewayApiKey is empty (Desktop requires a value; use the placeholder)"
+                .to_owned()
+        },
+    );
+    let models = json_or_string(config.get("inferenceModels"));
+    let names: Vec<String> = models
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    Value::String(name) => Some(name.clone()),
+                    Value::Object(object) => object
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    check(
+        names.iter().any(|name| name == DESKTOP_MODEL_ID),
+        format!(
+            "inferenceModels lists {} (want {DESKTOP_MODEL_ID})",
+            if names.is_empty() {
+                "nothing".to_owned()
+            } else {
+                names.join(", ")
+            }
+        ),
+    );
+    let discovery = bool_like(config.get("modelDiscoveryEnabled"));
+    check(
+        discovery == Some(false),
+        format!(
+            "modelDiscoveryEnabled is {} (want false: the router lists no Desktop models)",
+            discovery.map_or("unset".to_owned(), |flag| flag.to_string())
+        ),
+    );
+    findings
+}
+
+/// Desktop's applied third-party configuration on macOS:
+/// `Claude-3p/configLibrary/<appliedId>.json`, named by `_meta.json`.
+pub fn applied_desktop_config_path(home: &Path) -> io::Result<PathBuf> {
+    let library = home
+        .join("Library")
+        .join("Application Support")
+        .join("Claude-3p")
+        .join("configLibrary");
+    let meta: Value =
+        serde_json::from_slice(&fs::read(library.join("_meta.json"))?).map_err(io::Error::other)?;
+    let id = meta
+        .get("appliedId")
+        .and_then(Value::as_str)
+        .filter(|id| {
+            !id.is_empty()
+                && id
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+        })
+        .ok_or_else(|| io::Error::other("Desktop has no applied third-party configuration"))?;
+    Ok(library.join(format!("{id}.json")))
+}
+
+fn render_findings(source: &Path, findings: &[Finding]) -> (bool, String) {
+    let ok = findings.iter().all(|finding| finding.ok);
+    let mut out = format!("Claude Desktop configuration: {}\n", source.display());
+    for finding in findings {
+        out.push_str(if finding.ok { "  ok    " } else { "  FAIL  " });
+        out.push_str(&finding.message);
+        out.push('\n');
+    }
+    if !ok {
+        out.push_str("Re-import the file `rayline claude app` prints, then Apply Changes.\n");
+    }
+    (ok, out)
+}
+
+// ---------------------------------------------------------------------------
+// LaunchAgent.
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// LaunchAgent that runs `rayline [--env <env>] claude app serve` at login. The
+/// plist carries no secret: `serve` reads the key from Rayline's credentials.
+pub fn launch_agent_plist(rayline_bin: &Path, env_name: Option<&str>, paths: &AppPaths) -> String {
+    let mut program = vec![rayline_bin.to_string_lossy().into_owned()];
+    if let Some(env) = env_name {
+        program.push("--env".to_owned());
+        program.push(env.to_owned());
+    }
+    program.extend(["claude", "app", "serve"].map(str::to_owned));
+    let arguments: String = program
+        .iter()
+        .map(|arg| format!("\t\t<string>{}</string>\n", xml_escape(arg)))
+        .collect();
+    let log = xml_escape(&paths.log_file.to_string_lossy());
+    let dir = xml_escape(&paths.dir.to_string_lossy());
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+<plist version=\"1.0\">\n\
+<dict>\n\
+\t<key>Label</key>\n\t<string>{SERVICE_LABEL}</string>\n\
+\t<key>ProgramArguments</key>\n\t<array>\n{arguments}\t</array>\n\
+\t<key>RunAtLoad</key>\n\t<true/>\n\
+\t<key>KeepAlive</key>\n\t<true/>\n\
+\t<key>ThrottleInterval</key>\n\t<integer>30</integer>\n\
+\t<key>WorkingDirectory</key>\n\t<string>{dir}</string>\n\
+\t<key>StandardOutPath</key>\n\t<string>{log}</string>\n\
+\t<key>StandardErrorPath</key>\n\t<string>{log}</string>\n\
+</dict>\n\
+</plist>\n"
+    )
+}
+
+#[cfg(unix)]
+fn launchd_domain() -> String {
+    // SAFETY: getuid has no preconditions and cannot fail.
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+#[cfg(not(unix))]
+fn launchd_domain() -> String {
+    String::new()
+}
+
+fn service_loaded() -> bool {
+    cfg!(target_os = "macos")
+        && Command::new("launchctl")
+            .args(["print", &format!("{}/{SERVICE_LABEL}", launchd_domain())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+}
+
+fn bootout_service() {
+    if cfg!(target_os = "macos") {
+        let _ = Command::new("launchctl")
+            .args(["bootout", &format!("{}/{SERVICE_LABEL}", launchd_domain())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime.
+
+struct Resolved {
+    home: PathBuf,
+    env: String,
+    router_url: String,
+}
+
+fn resolve(request: &AppRequest) -> Result<Resolved, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    let env = crate::status::resolve_env(request.env_name.as_deref(), Some(&home));
+    let hosted = crate::status::resolve_hosted_environment(&env, Some(&home))
+        .map_err(|error| error.to_string())?;
+    if !crate::router_config::endpoint_base_url_is_hosted_rcr(Some(&hosted.router_url)) {
+        return Err(format!(
+            "environment '{env}' routes to {}, which does not serve ARC",
+            hosted.router_url
+        ));
+    }
+    Ok(Resolved {
+        home,
+        env,
+        router_url: hosted.router_url,
+    })
+}
+
+fn write_json(path: &Path, value: &Value) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut body = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    body.push(b'\n');
+    fs::write(path, body)
+}
+
+/// Write the router config and the Desktop import file. Returns whether the
+/// router config changed (a running router must restart to pick it up).
+fn write_instance_files(paths: &AppPaths, router_url: &str, arc_model: &str) -> io::Result<bool> {
+    let router = router_config_json(router_url, arc_model);
+    let previous = fs::read(&paths.router_config)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    write_json(&paths.router_config, &router)?;
+    write_json(
+        &paths.desktop_import,
+        &desktop_import_json(&gateway_url(PORTS)),
+    )?;
+    Ok(previous.as_ref() != Some(&router))
+}
+
+async fn router_healthy(client: &reqwest::Client) -> bool {
+    client
+        .get(format!("{}/healthz", gateway_url(PORTS)))
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
+async fn wait_healthy(client: &reqwest::Client, pid: Option<i32>) -> bool {
+    let deadline = Instant::now() + HEALTH_TIMEOUT;
+    while Instant::now() < deadline {
+        if router_healthy(client).await {
+            return true;
+        }
+        if pid.is_some_and(|pid| !process_alive(pid)) {
+            return false;
+        }
+        tokio::time::sleep(HEALTH_POLL).await;
+    }
+    false
+}
+
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .no_proxy()
+        .build()
+        .unwrap_or_default()
+}
+
+fn setup_instructions(paths: &AppPaths, arc_model: &str, router_url: &str) -> String {
+    format!(
+        "\
+Rayline ARC gateway for Claude Desktop is running.
+  Gateway URL:  {gateway}
+  Desktop model: {DESKTOP_MODEL_ID} (shown as \"{DESKTOP_MODEL_LABEL}\"), served by {arc_model} at {router_url}
+  Import file:  {import}
+  Your Rayline key stays in the router process; Desktop stores only a placeholder.
+
+Before you continue: third-party mode applies to the whole Claude Desktop app.
+It signs Desktop out of your claude.ai subscription, and Chat and Cowork are
+off while it is active. Run `rayline claude app off` to see how to switch back.
+
+Connect Claude Desktop (once):
+  1. Open Claude Desktop. From the menu bar choose Help > Troubleshooting >
+     Enable Developer Mode.
+  2. Choose Developer > Configure Third-Party Inference...
+  3. Choose Import configuration and select the import file above.
+  4. Click Apply Changes, then Save & Restart.
+  5. On the sign-in screen, choose to continue with the configured gateway.
+  6. Open Code and pick \"{DESKTOP_MODEL_LABEL}\" in the model picker.
+
+Check the setup with `rayline claude app validate`. Keep the router running
+across logins with `rayline claude app install-service`.
+Anthropic does not support routing Claude Code to non-Claude models through a
+gateway, so a Desktop update can change this behaviour.
+",
+        gateway = gateway_url(PORTS),
+        import = paths.desktop_import.display(),
+    )
+}
+
+fn off_instructions() -> &'static str {
+    "\
+To return Claude Desktop to your claude.ai subscription:
+  1. In Claude Desktop, open the account menu at the bottom left (it shows
+     \"Gateway\") and choose Sign out.
+  2. On the sign-in screen, sign in with your Anthropic account instead of the
+     configured gateway.
+Your subscription data is kept. The imported gateway configuration stays
+available under Developer > Configure Third-Party Inference... for next time.
+"
+}
+
+pub async fn run(request: AppRequest) -> ExitCode {
+    match run_inner(&request).await {
+        Ok(message) => {
+            print!("{message}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("Error: {message}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn run_inner(request: &AppRequest) -> Result<String, String> {
+    let arc_model = request.model.as_deref().unwrap_or(DEFAULT_ARC_MODEL);
+    match request.action {
+        AppAction::Start => start(request, arc_model).await,
+        AppAction::Serve => serve(request, arc_model),
+        AppAction::Status => status(request).await,
+        AppAction::Validate => validate(request),
+        AppAction::Stop => stop(),
+        AppAction::InstallService => install_service(request, arc_model).await,
+        AppAction::UninstallService => uninstall_service(),
+        AppAction::Off => {
+            let stopped = stop()?;
+            Ok(format!("{}\n{stopped}\n", off_instructions()))
+        }
+        AppAction::Uninstall => uninstall(),
+    }
+}
+
+fn home_paths() -> Result<AppPaths, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    Ok(AppPaths::new(&home))
+}
+
+async fn start(request: &AppRequest, arc_model: &str) -> Result<String, String> {
+    let resolved = resolve(request)?;
+    let paths = AppPaths::new(&resolved.home);
+    // Provision or read the key first: an interactive login must happen before
+    // anything starts. The key is only ever handed to rld's environment.
+    let key = crate::claude::ensure_router_key(
+        &resolved.env,
+        &resolved.home,
+        request.auth_token.as_deref(),
+        request.root_env_explicit,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    let changed = write_instance_files(&paths, &resolved.router_url, arc_model)
+        .map_err(|error| format!("failed to write {}: {error}", paths.dir.display()))?;
+    let client = http_client();
+    let instructions = setup_instructions(&paths, arc_model, &resolved.router_url);
+
+    if service_loaded() {
+        if changed {
+            // launchd restarts the job with the new config.
+            let _ = Command::new("launchctl")
+                .args([
+                    "kickstart",
+                    "-k",
+                    &format!("{}/{SERVICE_LABEL}", launchd_domain()),
+                ])
+                .status();
+        }
+        if !wait_healthy(&client, None).await {
+            return Err(format!(
+                "the login service is loaded but the router is not answering; see {}",
+                paths.log_file.display()
+            ));
+        }
+        return Ok(instructions);
+    }
+
+    let running = matches!(
+        stop_target(
+            read_pid(&paths.pid_file),
+            &paths,
+            process_alive,
+            process_command_line
+        ),
+        StopTarget::Ours(_)
+    );
+    if running && !changed && router_healthy(&client).await {
+        return Ok(instructions);
+    }
+    if running {
+        stop_instance(&paths).map_err(|error| error.to_string())?;
+    }
+    let busy = busy_ports(PORTS);
+    if !busy.is_empty() {
+        return Err(format!(
+            "port(s) {busy:?} are in use by another process. The Claude Desktop router \
+             needs {:?} and will not touch a process it did not start.",
+            PORTS.all()
+        ));
+    }
+    let rld_bin =
+        crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
+    fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
+    let log = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.log_file)
+        .map_err(|error| error.to_string())?;
+    let mut command = rld_command(&rld_bin, &paths, &key);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            log.try_clone().map_err(|error| error.to_string())?,
+        ))
+        .stderr(Stdio::from(log));
+    // Detach from the launching terminal's session so closing it does not
+    // SIGHUP the router (mirrors the shared router's spawn).
+    #[cfg(unix)]
+    // SAFETY: the pre_exec closure only calls setsid, which is
+    // async-signal-safe, between fork and exec.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .spawn()
+        .map_err(|error| format!("failed to start {}: {error}", rld_bin.display()))?;
+    let pid = child.id() as i32;
+    fs::write(&paths.pid_file, format!("{pid}\n")).map_err(|error| error.to_string())?;
+    if !wait_healthy(&client, Some(pid)).await {
+        let _ = stop_instance(&paths);
+        return Err(format!(
+            "the Claude Desktop router did not become healthy; see {}",
+            paths.log_file.display()
+        ));
+    }
+    Ok(instructions)
+}
+
+/// Foreground mode for the LaunchAgent: write the config, then replace this
+/// process with `rld` so launchd supervises the router directly.
+fn serve(request: &AppRequest, arc_model: &str) -> Result<String, String> {
+    let resolved = resolve(request)?;
+    let paths = AppPaths::new(&resolved.home);
+    let key = crate::status::load_claude_key_from_home(&resolved.env, &resolved.home).ok_or_else(
+        || {
+            format!(
+                "no Rayline key for '{}'; run `rayline auth login` (the login service \
+                 never prompts)",
+                resolved.env
+            )
+        },
+    )?;
+    write_instance_files(&paths, &resolved.router_url, arc_model)
+        .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
+    let rld_bin =
+        crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
+    fs::write(&paths.pid_file, format!("{}\n", std::process::id()))
+        .map_err(|error| error.to_string())?;
+    let mut command = rld_command(&rld_bin, &paths, &key);
+    exec(&mut command)
+}
+
+#[cfg(unix)]
+fn exec(command: &mut Command) -> Result<String, String> {
+    use std::os::unix::process::CommandExt;
+    Err(format!("failed to exec rld: {}", command.exec()))
+}
+
+#[cfg(not(unix))]
+fn exec(_command: &mut Command) -> Result<String, String> {
+    Err("the Claude Desktop login service is only supported on macOS".to_owned())
+}
+
+async fn status(request: &AppRequest) -> Result<String, String> {
+    let paths = home_paths()?;
+    let client = http_client();
+    let mut out = String::new();
+    let healthy = router_healthy(&client).await;
+    let owner = if service_loaded() {
+        "login service".to_owned()
+    } else {
+        match stop_target(
+            read_pid(&paths.pid_file),
+            &paths,
+            process_alive,
+            process_command_line,
+        ) {
+            StopTarget::Ours(pid) => format!("pid {pid}"),
+            StopTarget::Foreign(pid) => format!("stale pid file (pid {pid} is not ours)"),
+            StopTarget::NotRunning => "not running".to_owned(),
+        }
+    };
+    out.push_str(&format!(
+        "Claude Desktop router: {} ({owner})\n  Gateway URL: {}\n  State: {}\n",
+        if healthy { "healthy" } else { "not answering" },
+        gateway_url(PORTS),
+        paths.dir.display()
+    ));
+    if healthy {
+        let snapshot = client
+            .get(format!(
+                "http://127.0.0.1:{}/v1/router/top/snapshot",
+                PORTS.metrics
+            ))
+            .send()
+            .await
+            .ok();
+        if let Some(response) = snapshot {
+            if let Ok(body) = response.json::<Value>().await {
+                if let Some(totals) = body.get("totals") {
+                    out.push_str(&format!("  Totals: {totals}\n"));
+                }
+            }
+        }
+    }
+    match validate(request) {
+        Ok(report) | Err(report) => out.push_str(&report),
+    }
+    Ok(out)
+}
+
+fn validate(request: &AppRequest) -> Result<String, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    let source = match request.desktop_config.clone() {
+        Some(path) => path,
+        None => applied_desktop_config_path(&home).map_err(|error| {
+            format!(
+                "could not read Claude Desktop's applied third-party configuration \
+                 ({error}). Import the file from `rayline claude app` first.\n"
+            )
+        })?,
+    };
+    let bytes = fs::read(&source).map_err(|error| format!("{}: {error}\n", source.display()))?;
+    let config: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{}: {error}\n", source.display()))?;
+    let (ok, report) = render_findings(
+        &source,
+        &validate_desktop_config(&config, &gateway_url(PORTS)),
+    );
+    if ok { Ok(report) } else { Err(report) }
+}
+
+fn stop() -> Result<String, String> {
+    let paths = home_paths()?;
+    let mut out = String::new();
+    if service_loaded() {
+        bootout_service();
+        out.push_str(&format!(
+            "Unloaded the login service until next login ({SERVICE_LABEL}).\n"
+        ));
+    }
+    let stopped = stop_instance(&paths).map_err(|error| error.to_string())?;
+    out.push_str(&stopped);
+    out.push('\n');
+    Ok(out)
+}
+
+async fn install_service(request: &AppRequest, arc_model: &str) -> Result<String, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("the login service is only supported on macOS".to_owned());
+    }
+    let resolved = resolve(request)?;
+    let paths = AppPaths::new(&resolved.home);
+    // Make sure a key exists now; the service itself never prompts.
+    crate::claude::ensure_router_key(
+        &resolved.env,
+        &resolved.home,
+        request.auth_token.as_deref(),
+        request.root_env_explicit,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    write_instance_files(&paths, &resolved.router_url, arc_model)
+        .map_err(|error| error.to_string())?;
+    // Hand the ports over from a detached instance to launchd.
+    stop_instance(&paths).map_err(|error| error.to_string())?;
+    bootout_service();
+    let rayline_bin = std::env::current_exe().map_err(|error| error.to_string())?;
+    let env_name = request.root_env_explicit.then_some(resolved.env.as_str());
+    if let Some(dir) = paths.launch_agent.parent() {
+        fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    }
+    fs::write(
+        &paths.launch_agent,
+        launch_agent_plist(&rayline_bin, env_name, &paths),
+    )
+    .map_err(|error| error.to_string())?;
+    let status = Command::new("launchctl")
+        .args([
+            OsStr::new("bootstrap"),
+            OsStr::new(&launchd_domain()),
+            paths.launch_agent.as_os_str(),
+        ])
+        .status()
+        .map_err(|error| error.to_string())?;
+    if !status.success() {
+        return Err(format!(
+            "launchctl bootstrap failed for {}",
+            paths.launch_agent.display()
+        ));
+    }
+    if !wait_healthy(&http_client(), None).await {
+        return Err(format!(
+            "the login service started but the router is not answering; see {}",
+            paths.log_file.display()
+        ));
+    }
+    Ok(format!(
+        "Installed the login service {SERVICE_LABEL} ({}). The router now starts at login.\n",
+        paths.launch_agent.display()
+    ))
+}
+
+fn uninstall_service() -> Result<String, String> {
+    let paths = home_paths()?;
+    bootout_service();
+    match fs::remove_file(&paths.launch_agent) {
+        Ok(()) => Ok(format!(
+            "Removed the login service ({}).\n",
+            paths.launch_agent.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok("The login service is not installed.\n".to_owned())
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn uninstall() -> Result<String, String> {
+    let paths = home_paths()?;
+    let mut out = uninstall_service()?;
+    out.push_str(&stop()?);
+    match fs::remove_dir_all(&paths.dir) {
+        Ok(()) => out.push_str(&format!("Removed {}.\n", paths.dir.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    out.push_str(
+        "Claude Desktop's own configuration was not changed. To remove the gateway \
+         configuration, open Developer > Configure Third-Party Inference... in Desktop.\n\n",
+    );
+    out.push_str(off_instructions());
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_HOME: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_home() -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "rayline-claude-app-test-{}-{}",
+            std::process::id(),
+            NEXT_HOME.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create temp home");
+        home
+    }
+
+    #[test]
+    fn router_config_golden() {
+        let expected = json!({
+            "endpoints": [{
+                "id": "rayline-arc",
+                "protocol": "anthropic_messages",
+                "base_url": "https://api.rayline.ai",
+                "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                "models": ["arc-1.0"],
+                "headers": { "x-rayline-client": "claude-desktop" }
+            }],
+            "routes": {
+                "main": { "endpoint": "rayline-arc", "model": "arc-1.0" },
+                "subagent": { "endpoint": "rayline-arc", "model": "arc-1.0" },
+                "default": { "endpoint": "rayline-arc", "model": "arc-1.0" },
+                "model_routes": {
+                    "claude-arc-desktop": { "endpoint": "rayline-arc", "model": "arc-1.0" }
+                },
+                "subagents": {}
+            }
+        });
+        assert_eq!(
+            router_config_json("https://api.rayline.ai", DEFAULT_ARC_MODEL),
+            expected
+        );
+    }
+
+    #[test]
+    fn router_config_parses_as_local_router_config_with_explicit_alias() {
+        let value = router_config_json("https://api-dev.rayline.ai", "rayline/arc-swift");
+        let config: rayline_local_router::RouterConfig =
+            serde_json::from_value(value).expect("router config parses");
+        let alias = config
+            .routes
+            .model_routes
+            .get(DESKTOP_MODEL_ID)
+            .expect("explicit alias route");
+        assert_eq!(alias.endpoint, ENDPOINT_ID);
+        assert_eq!(alias.model, "rayline/arc-swift");
+        let endpoint = &config.endpoints[0];
+        assert_eq!(endpoint.api_key_env.as_deref(), Some(ROUTER_KEY_ENV));
+    }
+
+    #[test]
+    fn router_config_never_contains_a_key() {
+        let text = router_config_json("https://api.rayline.ai", DEFAULT_ARC_MODEL).to_string();
+        assert!(!text.contains("rlk-"));
+        let import = desktop_import_json(&gateway_url(PORTS)).to_string();
+        assert!(!import.contains("rlk-"));
+    }
+
+    #[test]
+    fn desktop_import_golden() {
+        let expected = json!({
+            "inferenceProvider": "gateway",
+            "inferenceGatewayBaseUrl": "http://127.0.0.1:20831",
+            "inferenceCredentialKind": "static",
+            "inferenceGatewayApiKey": "rayline-local-placeholder",
+            "modelDiscoveryEnabled": false,
+            "inferenceModels": [{ "name": "claude-arc-desktop", "labelOverride": "ARC" }],
+            "coworkTabEnabled": false
+        });
+        assert_eq!(desktop_import_json(&gateway_url(PORTS)), expected);
+    }
+
+    #[test]
+    fn generated_import_validates() {
+        let findings = validate_desktop_config(
+            &desktop_import_json(&gateway_url(PORTS)),
+            &gateway_url(PORTS),
+        );
+        assert!(findings.iter().all(|finding| finding.ok), "{findings:?}");
+    }
+
+    #[test]
+    fn validation_accepts_string_encoded_values_and_flags_mismatches() {
+        let config = json!({
+            "inferenceProvider": "gateway",
+            "inferenceGatewayBaseUrl": "http://127.0.0.1:20831/",
+            "inferenceGatewayApiKey": "anything",
+            "modelDiscoveryEnabled": "false",
+            "inferenceModels": "[\"claude-arc-desktop\"]"
+        });
+        let findings = validate_desktop_config(&config, &gateway_url(PORTS));
+        assert!(findings.iter().all(|finding| finding.ok), "{findings:?}");
+
+        let wrong = json!({
+            "inferenceProvider": "gateway",
+            "inferenceGatewayBaseUrl": "http://127.0.0.1:21811",
+            "inferenceGatewayApiKey": "rlk-secret-value",
+            "inferenceModels": [{ "name": "claude-sonnet-5" }]
+        });
+        let findings = validate_desktop_config(&wrong, &gateway_url(PORTS));
+        let failed: Vec<_> = findings.iter().filter(|finding| !finding.ok).collect();
+        assert_eq!(failed.len(), 3, "{findings:?}");
+        // The gateway key value is never echoed.
+        assert!(
+            findings
+                .iter()
+                .all(|finding| !finding.message.contains("rlk-secret-value"))
+        );
+    }
+
+    #[test]
+    fn applied_config_path_follows_meta_and_rejects_traversal() {
+        let home = temp_home();
+        let library = home.join("Library/Application Support/Claude-3p/configLibrary");
+        fs::create_dir_all(&library).expect("library");
+        fs::write(library.join("_meta.json"), r#"{"appliedId":"abc-123"}"#).expect("meta");
+        assert_eq!(
+            applied_desktop_config_path(&home).expect("path"),
+            library.join("abc-123.json")
+        );
+        fs::write(library.join("_meta.json"), r#"{"appliedId":"../../x"}"#).expect("meta");
+        assert!(applied_desktop_config_path(&home).is_err());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ports_are_disjoint_from_every_other_rayline_router() {
+        let shared = [
+            20808,
+            20809,
+            20810,
+            crate::router::DEFAULT_LOCAL_ROUTER_PORT,
+            rayline_metrics::DEFAULT_METRICS_PORT,
+            20814,
+        ];
+        for port in PORTS.all() {
+            assert!(!shared.contains(&port), "port {port} collides");
+        }
+        let mut unique = PORTS.all().to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 4);
+    }
+
+    #[test]
+    fn state_lives_outside_the_shared_router_state() {
+        let home = Path::new("/home/u");
+        let paths = AppPaths::new(home);
+        let shared = home.join(crate::ROUTER_STATE_DIR);
+        for path in [
+            &paths.dir,
+            &paths.router_config,
+            &paths.pid_file,
+            &paths.data_dir,
+        ] {
+            assert!(!path.starts_with(&shared), "{} is shared", path.display());
+        }
+        assert!(
+            !paths
+                .dir
+                .starts_with(home.join(".config").join(crate::CONFIG_DIR))
+        );
+        assert!(!paths.dir.starts_with(home.join(".claude")));
+    }
+
+    #[test]
+    fn rld_args_name_the_instance_ports_and_config() {
+        let paths = AppPaths::new(Path::new("/home/u"));
+        let args: Vec<String> = rld_args(&paths, PORTS)
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let value_of = |flag: &str| {
+            let index = args.iter().position(|arg| arg == flag).expect(flag);
+            args[index + 1].clone()
+        };
+        assert_eq!(args[0], "serve");
+        assert!(args.contains(&"--no-local-model".to_owned()));
+        assert_eq!(value_of("--local-router-port"), "20831");
+        assert_eq!(value_of("--adapter-port"), "20828");
+        assert_eq!(value_of("--injector-port"), "20829");
+        assert_eq!(value_of("--metrics-port"), "20833");
+        assert_eq!(value_of("--decision-plane"), "local");
+        assert_eq!(
+            value_of("--router-config-path"),
+            paths.router_config.to_string_lossy()
+        );
+        assert!(!args.iter().any(|arg| arg.contains("proxy")));
+    }
+
+    #[test]
+    fn env_is_scrubbed_of_rayline_anthropic_and_claude_vars() {
+        let env = scrubbed_env(
+            [
+                ("PATH", "/bin"),
+                ("RAYLINE_PROXY_PORT", "1"),
+                ("RAYLINE_ROUTER_API_KEY", "rlk-old"),
+                ("ANTHROPIC_BASE_URL", "http://x"),
+                ("CLAUDE_CONFIG_DIR", "/c"),
+                ("HOME", "/home/u"),
+            ]
+            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+        );
+        let names: Vec<_> = env
+            .iter()
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["PATH", "HOME"]);
+    }
+
+    #[test]
+    fn stop_target_only_claims_our_command_line() {
+        let paths = AppPaths::new(Path::new("/home/u"));
+        let ours = format!(
+            "/home/u/.rayline/bin/rld serve --router-config-path {}",
+            paths.router_config.display()
+        );
+        assert_eq!(
+            stop_target(Some(42), &paths, |_| true, |_| Some(ours.clone())),
+            StopTarget::Ours(42)
+        );
+        assert_eq!(
+            stop_target(
+                Some(42),
+                &paths,
+                |_| true,
+                |_| Some("/usr/bin/python3 start.py".to_owned())
+            ),
+            StopTarget::Foreign(42)
+        );
+        assert_eq!(
+            stop_target(Some(42), &paths, |_| true, |_| None),
+            StopTarget::Foreign(42)
+        );
+        assert_eq!(
+            stop_target(Some(42), &paths, |_| false, |_| Some(ours.clone())),
+            StopTarget::NotRunning
+        );
+        assert_eq!(
+            stop_target(Some(1), &paths, |_| true, |_| Some(ours.clone())),
+            StopTarget::NotRunning
+        );
+        assert_eq!(
+            stop_target(None, &paths, |_| true, |_| Some(ours.clone())),
+            StopTarget::NotRunning
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_never_kills_a_foreign_process() {
+        let home = temp_home();
+        let paths = AppPaths::new(&home);
+        fs::create_dir_all(&paths.dir).expect("state dir");
+        let mut foreign = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = foreign.id() as i32;
+        fs::write(&paths.pid_file, format!("{pid}\n")).expect("pid file");
+
+        let result = stop_instance(&paths);
+
+        assert!(result.is_err(), "stop must refuse a foreign pid");
+        assert!(process_alive(pid), "foreign process was signalled");
+        assert!(paths.pid_file.exists(), "pid file kept for inspection");
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stop_terminates_our_own_process() {
+        let home = temp_home();
+        let paths = AppPaths::new(&home);
+        fs::create_dir_all(&paths.dir).expect("state dir");
+        // A stand-in whose command line names this instance's router config,
+        // exactly as the real `rld serve --router-config-path <path>` does.
+        let mut ours = Command::new("sh")
+            .arg("-c")
+            .arg("sleep 30; : \"$0\"")
+            .arg(&paths.router_config)
+            .spawn()
+            .expect("spawn stand-in");
+        let pid = ours.id() as i32;
+        fs::write(&paths.pid_file, format!("{pid}\n")).expect("pid file");
+
+        let reaper = std::thread::spawn(move || ours.wait());
+        let result = stop_instance(&paths).expect("stop ours");
+
+        assert!(result.contains(&pid.to_string()), "{result}");
+        assert!(!paths.pid_file.exists());
+        let _ = reaper.join();
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn launch_agent_plist_runs_serve_and_holds_no_secret() {
+        let paths = AppPaths::new(Path::new("/home/u"));
+        let plist = launch_agent_plist(
+            Path::new("/home/u/.rayline/bin/rayline"),
+            Some("dev"),
+            &paths,
+        );
+        assert!(plist.contains("<string>ai.rayline.claude-desktop</string>"));
+        assert!(plist.contains(
+            "<string>/home/u/.rayline/bin/rayline</string>\n\t\t<string>--env</string>\n\t\t<string>dev</string>\n\t\t<string>claude</string>\n\t\t<string>app</string>\n\t\t<string>serve</string>"
+        ));
+        assert!(!plist.contains("rlk-"));
+        assert!(!plist.contains(ROUTER_KEY_ENV));
+        let prod = launch_agent_plist(Path::new("/r"), None, &paths);
+        assert!(!prod.contains("--env"));
+    }
+
+    #[test]
+    fn actions_parse() {
+        for (text, action) in [
+            ("start", AppAction::Start),
+            ("serve", AppAction::Serve),
+            ("status", AppAction::Status),
+            ("validate", AppAction::Validate),
+            ("stop", AppAction::Stop),
+            ("install-service", AppAction::InstallService),
+            ("uninstall-service", AppAction::UninstallService),
+            ("off", AppAction::Off),
+            ("uninstall", AppAction::Uninstall),
+        ] {
+            assert_eq!(AppAction::parse(text), Some(action));
+        }
+        assert_eq!(AppAction::parse("bogus"), None);
+    }
+}
