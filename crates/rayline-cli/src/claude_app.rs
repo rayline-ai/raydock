@@ -36,7 +36,7 @@ pub const DESKTOP_MODEL_ID: &str = "claude-arc-desktop";
 /// The model-picker label Desktop shows for [`DESKTOP_MODEL_ID`].
 pub const DESKTOP_MODEL_LABEL: &str = "ARC";
 /// The hosted ARC model the alias is routed to unless `--model` overrides it.
-pub const DEFAULT_ARC_MODEL: &str = "arc-1.0";
+pub const DEFAULT_ARC_MODEL: &str = "rayline/arc-sage";
 /// `x-rayline-client` value stamped on every upstream request.
 pub const CLIENT_HEADER_VALUE: &str = "claude-desktop";
 /// Non-secret value Desktop stores as its gateway key. The local router ignores
@@ -1082,15 +1082,15 @@ mod tests {
                 "protocol": "anthropic_messages",
                 "base_url": "https://api.rayline.ai",
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": ["arc-1.0"],
+                "models": ["rayline/arc-sage"],
                 "headers": { "x-rayline-client": "claude-desktop" }
             }],
             "routes": {
-                "main": { "endpoint": "rayline-arc", "model": "arc-1.0" },
-                "subagent": { "endpoint": "rayline-arc", "model": "arc-1.0" },
-                "default": { "endpoint": "rayline-arc", "model": "arc-1.0" },
+                "main": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
+                "subagent": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
+                "default": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
                 "model_routes": {
-                    "claude-arc-desktop": { "endpoint": "rayline-arc", "model": "arc-1.0" }
+                    "claude-arc-desktop": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" }
                 },
                 "subagents": {}
             }

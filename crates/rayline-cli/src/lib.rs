@@ -171,7 +171,8 @@ Commands:
   uninstall          Remove the service, the router state and its files
 
 Options:
-  --model <model>           Upstream ARC model (default: arc-1.0)
+  --model <model>           ARC tier (default: rayline/arc-sage;
+                            rayline/arc-swift is cheaper)
   --desktop-config <path>   validate: check this file instead of Desktop's
   --help                    Show this message and exit
 ";

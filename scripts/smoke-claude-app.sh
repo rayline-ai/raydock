@@ -8,6 +8,9 @@ REPO=${REPO:-$(cd "$(dirname "$0")/.." && pwd)}
 RAYLINE=${RAYLINE:-$REPO/target/debug/rayline}
 export RLD_BIN=${RLD_BIN:-$REPO/target/debug/rld}
 CLAUDE=${CLAUDE:-$(command -v claude)}
+# The ARC tier to route to; empty means the launcher default (rayline/arc-sage).
+ARC_MODEL=${ARC_MODEL:-}
+EXPECT_MODEL=${ARC_MODEL:-rayline/arc-sage}
 OUT=$(mktemp -d "${TMPDIR:-/tmp}/claude-app-smoke.XXXXXX")
 H=$OUT/home
 mkdir -p "$H/.config/rayline" "$H/work"
@@ -31,7 +34,7 @@ PY
 run() { env -i PATH="$PATH" HOME="$H" RLD_BIN="$RLD_BIN" TERM=dumb "$@"; }
 
 echo "== rayline claude app (start)"
-run "$RAYLINE" claude app </dev/null | tee "$OUT/start.txt"
+run "$RAYLINE" claude app ${ARC_MODEL:+--model "$ARC_MODEL"} </dev/null | tee "$OUT/start.txt"
 echo "== validate the generated import file"
 run "$RAYLINE" claude app validate --desktop-config "$H/.rayline/claude-desktop/claude-desktop-import.json"
 if grep -q 'rlk-' "$H/.rayline/claude-desktop/"*.json; then echo "FAIL: key in instance files"; exit 1; fi
@@ -46,7 +49,7 @@ echo "== one headless Claude Code turn as Desktop sends it"
   "$CLAUDE" -p "Reply with exactly the word PONG." --output-format json </dev/null) > "$OUT/turn.json"
 
 curl -fsS http://127.0.0.1:20833/v1/router/top/snapshot > "$OUT/snapshot.json"
-python3 -I - "$OUT/turn.json" "$OUT/snapshot.json" "$H/.rayline/claude-desktop/router.json" <<'PY'
+python3 -I - "$OUT/turn.json" "$OUT/snapshot.json" "$H/.rayline/claude-desktop/router.json" "$EXPECT_MODEL" <<'PY'
 import json, sys
 turn = json.load(open(sys.argv[1]))
 assert not turn.get("is_error"), turn
@@ -59,8 +62,9 @@ for r in recent:
     assert r["endpoint_id"] == "rayline-arc", r["endpoint_id"]
     assert r["status_code"] == 200 and not r.get("error"), r
 router = json.load(open(sys.argv[3]))
-assert router["routes"]["model_routes"]["claude-arc-desktop"]["model"] == "arc-1.0"
-assert router["endpoints"][0]["models"] == ["arc-1.0"]
+expect = sys.argv[4]
+assert router["routes"]["model_routes"]["claude-arc-desktop"]["model"] == expect
+assert router["endpoints"][0]["models"] == [expect]
 print("reply:", turn["result"].strip())
 print("requests:", len(recent), "policy:", recent[0]["policy"], "upstream answered as:", recent[0]["selected_model"])
 print("cost reported by Claude Code (USD, list-price estimate):", turn.get("total_cost_usd"))
