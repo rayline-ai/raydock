@@ -7,9 +7,10 @@
 //! Inference…**. Three facts shape this module:
 //!
 //! 1. Desktop only accepts model ids that look like Anthropic models, so the
-//!    app is configured with the compatibility alias [`DESKTOP_MODEL_ID`] and a
-//!    dedicated local router rewrites it to the upstream ARC model through an
-//!    explicit `model_routes` entry.
+//!    app is configured with hidden compatibility ids ([`DESKTOP_MODELS`]),
+//!    shown in the picker as `arc-sage` and `arc-swift`, and a dedicated local
+//!    router maps each to its ARC tier through an explicit `model_routes` entry.
+//!    ARC is not a Claude model; the ids only satisfy Desktop's model-id check.
 //! 2. 3P mode applies to the whole app (it signs Desktop out of the claude.ai
 //!    subscription), so the router runs as its **own** instance — its own state
 //!    directory, ports, pid file and LaunchAgent — and never touches the shared
@@ -29,14 +30,33 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// The model id Claude Desktop sends. Desktop rejects ids that do not look like
-/// an Anthropic model, so this is a local compatibility alias; it never leaves
-/// the machine (the router rewrites it to [`DEFAULT_ARC_MODEL`]).
-pub const DESKTOP_MODEL_ID: &str = "claude-arc-desktop";
-/// The model-picker label Desktop shows for [`DESKTOP_MODEL_ID`].
-pub const DESKTOP_MODEL_LABEL: &str = "ARC";
-/// The hosted ARC model the alias is routed to unless `--model` overrides it.
-pub const DEFAULT_ARC_MODEL: &str = "rayline/arc-sage";
+/// One model the Desktop import offers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DesktopModel {
+    /// The id Desktop sends. Desktop rejects ids that do not look like an
+    /// Anthropic model, so this is a hidden local compatibility id; it never
+    /// leaves the machine (the router rewrites it to `arc_model`).
+    pub id: &'static str,
+    /// The model-picker label Desktop shows (`labelOverride`).
+    pub label: &'static str,
+    /// The hosted ARC tier the id is routed to.
+    pub arc_model: &'static str,
+}
+
+/// The models the import offers, default first (Desktop's first
+/// `inferenceModels` entry is its default).
+pub const DESKTOP_MODELS: [DesktopModel; 2] = [
+    DesktopModel {
+        id: "claude-arc-sage",
+        label: "arc-sage",
+        arc_model: "rayline/arc-sage",
+    },
+    DesktopModel {
+        id: "claude-arc-swift",
+        label: "arc-swift",
+        arc_model: "rayline/arc-swift",
+    },
+];
 /// `x-rayline-client` value stamped on every upstream request.
 pub const CLIENT_HEADER_VALUE: &str = "claude-desktop";
 /// Non-secret value Desktop stores as its gateway key. The local router ignores
@@ -119,8 +139,6 @@ impl AppAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppRequest {
     pub action: AppAction,
-    /// Upstream ARC model id; `None` means [`DEFAULT_ARC_MODEL`].
-    pub model: Option<String>,
     /// `validate`: check this file instead of Desktop's applied configuration.
     pub desktop_config: Option<PathBuf>,
     pub env_name: Option<String>,
@@ -159,24 +177,31 @@ impl AppPaths {
     }
 }
 
-/// Router config: every route, and the Desktop alias explicitly, goes to the
-/// hosted ARC model. The key is referenced by env var name only.
-pub fn router_config_json(router_url: &str, arc_model: &str) -> Value {
-    let target = json!({ "endpoint": ENDPOINT_ID, "model": arc_model });
+/// Router config: each Desktop id is routed to its ARC tier by an explicit
+/// `model_routes` entry; any other id (main, subagent or default) goes to the
+/// default tier. The key is referenced by env var name only.
+pub fn router_config_json(router_url: &str) -> Value {
+    let target = |arc_model: &str| json!({ "endpoint": ENDPOINT_ID, "model": arc_model });
+    let default = target(DESKTOP_MODELS[0].arc_model);
+    let model_routes: serde_json::Map<String, Value> = DESKTOP_MODELS
+        .iter()
+        .map(|model| (model.id.to_owned(), target(model.arc_model)))
+        .collect();
+    let upstream: Vec<&str> = DESKTOP_MODELS.iter().map(|model| model.arc_model).collect();
     json!({
         "endpoints": [{
             "id": ENDPOINT_ID,
             "protocol": "anthropic_messages",
             "base_url": router_url,
             "api_key_env": ROUTER_KEY_ENV,
-            "models": [arc_model],
+            "models": upstream,
             "headers": { "x-rayline-client": CLIENT_HEADER_VALUE }
         }],
         "routes": {
-            "main": target,
-            "subagent": target,
-            "default": target,
-            "model_routes": { DESKTOP_MODEL_ID: target },
+            "main": default,
+            "subagent": default,
+            "default": default,
+            "model_routes": model_routes,
             "subagents": {}
         }
     })
@@ -191,7 +216,10 @@ pub fn desktop_import_json(gateway_url: &str) -> Value {
         "inferenceCredentialKind": "static",
         "inferenceGatewayApiKey": PLACEHOLDER_GATEWAY_KEY,
         "modelDiscoveryEnabled": false,
-        "inferenceModels": [{ "name": DESKTOP_MODEL_ID, "labelOverride": DESKTOP_MODEL_LABEL }],
+        "inferenceModels": DESKTOP_MODELS
+            .iter()
+            .map(|model| json!({ "name": model.id, "labelOverride": model.label }))
+            .collect::<Vec<_>>(),
         "coworkTabEnabled": false
     })
 }
@@ -449,15 +477,17 @@ pub fn validate_desktop_config(config: &Value, gateway_url: &str) -> Vec<Finding
                 .collect()
         })
         .unwrap_or_default();
+    let wanted: Vec<&str> = DESKTOP_MODELS.iter().map(|model| model.id).collect();
     check(
-        names.iter().any(|name| name == DESKTOP_MODEL_ID),
+        wanted.iter().all(|id| names.iter().any(|name| name == id)),
         format!(
-            "inferenceModels lists {} (want {DESKTOP_MODEL_ID})",
+            "inferenceModels lists {} (want {})",
             if names.is_empty() {
                 "nothing".to_owned()
             } else {
                 names.join(", ")
-            }
+            },
+            wanted.join(" and ")
         ),
     );
     let discovery = bool_like(config.get("modelDiscoveryEnabled"));
@@ -620,8 +650,8 @@ fn write_json(path: &Path, value: &Value) -> io::Result<()> {
 
 /// Write the router config and the Desktop import file. Returns whether the
 /// router config changed (a running router must restart to pick it up).
-fn write_instance_files(paths: &AppPaths, router_url: &str, arc_model: &str) -> io::Result<bool> {
-    let router = router_config_json(router_url, arc_model);
+fn write_instance_files(paths: &AppPaths, router_url: &str) -> io::Result<bool> {
+    let router = router_config_json(router_url);
     let previous = fs::read(&paths.router_config)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
@@ -663,12 +693,15 @@ fn http_client() -> reqwest::Client {
         .unwrap_or_default()
 }
 
-fn setup_instructions(paths: &AppPaths, arc_model: &str, router_url: &str) -> String {
+fn setup_instructions(paths: &AppPaths, router_url: &str) -> String {
     format!(
         "\
 Rayline ARC gateway for Claude Desktop is running.
   Gateway URL:  {gateway}
-  Desktop model: {DESKTOP_MODEL_ID} (shown as \"{DESKTOP_MODEL_LABEL}\"), served by {arc_model} at {router_url}
+  Desktop models: arc-sage (default) and arc-swift, served by ARC at {router_url}.
+  Desktop requires Claude-style model ids, so the import uses claude-arc-sage
+  and claude-arc-swift internally. ARC is not a Claude model, and Rayline is
+  not affiliated with Anthropic.
   Import file:  {import}
   Your Rayline key stays in the router process; Desktop stores only a placeholder.
 
@@ -683,7 +716,7 @@ Connect Claude Desktop (once):
   3. Choose Import configuration and select the import file above.
   4. Click Apply Changes, then Save & Restart.
   5. On the sign-in screen, choose to continue with the configured gateway.
-  6. Open Code and pick \"{DESKTOP_MODEL_LABEL}\" in the model picker.
+  6. Open Code and pick arc-sage, or arc-swift for the cheaper tier.
 
 Check the setup with `rayline claude app validate`. Keep the router running
 across logins with `rayline claude app install-service`.
@@ -721,14 +754,13 @@ pub async fn run(request: AppRequest) -> ExitCode {
 }
 
 async fn run_inner(request: &AppRequest) -> Result<String, String> {
-    let arc_model = request.model.as_deref().unwrap_or(DEFAULT_ARC_MODEL);
     match request.action {
-        AppAction::Start => start(request, arc_model).await,
-        AppAction::Serve => serve(request, arc_model),
+        AppAction::Start => start(request).await,
+        AppAction::Serve => serve(request),
         AppAction::Status => status(request).await,
         AppAction::Validate => validate(request),
         AppAction::Stop => stop(),
-        AppAction::InstallService => install_service(request, arc_model).await,
+        AppAction::InstallService => install_service(request).await,
         AppAction::UninstallService => uninstall_service(),
         AppAction::Off => {
             let stopped = stop()?;
@@ -743,7 +775,7 @@ fn home_paths() -> Result<AppPaths, String> {
     Ok(AppPaths::new(&home))
 }
 
-async fn start(request: &AppRequest, arc_model: &str) -> Result<String, String> {
+async fn start(request: &AppRequest) -> Result<String, String> {
     let resolved = resolve(request)?;
     let paths = AppPaths::new(&resolved.home);
     // Provision or read the key first: an interactive login must happen before
@@ -756,10 +788,10 @@ async fn start(request: &AppRequest, arc_model: &str) -> Result<String, String> 
     )
     .await
     .map_err(|error| error.to_string())?;
-    let changed = write_instance_files(&paths, &resolved.router_url, arc_model)
+    let changed = write_instance_files(&paths, &resolved.router_url)
         .map_err(|error| format!("failed to write {}: {error}", paths.dir.display()))?;
     let client = http_client();
-    let instructions = setup_instructions(&paths, arc_model, &resolved.router_url);
+    let instructions = setup_instructions(&paths, &resolved.router_url);
 
     if service_loaded() {
         if changed {
@@ -850,7 +882,7 @@ async fn start(request: &AppRequest, arc_model: &str) -> Result<String, String> 
 
 /// Foreground mode for the LaunchAgent: write the config, then replace this
 /// process with `rld` so launchd supervises the router directly.
-fn serve(request: &AppRequest, arc_model: &str) -> Result<String, String> {
+fn serve(request: &AppRequest) -> Result<String, String> {
     let resolved = resolve(request)?;
     let paths = AppPaths::new(&resolved.home);
     let key = crate::status::load_claude_key_from_home(&resolved.env, &resolved.home).ok_or_else(
@@ -862,8 +894,7 @@ fn serve(request: &AppRequest, arc_model: &str) -> Result<String, String> {
             )
         },
     )?;
-    write_instance_files(&paths, &resolved.router_url, arc_model)
-        .map_err(|error| error.to_string())?;
+    write_instance_files(&paths, &resolved.router_url).map_err(|error| error.to_string())?;
     fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
     let rld_bin =
         crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
@@ -968,7 +999,7 @@ fn stop() -> Result<String, String> {
     Ok(out)
 }
 
-async fn install_service(request: &AppRequest, arc_model: &str) -> Result<String, String> {
+async fn install_service(request: &AppRequest) -> Result<String, String> {
     if !cfg!(target_os = "macos") {
         return Err("the login service is only supported on macOS".to_owned());
     }
@@ -983,8 +1014,7 @@ async fn install_service(request: &AppRequest, arc_model: &str) -> Result<String
     )
     .await
     .map_err(|error| error.to_string())?;
-    write_instance_files(&paths, &resolved.router_url, arc_model)
-        .map_err(|error| error.to_string())?;
+    write_instance_files(&paths, &resolved.router_url).map_err(|error| error.to_string())?;
     // Hand the ports over from a detached instance to launchd.
     stop_instance(&paths).map_err(|error| error.to_string())?;
     bootout_service();
@@ -1082,7 +1112,7 @@ mod tests {
                 "protocol": "anthropic_messages",
                 "base_url": "https://api.rayline.ai",
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": ["rayline/arc-sage"],
+                "models": ["rayline/arc-sage", "rayline/arc-swift"],
                 "headers": { "x-rayline-client": "claude-desktop" }
             }],
             "routes": {
@@ -1090,36 +1120,40 @@ mod tests {
                 "subagent": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
                 "default": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
                 "model_routes": {
-                    "claude-arc-desktop": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" }
+                    "claude-arc-sage": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
+                    "claude-arc-swift": { "endpoint": "rayline-arc", "model": "rayline/arc-swift" }
                 },
                 "subagents": {}
             }
         });
-        assert_eq!(
-            router_config_json("https://api.rayline.ai", DEFAULT_ARC_MODEL),
-            expected
-        );
+        assert_eq!(router_config_json("https://api.rayline.ai"), expected);
     }
 
     #[test]
-    fn router_config_parses_as_local_router_config_with_explicit_alias() {
-        let value = router_config_json("https://api-dev.rayline.ai", "rayline/arc-swift");
+    fn router_config_parses_as_local_router_config_with_explicit_aliases() {
+        let value = router_config_json("https://api-dev.rayline.ai");
         let config: rayline_local_router::RouterConfig =
             serde_json::from_value(value).expect("router config parses");
-        let alias = config
-            .routes
-            .model_routes
-            .get(DESKTOP_MODEL_ID)
-            .expect("explicit alias route");
-        assert_eq!(alias.endpoint, ENDPOINT_ID);
-        assert_eq!(alias.model, "rayline/arc-swift");
+        for (id, tier) in [
+            ("claude-arc-sage", "rayline/arc-sage"),
+            ("claude-arc-swift", "rayline/arc-swift"),
+        ] {
+            let alias = config
+                .routes
+                .model_routes
+                .get(id)
+                .expect("explicit alias route");
+            assert_eq!(alias.endpoint, ENDPOINT_ID);
+            assert_eq!(alias.model, tier);
+        }
+        assert_eq!(config.routes.model_routes.len(), 2);
         let endpoint = &config.endpoints[0];
         assert_eq!(endpoint.api_key_env.as_deref(), Some(ROUTER_KEY_ENV));
     }
 
     #[test]
     fn router_config_never_contains_a_key() {
-        let text = router_config_json("https://api.rayline.ai", DEFAULT_ARC_MODEL).to_string();
+        let text = router_config_json("https://api.rayline.ai").to_string();
         assert!(!text.contains("rlk-"));
         let import = desktop_import_json(&gateway_url(PORTS)).to_string();
         assert!(!import.contains("rlk-"));
@@ -1133,7 +1167,10 @@ mod tests {
             "inferenceCredentialKind": "static",
             "inferenceGatewayApiKey": "rayline-local-placeholder",
             "modelDiscoveryEnabled": false,
-            "inferenceModels": [{ "name": "claude-arc-desktop", "labelOverride": "ARC" }],
+            "inferenceModels": [
+                { "name": "claude-arc-sage", "labelOverride": "arc-sage" },
+                { "name": "claude-arc-swift", "labelOverride": "arc-swift" }
+            ],
             "coworkTabEnabled": false
         });
         assert_eq!(desktop_import_json(&gateway_url(PORTS)), expected);
@@ -1155,7 +1192,7 @@ mod tests {
             "inferenceGatewayBaseUrl": "http://127.0.0.1:20831/",
             "inferenceGatewayApiKey": "anything",
             "modelDiscoveryEnabled": "false",
-            "inferenceModels": "[\"claude-arc-desktop\"]"
+            "inferenceModels": "[\"claude-arc-sage\", \"claude-arc-swift\"]"
         });
         let findings = validate_desktop_config(&config, &gateway_url(PORTS));
         assert!(findings.iter().all(|finding| finding.ok), "{findings:?}");

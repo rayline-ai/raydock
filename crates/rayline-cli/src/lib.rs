@@ -150,7 +150,9 @@ Options:
 const CLAUDE_APP_HELP: &str = "\
 Usage: rayline claude app [COMMAND] [OPTIONS]
 
-Run Claude Code inside the Claude desktop app on ARC. Starts a dedicated
+Run Claude Code inside the Claude desktop app on ARC. The import adds two
+models to Desktop's picker: arc-sage (default) and arc-swift (cheaper). ARC is
+not a Claude model, and Rayline is not affiliated with Anthropic. Starts a dedicated
 local router (its own ports and state in ~/.rayline/claude-desktop, separate
 from `rayline claude` and `rayline codex`) and writes a configuration file for
 Claude Desktop's Developer > Configure Third-Party Inference > Import
@@ -171,8 +173,6 @@ Commands:
   uninstall          Remove the service, the router state and its files
 
 Options:
-  --model <model>           ARC tier (default: rayline/arc-sage;
-                            rayline/arc-swift is cheaper)
   --desktop-config <path>   validate: check this file instead of Desktop's
   --help                    Show this message and exit
 ";
@@ -1512,17 +1512,12 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     let mut action = None;
-    let mut model = None;
     let mut desktop_config = None;
     let mut args = args;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_str()?;
         if let Some((option, value)) = arg_str.split_once('=') {
             match option {
-                "--model" => {
-                    model = Some(value.to_owned());
-                    continue;
-                }
                 "--desktop-config" => {
                     desktop_config = Some(PathBuf::from(value));
                     continue;
@@ -1531,7 +1526,6 @@ where
             }
         }
         match arg_str {
-            "--model" => model = Some(args.next()?.to_str()?.to_owned()),
             "--desktop-config" => desktop_config = Some(PathBuf::from(args.next()?)),
             _ if arg_str.starts_with('-') => return None,
             _ if action.is_none() => action = Some(crate::claude_app::AppAction::parse(arg_str)?),
@@ -1544,7 +1538,6 @@ where
     }
     Some(crate::claude_app::AppRequest {
         action,
-        model,
         desktop_config,
         env_name: root_env,
         auth_token: root_auth_token,
@@ -3109,7 +3102,6 @@ mod tests {
         match rayline_dispatch_for_argv(&argv(&["rayline", "claude", "app"])) {
             RaylineDispatch::ClaudeApp(request) => {
                 assert_eq!(request.action, crate::claude_app::AppAction::Start);
-                assert_eq!(request.model, None);
                 assert!(!request.root_env_explicit);
             }
             other => panic!("expected ClaudeApp, got {other:?}"),
@@ -3117,19 +3109,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_app_dispatch_parses_subcommands_env_and_model() {
+    fn claude_app_dispatch_parses_subcommands_and_env() {
         match rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "--env",
-            "dev",
-            "claude",
-            "app",
-            "status",
-            "--model=rayline/arc-swift",
+            "rayline", "--env", "dev", "claude", "app", "status",
         ])) {
             RaylineDispatch::ClaudeApp(request) => {
                 assert_eq!(request.action, crate::claude_app::AppAction::Status);
-                assert_eq!(request.model.as_deref(), Some("rayline/arc-swift"));
                 assert_eq!(request.env_name.as_deref(), Some("dev"));
                 assert!(request.root_env_explicit);
             }
@@ -3160,6 +3145,7 @@ mod tests {
             &["rayline", "claude", "app", "bogus"][..],
             &["rayline", "claude", "app", "start", "stop"][..],
             &["rayline", "claude", "app", "--local"][..],
+            &["rayline", "claude", "app", "--model", "rayline/arc-swift"][..],
             &[
                 "rayline",
                 "claude",

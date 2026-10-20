@@ -163,10 +163,12 @@ model ids that look like Anthropic models. The launcher therefore:
 - runs a **dedicated** `rld` with its own state (`~/.rayline/claude-desktop`)
   and ports (router 20831, adapter 20828, injector 20829, metrics 20833), so it
   never touches the shared router on 20808–20814 or your Claude Code CLI config;
-- writes a router config whose explicit `model_routes` entry maps the Desktop
-  model id `claude-arc-desktop` (picker label **ARC**) to the ARC Sage tier,
-  `rayline/arc-sage` (`--model rayline/arc-swift` picks the cheaper Swift
-  tier), stamping `x-rayline-client: claude-desktop`;
+- offers Desktop two models, shown in the picker as **arc-sage** (the default)
+  and **arc-swift** (the cheaper tier). Desktop requires Claude-style model
+  ids, so the import uses `claude-arc-sage` and `claude-arc-swift` internally,
+  and explicit `model_routes` entries map them to `rayline/arc-sage` and
+  `rayline/arc-swift`, stamping `x-rayline-client: claude-desktop`. ARC is not
+  a Claude model, and Rayline is not affiliated with Anthropic;
 - keeps your `rlk-` key in the router's environment only. Desktop gets
   `http://127.0.0.1:20831` and a placeholder key through
   `~/.rayline/claude-desktop/claude-desktop-import.json`, which you load with
@@ -176,7 +178,6 @@ model ids that look like Anthropic models. The launcher therefore:
 
 ```bash
 rayline claude app                    # start or reuse the router; print the steps
-rayline claude app --model rayline/arc-swift   # the cheaper Swift tier
 rayline --env dev claude app          # route to the dev environment instead
 rayline claude app status             # health, request totals, Desktop check
 rayline claude app validate           # Desktop's applied config vs. the router
@@ -192,7 +193,7 @@ switch back, open the account menu (it shows **Gateway**), choose **Sign out**,
 and sign in with your Anthropic account. Anthropic does not support routing
 Claude Code to non-Claude models through a gateway, so a Desktop update can
 change this behaviour; `scripts/smoke-claude-app.sh` checks the wire path with
-one headless Claude Code turn.
+one headless Claude Code turn per model.
 
 ## OpenClaw
 
