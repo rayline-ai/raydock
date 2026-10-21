@@ -3384,7 +3384,7 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools
             .iter()
-            .filter_map(|tool| responses_tool_to_anthropic(tool, &rewrites))
+            .flat_map(|tool| responses_tools_to_anthropic(tool, &rewrites))
         {
             converted_tools.push(tool);
         }
@@ -3439,7 +3439,7 @@ fn append_responses_input_as_anthropic(
             if let Some(tools) = item.get("tools").and_then(Value::as_array) {
                 for tool in tools
                     .iter()
-                    .filter_map(|tool| responses_tool_to_anthropic(tool, rewrites))
+                    .flat_map(|tool| responses_tools_to_anthropic(tool, rewrites))
                 {
                     converted_tools.push(tool);
                 }
@@ -3494,7 +3494,10 @@ fn append_responses_input_as_anthropic(
                 .get("call_id")
                 .and_then(Value::as_str)
                 .unwrap_or("call_rayline");
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let name = qualified_tool_name(
+                item.get("namespace").and_then(Value::as_str),
+                item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+            );
             let arguments = item
                 .get("arguments")
                 .or_else(|| item.get("input"))
@@ -3506,7 +3509,7 @@ fn append_responses_input_as_anthropic(
                 "content": [{
                     "type": "tool_use",
                     "id": id,
-                    "name": rewrites.upstream(name),
+                    "name": rewrites.upstream(&name),
                     "input": arguments,
                 }]
             }));
@@ -3649,6 +3652,23 @@ fn openai_image_url_to_anthropic(url: &str) -> Value {
 struct ToolNameRewrites {
     to_upstream: HashMap<String, String>,
     to_client: HashMap<String, String>,
+    /// Qualified name (`namespace__function`) -> (namespace, function) for
+    /// functions declared inside a Responses `namespace` tool (Codex's
+    /// `multi_agent_v1` sub-agent tools). Anthropic has no namespaces, so the
+    /// function is declared and called by its qualified name, and the
+    /// namespace is restored on the call that comes back.
+    namespaces: HashMap<String, (String, String)>,
+}
+
+/// Joins a namespace and a function into the one name a format without
+/// namespaces calls (the same scheme as VSR's `QualifiedToolName`).
+const NAMESPACE_SEPARATOR: &str = "__";
+
+fn qualified_tool_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace.filter(|namespace| !namespace.is_empty()) {
+        Some(namespace) => format!("{namespace}{NAMESPACE_SEPARATOR}{name}"),
+        None => name.to_owned(),
+    }
 }
 
 impl ToolNameRewrites {
@@ -3674,7 +3694,12 @@ impl ToolNameRewrites {
                 // in `tools`.
                 Some("function_call") | Some("custom_tool_call") => {
                     if let Some(name) = item.get("name").and_then(Value::as_str) {
-                        rewrites.record(name);
+                        let namespace = item.get("namespace").and_then(Value::as_str);
+                        if let Some(namespace) = namespace.filter(|ns| !ns.is_empty()) {
+                            rewrites.record_namespaced(namespace, name);
+                        } else {
+                            rewrites.record(name);
+                        }
                     }
                 }
                 _ => {}
@@ -3685,6 +3710,22 @@ impl ToolNameRewrites {
 
     fn record_tools(&mut self, tools: &[Value]) {
         for tool in tools {
+            if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+                let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                for member in tool
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(name) = member.get("name").and_then(Value::as_str) {
+                        self.record_namespaced(namespace, name);
+                    }
+                }
+                continue;
+            }
             if let Some(name) = tool
                 .get("name")
                 .or_else(|| tool.pointer("/function/name"))
@@ -3708,6 +3749,22 @@ impl ToolNameRewrites {
         }
         self.to_client.insert(candidate.clone(), name.to_owned());
         self.to_upstream.insert(name.to_owned(), candidate);
+    }
+
+    fn record_namespaced(&mut self, namespace: &str, name: &str) {
+        let qualified = qualified_tool_name(Some(namespace), name);
+        self.record(&qualified);
+        self.namespaces
+            .insert(qualified, (namespace.to_owned(), name.to_owned()));
+    }
+
+    /// The client's `(function name, namespace)` for an upstream tool name.
+    fn client_call(&self, upstream: &str) -> (String, Option<String>) {
+        let client = self.client(upstream);
+        match self.namespaces.get(client) {
+            Some((namespace, name)) => (name.clone(), Some(namespace.clone())),
+            None => (client.to_owned(), None),
+        }
     }
 
     fn upstream<'a>(&'a self, name: &'a str) -> &'a str {
@@ -3894,6 +3951,51 @@ fn responses_web_search_to_anthropic(tool: &Value) -> Value {
         out.insert("user_location".to_owned(), Value::Object(mapped));
     }
     Value::Object(out)
+}
+
+/// One Responses tool as Anthropic tools: a `namespace` tool becomes one tool
+/// per member function, declared by its qualified name with the namespace's
+/// description first; anything else is [`responses_tool_to_anthropic`].
+fn responses_tools_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Vec<Value> {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        return responses_tool_to_anthropic(tool, rewrites)
+            .into_iter()
+            .collect();
+    }
+    let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let namespace_description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    tool.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|member| member.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|member| {
+            let name = member.get("name").and_then(Value::as_str)?;
+            let qualified = qualified_tool_name(Some(namespace), name);
+            let own = member
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let description = match (namespace_description.is_empty(), own.is_empty()) {
+                (true, _) => own.to_owned(),
+                (false, true) => namespace_description.to_owned(),
+                (false, false) => format!("{namespace_description}\n\n{own}"),
+            };
+            Some(json!({
+                "name": rewrites.upstream(&qualified),
+                "description": description,
+                "input_schema": member
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+            }))
+        })
+        .collect()
 }
 
 fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Option<Value> {
@@ -4175,6 +4277,8 @@ fn is_empty_json_object(value: &Value) -> bool {
 struct AnthropicToolBlock {
     id: String,
     name: String,
+    /// The client namespace the function was declared in, if any.
+    namespace: Option<String>,
     input_json: String,
 }
 
@@ -4293,15 +4397,12 @@ impl AnthropicToResponsesTranslator {
                         .and_then(Value::as_str)
                         .unwrap_or("call_rayline")
                         .to_owned();
-                    let name = self
-                        .tool_names
-                        .client(
-                            value
-                                .pointer("/content_block/name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("tool"),
-                        )
-                        .to_owned();
+                    let (name, namespace) = self.tool_names.client_call(
+                        value
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool"),
+                    );
                     // Anthropic streams a `tool_use` block's arguments via
                     // `input_json_delta` fragments; the `input` on
                     // `content_block_start` is a placeholder (`{}`) that must not
@@ -4318,6 +4419,7 @@ impl AnthropicToResponsesTranslator {
                         AnthropicToolBlock {
                             id,
                             name,
+                            namespace,
                             input_json,
                         },
                     );
@@ -4371,7 +4473,7 @@ impl AnthropicToResponsesTranslator {
                         tool.input_json
                     };
                     let output_index = self.output.len();
-                    let item = json!({
+                    let mut item = json!({
                         "type": "function_call",
                         "id": tool.id,
                         "name": tool.name,
@@ -4379,6 +4481,9 @@ impl AnthropicToResponsesTranslator {
                         "call_id": tool.id,
                         "status": "completed",
                     });
+                    if let Some(namespace) = tool.namespace {
+                        item["namespace"] = json!(namespace);
+                    }
                     self.output.push(Some(item.clone()));
                     self.emit(
                         out,
@@ -4547,15 +4652,16 @@ fn synthetic_responses_sse(
     {
         match block.get("type").and_then(Value::as_str) {
             Some("tool_use") => {
+                let (name, namespace) = tool_names
+                    .client_call(block.get("name").and_then(Value::as_str).unwrap_or("tool"));
                 let tool = AnthropicToolBlock {
                     id: block
                         .get("id")
                         .and_then(Value::as_str)
                         .unwrap_or("call_rayline")
                         .to_owned(),
-                    name: tool_names
-                        .client(block.get("name").and_then(Value::as_str).unwrap_or("tool"))
-                        .to_owned(),
+                    name,
+                    namespace,
                     input_json: block
                         .get("input")
                         .cloned()
@@ -4664,17 +4770,22 @@ fn synthetic_response_items(
     {
         match block.get("type").and_then(Value::as_str) {
             Some("tool_use") if output_kind == SyntheticOutputKind::Message => {
-                output.push(json!({
+                let (name, namespace) = tool_names
+                    .client_call(block.get("name").and_then(Value::as_str).unwrap_or("tool"));
+                let mut item = json!({
                     "type": "function_call",
-                    "name": tool_names
-                        .client(block.get("name").and_then(Value::as_str).unwrap_or("tool")),
+                    "name": name,
                     "arguments": block
                         .get("input")
                         .cloned()
                         .unwrap_or_else(|| json!({}))
                         .to_string(),
                     "call_id": block.get("id").and_then(Value::as_str).unwrap_or("call_rayline"),
-                }));
+                });
+                if let Some(namespace) = namespace {
+                    item["namespace"] = json!(namespace);
+                }
+                output.push(item);
             }
             _ => {
                 if let Some(part) = block.get("text").and_then(Value::as_str)
@@ -6483,6 +6594,112 @@ mod tests {
 
         assert!(out.contains("\"name\":\"codex.list_resource_templates\""));
         assert!(!out.contains(&format!("\"name\":\"{upstream_name}\"")));
+    }
+
+    /// Codex 0.163 declares its sub-agent functions inside a `namespace` tool
+    /// (`multi_agent_v1`). They used to be dropped on the way to an Anthropic
+    /// upstream, so sub-agents silently did not exist. They must be declared
+    /// by qualified name, replayed calls must use it, and a call that comes
+    /// back must carry the client's function name and namespace again.
+    #[test]
+    fn responses_namespace_tools_round_trip_through_anthropic() {
+        let request = json!({
+            "model": "arc-swift",
+            "input": [
+                {"type": "message", "role": "user", "content": "spawn a helper"},
+                {"type": "function_call", "call_id": "call_0", "name": "spawn_agent",
+                 "namespace": "multi_agent_v1", "arguments": "{\"message\":\"hi\"}"},
+                {"type": "function_call_output", "call_id": "call_0", "output": "agent-1"}
+            ],
+            "tools": [
+                {"type": "function", "name": "shell",
+                 "parameters": {"type": "object", "properties": {}}},
+                {"type": "namespace", "name": "multi_agent_v1",
+                 "description": "Tools for spawning and managing sub-agents.",
+                 "tools": [
+                     {"type": "function", "name": "spawn_agent", "description": "Spawn a sub-agent.",
+                      "parameters": {"type": "object",
+                                     "properties": {"message": {"type": "string"}}}},
+                     {"type": "function", "name": "wait_agent", "description": "",
+                      "parameters": {"type": "object", "properties": {}}}
+                 ]}
+            ]
+        });
+        let (converted, rewrites) = responses_to_anthropic_request(&request, "arc-swift");
+        let names: Vec<&str> = converted["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "shell",
+                "multi_agent_v1__spawn_agent",
+                "multi_agent_v1__wait_agent"
+            ]
+        );
+        let spawn = &converted["tools"][1];
+        assert_eq!(
+            spawn["description"],
+            "Tools for spawning and managing sub-agents.\n\nSpawn a sub-agent."
+        );
+        assert_eq!(
+            spawn["input_schema"]["properties"]["message"]["type"],
+            "string"
+        );
+        assert_eq!(
+            converted["tools"][2]["description"],
+            "Tools for spawning and managing sub-agents."
+        );
+        // The replayed call uses the qualified name.
+        let replayed = converted["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .find(|block| block["type"] == "tool_use")
+            .expect("replayed tool_use");
+        assert_eq!(replayed["name"], "multi_agent_v1__spawn_agent");
+
+        // A streamed call comes back under the client's name and namespace.
+        let mut translator = AnthropicToResponsesTranslator::new(
+            "resp_test".to_owned(),
+            "arc-swift".to_owned(),
+            1,
+            SyntheticOutputKind::Message,
+            rewrites.clone(),
+        );
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"tool_use","id":"call_1",
+                                    "name":"multi_agent_v1__wait_agent","input":{}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        );
+        let out = translator.push_bytes(upstream.as_bytes());
+        assert!(out.contains("\"name\":\"wait_agent\""), "{out}");
+        assert!(out.contains("\"namespace\":\"multi_agent_v1\""), "{out}");
+        assert!(!out.contains("multi_agent_v1__wait_agent"), "{out}");
+        // Non-namespaced tools are unchanged.
+        assert_eq!(rewrites.client_call("shell"), ("shell".to_owned(), None));
+
+        // The non-streaming path restores it the same way.
+        let items = synthetic_response_items(
+            &json!({"content": [{"type": "tool_use", "id": "call_2",
+                                 "name": "multi_agent_v1__spawn_agent", "input": {}}]}),
+            SyntheticOutputKind::Message,
+            &rewrites,
+        );
+        assert_eq!(items[0]["name"], "spawn_agent");
+        assert_eq!(items[0]["namespace"], "multi_agent_v1");
     }
 
     /// Codex `web_search = "live"` declares the hosted `{type: "web_search"}`
