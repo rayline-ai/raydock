@@ -1275,6 +1275,33 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
         });
     }
 
+    // Never forward a translated request without a hosted tool the caller
+    // declared: translate it where the target has an equivalent, refuse it
+    // with an actionable error where it does not.
+    let hosted_target = match &decision.target {
+        RouteSelection::Local => Some(HostedToolTarget::NoHostedTools),
+        RouteSelection::Endpoint(endpoint_id) => state
+            .config
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == *endpoint_id)
+            .and_then(|endpoint| match endpoint.protocol {
+                EndpointProtocol::OpenAIResponses => None,
+                EndpointProtocol::AnthropicMessages => Some(HostedToolTarget::AnthropicMessages),
+                EndpointProtocol::OpenAIChat => Some(HostedToolTarget::NoHostedTools),
+            }),
+    };
+    if let Some(target) = hosted_target {
+        let refused = responses_untranslatable_hosted_tools(&parsed, target);
+        if !refused.is_empty() {
+            warn!(
+                "local router: refusing Responses request with hosted tool(s) {} the route cannot run",
+                refused.join(",")
+            );
+            return Ok(unsupported_hosted_tool_response(&refused, target));
+        }
+    }
+
     let response = match &decision.target {
         RouteSelection::Local => {
             forward_responses_to_local_adapter(&state, &decision, &parsed, &request_id, output_kind)
@@ -3712,7 +3739,130 @@ fn sanitize_tool_name(name: &str) -> String {
     out
 }
 
+/// The server-executed (hosted) tool types of the OpenAI Responses API. A
+/// translated request must never drop one of these silently: the model would
+/// run without a tool the caller declared and answer as if it did not exist.
+fn responses_hosted_tool_type(tool: &Value) -> Option<&str> {
+    let kind = tool.get("type")?.as_str()?;
+    let hosted = kind.starts_with("web_search")
+        || matches!(
+            kind,
+            "file_search"
+                | "code_interpreter"
+                | "image_generation"
+                | "computer_use_preview"
+                | "computer_use"
+                | "mcp"
+        );
+    hosted.then_some(kind)
+}
+
+/// Where a Responses request is being translated to, for hosted tools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedToolTarget {
+    /// Anthropic Messages: OpenAI `web_search` has a native equivalent.
+    AnthropicMessages,
+    /// Chat Completions or the on-device adapter: no hosted tools at all.
+    NoHostedTools,
+}
+
+/// Every hosted tool the request declares (top-level `tools` and Codex
+/// `additional_tools` input items).
+fn responses_declared_hosted_tools(body: &Value) -> Vec<String> {
+    let top = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let additional = body
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten();
+    let mut kinds: Vec<String> = Vec::new();
+    for kind in top.chain(additional).filter_map(responses_hosted_tool_type) {
+        if !kinds.iter().any(|seen| seen == kind) {
+            kinds.push(kind.to_owned());
+        }
+    }
+    kinds
+}
+
+/// The hosted tools `target` cannot carry. A non-empty answer is refused with
+/// `unsupported_hosted_tool` rather than forwarded without them.
+fn responses_untranslatable_hosted_tools(body: &Value, target: HostedToolTarget) -> Vec<String> {
+    responses_declared_hosted_tools(body)
+        .into_iter()
+        .filter(|kind| {
+            !(target == HostedToolTarget::AnthropicMessages && kind.starts_with("web_search"))
+        })
+        .collect()
+}
+
+fn unsupported_hosted_tool_response(
+    kinds: &[String],
+    target: HostedToolTarget,
+) -> Response<BoxBody> {
+    let names = kinds.join(", ");
+    let reason = match target {
+        HostedToolTarget::AnthropicMessages => {
+            "the configured route speaks Anthropic Messages, which has no equivalent (only web_search translates)"
+        }
+        HostedToolTarget::NoHostedTools => {
+            "the configured route (Chat Completions or an on-device model) cannot run hosted tools"
+        }
+    };
+    json_response(
+        StatusCode::BAD_REQUEST,
+        json!({"error": {
+            "type": "invalid_request_error",
+            "code": "unsupported_hosted_tool",
+            "param": "tools",
+            "message": format!(
+                "Rayline Local cannot run the hosted tool(s) {names} on this route: {reason}. \
+                 Remove them from the request, or route to an endpoint that serves the Responses API natively."
+            ),
+        }}),
+    )
+}
+
+/// OpenAI's hosted `web_search` (and its dated / preview spellings) as
+/// Anthropic's server tool. Domain filters and the approximate user location
+/// carry over; options with no Anthropic equivalent are left out.
+fn responses_web_search_to_anthropic(tool: &Value) -> Value {
+    let mut out = Map::new();
+    out.insert("type".to_owned(), json!("web_search_20250305"));
+    out.insert("name".to_owned(), json!("web_search"));
+    if let Some(domains) = tool
+        .pointer("/filters/allowed_domains")
+        .filter(|domains| domains.as_array().is_some_and(|list| !list.is_empty()))
+    {
+        out.insert("allowed_domains".to_owned(), domains.clone());
+    }
+    if let Some(location) = tool.get("user_location").and_then(Value::as_object) {
+        let mut mapped = Map::new();
+        mapped.insert("type".to_owned(), json!("approximate"));
+        for key in ["city", "region", "country", "timezone"] {
+            if let Some(value) = location.get(key).filter(|value| value.is_string()) {
+                mapped.insert(key.to_owned(), value.clone());
+            }
+        }
+        out.insert("user_location".to_owned(), Value::Object(mapped));
+    }
+    Value::Object(out)
+}
+
 fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Option<Value> {
+    if tool
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"))
+    {
+        return Some(responses_web_search_to_anthropic(tool));
+    }
     if tool.get("type").and_then(Value::as_str) != Some("function") {
         return None;
     }
@@ -6289,6 +6439,81 @@ mod tests {
 
         assert!(out.contains("\"name\":\"codex.list_resource_templates\""));
         assert!(!out.contains(&format!("\"name\":\"{upstream_name}\"")));
+    }
+
+    /// Codex `web_search = "live"` declares the hosted `{type: "web_search"}`
+    /// tool. The Anthropic translation used to drop every non-function tool,
+    /// so the model answered that it had no search tool. It must arrive as
+    /// Anthropic's server tool, with its domain filter and location.
+    #[test]
+    fn responses_web_search_translates_to_anthropic_server_tool() {
+        let request = json!({
+            "model": "arc-swift",
+            "input": "What changed in Rust 1.88?",
+            "tools": [
+                {"type": "function", "name": "shell",
+                 "parameters": {"type": "object", "properties": {}}},
+                {"type": "web_search",
+                 "filters": {"allowed_domains": ["blog.rust-lang.org"]},
+                 "user_location": {"type": "approximate", "country": "US", "city": "Austin"}},
+            ]
+        });
+        let (converted, _rewrites) = responses_to_anthropic_request(&request, "arc-swift");
+        let tools = converted["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2, "{tools:?}");
+        let search = tools
+            .iter()
+            .find(|tool| tool["type"] == "web_search_20250305")
+            .expect("web_search must not be dropped");
+        assert_eq!(search["name"], "web_search");
+        assert_eq!(search["allowed_domains"], json!(["blog.rust-lang.org"]));
+        assert_eq!(
+            search["user_location"],
+            json!({"type": "approximate", "country": "US", "city": "Austin"})
+        );
+        // Preview spellings translate the same way.
+        let (preview, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [{"type": "web_search_preview"}]}),
+            "arc-swift",
+        );
+        assert_eq!(
+            preview["tools"],
+            json!([{"type": "web_search_20250305", "name": "web_search"}])
+        );
+    }
+
+    #[test]
+    fn hosted_tools_without_an_equivalent_are_refused_not_dropped() {
+        let request = json!({
+            "input": [
+                {"type": "additional_tools", "role": "developer",
+                 "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]},
+                {"type": "message", "role": "user", "content": "hi"}
+            ],
+            "tools": [
+                {"type": "web_search"},
+                {"type": "file_search", "vector_store_ids": ["vs_1"]},
+                {"type": "function", "name": "shell"},
+                {"type": "web_search"}
+            ]
+        });
+        assert_eq!(
+            responses_untranslatable_hosted_tools(&request, HostedToolTarget::AnthropicMessages),
+            vec!["file_search".to_owned(), "code_interpreter".to_owned()]
+        );
+        assert_eq!(
+            responses_untranslatable_hosted_tools(&request, HostedToolTarget::NoHostedTools),
+            vec![
+                "web_search".to_owned(),
+                "file_search".to_owned(),
+                "code_interpreter".to_owned()
+            ]
+        );
+        let plain = json!({"tools": [{"type": "function", "name": "shell"}]});
+        assert!(
+            responses_untranslatable_hosted_tools(&plain, HostedToolTarget::NoHostedTools)
+                .is_empty()
+        );
     }
 
     /// Clients that take the turn's output from `response.completed` (Unreal

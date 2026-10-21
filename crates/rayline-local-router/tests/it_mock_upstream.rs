@@ -1044,3 +1044,76 @@ async fn anthropic_messages_leaves_legacy_family_body_untouched() {
     let _ = std::fs::remove_file(path);
     println!("PASS legacy family body forwarded untouched: {sent}");
 }
+
+/// Codex `web_search = "live"` through a Responses → Anthropic route: the
+/// hosted `web_search` tool reaches the upstream as Anthropic's server tool
+/// (never silently dropped), and a hosted tool with no Anthropic equivalent is
+/// refused with an actionable `unsupported_hosted_tool` before any upstream
+/// call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "Searched."}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
+        })),
+        tx,
+    ));
+    let config = write_config(
+        "hosted-tools",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/v1/responses");
+
+    let refused = client
+        .post(&url)
+        .json(&json!({"model": "m", "input": "hi", "stream": false,
+                      "tools": [{"type": "web_search"}, {"type": "code_interpreter"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_hosted_tool");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("code_interpreter")
+    );
+
+    let ok = client
+        .post(&url)
+        .json(
+            &json!({"model": "m", "input": "What changed in Rust 1.88?", "stream": false,
+                      "tools": [{"type": "web_search",
+                                 "filters": {"allowed_domains": ["blog.rust-lang.org"]}}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let forwarded = rx.await.expect("upstream saw the request");
+    let body = forwarded.split("\r\n\r\n").nth(1).expect("request body");
+    let sent: Value = serde_json::from_str(body).expect("json body");
+    assert_eq!(
+        sent["tools"],
+        json!([{"type": "web_search_20250305", "name": "web_search",
+                "allowed_domains": ["blog.rust-lang.org"]}])
+    );
+    let _ = std::fs::remove_file(config);
+}
