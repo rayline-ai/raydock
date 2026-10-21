@@ -1,5 +1,5 @@
 //! Hermes Agent: `HERMES_HOME=<dir>` holds `config.yaml` (plus Hermes' own
-//! state: sessions, memories, skills). `key_env` names the key's env var and
+//! state: sessions, memories, skills). `api_key` is the literal key and
 //! `${VAR}` is expanded in config values.
 //!
 //! Episode keying: Hermes sends its session id as `x-session-affinity` on
@@ -16,7 +16,7 @@
 
 use serde_json::json;
 
-use super::{CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, Plan, ROUTER_MODEL, RenderContext, yaml_file};
+use super::{CONTEXT_WINDOW, CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, yaml_file};
 
 pub(crate) const CONFIG_FILE: &str = "config.yaml";
 pub(crate) const MESSAGES_PROVIDER: &str = "rayline-anth";
@@ -26,7 +26,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let models = json!({ ROUTER_MODEL: { "context_length": CONTEXT_WINDOW } });
     let mut responses = json!({
         "base_url": ctx.v1_base(),
-        "key_env": KEY_ENV,
+        "api_key": ctx.key,
         "api_mode": "codex_responses",
         "models": models
     });
@@ -35,7 +35,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     }
     let mut messages = json!({
         "base_url": ctx.messages_base(),
-        "key_env": KEY_ENV,
+        "api_key": ctx.key,
         "api_mode": "anthropic_messages",
         "models": models
     });
@@ -120,18 +120,18 @@ model:
   provider: \"custom:rayline-anth\"
 providers:
   rayline-anth:
+    api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
     base_url: \"https://api-dev.rayline.ai\"
     extra_headers:
       x-conversation-id: \"${RAYLINE_CONV_ID}\"
-    key_env: \"RAYLINE_KEY\"
     models:
       rayline-router:
         context_length: 200000
   rayline-resp:
+    api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
     base_url: \"https://api-dev.rayline.ai/v1\"
-    key_env: \"RAYLINE_KEY\"
     models:
       rayline-router:
         context_length: 200000

@@ -1,5 +1,6 @@
 //! pi: `PI_CODING_AGENT_DIR=<dir>`, which holds `models.json`, `settings.json`,
-//! `auth.json` and `sessions/`. pi resolves `$VAR` in `apiKey` and header values.
+//! `auth.json` and `sessions/`. pi resolves `$VAR` in header values; `apiKey`
+//! is the literal key.
 //!
 //! `compat.sendSessionAffinityHeaders` makes pi send its session id as
 //! `x-session-affinity` on Messages (pi 0.87.1 and 1.0.0; off by default for
@@ -20,8 +21,7 @@
 use serde_json::json;
 
 use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
-    json_file,
+    CONTEXT_WINDOW, CONV_ID_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext, json_file,
 };
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -50,7 +50,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             PROVIDER_ID: {
                 "baseUrl": ctx.messages_base(),
                 "api": "anthropic-messages",
-                "apiKey": format!("${KEY_ENV}"),
+                "apiKey": ctx.key,
                 "headers": ctx.conversation_headers(&format!("${CONV_ID_ENV}")),
                 "compat": compat,
                 "models": [{
@@ -87,6 +87,7 @@ mod tests {
     fn render_models(dir: &std::path::Path, env_name: &str, allow: bool) -> serde_json::Value {
         let ctx = super::super::RenderContext {
             env_name,
+            key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
             conversation_id: super::super::ConversationIdFallback::new(env_name, None),
@@ -141,7 +142,7 @@ mod tests {
         let provider = &read("models.json")["providers"]["rayline"];
         assert_eq!(provider["baseUrl"], TEST_URL);
         assert_eq!(provider["api"], "anthropic-messages");
-        assert_eq!(provider["apiKey"], "$RAYLINE_KEY");
+        assert_eq!(provider["apiKey"], super::super::tests::TEST_KEY);
         assert_eq!(provider["compat"]["sendSessionAffinityHeaders"], true);
         assert_eq!(provider["compat"]["allowEmptySignature"], true);
         assert_eq!(provider["headers"], serde_json::json!({}));

@@ -5,8 +5,11 @@
 //! way `rayline claude` does, writes a Rayline-owned config under
 //! `~/.config/rayline/harness/<name>/<env>/`, points the harness at it through
 //! the harness's own config env var, and execs the harness with the remaining
-//! args. The key is never written to disk: every config references it from the
-//! `RAYLINE_KEY` env var, which only the child process sees.
+//! args. The key lives only in that config (0600, in a 0700 dir), never in the
+//! harness's environment: every tool subprocess the harness spawns inherits its
+//! environment, so a key there would reach a model-visible `env` call. For the
+//! same reason the launch removes [`KEY_ENV`] and `RAYLINE_ROUTER_API_KEY`
+//! from the child's environment.
 //!
 //! Every config uses Anthropic Messages, model `rayline-router`,
 //! `contextWindow` 200000 / `maxTokens` 32000.
@@ -41,9 +44,12 @@ use std::process::{Command, ExitCode};
 
 use serde_json::Value;
 
-/// Env var that carries the router key to the harness. Configs reference it by
-/// name; the value is never written to disk.
+/// Env var that carried the router key to the harness before 0.2.11. Removed
+/// from the child's environment, with [`ROUTER_KEY_ENV`], so neither an
+/// exported key nor one from a parent launch reaches the harness's tools.
 pub const KEY_ENV: &str = "RAYLINE_KEY";
+/// The explicit router key the launcher reads ([`explicit_router_key`]).
+const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 /// Env var that carries the per-launch conversation id (fallback only).
 pub const CONV_ID_ENV: &str = "RAYLINE_CONV_ID";
 /// Header the gateway reads as the conversation (episode) key.
@@ -168,10 +174,11 @@ pub struct RunRequest {
     pub args: Vec<OsString>,
 }
 
-/// What a harness renderer needs. Holds no secret: the key only ever travels
-/// through the child's environment.
+/// What a harness renderer needs.
 pub(crate) struct RenderContext<'a> {
     pub env_name: &'a str,
+    /// The router key, written into the Rayline-owned config.
+    pub key: &'a str,
     /// Router origin with no trailing `/` and no `/v1`
     /// (e.g. `https://api-dev.rayline.ai`).
     pub router_url: &'a str,
@@ -279,6 +286,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
     let config_dir = config_dir(&home, harness, &env_name);
     let ctx = RenderContext {
         env_name: &env_name,
+        key: &key,
         router_url: &router_url,
         config_dir: &config_dir,
         conversation_id: ConversationIdFallback::new(
@@ -340,17 +348,11 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         }
         _ => request.args,
     };
-    Ok(build_command(
-        &binary,
-        &plan,
-        &key,
-        conv_id.as_deref(),
-        &args,
-    ))
+    Ok(build_command(&binary, &plan, conv_id.as_deref(), &args))
 }
 
 fn explicit_router_key() -> Option<String> {
-    std::env::var("RAYLINE_ROUTER_API_KEY")
+    std::env::var(ROUTER_KEY_ENV)
         .ok()
         .filter(|value| !value.is_empty())
 }
@@ -388,28 +390,49 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
             continue;
         }
         let tmp = dir.join(format!(".{}.tmp-{}", file.name, std::process::id()));
-        fs::write(&tmp, &file.contents)?;
+        write_private(&tmp, &file.contents)?;
         fs::rename(&tmp, &path)?;
     }
     Ok(())
 }
 
+/// Write `contents` to a new file at `path` that only the owner can read: the
+/// Rayline-owned configs hold the router key. A stale file is removed first,
+/// since an open of an existing file keeps its mode.
+fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+    use std::io::Write as _;
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents.as_bytes())
+}
+
 pub(crate) fn build_command(
     binary: &Path,
     plan: &Plan,
-    key: &str,
     conv_id: Option<&str>,
     args: &[OsString],
 ) -> Command {
     let mut command = Command::new(binary);
     command.args(args);
+    // The key reaches the harness through its config only (see the module docs).
+    command.env_remove(KEY_ENV);
+    command.env_remove(ROUTER_KEY_ENV);
     for name in &plan.env_remove {
         command.env_remove(name);
     }
     for (name, value) in &plan.env_set {
         command.env(name, value);
     }
-    command.env(KEY_ENV, key);
     match conv_id {
         Some(conv_id) => command.env(CONV_ID_ENV, conv_id),
         // An inherited id (e.g. from a parent launch) must not leak in.
@@ -613,6 +636,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     pub(crate) const TEST_URL: &str = "https://api-dev.rayline.ai";
+    pub(crate) const TEST_KEY: &str = "rlk-test";
 
     pub(crate) fn temp_dir(label: &str) -> PathBuf {
         // A counter, not the clock: parallel tests can read the same time.
@@ -641,6 +665,7 @@ pub(crate) mod tests {
         let dir = config_dir(&home, harness, "dev");
         let ctx = RenderContext {
             env_name: "dev",
+            key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
             conversation_id,
@@ -734,7 +759,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn command_carries_key_and_conversation_id_only_in_env() {
+    fn command_carries_conversation_id_and_removes_keys() {
         let plan = Plan {
             files: Vec::new(),
             env_set: vec![("OPENCODE_CONFIG", OsString::from("/x/opencode.json"))],
@@ -743,7 +768,6 @@ pub(crate) mod tests {
         let command = build_command(
             Path::new("/bin/true"),
             &plan,
-            "rlk-test",
             Some("conv-1"),
             &[OsString::from("run"), OsString::from("hi")],
         );
@@ -756,7 +780,13 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        assert!(envs.contains(&("RAYLINE_KEY".into(), Some("rlk-test".into()))));
+        assert!(envs.contains(&("RAYLINE_KEY".into(), None)));
+        assert!(envs.contains(&("RAYLINE_ROUTER_API_KEY".into(), None)));
+        assert!(
+            !envs
+                .iter()
+                .any(|(_, value)| value.as_deref() == Some(TEST_KEY))
+        );
         assert!(envs.contains(&("RAYLINE_CONV_ID".into(), Some("conv-1".into()))));
         assert!(envs.contains(&("OPENCODE_CONFIG".into(), Some("/x/opencode.json".into()))));
         assert!(envs.contains(&("CLAUDE_CONFIG_DIR".into(), None)));
@@ -796,13 +826,7 @@ pub(crate) mod tests {
 
     #[test]
     fn native_session_keys_are_the_dev_default() {
-        let command = build_command(
-            Path::new("/bin/true"),
-            &Plan::default(),
-            "rlk-test",
-            None,
-            &[],
-        );
+        let command = build_command(Path::new("/bin/true"), &Plan::default(), None, &[]);
         let conv = command
             .get_envs()
             .find(|(k, _)| *k == std::ffi::OsStr::new(CONV_ID_ENV));
@@ -859,22 +883,84 @@ pub(crate) mod tests {
         }
     }
 
+    /// The key reaches each harness through an owner-only Rayline config file,
+    /// never through an env var a tool subprocess would inherit.
     #[test]
-    fn no_rendered_config_contains_a_key() {
+    fn key_is_only_in_owner_only_config_files() {
         for harness in Harness::ALL {
             let (dir, plan) = render(harness);
-            let mut references_key_env = false;
+            let mut holds_key = false;
             for file in &plan.files {
-                let text = fs::read_to_string(dir.join(file.name)).unwrap();
-                assert!(!text.contains("rlk-"), "{}: {}", harness.name(), file.name);
-                references_key_env |= text.contains(KEY_ENV);
+                let path = dir.join(file.name);
+                let text = fs::read_to_string(&path).unwrap();
+                holds_key |= text.contains(TEST_KEY);
+                assert!(!text.contains(KEY_ENV), "{}: {}", harness.name(), file.name);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = fs::metadata(&path).unwrap().permissions().mode();
+                    assert_eq!(mode & 0o777, 0o600, "{}: {}", harness.name(), file.name);
+                }
             }
+            assert!(holds_key, "{} config must carry the key", harness.name());
             assert!(
-                references_key_env,
-                "{} must reference {KEY_ENV}",
+                plan.env_set
+                    .iter()
+                    .all(|(_, value)| !value.to_string_lossy().contains(TEST_KEY)),
+                "{}",
                 harness.name()
             );
         }
+    }
+
+    /// #1 (0.2.11): an exported key, or one a parent launch set, must not reach
+    /// the harness, whose tool subprocesses inherit its environment.
+    #[cfg(unix)]
+    #[test]
+    fn harness_child_never_inherits_a_router_key() {
+        let vars = [KEY_ENV, ROUTER_KEY_ENV];
+        let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        for var in vars {
+            // SAFETY: tests run with --test-threads=1 (AGENTS.md), so no other
+            // thread reads the environment concurrently.
+            unsafe { std::env::set_var(var, "rlk-test-not-a-real-key") };
+        }
+        let output = build_command(Path::new("/usr/bin/env"), &Plan::default(), None, &[])
+            .output()
+            .expect("run env");
+        for (var, value) in vars.iter().zip(previous) {
+            // SAFETY: as above.
+            match value {
+                Some(value) => unsafe { std::env::set_var(var, value) },
+                None => unsafe { std::env::remove_var(var) },
+            }
+        }
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success());
+        assert!(
+            !printed.contains("rlk-test-not-a-real-key"),
+            "the harness environment still carries a router key"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_files_replaces_a_readable_file_with_an_owner_only_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = temp_dir("mode").join("cfg");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("owned.json");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let files = [ConfigFile {
+            name: "owned.json",
+            contents: "new".to_owned(),
+            overwrite: true,
+        }];
+        write_files(&dir, &files).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
     }
 
     #[test]

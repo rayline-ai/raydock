@@ -156,8 +156,11 @@ rayline router stop
 ## OpenClaw
 
 `rayline openclaw` runs OpenClaw against the Rayline router with a generated
-config. It gives the router key to OpenClaw as an environment SecretRef, so the
-key stays out of OpenClaw's files.
+config. It gives the router key to OpenClaw as a file SecretRef that reads an
+owner-only `router-key` file next to that config, so the key stays out of
+OpenClaw's own files and out of the environment its tools inherit. The other
+launchers (`rayline opencode`, `pi`, `omp`, `hermes`) likewise write the key into
+their owner-only generated config, never into the harness's environment.
 
 If you configure OpenClaw by hand, do the same. Write the provider's `apiKey`
 as a SecretRef object, not as the `${VAR}` shorthand:
