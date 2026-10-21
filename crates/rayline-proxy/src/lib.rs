@@ -59,6 +59,7 @@ pub const DEFAULT_ANTHROPIC_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_ROUTER_URL: &str = "https://api.rayline.ai";
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
+const VIRTUAL_MODEL: &str = "rayline-router";
 /// Claude Code writes `agent-<id>.meta.json` (which carries `agentType`)
 /// concurrently with — sometimes a few ms after — it fires the subagent's
 /// first request. Resolving the type just once races that write and can fall
@@ -568,6 +569,9 @@ async fn forward_anthropic_request(
         state.opts.routing_mode,
         &state.opts.selective_subagent_ids,
         agent_type.as_deref(),
+        // The local router routes a subagent turn from its concrete model and
+        // agent type, so only a hosted router gets the virtual model.
+        !state.opts.local_router_owns_metrics,
     );
     let decision = routed.decision;
     let body_model = request_body_model(&routed.body);
@@ -1984,9 +1988,11 @@ fn prepare_anthropic_route(
         routing_mode,
         &[],
         None,
+        true,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_anthropic_route_with_subagent_filter(
     method: &Method,
     path: &str,
@@ -1995,6 +2001,7 @@ fn prepare_anthropic_route_with_subagent_filter(
     routing_mode: ProxyRoutingMode,
     selective_subagent_ids: &[String],
     resolved_agent_type: Option<&str>,
+    name_virtual_model: bool,
 ) -> PreparedAnthropicRoute {
     let agent_id = claude_code_agent_id(headers).map(ToOwned::to_owned);
     let agent_type = resolved_agent_type.map(ToOwned::to_owned);
@@ -2082,13 +2089,18 @@ fn prepare_anthropic_route_with_subagent_filter(
                 agent_type,
             );
         }
+        let rewritten = name_virtual_model
+            .then(|| virtual_model_body(&body))
+            .flatten();
+        let body_was_rewritten = rewritten.is_some();
+        let body = rewritten.unwrap_or(body);
         return prepared_anthropic_route(
             RouteDecision {
                 target: RouteTarget::Router,
                 reason: "selective_subagent_header",
             },
             body,
-            false,
+            body_was_rewritten,
             agent_id,
             agent_type,
         );
@@ -2174,6 +2186,20 @@ fn request_body_model(body: &[u8]) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(normalize_model_name)
         })
+}
+
+/// The hosted router serves a `claude-*` id as the pin it names, so a routed
+/// subagent turn names the virtual model instead. Other ids stay as they are.
+fn virtual_model_body(body: &[u8]) -> Option<Bytes> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
+    let model = value.get("model")?.as_str()?;
+    if !is_anthropic_model_id(model) {
+        return None;
+    }
+    value
+        .as_object_mut()?
+        .insert("model".to_owned(), Value::String(VIRTUAL_MODEL.to_owned()));
+    serde_json::to_vec(&value).ok().map(Bytes::from)
 }
 
 fn approximate_input_tokens(body: &[u8]) -> u64 {
@@ -2389,7 +2415,7 @@ fn claude_project_slug(path: &Path) -> String {
 fn is_virtual_model(model: Option<&str>) -> bool {
     model.is_some_and(|model| {
         let normalized = normalize_model_name(model);
-        normalized == "rayline-router"
+        normalized == VIRTUAL_MODEL
     })
 }
 
@@ -3065,27 +3091,52 @@ mod tests {
         assert!(proxy_owns_metrics_for_route(&opts, RouteTarget::Anthropic));
     }
 
-    #[test]
-    fn selective_mode_routes_subagent_messages_without_rewrite() {
+    fn prepare_subagent_route(model: &str, name_virtual_model: bool) -> PreparedAnthropicRoute {
         let mut headers = HeaderMap::new();
         headers.insert(
             CLAUDE_CODE_AGENT_ID_HEADER,
             HeaderValue::from_static("agent-1"),
         );
-        let prepared = prepare_anthropic_route(
+        prepare_anthropic_route_with_subagent_filter(
             &Method::POST,
             "/v1/messages",
             &headers,
-            Bytes::from_static(br#"{"model":"claude-sonnet-4-5","messages":[]}"#),
+            Bytes::from(json!({"model": model, "messages": []}).to_string()),
             ProxyRoutingMode::SelectiveSubagents,
-        );
+            &[],
+            None,
+            name_virtual_model,
+        )
+    }
+
+    #[test]
+    fn selective_mode_routes_subagent_messages_with_virtual_model() {
+        let prepared = prepare_subagent_route("claude-sonnet-4-5", true);
 
         assert_eq!(prepared.decision.target, RouteTarget::Router);
         assert_eq!(prepared.decision.reason, "selective_subagent_header");
-        assert!(!prepared.body_was_rewritten);
+        assert!(prepared.body_was_rewritten);
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
-        assert_eq!(body["model"], "claude-sonnet-4-5");
+        assert_eq!(body["model"], "rayline-router");
         assert_eq!(body["messages"], json!([]));
+    }
+
+    #[test]
+    fn selective_mode_keeps_subagent_model_without_rewrite() {
+        for (model, name_virtual_model) in [
+            // A non-Claude id is a pin the subagent chose.
+            ("gpt-5.5", true),
+            // The local router routes from the concrete model.
+            ("claude-sonnet-4-5", false),
+        ] {
+            let prepared = prepare_subagent_route(model, name_virtual_model);
+
+            assert_eq!(prepared.decision.target, RouteTarget::Router, "{model}");
+            assert_eq!(prepared.decision.reason, "selective_subagent_header");
+            assert!(!prepared.body_was_rewritten, "{model}");
+            let body: Value = serde_json::from_slice(&prepared.body).unwrap();
+            assert_eq!(body["model"], model);
+        }
     }
 
     #[test]
@@ -3104,6 +3155,7 @@ mod tests {
             ProxyRoutingMode::SelectiveSubagents,
             &allowlist,
             None,
+            true,
         );
         assert_eq!(prepared.decision.target, RouteTarget::Router);
         assert_eq!(prepared.decision.reason, "selective_subagent_header");
@@ -3121,6 +3173,7 @@ mod tests {
             ProxyRoutingMode::SelectiveSubagents,
             &allowlist,
             None,
+            true,
         );
         assert_eq!(prepared.decision.target, RouteTarget::Anthropic);
         assert_eq!(prepared.decision.reason, "selective_subagent_passthrough");
@@ -3147,6 +3200,7 @@ mod tests {
             ProxyRoutingMode::SelectiveSubagents,
             &allowlist,
             None,
+            true,
         );
         assert_eq!(prepared.decision.target, RouteTarget::Anthropic);
         assert_eq!(prepared.decision.reason, "selective_subagent_passthrough");
@@ -3162,6 +3216,7 @@ mod tests {
             ProxyRoutingMode::SelectiveSubagents,
             &allowlist,
             Some("Explore"),
+            true,
         );
         assert_eq!(prepared.decision.target, RouteTarget::Router);
         assert_eq!(prepared.decision.reason, "selective_subagent_header");
