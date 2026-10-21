@@ -1292,6 +1292,11 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
             }),
     };
     if let Some(target) = hosted_target {
+        if responses_declares_offline_web_search(&parsed) {
+            info!(
+                "local router: omitting web_search with external_web_access=false (no live search requested)"
+            );
+        }
         let refused = responses_untranslatable_hosted_tools(&parsed, target);
         if !refused.is_empty() {
             warn!(
@@ -3742,8 +3747,16 @@ fn sanitize_tool_name(name: &str) -> String {
 /// The server-executed (hosted) tool types of the OpenAI Responses API. A
 /// translated request must never drop one of these silently: the model would
 /// run without a tool the caller declared and answer as if it did not exist.
+///
+/// A `web_search` with `external_web_access: false` is not a request for live
+/// search: Codex declares it on every turn and flips the flag only for
+/// `--search` / `web_search = "live"`. It is omitted (and logged), the way the
+/// hosted ARC path omits it, rather than counted as a hosted tool.
 fn responses_hosted_tool_type(tool: &Value) -> Option<&str> {
     let kind = tool.get("type")?.as_str()?;
+    if is_responses_web_search_without_live_access(tool) {
+        return None;
+    }
     let hosted = kind.starts_with("web_search")
         || matches!(
             kind,
@@ -3755,6 +3768,34 @@ fn responses_hosted_tool_type(tool: &Value) -> Option<&str> {
                 | "mcp"
         );
     hosted.then_some(kind)
+}
+
+/// A `web_search` tool that does not ask for live web access.
+fn is_responses_web_search_without_live_access(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"))
+        && tool.get("external_web_access").and_then(Value::as_bool) == Some(false)
+}
+
+/// Whether the request declares a `web_search` without live access, which
+/// translation omits.
+fn responses_declares_offline_web_search(body: &Value) -> bool {
+    let top = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let additional = body
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten();
+    top.chain(additional)
+        .any(is_responses_web_search_without_live_access)
 }
 
 /// Where a Responses request is being translated to, for hosted tools.
@@ -3856,6 +3897,9 @@ fn responses_web_search_to_anthropic(tool: &Value) -> Value {
 }
 
 fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Option<Value> {
+    if is_responses_web_search_without_live_access(tool) {
+        return None;
+    }
     if tool
         .get("type")
         .and_then(Value::as_str)
@@ -6471,6 +6515,26 @@ mod tests {
             search["user_location"],
             json!({"type": "approximate", "country": "US", "city": "Austin"})
         );
+        // Codex declares web_search with external_web_access=false on every
+        // turn; that is not a request for live search and is omitted.
+        let (offline, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "web_search", "external_web_access": false}
+            ]}),
+            "arc-swift",
+        );
+        assert_eq!(
+            offline["tools"].as_array().map(Vec::len),
+            Some(1),
+            "{offline}"
+        );
+        assert_eq!(offline["tools"][0]["name"], "shell");
+        let (live, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [{"type": "web_search", "external_web_access": true}]}),
+            "arc-swift",
+        );
+        assert_eq!(live["tools"][0]["type"], "web_search_20250305");
         // Preview spellings translate the same way.
         let (preview, _) = responses_to_anthropic_request(
             &json!({"input": "x", "tools": [{"type": "web_search_preview"}]}),
@@ -6509,6 +6573,16 @@ mod tests {
                 "code_interpreter".to_owned()
             ]
         );
+        // Codex's default (no live access) is never refused, on any route.
+        let codex_default = json!({"tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "web_search", "external_web_access": false}
+        ]});
+        assert!(
+            responses_untranslatable_hosted_tools(&codex_default, HostedToolTarget::NoHostedTools)
+                .is_empty()
+        );
+        assert!(responses_declares_offline_web_search(&codex_default));
         let plain = json!({"tools": [{"type": "function", "name": "shell"}]});
         assert!(
             responses_untranslatable_hosted_tools(&plain, HostedToolTarget::NoHostedTools)

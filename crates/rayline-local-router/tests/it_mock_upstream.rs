@@ -1117,3 +1117,54 @@ async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
     );
     let _ = std::fs::remove_file(config);
 }
+
+/// Codex declares `{type: "web_search", external_web_access: false}` on every
+/// turn and sets it to true only for live search. The default must keep
+/// working through a Responses → Anthropic route: the offline declaration is
+/// omitted, never translated into a server tool the upstream would refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_codex_default_web_search_is_omitted_not_translated() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "20.50"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
+        })),
+        tx,
+    ));
+    let config = write_config(
+        "codex-default-web-search",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({"model": "m", "input": "total?", "stream": false,
+        "tools": [
+            {"type": "function", "name": "shell",
+             "parameters": {"type": "object", "properties": {}}},
+            {"type": "web_search", "external_web_access": false}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let forwarded = rx.await.expect("upstream saw the request");
+    let body = forwarded.split("\r\n\r\n").nth(1).expect("request body");
+    let sent: Value = serde_json::from_str(body).expect("json body");
+    let tools = sent["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    assert_eq!(tools[0]["name"], "shell");
+    let _ = std::fs::remove_file(config);
+}
