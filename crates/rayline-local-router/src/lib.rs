@@ -3997,7 +3997,13 @@ struct AnthropicToResponsesTranslator {
     running_output_chars: usize,
     completed: bool,
     saw_content: bool,
-    text_item_started: bool,
+    /// The response's output items in emission order. The text item's slot is
+    /// reserved when it starts streaming and filled when it completes.
+    output: Vec<Option<Value>>,
+    /// The text item's position in `output`, once it has started.
+    text_output_index: Option<usize>,
+    /// The next event's `sequence_number`.
+    sequence: u64,
 }
 
 impl AnthropicToResponsesTranslator {
@@ -4021,13 +4027,28 @@ impl AnthropicToResponsesTranslator {
             running_output_chars: 0,
             completed: false,
             saw_content: false,
-            text_item_started: false,
+            output: Vec::new(),
+            text_output_index: None,
+            sequence: 0,
         }
     }
 
-    fn start(&self) -> String {
+    /// Write one event, stamped with the stream's next `sequence_number`.
+    fn emit(&mut self, out: &mut String, event: &str, mut data: Value) {
+        if let Some(object) = data.as_object_mut() {
+            object.insert("sequence_number".to_owned(), json!(self.sequence));
+        }
+        self.sequence += 1;
+        push_sse(out, event, data);
+    }
+
+    fn text_item_id(&self, index: usize) -> String {
+        format!("msg_{}_{index}", self.response_id)
+    }
+
+    fn start(&mut self) -> String {
         let mut out = String::new();
-        push_sse(
+        self.emit(
             &mut out,
             "response.created",
             json!({
@@ -4119,11 +4140,18 @@ impl AnthropicToResponsesTranslator {
                             self.running_output_chars += text.len();
                             self.saw_content = true;
                             if self.output_kind == SyntheticOutputKind::Message {
-                                self.start_text_item(out);
-                                push_sse(
+                                let index = self.start_text_item(out);
+                                let item_id = self.text_item_id(index);
+                                self.emit(
                                     out,
                                     "response.output_text.delta",
-                                    json!({"type": "response.output_text.delta", "delta": text}),
+                                    json!({
+                                        "type": "response.output_text.delta",
+                                        "item_id": item_id,
+                                        "output_index": index,
+                                        "content_index": 0,
+                                        "delta": text,
+                                    }),
                                 );
                             }
                         }
@@ -4148,21 +4176,27 @@ impl AnthropicToResponsesTranslator {
                     } else {
                         tool.input_json
                     };
+                    let output_index = self.output.len();
                     let item = json!({
                         "type": "function_call",
+                        "id": tool.id,
                         "name": tool.name,
                         "arguments": arguments,
                         "call_id": tool.id,
+                        "status": "completed",
                     });
-                    push_sse(
+                    self.output.push(Some(item.clone()));
+                    self.emit(
                         out,
                         "response.output_item.added",
-                        json!({"type": "response.output_item.added", "item": item}),
+                        json!({"type": "response.output_item.added",
+                               "output_index": output_index, "item": item}),
                     );
-                    push_sse(
+                    self.emit(
                         out,
                         "response.output_item.done",
-                        json!({"type": "response.output_item.done", "item": item}),
+                        json!({"type": "response.output_item.done",
+                               "output_index": output_index, "item": item}),
                     );
                 }
             }
@@ -4188,63 +4222,81 @@ impl AnthropicToResponsesTranslator {
         self.completed = true;
         let mut out = String::new();
         if !self.text.is_empty() {
+            let index = match self.text_output_index {
+                Some(index) => index,
+                None => {
+                    self.output.push(None);
+                    self.output.len() - 1
+                }
+            };
             let item = match self.output_kind {
                 SyntheticOutputKind::Message => json!({
                     "type": "message",
+                    "id": self.text_item_id(index),
+                    "status": "completed",
                     "role": "assistant",
-                    "content": [{"type": "output_text", "text": self.text}],
+                    "content": [{"type": "output_text", "text": self.text, "annotations": []}],
                     "phase": "final_answer",
                 }),
                 SyntheticOutputKind::Compaction => json!({
                     "type": "compaction",
+                    "id": self.text_item_id(index),
                     "encrypted_content": self.text,
                 }),
             };
-            push_sse(
+            self.output[index] = Some(item.clone());
+            self.emit(
                 &mut out,
                 "response.output_item.done",
-                json!({"type": "response.output_item.done", "item": item}),
+                json!({"type": "response.output_item.done", "output_index": index, "item": item}),
             );
         }
         let output_tokens = self.output_tokens_estimate();
-        push_sse(
+        let output: Vec<Value> = self.output.iter().flatten().cloned().collect();
+        let response = json!({
+            "id": self.response_id,
+            "object": "response",
+            "status": "completed",
+            "model": self.selected_model,
+            "output": output,
+            "usage": {
+                "input_tokens": self.input_tokens,
+                "input_tokens_details": {"cached_tokens": 0},
+                "output_tokens": output_tokens,
+                "output_tokens_details": {"reasoning_tokens": 0},
+                "total_tokens": self.input_tokens + output_tokens,
+            }
+        });
+        self.emit(
             &mut out,
             "response.completed",
-            json!({
-                "type": "response.completed",
-                "response": {
-                    "id": self.response_id,
-                    "status": "completed",
-                    "model": self.selected_model,
-                    "usage": {
-                        "input_tokens": self.input_tokens,
-                        "input_tokens_details": {"cached_tokens": 0},
-                        "output_tokens": output_tokens,
-                        "output_tokens_details": {"reasoning_tokens": 0},
-                        "total_tokens": self.input_tokens + output_tokens,
-                    }
-                }
-            }),
+            json!({"type": "response.completed", "response": response}),
         );
         out
     }
 
-    fn start_text_item(&mut self, out: &mut String) {
-        if self.text_item_started {
-            return;
+    /// Open the streamed text item, once, and return its output index.
+    fn start_text_item(&mut self, out: &mut String) -> usize {
+        if let Some(index) = self.text_output_index {
+            return index;
         }
-        self.text_item_started = true;
+        let index = self.output.len();
+        self.output.push(None);
+        self.text_output_index = Some(index);
         let item = json!({
             "type": "message",
+            "id": self.text_item_id(index),
+            "status": "in_progress",
             "role": "assistant",
             "content": [],
             "phase": "final_answer",
         });
-        push_sse(
+        self.emit(
             out,
             "response.output_item.added",
-            json!({"type": "response.output_item.added", "item": item}),
+            json!({"type": "response.output_item.added", "output_index": index, "item": item}),
         );
+        index
     }
 
     fn output_tokens_estimate(&self) -> u64 {
@@ -6237,6 +6289,129 @@ mod tests {
 
         assert!(out.contains("\"name\":\"codex.list_resource_templates\""));
         assert!(!out.contains(&format!("\"name\":\"{upstream_name}\"")));
+    }
+
+    /// Clients that take the turn's output from `response.completed` (Unreal
+    /// Agent's Go client) saw `Output: []` because the completed response had
+    /// no `output`. The completed response must carry every output item, in
+    /// order, and each item event its `output_index`, as OpenAI's stream does.
+    #[test]
+    fn anthropic_stream_translator_completed_response_carries_output() {
+        fn events(sse: &str) -> Vec<Value> {
+            sse.split("\n\n")
+                .filter_map(|raw| raw.lines().find_map(|line| line.strip_prefix("data: ")))
+                .map(|data| serde_json::from_str(data).expect("event json"))
+                .collect()
+        }
+        let mut translator = AnthropicToResponsesTranslator::new(
+            "resp_test".to_owned(),
+            "arc-swift".to_owned(),
+            3,
+            SyntheticOutputKind::Message,
+            ToolNameRewrites::default(),
+        );
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"input_tokens":1043}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Reading it."}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":1,
+                   "content_block":{"type":"tool_use","id":"call_1","name":"Bash","input":{}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":1,
+                   "delta":{"type":"input_json_delta","partial_json":"{\"command\":\"cat receipt.txt\"}"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":1}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_delta",
+            json!({"type":"message_delta","usage":{"output_tokens":54}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_stop",
+            json!({"type":"message_stop"}),
+        );
+        let mut sse = translator.start();
+        sse.push_str(&translator.push_bytes(upstream.as_bytes()));
+        let events = events(&sse);
+
+        let completed = events
+            .iter()
+            .find(|event| event["type"] == "response.completed")
+            .expect("response.completed");
+        let output = completed["response"]["output"]
+            .as_array()
+            .expect("output array");
+        assert_eq!(output.len(), 2, "{completed}");
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["content"][0]["text"], "Reading it.");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["name"], "Bash");
+        assert_eq!(output[1]["arguments"], "{\"command\":\"cat receipt.txt\"}");
+        assert_eq!(completed["response"]["object"], "response");
+
+        // Item events name their position, and every event its sequence.
+        for event in &events {
+            assert!(event["sequence_number"].is_u64(), "{event}");
+            let kind = event["type"].as_str().unwrap_or_default();
+            if kind.starts_with("response.output_item.") {
+                assert!(event["output_index"].is_u64(), "{event}");
+                assert!(event["item"]["id"].is_string(), "{event}");
+            }
+            if kind == "response.output_text.delta" {
+                assert_eq!(event["output_index"], 0, "{event}");
+            }
+        }
+        let done: Vec<_> = events
+            .iter()
+            .filter(|event| event["type"] == "response.output_item.done")
+            .map(|event| {
+                (
+                    event["output_index"].as_u64(),
+                    event["item"]["type"].clone(),
+                )
+            })
+            .collect();
+        assert!(done.contains(&(Some(0), json!("message"))), "{done:?}");
+        assert!(
+            done.contains(&(Some(1), json!("function_call"))),
+            "{done:?}"
+        );
+        let sequences: Vec<u64> = events
+            .iter()
+            .filter_map(|event| event["sequence_number"].as_u64())
+            .collect();
+        assert!(
+            sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "{sequences:?}"
+        );
     }
 
     #[test]
