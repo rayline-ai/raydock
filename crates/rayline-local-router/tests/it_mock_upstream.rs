@@ -1044,3 +1044,111 @@ async fn anthropic_messages_leaves_legacy_family_body_untouched() {
     let _ = std::fs::remove_file(path);
     println!("PASS legacy family body forwarded untouched: {sent}");
 }
+
+/// OpenAI-compatible-only harnesses speak Chat Completions. On an Anthropic
+/// route the router translates the request and answers in Chat Completions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_completions_translate_to_anthropic_and_back() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "tool_use", "id": "call_1", "name": "shell", "input": {"cmd": "ls"}}],
+            "stop_reason": "tool_use", "usage": {"input_tokens": 9, "output_tokens": 2}
+        })),
+        tx,
+    ));
+    let config = write_config(
+        "chat-inbound-anthropic",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&json!({"model": "m", "messages": [
+                          {"role": "system", "content": "Be brief."},
+                          {"role": "user", "content": "list files"}],
+                      "tools": [{"type": "function", "function": {"name": "shell",
+                                 "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let completion: Value = response.json().await.unwrap();
+    assert_eq!(completion["object"], "chat.completion");
+    let choice = &completion["choices"][0];
+    assert_eq!(choice["finish_reason"], "tool_calls");
+    assert_eq!(
+        choice["message"]["tool_calls"][0]["function"]["name"],
+        "shell"
+    );
+    assert_eq!(
+        choice["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"cmd\":\"ls\"}"
+    );
+    let forwarded = rx.await.expect("upstream saw the request");
+    assert!(forwarded.starts_with("POST /v1/messages"), "{forwarded}");
+    let sent: Value =
+        serde_json::from_str(forwarded.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(sent["system"], "Be brief.");
+    assert_eq!(sent["messages"][0]["content"][0]["text"], "list files");
+    assert_eq!(sent["tools"][0]["name"], "shell");
+    let _ = std::fs::remove_file(config);
+}
+
+/// On an OpenAI Chat route the request passes through with the routed model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_completions_pass_through_to_openai_chat() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "chatcmpl_1", "object": "chat.completion", "created": 1, "model": "routed",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "PONG"},
+                         "finish_reason": "stop"}]
+        })),
+        tx,
+    ));
+    let config = write_config(
+        "chat-inbound-openai",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "openai_chat",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}/v1"),
+                           "models": ["routed"]}],
+            "routes": {"main": {"endpoint": "up", "model": "routed"},
+                       "default": {"endpoint": "up", "model": "routed"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&json!({"model": "anything", "messages": [{"role": "user", "content": "ping"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let completion: Value = response.json().await.unwrap();
+    assert_eq!(completion["choices"][0]["message"]["content"], "PONG");
+    let forwarded = rx.await.expect("upstream saw the request");
+    assert!(
+        forwarded.starts_with("POST /v1/chat/completions"),
+        "{forwarded}"
+    );
+    let sent: Value =
+        serde_json::from_str(forwarded.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(sent["model"], "routed");
+    let _ = std::fs::remove_file(config);
+}
