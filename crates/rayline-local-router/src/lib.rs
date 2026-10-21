@@ -616,13 +616,15 @@ fn reject_untrusted_request(
         let content_type = headers
             .get(hyper::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok());
-        let is_json = content_type.is_some_and(|value| {
-            value
-                .split(';')
-                .next()
-                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        let mime = content_type.and_then(|value| value.split(';').next().map(str::trim));
+        let allowed = mime.is_some_and(|mime| {
+            mime.eq_ignore_ascii_case("application/json")
+                // OpenAI SDKs upload image edits as multipart; a browser that
+                // could send this cross-site still carries the Origin refused above.
+                || (uri.path() == "/v1/images/edits"
+                    && mime.eq_ignore_ascii_case("multipart/form-data"))
         });
-        if !is_json && (has_body || content_type.is_some()) {
+        if !allowed && (has_body || content_type.is_some()) {
             return forbidden(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "POST requests must use content-type application/json",
@@ -5588,6 +5590,19 @@ mod tests {
                 "{method} {headers:?}"
             );
         }
+        // OpenAI SDK image edits upload multipart; no other route accepts it.
+        const MULTIPART: GuardHeaders = &[
+            ("host", "127.0.0.1:20811"),
+            ("content-type", "multipart/form-data; boundary=x"),
+        ];
+        assert_eq!(
+            guard_status(Method::POST, "/v1/images/edits", MULTIPART, true),
+            None
+        );
+        assert_eq!(
+            guard_status(Method::POST, "/v1/messages", MULTIPART, true),
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
         // HTTP/2 carries the authority in the URI instead of a Host header.
         assert_eq!(
             guard_status(Method::GET, "http://127.0.0.1:20811/healthz", &[], false),
