@@ -917,7 +917,7 @@ async fn run_command_from_home(
         diag_print_preamble(&env_name, &router_url, request.routing_mode, home).await;
     }
 
-    let mut command = Command::new(&claude_bin);
+    let mut command = claude_command(&claude_bin);
     add_claude_bin_dir_to_child_path(&mut command, &claude_bin);
     let args = if request.diagnose {
         inject_claude_debug(&request.args)
@@ -1317,7 +1317,18 @@ fn configure_proxy_auth_env(command: &mut Command, routing_mode: RoutingMode) {
         command.env_remove("ANTHROPIC_BASE_URL");
         command.env_remove("ANTHROPIC_API_KEY");
     }
+}
+
+/// The Claude Code session command, with Rayline's router keys withheld in
+/// every mode. Claude Code never needs them: the proxy holds the key in proxy
+/// modes, and `--via env` passes it as `ANTHROPIC_AUTH_TOKEN`. Its Bash tool
+/// passes Claude Code's environment on to every command it runs, so a key
+/// left there would reach a model-visible `env` call.
+fn claude_command(claude_bin: &Path) -> Command {
+    let mut command = Command::new(claude_bin);
     command.env_remove("RAYLINE_ROUTER_API_KEY");
+    command.env_remove(crate::harness::KEY_ENV);
+    command
 }
 
 fn resolve_injector_port(explicit: Option<u16>) -> Result<u16, RunError> {
@@ -2669,6 +2680,41 @@ mod router_auto_compact_window_tests {
             assert!(error.contains(reason), "{error}");
             assert!(error.contains("--auto-compact-window <tokens>"), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod claude_command_tests {
+    use super::*;
+
+    /// A router key in the launcher's environment must not reach Claude Code,
+    /// whose Bash tool hands its environment to every command it runs.
+    #[cfg(unix)]
+    #[test]
+    fn claude_session_never_inherits_a_router_key() {
+        let vars = ["RAYLINE_ROUTER_API_KEY", crate::harness::KEY_ENV];
+        let previous: Vec<_> = vars.iter().map(env::var_os).collect();
+        for var in vars {
+            // SAFETY: tests run with --test-threads=1 (AGENTS.md), so no other
+            // thread reads the environment concurrently.
+            unsafe { env::set_var(var, "rlk-test-not-a-real-key") };
+        }
+        let output = claude_command(Path::new("/usr/bin/env"))
+            .output()
+            .expect("run env");
+        for (var, value) in vars.iter().zip(previous) {
+            // SAFETY: as above.
+            match value {
+                Some(value) => unsafe { env::set_var(var, value) },
+                None => unsafe { env::remove_var(var) },
+            }
+        }
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success());
+        assert!(
+            !printed.contains("rlk-test-not-a-real-key"),
+            "the Claude Code environment still carries a router key"
+        );
     }
 }
 
