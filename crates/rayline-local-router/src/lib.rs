@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::{Body as _, Frame, Incoming};
 use hyper::header::{HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode};
@@ -579,7 +579,91 @@ fn json_response(status: StatusCode, value: Value) -> Response<BoxBody> {
         .unwrap()
 }
 
+/// The router listens on loopback without auth and spends stored provider
+/// credentials, so refuse traffic a web page could originate: a cross-site
+/// `Origin`, a non-loopback `Host` (DNS rebinding), or a POST body that is not
+/// JSON (a CORS "simple" request that skips preflight).
+fn reject_untrusted_request(
+    method: &Method,
+    uri: &hyper::Uri,
+    headers: &HeaderMap,
+    has_body: bool,
+) -> Option<Response<BoxBody>> {
+    let forbidden = |status: StatusCode, message: &str| {
+        Some(json_response(
+            status,
+            json!({"type":"error","error":{"type":"permission_error","message":message}}),
+        ))
+    };
+    if let Some(origin) = headers.get(hyper::header::ORIGIN) {
+        if !origin.to_str().is_ok_and(is_loopback_url_authority) {
+            return forbidden(
+                StatusCode::FORBIDDEN,
+                "cross-origin requests are not allowed",
+            );
+        }
+    }
+    let host = match uri.authority() {
+        Some(authority) => Some(authority.as_str()),
+        None => headers
+            .get(hyper::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    };
+    if !host.is_some_and(|host| is_loopback_url_authority(&format!("http://{host}"))) {
+        return forbidden(StatusCode::FORBIDDEN, "host must be a loopback address");
+    }
+    if *method == Method::POST {
+        let content_type = headers
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+        let is_json = content_type.is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"))
+        });
+        if !is_json && (has_body || content_type.is_some()) {
+            return forbidden(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "POST requests must use content-type application/json",
+            );
+        }
+    }
+    None
+}
+
+/// True when `url` is an `http(s)://` origin whose host is `localhost` or a
+/// loopback IP, with no path, query or credentials.
+fn is_loopback_url_authority(url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let loopback = url.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    loopback
+        && matches!(url.scheme(), "http" | "https")
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.path() == "/"
+        && url.query().is_none()
+        && url.fragment().is_none()
+}
+
 async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
+    if let Some(rejection) = reject_untrusted_request(
+        req.method(),
+        req.uri(),
+        req.headers(),
+        !req.body().is_end_stream(),
+    ) {
+        return rejection;
+    }
     let path = req.uri().path().to_owned();
     let path_and_query = req
         .uri()
@@ -5451,6 +5535,148 @@ fn unix_now_secs() -> u64 {
 mod tests {
     use super::*;
     use rayline_metrics::MetricsSink as _;
+
+    type GuardHeaders = &'static [(&'static str, &'static str)];
+
+    fn guard_status(
+        method: Method,
+        uri: &str,
+        headers: GuardHeaders,
+        has_body: bool,
+    ) -> Option<StatusCode> {
+        let uri = uri.parse::<hyper::Uri>().unwrap();
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.append(*name, HeaderValue::from_static(value));
+        }
+        reject_untrusted_request(&method, &uri, &map, has_body).map(|response| response.status())
+    }
+
+    #[test]
+    fn request_guard_allows_loopback_clients() {
+        const JSON: (&str, &str) = ("content-type", "application/json");
+        let cases: &[(Method, GuardHeaders, bool)] = &[
+            (Method::GET, &[("host", "127.0.0.1:20811")], false),
+            (Method::GET, &[("host", "localhost:20811")], false),
+            (Method::GET, &[("host", "[::1]:20811")], false),
+            (Method::GET, &[("host", "127.0.0.1")], false),
+            (Method::POST, &[("host", "127.0.0.1:20811"), JSON], true),
+            (
+                Method::POST,
+                &[
+                    ("host", "127.0.0.1:20811"),
+                    ("content-type", "Application/JSON; charset=utf-8"),
+                ],
+                true,
+            ),
+            (
+                Method::POST,
+                &[
+                    ("host", "127.0.0.1:20811"),
+                    ("origin", "http://localhost:3000"),
+                    JSON,
+                ],
+                true,
+            ),
+            // A bodyless POST (e.g. a Responses cancel) carries no content type.
+            (Method::POST, &[("host", "127.0.0.1:20811")], false),
+        ];
+        for (method, headers, has_body) in cases {
+            assert_eq!(
+                guard_status(method.clone(), "/v1/messages", headers, *has_body),
+                None,
+                "{method} {headers:?}"
+            );
+        }
+        // HTTP/2 carries the authority in the URI instead of a Host header.
+        assert_eq!(
+            guard_status(Method::GET, "http://127.0.0.1:20811/healthz", &[], false),
+            None
+        );
+    }
+
+    #[test]
+    fn request_guard_rejects_browser_reachable_requests() {
+        const HOST: (&str, &str) = ("host", "127.0.0.1:20811");
+        const JSON: (&str, &str) = ("content-type", "application/json");
+        let cases: &[(Method, GuardHeaders, bool, StatusCode)] = &[
+            // Cross-site page (fetch/form) and opaque origins.
+            (
+                Method::POST,
+                &[HOST, JSON, ("origin", "https://evil.example")],
+                true,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::POST,
+                &[HOST, JSON, ("origin", "null")],
+                true,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::GET,
+                &[HOST, ("origin", "http://127.0.0.1.evil.example")],
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            // DNS rebinding: a loopback socket reached through an attacker hostname.
+            (
+                Method::GET,
+                &[("host", "evil.example:20811")],
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::GET,
+                &[("host", "evil.example@127.0.0.1:20811")],
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Method::GET,
+                &[("host", "localhost.evil.example")],
+                false,
+                StatusCode::FORBIDDEN,
+            ),
+            (Method::GET, &[], false, StatusCode::FORBIDDEN),
+            // CORS "simple" POSTs that skip preflight.
+            (
+                Method::POST,
+                &[HOST, ("content-type", "text/plain")],
+                true,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                Method::POST,
+                &[HOST, ("content-type", "application/x-www-form-urlencoded")],
+                true,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                Method::POST,
+                &[HOST, ("content-type", "text/plain")],
+                false,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                Method::POST,
+                &[HOST],
+                true,
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ];
+        for (method, headers, has_body, expected) in cases {
+            assert_eq!(
+                guard_status(method.clone(), "/v1/messages", headers, *has_body),
+                Some(*expected),
+                "{method} {headers:?}"
+            );
+        }
+        assert_eq!(
+            guard_status(Method::GET, "http://evil.example:20811/healthz", &[], false),
+            Some(StatusCode::FORBIDDEN)
+        );
+    }
 
     #[test]
     fn expected_local_adapter_redirect_accepts_loopback_responses() {

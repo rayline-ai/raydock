@@ -1044,3 +1044,59 @@ async fn anthropic_messages_leaves_legacy_family_body_untouched() {
     let _ = std::fs::remove_file(path);
     println!("PASS legacy family body forwarded untouched: {sent}");
 }
+
+/// Requests a web page could send to the loopback router (cross-site Origin,
+/// DNS-rebound Host, CORS "simple" POST) are refused before they reach the
+/// provider endpoint, so they cannot spend its stored credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_reachable_requests_never_reach_the_provider() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "local-openai",
+            "protocol": "openai_chat",
+            "base_url": format!("http://127.0.0.1:{up_port}/v1"),
+            "models": ["local-model-x"]
+        }],
+        "routes": {
+            "main": {"endpoint": "local-openai", "model": "local-model-x"},
+            "default": {"endpoint": "local-openai", "model": "local-model-x"}
+        }
+    });
+    let path = write_config("request-guard", &config);
+    start_router(port, path.clone()).await;
+
+    let url = format!("http://127.0.0.1:{port}/v1/messages");
+    let body = json!({"model": "rayline-router", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
+    let client = reqwest::Client::new();
+    let cross_origin = client
+        .post(&url)
+        .header("origin", "https://evil.example")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), 403);
+    let rebound = client
+        .post(&url)
+        .header("host", format!("evil.example:{port}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rebound.status(), 403);
+    let simple_post = client
+        .post(&url)
+        .header("content-type", "text/plain")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(simple_post.status(), 415);
+
+    let reached = tokio::time::timeout(Duration::from_millis(300), upstream.accept()).await;
+    assert!(reached.is_err(), "a guarded request reached the provider");
+    let _ = std::fs::remove_file(path);
+}
