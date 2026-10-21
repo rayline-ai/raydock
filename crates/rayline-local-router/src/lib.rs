@@ -30,6 +30,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+pub mod inbound_guard;
+pub use inbound_guard::InboundGuard;
+
 pub const DEFAULT_PORT: u16 = 20811;
 pub const DEFAULT_LOCAL_ADAPTER_PORT: u16 = 20808;
 pub const DEFAULT_VIRTUAL_MODEL: &str = "rayline-router";
@@ -62,6 +65,9 @@ pub struct LocalRouterOptions {
     /// Responses forward to the hosted RCR, and follow the RCR's 307 to the
     /// on-device adapter. Off for every other run.
     pub may_local_advertise: bool,
+    /// Loopback-only Host/Origin, JSON-only bodies and a per-instance token on
+    /// every request (`rayline claude-desktop`). `None` for every other run.
+    pub inbound_guard: Option<InboundGuard>,
 }
 
 impl Default for LocalRouterOptions {
@@ -73,6 +79,7 @@ impl Default for LocalRouterOptions {
             config_path: None,
             metrics: None,
             may_local_advertise: false,
+            inbound_guard: None,
         }
     }
 }
@@ -587,6 +594,14 @@ async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
         .map(|value| value.as_str().to_owned())
         .unwrap_or_else(|| path.clone());
     let method = req.method().clone();
+    if let Some(guard) = state.opts.inbound_guard.as_ref() {
+        if let Err(refusal) = guard.check(&method, &path, req.headers()) {
+            return json_response(
+                refusal.status,
+                json!({"type": "error", "error": {"type": refusal.kind, "message": refusal.message}}),
+            );
+        }
+    }
     match (method, path.as_str()) {
         (Method::GET, "/healthz") => healthz_response(&state),
         (Method::GET, "/v1/models" | "/v1/models/") => {

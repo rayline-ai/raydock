@@ -155,7 +155,7 @@ rayline router stop
 
 ## Claude Desktop (Code)
 
-`rayline claude app` connects Claude Code inside the Claude desktop app to ARC.
+`rayline claude-desktop` connects Claude Code inside the Claude desktop app to ARC.
 Desktop's Code sessions ignore `ANTHROPIC_BASE_URL`; they reach a gateway only
 through the app's third-party inference ("3P") mode, and Desktop accepts only
 model ids that look like Anthropic models. The launcher therefore:
@@ -171,21 +171,25 @@ model ids that look like Anthropic models. The launcher therefore:
   aliases instead, for a router that predates the bare ids), stamping `x-rayline-client: claude-desktop`. ARC is not
   a Claude model, and Rayline is not affiliated with Anthropic;
 - keeps your `rlk-` key in the router's environment only. Desktop gets
-  `http://127.0.0.1:20831` and a placeholder key through
+  `http://127.0.0.1:20831` and a random per-instance gateway token
+  (`~/.rayline/claude-desktop/gateway-token`, mode 600) through
   `~/.rayline/claude-desktop/claude-desktop-import.json`, which you load with
   **Developer → Configure Third-Party Inference… → Import configuration**,
   then **Apply Changes** and **Save & Restart**. The launcher never writes
-  Desktop's own configuration.
+  Desktop's own configuration. The router answers only requests that carry
+  that token, address a loopback Host on its port, carry no non-loopback
+  Origin, and send JSON, so other local processes and web pages (DNS
+  rebinding, cross-site `text/plain` posts) cannot spend on your account;
 
 ```bash
-rayline claude app                    # start or reuse the router; print the steps
-rayline --env dev claude app          # route to the dev environment instead
-rayline claude app status             # health, request totals, Desktop check
-rayline claude app validate           # Desktop's applied config vs. the router
-rayline claude app install-service    # LaunchAgent ai.rayline.claude-desktop
-rayline claude app stop
-rayline claude app off                # switch Desktop back to your subscription
-rayline claude app uninstall          # service + router state; Desktop untouched
+rayline claude-desktop                    # start or reuse the router; print the steps
+rayline --env dev claude-desktop          # route to the dev environment instead
+rayline claude-desktop status             # health, request totals, Desktop check
+rayline claude-desktop validate           # Desktop's applied config vs. the router
+rayline claude-desktop install-service    # LaunchAgent ai.rayline.claude-desktop
+rayline claude-desktop stop
+rayline claude-desktop off                # switch Desktop back to your subscription
+rayline claude-desktop uninstall          # service + router state; Desktop untouched
 ```
 
 3P mode applies to the whole Desktop app: it signs Desktop out of your

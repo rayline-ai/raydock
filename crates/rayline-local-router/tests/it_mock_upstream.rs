@@ -1044,3 +1044,119 @@ async fn anthropic_messages_leaves_legacy_family_body_untouched() {
     let _ = std::fs::remove_file(path);
     println!("PASS legacy family body forwarded untouched: {sent}");
 }
+
+/// `rayline claude-desktop`: with an inbound guard the router refuses every
+/// request that lacks the per-instance token, names a non-loopback Host
+/// (DNS rebinding) or Origin, or sends a non-JSON body — before anything is
+/// forwarded — and forwards an authorized request without leaking the token
+/// upstream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_guard_refuses_unauthorized_rebinding_and_non_json_requests() {
+    const TOKEN: &str = "rlt-it-guard-token-0123456789abcdef";
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "OK"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
+        })),
+        tx,
+    ));
+    let config = write_config(
+        "inbound-guard",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        inbound_guard: rayline_local_router::InboundGuard::new(TOKEN, port),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{port}");
+    for _ in 0..100 {
+        if client
+            .get(format!("{base}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let body = r#"{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}"#;
+    let post = |token: Option<&str>, content_type: &str| {
+        let mut request = client
+            .post(format!("{base}/v1/messages"))
+            .header("content-type", content_type)
+            .body(body);
+        if let Some(token) = token {
+            request = request.header("x-api-key", token);
+        }
+        request
+    };
+    assert_eq!(
+        post(None, "application/json")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        post(Some("rayline-local-placeholder"), "application/json")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        post(Some(TOKEN), "text/plain")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        415
+    );
+    assert_eq!(
+        post(Some(TOKEN), "application/json")
+            .header("host", format!("rebind.example:{port}"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        421
+    );
+    assert_eq!(
+        post(Some(TOKEN), "application/json")
+            .header("origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        403
+    );
+    let ok = post(Some(TOKEN), "application/json").send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+    let forwarded = rx.await.expect("upstream saw the authorized request");
+    assert!(
+        !forwarded.contains(TOKEN),
+        "the inbound token reached the upstream"
+    );
+    let _ = std::fs::remove_file(config);
+}

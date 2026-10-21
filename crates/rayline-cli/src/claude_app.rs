@@ -1,4 +1,4 @@
-//! `rayline claude app` — run Claude Code inside the **Claude desktop app**
+//! `rayline claude-desktop` — run Claude Code inside the **Claude desktop app**
 //! against ARC through Rayline Local.
 //!
 //! Claude Desktop's Code sessions ignore `ANTHROPIC_BASE_URL`; the only way to
@@ -85,9 +85,13 @@ pub const DESKTOP_MODELS: [DesktopModel; 2] = [
 ];
 /// `x-rayline-client` value stamped on every upstream request.
 pub const CLIENT_HEADER_VALUE: &str = "claude-desktop";
-/// Non-secret value Desktop stores as its gateway key. The local router ignores
-/// inbound credentials and authenticates upstream with the real key.
-pub const PLACEHOLDER_GATEWAY_KEY: &str = "rayline-local-placeholder";
+/// Prefix of the per-instance gateway token Desktop presents to the local
+/// router. The token only unlocks this loopback router; it is not a Rayline
+/// key and never leaves the machine.
+pub const GATEWAY_TOKEN_PREFIX: &str = "rlt-";
+/// Env var that disables every launchd action (the smoke test sets it so a
+/// throwaway HOME can never load, reuse or unload the user's login service).
+pub const NO_LAUNCHD_ENV: &str = "RAYLINE_CLAUDE_DESKTOP_NO_LAUNCHD";
 /// launchd label of the optional login service.
 pub const SERVICE_LABEL: &str = "ai.rayline.claude-desktop";
 const STATE_DIR: &str = "claude-desktop";
@@ -185,6 +189,8 @@ pub struct AppPaths {
     pub log_file: PathBuf,
     pub data_dir: PathBuf,
     pub launch_agent: PathBuf,
+    /// The per-instance gateway token (mode 0600).
+    pub token_file: PathBuf,
 }
 
 impl AppPaths {
@@ -196,6 +202,7 @@ impl AppPaths {
             pid_file: dir.join("rld.pid"),
             log_file: dir.join("rld.log"),
             data_dir: dir.join("data"),
+            token_file: dir.join("gateway-token"),
             launch_agent: home
                 .join("Library")
                 .join("LaunchAgents")
@@ -240,12 +247,12 @@ pub fn router_config_json(router_url: &str, style: IdStyle) -> Value {
 
 /// The configuration file the user loads with Desktop's **Import
 /// configuration**. Keys are Desktop's documented managed-configuration keys.
-pub fn desktop_import_json(gateway_url: &str) -> Value {
+pub fn desktop_import_json(gateway_url: &str, token: &str) -> Value {
     json!({
         "inferenceProvider": "gateway",
         "inferenceGatewayBaseUrl": gateway_url,
         "inferenceCredentialKind": "static",
-        "inferenceGatewayApiKey": PLACEHOLDER_GATEWAY_KEY,
+        "inferenceGatewayApiKey": token,
         "modelDiscoveryEnabled": false,
         "inferenceModels": DESKTOP_MODELS
             .iter()
@@ -253,6 +260,61 @@ pub fn desktop_import_json(gateway_url: &str) -> Value {
             .collect::<Vec<_>>(),
         "coworkTabEnabled": false
     })
+}
+
+/// A fresh gateway token: [`GATEWAY_TOKEN_PREFIX`] and 32 random bytes in hex.
+pub fn generate_gateway_token() -> io::Result<String> {
+    let mut bytes = [0u8; 32];
+    random_bytes(&mut bytes)?;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(format!("{GATEWAY_TOKEN_PREFIX}{hex}"))
+}
+
+#[cfg(unix)]
+fn random_bytes(buffer: &mut [u8]) -> io::Result<()> {
+    use std::io::Read;
+    fs::File::open("/dev/urandom")?.read_exact(buffer)
+}
+
+#[cfg(not(unix))]
+fn random_bytes(_buffer: &mut [u8]) -> io::Result<()> {
+    Err(io::Error::other(
+        "the Claude Desktop router is only supported on macOS and Linux",
+    ))
+}
+
+fn is_gateway_token(token: &str) -> bool {
+    token
+        .strip_prefix(GATEWAY_TOKEN_PREFIX)
+        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+/// Write `contents` readable only by the owner.
+fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// This instance's gateway token, created on first use and kept across
+/// restarts so an imported Desktop configuration stays valid.
+pub fn ensure_gateway_token(paths: &AppPaths) -> io::Result<String> {
+    if let Ok(existing) = fs::read_to_string(&paths.token_file) {
+        let existing = existing.trim();
+        if is_gateway_token(existing) {
+            return Ok(existing.to_owned());
+        }
+    }
+    let token = generate_gateway_token()?;
+    write_private(&paths.token_file, format!("{token}\n").as_bytes())?;
+    Ok(token)
 }
 
 /// Arguments for `rld serve` (after the binary).
@@ -297,12 +359,16 @@ where
         .collect()
 }
 
-fn rld_command(rld_bin: &Path, paths: &AppPaths, key: &str) -> Command {
+fn rld_command(rld_bin: &Path, paths: &AppPaths, key: &str, token: &str) -> Command {
     let mut command = Command::new(rld_bin);
     command.args(rld_args(paths, PORTS));
     command.env_clear();
     command.envs(scrubbed_env(std::env::vars_os()));
     command.env(ROUTER_KEY_ENV, key);
+    command.env(
+        rayline_local_router::inbound_guard::INBOUND_TOKEN_ENV,
+        token,
+    );
     command.env("RUST_LOG", "warn");
     command
 }
@@ -455,7 +521,11 @@ fn bool_like(value: Option<&Value>) -> Option<bool> {
 
 /// Check a Desktop third-party configuration against this instance. Reads key
 /// names and non-secret values only; the gateway key is never echoed.
-pub fn validate_desktop_config(config: &Value, gateway_url: &str) -> Vec<Finding> {
+pub fn validate_desktop_config(
+    config: &Value,
+    gateway_url: &str,
+    token: Option<&str>,
+) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut check = |ok: bool, message: String| findings.push(Finding { ok, message });
     let provider = config.get("inferenceProvider").and_then(Value::as_str);
@@ -477,19 +547,31 @@ pub fn validate_desktop_config(config: &Value, gateway_url: &str) -> Vec<Finding
             base_url.unwrap_or("unset")
         ),
     );
-    let has_key = config
+    let key = config
         .get("inferenceGatewayApiKey")
         .and_then(Value::as_str)
-        .is_some_and(|key| !key.is_empty());
-    check(
-        has_key,
-        if has_key {
-            "inferenceGatewayApiKey is set (value not shown; any value works)".to_owned()
-        } else {
-            "inferenceGatewayApiKey is empty (Desktop requires a value; use the placeholder)"
-                .to_owned()
-        },
-    );
+        .filter(|key| !key.is_empty());
+    let (key_ok, key_message) = match (key, token) {
+        (None, _) => (
+            false,
+            "inferenceGatewayApiKey is empty (re-import the configuration)",
+        ),
+        (Some(key), Some(token)) if key == token => (
+            true,
+            "inferenceGatewayApiKey matches this router's token (value not shown)",
+        ),
+        (Some(_), Some(_)) => (
+            false,
+            "inferenceGatewayApiKey does not match this router's token (value not shown); \
+             re-import the configuration",
+        ),
+        (Some(_), None) => (
+            false,
+            "inferenceGatewayApiKey is set, but this router has no token yet; run \
+             `rayline claude-desktop` and re-import",
+        ),
+    };
+    check(key_ok, key_message.to_owned());
     let models = json_or_string(config.get("inferenceModels"));
     let names: Vec<String> = models
         .as_ref()
@@ -564,7 +646,7 @@ fn render_findings(source: &Path, findings: &[Finding]) -> (bool, String) {
         out.push('\n');
     }
     if !ok {
-        out.push_str("Re-import the file `rayline claude app` prints, then Apply Changes.\n");
+        out.push_str("Re-import the file `rayline claude-desktop` prints, then Apply Changes.\n");
     }
     (ok, out)
 }
@@ -579,7 +661,7 @@ fn xml_escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// LaunchAgent that runs `rayline [--env <env>] claude app serve` at login. The
+/// LaunchAgent that runs `rayline [--env <env>] claude-desktop serve` at login. The
 /// plist carries no secret: `serve` reads the key from Rayline's credentials.
 pub fn launch_agent_plist(
     rayline_bin: &Path,
@@ -592,7 +674,7 @@ pub fn launch_agent_plist(
         program.push("--env".to_owned());
         program.push(env.to_owned());
     }
-    program.extend(["claude", "app", "serve"].map(str::to_owned));
+    program.extend(["claude-desktop", "serve"].map(str::to_owned));
     if style == IdStyle::Prefixed {
         program.push("--prefixed-ids".to_owned());
     }
@@ -631,8 +713,14 @@ fn launchd_domain() -> String {
     String::new()
 }
 
+/// launchd actions run only on macOS, and never when [`NO_LAUNCHD_ENV`] is
+/// set (an isolated test HOME must not touch the user's real login service).
+fn launchd_enabled() -> bool {
+    cfg!(target_os = "macos") && std::env::var_os(NO_LAUNCHD_ENV).is_none()
+}
+
 fn service_loaded() -> bool {
-    cfg!(target_os = "macos")
+    launchd_enabled()
         && Command::new("launchctl")
             .args(["print", &format!("{}/{SERVICE_LABEL}", launchd_domain())])
             .stdout(Stdio::null())
@@ -641,13 +729,46 @@ fn service_loaded() -> bool {
             .is_ok_and(|status| status.success())
 }
 
-fn bootout_service() {
-    if cfg!(target_os = "macos") {
-        let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{}/{SERVICE_LABEL}", launchd_domain())])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+/// Unload the login service if it is loaded. A failure that leaves it loaded
+/// is reported, not ignored.
+fn bootout_service() -> Result<bool, String> {
+    if !service_loaded() {
+        return Ok(false);
+    }
+    let output = Command::new("launchctl")
+        .args(["bootout", &format!("{}/{SERVICE_LABEL}", launchd_domain())])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("launchctl bootout failed to run: {error}"))?;
+    if !output.status.success() && service_loaded() {
+        return Err(format!(
+            "launchctl bootout {SERVICE_LABEL} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(true)
+}
+
+fn bootstrap_service(plist: &Path) -> Result<(), String> {
+    let output = Command::new("launchctl")
+        .args([
+            OsStr::new("bootstrap"),
+            OsStr::new(&launchd_domain()),
+            plist.as_os_str(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("launchctl bootstrap failed to run: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "launchctl bootstrap failed for {} ({}): {}",
+            plist.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
     }
 }
 
@@ -689,16 +810,21 @@ fn write_json(path: &Path, value: &Value) -> io::Result<()> {
 
 /// Write the router config and the Desktop import file. Returns whether the
 /// router config changed (a running router must restart to pick it up).
-fn write_instance_files(paths: &AppPaths, router_url: &str, style: IdStyle) -> io::Result<bool> {
+fn write_instance_files(
+    paths: &AppPaths,
+    router_url: &str,
+    style: IdStyle,
+    token: &str,
+) -> io::Result<bool> {
     let router = router_config_json(router_url, style);
     let previous = fs::read(&paths.router_config)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
     write_json(&paths.router_config, &router)?;
-    write_json(
-        &paths.desktop_import,
-        &desktop_import_json(&gateway_url(PORTS)),
-    )?;
+    let mut import = serde_json::to_vec_pretty(&desktop_import_json(&gateway_url(PORTS), token))
+        .map_err(io::Error::other)?;
+    import.push(b'\n');
+    write_private(&paths.desktop_import, &import)?;
     Ok(previous.as_ref() != Some(&router))
 }
 
@@ -708,6 +834,18 @@ async fn router_healthy(client: &reqwest::Client) -> bool {
         .send()
         .await
         .is_ok_and(|response| response.status().is_success())
+}
+
+/// Whether the running router enforces the inbound guard: an unauthenticated
+/// request must be refused. A router started before the guard existed is not.
+async fn router_guarded(client: &reqwest::Client) -> bool {
+    client
+        .post(format!("{}/v1/messages", gateway_url(PORTS)))
+        .header("content-type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
 }
 
 async fn wait_healthy(client: &reqwest::Client, pid: Option<i32>) -> bool {
@@ -746,7 +884,7 @@ Rayline ARC gateway for Claude Desktop is running.
 
 Before you continue: third-party mode applies to the whole Claude Desktop app.
 It signs Desktop out of your claude.ai subscription, and Chat and Cowork are
-off while it is active. Run `rayline claude app off` to see how to switch back.
+off while it is active. Run `rayline claude-desktop off` to see how to switch back.
 
 Connect Claude Desktop (once):
   1. Open Claude Desktop. From the menu bar choose Help > Troubleshooting >
@@ -757,8 +895,8 @@ Connect Claude Desktop (once):
   5. On the sign-in screen, choose to continue with the configured gateway.
   6. Open Code and pick arc-sage, or arc-swift for the cheaper tier.
 
-Check the setup with `rayline claude app validate`. Keep the router running
-across logins with `rayline claude app install-service`.
+Check the setup with `rayline claude-desktop validate`. Keep the router running
+across logins with `rayline claude-desktop install-service`.
 Anthropic does not support routing Claude Code to non-Claude models through a
 gateway, so a Desktop update can change this behaviour.
 ",
@@ -827,21 +965,40 @@ async fn start(request: &AppRequest) -> Result<String, String> {
     )
     .await
     .map_err(|error| error.to_string())?;
-    let changed = write_instance_files(&paths, &resolved.router_url, request.id_style)
+    let token = ensure_gateway_token(&paths)
+        .map_err(|error| format!("failed to create the gateway token: {error}"))?;
+    let changed = write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
         .map_err(|error| format!("failed to write {}: {error}", paths.dir.display()))?;
     let client = http_client();
     let instructions = setup_instructions(&paths, &resolved.router_url);
 
     if service_loaded() {
-        if changed {
-            // launchd restarts the job with the new config.
-            let _ = Command::new("launchctl")
+        // The service runs with the settings in its plist. Rewrite it for this
+        // request's environment and id style first, so a restart can never
+        // serve one environment while this command reports another.
+        let rayline_bin = std::env::current_exe().map_err(|error| error.to_string())?;
+        let env_name = request.root_env_explicit.then_some(resolved.env.as_str());
+        let plist = launch_agent_plist(&rayline_bin, env_name, request.id_style, &paths);
+        let current = fs::read_to_string(&paths.launch_agent).unwrap_or_default();
+        if current != plist {
+            bootout_service()?;
+            fs::write(&paths.launch_agent, &plist).map_err(|error| error.to_string())?;
+            bootstrap_service(&paths.launch_agent)?;
+        } else if changed || !router_guarded(&client).await {
+            let status = Command::new("launchctl")
                 .args([
                     "kickstart",
                     "-k",
                     &format!("{}/{SERVICE_LABEL}", launchd_domain()),
                 ])
-                .status();
+                .stdin(Stdio::null())
+                .status()
+                .map_err(|error| format!("launchctl kickstart failed to run: {error}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "launchctl kickstart {SERVICE_LABEL} failed ({status})"
+                ));
+            }
         }
         if !wait_healthy(&client, None).await {
             return Err(format!(
@@ -861,7 +1018,7 @@ async fn start(request: &AppRequest) -> Result<String, String> {
         ),
         StopTarget::Ours(_)
     );
-    if running && !changed && router_healthy(&client).await {
+    if running && !changed && router_healthy(&client).await && router_guarded(&client).await {
         return Ok(instructions);
     }
     if running {
@@ -883,7 +1040,7 @@ async fn start(request: &AppRequest) -> Result<String, String> {
         .append(true)
         .open(&paths.log_file)
         .map_err(|error| error.to_string())?;
-    let mut command = rld_command(&rld_bin, &paths, &key);
+    let mut command = rld_command(&rld_bin, &paths, &key, &token);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::from(
@@ -933,14 +1090,15 @@ fn serve(request: &AppRequest) -> Result<String, String> {
             )
         },
     )?;
-    write_instance_files(&paths, &resolved.router_url, request.id_style)
+    let token = ensure_gateway_token(&paths).map_err(|error| error.to_string())?;
+    write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
         .map_err(|error| error.to_string())?;
     fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
     let rld_bin =
         crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
     fs::write(&paths.pid_file, format!("{}\n", std::process::id()))
         .map_err(|error| error.to_string())?;
-    let mut command = rld_command(&rld_bin, &paths, &key);
+    let mut command = rld_command(&rld_bin, &paths, &key, &token);
     exec(&mut command)
 }
 
@@ -1010,16 +1168,20 @@ fn validate(request: &AppRequest) -> Result<String, String> {
         None => applied_desktop_config_path(&home).map_err(|error| {
             format!(
                 "could not read Claude Desktop's applied third-party configuration \
-                 ({error}). Import the file from `rayline claude app` first.\n"
+                 ({error}). Import the file from `rayline claude-desktop` first.\n"
             )
         })?,
     };
     let bytes = fs::read(&source).map_err(|error| format!("{}: {error}\n", source.display()))?;
     let config: Value = serde_json::from_slice(&bytes)
         .map_err(|error| format!("{}: {error}\n", source.display()))?;
+    let token = fs::read_to_string(AppPaths::new(&home).token_file)
+        .ok()
+        .map(|token| token.trim().to_owned())
+        .filter(|token| is_gateway_token(token));
     let (ok, report) = render_findings(
         &source,
-        &validate_desktop_config(&config, &gateway_url(PORTS)),
+        &validate_desktop_config(&config, &gateway_url(PORTS), token.as_deref()),
     );
     if ok { Ok(report) } else { Err(report) }
 }
@@ -1027,8 +1189,7 @@ fn validate(request: &AppRequest) -> Result<String, String> {
 fn stop() -> Result<String, String> {
     let paths = home_paths()?;
     let mut out = String::new();
-    if service_loaded() {
-        bootout_service();
+    if bootout_service()? {
         out.push_str(&format!(
             "Unloaded the login service until next login ({SERVICE_LABEL}).\n"
         ));
@@ -1040,8 +1201,10 @@ fn stop() -> Result<String, String> {
 }
 
 async fn install_service(request: &AppRequest) -> Result<String, String> {
-    if !cfg!(target_os = "macos") {
-        return Err("the login service is only supported on macOS".to_owned());
+    if !launchd_enabled() {
+        return Err(format!(
+            "the login service is only supported on macOS, and not with {NO_LAUNCHD_ENV} set"
+        ));
     }
     let resolved = resolve(request)?;
     let paths = AppPaths::new(&resolved.home);
@@ -1054,11 +1217,12 @@ async fn install_service(request: &AppRequest) -> Result<String, String> {
     )
     .await
     .map_err(|error| error.to_string())?;
-    write_instance_files(&paths, &resolved.router_url, request.id_style)
+    let token = ensure_gateway_token(&paths).map_err(|error| error.to_string())?;
+    write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
         .map_err(|error| error.to_string())?;
     // Hand the ports over from a detached instance to launchd.
     stop_instance(&paths).map_err(|error| error.to_string())?;
-    bootout_service();
+    bootout_service()?;
     let rayline_bin = std::env::current_exe().map_err(|error| error.to_string())?;
     let env_name = request.root_env_explicit.then_some(resolved.env.as_str());
     if let Some(dir) = paths.launch_agent.parent() {
@@ -1069,20 +1233,7 @@ async fn install_service(request: &AppRequest) -> Result<String, String> {
         launch_agent_plist(&rayline_bin, env_name, request.id_style, &paths),
     )
     .map_err(|error| error.to_string())?;
-    let status = Command::new("launchctl")
-        .args([
-            OsStr::new("bootstrap"),
-            OsStr::new(&launchd_domain()),
-            paths.launch_agent.as_os_str(),
-        ])
-        .status()
-        .map_err(|error| error.to_string())?;
-    if !status.success() {
-        return Err(format!(
-            "launchctl bootstrap failed for {}",
-            paths.launch_agent.display()
-        ));
-    }
+    bootstrap_service(&paths.launch_agent)?;
     if !wait_healthy(&http_client(), None).await {
         return Err(format!(
             "the login service started but the router is not answering; see {}",
@@ -1097,7 +1248,7 @@ async fn install_service(request: &AppRequest) -> Result<String, String> {
 
 fn uninstall_service() -> Result<String, String> {
     let paths = home_paths()?;
-    bootout_service();
+    bootout_service()?;
     match fs::remove_file(&paths.launch_agent) {
         Ok(()) => Ok(format!(
             "Removed the login service ({}).\n",
@@ -1143,6 +1294,87 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(&home).expect("create temp home");
         home
+    }
+
+    const TEST_TOKEN: &str = "rlt-0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[test]
+    fn gateway_token_is_random_private_and_stable() {
+        let home = temp_home();
+        let paths = AppPaths::new(&home);
+        let first = ensure_gateway_token(&paths).expect("token");
+        assert!(is_gateway_token(&first), "{first}");
+        assert_eq!(ensure_gateway_token(&paths).expect("token again"), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&paths.token_file)
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_ne!(generate_gateway_token().expect("other"), first);
+        // A corrupted file is replaced, never trusted.
+        fs::write(&paths.token_file, "rayline-local-placeholder").expect("corrupt");
+        let replaced = ensure_gateway_token(&paths).expect("replaced");
+        assert!(is_gateway_token(&replaced));
+        assert_ne!(replaced, first);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn import_file_is_private_and_carries_the_token() {
+        let home = temp_home();
+        let paths = AppPaths::new(&home);
+        let token = ensure_gateway_token(&paths).expect("token");
+        write_instance_files(&paths, "https://api.rayline.ai", IdStyle::Bare, &token)
+            .expect("files");
+        let import: Value =
+            serde_json::from_slice(&fs::read(&paths.desktop_import).expect("read")).expect("json");
+        assert_eq!(import["inferenceGatewayApiKey"], json!(token));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&paths.desktop_import)
+                .expect("meta")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // The router config references the key by env name and holds no token.
+        let router = fs::read_to_string(&paths.router_config).expect("router");
+        assert!(!router.contains(&token));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn validation_flags_a_stale_token_without_echoing_it() {
+        let config = desktop_import_json(&gateway_url(PORTS), TEST_TOKEN);
+        let other = "rlt-1111111111111111111111111111111111111111111111111111111111111111";
+        let findings = validate_desktop_config(&config, &gateway_url(PORTS), Some(other));
+        let key = findings
+            .iter()
+            .find(|finding| finding.message.contains("inferenceGatewayApiKey"))
+            .expect("key finding");
+        assert!(!key.ok);
+        assert!(
+            findings
+                .iter()
+                .all(|f| !f.message.contains(TEST_TOKEN) && !f.message.contains(other))
+        );
+    }
+
+    #[test]
+    fn rld_command_carries_the_inbound_token_env() {
+        let paths = AppPaths::new(Path::new("/home/u"));
+        let command = rld_command(Path::new("/bin/rld"), &paths, "rlk-k", TEST_TOKEN);
+        let token_env = command
+            .get_envs()
+            .find(|(name, _)| *name == rayline_local_router::inbound_guard::INBOUND_TOKEN_ENV)
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        assert_eq!(token_env.as_deref(), Some(TEST_TOKEN));
     }
 
     #[test]
@@ -1222,7 +1454,7 @@ mod tests {
     fn router_config_never_contains_a_key() {
         let text = router_config_json("https://api.rayline.ai", IdStyle::Bare).to_string();
         assert!(!text.contains("rlk-"));
-        let import = desktop_import_json(&gateway_url(PORTS)).to_string();
+        let import = desktop_import_json(&gateway_url(PORTS), TEST_TOKEN).to_string();
         assert!(!import.contains("rlk-"));
     }
 
@@ -1232,7 +1464,7 @@ mod tests {
             "inferenceProvider": "gateway",
             "inferenceGatewayBaseUrl": "http://127.0.0.1:20831",
             "inferenceCredentialKind": "static",
-            "inferenceGatewayApiKey": "rayline-local-placeholder",
+            "inferenceGatewayApiKey": TEST_TOKEN,
             "modelDiscoveryEnabled": false,
             "inferenceModels": [
                 { "name": "claude-arc-sage", "labelOverride": "arc-sage" },
@@ -1240,14 +1472,18 @@ mod tests {
             ],
             "coworkTabEnabled": false
         });
-        assert_eq!(desktop_import_json(&gateway_url(PORTS)), expected);
+        assert_eq!(
+            desktop_import_json(&gateway_url(PORTS), TEST_TOKEN),
+            expected
+        );
     }
 
     #[test]
     fn generated_import_validates() {
         let findings = validate_desktop_config(
-            &desktop_import_json(&gateway_url(PORTS)),
+            &desktop_import_json(&gateway_url(PORTS), TEST_TOKEN),
             &gateway_url(PORTS),
+            Some(TEST_TOKEN),
         );
         assert!(findings.iter().all(|finding| finding.ok), "{findings:?}");
     }
@@ -1257,11 +1493,11 @@ mod tests {
         let config = json!({
             "inferenceProvider": "gateway",
             "inferenceGatewayBaseUrl": "http://127.0.0.1:20831/",
-            "inferenceGatewayApiKey": "anything",
+            "inferenceGatewayApiKey": TEST_TOKEN,
             "modelDiscoveryEnabled": "false",
             "inferenceModels": "[\"claude-arc-sage\", \"claude-arc-swift\"]"
         });
-        let findings = validate_desktop_config(&config, &gateway_url(PORTS));
+        let findings = validate_desktop_config(&config, &gateway_url(PORTS), Some(TEST_TOKEN));
         assert!(findings.iter().all(|finding| finding.ok), "{findings:?}");
 
         let wrong = json!({
@@ -1270,9 +1506,9 @@ mod tests {
             "inferenceGatewayApiKey": "rlk-secret-value",
             "inferenceModels": [{ "name": "claude-sonnet-5" }]
         });
-        let findings = validate_desktop_config(&wrong, &gateway_url(PORTS));
+        let findings = validate_desktop_config(&wrong, &gateway_url(PORTS), Some(TEST_TOKEN));
         let failed: Vec<_> = findings.iter().filter(|finding| !finding.ok).collect();
-        assert_eq!(failed.len(), 3, "{findings:?}");
+        assert_eq!(failed.len(), 4, "{findings:?}");
         // The gateway key value is never echoed.
         assert!(
             findings
@@ -1479,7 +1715,7 @@ mod tests {
         );
         assert!(plist.contains("<string>ai.rayline.claude-desktop</string>"));
         assert!(plist.contains(
-            "<string>/home/u/.rayline/bin/rayline</string>\n\t\t<string>--env</string>\n\t\t<string>dev</string>\n\t\t<string>claude</string>\n\t\t<string>app</string>\n\t\t<string>serve</string>"
+            "<string>/home/u/.rayline/bin/rayline</string>\n\t\t<string>--env</string>\n\t\t<string>dev</string>\n\t\t<string>claude-desktop</string>\n\t\t<string>serve</string>"
         ));
         assert!(!plist.contains("rlk-"));
         assert!(!plist.contains(ROUTER_KEY_ENV));
