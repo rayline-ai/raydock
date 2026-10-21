@@ -9,7 +9,12 @@ RAYLINE=${RAYLINE:-$REPO/target/debug/rayline}
 export RLD_BIN=${RLD_BIN:-$REPO/target/debug/rld}
 CLAUDE=${CLAUDE:-$(command -v claude)}
 # Desktop's hidden model ids and the ARC tier each must route to.
-MODELS="claude-arc-sage=rayline/arc-sage claude-arc-swift=rayline/arc-swift"
+# PREFIXED_IDS=1 checks the --prefixed-ids fallback (rayline/arc-*).
+if [ -n "${PREFIXED_IDS:-}" ]; then
+  MODELS="claude-arc-sage=rayline/arc-sage claude-arc-swift=rayline/arc-swift"; START_FLAGS="--prefixed-ids"
+else
+  MODELS="claude-arc-sage=arc-sage claude-arc-swift=arc-swift"; START_FLAGS=""
+fi
 OUT=$(mktemp -d "${TMPDIR:-/tmp}/claude-app-smoke.XXXXXX")
 H=$OUT/home
 mkdir -p "$H/.config/rayline" "$H/work"
@@ -33,7 +38,7 @@ PY
 run() { env -i PATH="$PATH" HOME="$H" RLD_BIN="$RLD_BIN" TERM=dumb "$@"; }
 
 echo "== rayline claude app (start)"
-run "$RAYLINE" claude app </dev/null | tee "$OUT/start.txt"
+run "$RAYLINE" claude app $START_FLAGS </dev/null | tee "$OUT/start.txt"
 echo "== validate the generated import file"
 run "$RAYLINE" claude app validate --desktop-config "$H/.rayline/claude-desktop/claude-desktop-import.json"
 if grep -q 'rlk-' "$H/.rayline/claude-desktop/"*.json; then echo "FAIL: key in instance files"; exit 1; fi

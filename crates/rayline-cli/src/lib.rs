@@ -173,6 +173,10 @@ Commands:
   uninstall          Remove the service, the router state and its files
 
 Options:
+  --prefixed-ids            start/install-service: forward the prefixed
+                            rayline/arc-* aliases instead of the bare
+                            arc-sage/arc-swift ids (for a router that does
+                            not serve the bare ids yet)
   --desktop-config <path>   validate: check this file instead of Desktop's
   --help                    Show this message and exit
 ";
@@ -1513,6 +1517,7 @@ where
 {
     let mut action = None;
     let mut desktop_config = None;
+    let mut id_style = crate::claude_app::IdStyle::Bare;
     let mut args = args;
     while let Some(arg) = args.next() {
         let arg_str = arg.to_str()?;
@@ -1527,6 +1532,7 @@ where
         }
         match arg_str {
             "--desktop-config" => desktop_config = Some(PathBuf::from(args.next()?)),
+            "--prefixed-ids" => id_style = crate::claude_app::IdStyle::Prefixed,
             _ if arg_str.starts_with('-') => return None,
             _ if action.is_none() => action = Some(crate::claude_app::AppAction::parse(arg_str)?),
             _ => return None,
@@ -1536,9 +1542,20 @@ where
     if desktop_config.is_some() && !matches!(action, crate::claude_app::AppAction::Validate) {
         return None;
     }
+    if id_style == crate::claude_app::IdStyle::Prefixed
+        && !matches!(
+            action,
+            crate::claude_app::AppAction::Start
+                | crate::claude_app::AppAction::Serve
+                | crate::claude_app::AppAction::InstallService
+        )
+    {
+        return None;
+    }
     Some(crate::claude_app::AppRequest {
         action,
         desktop_config,
+        id_style,
         env_name: root_env,
         auth_token: root_auth_token,
         root_env_explicit,
@@ -3137,6 +3154,33 @@ mod tests {
             }
             other => panic!("expected ClaudeApp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn claude_app_dispatch_parses_prefixed_ids_fallback() {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "claude", "app", "--prefixed-ids"])) {
+            RaylineDispatch::ClaudeApp(request) => {
+                assert_eq!(request.action, crate::claude_app::AppAction::Start);
+                assert_eq!(request.id_style, crate::claude_app::IdStyle::Prefixed);
+            }
+            other => panic!("expected ClaudeApp, got {other:?}"),
+        }
+        match rayline_dispatch_for_argv(&argv(&["rayline", "claude", "app"])) {
+            RaylineDispatch::ClaudeApp(request) => {
+                assert_eq!(request.id_style, crate::claude_app::IdStyle::Bare);
+            }
+            other => panic!("expected ClaudeApp, got {other:?}"),
+        }
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&[
+                "rayline",
+                "claude",
+                "app",
+                "status",
+                "--prefixed-ids"
+            ])),
+            RaylineDispatch::Unavailable
+        );
     }
 
     #[test]

@@ -39,8 +39,32 @@ pub struct DesktopModel {
     pub id: &'static str,
     /// The model-picker label Desktop shows (`labelOverride`).
     pub label: &'static str,
-    /// The hosted ARC tier the id is routed to.
+    /// The hosted ARC tier the id is routed to: the bare first-party id.
     pub arc_model: &'static str,
+    /// The same tier's prefixed alias, which hosted routers that predate the
+    /// bare ids accept. Used only with [`IdStyle::Prefixed`].
+    pub prefixed_model: &'static str,
+}
+
+/// Which spelling of the tier ids the router forwards upstream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum IdStyle {
+    /// Bare first-party ids (`arc-sage`, `arc-swift`).
+    #[default]
+    Bare,
+    /// Prefixed aliases (`rayline/arc-sage`, `rayline/arc-swift`), a fallback
+    /// for a hosted router that does not serve the bare ids yet.
+    Prefixed,
+}
+
+impl DesktopModel {
+    /// The upstream id for this tier under `style`.
+    pub fn upstream(&self, style: IdStyle) -> &'static str {
+        match style {
+            IdStyle::Bare => self.arc_model,
+            IdStyle::Prefixed => self.prefixed_model,
+        }
+    }
 }
 
 /// The models the import offers, default first (Desktop's first
@@ -49,12 +73,14 @@ pub const DESKTOP_MODELS: [DesktopModel; 2] = [
     DesktopModel {
         id: "claude-arc-sage",
         label: "arc-sage",
-        arc_model: "rayline/arc-sage",
+        arc_model: "arc-sage",
+        prefixed_model: "rayline/arc-sage",
     },
     DesktopModel {
         id: "claude-arc-swift",
         label: "arc-swift",
-        arc_model: "rayline/arc-swift",
+        arc_model: "arc-swift",
+        prefixed_model: "rayline/arc-swift",
     },
 ];
 /// `x-rayline-client` value stamped on every upstream request.
@@ -141,6 +167,8 @@ pub struct AppRequest {
     pub action: AppAction,
     /// `validate`: check this file instead of Desktop's applied configuration.
     pub desktop_config: Option<PathBuf>,
+    /// Upstream tier-id spelling (`--prefixed-ids` selects the fallback).
+    pub id_style: IdStyle,
     pub env_name: Option<String>,
     pub auth_token: Option<String>,
     pub root_env_explicit: bool,
@@ -180,14 +208,17 @@ impl AppPaths {
 /// Router config: each Desktop id is routed to its ARC tier by an explicit
 /// `model_routes` entry; any other id (main, subagent or default) goes to the
 /// default tier. The key is referenced by env var name only.
-pub fn router_config_json(router_url: &str) -> Value {
+pub fn router_config_json(router_url: &str, style: IdStyle) -> Value {
     let target = |arc_model: &str| json!({ "endpoint": ENDPOINT_ID, "model": arc_model });
-    let default = target(DESKTOP_MODELS[0].arc_model);
+    let default = target(DESKTOP_MODELS[0].upstream(style));
     let model_routes: serde_json::Map<String, Value> = DESKTOP_MODELS
         .iter()
-        .map(|model| (model.id.to_owned(), target(model.arc_model)))
+        .map(|model| (model.id.to_owned(), target(model.upstream(style))))
         .collect();
-    let upstream: Vec<&str> = DESKTOP_MODELS.iter().map(|model| model.arc_model).collect();
+    let upstream: Vec<&str> = DESKTOP_MODELS
+        .iter()
+        .map(|model| model.upstream(style))
+        .collect();
     json!({
         "endpoints": [{
             "id": ENDPOINT_ID,
@@ -550,13 +581,21 @@ fn xml_escape(text: &str) -> String {
 
 /// LaunchAgent that runs `rayline [--env <env>] claude app serve` at login. The
 /// plist carries no secret: `serve` reads the key from Rayline's credentials.
-pub fn launch_agent_plist(rayline_bin: &Path, env_name: Option<&str>, paths: &AppPaths) -> String {
+pub fn launch_agent_plist(
+    rayline_bin: &Path,
+    env_name: Option<&str>,
+    style: IdStyle,
+    paths: &AppPaths,
+) -> String {
     let mut program = vec![rayline_bin.to_string_lossy().into_owned()];
     if let Some(env) = env_name {
         program.push("--env".to_owned());
         program.push(env.to_owned());
     }
     program.extend(["claude", "app", "serve"].map(str::to_owned));
+    if style == IdStyle::Prefixed {
+        program.push("--prefixed-ids".to_owned());
+    }
     let arguments: String = program
         .iter()
         .map(|arg| format!("\t\t<string>{}</string>\n", xml_escape(arg)))
@@ -650,8 +689,8 @@ fn write_json(path: &Path, value: &Value) -> io::Result<()> {
 
 /// Write the router config and the Desktop import file. Returns whether the
 /// router config changed (a running router must restart to pick it up).
-fn write_instance_files(paths: &AppPaths, router_url: &str) -> io::Result<bool> {
-    let router = router_config_json(router_url);
+fn write_instance_files(paths: &AppPaths, router_url: &str, style: IdStyle) -> io::Result<bool> {
+    let router = router_config_json(router_url, style);
     let previous = fs::read(&paths.router_config)
         .ok()
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
@@ -788,7 +827,7 @@ async fn start(request: &AppRequest) -> Result<String, String> {
     )
     .await
     .map_err(|error| error.to_string())?;
-    let changed = write_instance_files(&paths, &resolved.router_url)
+    let changed = write_instance_files(&paths, &resolved.router_url, request.id_style)
         .map_err(|error| format!("failed to write {}: {error}", paths.dir.display()))?;
     let client = http_client();
     let instructions = setup_instructions(&paths, &resolved.router_url);
@@ -894,7 +933,8 @@ fn serve(request: &AppRequest) -> Result<String, String> {
             )
         },
     )?;
-    write_instance_files(&paths, &resolved.router_url).map_err(|error| error.to_string())?;
+    write_instance_files(&paths, &resolved.router_url, request.id_style)
+        .map_err(|error| error.to_string())?;
     fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
     let rld_bin =
         crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
@@ -1014,7 +1054,8 @@ async fn install_service(request: &AppRequest) -> Result<String, String> {
     )
     .await
     .map_err(|error| error.to_string())?;
-    write_instance_files(&paths, &resolved.router_url).map_err(|error| error.to_string())?;
+    write_instance_files(&paths, &resolved.router_url, request.id_style)
+        .map_err(|error| error.to_string())?;
     // Hand the ports over from a detached instance to launchd.
     stop_instance(&paths).map_err(|error| error.to_string())?;
     bootout_service();
@@ -1025,7 +1066,7 @@ async fn install_service(request: &AppRequest) -> Result<String, String> {
     }
     fs::write(
         &paths.launch_agent,
-        launch_agent_plist(&rayline_bin, env_name, &paths),
+        launch_agent_plist(&rayline_bin, env_name, request.id_style, &paths),
     )
     .map_err(|error| error.to_string())?;
     let status = Command::new("launchctl")
@@ -1112,31 +1153,34 @@ mod tests {
                 "protocol": "anthropic_messages",
                 "base_url": "https://api.rayline.ai",
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": ["rayline/arc-sage", "rayline/arc-swift"],
+                "models": ["arc-sage", "arc-swift"],
                 "headers": { "x-rayline-client": "claude-desktop" }
             }],
             "routes": {
-                "main": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
-                "subagent": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
-                "default": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
+                "main": { "endpoint": "rayline-arc", "model": "arc-sage" },
+                "subagent": { "endpoint": "rayline-arc", "model": "arc-sage" },
+                "default": { "endpoint": "rayline-arc", "model": "arc-sage" },
                 "model_routes": {
-                    "claude-arc-sage": { "endpoint": "rayline-arc", "model": "rayline/arc-sage" },
-                    "claude-arc-swift": { "endpoint": "rayline-arc", "model": "rayline/arc-swift" }
+                    "claude-arc-sage": { "endpoint": "rayline-arc", "model": "arc-sage" },
+                    "claude-arc-swift": { "endpoint": "rayline-arc", "model": "arc-swift" }
                 },
                 "subagents": {}
             }
         });
-        assert_eq!(router_config_json("https://api.rayline.ai"), expected);
+        assert_eq!(
+            router_config_json("https://api.rayline.ai", IdStyle::Bare),
+            expected
+        );
     }
 
     #[test]
     fn router_config_parses_as_local_router_config_with_explicit_aliases() {
-        let value = router_config_json("https://api-dev.rayline.ai");
+        let value = router_config_json("https://api-dev.rayline.ai", IdStyle::Bare);
         let config: rayline_local_router::RouterConfig =
             serde_json::from_value(value).expect("router config parses");
         for (id, tier) in [
-            ("claude-arc-sage", "rayline/arc-sage"),
-            ("claude-arc-swift", "rayline/arc-swift"),
+            ("claude-arc-sage", "arc-sage"),
+            ("claude-arc-swift", "arc-swift"),
         ] {
             let alias = config
                 .routes
@@ -1152,8 +1196,31 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_fallback_routes_the_same_desktop_ids_to_prefixed_tiers() {
+        let value = router_config_json("https://api-dev.rayline.ai", IdStyle::Prefixed);
+        let routes = &value["routes"]["model_routes"];
+        assert_eq!(routes["claude-arc-sage"]["model"], "rayline/arc-sage");
+        assert_eq!(routes["claude-arc-swift"]["model"], "rayline/arc-swift");
+        assert_eq!(value["routes"]["main"]["model"], "rayline/arc-sage");
+        assert_eq!(
+            value["endpoints"][0]["models"],
+            json!(["rayline/arc-sage", "rayline/arc-swift"])
+        );
+        // The Desktop side is the same either way.
+        let bare = router_config_json("https://api-dev.rayline.ai", IdStyle::Bare);
+        assert_eq!(
+            bare["routes"]["model_routes"]
+                .as_object()
+                .map(|routes| routes.keys().cloned().collect::<Vec<_>>()),
+            routes
+                .as_object()
+                .map(|routes| routes.keys().cloned().collect::<Vec<_>>())
+        );
+    }
+
+    #[test]
     fn router_config_never_contains_a_key() {
-        let text = router_config_json("https://api.rayline.ai").to_string();
+        let text = router_config_json("https://api.rayline.ai", IdStyle::Bare).to_string();
         assert!(!text.contains("rlk-"));
         let import = desktop_import_json(&gateway_url(PORTS)).to_string();
         assert!(!import.contains("rlk-"));
@@ -1407,6 +1474,7 @@ mod tests {
         let plist = launch_agent_plist(
             Path::new("/home/u/.rayline/bin/rayline"),
             Some("dev"),
+            IdStyle::Bare,
             &paths,
         );
         assert!(plist.contains("<string>ai.rayline.claude-desktop</string>"));
@@ -1415,8 +1483,10 @@ mod tests {
         ));
         assert!(!plist.contains("rlk-"));
         assert!(!plist.contains(ROUTER_KEY_ENV));
-        let prod = launch_agent_plist(Path::new("/r"), None, &paths);
+        assert!(!plist.contains("--prefixed-ids"));
+        let prod = launch_agent_plist(Path::new("/r"), None, IdStyle::Prefixed, &paths);
         assert!(!prod.contains("--env"));
+        assert!(prod.contains("<string>serve</string>\n\t\t<string>--prefixed-ids</string>"));
     }
 
     #[test]

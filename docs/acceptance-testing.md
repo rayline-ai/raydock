@@ -340,8 +340,8 @@ Wire smoke, in a throwaway HOME (two hosted ARC turns, a few cents): it starts
 the Desktop router, validates the generated import file, runs one headless
 Claude Code turn per Desktop model with the exact id Desktop sends
 (`claude-arc-sage`, `claude-arc-swift`), and asserts each reply, each explicit
-alias route (`policy: model:<id>`) and its tier (`rayline/arc-sage`,
-`rayline/arc-swift`), then stops the router.
+alias route (`policy: model:<id>`) and its tier (`arc-sage`, `arc-swift`; with
+`PREFIXED_IDS=1`, the `rayline/arc-*` fallback), then stops the router.
 
 ```bash
 cargo build -p rayline-cli -p rayline-daemon --locked

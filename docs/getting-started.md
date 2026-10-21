@@ -166,8 +166,9 @@ model ids that look like Anthropic models. The launcher therefore:
 - offers Desktop two models, shown in the picker as **arc-sage** (the default)
   and **arc-swift** (the cheaper tier). Desktop requires Claude-style model
   ids, so the import uses `claude-arc-sage` and `claude-arc-swift` internally,
-  and explicit `model_routes` entries map them to `rayline/arc-sage` and
-  `rayline/arc-swift`, stamping `x-rayline-client: claude-desktop`. ARC is not
+  and explicit `model_routes` entries map them to the first-party tier ids
+  `arc-sage` and `arc-swift` (`--prefixed-ids` forwards the `rayline/arc-*`
+  aliases instead, for a router that predates the bare ids), stamping `x-rayline-client: claude-desktop`. ARC is not
   a Claude model, and Rayline is not affiliated with Anthropic;
 - keeps your `rlk-` key in the router's environment only. Desktop gets
   `http://127.0.0.1:20831` and a placeholder key through
