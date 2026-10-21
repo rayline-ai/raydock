@@ -32,6 +32,7 @@ mod omp;
 mod openclaw;
 mod opencode;
 mod pi;
+mod yaml_merge;
 
 use std::ffi::OsString;
 use std::fs;
@@ -147,14 +148,14 @@ impl Harness {
         }
     }
 
-    fn plan(self, ctx: &RenderContext<'_>) -> Plan {
-        match self {
+    fn plan(self, ctx: &RenderContext<'_>) -> Result<Plan, String> {
+        Ok(match self {
             Self::OpenCode => opencode::plan(ctx),
             Self::Pi => pi::plan(ctx),
             Self::Omp => omp::plan(ctx),
-            Self::Hermes => hermes::plan(ctx),
+            Self::Hermes => hermes::plan(ctx)?,
             Self::OpenClaw => openclaw::plan(ctx),
-        }
+        })
     }
 }
 
@@ -216,8 +217,10 @@ impl RenderContext<'_> {
 pub(crate) struct ConfigFile {
     pub name: &'static str,
     pub contents: String,
-    /// `true`: Rayline owns the file and rewrites it on every launch (it holds
-    /// the env's URL, so an env change must take effect). `false`: written once
+    /// `true`: Rayline rewrites it on every launch (it holds the env's URL, so
+    /// an env change must take effect), keeping the file's permissions; a
+    /// harness whose file also holds user settings merges them into
+    /// `contents` first (Hermes). `false`: written once
     /// as a default; the harness or the user may change it afterwards.
     pub overwrite: bool,
 }
@@ -290,7 +293,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             std::env::var(pi::ALLOW_EMPTY_SIGNATURE_ENV).ok().as_deref(),
         ),
     };
-    let plan = harness.plan(&ctx);
+    let plan = harness.plan(&ctx)?;
     write_files(&config_dir, &plan.files).map_err(|error| {
         format!(
             "failed to write {} config in {}: {error}",
@@ -389,6 +392,11 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
         }
         let tmp = dir.join(format!(".{}.tmp-{}", file.name, std::process::id()));
         fs::write(&tmp, &file.contents)?;
+        match fs::metadata(&path) {
+            Ok(existing) => fs::set_permissions(&tmp, existing.permissions())?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         fs::rename(&tmp, &path)?;
     }
     Ok(())
@@ -646,7 +654,7 @@ pub(crate) mod tests {
             conversation_id,
             allow_empty_signature: pi::allow_empty_signature("dev", None),
         };
-        let plan = harness.plan(&ctx);
+        let plan = harness.plan(&ctx).unwrap();
         write_files(&dir, &plan.files).unwrap();
         (dir, plan)
     }

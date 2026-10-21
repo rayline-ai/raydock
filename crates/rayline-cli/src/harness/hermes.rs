@@ -13,16 +13,38 @@
 //! `rayline-resp` provider (`--provider rayline-resp`) speaks Responses. Each
 //! entry has its own base_url because Hermes looks up `extra_headers` by
 //! base_url.
+//!
+//! `config.yaml` also holds the user's Hermes settings (`hermes config set`,
+//! `hermes tools`), so each launch merges only Rayline's keys ([`OWNED`]) into
+//! the existing file and keeps every other line as written.
+
+use std::{fs, io};
 
 use serde_json::json;
 
-use super::{CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, Plan, ROUTER_MODEL, RenderContext, yaml_file};
+use super::{
+    CONTEXT_WINDOW, CONV_ID_ENV, ConfigFile, KEY_ENV, Plan, ROUTER_MODEL, RenderContext, to_yaml,
+    yaml_merge,
+};
 
 pub(crate) const CONFIG_FILE: &str = "config.yaml";
 pub(crate) const MESSAGES_PROVIDER: &str = "rayline-anth";
 pub(crate) const RESPONSES_PROVIDER: &str = "rayline-resp";
 
-pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
+/// The keys Rayline sets in `config.yaml`. `fallback_providers` stays empty
+/// and the legacy `fallback_model` is removed, so a failed turn never moves
+/// off the router.
+const OWNED: &[&[&str]] = &[
+    &["model", "provider"],
+    &["model", "default"],
+    &["model", "context_length"],
+    &["providers", MESSAGES_PROVIDER],
+    &["providers", RESPONSES_PROVIDER],
+    &["fallback_providers"],
+    &["fallback_model"],
+];
+
+pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
     let models = json!({ ROUTER_MODEL: { "context_length": CONTEXT_WINDOW } });
     let mut responses = json!({
         "base_url": ctx.v1_base(),
@@ -56,11 +78,26 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         },
         "fallback_providers": []
     });
-    Plan {
-        files: vec![yaml_file(CONFIG_FILE, &config, true)],
+    let path = ctx.config_dir.join(CONFIG_FILE);
+    let contents = match fs::read_to_string(&path) {
+        Ok(existing) => yaml_merge::merge(&existing, &config, OWNED).map_err(|error| {
+            format!(
+                "cannot update {} ({error}); fix or remove the file",
+                path.display()
+            )
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => to_yaml(&config),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
+    Ok(Plan {
+        files: vec![ConfigFile {
+            name: CONFIG_FILE,
+            contents,
+            overwrite: true,
+        }],
         env_set: vec![("HERMES_HOME", ctx.config_dir.as_os_str().to_owned())],
         env_remove: Vec::new(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -101,6 +138,114 @@ mod tests {
             headers(ConversationIdFallback::new("prod", Some("0"))),
             (false, false)
         );
+    }
+
+    /// Launch Hermes twice over a config Hermes and the user already wrote.
+    #[test]
+    fn relaunch_keeps_user_settings_and_is_idempotent() {
+        use super::super::tests::{TEST_URL, temp_dir};
+        use super::super::{ConversationIdFallback, RenderContext, write_files};
+        let dir = temp_dir("hermes-merge");
+        let path = dir.join(CONFIG_FILE);
+        std::fs::write(
+            &path,
+            "model:
+  default: claude-opus
+  provider: anthropic
+  reasoning_effort: high
+providers:
+  rayline-anth:
+    base_url: https://stale.example
+  mine:
+    base_url: https://mine.example
+agent:
+  max_turns: 40
+  disabled_toolsets:
+  - web
+  - browser
+fallback_providers:
+- mine
+fallback_model:
+  provider: openrouter
+  model: external
+",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let launch = || {
+            let ctx = RenderContext {
+                env_name: "dev",
+                router_url: TEST_URL,
+                config_dir: &dir,
+                conversation_id: ConversationIdFallback::new("dev", None),
+                allow_empty_signature: false,
+            };
+            write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
+            std::fs::read_to_string(&path).unwrap()
+        };
+        let first = launch();
+        assert_eq!(
+            first,
+            "model:
+  default: \"rayline-router\"
+  provider: \"custom:rayline-anth\"
+  reasoning_effort: high
+  context_length: 200000
+providers:
+  rayline-anth:
+    api_mode: \"anthropic_messages\"
+    base_url: \"https://api-dev.rayline.ai\"
+    extra_headers:
+      x-conversation-id: \"${RAYLINE_CONV_ID}\"
+    key_env: \"RAYLINE_KEY\"
+    models:
+      rayline-router:
+        context_length: 200000
+  mine:
+    base_url: https://mine.example
+  rayline-resp:
+    api_mode: \"codex_responses\"
+    base_url: \"https://api-dev.rayline.ai/v1\"
+    key_env: \"RAYLINE_KEY\"
+    models:
+      rayline-router:
+        context_length: 200000
+agent:
+  max_turns: 40
+  disabled_toolsets:
+  - web
+  - browser
+fallback_providers: []
+"
+        );
+        assert_eq!(launch(), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn unreadable_config_is_an_error_not_a_rewrite() {
+        use super::super::tests::{TEST_URL, temp_dir};
+        use super::super::{ConversationIdFallback, RenderContext};
+        let dir = temp_dir("hermes-bad");
+        std::fs::write(dir.join(CONFIG_FILE), "---\nmodel: x\n").unwrap();
+        let ctx = RenderContext {
+            env_name: "dev",
+            router_url: TEST_URL,
+            config_dir: &dir,
+            conversation_id: ConversationIdFallback::new("dev", None),
+            allow_empty_signature: false,
+        };
+        let error = super::plan(&ctx).unwrap_err();
+        assert!(error.contains("fix or remove the file"), "{error}");
     }
 
     #[test]
