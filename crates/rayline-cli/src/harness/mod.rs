@@ -9,7 +9,10 @@
 //! harness's environment: every tool subprocess the harness spawns inherits its
 //! environment, so a key there would reach a model-visible `env` call. For the
 //! same reason the launch removes [`KEY_ENV`] and `RAYLINE_ROUTER_API_KEY`
-//! from the child's environment.
+//! from the child's environment. The config dir is per harness and env (it
+//! holds the harness's sessions), so two concurrent launches of one harness on
+//! one env with different explicit `RAYLINE_ROUTER_API_KEY` values share the
+//! last-written key.
 //!
 //! Every config uses Anthropic Messages, model `rayline-router`,
 //! `contextWindow` 200000 / `maxTokens` 32000.
