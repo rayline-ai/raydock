@@ -1061,6 +1061,24 @@ async fn run_inner(request: &AppRequest) -> Result<String, String> {
     }
 }
 
+/// The `rld` this instance runs, as an absolute path whose file name is `rld`.
+/// `stop` recognises the router by `rld serve` on its command line, and the
+/// LaunchAgent runs from the state directory, so a renamed or relative
+/// `RLD_BIN` is refused here rather than leaving a router `stop` cannot see or
+/// a service that cannot start.
+fn desktop_rld_bin(home: &Path) -> Result<PathBuf, String> {
+    let rld_bin = crate::router::resolve_rld_bin(home).map_err(|error| error.to_string())?;
+    let rld_bin =
+        std::path::absolute(&rld_bin).map_err(|error| format!("{}: {error}", rld_bin.display()))?;
+    if rld_bin.file_name() != Some(OsStr::new("rld")) {
+        return Err(format!(
+            "the Claude Desktop router needs an rld binary named `rld`, not {}",
+            rld_bin.display()
+        ));
+    }
+    Ok(rld_bin)
+}
+
 fn home_paths() -> Result<AppPaths, String> {
     let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
     Ok(AppPaths::new(&home))
@@ -1081,8 +1099,7 @@ async fn start(request: &AppRequest) -> Result<String, String> {
     .map_err(|error| error.to_string())?;
     let token = ensure_gateway_token(&paths)
         .map_err(|error| format!("failed to create the gateway token: {error}"))?;
-    let rld_bin =
-        crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
+    let rld_bin = desktop_rld_bin(&resolved.home)?;
     let router = write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
         .map_err(|error| format!("failed to write {}: {error}", paths.dir.display()))?;
     let instance = Instance {
@@ -1223,8 +1240,7 @@ fn serve(request: &AppRequest) -> Result<String, String> {
         },
     )?;
     let token = ensure_gateway_token(&paths).map_err(|error| error.to_string())?;
-    let rld_bin =
-        crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
+    let rld_bin = desktop_rld_bin(&resolved.home)?;
     let router = write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
         .map_err(|error| error.to_string())?;
     write_instance(
@@ -1363,8 +1379,7 @@ async fn install_service(request: &AppRequest) -> Result<String, String> {
     let token = ensure_gateway_token(&paths).map_err(|error| error.to_string())?;
     // Resolve rld now, with this shell's PATH and RLD_BIN, and pin it in the
     // plist: launchd's PATH would not find a custom location.
-    let rld_bin =
-        crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
+    let rld_bin = desktop_rld_bin(&resolved.home)?;
     write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
         .map_err(|error| error.to_string())?;
     // Hand the ports over from a detached instance to launchd.
