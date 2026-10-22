@@ -4475,26 +4475,23 @@ fn responses_tools_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Ve
 }
 
 /// A client function as an Anthropic tool. A missing or `null` parameter
-/// schema becomes an empty object schema (Anthropic requires an object), and
-/// an explicit `strict: true` is kept so arguments are still validated.
+/// schema becomes an empty object schema (Anthropic requires an object).
+///
+/// `strict` is not forwarded: Anthropic's strict mode rejects schema keywords
+/// OpenAI's accepts (numeric bounds, for one), so forwarding it would turn
+/// working tools into upstream 400s. Translating it safely is a follow-up.
 fn anthropic_function_tool(upstream_name: String, description: String, function: &Value) -> Value {
-    let field = |key: &str| {
-        function
-            .get(key)
-            .or_else(|| function.get("function").and_then(|inner| inner.get(key)))
-            .filter(|value| !value.is_null())
-    };
-    let mut tool = json!({
+    let parameters = function
+        .get("parameters")
+        .or_else(|| function.pointer("/function/parameters"))
+        .filter(|value| !value.is_null());
+    json!({
         "name": upstream_name,
         "description": description,
-        "input_schema": field("parameters")
+        "input_schema": parameters
             .cloned()
             .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-    });
-    if field("strict").and_then(Value::as_bool) == Some(true) {
-        tool["strict"] = json!(true);
-    }
-    tool
+    })
 }
 
 fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Option<Value> {
@@ -7298,10 +7295,11 @@ mod tests {
     }
 
     /// Anthropic requires an object `input_schema`, so a `null` parameter
-    /// schema must not pass through, and an explicit `strict: true` must keep
-    /// validating arguments, inside a namespace and outside one.
+    /// schema must not pass through, inside a namespace or outside one.
+    /// `strict` is not forwarded (Anthropic's strict mode rejects schemas
+    /// OpenAI's accepts).
     #[test]
-    fn function_tools_keep_a_schema_and_strict_mode() {
+    fn function_tools_always_send_an_object_schema() {
         let strict_schema = json!({"type": "object", "properties": {"n": {"type": "integer"}},
                                    "required": ["n"], "additionalProperties": false});
         let (converted, _) = responses_to_anthropic_request(
@@ -7320,7 +7318,7 @@ mod tests {
         assert_eq!(tools[0]["input_schema"], empty);
         assert!(tools[0].get("strict").is_none());
         assert_eq!(tools[1]["input_schema"], strict_schema);
-        assert_eq!(tools[1]["strict"], true);
+        assert!(tools[1].get("strict").is_none());
         assert_eq!(tools[2]["input_schema"], empty);
         assert!(tools[2].get("strict").is_none());
     }
