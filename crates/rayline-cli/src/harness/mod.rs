@@ -38,6 +38,7 @@ mod omp;
 mod openclaw;
 mod opencode;
 mod pi;
+mod yaml_merge;
 
 use std::ffi::OsString;
 use std::fs;
@@ -156,14 +157,14 @@ impl Harness {
         }
     }
 
-    fn plan(self, ctx: &RenderContext<'_>) -> Plan {
-        match self {
+    fn plan(self, ctx: &RenderContext<'_>) -> Result<Plan, String> {
+        Ok(match self {
             Self::OpenCode => opencode::plan(ctx),
             Self::Pi => pi::plan(ctx),
             Self::Omp => omp::plan(ctx),
-            Self::Hermes => hermes::plan(ctx),
+            Self::Hermes => hermes::plan(ctx)?,
             Self::OpenClaw => openclaw::plan(ctx),
-        }
+        })
     }
 }
 
@@ -226,10 +227,16 @@ impl RenderContext<'_> {
 pub(crate) struct ConfigFile {
     pub name: &'static str,
     pub contents: String,
-    /// `true`: Rayline owns the file and rewrites it on every launch (it holds
-    /// the env's URL, so an env change must take effect). `false`: written once
+    /// `true`: Rayline rewrites it on every launch (it holds the env's URL, so
+    /// an env change must take effect), owner-only (it holds the key); a
+    /// harness whose file also holds user settings merges them into
+    /// `contents` first (Hermes). `false`: written once
     /// as a default; the harness or the user may change it afterwards.
     pub overwrite: bool,
+    /// The file's text that `contents` was merged from. If the file no longer
+    /// reads exactly this when it is replaced (the harness saved a setting
+    /// meanwhile), the write is refused rather than losing that edit.
+    pub merged_from: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -301,7 +308,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             std::env::var(pi::ALLOW_EMPTY_SIGNATURE_ENV).ok().as_deref(),
         ),
     };
-    let plan = harness.plan(&ctx);
+    let plan = harness.plan(&ctx)?;
     write_files(&config_dir, &plan.files).map_err(|error| {
         format!(
             "failed to write {} config in {}: {error}",
@@ -394,6 +401,15 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
         }
         let tmp = dir.join(format!(".{}.tmp-{}", file.name, std::process::id()));
         write_private(&tmp, &file.contents)?;
+        if let Some(base) = &file.merged_from
+            && fs::read_to_string(&path).ok().as_ref() != Some(base)
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(io::Error::other(format!(
+                "{} changed while Rayline was updating it; run the command again",
+                path.display()
+            )));
+        }
         fs::rename(&tmp, &path)?;
     }
     Ok(())
@@ -479,6 +495,7 @@ pub(crate) fn json_file(name: &'static str, value: &Value, overwrite: bool) -> C
         name,
         contents,
         overwrite,
+        merged_from: None,
     }
 }
 
@@ -487,6 +504,7 @@ pub(crate) fn yaml_file(name: &'static str, value: &Value, overwrite: bool) -> C
         name,
         contents: to_yaml(value),
         overwrite,
+        merged_from: None,
     }
 }
 
@@ -674,7 +692,7 @@ pub(crate) mod tests {
             conversation_id,
             allow_empty_signature: pi::allow_empty_signature("dev", None),
         };
-        let plan = harness.plan(&ctx);
+        let plan = harness.plan(&ctx).unwrap();
         write_files(&dir, &plan.files).unwrap();
         (dir, plan)
     }
@@ -741,11 +759,13 @@ pub(crate) mod tests {
                     name: "owned.json",
                     contents: text.to_owned(),
                     overwrite: true,
+                    merged_from: None,
                 },
                 ConfigFile {
                     name: "default.json",
                     contents: text.to_owned(),
                     overwrite: false,
+                    merged_from: None,
                 },
             ]
         };
@@ -959,6 +979,7 @@ pub(crate) mod tests {
             name: "owned.json",
             contents: "new".to_owned(),
             overwrite: true,
+            merged_from: None,
         }];
         write_files(&dir, &files).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");

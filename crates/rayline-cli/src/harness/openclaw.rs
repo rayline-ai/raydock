@@ -222,6 +222,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 name: KEY_FILE,
                 contents: ctx.key.to_owned(),
                 overwrite: true,
+                merged_from: None,
             },
         ],
         env_set: vec![(
