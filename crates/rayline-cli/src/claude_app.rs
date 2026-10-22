@@ -2101,7 +2101,7 @@ mod tests {
         // absolute `.../rld`. Copying a binary is not portable: some coreutils
         // builds dispatch on their file name.
         let stand_in = home.join("rld");
-        let mut ours = Command::new("bash")
+        let child = Command::new("bash")
             .args(["-c", r#"exec -a "$0" yes "$@" >/dev/null"#])
             .arg(&stand_in)
             .arg("serve")
@@ -2110,7 +2110,18 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn stand-in");
-        let pid = ours.id() as i32;
+        let pid = child.id() as i32;
+        // Owns the child for the whole test: dropping it (also on panic) kills
+        // and reaps it through `Child`, which never signals a reaped pid.
+        struct StandIn(std::sync::Arc<std::sync::Mutex<std::process::Child>>);
+        impl Drop for StandIn {
+            fn drop(&mut self) {
+                let mut child = self.0.lock().unwrap_or_else(|error| error.into_inner());
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        let ours = StandIn(std::sync::Arc::new(std::sync::Mutex::new(child)));
         fs::write(&paths.pid_file, format!("{pid}\n")).expect("pid file");
         // bash replaces itself with `yes` after spawn returns; wait for that.
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2120,15 +2131,29 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
 
-        // Reap concurrently: stop waits for the pid to go, and an unreaped
-        // child would linger as a zombie.
-        let reaper = std::thread::spawn(move || ours.wait());
+        // Reap while stop waits for the pid to go: an unreaped child stays a
+        // zombie that still counts as alive.
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reaper = {
+            let child = std::sync::Arc::clone(&ours.0);
+            let done = std::sync::Arc::clone(&done);
+            std::thread::spawn(move || {
+                while !done.load(Ordering::Relaxed) {
+                    let exited = child
+                        .lock()
+                        .map(|mut child| matches!(child.try_wait(), Ok(Some(_))))
+                        .unwrap_or(true);
+                    if exited {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
         let result = stop_instance(&paths);
-        if result.is_err() {
-            // SAFETY: kill only signals the stand-in this test spawned.
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
+        done.store(true, Ordering::Relaxed);
         let _ = reaper.join();
+        drop(ours);
         let result = result.expect("stop ours");
 
         assert!(result.contains(&pid.to_string()), "{result}");
