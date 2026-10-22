@@ -257,6 +257,9 @@ What goes through the router versus straight to Anthropic:
 - **`all`**: route every request (main agent + subagents).
 - **`subagents`**: route only subagent traffic; the main agent stays on cloud
   Claude. This is the hybrid path — quality main agent, offloaded subagents.
+  With the cloud router, a routed subagent turn that names a Claude model is
+  sent as `rayline-router`, so the router picks its model; a subagent that names
+  another model keeps it.
 
 The default depends on the router, because the two are used differently:
 
