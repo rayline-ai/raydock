@@ -1096,6 +1096,27 @@ async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
             .contains("code_interpreter")
     );
 
+    // Settings Anthropic's search cannot honour, and a required call with no
+    // tool left to make it, are refused before any upstream call.
+    for (request, code) in [
+        (
+            json!({"model": "m", "input": "hi", "stream": false,
+                   "tools": [{"type": "web_search", "filters": {
+                       "allowed_domains": ["a.example"], "blocked_domains": ["b.a.example"]}}]}),
+            "unsupported_web_search",
+        ),
+        (
+            json!({"model": "m", "input": "hi", "stream": false, "tool_choice": "required",
+                   "tools": [{"type": "web_search", "external_web_access": false}]}),
+            "required_tool_unavailable",
+        ),
+    ] {
+        let refused = client.post(&url).json(&request).send().await.unwrap();
+        assert_eq!(refused.status(), 400);
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(body["error"]["code"], code, "{body}");
+    }
+
     let ok = client
         .post(&url)
         .json(
@@ -1115,6 +1136,57 @@ async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
         json!([{"type": "web_search_20250305", "name": "web_search",
                 "allowed_domains": ["blog.rust-lang.org"]}])
     );
+    let _ = std::fs::remove_file(config);
+}
+
+/// A request refused for a hosted tool the route cannot run is announced to
+/// metrics like any other; it must also be closed out there, or `rayline top`
+/// shows it as active forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_hosted_tool_request_is_not_left_active_in_metrics() {
+    let config = write_config(
+        "hosted-tools-metrics",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": "http://127.0.0.1:9", "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        metrics: Some(metrics.clone()),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let refused = client
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({"model": "m", "input": "hi", "stream": false,
+                      "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let totals = metrics.snapshot().totals;
+    assert_eq!(totals.active_requests, 0);
+    assert_eq!(totals.errored_requests, 1);
     let _ = std::fs::remove_file(config);
 }
 
@@ -1167,4 +1239,60 @@ async fn responses_codex_default_web_search_is_omitted_not_translated() {
     assert_eq!(tools.len(), 1, "{tools:?}");
     assert_eq!(tools[0]["name"], "shell");
     let _ = std::fs::remove_file(config);
+}
+
+/// Requests a web page could send to the loopback router (cross-site Origin,
+/// DNS-rebound Host, CORS "simple" POST) are refused before they reach the
+/// provider endpoint, so they cannot spend its stored credentials.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn browser_reachable_requests_never_reach_the_provider() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "local-openai",
+            "protocol": "openai_chat",
+            "base_url": format!("http://127.0.0.1:{up_port}/v1"),
+            "models": ["local-model-x"]
+        }],
+        "routes": {
+            "main": {"endpoint": "local-openai", "model": "local-model-x"},
+            "default": {"endpoint": "local-openai", "model": "local-model-x"}
+        }
+    });
+    let path = write_config("request-guard", &config);
+    start_router(port, path.clone()).await;
+
+    let url = format!("http://127.0.0.1:{port}/v1/messages");
+    let body = json!({"model": "rayline-router", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
+    let client = reqwest::Client::new();
+    let cross_origin = client
+        .post(&url)
+        .header("origin", "https://evil.example")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cross_origin.status(), 403);
+    let rebound = client
+        .post(&url)
+        .header("host", format!("evil.example:{port}"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rebound.status(), 421);
+    let simple_post = client
+        .post(&url)
+        .header("content-type", "text/plain")
+        .body(body.to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(simple_post.status(), 415);
+
+    let reached = tokio::time::timeout(Duration::from_millis(300), upstream.accept()).await;
+    assert!(reached.is_err(), "a guarded request reached the provider");
+    let _ = std::fs::remove_file(path);
 }
