@@ -156,8 +156,9 @@ not a Claude model, and Rayline is not affiliated with Anthropic. Starts a dedic
 local router (its own ports and state in ~/.rayline/claude-desktop, separate
 from `rayline claude` and `rayline codex`) and writes a configuration file for
 Claude Desktop's Developer > Configure Third-Party Inference > Import
-configuration. Your Rayline key stays in the router; Desktop gets a
-placeholder.
+configuration. Your Rayline key stays in the router; Desktop gets a gateway
+token that only unlocks this local router. macOS only (the router also runs on
+Linux, for testing).
 
 Third-party mode applies to the whole Desktop app and signs it out of your
 claude.ai subscription; `rayline claude-desktop off` shows how to switch back.

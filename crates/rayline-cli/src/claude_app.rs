@@ -16,9 +16,10 @@
 //!    directory, ports, pid file and LaunchAgent — and never touches the shared
 //!    `rayline claude` / `rayline codex` router or any Claude Code CLI config.
 //! 3. The Rayline `rlk-` key stays inside the router process. Desktop receives a
-//!    loopback URL and a placeholder key only, through a JSON file the user loads
-//!    with Desktop's documented **Import configuration**; this module never
-//!    writes Desktop's own configuration.
+//!    loopback URL and a per-instance gateway token (which only unlocks this
+//!    router), through a JSON file the user loads with Desktop's documented
+//!    **Import configuration**; this module never writes Desktop's own
+//!    configuration.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -29,6 +30,7 @@ use std::process::{Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 /// One model the Desktop import offers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,7 +105,13 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 /// Inherited variables with these prefixes are dropped before `rld` starts, so
 /// a developer shell (`RAYLINE_PROXY_PORT`, `ANTHROPIC_BASE_URL`, ...) can never
 /// reconfigure or leak into the Desktop instance.
-const SCRUBBED_ENV_PREFIXES: [&str; 3] = ["RAYLINE_", "ANTHROPIC_", "CLAUDE_"];
+const SCRUBBED_ENV_PREFIXES: [&str; 5] = [
+    "RAYLINE_",
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "OPENAI_",
+    "OPENROUTER_",
+];
 
 /// The Desktop instance's port block. Disjoint from the shared router
 /// (20808-20811, metrics 20813) and the `--isolated` proxy (20814).
@@ -191,6 +199,9 @@ pub struct AppPaths {
     pub launch_agent: PathBuf,
     /// The per-instance gateway token (mode 0600).
     pub token_file: PathBuf,
+    /// What the running router was started with: its environment name and a
+    /// digest of its key, token, config and `rld` (mode 0600).
+    pub instance_file: PathBuf,
 }
 
 impl AppPaths {
@@ -203,6 +214,7 @@ impl AppPaths {
             log_file: dir.join("rld.log"),
             data_dir: dir.join("data"),
             token_file: dir.join("gateway-token"),
+            instance_file: dir.join("instance.json"),
             launch_agent: home
                 .join("Library")
                 .join("LaunchAgents")
@@ -214,7 +226,9 @@ impl AppPaths {
 
 /// Router config: each Desktop id is routed to its ARC tier by an explicit
 /// `model_routes` entry; any other id (main, subagent or default) goes to the
-/// default tier. The key is referenced by env var name only.
+/// default tier. `replace_defaults` drops the router's built-in endpoints, so
+/// no model id can reach anything but ARC. The key is referenced by env var
+/// name only.
 pub fn router_config_json(router_url: &str, style: IdStyle) -> Value {
     let target = |arc_model: &str| json!({ "endpoint": ENDPOINT_ID, "model": arc_model });
     let default = target(DESKTOP_MODELS[0].upstream(style));
@@ -227,6 +241,7 @@ pub fn router_config_json(router_url: &str, style: IdStyle) -> Value {
         .map(|model| model.upstream(style))
         .collect();
     json!({
+        "replace_defaults": true,
         "endpoints": [{
             "id": ENDPOINT_ID,
             "protocol": "anthropic_messages",
@@ -289,18 +304,29 @@ fn is_gateway_token(token: &str) -> bool {
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-/// Write `contents` readable only by the owner.
+/// Write `contents` readable only by the owner. A new file is created 0600 and
+/// an existing one is narrowed to 0600 before any byte is written.
 fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir)?;
     }
-    fs::write(path, contents)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
-    Ok(())
+    file.set_len(0)?;
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 /// This instance's gateway token, created on first use and kept across
@@ -402,8 +428,23 @@ pub fn stop_target(
     }
 }
 
+/// Whether `line` (a `ps` command line) is `rld serve` with exactly this
+/// instance's `--router-config-path`. Another process that merely mentions the
+/// path (an editor, `tail`, a `.bak` copy) does not match.
 pub fn command_line_is_ours(line: &str, paths: &AppPaths) -> bool {
-    line.contains(&*paths.router_config.to_string_lossy())
+    let needle = format!(
+        " --router-config-path {}",
+        paths.router_config.to_string_lossy()
+    );
+    let names_config = line.match_indices(&needle).any(|(at, _)| {
+        let rest = &line[at + needle.len()..];
+        rest.is_empty() || rest.starts_with(' ')
+    });
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let runs_rld_serve = words.windows(2).any(|pair| {
+        Path::new(pair[0]).file_name() == Some(OsStr::new("rld")) && pair[1] == "serve"
+    });
+    names_config && runs_rld_serve
 }
 
 fn read_pid(path: &Path) -> Option<i32> {
@@ -663,8 +704,11 @@ fn xml_escape(text: &str) -> String {
 
 /// LaunchAgent that runs `rayline [--env <env>] claude-desktop serve` at login. The
 /// plist carries no secret: `serve` reads the key from Rayline's credentials.
+/// `RLD_BIN` pins the `rld` this command resolved, because launchd's PATH is
+/// not the user's shell PATH.
 pub fn launch_agent_plist(
     rayline_bin: &Path,
+    rld_bin: &Path,
     env_name: Option<&str>,
     style: IdStyle,
     paths: &AppPaths,
@@ -684,6 +728,7 @@ pub fn launch_agent_plist(
         .collect();
     let log = xml_escape(&paths.log_file.to_string_lossy());
     let dir = xml_escape(&paths.dir.to_string_lossy());
+    let rld = xml_escape(&rld_bin.to_string_lossy());
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
@@ -691,6 +736,7 @@ pub fn launch_agent_plist(
 <dict>\n\
 \t<key>Label</key>\n\t<string>{SERVICE_LABEL}</string>\n\
 \t<key>ProgramArguments</key>\n\t<array>\n{arguments}\t</array>\n\
+\t<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>RLD_BIN</key>\n\t\t<string>{rld}</string>\n\t</dict>\n\
 \t<key>RunAtLoad</key>\n\t<true/>\n\
 \t<key>KeepAlive</key>\n\t<true/>\n\
 \t<key>ThrottleInterval</key>\n\t<integer>30</integer>\n\
@@ -808,24 +854,63 @@ fn write_json(path: &Path, value: &Value) -> io::Result<()> {
     fs::write(path, body)
 }
 
-/// Write the router config and the Desktop import file. Returns whether the
-/// router config changed (a running router must restart to pick it up).
+/// Write the router config and the Desktop import file. Returns the router
+/// config, which is part of the instance digest.
 fn write_instance_files(
     paths: &AppPaths,
     router_url: &str,
     style: IdStyle,
     token: &str,
-) -> io::Result<bool> {
+) -> io::Result<Value> {
     let router = router_config_json(router_url, style);
-    let previous = fs::read(&paths.router_config)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
     write_json(&paths.router_config, &router)?;
     let mut import = serde_json::to_vec_pretty(&desktop_import_json(&gateway_url(PORTS), token))
         .map_err(io::Error::other)?;
     import.push(b'\n');
     write_private(&paths.desktop_import, &import)?;
-    Ok(previous.as_ref() != Some(&router))
+    Ok(router)
+}
+
+/// A digest of everything the running router was started with. A change to
+/// any of them (a re-login or rotated key, a new token, a new config or `rld`)
+/// means the router must restart.
+pub fn instance_digest(router: &Value, key: &str, token: &str, rld_bin: &Path) -> String {
+    let router = router.to_string();
+    let mut hasher = Sha256::new();
+    for part in [
+        router.as_bytes(),
+        key.as_bytes(),
+        token.as_bytes(),
+        rld_bin.as_os_str().as_encoded_bytes(),
+    ] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Instance {
+    pub env: String,
+    pub digest: String,
+}
+
+fn write_instance(paths: &AppPaths, instance: &Instance) -> io::Result<()> {
+    let mut body = serde_json::to_vec_pretty(&json!({
+        "env": instance.env,
+        "digest": instance.digest,
+    }))
+    .map_err(io::Error::other)?;
+    body.push(b'\n');
+    write_private(&paths.instance_file, &body)
+}
+
+fn read_instance(paths: &AppPaths) -> Option<Instance> {
+    let value: Value = serde_json::from_slice(&fs::read(&paths.instance_file).ok()?).ok()?;
+    Some(Instance {
+        env: value.get("env")?.as_str()?.to_owned(),
+        digest: value.get("digest")?.as_str()?.to_owned(),
+    })
 }
 
 async fn router_healthy(client: &reqwest::Client) -> bool {
@@ -836,23 +921,40 @@ async fn router_healthy(client: &reqwest::Client) -> bool {
         .is_ok_and(|response| response.status().is_success())
 }
 
-/// Whether the running router enforces the inbound guard: an unauthenticated
-/// request must be refused. A router started before the guard existed is not.
-async fn router_guarded(client: &reqwest::Client) -> bool {
-    client
-        .post(format!("{}/v1/messages", gateway_url(PORTS)))
-        .header("content-type", "application/json")
-        .body("{}")
+/// Whether the router on the gateway port is this instance, enforcing its
+/// token: `/v1/models` (answered locally, never forwarded) is refused without
+/// the token and served with it. A router from an `rld` that predates the
+/// guard, or anything else on the port, fails one of the two.
+async fn router_guarded(client: &reqwest::Client, token: &str) -> bool {
+    let url = format!("{}/v1/models", gateway_url(PORTS));
+    let refused = client
+        .get(&url)
         .send()
         .await
-        .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
+        .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED);
+    refused
+        && client
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success())
 }
 
-async fn wait_healthy(client: &reqwest::Client, pid: Option<i32>) -> bool {
+/// Wait until the router answers as this guarded instance. With `pid` (a
+/// router this command just spawned) a healthy but unguarded answer fails at
+/// once; a launchd-run router is polled until the deadline, because the
+/// previous process may still be exiting.
+async fn wait_guarded(client: &reqwest::Client, token: &str, pid: Option<i32>) -> bool {
     let deadline = Instant::now() + HEALTH_TIMEOUT;
     while Instant::now() < deadline {
         if router_healthy(client).await {
-            return true;
+            if router_guarded(client, token).await {
+                return true;
+            }
+            if pid.is_some() {
+                return false;
+            }
         }
         if pid.is_some_and(|pid| !process_alive(pid)) {
             return false;
@@ -860,6 +962,17 @@ async fn wait_healthy(client: &reqwest::Client, pid: Option<i32>) -> bool {
         tokio::time::sleep(HEALTH_POLL).await;
     }
     false
+}
+
+fn unguarded_error(paths: &AppPaths, rld_bin: &Path) -> String {
+    format!(
+        "the router on {} did not come up enforcing its gateway token, so any local \
+         process could spend your Rayline key; it was stopped. {} may be older than this \
+         CLI: update Rayline and run `rayline claude-desktop` again. See {}",
+        gateway_url(PORTS),
+        rld_bin.display(),
+        paths.log_file.display()
+    )
 }
 
 fn http_client() -> reqwest::Client {
@@ -880,7 +993,8 @@ Rayline ARC gateway for Claude Desktop is running.
   and claude-arc-swift internally. ARC is not a Claude model, and Rayline is
   not affiliated with Anthropic.
   Import file:  {import}
-  Your Rayline key stays in the router process; Desktop stores only a placeholder.
+  Your Rayline key stays in the router process. Desktop stores only a gateway
+  token that unlocks this local router.
 
 Before you continue: third-party mode applies to the whole Claude Desktop app.
 It signs Desktop out of your claude.ai subscription, and Chat and Cowork are
@@ -967,24 +1081,31 @@ async fn start(request: &AppRequest) -> Result<String, String> {
     .map_err(|error| error.to_string())?;
     let token = ensure_gateway_token(&paths)
         .map_err(|error| format!("failed to create the gateway token: {error}"))?;
-    let changed = write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
+    let rld_bin =
+        crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
+    let router = write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
         .map_err(|error| format!("failed to write {}: {error}", paths.dir.display()))?;
+    let instance = Instance {
+        env: resolved.env.clone(),
+        digest: instance_digest(&router, &key, &token, &rld_bin),
+    };
+    let current = read_instance(&paths).as_ref() == Some(&instance);
     let client = http_client();
     let instructions = setup_instructions(&paths, &resolved.router_url);
+    let rayline_bin = std::env::current_exe().map_err(|error| error.to_string())?;
+    let env_name = request.root_env_explicit.then_some(resolved.env.as_str());
+    let plist = launch_agent_plist(&rayline_bin, &rld_bin, env_name, request.id_style, &paths);
+    let installed_plist = fs::read_to_string(&paths.launch_agent).ok();
 
     if service_loaded() {
         // The service runs with the settings in its plist. Rewrite it for this
-        // request's environment and id style first, so a restart can never
-        // serve one environment while this command reports another.
-        let rayline_bin = std::env::current_exe().map_err(|error| error.to_string())?;
-        let env_name = request.root_env_explicit.then_some(resolved.env.as_str());
-        let plist = launch_agent_plist(&rayline_bin, env_name, request.id_style, &paths);
-        let current = fs::read_to_string(&paths.launch_agent).unwrap_or_default();
-        if current != plist {
+        // request first, so a restart can never serve one environment while
+        // this command reports another.
+        if installed_plist.as_deref() != Some(plist.as_str()) {
             bootout_service()?;
             fs::write(&paths.launch_agent, &plist).map_err(|error| error.to_string())?;
             bootstrap_service(&paths.launch_agent)?;
-        } else if changed || !router_guarded(&client).await {
+        } else if !current || !router_guarded(&client, &token).await {
             let status = Command::new("launchctl")
                 .args([
                     "kickstart",
@@ -1000,13 +1121,21 @@ async fn start(request: &AppRequest) -> Result<String, String> {
                 ));
             }
         }
-        if !wait_healthy(&client, None).await {
-            return Err(format!(
-                "the login service is loaded but the router is not answering; see {}",
-                paths.log_file.display()
-            ));
+        if !wait_guarded(&client, &token, None).await {
+            let _ = bootout_service();
+            return Err(unguarded_error(&paths, &rld_bin));
         }
         return Ok(instructions);
+    }
+
+    // An installed but unloaded service (after `stop`) loads its plist at the
+    // next login: keep it on this request's settings too.
+    if launchd_enabled()
+        && installed_plist
+            .as_deref()
+            .is_some_and(|installed| installed != plist)
+    {
+        fs::write(&paths.launch_agent, &plist).map_err(|error| error.to_string())?;
     }
 
     let running = matches!(
@@ -1018,7 +1147,7 @@ async fn start(request: &AppRequest) -> Result<String, String> {
         ),
         StopTarget::Ours(_)
     );
-    if running && !changed && router_healthy(&client).await && router_guarded(&client).await {
+    if running && current && router_guarded(&client, &token).await {
         return Ok(instructions);
     }
     if running {
@@ -1032,8 +1161,6 @@ async fn start(request: &AppRequest) -> Result<String, String> {
             PORTS.all()
         ));
     }
-    let rld_bin =
-        crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
     fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
     let log = fs::OpenOptions::new()
         .create(true)
@@ -1066,13 +1193,18 @@ async fn start(request: &AppRequest) -> Result<String, String> {
         .map_err(|error| format!("failed to start {}: {error}", rld_bin.display()))?;
     let pid = child.id() as i32;
     fs::write(&paths.pid_file, format!("{pid}\n")).map_err(|error| error.to_string())?;
-    if !wait_healthy(&client, Some(pid)).await {
+    if !wait_guarded(&client, &token, Some(pid)).await {
         let _ = stop_instance(&paths);
-        return Err(format!(
-            "the Claude Desktop router did not become healthy; see {}",
-            paths.log_file.display()
-        ));
+        return Err(if process_alive(pid) || router_healthy(&client).await {
+            unguarded_error(&paths, &rld_bin)
+        } else {
+            format!(
+                "the Claude Desktop router did not become healthy; see {}",
+                paths.log_file.display()
+            )
+        });
     }
+    write_instance(&paths, &instance).map_err(|error| error.to_string())?;
     Ok(instructions)
 }
 
@@ -1091,11 +1223,19 @@ fn serve(request: &AppRequest) -> Result<String, String> {
         },
     )?;
     let token = ensure_gateway_token(&paths).map_err(|error| error.to_string())?;
-    write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
-        .map_err(|error| error.to_string())?;
-    fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
     let rld_bin =
         crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
+    let router = write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
+        .map_err(|error| error.to_string())?;
+    write_instance(
+        &paths,
+        &Instance {
+            env: resolved.env.clone(),
+            digest: instance_digest(&router, &key, &token, &rld_bin),
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
     fs::write(&paths.pid_file, format!("{}\n", std::process::id()))
         .map_err(|error| error.to_string())?;
     let mut command = rld_command(&rld_bin, &paths, &key, &token);
@@ -1138,6 +1278,9 @@ async fn status(request: &AppRequest) -> Result<String, String> {
         gateway_url(PORTS),
         paths.dir.display()
     ));
+    if let Some(instance) = read_instance(&paths) {
+        out.push_str(&format!("  Environment: {}\n", instance.env));
+    }
     if healthy {
         let snapshot = client
             .get(format!(
@@ -1218,6 +1361,10 @@ async fn install_service(request: &AppRequest) -> Result<String, String> {
     .await
     .map_err(|error| error.to_string())?;
     let token = ensure_gateway_token(&paths).map_err(|error| error.to_string())?;
+    // Resolve rld now, with this shell's PATH and RLD_BIN, and pin it in the
+    // plist: launchd's PATH would not find a custom location.
+    let rld_bin =
+        crate::router::resolve_rld_bin(&resolved.home).map_err(|error| error.to_string())?;
     write_instance_files(&paths, &resolved.router_url, request.id_style, &token)
         .map_err(|error| error.to_string())?;
     // Hand the ports over from a detached instance to launchd.
@@ -1230,15 +1377,13 @@ async fn install_service(request: &AppRequest) -> Result<String, String> {
     }
     fs::write(
         &paths.launch_agent,
-        launch_agent_plist(&rayline_bin, env_name, request.id_style, &paths),
+        launch_agent_plist(&rayline_bin, &rld_bin, env_name, request.id_style, &paths),
     )
     .map_err(|error| error.to_string())?;
     bootstrap_service(&paths.launch_agent)?;
-    if !wait_healthy(&http_client(), None).await {
-        return Err(format!(
-            "the login service started but the router is not answering; see {}",
-            paths.log_file.display()
-        ));
+    if !wait_guarded(&http_client(), &token, None).await {
+        let _ = bootout_service();
+        return Err(unguarded_error(&paths, &rld_bin));
     }
     Ok(format!(
         "Installed the login service {SERVICE_LABEL} ({}). The router now starts at login.\n",
@@ -1298,6 +1443,7 @@ mod tests {
 
     const TEST_TOKEN: &str = "rlt-0000000000000000000000000000000000000000000000000000000000000000";
 
+    #[cfg(unix)]
     #[test]
     fn gateway_token_is_random_private_and_stable() {
         let home = temp_home();
@@ -1323,6 +1469,72 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
     }
 
+    #[cfg(not(unix))]
+    #[test]
+    fn gateway_token_is_unsupported_off_unix() {
+        let home = temp_home();
+        let paths = AppPaths::new(&home);
+        assert!(ensure_gateway_token(&paths).is_err());
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_private_narrows_an_existing_file_before_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home();
+        let path = home.join("secret");
+        fs::write(&path, "old").expect("seed");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        write_private(&path, b"new").expect("write");
+        let mode = fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(fs::read_to_string(&path).expect("read"), "new");
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn instance_digest_tracks_key_token_config_and_rld() {
+        let router = router_config_json("https://api.rayline.ai", IdStyle::Bare);
+        let base = instance_digest(&router, "rlk-a", TEST_TOKEN, Path::new("/bin/rld"));
+        assert_eq!(
+            base,
+            instance_digest(&router, "rlk-a", TEST_TOKEN, Path::new("/bin/rld"))
+        );
+        let prefixed = router_config_json("https://api.rayline.ai", IdStyle::Prefixed);
+        for other in [
+            instance_digest(&router, "rlk-b", TEST_TOKEN, Path::new("/bin/rld")),
+            instance_digest(&router, "rlk-a", "rlt-other", Path::new("/bin/rld")),
+            instance_digest(&router, "rlk-a", TEST_TOKEN, Path::new("/opt/rld")),
+            instance_digest(&prefixed, "rlk-a", TEST_TOKEN, Path::new("/bin/rld")),
+        ] {
+            assert_ne!(base, other);
+        }
+        assert!(!base.contains("rlk-a"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn instance_file_round_trips_privately() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home();
+        let paths = AppPaths::new(&home);
+        assert_eq!(read_instance(&paths), None);
+        let instance = Instance {
+            env: "dev".to_owned(),
+            digest: "abc".to_owned(),
+        };
+        write_instance(&paths, &instance).expect("write");
+        assert_eq!(read_instance(&paths), Some(instance));
+        let mode = fs::metadata(&paths.instance_file)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn import_file_is_private_and_carries_the_token() {
         let home = temp_home();
@@ -1380,6 +1592,7 @@ mod tests {
     #[test]
     fn router_config_golden() {
         let expected = json!({
+            "replace_defaults": true,
             "endpoints": [{
                 "id": "rayline-arc",
                 "protocol": "anthropic_messages",
@@ -1606,6 +1819,8 @@ mod tests {
                 ("RAYLINE_ROUTER_API_KEY", "rlk-old"),
                 ("ANTHROPIC_BASE_URL", "http://x"),
                 ("CLAUDE_CONFIG_DIR", "/c"),
+                ("OPENAI_API_KEY", "sk-x"),
+                ("OPENROUTER_API_KEY", "sk-or-x"),
                 ("HOME", "/home/u"),
             ]
             .map(|(name, value)| (OsString::from(name), OsString::from(value))),
@@ -1640,6 +1855,29 @@ mod tests {
         assert_eq!(
             stop_target(Some(42), &paths, |_| true, |_| None),
             StopTarget::Foreign(42)
+        );
+        // Mentioning the config path is not enough: it must be `rld serve`
+        // with exactly this `--router-config-path`.
+        let config = paths.router_config.display().to_string();
+        for line in [
+            format!("vim {config}"),
+            format!("tail -f {config}"),
+            format!("/home/u/.rayline/bin/rld serve --router-config-path {config}.bak"),
+            format!("/home/u/.rayline/bin/rld status --router-config-path {config}"),
+            format!("/usr/bin/not-rld serve --router-config-path {config}"),
+        ] {
+            assert_eq!(
+                stop_target(Some(42), &paths, |_| true, |_| Some(line.clone())),
+                StopTarget::Foreign(42),
+                "{line}"
+            );
+        }
+        let with_more_args = format!(
+            "/home/u/.rayline/bin/rld serve --no-local-model --router-config-path {config} --data-dir /d"
+        );
+        assert_eq!(
+            stop_target(Some(42), &paths, |_| true, |_| Some(with_more_args.clone())),
+            StopTarget::Ours(42)
         );
         assert_eq!(
             stop_target(Some(42), &paths, |_| false, |_| Some(ours.clone())),
@@ -1684,11 +1922,14 @@ mod tests {
         let home = temp_home();
         let paths = AppPaths::new(&home);
         fs::create_dir_all(&paths.dir).expect("state dir");
-        // A stand-in whose command line names this instance's router config,
-        // exactly as the real `rld serve --router-config-path <path>` does.
+        // A stand-in whose command line reads like the real
+        // `rld serve --router-config-path <path>`.
+        let stand_in = home.join("rld");
+        fs::write(&stand_in, "sleep 30\n").expect("stand-in script");
         let mut ours = Command::new("sh")
-            .arg("-c")
-            .arg("sleep 30; : \"$0\"")
+            .arg(&stand_in)
+            .arg("serve")
+            .arg("--router-config-path")
             .arg(&paths.router_config)
             .spawn()
             .expect("spawn stand-in");
@@ -1709,6 +1950,7 @@ mod tests {
         let paths = AppPaths::new(Path::new("/home/u"));
         let plist = launch_agent_plist(
             Path::new("/home/u/.rayline/bin/rayline"),
+            Path::new("/opt/rayline/rld"),
             Some("dev"),
             IdStyle::Bare,
             &paths,
@@ -1717,10 +1959,19 @@ mod tests {
         assert!(plist.contains(
             "<string>/home/u/.rayline/bin/rayline</string>\n\t\t<string>--env</string>\n\t\t<string>dev</string>\n\t\t<string>claude-desktop</string>\n\t\t<string>serve</string>"
         ));
+        assert!(plist.contains(
+            "<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>RLD_BIN</key>\n\t\t<string>/opt/rayline/rld</string>"
+        ));
         assert!(!plist.contains("rlk-"));
         assert!(!plist.contains(ROUTER_KEY_ENV));
         assert!(!plist.contains("--prefixed-ids"));
-        let prod = launch_agent_plist(Path::new("/r"), None, IdStyle::Prefixed, &paths);
+        let prod = launch_agent_plist(
+            Path::new("/r"),
+            Path::new("/rld"),
+            None,
+            IdStyle::Prefixed,
+            &paths,
+        );
         assert!(!prod.contains("--env"));
         assert!(prod.contains("<string>serve</string>\n\t\t<string>--prefixed-ids</string>"));
     }

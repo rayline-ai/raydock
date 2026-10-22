@@ -1079,7 +1079,7 @@ async fn inbound_guard_refuses_unauthorized_rebinding_and_non_json_requests() {
     let opts = LocalRouterOptions {
         port,
         config_path: Some(config.clone()),
-        inbound_guard: rayline_local_router::InboundGuard::new(TOKEN, port),
+        inbound_guard: rayline_local_router::InboundGuard::new(TOKEN),
         ..LocalRouterOptions::default()
     };
     tokio::spawn(async move {

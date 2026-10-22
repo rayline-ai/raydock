@@ -179,7 +179,15 @@ model ids that look like Anthropic models. The launcher therefore:
   Desktop's own configuration. The router answers only requests that carry
   that token, address a loopback Host on its port, carry no non-loopback
   Origin, and send JSON, so other local processes and web pages (DNS
-  rebinding, cross-site `text/plain` posts) cannot spend on your account;
+  rebinding, cross-site `text/plain` posts) cannot spend on your account.
+  After every start or restart the launcher checks that the router refuses a
+  request without the token. If it does not (for example an `rld` older than
+  the CLI), the launcher stops it and exits with an error;
+- routes only to ARC: the router config replaces the built-in endpoints, so
+  no model id can reach another provider, and it restarts the router when the
+  key, token, config or `rld` changes. The login service pins the `rld` path
+  the launcher resolved. Claude Desktop's third-party mode is macOS-only, so
+  the launcher targets macOS (the router also runs on Linux, for testing);
 
 ```bash
 rayline claude-desktop                    # start or reuse the router; print the steps

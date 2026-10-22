@@ -65,8 +65,8 @@ pub struct LocalRouterOptions {
     /// Responses forward to the hosted RCR, and follow the RCR's 307 to the
     /// on-device adapter. Off for every other run.
     pub may_local_advertise: bool,
-    /// Loopback-only Host/Origin, JSON-only bodies and a per-instance token on
-    /// every request (`rayline claude-desktop`). `None` for every other run.
+    /// A per-instance token required on every request but `GET /healthz`
+    /// (`rayline claude-desktop`). `None` for every other run.
     pub inbound_guard: Option<InboundGuard>,
 }
 
@@ -332,11 +332,25 @@ fn load_config(opts: &LocalRouterOptions) -> Result<RouterConfig> {
         let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let overrides = serde_json::from_str::<RouterConfig>(&raw)
             .with_context(|| format!("parse router config {}", path.display()))?;
-        merge_config(&mut config, overrides);
+        if replaces_defaults(&raw) {
+            config = overrides;
+        } else {
+            merge_config(&mut config, overrides);
+        }
     }
     apply_env_overrides(&mut config);
     normalize_config(&mut config, &opts.local_model_id)?;
     Ok(config)
+}
+
+/// A config with top-level `"replace_defaults": true` is the whole config: the
+/// built-in endpoints and routes are dropped instead of merged underneath, so
+/// no request can reach an endpoint the file does not name.
+fn replaces_defaults(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.get("replace_defaults").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
@@ -586,8 +600,7 @@ fn json_response(status: StatusCode, value: Value) -> Response<BoxBody> {
         .unwrap()
 }
 
-/// Hosts the router answers as. Same rules as the opt-in token guard in #94's
-/// `inbound_guard.rs`, so the two stay one policy.
+/// Hosts the router answers as.
 const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 
 /// The router listens on loopback without auth and spends stored provider
@@ -5931,6 +5944,39 @@ mod tests {
         let explore = config.routes.subagents.get("Explore").unwrap();
         assert_eq!(explore.endpoint, "local");
         assert_eq!(explore.model, "local-model");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn replace_defaults_config_drops_built_in_endpoints_and_routes() {
+        let path = std::env::temp_dir().join(format!(
+            "rayline-local-router-replace-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"{"replace_defaults":true,
+                "endpoints":[{"id":"arc","protocol":"anthropic_messages",
+                              "base_url":"https://api.rayline.ai","models":["arc-sage"]}],
+                "routes":{"main":{"endpoint":"arc","model":"arc-sage"}}}"#,
+        )
+        .unwrap();
+        let opts = LocalRouterOptions {
+            config_path: Some(path.clone()),
+            ..LocalRouterOptions::default()
+        };
+
+        let config = load_config(&opts).unwrap();
+
+        let ids: Vec<&str> = config.endpoints.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["arc"]);
+        assert!(config.routes.subagent.is_none());
+        assert!(route_direct_model(&config, "claude-sonnet-5").is_none());
+        assert!(route_direct_model(&config, "gpt-5.5").is_none());
         let _ = fs::remove_file(path);
     }
 

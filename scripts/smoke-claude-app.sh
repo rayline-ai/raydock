@@ -45,20 +45,25 @@ echo "== validate the generated import file"
 run "$RAYLINE" claude-desktop validate --desktop-config "$H/.rayline/claude-desktop/claude-desktop-import.json"
 if grep -q 'rlk-' "$H/.rayline/claude-desktop/"*.json; then echo "FAIL: key in instance files"; exit 1; fi
 
-# The per-instance gateway token Desktop would present. Read, never printed.
+# The per-instance gateway token Desktop would present. Read, never printed,
+# and never put on a command line: curl reads it from a 0600 header file.
 GATEWAY_TOKEN=$(cat "$H/.rayline/claude-desktop/gateway-token")
+AUTH_HEADER=$OUT/auth.header
+(umask 077 && printf 'x-api-key: %s\n' "$GATEWAY_TOKEN" > "$AUTH_HEADER")
 G=http://127.0.0.1:20831
 echo "== the router refuses unauthenticated, cross-site and non-JSON requests"
 expect() { # expect STATUS curl-args...
   local want=$1; shift
   local got; got=$(curl -s -o /dev/null -w '%{http_code}' "$@")
-  [ "$got" = "$want" ] || { echo "FAIL: expected $want, got $got for: $*" | sed "s/$GATEWAY_TOKEN/<token>/g"; exit 1; }
+  [ "$got" = "$want" ] || { echo "FAIL: expected $want, got $got for: $*"; exit 1; }
 }
 body='{"model":"claude-arc-sage","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}'
 expect 401 -X POST "$G/v1/messages" -H 'content-type: application/json' -d "$body"
-expect 415 -X POST "$G/v1/messages" -H "x-api-key: $GATEWAY_TOKEN" -H 'content-type: text/plain' -d "$body"
-expect 421 -X POST "$G/v1/messages" -H "x-api-key: $GATEWAY_TOKEN" -H 'content-type: application/json' -H 'host: rebind.example:20831' -d "$body"
-expect 403 -X POST "$G/v1/messages" -H "x-api-key: $GATEWAY_TOKEN" -H 'content-type: application/json' -H 'origin: https://evil.example' -d "$body"
+expect 401 "$G/v1/models"
+expect 200 -H @"$AUTH_HEADER" "$G/v1/models"
+expect 415 -X POST "$G/v1/messages" -H @"$AUTH_HEADER" -H 'content-type: text/plain' -d "$body"
+expect 421 -X POST "$G/v1/messages" -H @"$AUTH_HEADER" -H 'content-type: application/json' -H 'host: rebind.example:20831' -d "$body"
+expect 403 -X POST "$G/v1/messages" -H @"$AUTH_HEADER" -H 'content-type: application/json' -H 'origin: https://evil.example' -d "$body"
 echo "refusals: ok"
 
 for pair in $MODELS; do
