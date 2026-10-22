@@ -287,6 +287,22 @@ fn chat_translation_refusal(body: &Value) -> Option<Response<BoxBody>> {
                 .to_owned(),
         ));
     }
+    // Chat's built-in search is requested outside `tools`; this translation
+    // does not carry it, so a request for it must not quietly run without.
+    if body
+        .get("web_search_options")
+        .is_some_and(|options| !options.is_null())
+    {
+        warn!("local router: refusing Chat Completions request with web_search_options");
+        return Some(chat_invalid_request(
+            "unsupported_parameter",
+            "web_search_options",
+            "Rayline Local cannot run Chat Completions web search on this route: it translates \
+             Chat Completions to Anthropic Messages without web search. Remove \
+             web_search_options, or route to an endpoint that speaks Chat Completions natively."
+                .to_owned(),
+        ));
+    }
     if let Some(refusal) = untranslatable_chat_tools_response(body) {
         return Some(refusal);
     }
@@ -1285,10 +1301,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_function_fields_are_refused() {
+    fn legacy_function_fields_and_web_search_options_are_refused() {
         for body in [
             json!({"messages": [], "functions": [{"name": "read"}]}),
             json!({"messages": [], "function_call": {"name": "read"}}),
+            json!({"messages": [], "web_search_options": {}}),
             json!({"messages": [{"role": "function", "name": "read", "content": "ok"}]}),
             json!({"messages": [{"role": "assistant", "content": null,
                                  "function_call": {"name": "read", "arguments": "{}"}}]}),
@@ -1297,8 +1314,10 @@ mod tests {
             assert_eq!(refusal.status(), StatusCode::BAD_REQUEST, "{body}");
         }
         assert!(
-            chat_translation_refusal(&json!({"messages": [], "functions": null,
-                                             "function_call": null}))
+            chat_translation_refusal(
+                &json!({"messages": [], "functions": null, "web_search_options": null,
+                                             "function_call": null})
+            )
             .is_none()
         );
     }
