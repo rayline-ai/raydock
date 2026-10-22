@@ -257,6 +257,12 @@ struct ServeArgs {
     /// serves; local availability is advertised as unavailable.
     #[arg(long, env = NO_LOCAL_MODEL_ENV)]
     no_local_model: bool,
+
+    /// Refuse to start unless the local router's inbound token is set. The
+    /// Claude Desktop gateway passes it so an `rld` that predates the token
+    /// guard rejects the unknown flag instead of serving unguarded.
+    #[arg(long, hide = true)]
+    require_inbound_token: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -448,6 +454,12 @@ fn serve_data_ports(args: &ServeArgs) -> Vec<u16> {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<()> {
+    if args.require_inbound_token && rayline_local_router::InboundGuard::from_env().is_none() {
+        return Err(anyhow!(
+            "--require-inbound-token: {} is missing or not a valid token",
+            rayline_local_router::inbound_guard::INBOUND_TOKEN_ENV
+        ));
+    }
     let metrics = RouterMetrics::new("rayline-router");
     let metrics_sink: SharedMetricsSink = metrics.clone();
     // Best-effort, as in proxy mode: a metrics bind failure (another rld may
@@ -703,6 +715,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             config_path: args.router_config_path.clone(),
             metrics: Some(metrics_sink.clone()),
             may_local_advertise: args.may_local_advertise,
+            inbound_guard: rayline_local_router::InboundGuard::from_env(),
         })
     } else {
         None
