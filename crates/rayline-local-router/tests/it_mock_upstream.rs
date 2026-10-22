@@ -1045,6 +1045,24 @@ async fn anthropic_messages_leaves_legacy_family_body_untouched() {
     println!("PASS legacy family body forwarded untouched: {sent}");
 }
 
+/// Write `request` to the router over a raw TCP socket and return the response
+/// status code, so a test controls header order and repetition byte-for-byte.
+async fn raw_status(port: u16, request: &str) -> u16 {
+    let mut sock = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    sock.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    // A request that slipped past the guard would hang on the silent upstream.
+    let _ = tokio::time::timeout(Duration::from_secs(5), sock.read_to_end(&mut response)).await;
+    let response = String::from_utf8_lossy(&response);
+    response
+        .strip_prefix("HTTP/1.1 ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("unexpected response: {response}"))
+}
+
 /// Requests a web page could send to the loopback router (cross-site Origin,
 /// DNS-rebound Host, CORS "simple" POST) are refused before they reach the
 /// provider endpoint, so they cannot spend its stored credentials.
@@ -1095,6 +1113,58 @@ async fn browser_reachable_requests_never_reach_the_provider() {
         .await
         .unwrap();
     assert_eq!(simple_post.status(), 415);
+
+    // Raw HTTP/1.1 requests that smuggle a second guarded header past a check
+    // that reads only the first value, or an absolute-form target whose
+    // authority disagrees with Host.
+    let payload = body.to_string();
+    let absolute = format!("http://127.0.0.1:{port}/v1/messages");
+    let raw_cases = [
+        (
+            "/v1/messages",
+            format!(
+                "host: 127.0.0.1:{port}\r\nhost: evil.example:{port}\r\ncontent-type: application/json\r\n"
+            ),
+            421,
+        ),
+        (
+            absolute.as_str(),
+            format!("host: evil.example:{port}\r\ncontent-type: application/json\r\n"),
+            421,
+        ),
+        (
+            "/v1/messages",
+            format!(
+                "host: 127.0.0.1:{port}\r\norigin: http://127.0.0.1:{port}\r\norigin: https://evil.example\r\ncontent-type: application/json\r\n"
+            ),
+            403,
+        ),
+        (
+            "/v1/messages",
+            format!(
+                "host: 127.0.0.1:{port}\r\norigin: http://127.0.0.1:{port}\r\norigin: null\r\ncontent-type: application/json\r\n"
+            ),
+            403,
+        ),
+        (
+            "/v1/messages",
+            format!(
+                "host: 127.0.0.1:{port}\r\ncontent-type: application/json\r\ncontent-type: text/plain\r\n"
+            ),
+            415,
+        ),
+    ];
+    for (target, headers, expected) in raw_cases {
+        let request = format!(
+            "POST {target} HTTP/1.1\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        assert_eq!(
+            raw_status(port, &request).await,
+            expected,
+            "{target} {headers:?}"
+        );
+    }
 
     let reached = tokio::time::timeout(Duration::from_millis(300), upstream.accept()).await;
     assert!(reached.is_err(), "a guarded request reached the provider");
