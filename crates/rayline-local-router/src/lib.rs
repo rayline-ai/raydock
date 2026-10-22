@@ -3572,6 +3572,13 @@ fn responses_required_tool_unavailable(body: &Value) -> bool {
     let Some(forced) = translated.get("tool_choice") else {
         return true;
     };
+    // The forced tool must be the kind the caller forced, not just share its
+    // upstream name: a forced function named `web_search` that was never
+    // declared is not satisfied by the hosted search.
+    let forces_search = choice
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"));
     match forced.get("type").and_then(Value::as_str) {
         Some("any") => false,
         Some("tool") => !translated
@@ -3579,7 +3586,10 @@ fn responses_required_tool_unavailable(body: &Value) -> bool {
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .any(|tool| tool.get("name") == forced.get("name")),
+            .any(|tool| {
+                tool.get("name") == forced.get("name")
+                    && is_anthropic_web_search_tool(tool) == forces_search
+            }),
         _ => true,
     }
 }
@@ -7291,6 +7301,18 @@ mod tests {
                           {"type": "function", "name": "shell"}]});
             assert!(responses_required_tool_unavailable(&request), "{choice}");
         }
+        // A forced function is not satisfied by the hosted search that shares
+        // its upstream name.
+        let function_named_search = json!({"input": "x", "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "function", "name": "web_search"}});
+        assert!(responses_required_tool_unavailable(&function_named_search));
+        let forced_search = json!({"input": "x", "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"}});
+        assert!(!responses_required_tool_unavailable(&forced_search));
+        let declared_function = json!({"input": "x", "tools": [
+            {"type": "web_search"}, {"type": "function", "name": "web_search"}
+        ], "tool_choice": {"type": "function", "name": "web_search"}});
+        assert!(!responses_required_tool_unavailable(&declared_function));
         // Forcing a search that was not declared live would name a missing tool.
         let (offline, _) = responses_to_anthropic_request(
             &json!({"input": "x", "tool_choice": {"type": "web_search"}, "tools": [
