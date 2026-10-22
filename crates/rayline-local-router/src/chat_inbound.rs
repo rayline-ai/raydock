@@ -172,12 +172,15 @@ fn without_inbound_token(headers: &HeaderMap, guard: Option<&InboundGuard>) -> H
             .get_all(hyper::header::AUTHORIZATION)
             .iter()
             .filter_map(|value| value.to_str().ok())
-            .filter_map(|value| {
-                value
-                    .strip_prefix("Bearer ")
-                    .or_else(|| value.strip_prefix("bearer "))
+            .any(|value| {
+                // The scheme is case-insensitive; a bare token counts too.
+                let credential = value
+                    .trim()
+                    .split_once(char::is_whitespace)
+                    .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                    .map_or(value, |(_, credential)| credential);
+                guard.is_token(credential) || guard.is_token(value)
             })
-            .any(|token| guard.is_token(token))
     });
     if carries_token {
         forwarded.remove(hyper::header::AUTHORIZATION);
@@ -287,6 +290,17 @@ fn chat_translation_refusal(body: &Value) -> Option<Response<BoxBody>> {
     if let Some(refusal) = untranslatable_chat_tools_response(body) {
         return Some(refusal);
     }
+    if chat_has_untranslatable_tool_call(body) {
+        warn!("local router: refusing Chat Completions request replaying a non-function tool call");
+        return Some(chat_invalid_request(
+            "unsupported_tool_type",
+            "messages",
+            "Rayline Local cannot replay an assistant tool call that is not a named function \
+             call (a custom tool call, for example) on this route: it translates Chat \
+             Completions to Anthropic Messages, which supports only function tools."
+                .to_owned(),
+        ));
+    }
     if chat_required_tool_unavailable(body) {
         warn!("local router: refusing Chat Completions request whose tool_choice cannot be met");
         return Some(chat_invalid_request(
@@ -316,6 +330,23 @@ fn chat_uses_legacy_functions(body: &Value) -> bool {
                 message.get("role").and_then(Value::as_str) == Some("function")
                     || present(message.get("function_call"))
             })
+}
+
+/// Whether an assistant turn replays a tool call that is not a named
+/// function call (a `custom` tool call, or one without a function name).
+/// Translated, it would become a fictitious call to a tool named `tool`.
+fn chat_has_untranslatable_tool_call(body: &Value) -> bool {
+    body.get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .any(|call| {
+            call.get("type")
+                .is_some_and(|kind| kind.as_str() != Some("function"))
+                || !call.pointer("/function/name").is_some_and(Value::is_string)
+        })
 }
 
 /// Whether `tool_choice` requires a tool call (`required`, a forced function,
@@ -657,8 +688,13 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
         let mut choice = tool_choice
             .and_then(|choice| chat_tool_choice_to_anthropic(choice, &rewrites, &declared));
         // `parallel_tool_calls: false` is Anthropic's
-        // `tool_choice.disable_parallel_tool_use` (not valid with `none`).
-        if body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false) {
+        // `tool_choice.disable_parallel_tool_use` (not valid with `none`). A
+        // forced function is called exactly once in Chat Completions, and
+        // Anthropic allows parallel calls unless told otherwise.
+        let forced = choice
+            .as_ref()
+            .is_some_and(|choice| choice["type"] == "tool");
+        if forced || body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false) {
             let mut base = choice.unwrap_or_else(|| json!({"type": "auto"}));
             if base["type"] != "none" {
                 base["disable_parallel_tool_use"] = json!(true);
@@ -1233,9 +1269,10 @@ mod tests {
         assert!(chat_translation_refusal(&body("tool_1lookup")).is_some());
 
         let (forced, _) = chat_to_anthropic_request(&body("1lookup"), "m");
+        // A forced function is called exactly once.
         assert_eq!(
             forced["tool_choice"],
-            json!({"type": "tool", "name": "tool_1lookup"})
+            json!({"type": "tool", "name": "tool_1lookup", "disable_parallel_tool_use": true})
         );
         assert!(chat_translation_refusal(&body("1lookup")).is_none());
         // A choice form with no Anthropic equivalent that requires a call.
@@ -1267,6 +1304,30 @@ mod tests {
     }
 
     #[test]
+    fn replayed_non_function_tool_calls_are_refused() {
+        let replaying = |call: Value| {
+            json!({"messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": null, "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+            ], "tools": [{"type": "function", "function": {"name": "read"}}]})
+        };
+        for call in [
+            json!({"id": "call_1", "type": "custom",
+                   "custom": {"name": "apply_patch", "input": "*** Begin Patch"}}),
+            json!({"id": "call_1", "type": "function", "function": {"arguments": "{}"}}),
+        ] {
+            let refusal = chat_translation_refusal(&replaying(call.clone())).expect("refused");
+            assert_eq!(refusal.status(), StatusCode::BAD_REQUEST, "{call}");
+        }
+        assert!(
+            chat_translation_refusal(&replaying(json!({"id": "call_1", "type": "function",
+                "function": {"name": "read", "arguments": "{}"}})))
+            .is_none()
+        );
+    }
+
+    #[test]
     fn inbound_token_is_not_forwarded_as_the_callers_bearer() {
         let guard = InboundGuard::new("rlt-unit-token").expect("guard");
         let headers = |authorization: &str| {
@@ -1277,8 +1338,18 @@ mod tests {
             );
             map
         };
-        let stripped = without_inbound_token(&headers("Bearer rlt-unit-token"), Some(&guard));
-        assert!(stripped.get(hyper::header::AUTHORIZATION).is_none());
+        for carrying in [
+            "Bearer rlt-unit-token",
+            "BEARER rlt-unit-token",
+            "bEaReR  rlt-unit-token",
+            "rlt-unit-token",
+        ] {
+            let stripped = without_inbound_token(&headers(carrying), Some(&guard));
+            assert!(
+                stripped.get(hyper::header::AUTHORIZATION).is_none(),
+                "{carrying}"
+            );
+        }
         let provider = without_inbound_token(&headers("Bearer sk-provider"), Some(&guard));
         assert_eq!(provider[hyper::header::AUTHORIZATION], "Bearer sk-provider");
         let unguarded = without_inbound_token(&headers("Bearer rlt-unit-token"), None);
