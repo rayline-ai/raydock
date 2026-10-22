@@ -16,6 +16,13 @@
 //! differ only by quoting (`null` and `'null'`), sequences nested directly in
 //! sequences, literal U+2028/U+2029, and the anchors `safe_dump` writes for
 //! shared objects. A file that is already invalid YAML may still be rewritten.
+//!
+//! Comments are never dropped. Replacing an entry keeps the comment on its key
+//! line after the new value (on the `key:` line of a mapping), and moves every
+//! other comment from inside the old value (comment lines, and comments after
+//! a nested key, item or wrapped line) onto its own line right after the key
+//! line, at the child indentation. Removing an entry keeps its comments, each
+//! on its own line where the entry was.
 
 use serde_json::{Value, json};
 
@@ -54,7 +61,7 @@ pub(crate) fn merge(existing: &str, values: &Value, paths: &[&[&str]]) -> Result
         }
     }
     // Check the whole document, not only the entries the paths touch.
-    mapping(&lines, 0, lines.len(), 0, false)?;
+    mapping(&lines, 0, lines.len(), 0, false, &mut Vec::new())?;
     for path in paths {
         let value = path.iter().try_fold(values, |value, key| value.get(*key));
         let end = lines.len();
@@ -78,6 +85,9 @@ struct Entry {
     child: Option<usize>,
 }
 
+/// A comment: the 0-based line and the byte column of its `#`.
+type Note = (usize, usize);
+
 /// An error at 0-based line `index`. Never quotes the line: it may hold a
 /// secret.
 fn at(index: usize, what: &str) -> String {
@@ -92,7 +102,8 @@ fn set(
     path: &[&str],
     value: Option<&Value>,
 ) -> Result<(), String> {
-    let entries = mapping(lines, start, end, indent, false)?;
+    let mut notes = Vec::new();
+    let entries = mapping(lines, start, end, indent, false, &mut notes)?;
     let found = entries.iter().find(|entry| entry.key == path[0]);
     if let Some(entry) = found
         && path.len() > 1
@@ -104,9 +115,12 @@ fn set(
             return Ok(());
         }
     }
-    let rendered = value.map_or_else(Vec::new, |value| render(path, value, indent));
+    let mut rendered = value.map_or_else(Vec::new, |value| render(path, value, indent));
     let range = match found {
-        Some(entry) => entry.start..entry.end,
+        Some(entry) => {
+            keep_comments(lines, entry, &mut notes, indent, &mut rendered);
+            entry.start..entry.end
+        }
         None => {
             let at = entries.last().map_or(end, |entry| entry.end);
             at..at
@@ -116,15 +130,72 @@ fn set(
     Ok(())
 }
 
+/// Carry the comments inside `entry` over to `rendered`, its replacement (or
+/// nothing, when it is removed); see the module docs.
+fn keep_comments(
+    lines: &[String],
+    entry: &Entry,
+    notes: &mut Vec<Note>,
+    indent: usize,
+    rendered: &mut Vec<String>,
+) {
+    notes.sort_unstable();
+    notes.dedup();
+    let mut inline = None;
+    let mut own_lines = Vec::new();
+    for &(line, column) in notes.iter() {
+        if !(entry.start..entry.end).contains(&line) {
+            continue;
+        }
+        let comment = &lines[line][column..];
+        if line == entry.start && !rendered.is_empty() {
+            inline = Some(comment);
+        } else {
+            own_lines.push(comment);
+        }
+    }
+    let pad = " ".repeat(if rendered.is_empty() {
+        indent
+    } else {
+        indent + 2
+    });
+    let own_lines = own_lines
+        .into_iter()
+        .map(|comment| format!("{pad}{comment}"));
+    match rendered.first_mut() {
+        Some(first) => {
+            if let Some(comment) = inline {
+                first.push(' ');
+                first.push_str(comment);
+            }
+            rendered.splice(1..1, own_lines);
+        }
+        None => rendered.extend(own_lines),
+    }
+}
+
+/// Record each line of `lines[from..to]` that is a whole-line comment. Only
+/// for lines outside quoted values.
+fn comment_lines(lines: &[String], from: usize, to: usize, notes: &mut Vec<Note>) {
+    for (index, line) in lines.iter().enumerate().take(to).skip(from) {
+        let (depth, text) = split(line);
+        if text.starts_with('#') {
+            notes.push((index, depth));
+        }
+    }
+}
+
 /// The entries of the block mapping with keys at column `indent` in
 /// `lines[start..end]`, checking each value. With `item`, `lines[start]` is a
-/// sequence item whose first key follows its `- ` at column `indent`.
+/// sequence item whose first key follows its `- ` at column `indent`. Records
+/// every comment in `lines[start..end]` in `notes`.
 fn mapping(
     lines: &[String],
     start: usize,
     end: usize,
     indent: usize,
     item: bool,
+    notes: &mut Vec<Note>,
 ) -> Result<Vec<Entry>, String> {
     let mut entries: Vec<Entry> = Vec::new();
     let mut index = start;
@@ -135,13 +206,15 @@ fn mapping(
             split(&lines[index])
         };
         if !is_content(text) {
+            comment_lines(lines, index, index + 1, notes);
             index += 1;
             continue;
         }
         if depth != indent {
             return Err(at(index, "unexpected indentation"));
         }
-        let (key, inline) = parse_key(text).ok_or_else(|| at(index, "expected `key:`"))?;
+        let (key, rest) = key_parts(text).ok_or_else(|| at(index, "expected `key:`"))?;
+        let inline = value_text(rest);
         if key == "<<" {
             // Inherited keys would survive the merge.
             return Err(at(index, "YAML merge key"));
@@ -162,10 +235,14 @@ fn mapping(
             })
             .unwrap_or(end);
         let (value_end, child) = if nested {
-            nested_value(lines, index, boundary)?
+            if let Some(hash) = rest.find('#') {
+                notes.push((index, indent + text.len() - rest.len() + hash));
+            }
+            nested_value(lines, index, boundary, notes)?
         } else {
-            (scalar(lines, index, boundary, indent, &inline)?, None)
+            (scalar(lines, index, boundary, indent, inline, notes)?, None)
         };
+        comment_lines(lines, value_end, boundary, notes);
         entries.push(Entry {
             key,
             start: index,
@@ -184,30 +261,39 @@ fn nested_value(
     lines: &[String],
     start: usize,
     end: usize,
+    notes: &mut Vec<Note>,
 ) -> Result<(usize, Option<usize>), String> {
     let Some(first) = (start + 1..end).find(|&index| is_content(split(&lines[index]).1)) else {
         return Ok((start + 1, None));
     };
+    comment_lines(lines, start + 1, first, notes);
     let (depth, text) = split(&lines[first]);
     if is_sequence_item(text) {
-        return Ok((sequence(lines, first, end, depth)?, None));
+        return Ok((sequence(lines, first, end, depth, notes)?, None));
     }
     if parse_key(text).is_none() {
         return Err(at(first, "scalar on the line after its key"));
     }
-    let entries = mapping(lines, first, end, depth, false)?;
+    let entries = mapping(lines, first, end, depth, false, notes)?;
     let value_end = entries.last().map_or(first + 1, |entry| entry.end);
     Ok((value_end, Some(depth)))
 }
 
 /// Check the block sequence with its `- ` at column `indent` in
 /// `lines[start..end]`; returns one past its last line.
-fn sequence(lines: &[String], start: usize, end: usize, indent: usize) -> Result<usize, String> {
+fn sequence(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    indent: usize,
+    notes: &mut Vec<Note>,
+) -> Result<usize, String> {
     let mut value_end = start + 1;
     let mut index = start;
     while index < end {
         let (depth, text) = split(&lines[index]);
         if !is_content(text) {
+            comment_lines(lines, index, index + 1, notes);
             index += 1;
             continue;
         }
@@ -226,11 +312,12 @@ fn sequence(lines: &[String], start: usize, end: usize, indent: usize) -> Result
         }
         value_end = if parse_key(rest).is_some() {
             let column = indent + text.len() - rest.len();
-            let entries = mapping(lines, index, boundary, column, true)?;
+            let entries = mapping(lines, index, boundary, column, true, notes)?;
             entries.last().map_or(index + 1, |entry| entry.end)
         } else {
-            scalar(lines, index, boundary, indent, rest)?
+            scalar(lines, index, boundary, indent, rest, notes)?
         };
+        comment_lines(lines, value_end, boundary, notes);
         index = boundary;
     }
     Ok(value_end)
@@ -238,14 +325,17 @@ fn sequence(lines: &[String], start: usize, end: usize, indent: usize) -> Result
 
 /// Check the scalar `inline` that follows its key (at column `indent`) or
 /// `- ` on `lines[start]` and may wrap onto the lines before `end`; returns
-/// one past its last line.
+/// one past its last line. Records the comments that end its lines.
 fn scalar(
     lines: &[String],
     start: usize,
     end: usize,
     indent: usize,
     inline: &str,
+    notes: &mut Vec<Note>,
 ) -> Result<usize, String> {
+    // `inline` ends `lines[start]`, give or take trailing spaces.
+    let offset = lines[start].trim_end_matches(' ').len() - inline.trim_end_matches(' ').len();
     let quote = match inline.chars().next() {
         Some(quote @ ('"' | '\'')) => quote,
         Some('[' | '{') => {
@@ -257,6 +347,9 @@ fn scalar(
             let wraps = (start + 1..end).any(|index| is_content(split(&lines[index]).1));
             if !matches!(code, "[]" | "{}") || wraps {
                 return Err(at(start, "non-empty flow collection"));
+            }
+            if let Some(space) = inline.find(" #") {
+                notes.push((start, offset + space + 1));
             }
             return Ok(start + 1);
         }
@@ -271,15 +364,21 @@ fn scalar(
             }
             // A comment ends a plain scalar: no content may follow it.
             let mut commented = inline.contains(" #");
+            if let Some(space) = inline.find(" #") {
+                notes.push((start, offset + space + 1));
+            }
             for (index, line) in lines.iter().enumerate().take(end).skip(start + 1) {
-                let text = split(line).1;
+                let (depth, text) = split(line);
                 if text.starts_with('#') {
                     commented = true;
                 } else if is_content(text) {
                     if commented || !is_plain_text(text, false) {
                         return Err(at(index, "not a plain scalar"));
                     }
-                    commented = text.contains(" #");
+                    if let Some(space) = text.find(" #") {
+                        commented = true;
+                        notes.push((index, depth + space + 1));
+                    }
                 }
             }
             let last = (start + 1..end)
@@ -317,6 +416,14 @@ fn scalar(
     let after_text = after.trim_matches(' ');
     if !(after_text.is_empty() || after.starts_with(' ') && after_text.starts_with('#')) {
         return Err(at(close_line, "text after a quoted value"));
+    }
+    if let Some(hash) = after.find('#') {
+        // The closing quote's column on its own line.
+        let column = match text[..close].rfind('\n') {
+            Some(newline) => close - newline - 1,
+            None => offset + 1 + close,
+        };
+        notes.push((close_line, column + 1 + hash));
     }
     if let Some(index) = (close_line + 1..end).find(|&index| is_content(split(&lines[index]).1)) {
         return Err(at(index, "unexpected indentation"));
@@ -368,6 +475,19 @@ fn is_sequence_item(text: &str) -> bool {
 /// Split `key: rest` into the key (unquoted) and `rest` without a trailing
 /// comment. `None` for anything other than a plain or quoted scalar key.
 fn parse_key(text: &str) -> Option<(String, String)> {
+    let (key, rest) = key_parts(text)?;
+    Some((key, value_text(rest).to_owned()))
+}
+
+/// The value in `rest`, the text after a key's `:`: empty when there is none
+/// or only a comment.
+fn value_text(rest: &str) -> &str {
+    let rest = rest.trim_matches(' ');
+    if rest.starts_with('#') { "" } else { rest }
+}
+
+/// Split `key: rest` into the key (unquoted) and everything after its `:`.
+fn key_parts(text: &str) -> Option<(String, &str)> {
     let (key, rest) = if let Some(quoted) = text.strip_prefix('"') {
         let close = closing_double_quote(quoted)?;
         let key = serde_json::from_str(&text[..close + 2]).ok()?;
@@ -396,9 +516,7 @@ fn parse_key(text: &str) -> Option<(String, String)> {
     if !(rest.is_empty() || rest.starts_with(' ')) {
         return None;
     }
-    let rest = rest.trim_matches(' ');
-    let inline = if rest.starts_with('#') { "" } else { rest };
-    Some((key, inline.to_owned()))
+    Some((key, rest))
 }
 
 fn closing_double_quote(text: &str) -> Option<usize> {
@@ -526,7 +644,7 @@ agent:
             "\
 # user header
 model:
-  default: \"router\"
+  default: \"router\" # was this
   base_url: https://keep
   provider: \"custom:r\"
 providers:
@@ -714,6 +832,134 @@ fallback_providers: []
             )
             .unwrap(),
             "providers:\n  r:\n    base_url: \"https://x\"\n    key_env: \"K\"\n      # keep\n  mine: {}\n"
+        );
+    }
+
+    #[test]
+    fn inline_comment_on_a_replaced_scalar_is_kept() {
+        for (existing, expected) in [
+            (
+                "model:\n  provider: old # keep this explanation\n",
+                "model:\n  provider: \"custom:r\" # keep this explanation\n",
+            ),
+            (
+                "model:\n  provider: 'o''ld'   #  spaced # twice\n",
+                "model:\n  provider: \"custom:r\" #  spaced # twice\n",
+            ),
+            (
+                "model:\n  provider: \"a #b\" # c\n",
+                "model:\n  provider: \"custom:r\" # c\n",
+            ),
+            (
+                "model:\n  provider: [] # none yet\n",
+                "model:\n  provider: \"custom:r\" # none yet\n",
+            ),
+            // Not comments: `#` without a space before it, or inside quotes.
+            (
+                "model:\n  provider: a#b\n",
+                "model:\n  provider: \"custom:r\"\n",
+            ),
+            (
+                "model:\n  provider: 'x # y'\n",
+                "model:\n  provider: \"custom:r\"\n",
+            ),
+            // A wrapped value's comments get their own lines.
+            (
+                "model:\n  provider: a long\n    value # end\n",
+                "model:\n  provider: \"custom:r\"\n    # end\n",
+            ),
+            (
+                "model:\n  provider: 'a long\n    # inside\n    value' # end\n",
+                "model:\n  provider: \"custom:r\"\n    # end\n",
+            ),
+        ] {
+            let merged = set_provider(existing).unwrap();
+            assert_eq!(merged, expected, "{existing}");
+            assert_eq!(set_provider(&merged).unwrap(), merged);
+        }
+    }
+
+    #[test]
+    fn inline_comment_on_a_replaced_mapping_key_is_kept() {
+        let merged = merge(
+            "providers:\n  r: # Rayline's entry\n    base_url: x\n",
+            &values(),
+            &[&["providers", "r"]],
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            "providers:\n  r: # Rayline's entry\n    base_url: \"https://x\"\n    key_env: \"K\"\n"
+        );
+        // A scalar replaced by a mapping keeps its comment on the `key:` line.
+        assert_eq!(
+            set_provider("model: some-model # pick one\n").unwrap(),
+            "model: # pick one\n  provider: \"custom:r\"\n"
+        );
+    }
+
+    #[test]
+    fn comments_inside_a_replaced_mapping_are_kept() {
+        let existing = "\
+providers:
+  r:
+    # why this router
+    base_url: x # old url
+
+    # about the key
+    key_env: OLD
+    list: # items
+    # first
+    - a # one
+    - 'b
+      # not a comment'
+  mine: {}
+";
+        let merged = merge(existing, &values(), &[&["providers", "r"]]).unwrap();
+        assert_eq!(
+            merged,
+            "\
+providers:
+  r:
+    # why this router
+    # old url
+    # about the key
+    # items
+    # first
+    # one
+    base_url: \"https://x\"
+    key_env: \"K\"
+  mine: {}
+"
+        );
+        assert_eq!(
+            merge(&merged, &values(), &[&["providers", "r"]]).unwrap(),
+            merged
+        );
+    }
+
+    /// A removed entry's comments stay, each on its own line where the entry
+    /// was: comments never change what the file means, so none is dropped.
+    #[test]
+    fn comments_of_a_removed_entry_are_kept() {
+        let merged = merge(
+            "\
+fallback_model: # old fallback
+  # use openrouter
+  provider: openrouter # cheap
+agent: {}
+",
+            &values(),
+            &[&["fallback_model"]],
+        )
+        .unwrap();
+        assert_eq!(
+            merged,
+            "# old fallback\n# use openrouter\n# cheap\nagent: {}\n"
+        );
+        assert_eq!(
+            merge(&merged, &values(), &[&["fallback_model"]]).unwrap(),
+            merged
         );
     }
 
