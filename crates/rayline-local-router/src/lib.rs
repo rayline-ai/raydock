@@ -1420,9 +1420,10 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
                     "type": "invalid_request_error",
                     "code": "required_tool_unavailable",
                     "param": "tool_choice",
-                    "message": "tool_choice requires a tool call, but none of the tools it \
-                                permits can be sent to this Anthropic route (a web_search \
-                                without live access is omitted). Declare a permitted tool the \
+                    "message": "tool_choice requires a tool call this Anthropic route cannot \
+                                make: the tool it forces, or every tool it permits, is not \
+                                sent upstream (custom tools, and a web_search without live \
+                                access or with max_tool_calls 0, are not). Declare a tool the \
                                 route can run, or relax tool_choice.",
                 }}),
             ));
@@ -3578,10 +3579,11 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
     (Value::Object(out), rewrites)
 }
 
-/// Whether `tool_choice` requires a tool call but no tool it permits survives
-/// translation (an omitted offline search, or an `allowed_tools` subset with
-/// nothing translatable). Forwarded, the request would lose its tools and
-/// the requirement with them and come back as plain text.
+/// Whether `tool_choice` requires a tool call (`required`, `allowed_tools`
+/// in `required` mode, or a specific tool) that the translated request no
+/// longer requires: the forced tool was omitted (an offline or zero-budget
+/// search, a tool type Anthropic has no equivalent for) or nothing permitted
+/// is left. Forwarded, the requirement would silently relax to `auto`.
 fn responses_required_tool_unavailable(body: &Value) -> bool {
     let Some(choice) = body.get("tool_choice") else {
         return false;
@@ -3590,16 +3592,27 @@ fn responses_required_tool_unavailable(body: &Value) -> bool {
         Some(mode) => mode == "required",
         None => match choice.get("type").and_then(Value::as_str) {
             Some("allowed_tools") => choice.get("mode").and_then(Value::as_str) == Some("required"),
-            Some("function") => true,
-            Some(kind) => kind.starts_with("web_search"),
+            Some(_) => true,
             None => false,
         },
     };
-    requires_call
-        && responses_to_anthropic_request(body, "")
-            .0
+    if !requires_call {
+        return false;
+    }
+    let (translated, _) = responses_to_anthropic_request(body, "");
+    let Some(forced) = translated.get("tool_choice") else {
+        return true;
+    };
+    match forced.get("type").and_then(Value::as_str) {
+        Some("any") => false,
+        Some("tool") => !translated
             .get("tools")
-            .is_none()
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|tool| tool.get("name") == forced.get("name")),
+        _ => true,
+    }
 }
 
 fn is_anthropic_web_search_tool(tool: &Value) -> bool {
@@ -7212,6 +7225,23 @@ mod tests {
         let permitted = json!({"input": "x", "tools": [{"type": "function", "name": "shell"}],
                                "tool_choice": "required"});
         assert!(!responses_required_tool_unavailable(&permitted));
+        let forced = json!({"input": "x", "tools": [{"type": "function", "name": "shell"}],
+                            "tool_choice": {"type": "function", "name": "shell"}});
+        assert!(!responses_required_tool_unavailable(&forced));
+        // A forced tool that does not survive translation is refused even
+        // when other tools remain: a custom tool, a zero-budget search, or an
+        // undeclared function.
+        for choice in [
+            json!({"type": "custom", "name": "execute"}),
+            json!({"type": "web_search_preview"}),
+            json!({"type": "function", "name": "missing"}),
+        ] {
+            let request = json!({"input": "x", "max_tool_calls": 0, "tool_choice": choice,
+                "tools": [{"type": "custom", "name": "execute"},
+                          {"type": "web_search_preview"},
+                          {"type": "function", "name": "shell"}]});
+            assert!(responses_required_tool_unavailable(&request), "{choice}");
+        }
         // Forcing a search that was not declared live would name a missing tool.
         let (offline, _) = responses_to_anthropic_request(
             &json!({"input": "x", "tool_choice": {"type": "web_search"}, "tools": [
