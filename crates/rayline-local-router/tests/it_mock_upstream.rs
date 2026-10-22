@@ -1096,6 +1096,27 @@ async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
             .contains("code_interpreter")
     );
 
+    // Settings Anthropic's search cannot honour, and a required call with no
+    // tool left to make it, are refused before any upstream call.
+    for (request, code) in [
+        (
+            json!({"model": "m", "input": "hi", "stream": false,
+                   "tools": [{"type": "web_search", "filters": {
+                       "allowed_domains": ["a.example"], "blocked_domains": ["b.a.example"]}}]}),
+            "unsupported_web_search",
+        ),
+        (
+            json!({"model": "m", "input": "hi", "stream": false, "tool_choice": "required",
+                   "tools": [{"type": "web_search", "external_web_access": false}]}),
+            "required_tool_unavailable",
+        ),
+    ] {
+        let refused = client.post(&url).json(&request).send().await.unwrap();
+        assert_eq!(refused.status(), 400);
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(body["error"]["code"], code, "{body}");
+    }
+
     let ok = client
         .post(&url)
         .json(

@@ -1410,6 +1410,23 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
                 }}),
             ));
         }
+        if target == HostedToolTarget::AnthropicMessages
+            && responses_required_tool_unavailable(&parsed)
+        {
+            warn!("local router: refusing Responses request whose required tool cannot be sent");
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "required_tool_unavailable",
+                    "param": "tool_choice",
+                    "message": "tool_choice requires a tool call, but none of the tools it \
+                                permits can be sent to this Anthropic route (a web_search \
+                                without live access is omitted). Declare a permitted tool the \
+                                route can run, or relax tool_choice.",
+                }}),
+            ));
+        }
     }
 
     let response = match &decision.target {
@@ -3537,14 +3554,52 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
     }
     let web_search_declared = converted_tools.iter().any(is_anthropic_web_search_tool);
     if !converted_tools.is_empty() {
-        if let Some(choice) = tool_choice.and_then(|choice| {
+        let mut choice = tool_choice.and_then(|choice| {
             responses_tool_choice_to_anthropic(choice, &rewrites, web_search_declared)
-        }) {
+        });
+        // A forced function is called exactly once in Responses, and
+        // `parallel_tool_calls: false` allows one call per turn; Anthropic
+        // allows parallel calls unless told otherwise.
+        let single_call = body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+            || choice
+                .as_ref()
+                .is_some_and(|choice| choice["type"] == "tool");
+        if single_call {
+            let choice = choice.get_or_insert_with(|| json!({"type": "auto"}));
+            if choice["type"] != "none" {
+                choice["disable_parallel_tool_use"] = json!(true);
+            }
+        }
+        if let Some(choice) = choice {
             out.insert("tool_choice".to_owned(), choice);
         }
         out.insert("tools".to_owned(), Value::Array(converted_tools));
     }
     (Value::Object(out), rewrites)
+}
+
+/// Whether `tool_choice` requires a tool call but no tool it permits survives
+/// translation (an omitted offline search, or an `allowed_tools` subset with
+/// nothing translatable). Forwarded, the request would lose its tools and
+/// the requirement with them and come back as plain text.
+fn responses_required_tool_unavailable(body: &Value) -> bool {
+    let Some(choice) = body.get("tool_choice") else {
+        return false;
+    };
+    let requires_call = match choice.as_str() {
+        Some(mode) => mode == "required",
+        None => match choice.get("type").and_then(Value::as_str) {
+            Some("allowed_tools") => choice.get("mode").and_then(Value::as_str) == Some("required"),
+            Some("function") => true,
+            Some(kind) => kind.starts_with("web_search"),
+            None => false,
+        },
+    };
+    requires_call
+        && responses_to_anthropic_request(body, "")
+            .0
+            .get("tools")
+            .is_none()
 }
 
 fn is_anthropic_web_search_tool(tool: &Value) -> bool {
@@ -4014,6 +4069,9 @@ fn responses_hosted_tool_type(tool: &Value) -> Option<&str> {
                 | "computer_use"
                 | "mcp"
         )
+        // Tool search runs on OpenAI's side unless the client executes it.
+        || (kind == "tool_search"
+            && tool.get("execution").and_then(Value::as_str) != Some("client"))
         // The `shell` tool runs in an OpenAI-hosted container unless its
         // environment is the client's own machine.
         || (kind == "shell"
@@ -7085,7 +7143,7 @@ mod tests {
         assert_eq!(converted["messages"][1]["content"][0]["name"], upstream);
         assert_eq!(
             converted["tool_choice"],
-            json!({"type": "tool", "name": upstream})
+            json!({"type": "tool", "name": upstream, "disable_parallel_tool_use": true})
         );
 
         // Without live search there is no server tool, so the name is free.
@@ -7118,24 +7176,42 @@ mod tests {
         assert_eq!(choice_for(json!("none")), Some(json!({"type": "none"})));
         assert_eq!(choice_for(json!("auto")), Some(json!({"type": "auto"})));
         assert_eq!(choice_for(json!("required")), Some(json!({"type": "any"})));
+        // A forced tool is called exactly once.
         assert_eq!(
             choice_for(json!({"type": "function", "name": "shell"})),
-            Some(json!({"type": "tool", "name": "shell"}))
+            Some(json!({"type": "tool", "name": "shell", "disable_parallel_tool_use": true}))
         );
         // A rewritten function name is forced by its upstream name.
         assert_eq!(
             choice_for(json!({"type": "function", "name": "codex.list"})),
-            Some(json!({"type": "tool", "name": "codex_list"}))
+            Some(json!({"type": "tool", "name": "codex_list", "disable_parallel_tool_use": true}))
         );
         assert_eq!(
             choice_for(json!({"type": "web_search_preview"})),
-            Some(json!({"type": "tool", "name": "web_search"}))
+            Some(json!({"type": "tool", "name": "web_search", "disable_parallel_tool_use": true}))
         );
         // No Anthropic equivalent: left at the default.
-        assert_eq!(
-            choice_for(json!({"type": "allowed_tools", "mode": "auto", "tools": []})),
-            None
+        assert_eq!(choice_for(json!({"type": "custom", "name": "x"})), None);
+        // parallel_tool_calls: false allows one call per turn.
+        let (serial, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "parallel_tool_calls": false,
+                    "tools": [{"type": "function", "name": "shell"}]}),
+            "arc-swift",
         );
+        assert_eq!(
+            serial["tool_choice"],
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+        // A required call with nothing left to call is refused, not dropped.
+        let nothing_permitted = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "web_search", "external_web_access": false}
+        ], "tool_choice": {"type": "allowed_tools", "mode": "required",
+                           "tools": [{"type": "web_search"}]}});
+        assert!(responses_required_tool_unavailable(&nothing_permitted));
+        let permitted = json!({"input": "x", "tools": [{"type": "function", "name": "shell"}],
+                               "tool_choice": "required"});
+        assert!(!responses_required_tool_unavailable(&permitted));
         // Forcing a search that was not declared live would name a missing tool.
         let (offline, _) = responses_to_anthropic_request(
             &json!({"input": "x", "tool_choice": {"type": "web_search"}, "tools": [
@@ -7252,13 +7328,16 @@ mod tests {
 
         // A shell in an OpenAI-hosted container is a hosted tool; the
         // client-run shell is not.
+        // So is server-executed tool search.
         let shells = json!({"tools": [
             {"type": "shell", "environment": {"type": "container_auto"}},
-            {"type": "shell", "environment": {"type": "local"}}
+            {"type": "shell", "environment": {"type": "local"}},
+            {"type": "tool_search"},
+            {"type": "tool_search", "execution": "client"}
         ]});
         assert_eq!(
             responses_untranslatable_hosted_tools(&shells, HostedToolTarget::AnthropicMessages),
-            vec!["shell".to_owned()]
+            vec!["shell".to_owned(), "tool_search".to_owned()]
         );
     }
 
