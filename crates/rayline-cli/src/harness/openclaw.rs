@@ -1,6 +1,7 @@
 //! OpenClaw: `OPENCLAW_CONFIG_PATH=<dir>/openclaw.json` (state stays in the
 //! user's `~/.openclaw`). `${VAR}` is OpenClaw's config substitution; the API
-//! key is an env SecretRef instead, so OpenClaw never caches its value (#83).
+//! key is a file SecretRef to `<dir>/router-key` instead, so OpenClaw never
+//! caches its value (#83) and the key stays out of its environment.
 //!
 //! `api` must be explicit: OpenClaw's default is chat completions, which 404s
 //! at the gateway. Memory search is off because its default embeddings
@@ -32,13 +33,17 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
+    CONTEXT_WINDOW, CONV_ID_ENV, ConfigFile, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
     json_file,
 };
 
 pub(crate) const CONFIG_FILE: &str = "openclaw.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
 pub(crate) const RESPONSES_PROVIDER_ID: &str = "rayline-resp";
+/// The file the key SecretRef reads, next to the config.
+pub(crate) const KEY_FILE: &str = "router-key";
+/// The `secrets.providers` entry that reads [`KEY_FILE`].
+pub(crate) const SECRET_PROVIDER: &str = "rayline";
 
 /// The value of `--session-id <v>` / `--session-id=<v>` in OpenClaw's args
 /// (the last one wins; trimmed, as OpenClaw does; a blank value counts as none).
@@ -150,11 +155,13 @@ pub(crate) fn stable_conversation_id(session_id: &str) -> String {
 }
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
-    // A structured env SecretRef, not the `${VAR}` shorthand: OpenClaw resolves
-    // a `${VAR}` string while loading the config and then writes the resolved
+    // A SecretRef, not a string: OpenClaw resolves a string `apiKey` (or a
+    // `${VAR}` in one) while loading the config and then writes the resolved
     // value into its agent model cache (`agents/<id>/agent/models.json`). For a
-    // SecretRef it writes only the variable's name there (#83).
-    let api_key = json!({ "source": "env", "provider": "default", "id": KEY_ENV });
+    // SecretRef it writes only a marker there (#83). A `singleValue` file
+    // provider returns the whole file (one trailing newline trimmed); its ref
+    // id must be `value`. OpenClaw refuses a file other users can read.
+    let api_key = json!({ "source": "file", "provider": SECRET_PROVIDER, "id": "value" });
     let conv_ref = format!("${{{CONV_ID_ENV}}}");
     // No native session id on Messages (see the module docs).
     let messages_headers = ctx.conversation_headers_for(&conv_ref, false);
@@ -171,6 +178,15 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         })
     };
     let config = json!({
+        "secrets": {
+            "providers": {
+                SECRET_PROVIDER: {
+                    "source": "file",
+                    "path": ctx.config_dir.join(KEY_FILE).to_string_lossy(),
+                    "mode": "singleValue"
+                }
+            }
+        },
         "memory": { "search": { "provider": "none" } },
         "agents": {
             "defaults": {
@@ -200,7 +216,15 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         }
     });
     Plan {
-        files: vec![json_file(CONFIG_FILE, &config, true)],
+        files: vec![
+            json_file(CONFIG_FILE, &config, true),
+            ConfigFile {
+                name: KEY_FILE,
+                contents: ctx.key.to_owned(),
+                overwrite: true,
+                merged_from: None,
+            },
+        ],
         env_set: vec![(
             "OPENCLAW_CONFIG_PATH",
             ctx.config_dir.join(CONFIG_FILE).into_os_string(),
@@ -212,8 +236,8 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::super::Harness;
-    use super::super::tests::{TEST_URL, env_value, render};
-    use super::CONFIG_FILE;
+    use super::super::tests::{TEST_KEY, TEST_URL, env_value, render};
+    use super::{CONFIG_FILE, KEY_FILE};
 
     #[test]
     fn renders_explicit_api_and_disables_side_calls() {
@@ -234,9 +258,20 @@ mod tests {
         assert_eq!(config["models"]["mode"], "merge");
         assert_eq!(provider["baseUrl"], TEST_URL);
         assert_eq!(provider["api"], "anthropic-messages");
-        let key_ref =
-            serde_json::json!({ "source": "env", "provider": "default", "id": "RAYLINE_KEY" });
+        let key_ref = serde_json::json!({ "source": "file", "provider": "rayline", "id": "value" });
         assert_eq!(provider["apiKey"], key_ref);
+        assert_eq!(
+            config["secrets"]["providers"]["rayline"],
+            serde_json::json!({
+                "source": "file",
+                "path": dir.join(KEY_FILE).to_string_lossy(),
+                "mode": "singleValue"
+            })
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(KEY_FILE)).unwrap(),
+            TEST_KEY
+        );
         // dev: Messages still carries the per-launch id, Responses does not.
         assert_eq!(
             provider["headers"],

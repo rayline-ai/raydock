@@ -1,6 +1,6 @@
 //! opencode: `OPENCODE_CONFIG=<dir>/opencode.json`. opencode merges this file
 //! over the user's global config (project configs still win). `{env:VAR}` is
-//! opencode's config substitution.
+//! opencode's config substitution; the key is written as a literal `apiKey`.
 //!
 //! opencode sends its session id as `x-session-affinity` on its own, which
 //! the gateway keys the episode on; `opencode -c` / `--session` keeps it.
@@ -8,8 +8,7 @@
 use serde_json::json;
 
 use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
-    json_file,
+    CONTEXT_WINDOW, CONV_ID_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext, json_file,
 };
 
 pub(crate) const CONFIG_FILE: &str = "opencode.json";
@@ -33,7 +32,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "npm": "@ai-sdk/anthropic",
                 "options": {
                     "baseURL": ctx.v1_base(),
-                    "apiKey": format!("{{env:{KEY_ENV}}}"),
+                    "apiKey": ctx.key,
                     "headers": ctx.conversation_headers(&format!("{{env:{CONV_ID_ENV}}}")),
                 },
                 "models": {
@@ -62,11 +61,11 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::super::Harness;
-    use super::super::tests::{TEST_URL, env_value, render};
+    use super::super::tests::{TEST_KEY, TEST_URL, env_value, render};
     use super::*;
 
     #[test]
-    fn renders_messages_provider_with_env_refs() {
+    fn renders_messages_provider_with_the_key() {
         let (dir, plan) = render(Harness::OpenCode);
         let path = dir.join(CONFIG_FILE);
         assert_eq!(
@@ -80,7 +79,7 @@ mod tests {
         let provider = &config["provider"]["rayline"];
         assert_eq!(provider["npm"], "@ai-sdk/anthropic");
         assert_eq!(provider["options"]["baseURL"], format!("{TEST_URL}/v1"));
-        assert_eq!(provider["options"]["apiKey"], "{env:RAYLINE_KEY}");
+        assert_eq!(provider["options"]["apiKey"], TEST_KEY);
         assert_eq!(provider["options"]["headers"], serde_json::json!({}));
         let model = &provider["models"]["rayline-router"];
         assert_eq!(model["limit"]["context"], 200000);
