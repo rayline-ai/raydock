@@ -1,5 +1,5 @@
 //! Hermes Agent: `HERMES_HOME=<dir>` holds `config.yaml` (plus Hermes' own
-//! state: sessions, memories, skills). `key_env` names the key's env var and
+//! state: sessions, memories, skills). `api_key` is the literal key and
 //! `${VAR}` is expanded in config values.
 //!
 //! Episode keying: Hermes sends its session id as `x-session-affinity` on
@@ -23,8 +23,7 @@ use std::{fs, io};
 use serde_json::json;
 
 use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, ConfigFile, KEY_ENV, Plan, ROUTER_MODEL, RenderContext, to_yaml,
-    yaml_merge,
+    CONTEXT_WINDOW, CONV_ID_ENV, ConfigFile, Plan, ROUTER_MODEL, RenderContext, to_yaml, yaml_merge,
 };
 
 pub(crate) const CONFIG_FILE: &str = "config.yaml";
@@ -48,7 +47,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
     let models = json!({ ROUTER_MODEL: { "context_length": CONTEXT_WINDOW } });
     let mut responses = json!({
         "base_url": ctx.v1_base(),
-        "key_env": KEY_ENV,
+        "api_key": ctx.key,
         "api_mode": "codex_responses",
         "models": models
     });
@@ -57,7 +56,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
     }
     let mut messages = json!({
         "base_url": ctx.messages_base(),
-        "key_env": KEY_ENV,
+        "api_key": ctx.key,
         "api_mode": "anthropic_messages",
         "models": models
     });
@@ -179,6 +178,7 @@ fallback_model:
         let launch = || {
             let ctx = RenderContext {
                 env_name: "dev",
+                key: super::super::tests::TEST_KEY,
                 router_url: TEST_URL,
                 config_dir: &dir,
                 conversation_id: ConversationIdFallback::new("dev", None),
@@ -197,20 +197,20 @@ fallback_model:
   context_length: 200000
 providers:
   rayline-anth:
+    api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
     base_url: \"https://api-dev.rayline.ai\"
     extra_headers:
       x-conversation-id: \"${RAYLINE_CONV_ID}\"
-    key_env: \"RAYLINE_KEY\"
     models:
       rayline-router:
         context_length: 200000
   mine:
     base_url: https://mine.example
   rayline-resp:
+    api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
     base_url: \"https://api-dev.rayline.ai/v1\"
-    key_env: \"RAYLINE_KEY\"
     models:
       rayline-router:
         context_length: 200000
@@ -239,6 +239,7 @@ fallback_providers: []
         std::fs::write(dir.join(CONFIG_FILE), "---\nmodel: x\n").unwrap();
         let ctx = RenderContext {
             env_name: "dev",
+            key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
             conversation_id: ConversationIdFallback::new("dev", None),
@@ -265,18 +266,18 @@ model:
   provider: \"custom:rayline-anth\"
 providers:
   rayline-anth:
+    api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
     base_url: \"https://api-dev.rayline.ai\"
     extra_headers:
       x-conversation-id: \"${RAYLINE_CONV_ID}\"
-    key_env: \"RAYLINE_KEY\"
     models:
       rayline-router:
         context_length: 200000
   rayline-resp:
+    api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
     base_url: \"https://api-dev.rayline.ai/v1\"
-    key_env: \"RAYLINE_KEY\"
     models:
       rayline-router:
         context_length: 200000
