@@ -15,8 +15,11 @@ const DEFAULT_CLAUDE_SETTINGS_SUFFIX: &str = ".claude/settings.json";
 const DEFAULT_MODEL: &str = "rayline-router";
 const DEFAULT_PROXY_SUBAGENTS_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_ROUTER_KEY_NAME: &str = "rayline-cli";
-const DEFAULT_AUTO_COMPACT_WINDOW: &str = "180000";
-const DEFAULT_AUTO_COMPACT_WINDOW_1M: &str = "950000";
+/// Claude Code's `--model` / `ANTHROPIC_MODEL` aliases (each may also carry a
+/// `[1m]` suffix).
+const CLAUDE_CODE_MODEL_ALIASES: [&str; 7] = [
+    "default", "best", "opus", "sonnet", "haiku", "fable", "opusplan",
+];
 const DEFAULT_LOCAL_INJECTOR_PORT: u16 = 20809;
 const DEFAULT_PROXY_PORT: u16 = 20810;
 /// Distinct proxy port for `--isolated` proxy-mode runs, so an isolated session
@@ -835,12 +838,14 @@ async fn run_command_from_home(
         } else {
             (model, set_model_env)
         };
-    // An explicit flag/env wins; otherwise the hosted router derives the window
-    // from the launch model's catalog context window. The local plane has no
-    // hosted router, so it keeps the model-aware default.
+    // An explicit flag/env wins. Otherwise Claude Code sizes the session itself
+    // unless the hosted router knows a window for a launch model Claude Code
+    // doesn't (`rayline-router`, an ARC id, another provider's model). A Claude
+    // Code alias (`opus`, `sonnet[1m]`, ...) is Claude Code's own, so it skips the
+    // lookup. The local plane has no hosted router and no served window to report.
     let auto_compact_window = match explicit_auto_compact_window(request) {
-        Some(window) => window,
-        None if local_plane => default_auto_compact_window(&model).to_owned(),
+        Some(window) => Some(window),
+        None if local_plane || is_claude_code_model_alias(&model) => None,
         None => {
             router_auto_compact_window(
                 &env_name,
@@ -866,7 +871,7 @@ async fn run_command_from_home(
     let mut daemon_request = RequestSpec {
         env_name: &env_name,
         routing_mode: request.routing_mode,
-        auto_compact_window: &auto_compact_window,
+        auto_compact_window: auto_compact_window.as_deref(),
         args: &request.args,
         requested_local_port,
         requested_proxy_port,
@@ -948,7 +953,7 @@ async fn run_command_from_home(
                 router_url.as_str(),
                 &key,
                 &model,
-                &auto_compact_window,
+                auto_compact_window.as_deref(),
             )
             .await?;
         }
@@ -996,7 +1001,7 @@ async fn run_command_from_home(
                 router_url.as_str(),
                 &key,
                 set_model_env.then_some(model.as_str()),
-                &auto_compact_window,
+                auto_compact_window.as_deref(),
                 isolated,
             )
             .await?;
@@ -1174,7 +1179,7 @@ async fn configure_override_env(
     router_url: &str,
     key: &str,
     model: &str,
-    auto_compact_window: &str,
+    auto_compact_window: Option<&str>,
 ) -> Result<(), RunError> {
     if let Some(start_request) = local_start_request {
         let injector_port = start_request.injector_port;
@@ -1188,7 +1193,7 @@ async fn configure_override_env(
     }
     command.env("ANTHROPIC_AUTH_TOKEN", key);
     command.env("ANTHROPIC_MODEL", model);
-    command.env(AUTO_COMPACT_WINDOW_ENV, auto_compact_window);
+    set_auto_compact_window_env(command, auto_compact_window);
     command.env(RAYLINE_ENV_NAME_ENV, env_name);
     command.env_remove("ANTHROPIC_API_KEY");
     command.env_remove("RAYLINE_CLAUDE_ROUTING_MODE");
@@ -1206,7 +1211,7 @@ async fn configure_proxy_env(
     router_url: &str,
     key: &str,
     model: Option<&str>,
-    auto_compact_window: &str,
+    auto_compact_window: Option<&str>,
     isolated: bool,
 ) -> Result<(), RunError> {
     let proxy_port = resolve_proxy_port(isolated)?;
@@ -1278,7 +1283,7 @@ async fn configure_proxy_env(
     if let Some(model) = model {
         command.env("ANTHROPIC_MODEL", model);
     }
-    command.env(AUTO_COMPACT_WINDOW_ENV, auto_compact_window);
+    set_auto_compact_window_env(command, auto_compact_window);
     command.env(
         "RAYLINE_CLAUDE_ROUTING_MODE",
         routing_mode_name(request.routing_mode),
@@ -1359,12 +1364,22 @@ fn explicit_auto_compact_window(request: &RunRequest) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn default_auto_compact_window(model: &str) -> &'static str {
-    if model.trim_end().ends_with("[1m]") {
-        DEFAULT_AUTO_COMPACT_WINDOW_1M
-    } else {
-        DEFAULT_AUTO_COMPACT_WINDOW
-    }
+/// Whether `model` is a Claude Code model alias (`opus`, `sonnet[1m]`,
+/// `opusplan`, ...) rather than a concrete model id. Claude Code resolves these
+/// itself, so the hosted router's catalog cannot answer for them.
+fn is_claude_code_model_alias(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let base = model.strip_suffix("[1m]").unwrap_or(&model);
+    CLAUDE_CODE_MODEL_ALIASES.contains(&base)
+}
+
+/// Pin `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, or clear it so Claude Code applies
+/// its own window for the model.
+fn set_auto_compact_window_env(command: &mut Command, auto_compact_window: Option<&str>) {
+    match auto_compact_window {
+        Some(window) => command.env(AUTO_COMPACT_WINDOW_ENV, window),
+        None => command.env_remove(AUTO_COMPACT_WINDOW_ENV),
+    };
 }
 
 /// Read the account-level `enable_local_router` toggle from a `GET /v1/settings`
@@ -1379,24 +1394,28 @@ fn enable_local_router_from_router_settings(result: &Value) -> bool {
 }
 
 /// The hosted router's auto-compact window for the launch model:
-/// `GET /v1/settings?model=<model>` returns 95% of the model's catalog context
-/// window (or of the pinned main model's, for a virtual launch model). A failed
-/// request or a missing window fails the launch rather than guessing one.
+/// `GET /v1/settings?model=<model>&client_sizes=1` returns the window of the model serving a
+/// launch id Claude Code doesn't know, and a null or absent `autoCompactWindow`
+/// for one Claude Code sizes itself, which is `None` here. A failed request or a
+/// window that isn't a positive integer fails the launch rather than guessing.
 async fn router_auto_compact_window(
     env_name: &str,
     router_base: &str,
     auth_token: Option<&str>,
     router_key: &str,
     model: &str,
-) -> Result<String, RunError> {
+) -> Result<Option<String>, RunError> {
     get_router_settings(env_name, router_base, auth_token, router_key, Some(model))
         .await
-        .and_then(|body| {
-            body.get("autoCompactWindow")
-                .and_then(Value::as_u64)
+        .and_then(|body| match body.get("autoCompactWindow") {
+            None | Some(Value::Null) => Ok(None),
+            Some(window) => window
+                .as_u64()
                 .filter(|window| *window > 0)
-                .map(|window| window.to_string())
-                .ok_or_else(|| "the response has no autoCompactWindow".to_owned())
+                .map(|window| Some(window.to_string()))
+                .ok_or_else(|| {
+                    format!("the response's autoCompactWindow {window} is not a positive integer")
+                }),
         })
         .map_err(|error| {
             RunError::Router(format!(
@@ -1448,7 +1467,10 @@ async fn get_router_settings(
         .get(format!("{router_base}/v1/settings"))
         .bearer_auth(bearer_token);
     if let Some(model) = model {
-        request = request.query(&[("model", model)]);
+        // `client_sizes=1` tells the router this client accepts a null window
+        // (Claude Code sizes the model itself). Without it the router keeps
+        // answering a number, because 0.2.10 fails the launch on null.
+        request = request.query(&[("model", model), ("client_sizes", "1")]);
     }
     let response = request.send().await.map_err(|error| error.to_string())?;
     let status = response.status();
@@ -2630,10 +2652,13 @@ mod router_auto_compact_window_tests {
         (base, served)
     }
 
-    async fn window(status: &'static str, body: &'static str) -> (Result<String, String>, String) {
+    async fn window(
+        status: &'static str,
+        body: &'static str,
+    ) -> (Result<Option<String>, String>, String) {
         let (base, served) = settings_stub(status, body).await;
         let window =
-            router_auto_compact_window("dev", &base, Some("token"), "key", "claude-opus-4-8[1m]")
+            router_auto_compact_window("dev", &base, Some("token"), "key", "rayline-router[1m]")
                 .await
                 .map_err(|error| error.to_string());
         (window, served.await.unwrap())
@@ -2642,26 +2667,43 @@ mod router_auto_compact_window_tests {
     #[tokio::test]
     async fn asks_the_router_with_the_launch_model_and_returns_its_window() {
         let (window, request_line) =
-            window("200 OK", r#"{"settings":{},"autoCompactWindow":950000}"#).await;
-        assert_eq!(window, Ok("950000".to_owned()));
+            window("200 OK", r#"{"settings":{},"autoCompactWindow":262144}"#).await;
+        assert_eq!(window, Ok(Some("262144".to_owned())));
         assert!(
-            request_line.starts_with("GET /v1/settings?model=claude-opus-4-8%5B1m%5D "),
+            request_line
+                .starts_with("GET /v1/settings?model=rayline-router%5B1m%5D&client_sizes=1 "),
             "{request_line}"
         );
     }
 
     #[tokio::test]
-    async fn fails_the_launch_when_the_router_has_no_window() {
+    async fn a_null_or_absent_window_leaves_the_window_to_claude_code() {
+        for body in [
+            r#"{"settings":{},"autoCompactWindow":null}"#,
+            r#"{"settings":{}}"#,
+        ] {
+            let (window, _) = window("200 OK", body).await;
+            assert_eq!(window, Ok(None), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_the_launch_on_a_router_error_or_a_malformed_window() {
         for (status, body, reason) in [
             (
                 "400 Bad Request",
-                r#"{"error":"Unknown model: claude-opus-4-8[1m]"}"#,
-                "Unknown model: claude-opus-4-8[1m]",
+                r#"{"error":"Unknown model: rayline-router[1m]"}"#,
+                "Unknown model: rayline-router[1m]",
             ),
             (
                 "200 OK",
-                r#"{"settings":{}}"#,
-                "the response has no autoCompactWindow",
+                r#"{"settings":{},"autoCompactWindow":"950000"}"#,
+                r#"autoCompactWindow "950000" is not a positive integer"#,
+            ),
+            (
+                "200 OK",
+                r#"{"settings":{},"autoCompactWindow":0}"#,
+                "autoCompactWindow 0 is not a positive integer",
             ),
         ] {
             let (window, _) = window(status, body).await;
@@ -2669,6 +2711,66 @@ mod router_auto_compact_window_tests {
             assert!(error.contains(reason), "{error}");
             assert!(error.contains("--auto-compact-window <tokens>"), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod claude_code_model_alias_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_claude_code_aliases() {
+        for model in [
+            "opus",
+            "sonnet",
+            "haiku",
+            "fable",
+            "best",
+            "default",
+            "opusplan",
+            "opus[1m]",
+            "sonnet[1m]",
+            "fable[1m]",
+            "opusplan[1m]",
+            " Opus ",
+            "SONNET[1M]",
+        ] {
+            assert!(is_claude_code_model_alias(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn concrete_and_virtual_models_are_not_aliases() {
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-4-8[1m]",
+            "claude-sonnet-5",
+            "rayline-router",
+            "opus-4",
+            "",
+        ] {
+            assert!(!is_claude_code_model_alias(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn unpinned_window_clears_an_inherited_env_value() {
+        let mut command = Command::new("true");
+        command.env(AUTO_COMPACT_WINDOW_ENV, "");
+        set_auto_compact_window_env(&mut command, None);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == AUTO_COMPACT_WINDOW_ENV && value.is_none())
+        );
+
+        set_auto_compact_window_env(&mut command, Some("180000"));
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == AUTO_COMPACT_WINDOW_ENV
+                    && value == Some(std::ffi::OsStr::new("180000")))
+        );
     }
 }
 
