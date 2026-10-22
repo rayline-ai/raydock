@@ -316,37 +316,43 @@ fn private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `contents` readable only by the owner. A new file is created 0600 and
-/// an existing one is narrowed to 0600 before any byte is written.
+/// Write `contents` readable only by the owner: into a new 0600 file beside
+/// `path`, then renamed over it. Whatever was at `path` (a loosened file, a
+/// planted symlink) is replaced, never written through.
 fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    if let Some(dir) = path.parent() {
-        private_dir(dir)?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    private_dir(dir)?;
+    let name = path
+        .file_name()
+        .map(OsStr::to_string_lossy)
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
     let mut options = fs::OpenOptions::new();
-    options.write(true).create(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let mut file = options.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut file = options.open(&tmp)?;
+    let written = file.write_all(contents).and_then(|()| file.sync_all());
+    if let Err(error) = written.and_then(|()| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
     }
-    file.set_len(0)?;
-    file.write_all(contents)?;
-    file.sync_all()
+    Ok(())
 }
 
 /// This instance's gateway token, created on first use and kept across
 /// restarts so an imported Desktop configuration stays valid.
 pub fn ensure_gateway_token(paths: &AppPaths) -> io::Result<String> {
-    if owned_and_private(&paths.token_file)
-        && let Ok(existing) = fs::read_to_string(&paths.token_file)
-    {
+    if let Some(existing) = read_private(&paths.token_file) {
         let existing = existing.trim();
         if is_gateway_token(existing) {
             return Ok(existing.to_owned());
@@ -357,21 +363,33 @@ pub fn ensure_gateway_token(paths: &AppPaths) -> io::Result<String> {
     Ok(token)
 }
 
-/// Whether `path` is a regular file owned by this user that no one else can
-/// read or write. A token file failing this (planted, or loosened) is replaced.
+/// `path`'s contents if it is a regular file owned by this user that no one
+/// else can read or write, checked on the opened file (not followed through a
+/// symlink, so it cannot be swapped between check and read). A token file
+/// failing this (planted, or loosened) is replaced.
 #[cfg(unix)]
-fn owned_and_private(path: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
+fn read_private(path: &Path) -> Option<String> {
+    use std::io::Read;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
     // SAFETY: geteuid has no preconditions and cannot fail.
     let uid = unsafe { libc::geteuid() };
-    fs::symlink_metadata(path).is_ok_and(|meta| {
-        meta.file_type().is_file() && meta.uid() == uid && meta.mode() & 0o077 == 0
-    })
+    if !meta.file_type().is_file() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
+        return None;
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    Some(contents)
 }
 
 #[cfg(not(unix))]
-fn owned_and_private(_path: &Path) -> bool {
-    false
+fn read_private(_path: &Path) -> Option<String> {
+    None
 }
 
 /// Arguments for `rld serve` (after the binary).
@@ -1137,6 +1155,14 @@ fn desktop_rld_bin(home: &Path) -> Result<PathBuf, String> {
             rld_bin.display()
         ));
     }
+    // `stop` recognises the router by its `ps` command line, split on
+    // whitespace, so the program path must be one word.
+    if rld_bin.to_string_lossy().chars().any(char::is_whitespace) {
+        return Err(format!(
+            "the Claude Desktop router needs an rld path without spaces, not {}",
+            rld_bin.display()
+        ));
+    }
     Ok(rld_bin)
 }
 
@@ -1633,6 +1659,24 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+        // A symlink at the token path is replaced, never read or written through.
+        let target = home.join("victim");
+        fs::write(&target, format!("{planted}\n")).expect("victim");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).expect("narrow");
+        fs::remove_file(&paths.token_file).expect("unlink");
+        std::os::unix::fs::symlink(&target, &paths.token_file).expect("symlink");
+        let fresh = ensure_gateway_token(&paths).expect("replace symlink");
+        assert_ne!(fresh, planted);
+        assert_eq!(
+            fs::read_to_string(&target).expect("victim intact"),
+            format!("{planted}\n")
+        );
+        assert!(
+            !fs::symlink_metadata(&paths.token_file)
+                .expect("token")
+                .file_type()
+                .is_symlink()
+        );
         let _ = fs::remove_dir_all(home);
     }
 
