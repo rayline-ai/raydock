@@ -467,7 +467,7 @@ fn resolve_daemon_conflict(
 /// the default (or inherited) config dir.
 fn stop_conflicting_daemon(claude_bin: &Path, config_dir: &Path) -> Result<(), RunError> {
     eprintln!("Stopping the current daemon ({STOP_COMMAND})...");
-    match Command::new(claude_bin)
+    match crate::claude::claude_command(claude_bin)
         .args(["daemon", "stop", "--any"])
         .env(CLAUDE_CONFIG_DIR_ENV, config_dir)
         .status()

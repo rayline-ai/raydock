@@ -26,7 +26,9 @@ pub(crate) const MIN_SESSION_HEADER_VERSION: (u64, u64, u64) = (18, 1, 10);
 /// Warn when `omp --version` reports a version that sends no session id in
 /// apiKey mode. Silent when the version cannot be read.
 pub(crate) fn warn_if_old(binary: &Path) {
-    let Ok(output) = Command::new(binary)
+    let mut command = Command::new(binary);
+    crate::codex::withhold_router_key(&mut command);
+    let Ok(output) = command
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())

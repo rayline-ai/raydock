@@ -1328,11 +1328,12 @@ fn configure_proxy_auth_env(command: &mut Command, routing_mode: RoutingMode) {
 /// every mode. Claude Code never needs them: the proxy holds the key in proxy
 /// modes, and `--via env` passes it as `ANTHROPIC_AUTH_TOKEN`. Its Bash tool
 /// passes Claude Code's environment on to every command it runs, so a key
-/// left there would reach a model-visible `env` call.
-fn claude_command(claude_bin: &Path) -> Command {
+/// left there would reach a model-visible `env` call. Every `claude` spawn (the
+/// session, `auth login`, `daemon stop`, the diagnostic version probe) goes
+/// through here.
+pub(crate) fn claude_command(claude_bin: &Path) -> Command {
     let mut command = Command::new(claude_bin);
-    command.env_remove("RAYLINE_ROUTER_API_KEY");
-    command.env_remove(crate::harness::KEY_ENV);
+    crate::codex::withhold_router_key(&mut command);
     command
 }
 
@@ -1884,7 +1885,7 @@ fn run_isolated_browser_login(isolated_dir: &Path, claude_bin: &Path) -> Result<
     // credential location on Linux/Windows; on macOS the credential lands in the
     // keychain under the isolated dir's namespaced service. Claude sets up the
     // credential and its ACL itself, so there is no keychain prompt from us.
-    let status = Command::new(claude_bin)
+    let status = claude_command(claude_bin)
         .args(["auth", "login"])
         .env(CLAUDE_CONFIG_DIR_ENV, isolated_dir)
         .status()
@@ -2123,7 +2124,7 @@ async fn diag_print_preamble(
     eprintln!("  {:<12} : {}", crate::CLI_BIN, crate::RAYLINE_VERSION);
     match find_claude_bin(home) {
         Some(claude_bin) => {
-            let version = Command::new(&claude_bin)
+            let version = claude_command(&claude_bin)
                 .arg("--version")
                 .output()
                 .ok()
