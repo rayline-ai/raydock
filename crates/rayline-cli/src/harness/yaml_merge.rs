@@ -20,8 +20,17 @@ use serde_json::{Value, json};
 pub(crate) fn merge(existing: &str, values: &Value, paths: &[&[&str]]) -> Result<String, String> {
     let existing = existing.strip_prefix('\u{feff}').unwrap_or(existing);
     let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
+    // YAML whitespace is space and tab, and its line breaks include `\r`,
+    // NEL, LS and PS, which `str::lines` does not split on. Refuse them all so
+    // every check below can trust `' '` and `'\n'` alone.
     if let Some(index) = lines.iter().position(|line| line.contains('\t')) {
         return Err(at(index, "tab character"));
+    }
+    if let Some(index) = lines
+        .iter()
+        .position(|line| line.contains(['\r', '\u{85}', '\u{2028}', '\u{2029}']))
+    {
+        return Err(at(index, "line break other than \\n"));
     }
     // Check the whole document, not only the entries the paths touch.
     mapping(&lines, 0, lines.len(), 0, false)?;
@@ -219,7 +228,11 @@ fn scalar(
     let quote = match inline.chars().next() {
         Some(quote @ ('"' | '\'')) => quote,
         Some('[' | '{') => {
-            let code = inline.split(" #").next().unwrap_or(inline).trim_end();
+            let code = inline
+                .split(" #")
+                .next()
+                .unwrap_or(inline)
+                .trim_end_matches(' ');
             let wraps = (start + 1..end).any(|index| is_content(split(&lines[index]).1));
             if !matches!(code, "[]" | "{}") || wraps {
                 return Err(at(start, "non-empty flow collection"));
@@ -259,12 +272,13 @@ fn scalar(
     let close_line = start + text[..close].matches('\n').count();
     if let Some(index) = (start + 1..=close_line).find(|&index| {
         let (depth, text) = split(&lines[index]);
-        !text.trim().is_empty() && depth <= indent
+        !text.trim_matches(' ').is_empty() && depth <= indent
     }) {
         return Err(at(index, "continuation line not deeper than its key"));
     }
     let after = text[close + 1..].split('\n').next().unwrap_or("");
-    if !(after.trim().is_empty() || after.starts_with(' ') && after.trim().starts_with('#')) {
+    let after_text = after.trim_matches(' ');
+    if !(after_text.is_empty() || after.starts_with(' ') && after_text.starts_with('#')) {
         return Err(at(close_line, "text after a quoted value"));
     }
     if let Some(index) = (close_line + 1..end).find(|&index| is_content(split(&lines[index]).1)) {
@@ -282,7 +296,7 @@ fn split(line: &str) -> (usize, &str) {
 /// Not blank and not a comment. (Inside a quoted scalar a `#` line is
 /// content; [`scalar`] handles that.)
 fn is_content(text: &str) -> bool {
-    let text = text.trim();
+    let text = text.trim_matches(' ');
     !text.is_empty() && !text.starts_with('#')
 }
 
@@ -312,13 +326,16 @@ fn parse_key(text: &str) -> Option<(String, String)> {
             .char_indices()
             .find(|&(at, ch)| ch == ':' && text[at + 1..].chars().next().is_none_or(|c| c == ' '))?
             .0;
-        (text[..colon].trim_end().to_owned(), &text[colon..])
+        (
+            text[..colon].trim_end_matches(' ').to_owned(),
+            &text[colon..],
+        )
     };
     let rest = rest.trim_start_matches(' ').strip_prefix(':')?;
     if !(rest.is_empty() || rest.starts_with(' ')) {
         return None;
     }
-    let rest = rest.trim();
+    let rest = rest.trim_matches(' ');
     let inline = if rest.starts_with('#') { "" } else { rest };
     Some((key, inline.to_owned()))
 }
@@ -385,6 +402,25 @@ mod tests {
 
     fn set_provider(existing: &str) -> Result<String, String> {
         merge(existing, &values(), &[&["model", "provider"]])
+    }
+
+    #[test]
+    fn only_spaces_are_whitespace_in_keys_and_comments() {
+        // A no-break space is part of the key in YAML: `provider\u{a0}` is a
+        // different key and stays, next to the appended `provider`.
+        assert_eq!(
+            set_provider("model:\n  provider\u{a0}: keep\n").unwrap(),
+            "model:\n  provider\u{a0}: keep\n  provider: \"custom:r\"\n"
+        );
+        // `\u{a0}#keep` is a key, not a comment, so replacing the entry above
+        // it keeps its block.
+        assert_eq!(
+            set_provider(
+                "model:\n  provider: old\n  \u{a0}#keep:\n    enabled: true\n  effort: high\n"
+            )
+            .unwrap(),
+            "model:\n  provider: \"custom:r\"\n  \u{a0}#keep:\n    enabled: true\n  effort: high\n"
+        );
     }
 
     #[test]
@@ -641,6 +677,11 @@ fallback_providers: []
             "model: x\n...\n",
             "%YAML 1.2\n---\nmodel: x\n",
             "model:\n\tdefault: x\n",
+            // Line breaks `str::lines` does not split on.
+            "note: x\rmodel:\r  effort: high\r",
+            "note: x\u{85}model: y\n",
+            "note: x\u{2028}model: y\n",
+            "note: x\u{2029}model: y\n",
             // Other shapes `safe_dump` does not write.
             "fallback_providers: []\nfallback_providers:\n- other\n",
             "? complex\n: key\n",
