@@ -1364,9 +1364,9 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
         });
     }
 
-    // Never forward a translated request without a hosted tool the caller
-    // declared: translate it where the target has an equivalent, refuse it
-    // with an actionable error where it does not.
+    // Never forward a translated request without a tool the caller declared,
+    // or with a restriction the caller set lifted: translate what the target
+    // has an equivalent for, refuse everything else with an actionable error.
     let hosted_target = match &decision.target {
         RouteSelection::Local => Some(HostedToolTarget::NoHostedTools),
         RouteSelection::Endpoint(endpoint_id) => state
@@ -4028,55 +4028,9 @@ fn sanitize_tool_name(name: &str) -> String {
     out
 }
 
-/// The server-executed (hosted) tool types of the OpenAI Responses API. A
-/// translated request must never drop one of these silently: the model would
-/// run without a tool the caller declared and answer as if it did not exist.
-///
-/// A `web_search` with `external_web_access: false` is not a request for live
-/// search: Codex declares it on every turn and flips the flag only for
-/// `--search` / `web_search = "live"`. It is omitted (and logged), the way the
-/// hosted ARC path omits it, rather than counted as a hosted tool.
-fn responses_hosted_tool_type(tool: &Value) -> Option<&str> {
-    let kind = tool.get("type")?.as_str()?;
-    if is_responses_web_search_without_live_access(tool) {
-        return None;
-    }
-    let hosted = kind.starts_with("web_search")
-        || matches!(
-            kind,
-            "file_search"
-                | "code_interpreter"
-                | "image_generation"
-                | "computer_use_preview"
-                | "computer_use"
-                | "mcp"
-        )
-        // Tool search runs on OpenAI's side unless the client executes it.
-        || (kind == "tool_search"
-            && tool.get("execution").and_then(Value::as_str) != Some("client"))
-        // The `shell` tool runs in an OpenAI-hosted container unless its
-        // environment is the client's own machine.
-        || (kind == "shell"
-            && tool
-                .pointer("/environment/type")
-                .and_then(Value::as_str)
-                .is_some_and(|environment| environment.starts_with("container")));
-    hosted.then_some(kind)
-}
-
-/// A `web_search` tool that does not ask for live web access.
-/// Only the GA `web_search` honours `external_web_access`; the preview
-/// versions ignore it and always search live.
-fn is_responses_web_search_without_live_access(tool: &Value) -> bool {
-    tool.get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind.starts_with("web_search") && !kind.contains("preview"))
-        && tool.get("external_web_access").and_then(Value::as_bool) == Some(false)
-}
-
-/// Whether the request declares a `web_search` without live access, which
-/// translation omits.
-fn responses_declares_offline_web_search(body: &Value) -> bool {
+/// Every tool the request declares: the top-level `tools` and those of Codex
+/// `additional_tools` input items.
+fn responses_declared_tools(body: &Value) -> impl Iterator<Item = &Value> {
     let top = body
         .get("tools")
         .and_then(Value::as_array)
@@ -4091,10 +4045,42 @@ fn responses_declares_offline_web_search(body: &Value) -> bool {
         .filter_map(|item| item.get("tools").and_then(Value::as_array))
         .flatten();
     top.chain(additional)
-        .any(is_responses_web_search_without_live_access)
 }
 
-/// Where a Responses request is being translated to, for hosted tools.
+/// OpenAI's hosted `web_search`, in any of its dated / preview spellings.
+fn is_responses_web_search(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"))
+}
+
+/// A `web_search` tool that does not ask for live web access.
+/// Only the GA `web_search` honours `external_web_access`; the preview
+/// versions ignore it and always search live.
+///
+/// This is not a request for live search: Codex declares it on every turn and
+/// flips the flag only for `--search` / `web_search = "live"`. Translation
+/// omits it (and logs that), the way the hosted ARC path omits it.
+fn is_responses_web_search_without_live_access(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search") && !kind.contains("preview"))
+        && tool.get("external_web_access").and_then(Value::as_bool) == Some(false)
+}
+
+/// A `web_search` tool that asks for live search, which translates to
+/// Anthropic's server tool.
+fn is_responses_live_web_search(tool: &Value) -> bool {
+    is_responses_web_search(tool) && !is_responses_web_search_without_live_access(tool)
+}
+
+/// Whether the request declares a `web_search` without live access, which
+/// translation omits.
+fn responses_declares_offline_web_search(body: &Value) -> bool {
+    responses_declared_tools(body).any(is_responses_web_search_without_live_access)
+}
+
+/// Where a Responses request is being translated to, for its tools.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HostedToolTarget {
     /// Anthropic Messages: OpenAI `web_search` has a native equivalent.
@@ -4103,38 +4089,74 @@ enum HostedToolTarget {
     NoHostedTools,
 }
 
-/// Every hosted tool the request declares (top-level `tools` and Codex
-/// `additional_tools` input items).
-fn responses_declared_hosted_tools(body: &Value) -> Vec<String> {
-    let top = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten();
-    let additional = body
-        .get("input")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
-        .filter_map(|item| item.get("tools").and_then(Value::as_array))
-        .flatten();
+/// The type of `tool` when translation to `target` cannot carry it, `None`
+/// when it can.
+///
+/// This is an ALLOWLIST of the tool types the translation carries faithfully:
+/// `function` everywhere, a live `web_search` (any spelling) to Anthropic,
+/// and a `web_search` without live access, which is deliberately omitted
+/// ([`is_responses_web_search_without_live_access`]). Every other type, known
+/// or not, hosted or client-run, is refused rather than silently left out of
+/// the translated request: a model run without a tool the caller declared
+/// answers as if it did not exist.
+fn responses_unsupported_tool_type(tool: &Value, target: HostedToolTarget) -> Option<String> {
+    let Some(kind) = tool.get("type").and_then(Value::as_str) else {
+        return Some("(missing type)".to_owned());
+    };
+    let supported = match kind {
+        "function" => tool
+            .get("name")
+            .or_else(|| tool.pointer("/function/name"))
+            .is_some_and(Value::is_string),
+        _ if is_responses_web_search_without_live_access(tool) => true,
+        _ if is_responses_web_search(tool) => target == HostedToolTarget::AnthropicMessages,
+        _ => false,
+    };
+    (!supported).then(|| match kind {
+        "function" => "function (without a name)".to_owned(),
+        kind => kind.to_owned(),
+    })
+}
+
+/// The declared tool types `target` cannot carry, each once. A non-empty
+/// answer is refused with `unsupported_tool` rather than forwarded without
+/// them.
+fn responses_untranslatable_tools(body: &Value, target: HostedToolTarget) -> Vec<String> {
     let mut kinds: Vec<String> = Vec::new();
-    for kind in top.chain(additional).filter_map(responses_hosted_tool_type) {
-        if !kinds.iter().any(|seen| seen == kind) {
-            kinds.push(kind.to_owned());
+    for kind in responses_declared_tools(body)
+        .filter_map(|tool| responses_unsupported_tool_type(tool, target))
+    {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
         }
     }
     kinds
 }
 
-/// The hosted tools `target` cannot carry. A non-empty answer is refused with
-/// `unsupported_hosted_tool` rather than forwarded without them.
-fn responses_untranslatable_hosted_tools(body: &Value, target: HostedToolTarget) -> Vec<String> {
-    responses_declared_hosted_tools(body)
-        .into_iter()
-        .filter(|kind| {
-            !(target == HostedToolTarget::AnthropicMessages && kind.starts_with("web_search"))
+/// Whether a function tool's `allowed_callers` lets the model call it
+/// directly. Omitted means `["direct"]`; `["programmatic"]` restricts it to
+/// code in a `program` item, which no translated route can run.
+fn responses_function_allows_direct_calls(tool: &Value) -> bool {
+    match tool.get("allowed_callers") {
+        None | Some(Value::Null) => true,
+        Some(callers) => callers
+            .as_array()
+            .is_some_and(|callers| callers.iter().any(|caller| caller == "direct")),
+    }
+}
+
+/// The declared functions the model may not call directly. Translated, they
+/// would become ordinary tools the model can call, lifting the restriction.
+fn responses_indirect_only_functions(body: &Value) -> Vec<String> {
+    responses_declared_tools(body)
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .filter(|tool| !responses_function_allows_direct_calls(tool))
+        .map(|tool| {
+            tool.get("name")
+                .or_else(|| tool.pointer("/function/name"))
+                .and_then(Value::as_str)
+                .unwrap_or("(unnamed)")
+                .to_owned()
         })
         .collect()
 }
@@ -4145,15 +4167,36 @@ fn responses_translation_refusal(
     body: &Value,
     target: HostedToolTarget,
 ) -> Option<(&'static str, Response<BoxBody>)> {
-    let refused = responses_untranslatable_hosted_tools(body, target);
+    let refused = responses_untranslatable_tools(body, target);
     if !refused.is_empty() {
         info!(
-            "local router: hosted tool(s) {} cannot run on this route",
+            "local router: tool type(s) {} cannot be translated for this route",
             refused.join(",")
         );
         return Some((
-            "unsupported_hosted_tool",
-            unsupported_hosted_tool_response(&refused, target),
+            "unsupported_tool",
+            unsupported_tool_response(&refused, target),
+        ));
+    }
+    let indirect = responses_indirect_only_functions(body);
+    if !indirect.is_empty() {
+        return Some((
+            "unsupported_tool",
+            json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_tool",
+                    "param": "tools",
+                    "message": format!(
+                        "Rayline Local cannot keep the allowed_callers restriction of the \
+                         function(s) {}: translated, the model could call them directly. Allow \
+                         direct calls (\"direct\" in allowed_callers), or route to an endpoint \
+                         that serves the Responses API natively.",
+                        indirect.join(", ")
+                    ),
+                }}),
+            ),
         ));
     }
     if target != HostedToolTarget::AnthropicMessages {
@@ -4186,9 +4229,9 @@ fn responses_translation_refusal(
                     "param": "tool_choice",
                     "message": "tool_choice requires a tool call this Anthropic route cannot \
                                 make: the tool it forces, or every tool it permits, is not \
-                                sent upstream (custom tools, and a web_search without live \
-                                access or with max_tool_calls 0, are not). Declare a tool the \
-                                route can run, or relax tool_choice.",
+                                sent upstream (a web_search without live access or with \
+                                max_tool_calls 0 is not, nor is an undeclared tool). Declare \
+                                a tool the route can run, or relax tool_choice.",
                 }}),
             ),
         ));
@@ -4196,27 +4239,24 @@ fn responses_translation_refusal(
     None
 }
 
-fn unsupported_hosted_tool_response(
-    kinds: &[String],
-    target: HostedToolTarget,
-) -> Response<BoxBody> {
+fn unsupported_tool_response(kinds: &[String], target: HostedToolTarget) -> Response<BoxBody> {
     let names = kinds.join(", ");
     let reason = match target {
         HostedToolTarget::AnthropicMessages => {
-            "the configured route speaks Anthropic Messages, which has no equivalent (only web_search translates)"
+            "the configured route speaks Anthropic Messages, and only function and web_search tools translate to it"
         }
         HostedToolTarget::NoHostedTools => {
-            "the configured route (Chat Completions or an on-device model) cannot run hosted tools"
+            "the configured route (Chat Completions or an on-device model) carries only function tools"
         }
     };
     json_response(
         StatusCode::BAD_REQUEST,
         json!({"error": {
             "type": "invalid_request_error",
-            "code": "unsupported_hosted_tool",
+            "code": "unsupported_tool",
             "param": "tools",
             "message": format!(
-                "Rayline Local cannot run the hosted tool(s) {names} on this route: {reason}. \
+                "Rayline Local cannot translate the tool type(s) {names} for this route: {reason}. \
                  Remove them from the request, or route to an endpoint that serves the Responses API natively."
             ),
         }}),
@@ -4230,9 +4270,7 @@ const ANTHROPIC_WEB_SEARCH_TOOL_NAME: &str = "web_search";
 /// Whether the request declares a hosted `web_search` that asks for live
 /// access, which translates to Anthropic's server tool.
 fn responses_declares_live_web_search(body: &Value) -> bool {
-    responses_declared_hosted_tools(body)
-        .iter()
-        .any(|kind| kind.starts_with("web_search"))
+    responses_declared_tools(body).any(is_responses_live_web_search)
 }
 
 /// Why a request's `web_search` cannot be translated to Anthropic without
@@ -4272,22 +4310,7 @@ fn responses_web_search_refusal(body: &Value) -> Option<&'static str> {
 }
 
 fn responses_live_web_search_tools(body: &Value) -> impl Iterator<Item = &Value> {
-    let top = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten();
-    let additional = body
-        .get("input")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
-        .filter_map(|item| item.get("tools").and_then(Value::as_array))
-        .flatten();
-    top.chain(additional).filter(|tool| {
-        responses_hosted_tool_type(tool).is_some_and(|kind| kind.starts_with("web_search"))
-    })
+    responses_declared_tools(body).filter(|tool| is_responses_live_web_search(tool))
 }
 
 /// Whether the request declares live `web_search` more than once with
@@ -7382,9 +7405,8 @@ mod tests {
             json!([{"type": "web_search_20250305", "name": "web_search"}])
         );
 
-        // A shell in an OpenAI-hosted container is a hosted tool; the
-        // client-run shell is not.
-        // So is server-executed tool search.
+        // Shell and tool search have no translation, whether OpenAI or the
+        // client runs them.
         let shells = json!({"tools": [
             {"type": "shell", "environment": {"type": "container_auto"}},
             {"type": "shell", "environment": {"type": "local"}},
@@ -7392,7 +7414,7 @@ mod tests {
             {"type": "tool_search", "execution": "client"}
         ]});
         assert_eq!(
-            responses_untranslatable_hosted_tools(&shells, HostedToolTarget::AnthropicMessages),
+            responses_untranslatable_tools(&shells, HostedToolTarget::AnthropicMessages),
             vec!["shell".to_owned(), "tool_search".to_owned()]
         );
     }
@@ -7413,11 +7435,11 @@ mod tests {
             ]
         });
         assert_eq!(
-            responses_untranslatable_hosted_tools(&request, HostedToolTarget::AnthropicMessages),
+            responses_untranslatable_tools(&request, HostedToolTarget::AnthropicMessages),
             vec!["file_search".to_owned(), "code_interpreter".to_owned()]
         );
         assert_eq!(
-            responses_untranslatable_hosted_tools(&request, HostedToolTarget::NoHostedTools),
+            responses_untranslatable_tools(&request, HostedToolTarget::NoHostedTools),
             vec![
                 "web_search".to_owned(),
                 "file_search".to_owned(),
@@ -7430,15 +7452,121 @@ mod tests {
             {"type": "web_search", "external_web_access": false}
         ]});
         assert!(
-            responses_untranslatable_hosted_tools(&codex_default, HostedToolTarget::NoHostedTools)
+            responses_untranslatable_tools(&codex_default, HostedToolTarget::NoHostedTools)
                 .is_empty()
         );
         assert!(responses_declares_offline_web_search(&codex_default));
         let plain = json!({"tools": [{"type": "function", "name": "shell"}]});
-        assert!(
-            responses_untranslatable_hosted_tools(&plain, HostedToolTarget::NoHostedTools)
-                .is_empty()
+        assert!(responses_untranslatable_tools(&plain, HostedToolTarget::NoHostedTools).is_empty());
+    }
+
+    /// Only the tool types the translation carries pass; any other type,
+    /// including ones this translator has never heard of, is refused whether
+    /// tool_choice is automatic or forces it, never silently left out.
+    #[test]
+    fn tool_types_outside_the_allowlist_are_refused_not_dropped() {
+        let refusal_code = |request: &Value, target| {
+            responses_translation_refusal(request, target).map(|(code, _)| code)
+        };
+        for kind in [
+            "made_up_tool_2031",
+            "computer",
+            "computer_use_preview",
+            "programmatic_tool_calling",
+            "custom",
+            "namespace",
+            "local_shell",
+            "apply_patch",
+        ] {
+            let tools = json!([{"type": "function", "name": "shell"},
+                               {"type": kind, "name": "x"}]);
+            for tool_choice in [json!("auto"), json!({"type": kind, "name": "x"})] {
+                let request = json!({"input": "x", "tools": tools, "tool_choice": tool_choice});
+                for target in [
+                    HostedToolTarget::AnthropicMessages,
+                    HostedToolTarget::NoHostedTools,
+                ] {
+                    assert_eq!(
+                        refusal_code(&request, target),
+                        Some("unsupported_tool"),
+                        "{kind} {tool_choice} {target:?}"
+                    );
+                }
+            }
+            // Declared through Codex `additional_tools` too.
+            let additional = json!({"input": [
+                {"type": "additional_tools", "tools": [{"type": kind}]}
+            ]});
+            assert_eq!(
+                responses_untranslatable_tools(&additional, HostedToolTarget::AnthropicMessages),
+                vec![kind.to_owned()]
+            );
+        }
+        // A tool without a type, or a function without a name, has nothing
+        // to translate to either.
+        let malformed = json!({"tools": [{"name": "x"}, {"type": "function"}]});
+        assert_eq!(
+            responses_untranslatable_tools(&malformed, HostedToolTarget::AnthropicMessages),
+            vec![
+                "(missing type)".to_owned(),
+                "function (without a name)".to_owned()
+            ]
         );
+
+        // The supported tools still pass.
+        let supported = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "function", "function": {"name": "nested"}},
+            {"type": "function", "name": "both", "allowed_callers": ["direct", "programmatic"]},
+            {"type": "web_search", "external_web_access": false},
+            {"type": "web_search_preview"}
+        ]});
+        assert!(refusal_code(&supported, HostedToolTarget::AnthropicMessages).is_none());
+        let functions_only = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell", "allowed_callers": ["direct"]},
+            {"type": "web_search", "external_web_access": false}
+        ]});
+        assert!(refusal_code(&functions_only, HostedToolTarget::NoHostedTools).is_none());
+    }
+
+    /// A function the model may not call directly would become an ordinary
+    /// tool once translated, so it is refused.
+    #[test]
+    fn functions_the_model_may_not_call_directly_are_refused() {
+        for callers in [json!(["programmatic"]), json!([]), json!("direct")] {
+            let request = json!({"input": "x", "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "function", "name": "delete_all", "allowed_callers": callers}
+            ]});
+            assert_eq!(
+                responses_indirect_only_functions(&request),
+                vec!["delete_all".to_owned()],
+                "{callers}"
+            );
+            for target in [
+                HostedToolTarget::AnthropicMessages,
+                HostedToolTarget::NoHostedTools,
+            ] {
+                assert_eq!(
+                    responses_translation_refusal(&request, target).map(|(code, _)| code),
+                    Some("unsupported_tool"),
+                    "{callers} {target:?}"
+                );
+            }
+        }
+        for callers in [
+            Value::Null,
+            json!(["direct"]),
+            json!(["programmatic", "direct"]),
+        ] {
+            let request = json!({"tools": [
+                {"type": "function", "name": "shell", "allowed_callers": callers}
+            ]});
+            assert!(
+                responses_indirect_only_functions(&request).is_empty(),
+                "{callers}"
+            );
+        }
     }
 
     /// Clients that take the turn's output from `response.completed` (Unreal

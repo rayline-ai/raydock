@@ -1048,7 +1048,7 @@ async fn anthropic_messages_leaves_legacy_family_body_untouched() {
 /// Codex `web_search = "live"` through a Responses → Anthropic route: the
 /// hosted `web_search` tool reaches the upstream as Anthropic's server tool
 /// (never silently dropped), and a hosted tool with no Anthropic equivalent is
-/// refused with an actionable `unsupported_hosted_tool` before any upstream
+/// refused with an actionable `unsupported_tool` before any upstream
 /// call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
@@ -1088,13 +1088,37 @@ async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
         .unwrap();
     assert_eq!(refused.status(), 400);
     let body: Value = refused.json().await.unwrap();
-    assert_eq!(body["error"]["code"], "unsupported_hosted_tool");
+    assert_eq!(body["error"]["code"], "unsupported_tool");
     assert!(
         body["error"]["message"]
             .as_str()
             .unwrap()
             .contains("code_interpreter")
     );
+
+    // Any tool type outside the translation's allowlist is refused, under
+    // automatic and forced tool choice alike, and so is a function the model
+    // may only call from a program.
+    let mut refusals = Vec::new();
+    for kind in ["computer", "programmatic_tool_calling", "made_up_tool_2031"] {
+        for tool_choice in [json!("auto"), json!({"type": kind})] {
+            refusals.push(json!({"model": "m", "input": "hi", "stream": false,
+                "tool_choice": tool_choice,
+                "tools": [{"type": "function", "name": "shell"}, {"type": kind}]}));
+        }
+    }
+    refusals.push(json!({"model": "m", "input": "hi", "stream": false,
+        "tools": [{"type": "function", "name": "delete_all",
+                   "allowed_callers": ["programmatic"]}]}));
+    for request in refusals {
+        let refused = client.post(&url).json(&request).send().await.unwrap();
+        assert_eq!(refused.status(), 400, "{request}");
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(
+            body["error"]["code"], "unsupported_tool",
+            "{request} {body}"
+        );
+    }
 
     // Settings Anthropic's search cannot honour, and a required call with no
     // tool left to make it, are refused before any upstream call.
