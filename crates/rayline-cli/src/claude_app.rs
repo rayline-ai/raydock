@@ -549,11 +549,20 @@ fn terminate(_pid: i32) -> io::Result<()> {
 
 /// Stop this instance's detached router, never anything else.
 pub fn stop_instance(paths: &AppPaths) -> io::Result<String> {
+    stop_instance_with(paths, process_command_line)
+}
+
+/// [`stop_instance`] with the `ps` command-line lookup injectable, so a test
+/// can stop a real child without depending on how a platform's `ps` prints it.
+fn stop_instance_with(
+    paths: &AppPaths,
+    command_line: impl Fn(i32) -> Option<String>,
+) -> io::Result<String> {
     let target = stop_target(
         read_pid(&paths.pid_file),
         paths,
         process_alive,
-        process_command_line,
+        command_line,
     );
     match target {
         StopTarget::NotRunning => {
@@ -2095,19 +2104,12 @@ mod tests {
         let home = temp_home();
         let paths = AppPaths::new(&home);
         fs::create_dir_all(&paths.dir).expect("state dir");
-        // A stand-in whose command line reads like the real
-        // `<abs>/rld serve --router-config-path <path>`: `yes` (it accepts any
-        // arguments and runs until signalled) exec'd with argv[0] set to an
-        // absolute `.../rld`. Copying a binary is not portable: some coreutils
-        // builds dispatch on their file name.
-        let stand_in = home.join("rld");
-        let child = Command::new("bash")
-            .args(["-c", r#"exec -a "$0" yes "$@" >/dev/null"#])
-            .arg(&stand_in)
-            .arg("serve")
-            .arg("--router-config-path")
-            .arg(&paths.router_config)
-            .stderr(Stdio::null())
+        // A real child to stop. Which pid is ours is decided from its `ps`
+        // command line (covered by `stop_target_only_claims_our_command_line`);
+        // here that lookup answers like the real router's, so the test does
+        // not depend on how each platform's `ps` prints an exec'd argv[0].
+        let child = Command::new("sleep")
+            .arg("30")
             .spawn()
             .expect("spawn stand-in");
         let pid = child.id() as i32;
@@ -2123,13 +2125,11 @@ mod tests {
         }
         let ours = StandIn(std::sync::Arc::new(std::sync::Mutex::new(child)));
         fs::write(&paths.pid_file, format!("{pid}\n")).expect("pid file");
-        // bash replaces itself with `yes` after spawn returns; wait for that.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !process_command_line(pid).is_some_and(|line| command_line_is_ours(&line, &paths))
-            && Instant::now() < deadline
-        {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        let ours_line = format!(
+            "{} serve --router-config-path {}",
+            home.join("rld").display(),
+            paths.router_config.display()
+        );
 
         // Reap while stop waits for the pid to go: an unreaped child stays a
         // zombie that still counts as alive.
@@ -2150,7 +2150,9 @@ mod tests {
                 }
             })
         };
-        let result = stop_instance(&paths);
+        let result = stop_instance_with(&paths, |candidate| {
+            (candidate == pid).then(|| ours_line.clone())
+        });
         done.store(true, Ordering::Relaxed);
         let _ = reaper.join();
         // Whether stop itself ended the stand-in, read before the guard's
