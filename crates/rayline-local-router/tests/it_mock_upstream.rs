@@ -1959,6 +1959,71 @@ async fn inbound_chat_client_bearer_forwards_caller_auth() {
     let _ = std::fs::remove_file(config);
 }
 
+/// With an inbound guard, a caller that authenticates to the router with its
+/// token as `Authorization: Bearer` does not have that token forwarded to a
+/// `client_bearer` endpoint as its provider credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_client_bearer_never_forwards_the_inbound_token() {
+    const TOKEN: &str = "rlt-it-chat-bearer-token-0123456789abcdef";
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "chatcmpl_1", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}]
+        })),
+        tx,
+    ));
+    let config = chat_route_config(
+        "chat-client-bearer-guard",
+        json!({"id": "up", "protocol": "openai_chat", "auth": "client_bearer",
+               "base_url": format!("http://127.0.0.1:{upstream_port}/v1"), "models": ["m"]}),
+    );
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        inbound_guard: rayline_local_router::InboundGuard::new(TOKEN),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let captured = rx.await.expect("upstream saw the request");
+    assert!(
+        !captured.contains(TOKEN),
+        "the inbound token reached the upstream: {captured}"
+    );
+    assert!(
+        !captured.to_ascii_lowercase().contains("authorization:"),
+        "{captured}"
+    );
+    let _ = std::fs::remove_file(config);
+}
+
 /// An OpenAI Chat upstream's error status and end-to-end headers (here a
 /// 429's Retry-After) reach the Chat client unchanged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

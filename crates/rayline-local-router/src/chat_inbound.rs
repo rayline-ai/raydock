@@ -51,7 +51,7 @@ pub(crate) async fn handle_chat_completions(
         .unwrap_or(false);
     let response = match &decision.target {
         RouteSelection::Local => {
-            if let Some(refusal) = untranslatable_chat_tools_response(&parsed) {
+            if let Some(refusal) = chat_translation_refusal(&parsed) {
                 return Ok(refusal);
             }
             let (anthropic, tool_names) =
@@ -88,7 +88,7 @@ pub(crate) async fn handle_chat_completions(
                 .ok_or_else(|| anyhow!("endpoint {endpoint_id:?} not found"))?;
             match endpoint.protocol {
                 EndpointProtocol::AnthropicMessages => {
-                    if let Some(refusal) = untranslatable_chat_tools_response(&parsed) {
+                    if let Some(refusal) = chat_translation_refusal(&parsed) {
                         return Ok(refusal);
                     }
                     let (anthropic, tool_names) =
@@ -142,8 +142,11 @@ pub(crate) async fn handle_chat_completions(
                     let mut outbound = http.post(url);
                     // Same header policy as the Responses passthrough: a
                     // `client_bearer` endpoint authenticates with the caller's
-                    // own Authorization (and account headers).
-                    copy_openai_passthrough_headers(&mut outbound, &headers, true, client_bearer);
+                    // own Authorization (and account headers), never the
+                    // router's own inbound token.
+                    let forwarded =
+                        without_inbound_token(&headers, state.opts.inbound_guard.as_ref());
+                    copy_openai_passthrough_headers(&mut outbound, &forwarded, true, client_bearer);
                     outbound = outbound.json(&body);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
                     let resp = outbound.send().await?;
@@ -156,6 +159,30 @@ pub(crate) async fn handle_chat_completions(
         record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
     }
     response
+}
+
+/// `headers` without an `Authorization` that carries the router's inbound
+/// guard token. That token authenticates the caller to this router; a
+/// `client_bearer` endpoint must never receive it as the caller's provider
+/// credential.
+fn without_inbound_token(headers: &HeaderMap, guard: Option<&InboundGuard>) -> HeaderMap {
+    let mut forwarded = headers.clone();
+    let carries_token = guard.is_some_and(|guard| {
+        forwarded
+            .get_all(hyper::header::AUTHORIZATION)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter_map(|value| {
+                value
+                    .strip_prefix("Bearer ")
+                    .or_else(|| value.strip_prefix("bearer "))
+            })
+            .any(|token| guard.is_token(token))
+    });
+    if carries_token {
+        forwarded.remove(hyper::header::AUTHORIZATION);
+    }
+    forwarded
 }
 
 /// An OpenAI-protocol upstream's answer, unchanged (streamed as it arrives).
@@ -239,6 +266,163 @@ pub(crate) fn untranslatable_chat_tool_types(body: &Value) -> Vec<String> {
         }
     }
     kinds
+}
+
+/// Why a Chat request cannot be translated to Anthropic Messages without
+/// silently dropping or loosening part of it, as an OpenAI-shaped 400; `None`
+/// when it can. Like the Responses translation, anything the route cannot
+/// carry is refused instead of forwarded without it.
+fn chat_translation_refusal(body: &Value) -> Option<Response<BoxBody>> {
+    if chat_uses_legacy_functions(body) {
+        warn!("local router: refusing Chat Completions request with legacy function fields");
+        return Some(chat_invalid_request(
+            "unsupported_parameter",
+            "functions",
+            "Rayline Local cannot translate the deprecated functions / function_call fields \
+             (or role \"function\" messages) on this route. Declare them as tools and use \
+             tool_choice and tool messages instead."
+                .to_owned(),
+        ));
+    }
+    if let Some(refusal) = untranslatable_chat_tools_response(body) {
+        return Some(refusal);
+    }
+    if chat_required_tool_unavailable(body) {
+        warn!("local router: refusing Chat Completions request whose tool_choice cannot be met");
+        return Some(chat_invalid_request(
+            "required_tool_unavailable",
+            "tool_choice",
+            "tool_choice requires a tool call this route cannot make: the tool it forces, or \
+             every tool it permits, is not a declared function tool. Declare the tool, or relax \
+             tool_choice."
+                .to_owned(),
+        ));
+    }
+    None
+}
+
+/// Whether the request uses the deprecated `functions` / `function_call`
+/// fields or `function` role messages, which this translation does not carry.
+fn chat_uses_legacy_functions(body: &Value) -> bool {
+    let present = |value: Option<&Value>| value.is_some_and(|value| !value.is_null());
+    present(body.get("functions"))
+        || present(body.get("function_call"))
+        || body
+            .get("messages")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("function")
+                    || present(message.get("function_call"))
+            })
+}
+
+/// Whether `tool_choice` requires a tool call (`required`, a forced function,
+/// `allowed_tools` in `required` mode, or a form with no Anthropic
+/// equivalent) that the translated request no longer requires: the forced
+/// function is not declared, or nothing permitted is left. Forwarded, the
+/// requirement would silently relax to `auto`.
+fn chat_required_tool_unavailable(body: &Value) -> bool {
+    let Some(choice) = body.get("tool_choice").filter(|choice| !choice.is_null()) else {
+        return false;
+    };
+    let requires_call = match choice.as_str() {
+        Some(mode) => mode == "required",
+        None => match choice.get("type").and_then(Value::as_str) {
+            Some("allowed_tools") => {
+                choice
+                    .pointer("/allowed_tools/mode")
+                    .and_then(Value::as_str)
+                    == Some("required")
+            }
+            Some(_) => true,
+            None => false,
+        },
+    };
+    if !requires_call {
+        return false;
+    }
+    let (translated, _) = chat_to_anthropic_request(body, "");
+    !matches!(
+        translated
+            .pointer("/tool_choice/type")
+            .and_then(Value::as_str),
+        Some("any" | "tool")
+    )
+}
+
+/// The names of the function tools the request declares.
+fn chat_declared_functions(body: &Value) -> HashSet<&str> {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+        .collect()
+}
+
+/// The declared functions an `allowed_tools` choice permits, `None` for any
+/// other choice. Anthropic has no `allowed_tools` choice, so the functions it
+/// does not permit are left out of the request instead. Only a declared name
+/// counts: an undeclared one may be another function's upstream alias.
+fn chat_allowed_functions<'a>(
+    choice: &'a Value,
+    declared: &HashSet<&str>,
+) -> Option<HashSet<&'a str>> {
+    if choice.get("type").and_then(Value::as_str) != Some("allowed_tools") {
+        return None;
+    }
+    Some(
+        choice
+            .pointer("/allowed_tools/tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+            .filter_map(|tool| tool.pointer("/function/name").and_then(Value::as_str))
+            .filter(|name| declared.contains(name))
+            .collect(),
+    )
+}
+
+/// Chat `tool_choice` as Anthropic's. `allowed_tools` keeps its mode (its
+/// subset is applied to the declared tools by [`chat_allowed_functions`]). A
+/// forced function must be declared: an undeclared name may be another
+/// function's upstream alias. A form with no Anthropic equivalent is left
+/// out, which is Anthropic's default, `auto` (and refused first when it
+/// requires a call, see [`chat_required_tool_unavailable`]).
+fn chat_tool_choice_to_anthropic(
+    choice: &Value,
+    rewrites: &ToolNameRewrites,
+    declared: &HashSet<&str>,
+) -> Option<Value> {
+    if let Some(mode) = choice.as_str() {
+        return match mode {
+            "none" => Some(json!({"type": "none"})),
+            "auto" => Some(json!({"type": "auto"})),
+            "required" => Some(json!({"type": "any"})),
+            _ => None,
+        };
+    }
+    match choice.get("type").and_then(Value::as_str)? {
+        "allowed_tools" => match choice
+            .pointer("/allowed_tools/mode")
+            .and_then(Value::as_str)
+        {
+            Some("required") => Some(json!({"type": "any"})),
+            Some("auto") => Some(json!({"type": "auto"})),
+            _ => None,
+        },
+        "function" => {
+            let name = choice.pointer("/function/name").and_then(Value::as_str)?;
+            declared
+                .contains(name)
+                .then(|| json!({"type": "tool", "name": rewrites.upstream(None, name)}))
+        }
+        _ => None,
+    }
 }
 
 fn untranslatable_chat_tools_response(body: &Value) -> Option<Response<BoxBody>> {
@@ -440,6 +624,9 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
         }
         _ => {}
     }
+    let declared = chat_declared_functions(body);
+    let tool_choice = body.get("tool_choice").filter(|choice| !choice.is_null());
+    let allowed = tool_choice.and_then(|choice| chat_allowed_functions(choice, &declared));
     let tools: Vec<Value> = body
         .get("tools")
         .and_then(Value::as_array)
@@ -449,6 +636,12 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
         .filter_map(|tool| {
             let function = tool.get("function")?;
             let name = function.get("name")?.as_str()?;
+            if allowed
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(name))
+            {
+                return None;
+            }
             Some(json!({
                 "name": rewrites.upstream(None, name),
                 "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
@@ -461,16 +654,8 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
         .collect();
     if !tools.is_empty() {
         out.insert("tools".to_owned(), Value::Array(tools));
-        let mut choice = match body.get("tool_choice") {
-            Some(Value::String(choice)) if choice == "none" => Some(json!({"type": "none"})),
-            Some(Value::String(choice)) if choice == "required" => Some(json!({"type": "any"})),
-            Some(Value::Object(choice)) => choice
-                .get("function")
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-                .map(|name| json!({"type": "tool", "name": rewrites.upstream(None, name)})),
-            _ => None,
-        };
+        let mut choice = tool_choice
+            .and_then(|choice| chat_tool_choice_to_anthropic(choice, &rewrites, &declared));
         // `parallel_tool_calls: false` is Anthropic's
         // `tool_choice.disable_parallel_tool_use` (not valid with `none`).
         if body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false) {
@@ -995,6 +1180,113 @@ impl AnthropicToChatTranslator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_names(out: &Value) -> Vec<&str> {
+        out["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect()
+    }
+
+    #[test]
+    fn allowed_tools_choice_keeps_only_permitted_tools_and_its_mode() {
+        let tools = json!([
+            {"type": "function", "function": {"name": "read"}},
+            {"type": "function", "function": {"name": "delete"}}
+        ]);
+        let allowed = |mode: &str, permitted: Value| {
+            json!({"messages": [], "tools": tools, "tool_choice": {
+                "type": "allowed_tools",
+                "allowed_tools": {"mode": mode, "tools": permitted}}})
+        };
+        let only_read = json!([{"type": "function", "function": {"name": "read"}}]);
+        let (required, _) = chat_to_anthropic_request(&allowed("required", only_read.clone()), "m");
+        assert_eq!(tool_names(&required), vec!["read"]);
+        assert_eq!(required["tool_choice"], json!({"type": "any"}));
+        let (auto, _) = chat_to_anthropic_request(&allowed("auto", only_read.clone()), "m");
+        assert_eq!(tool_names(&auto), vec!["read"]);
+        assert_eq!(auto["tool_choice"], json!({"type": "auto"}));
+        assert!(chat_translation_refusal(&allowed("required", only_read)).is_none());
+
+        // Nothing declared is permitted: a required call cannot be made.
+        let undeclared = json!([{"type": "function", "function": {"name": "write"}}]);
+        let refusal =
+            chat_translation_refusal(&allowed("required", undeclared.clone())).expect("refused");
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+        assert!(chat_translation_refusal(&allowed("auto", undeclared)).is_none());
+    }
+
+    #[test]
+    fn forcing_an_undeclared_function_is_refused_even_when_it_is_an_alias() {
+        // `1lookup` goes upstream as `tool_1lookup`; forcing the undeclared
+        // `tool_1lookup` must not force `1lookup`.
+        let body = |forced: &str| {
+            json!({"messages": [],
+                   "tools": [{"type": "function", "function": {"name": "1lookup"}}],
+                   "tool_choice": {"type": "function", "function": {"name": forced}}})
+        };
+        let (translated, rewrites) = chat_to_anthropic_request(&body("tool_1lookup"), "m");
+        assert_eq!(rewrites.upstream(None, "1lookup"), "tool_1lookup");
+        assert!(translated.get("tool_choice").is_none(), "{translated}");
+        assert!(chat_translation_refusal(&body("tool_1lookup")).is_some());
+
+        let (forced, _) = chat_to_anthropic_request(&body("1lookup"), "m");
+        assert_eq!(
+            forced["tool_choice"],
+            json!({"type": "tool", "name": "tool_1lookup"})
+        );
+        assert!(chat_translation_refusal(&body("1lookup")).is_none());
+        // A choice form with no Anthropic equivalent that requires a call.
+        assert!(
+            chat_translation_refusal(&json!({"messages": [],
+                "tools": [{"type": "function", "function": {"name": "read"}}],
+                "tool_choice": {"type": "custom", "custom": {"name": "read"}}}))
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn legacy_function_fields_are_refused() {
+        for body in [
+            json!({"messages": [], "functions": [{"name": "read"}]}),
+            json!({"messages": [], "function_call": {"name": "read"}}),
+            json!({"messages": [{"role": "function", "name": "read", "content": "ok"}]}),
+            json!({"messages": [{"role": "assistant", "content": null,
+                                 "function_call": {"name": "read", "arguments": "{}"}}]}),
+        ] {
+            let refusal = chat_translation_refusal(&body).expect("refused");
+            assert_eq!(refusal.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert!(
+            chat_translation_refusal(&json!({"messages": [], "functions": null,
+                                             "function_call": null}))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn inbound_token_is_not_forwarded_as_the_callers_bearer() {
+        let guard = InboundGuard::new("rlt-unit-token").expect("guard");
+        let headers = |authorization: &str| {
+            let mut map = HeaderMap::new();
+            map.insert(
+                hyper::header::AUTHORIZATION,
+                HeaderValue::from_str(authorization).expect("header"),
+            );
+            map
+        };
+        let stripped = without_inbound_token(&headers("Bearer rlt-unit-token"), Some(&guard));
+        assert!(stripped.get(hyper::header::AUTHORIZATION).is_none());
+        let provider = without_inbound_token(&headers("Bearer sk-provider"), Some(&guard));
+        assert_eq!(provider[hyper::header::AUTHORIZATION], "Bearer sk-provider");
+        let unguarded = without_inbound_token(&headers("Bearer rlt-unit-token"), None);
+        assert_eq!(
+            unguarded[hyper::header::AUTHORIZATION],
+            "Bearer rlt-unit-token"
+        );
+    }
 
     #[test]
     fn chat_request_translates_messages_tools_and_controls() {
