@@ -2153,8 +2153,16 @@ mod tests {
         let result = stop_instance(&paths);
         done.store(true, Ordering::Relaxed);
         let _ = reaper.join();
+        // Whether stop itself ended the stand-in, read before the guard's
+        // cleanup kills it.
+        let exited = ours
+            .0
+            .lock()
+            .map(|mut child| matches!(child.try_wait(), Ok(Some(_))))
+            .unwrap_or(false);
         drop(ours);
         let result = result.expect("stop ours");
+        assert!(exited, "stop left the stand-in running");
 
         assert!(result.contains(&pid.to_string()), "{result}");
         assert!(!paths.pid_file.exists());
