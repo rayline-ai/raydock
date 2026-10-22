@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+mod chat_inbound;
 pub mod inbound_guard;
 pub use inbound_guard::InboundGuard;
 
@@ -779,6 +780,18 @@ async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
                 )
             }
         },
+        (Method::POST, "/v1/chat/completions" | "/chat/completions") => {
+            match chat_inbound::handle_chat_completions(state, req).await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!("local router /v1/chat/completions error: {error:#}");
+                    json_response(
+                        StatusCode::BAD_GATEWAY,
+                        json!({"error":{"type":"api_error","message":error.to_string()}}),
+                    )
+                }
+            }
+        }
         (method, path)
             if path.starts_with("/v1/responses/")
                 && matches!(method, Method::GET | Method::DELETE | Method::POST) =>

@@ -78,7 +78,14 @@ impl InboundGuard {
         [bearer, api_key]
             .into_iter()
             .flatten()
-            .any(|presented| constant_time_eq(presented.trim().as_bytes(), self.token.as_bytes()))
+            .any(|presented| self.is_token(presented))
+    }
+
+    /// Whether `presented` (a bearer token or `x-api-key` value) is this
+    /// guard's token. A route that forwards caller credentials upstream uses
+    /// it to keep the router's own token from reaching a provider.
+    pub fn is_token(&self, presented: &str) -> bool {
+        constant_time_eq(presented.trim().as_bytes(), self.token.as_bytes())
     }
 }
 
