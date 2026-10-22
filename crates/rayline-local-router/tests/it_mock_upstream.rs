@@ -1086,7 +1086,7 @@ async fn browser_reachable_requests_never_reach_the_provider() {
         .send()
         .await
         .unwrap();
-    assert_eq!(rebound.status(), 403);
+    assert_eq!(rebound.status(), 421);
     let simple_post = client
         .post(&url)
         .header("content-type", "text/plain")
