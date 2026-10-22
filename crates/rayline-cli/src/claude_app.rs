@@ -2096,26 +2096,43 @@ mod tests {
         let paths = AppPaths::new(&home);
         fs::create_dir_all(&paths.dir).expect("state dir");
         // A stand-in whose command line reads like the real
-        // `<abs>/rld serve --router-config-path <path>`: a copy of `yes`, which
-        // accepts any arguments and runs until signalled.
+        // `<abs>/rld serve --router-config-path <path>`: `yes` (it accepts any
+        // arguments and runs until signalled) exec'd with argv[0] set to an
+        // absolute `.../rld`. Copying a binary is not portable: some coreutils
+        // builds dispatch on their file name.
         let stand_in = home.join("rld");
-        fs::copy("/usr/bin/yes", &stand_in).expect("stand-in binary");
-        let mut ours = Command::new(&stand_in)
-            .stdout(Stdio::null())
+        let mut ours = Command::new("bash")
+            .args(["-c", r#"exec -a "$0" yes "$@" >/dev/null"#])
+            .arg(&stand_in)
             .arg("serve")
             .arg("--router-config-path")
             .arg(&paths.router_config)
+            .stderr(Stdio::null())
             .spawn()
             .expect("spawn stand-in");
         let pid = ours.id() as i32;
         fs::write(&paths.pid_file, format!("{pid}\n")).expect("pid file");
+        // bash replaces itself with `yes` after spawn returns; wait for that.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_command_line(pid).is_some_and(|line| command_line_is_ours(&line, &paths))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
 
+        // Reap concurrently: stop waits for the pid to go, and an unreaped
+        // child would linger as a zombie.
         let reaper = std::thread::spawn(move || ours.wait());
-        let result = stop_instance(&paths).expect("stop ours");
+        let result = stop_instance(&paths);
+        if result.is_err() {
+            // SAFETY: kill only signals the stand-in this test spawned.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        let _ = reaper.join();
+        let result = result.expect("stop ours");
 
         assert!(result.contains(&pid.to_string()), "{result}");
         assert!(!paths.pid_file.exists());
-        let _ = reaper.join();
         let _ = fs::remove_dir_all(&home);
     }
 
