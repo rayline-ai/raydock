@@ -334,6 +334,34 @@ routing there rather than duplicating those assertions here.
 
 ---
 
+## `rayline claude-desktop` (Claude Desktop) Acceptance
+
+Wire smoke, in a throwaway HOME (two hosted ARC turns, a few cents): it starts
+the Desktop router, validates the generated import file, runs one headless
+Claude Code turn per Desktop model with the exact id Desktop sends
+(`claude-arc-sage`, `claude-arc-swift`), and asserts each reply, each explicit
+alias route (`policy: model:<id>`) and its tier (`arc-sage`, `arc-swift`; with
+`PREFIXED_IDS=1`, the `rayline/arc-*` fallback), then stops the router.
+
+```bash
+cargo build -p rayline-cli -p rayline-daemon --locked
+scripts/smoke-claude-app.sh
+```
+
+It also asserts the router's refusals (no token 401, `text/plain` 415,
+rebinding Host 421, foreign Origin 403). It sets
+`RAYLINE_CLAUDE_DESKTOP_NO_LAUNCHD=1`, so it never loads, reuses or unloads your
+real login service. It copies only the prod `router_keys.prod.apiKey` from
+`~/.config/rayline/credentials.json` into the throwaway HOME and never prints it
+or the gateway token.
+
+Desktop UI checklist (per Desktop release, on a macOS user without other
+Desktop state): run `rayline claude-desktop`; import the file; **Apply Changes**,
+**Save & Restart**; continue with the gateway; open **Code**, pick **arc-sage**, send
+"Reply with exactly PONG"; confirm `rayline claude-desktop status` counts the
+request; sign out and back in with Anthropic to confirm the subscription
+returns.
+
 ## Troubleshooting
 
 If Claude reports a non-Rayline Local daemon conflict, stop only the isolated

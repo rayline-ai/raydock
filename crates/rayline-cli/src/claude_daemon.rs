@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -20,7 +19,7 @@ const DAEMON_SPAWN_MAX_DELAY_SECONDS: i64 = 60;
 pub struct RequestSpec<'a> {
     pub env_name: &'a str,
     pub routing_mode: RoutingMode,
-    pub auto_compact_window: &'a str,
+    pub auto_compact_window: Option<&'a str>,
     /// The effective refusal-recovery switches (`refusal_recovery_values`). A
     /// reused daemon's background workers inherit its env, so a daemon that
     /// holds other values is not this launch's.
@@ -208,7 +207,7 @@ fn read_proc_environ(pid: u32) -> Option<BTreeMap<String, String>> {
 
 #[cfg(target_os = "macos")]
 fn read_ps_environ(pid: u32) -> Option<BTreeMap<String, String>> {
-    let output = Command::new("/bin/ps")
+    let output = std::process::Command::new("/bin/ps")
         .arg("eww")
         .arg("-p")
         .arg(pid.to_string())
@@ -346,7 +345,7 @@ fn daemon_owner_matches_request(state: &DaemonState, request: &RequestSpec<'_>) 
         .env_vars
         .get(AUTO_COMPACT_WINDOW_ENV)
         .map(String::as_str)
-        != Some(request.auto_compact_window)
+        != request.auto_compact_window
     {
         return false;
     }
@@ -493,7 +492,7 @@ fn resolve_daemon_conflict(
 /// the default (or inherited) config dir.
 fn stop_conflicting_daemon(claude_bin: &Path, config_dir: &Path) -> Result<(), RunError> {
     eprintln!("Stopping the current daemon ({STOP_COMMAND})...");
-    match Command::new(claude_bin)
+    match crate::claude::claude_command(claude_bin)
         .args(["daemon", "stop", "--any"])
         .env(CLAUDE_CONFIG_DIR_ENV, config_dir)
         .status()
@@ -532,9 +531,7 @@ fn daemon_was_launched_by_wksp(
         {
             continue;
         }
-        if entry.get("auto_compact_window").and_then(Value::as_str)
-            != Some(request.auto_compact_window)
-        {
+        if entry.get("auto_compact_window").and_then(Value::as_str) != request.auto_compact_window {
             continue;
         }
         if !launch_refusal_recovery_matches(&entry, request) {
@@ -744,7 +741,7 @@ mod tests {
         RequestSpec {
             env_name: "prod",
             routing_mode: RoutingMode::Proxy,
-            auto_compact_window: "180000",
+            auto_compact_window: Some("180000"),
             refusal_recovery: Box::leak(
                 crate::claude::refusal_recovery_values(RoutingMode::Proxy, |_| None)
                     .into_boxed_slice(),
@@ -832,6 +829,38 @@ mod tests {
         let home = temp_home();
         let request = proxy_request();
         let state = state(rayline_proxy_env(20810));
+
+        assert_eq!(
+            classify_launch_safety(&state, &request, &home),
+            Safety::Safe
+        );
+    }
+
+    #[test]
+    fn unpinned_compact_window_matches_only_an_unpinned_daemon() {
+        let home = temp_home();
+        let mut request = proxy_request();
+        request.auto_compact_window = None;
+        let mut unpinned = rayline_proxy_env(20810);
+        unpinned.remove(AUTO_COMPACT_WINDOW_ENV);
+
+        assert_eq!(
+            classify_launch_safety(&state(unpinned), &request, &home),
+            Safety::Safe
+        );
+        assert_eq!(
+            classify_launch_safety(&state(rayline_proxy_env(20810)), &request, &home),
+            Safety::Conflict
+        );
+    }
+
+    #[test]
+    fn unpinned_compact_window_launch_log_attribution_is_safe() {
+        let home = temp_home();
+        let mut request = proxy_request();
+        request.auto_compact_window = None;
+        let state = unreadable_state(Some(9004), Some(1_700_000_030_000));
+        write_launch_log(&home, &request, 9004, 1_700_000_030);
 
         assert_eq!(
             classify_launch_safety(&state, &request, &home),

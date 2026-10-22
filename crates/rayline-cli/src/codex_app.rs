@@ -48,6 +48,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
     match crate::codex::resolve_codex_config_path_from_home(
         request.config_path.take(),
         request.auth_mode,
+        request.env_name.as_deref(),
     ) {
         Ok(path) => request.config_path = path,
         Err(error) => {
@@ -131,7 +132,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
     }
 
     // 4. Launch (or focus) the Codex app on the isolated home.
-    let mut command = Command::new("codex");
+    let mut command = crate::codex::codex_command();
     command.env("CODEX_HOME", &home).arg("app");
     command.args(&request.codex_args);
     match command.status() {

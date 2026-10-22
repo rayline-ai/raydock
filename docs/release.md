@@ -6,15 +6,15 @@ is intentionally reviewed.
 
 ## Release Tags
 
-Create releases from annotated or signed tags named `vX.Y.Z`:
+Prod releases are cut by the Rayline release pipeline, which builds a pinned
+commit of this repo, signs `SHA256SUMS` and `latest.txt` with minisign, signs
+and notarizes the macOS menu bar app, publishes to `https://get.rayline.ai`,
+then creates the `vX.Y.Z` tag on that commit and the GitHub release with the
+same files. Do not push `v*` tags by hand.
 
-```bash
-git tag -a v0.2.0 -m "Rayline 0.2.0"
-git push origin v0.2.0
-```
-
-Pushing a `v*` tag runs `.github/workflows/release.yml`. The workflow builds
-with Rust 1.88 and embeds:
+`.github/workflows/release.yml` is a manual fallback only: it runs from
+`workflow_dispatch` with an existing tag, never on a tag push, and fails if a
+release for that tag already exists. It builds with Rust 1.88 and embeds:
 
 - `RAYLINE_VERSION=<tag without v>`
 - `RAYLINE_CHANNEL=prod`

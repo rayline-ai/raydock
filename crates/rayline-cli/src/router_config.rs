@@ -6,6 +6,10 @@
 //! router). The on-device router is engaged only when the effective config routes
 //! something *away* from the hosted cloud router (see [`config_needs_local_router`]);
 //! a pure default stays on today's hosted path with no local process.
+//!
+//! The generated default is per hosted environment: prod keeps `router.json`, and
+//! any other `--env <name>` gets its own `router.<name>.json` pointed at that
+//! environment's router (see [`default_config_path_for_env`]).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -19,16 +23,31 @@ pub fn default_config_path(home: &Path) -> PathBuf {
         .join("router.json")
 }
 
+/// Default router config for a hosted environment. The default environment
+/// (prod) keeps the historical `router.json`; every other environment gets
+/// `router.<env>.json`, so a file generated for one environment is never reused
+/// for another (a dev `rlk-` key must not reach the prod router, and vice
+/// versa). Callers resolve the environment first, which rejects names that are
+/// not filename-safe (`is_valid_root_env`).
+pub fn default_config_path_for_env(home: &Path, env_name: &str) -> PathBuf {
+    if env_name == crate::status::resolve_env(None, None) {
+        return default_config_path(home);
+    }
+    home.join(".config")
+        .join(crate::CONFIG_DIR)
+        .join(format!("router.{env_name}.json"))
+}
+
 /// Default content: reproduce today's `rayline claude` — route everything to the
-/// hosted cloud router. Users edit this to send subagents/main to local or custom
-/// endpoints.
-pub fn default_config_json() -> Value {
+/// hosted cloud router at `router_url`. Users edit this to send subagents/main to
+/// local or custom endpoints.
+pub fn default_config_json(router_url: &str) -> Value {
     json!({
         "endpoints": [
             {
                 "id": "rayline-cloud",
                 "protocol": "anthropic_messages",
-                "base_url": crate::ROUTER_PROD_URL,
+                "base_url": router_url,
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
                 "models": ["rayline-router"]
             }
@@ -41,14 +60,17 @@ pub fn default_config_json() -> Value {
     })
 }
 
-/// Create the default config file if absent. Idempotent; never overwrites user edits.
-pub fn ensure_default_config(home: &Path) -> io::Result<PathBuf> {
-    let path = default_config_path(home);
+/// Create the default config for `env_name` if absent, pointing its cloud
+/// endpoint at `router_url` (the environment's resolved router). Idempotent;
+/// never overwrites user edits.
+pub fn ensure_default_config(home: &Path, env_name: &str, router_url: &str) -> io::Result<PathBuf> {
+    let path = default_config_path_for_env(home, env_name);
     if !path.exists() {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let body = serde_json::to_vec_pretty(&default_config_json()).map_err(io::Error::other)?;
+        let body = serde_json::to_vec_pretty(&default_config_json(router_url))
+            .map_err(io::Error::other)?;
         std::fs::write(&path, body)?;
     }
     Ok(path)
@@ -660,7 +682,7 @@ fn ensure_rcr_base_url_has_v1(endpoint: &mut serde_json::Map<String, Value>) -> 
 }
 
 /// Whether a `base_url` host is the hosted Rayline Cloud Router (prod or dev).
-fn endpoint_base_url_is_hosted_rcr(base_url: Option<&str>) -> bool {
+pub(crate) fn endpoint_base_url_is_hosted_rcr(base_url: Option<&str>) -> bool {
     matches!(
         base_url.and_then(host_of).as_deref(),
         Some("api.rayline.ai") | Some("api-dev.rayline.ai")
@@ -820,7 +842,9 @@ mod tests {
 
     #[test]
     fn default_config_does_not_need_local_router() {
-        assert!(!config_value_needs_local_router(&default_config_json()));
+        assert!(!config_value_needs_local_router(&default_config_json(
+            crate::ROUTER_PROD_URL
+        )));
     }
 
     #[test]
@@ -951,7 +975,7 @@ mod tests {
     #[test]
     fn ensure_default_config_creates_non_engaging_file() {
         let home = tmp_home();
-        let path = ensure_default_config(&home).unwrap();
+        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
         assert!(path.exists());
         assert_eq!(path, default_config_path(&home));
         // The default file reproduces today's behavior → no local router.
@@ -970,7 +994,7 @@ mod tests {
         let flag = PathBuf::from("/tmp/explicit.json");
         assert_eq!(resolve_config_path(Some(&flag), &home), Some(flag));
         // Default file is picked up once it exists.
-        let default = ensure_default_config(&home).unwrap();
+        let default = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
         assert_eq!(resolve_config_path(None, &home), Some(default));
         let _ = std::fs::remove_dir_all(&home);
     }

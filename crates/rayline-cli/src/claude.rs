@@ -15,8 +15,11 @@ const DEFAULT_CLAUDE_SETTINGS_SUFFIX: &str = ".claude/settings.json";
 const DEFAULT_MODEL: &str = "rayline-router";
 const DEFAULT_PROXY_SUBAGENTS_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_ROUTER_KEY_NAME: &str = "rayline-cli";
-const DEFAULT_AUTO_COMPACT_WINDOW: &str = "180000";
-const DEFAULT_AUTO_COMPACT_WINDOW_1M: &str = "950000";
+/// Claude Code's `--model` / `ANTHROPIC_MODEL` aliases (each may also carry a
+/// `[1m]` suffix).
+const CLAUDE_CODE_MODEL_ALIASES: [&str; 7] = [
+    "default", "best", "opus", "sonnet", "haiku", "fable", "opusplan",
+];
 const DEFAULT_LOCAL_INJECTOR_PORT: u16 = 20809;
 const DEFAULT_PROXY_PORT: u16 = 20810;
 /// Distinct proxy port for `--isolated` proxy-mode runs, so an isolated session
@@ -590,14 +593,11 @@ async fn run_command_from_home(
         .await?
     };
 
-    // Single `/v1/settings` fetch per launch, feeding BOTH the pinned-main-model
-    // auto-compact window and the account `enable_local_router` toggle. Skip it
-    // entirely when neither is needed: the window is already pinned by flag/env
-    // AND this machine has no `local_model` config (so the toggle is moot —
+    // `/v1/settings` fetch for the account `enable_local_router` toggle. Skip it
+    // when this machine has no `local_model` config (so the toggle is moot —
     // even an incomplete config needs the toggle, to decide whether to warn).
     let local_cfg = crate::local_model::read_from_home(home);
-    let need_settings =
-        !local_plane && (!auto_compact_window_is_explicit(request) || local_cfg.is_some());
+    let need_settings = !local_plane && local_cfg.is_some();
     let settings = if need_settings {
         fetch_router_settings(&env_name, &router_url, request.auth_token.as_deref(), &key).await
     } else {
@@ -849,7 +849,25 @@ async fn run_command_from_home(
         } else {
             (model, set_model_env)
         };
-    let auto_compact_window = effective_auto_compact_window(request, settings.as_ref(), &model);
+    // An explicit flag/env wins. Otherwise Claude Code sizes the session itself
+    // unless the hosted router knows a window for a launch model Claude Code
+    // doesn't (`rayline-router`, an ARC id, another provider's model). A Claude
+    // Code alias (`opus`, `sonnet[1m]`, ...) is Claude Code's own, so it skips the
+    // lookup. The local plane has no hosted router and no served window to report.
+    let auto_compact_window = match explicit_auto_compact_window(request) {
+        Some(window) => Some(window),
+        None if local_plane || is_claude_code_model_alias(&model) => None,
+        None => {
+            router_auto_compact_window(
+                &env_name,
+                &router_url,
+                request.auth_token.as_deref(),
+                &key,
+                &model,
+            )
+            .await?
+        }
+    };
 
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
     // config dir and, in proxy mode, a private proxy port. Resolve both per the
@@ -865,7 +883,7 @@ async fn run_command_from_home(
     let mut daemon_request = RequestSpec {
         env_name: &env_name,
         routing_mode: request.routing_mode,
-        auto_compact_window: &auto_compact_window,
+        auto_compact_window: auto_compact_window.as_deref(),
         refusal_recovery: &refusal_recovery,
         args: &request.args,
         requested_local_port,
@@ -917,7 +935,7 @@ async fn run_command_from_home(
         diag_print_preamble(&env_name, &router_url, request.routing_mode, home).await;
     }
 
-    let mut command = Command::new(&claude_bin);
+    let mut command = claude_command(&claude_bin);
     add_claude_bin_dir_to_child_path(&mut command, &claude_bin);
     let args = if request.diagnose {
         inject_claude_debug(&request.args)
@@ -948,7 +966,7 @@ async fn run_command_from_home(
                 router_url.as_str(),
                 &key,
                 &model,
-                &auto_compact_window,
+                auto_compact_window.as_deref(),
             )
             .await?;
         }
@@ -996,7 +1014,7 @@ async fn run_command_from_home(
                 router_url.as_str(),
                 &key,
                 set_model_env.then_some(model.as_str()),
-                &auto_compact_window,
+                auto_compact_window.as_deref(),
                 isolated,
             )
             .await?;
@@ -1175,7 +1193,7 @@ async fn configure_override_env(
     router_url: &str,
     key: &str,
     model: &str,
-    auto_compact_window: &str,
+    auto_compact_window: Option<&str>,
 ) -> Result<(), RunError> {
     if let Some(start_request) = local_start_request {
         let injector_port = start_request.injector_port;
@@ -1189,7 +1207,7 @@ async fn configure_override_env(
     }
     command.env("ANTHROPIC_AUTH_TOKEN", key);
     command.env("ANTHROPIC_MODEL", model);
-    command.env(AUTO_COMPACT_WINDOW_ENV, auto_compact_window);
+    set_auto_compact_window_env(command, auto_compact_window);
     command.env(RAYLINE_ENV_NAME_ENV, env_name);
     command.env_remove("ANTHROPIC_API_KEY");
     command.env_remove("RAYLINE_CLAUDE_ROUTING_MODE");
@@ -1207,7 +1225,7 @@ async fn configure_proxy_env(
     router_url: &str,
     key: &str,
     model: Option<&str>,
-    auto_compact_window: &str,
+    auto_compact_window: Option<&str>,
     isolated: bool,
 ) -> Result<(), RunError> {
     let proxy_port = resolve_proxy_port(isolated)?;
@@ -1279,7 +1297,7 @@ async fn configure_proxy_env(
     if let Some(model) = model {
         command.env("ANTHROPIC_MODEL", model);
     }
-    command.env(AUTO_COMPACT_WINDOW_ENV, auto_compact_window);
+    set_auto_compact_window_env(command, auto_compact_window);
     command.env(
         "RAYLINE_CLAUDE_ROUTING_MODE",
         routing_mode_name(request.routing_mode),
@@ -1357,7 +1375,19 @@ fn configure_proxy_auth_env(command: &mut Command, routing_mode: RoutingMode) {
         command.env_remove("ANTHROPIC_BASE_URL");
         command.env_remove("ANTHROPIC_API_KEY");
     }
-    command.env_remove("RAYLINE_ROUTER_API_KEY");
+}
+
+/// The Claude Code session command, with Rayline's router keys withheld in
+/// every mode. Claude Code never needs them: the proxy holds the key in proxy
+/// modes, and `--via env` passes it as `ANTHROPIC_AUTH_TOKEN`. Its Bash tool
+/// passes Claude Code's environment on to every command it runs, so a key
+/// left there would reach a model-visible `env` call. Every `claude` spawn (the
+/// session, `auth login`, `daemon stop`, the diagnostic version probe) goes
+/// through here.
+pub(crate) fn claude_command(claude_bin: &Path) -> Command {
+    let mut command = Command::new(claude_bin);
+    crate::codex::withhold_router_key(&mut command);
+    command
 }
 
 fn resolve_injector_port(explicit: Option<u16>) -> Result<u16, RunError> {
@@ -1388,73 +1418,38 @@ fn resolve_proxy_port(isolated: bool) -> Result<u16, RunError> {
     }
 }
 
-/// Resolve the auto-compact window, preferring an explicit flag/env, then the
-/// pinned main-model value from the (already-fetched) router settings, then a
-/// model-aware default. Pure: the single `/v1/settings` fetch happens in
-/// `run_command_from_home` and is threaded in here.
-fn effective_auto_compact_window(
-    request: &RunRequest,
-    settings: Option<&Value>,
-    model: &str,
-) -> String {
+/// The auto-compact window pinned by `--auto-compact-window` or
+/// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, if either is set.
+fn explicit_auto_compact_window(request: &RunRequest) -> Option<String> {
     if let Some(window) = request.auto_compact_window {
-        return window.to_string();
+        return Some(window.to_string());
     }
-    if let Ok(value) = env::var(AUTO_COMPACT_WINDOW_ENV) {
-        if !value.is_empty() {
-            return value;
-        }
-    }
-    if let Some(window) = settings.and_then(auto_compact_window_from_router_settings) {
-        return window;
-    }
-    default_auto_compact_window(model).to_owned()
+    env::var(AUTO_COMPACT_WINDOW_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
 }
 
-/// True when the explicit flag/env already pins the auto-compact window, so the
-/// settings fetch is not needed for that purpose.
-fn auto_compact_window_is_explicit(request: &RunRequest) -> bool {
-    if request.auto_compact_window.is_some() {
-        return true;
-    }
-    matches!(env::var(AUTO_COMPACT_WINDOW_ENV), Ok(value) if !value.is_empty())
+/// Whether `model` is a Claude Code model alias (`opus`, `sonnet[1m]`,
+/// `opusplan`, ...) rather than a concrete model id. Claude Code resolves these
+/// itself, so the hosted router's catalog cannot answer for them.
+fn is_claude_code_model_alias(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    let base = model.strip_suffix("[1m]").unwrap_or(&model);
+    CLAUDE_CODE_MODEL_ALIASES.contains(&base)
 }
 
-fn default_auto_compact_window(model: &str) -> &'static str {
-    if model.trim_end().ends_with("[1m]") {
-        DEFAULT_AUTO_COMPACT_WINDOW_1M
-    } else {
-        DEFAULT_AUTO_COMPACT_WINDOW
-    }
-}
-
-fn positive_int_string(value: &Value) -> Option<String> {
-    if let Some(number) = value.as_u64().filter(|number| *number > 0) {
-        return Some(number.to_string());
-    }
-    if let Some(number) = value.as_i64().filter(|number| *number > 0) {
-        return Some(number.to_string());
-    }
-    let number = value.as_f64()?;
-    if number.is_finite() && number > 0.0 && number.fract() == 0.0 {
-        return Some(format!("{number:.0}"));
-    }
-    None
-}
-
-fn auto_compact_window_from_router_settings(result: &Value) -> Option<String> {
-    result
-        .get("settings")?
-        .get("rules")?
-        .get("main_model")?
-        .get("autoCompactWindow")
-        .and_then(positive_int_string)
+/// Pin `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, or clear it so Claude Code applies
+/// its own window for the model.
+fn set_auto_compact_window_env(command: &mut Command, auto_compact_window: Option<&str>) {
+    match auto_compact_window {
+        Some(window) => command.env(AUTO_COMPACT_WINDOW_ENV, window),
+        None => command.env_remove(AUTO_COMPACT_WINDOW_ENV),
+    };
 }
 
 /// Read the account-level `enable_local_router` toggle from a `GET /v1/settings`
-/// response. Mirrors `auto_compact_window_from_router_settings` so both values
-/// come from one fetch. Defaults to `false` (stay cloud) when the field is
-/// absent or not a bool — the safe default the design mandates.
+/// response. Defaults to `false` (stay cloud) when the field is absent or not a
+/// bool — the safe default the design mandates.
 fn enable_local_router_from_router_settings(result: &Value) -> bool {
     result
         .get("settings")
@@ -1463,16 +1458,61 @@ fn enable_local_router_from_router_settings(result: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Fetch the caller's router settings once per launch. Prefer account credentials
-/// when available, but fall back to the already-provisioned router key because
-/// the router accepts either bearer form. `None` on request failure or an error
-/// payload, so callers fall back to safe defaults.
+/// The hosted router's auto-compact window for the launch model:
+/// `GET /v1/settings?model=<model>&client_sizes=1` returns the window of the model serving a
+/// launch id Claude Code doesn't know, and a null or absent `autoCompactWindow`
+/// for one Claude Code sizes itself, which is `None` here. A failed request or a
+/// window that isn't a positive integer fails the launch rather than guessing.
+async fn router_auto_compact_window(
+    env_name: &str,
+    router_base: &str,
+    auth_token: Option<&str>,
+    router_key: &str,
+    model: &str,
+) -> Result<Option<String>, RunError> {
+    get_router_settings(env_name, router_base, auth_token, router_key, Some(model))
+        .await
+        .and_then(|body| match body.get("autoCompactWindow") {
+            None | Some(Value::Null) => Ok(None),
+            Some(window) => window
+                .as_u64()
+                .filter(|window| *window > 0)
+                .map(|window| Some(window.to_string()))
+                .ok_or_else(|| {
+                    format!("the response's autoCompactWindow {window} is not a positive integer")
+                }),
+        })
+        .map_err(|error| {
+            RunError::Router(format!(
+                "Couldn't read the auto-compact window for {model} from {router_base}/v1/settings: \
+                 {error}. Pass --auto-compact-window <tokens> to set it."
+            ))
+        })
+}
+
+/// Fetch the caller's router settings for the `enable_local_router` toggle.
+/// `None` on request failure or an error payload, so the toggle stays off.
 async fn fetch_router_settings(
     env_name: &str,
     router_base: &str,
     auth_token: Option<&str>,
     router_key: &str,
 ) -> Option<Value> {
+    get_router_settings(env_name, router_base, auth_token, router_key, None)
+        .await
+        .ok()
+}
+
+/// `GET /v1/settings`, with `?model=` when given. Prefer account credentials
+/// when available, but fall back to the already-provisioned router key because
+/// the router accepts either bearer form.
+async fn get_router_settings(
+    env_name: &str,
+    router_base: &str,
+    auth_token: Option<&str>,
+    router_key: &str,
+    model: Option<&str>,
+) -> Result<Value, String> {
     let token_request = crate::status::AuthTokenRequest {
         env_name: Some(env_name.to_owned()),
         // Honor an explicit `--auth-token` first; when account credentials are
@@ -1485,24 +1525,34 @@ async fn fetch_router_settings(
         Ok(crate::status::AuthTokenOutcome::NotLoggedIn) => router_key.to_owned(),
         Err(_) => router_key.to_owned(),
     };
-    let url = format!("{router_base}/v1/settings");
-    let response = reqwest::Client::builder()
+    let mut request = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
-        .ok()?
-        .get(url)
-        .bearer_auth(bearer_token)
-        .send()
+        .map_err(|error| error.to_string())?
+        .get(format!("{router_base}/v1/settings"))
+        .bearer_auth(bearer_token);
+    if let Some(model) = model {
+        // `client_sizes=1` tells the router this client accepts a null window
+        // (Claude Code sizes the model itself). Without it the router keeps
+        // answering a number, because 0.2.10 fails the launch on null.
+        request = request.query(&[("model", model), ("client_sizes", "1")]);
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body: Value = response
+        .json()
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+        .map_err(|error| format!("HTTP {status}: {error}"))?;
+    if let Some(error) = body.get("error") {
+        let message = error
+            .as_str()
+            .map_or_else(|| error.to_string(), ToOwned::to_owned);
+        return Err(format!("HTTP {status}: {message}"));
     }
-    let body: Value = response.json().await.ok()?;
-    if body.get("error").is_some() {
-        return None;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
     }
-    Some(body)
+    Ok(body)
 }
 
 /// Resolve a present `local_model` config into one that can actually engage,
@@ -1888,7 +1938,7 @@ fn run_isolated_browser_login(isolated_dir: &Path, claude_bin: &Path) -> Result<
     // credential location on Linux/Windows; on macOS the credential lands in the
     // keychain under the isolated dir's namespaced service. Claude sets up the
     // credential and its ACL itself, so there is no keychain prompt from us.
-    let status = Command::new(claude_bin)
+    let status = claude_command(claude_bin)
         .args(["auth", "login"])
         .env(CLAUDE_CONFIG_DIR_ENV, isolated_dir)
         .status()
@@ -2127,7 +2177,7 @@ async fn diag_print_preamble(
     eprintln!("  {:<12} : {}", crate::CLI_BIN, crate::RAYLINE_VERSION);
     match find_claude_bin(home) {
         Some(claude_bin) => {
-            let version = Command::new(&claude_bin)
+            let version = claude_command(&claude_bin)
                 .arg("--version")
                 .output()
                 .ok()
@@ -2820,6 +2870,191 @@ mod refusal_recovery_env_tests {
         );
         // Subagents-only: nothing is set on the child.
         assert!(child_env(&values(RoutingMode::ProxySubagents, None, None)).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod router_auto_compact_window_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A `/v1/settings` stub answering one request with `status` and `body`;
+    /// the join handle yields the request line it received.
+    async fn settings_stub(
+        status: &'static str,
+        body: &'static str,
+    ) -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let read = stream.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            request.lines().next().unwrap_or_default().to_owned()
+        });
+        (base, served)
+    }
+
+    async fn window(
+        status: &'static str,
+        body: &'static str,
+    ) -> (Result<Option<String>, String>, String) {
+        let (base, served) = settings_stub(status, body).await;
+        let window =
+            router_auto_compact_window("dev", &base, Some("token"), "key", "rayline-router[1m]")
+                .await
+                .map_err(|error| error.to_string());
+        (window, served.await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn asks_the_router_with_the_launch_model_and_returns_its_window() {
+        let (window, request_line) =
+            window("200 OK", r#"{"settings":{},"autoCompactWindow":262144}"#).await;
+        assert_eq!(window, Ok(Some("262144".to_owned())));
+        assert!(
+            request_line
+                .starts_with("GET /v1/settings?model=rayline-router%5B1m%5D&client_sizes=1 "),
+            "{request_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_or_absent_window_leaves_the_window_to_claude_code() {
+        for body in [
+            r#"{"settings":{},"autoCompactWindow":null}"#,
+            r#"{"settings":{}}"#,
+        ] {
+            let (window, _) = window("200 OK", body).await;
+            assert_eq!(window, Ok(None), "{body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_the_launch_on_a_router_error_or_a_malformed_window() {
+        for (status, body, reason) in [
+            (
+                "400 Bad Request",
+                r#"{"error":"Unknown model: rayline-router[1m]"}"#,
+                "Unknown model: rayline-router[1m]",
+            ),
+            (
+                "200 OK",
+                r#"{"settings":{},"autoCompactWindow":"950000"}"#,
+                r#"autoCompactWindow "950000" is not a positive integer"#,
+            ),
+            (
+                "200 OK",
+                r#"{"settings":{},"autoCompactWindow":0}"#,
+                "autoCompactWindow 0 is not a positive integer",
+            ),
+        ] {
+            let (window, _) = window(status, body).await;
+            let error = window.unwrap_err();
+            assert!(error.contains(reason), "{error}");
+            assert!(error.contains("--auto-compact-window <tokens>"), "{error}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod claude_command_tests {
+    use super::*;
+
+    /// A router key in the launcher's environment must not reach Claude Code,
+    /// whose Bash tool hands its environment to every command it runs.
+    #[cfg(unix)]
+    #[test]
+    fn claude_session_never_inherits_a_router_key() {
+        let vars = ["RAYLINE_ROUTER_API_KEY", crate::harness::KEY_ENV];
+        let previous: Vec<_> = vars.iter().map(env::var_os).collect();
+        for var in vars {
+            // SAFETY: tests run with --test-threads=1 (AGENTS.md), so no other
+            // thread reads the environment concurrently.
+            unsafe { env::set_var(var, "rlk-test-not-a-real-key") };
+        }
+        let output = claude_command(Path::new("/usr/bin/env"))
+            .output()
+            .expect("run env");
+        for (var, value) in vars.iter().zip(previous) {
+            // SAFETY: as above.
+            match value {
+                Some(value) => unsafe { env::set_var(var, value) },
+                None => unsafe { env::remove_var(var) },
+            }
+        }
+        let printed = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success());
+        assert!(
+            !printed.contains("rlk-test-not-a-real-key"),
+            "the Claude Code environment still carries a router key"
+        );
+    }
+}
+
+#[cfg(test)]
+mod claude_code_model_alias_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_claude_code_aliases() {
+        for model in [
+            "opus",
+            "sonnet",
+            "haiku",
+            "fable",
+            "best",
+            "default",
+            "opusplan",
+            "opus[1m]",
+            "sonnet[1m]",
+            "fable[1m]",
+            "opusplan[1m]",
+            " Opus ",
+            "SONNET[1M]",
+        ] {
+            assert!(is_claude_code_model_alias(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn concrete_and_virtual_models_are_not_aliases() {
+        for model in [
+            "claude-opus-4-8",
+            "claude-opus-4-8[1m]",
+            "claude-sonnet-5",
+            "rayline-router",
+            "opus-4",
+            "",
+        ] {
+            assert!(!is_claude_code_model_alias(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn unpinned_window_clears_an_inherited_env_value() {
+        let mut command = Command::new("true");
+        command.env(AUTO_COMPACT_WINDOW_ENV, "");
+        set_auto_compact_window_env(&mut command, None);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == AUTO_COMPACT_WINDOW_ENV && value.is_none())
+        );
+
+        set_auto_compact_window_env(&mut command, Some("180000"));
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == AUTO_COMPACT_WINDOW_ENV
+                    && value == Some(std::ffi::OsStr::new("180000")))
+        );
     }
 }
 
