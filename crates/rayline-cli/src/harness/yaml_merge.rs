@@ -10,6 +10,12 @@
 //! aliases, tags, merge keys, document markers, tabs, a scalar starting on
 //! the line after its key) is an error, so a file this module cannot split
 //! by indentation is never rewritten.
+//!
+//! Known limits, all refusals rather than rewrites: keys with YAML-only
+//! escapes (`"\xE9"`), explicit `?` keys, a quoted `'<<'` key, keys that
+//! differ only by quoting (`null` and `'null'`), sequences nested directly in
+//! sequences, literal U+2028/U+2029, and the anchors `safe_dump` writes for
+//! shared objects. A file that is already invalid YAML may still be rewritten.
 
 use serde_json::{Value, json};
 
@@ -37,6 +43,15 @@ pub(crate) fn merge(existing: &str, values: &Value, paths: &[&[&str]]) -> Result
         .position(|line| line.chars().any(char::is_control))
     {
         return Err(at(index, "control character"));
+    }
+    // `safe_dump({})` writes `{}`: an empty root mapping, which the merge
+    // fills like an empty file.
+    if let Some(index) = lines.iter().position(|line| is_content(line)) {
+        if lines[index].trim_end_matches(' ') == "{}"
+            && !lines[index + 1..].iter().any(|line| is_content(line))
+        {
+            lines.remove(index);
+        }
     }
     // Check the whole document, not only the entries the paths touch.
     mapping(&lines, 0, lines.len(), 0, false)?;
@@ -675,6 +690,11 @@ fallback_providers: []
         );
         assert_eq!(
             set_provider("").unwrap(),
+            "model:\n  provider: \"custom:r\"\n"
+        );
+        // `safe_dump({})` writes `{}`.
+        assert_eq!(
+            set_provider("{}\n").unwrap(),
             "model:\n  provider: \"custom:r\"\n"
         );
     }
