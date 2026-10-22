@@ -600,12 +600,18 @@ fn reject_untrusted_request(
             json!({"type":"error","error":{"type":kind,"message":message}}),
         ))
     };
-    // HTTP/2 carries the authority in the URI instead of a Host header.
-    let host = match uri.authority() {
-        Some(authority) => Some(authority.as_str()),
-        None => headers
-            .get(hyper::header::HOST)
-            .and_then(|value| value.to_str().ok()),
+    // HTTP/2 carries the authority in the URI instead of a Host header. When
+    // both are present they must agree, and every guarded header must appear at
+    // most once: the checks below read one value, so a second one would slip by.
+    let host_header = single_header(headers, hyper::header::HOST);
+    let host = match (uri.authority(), host_header) {
+        (_, Err(())) => None,
+        (Some(authority), Ok(None)) => Some(authority.as_str()),
+        (Some(authority), Ok(Some(value))) => value
+            .to_str()
+            .ok()
+            .filter(|value| value.eq_ignore_ascii_case(authority.as_str())),
+        (None, Ok(value)) => value.and_then(|value| value.to_str().ok()),
     };
     if !host.is_some_and(|host| is_loopback_authority(host, port)) {
         return refuse(
@@ -614,12 +620,14 @@ fn reject_untrusted_request(
             "this router only answers requests addressed to its loopback host and port",
         );
     }
-    let origin_ok = headers.get(hyper::header::ORIGIN).is_none_or(|origin| {
-        origin.to_str().ok().is_some_and(|origin| {
-            origin
-                .strip_prefix("http://")
-                .or_else(|| origin.strip_prefix("https://"))
-                .is_some_and(|authority| is_loopback_authority(authority, port))
+    let origin_ok = single_header(headers, hyper::header::ORIGIN).is_ok_and(|origin| {
+        origin.is_none_or(|origin| {
+            origin.to_str().ok().is_some_and(|origin| {
+                origin
+                    .strip_prefix("http://")
+                    .or_else(|| origin.strip_prefix("https://"))
+                    .is_some_and(|authority| is_loopback_authority(authority, port))
+            })
         })
     });
     if !origin_ok || *method == Method::OPTIONS {
@@ -629,9 +637,15 @@ fn reject_untrusted_request(
             "cross-origin requests are not accepted",
         );
     }
+    let Ok(content_type) = single_header(headers, hyper::header::CONTENT_TYPE) else {
+        return refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "request bodies must carry exactly one content-type",
+        );
+    };
     if *method == Method::POST {
-        let mime = headers
-            .get(hyper::header::CONTENT_TYPE)
+        let mime = content_type
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .map(str::trim);
@@ -652,6 +666,16 @@ fn reject_untrusted_request(
         }
     }
     None
+}
+
+/// The header's only value, `Ok(None)` when absent, or `Err` when repeated.
+fn single_header(headers: &HeaderMap, name: HeaderName) -> Result<Option<&HeaderValue>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    match values.next() {
+        Some(_) => Err(()),
+        None => Ok(first),
+    }
 }
 
 /// True for `127.0.0.1`, `localhost` or `[::1]` on exactly `port`.
@@ -5597,11 +5621,14 @@ mod tests {
 
     const GUARD_PORT: u16 = 20811;
 
-    fn guard_status(method: Method, uri: &str, headers: GuardHeaders) -> Option<StatusCode> {
+    fn guard_status(method: Method, uri: &str, headers: &[(&str, &str)]) -> Option<StatusCode> {
         let uri = uri.parse::<hyper::Uri>().unwrap();
         let mut map = HeaderMap::new();
         for (name, value) in headers {
-            map.append(*name, HeaderValue::from_static(value));
+            map.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
         }
         reject_untrusted_request(GUARD_PORT, &method, &uri, &map).map(|response| response.status())
     }
@@ -5735,6 +5762,92 @@ mod tests {
             guard_status(Method::GET, "http://evil.example:20811/healthz", &[]),
             Some(StatusCode::MISDIRECTED_REQUEST)
         );
+    }
+
+    #[test]
+    fn request_guard_rejects_repeated_or_conflicting_headers() {
+        const HOST: (&str, &str) = ("host", "127.0.0.1:20811");
+        const JSON: (&str, &str) = ("content-type", "application/json");
+        const LOOPBACK_ORIGIN: (&str, &str) = ("origin", "http://127.0.0.1:20811");
+        let cases: &[(GuardHeaders, StatusCode)] = &[
+            // A second Host the first-value check never looked at.
+            (
+                &[HOST, ("host", "evil.example:20811"), JSON],
+                StatusCode::MISDIRECTED_REQUEST,
+            ),
+            (&[HOST, HOST, JSON], StatusCode::MISDIRECTED_REQUEST),
+            // A loopback Origin followed by a cross-site or opaque one.
+            (
+                &[
+                    HOST,
+                    JSON,
+                    LOOPBACK_ORIGIN,
+                    ("origin", "https://evil.example"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &[HOST, JSON, LOOPBACK_ORIGIN, ("origin", "null")],
+                StatusCode::FORBIDDEN,
+            ),
+            // JSON followed by a CORS "simple" type.
+            (
+                &[HOST, JSON, ("content-type", "text/plain")],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (&[HOST, JSON, JSON], StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ];
+        for (headers, expected) in cases {
+            assert_eq!(
+                guard_status(Method::POST, "/v1/messages", headers),
+                Some(*expected),
+                "{headers:?}"
+            );
+        }
+        assert_eq!(
+            guard_status(
+                Method::GET,
+                "/healthz",
+                &[HOST, ("content-type", "text/plain"), JSON]
+            ),
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+    }
+
+    #[test]
+    fn request_guard_requires_uri_authority_and_host_to_agree() {
+        const URI: &str = "http://127.0.0.1:20811/v1/messages";
+        const JSON: (&str, &str) = ("content-type", "application/json");
+        for host in ["evil.example:20811", "localhost:20811", "127.0.0.1:20812"] {
+            assert_eq!(
+                guard_status(Method::POST, URI, &[("host", host), JSON]),
+                Some(StatusCode::MISDIRECTED_REQUEST),
+                "{host}"
+            );
+        }
+        // A rebound authority is refused even with a loopback Host header.
+        assert_eq!(
+            guard_status(
+                Method::POST,
+                "http://evil.example:20811/v1/messages",
+                &[("host", "127.0.0.1:20811"), JSON]
+            ),
+            Some(StatusCode::MISDIRECTED_REQUEST)
+        );
+        // Agreeing authority and Host (case-insensitive) pass, as does either alone.
+        assert_eq!(
+            guard_status(Method::POST, URI, &[("host", "127.0.0.1:20811"), JSON]),
+            None
+        );
+        assert_eq!(
+            guard_status(
+                Method::POST,
+                "http://LOCALHOST:20811/v1/messages",
+                &[("host", "localhost:20811"), JSON]
+            ),
+            None
+        );
+        assert_eq!(guard_status(Method::POST, URI, &[JSON]), None);
     }
 
     #[test]
