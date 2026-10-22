@@ -1163,6 +1163,112 @@ async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
     let _ = std::fs::remove_file(config);
 }
 
+/// Codex declares its sub-agent functions inside a Responses `namespace`
+/// tool. Through a Responses → Anthropic route they must pass the tool
+/// allowlist, reach the upstream by qualified name (a choice forcing one by
+/// namespace and name included), and come back under the client's namespace
+/// and name. A Chat Completions route cannot carry them and refuses them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_namespace_tools_reach_anthropic_or_are_refused() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "tool_use", "id": "toolu_1",
+                         "name": "multi_agent_v1__spawn_agent",
+                         "input": {"message": "hi"}}],
+            "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 1}
+        })),
+        tx,
+    ));
+    let config = write_config(
+        "namespace-tools",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let chat_config = write_config(
+        "namespace-tools-chat",
+        &json!({
+            "endpoints": [{"id": "chat", "protocol": "openai_chat",
+                           "base_url": "http://127.0.0.1:9", "models": ["m"]}],
+            "routes": {"main": {"endpoint": "chat", "model": "m"},
+                       "default": {"endpoint": "chat", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let chat_port = free_port();
+    start_router(chat_port, chat_config.clone()).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/v1/responses");
+    let chat_url = format!("http://127.0.0.1:{chat_port}/v1/responses");
+    let request = || {
+        json!({"model": "m", "input": "spawn a helper", "stream": false,
+        "tool_choice": {"type": "function", "namespace": "multi_agent_v1",
+                        "name": "spawn_agent"},
+        "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "namespace", "name": "multi_agent_v1",
+             "description": "Sub-agents.",
+             "tools": [{"type": "function", "name": "spawn_agent",
+                        "parameters": {"type": "object", "properties": {
+                            "message": {"type": "string"}}}}]}
+        ]})
+    };
+
+    let refused = client
+        .post(&chat_url)
+        .json(&request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_tool", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("namespace"),
+        "{body}"
+    );
+
+    let ok = client.post(&url).json(&request()).send().await.unwrap();
+    assert_eq!(ok.status(), 200);
+    let response: Value = ok.json().await.unwrap();
+    let forwarded = rx.await.expect("upstream saw the request");
+    let body = forwarded.split("\r\n\r\n").nth(1).expect("request body");
+    let sent: Value = serde_json::from_str(body).expect("json body");
+    let names: Vec<&str> = sent["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect();
+    assert_eq!(names, ["shell", "multi_agent_v1__spawn_agent"]);
+    assert_eq!(sent["tool_choice"]["type"], "tool");
+    assert_eq!(sent["tool_choice"]["name"], "multi_agent_v1__spawn_agent");
+
+    let call = response["output"]
+        .as_array()
+        .expect("output")
+        .iter()
+        .find(|item| item["type"] == "function_call")
+        .unwrap_or_else(|| panic!("function_call in {response}"));
+    assert_eq!(call["name"], "spawn_agent");
+    assert_eq!(call["namespace"], "multi_agent_v1");
+    let _ = std::fs::remove_file(config);
+    let _ = std::fs::remove_file(chat_config);
+}
+
 /// A request refused for a hosted tool the route cannot run is announced to
 /// metrics like any other; it must also be closed out there, or `rayline top`
 /// shows it as active forever.
