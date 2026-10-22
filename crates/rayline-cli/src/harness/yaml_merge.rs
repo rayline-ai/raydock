@@ -1,11 +1,15 @@
 //! In-place merge of Rayline's keys into an existing YAML config (Hermes'
 //! `config.yaml`), keeping every other line as written.
 //!
-//! Handles block-style YAML as Hermes writes it (PyYAML `safe_dump`: block
-//! mappings, sequences level with their key, comments). A line it cannot
-//! place (tab indentation, document markers, complex keys, a non-mapping
-//! document) is an error, so a file it does not understand is never
-//! clobbered.
+//! Accepts what PyYAML `safe_dump` writes for Hermes' settings, plus
+//! comments: block mappings; block sequences of scalars or mappings; plain,
+//! single- or double-quoted scalars, which may wrap when every continuation
+//! line is indented deeper than its key; and the empty flow collections `[]`
+//! and `{}`. Then an entry's value is exactly the lines indented past its
+//! key. Anything else (non-empty flow collections, block scalars, anchors,
+//! aliases, tags, merge keys, document markers, tabs, a scalar starting on
+//! the line after its key) is an error, so a file this module cannot split
+//! by indentation is never rewritten.
 
 use serde_json::{Value, json};
 
@@ -16,33 +20,32 @@ use serde_json::{Value, json};
 pub(crate) fn merge(existing: &str, values: &Value, paths: &[&[&str]]) -> Result<String, String> {
     let existing = existing.strip_prefix('\u{feff}').unwrap_or(existing);
     let mut lines: Vec<String> = existing.lines().map(str::to_owned).collect();
-    let continued = continuations(&lines)?;
-    for (index, line) in lines.iter().enumerate() {
-        if !continued[index] && keeps_trailing_blanks(line) {
-            // Its trailing blank lines are part of its value, which an
-            // insertion after it would cut.
-            return Err(at(index, "block scalar with `+` chomping"));
-        }
+    if let Some(index) = lines.iter().position(|line| line.contains('\t')) {
+        return Err(at(index, "tab character"));
     }
+    // Check the whole document, not only the entries the paths touch.
+    mapping(&lines, 0, lines.len(), 0, false)?;
     for path in paths {
         let value = path.iter().try_fold(values, |value, key| value.get(*key));
         let end = lines.len();
         set(&mut lines, 0, end, 0, path, value)?;
     }
     let mut out = lines.join("\n");
-    out.push('\n');
+    if existing.is_empty() || existing.ends_with('\n') {
+        out.push('\n');
+    }
     Ok(out)
 }
 
 /// One `key: ...` entry of a block mapping: `lines[start]` is the key line and
-/// `lines[start + 1..end]` its nested value (trailing blank lines and
-/// shallower comments excluded).
+/// `lines[start + 1..end]` the rest of its value. Comments after the value's
+/// last line are not part of it.
 struct Entry {
     key: String,
     start: usize,
     end: usize,
-    /// What follows the `:` on the key line, without a trailing comment.
-    inline: String,
+    /// The indent of the value's keys when it is a nested block mapping.
+    child: Option<usize>,
 }
 
 /// An error at 0-based line `index`. Never quotes the line: it may hold a
@@ -59,93 +62,53 @@ fn set(
     path: &[&str],
     value: Option<&Value>,
 ) -> Result<(), String> {
-    let entries = entries(lines, start, end, indent)?;
+    let entries = mapping(lines, start, end, indent, false)?;
     let found = entries.iter().find(|entry| entry.key == path[0]);
     if let Some(entry) = found
         && path.len() > 1
     {
-        if let Some(child) = mapping_indent(lines, entry, indent) {
+        if let Some(child) = entry.child {
             return set(lines, entry.start + 1, entry.end, child, &path[1..], value);
         }
         if value.is_none() {
             return Ok(());
         }
-        if !replaceable_parent(&entry.inline) {
-            // A flow mapping or an anchored, aliased or tagged value holds
-            // settings this merge cannot keep.
-            return Err(at(
-                entry.start,
-                "unsupported value for a Rayline key's parent",
-            ));
-        }
     }
     let rendered = value.map_or_else(Vec::new, |value| render(path, value, indent));
-    match found {
-        Some(entry) => {
-            if let Some(index) = (entry.start..entry.end).find(|&index| has_anchor(&lines[index])) {
-                // Another entry may alias it.
-                return Err(at(index, "YAML anchor in a Rayline-owned entry"));
-            }
-            lines.splice(entry.start..entry.end, rendered);
-        }
+    let range = match found {
+        Some(entry) => entry.start..entry.end,
         None => {
             let at = entries.last().map_or(end, |entry| entry.end);
-            lines.splice(at..at, rendered);
+            at..at
         }
-    }
+    };
+    lines.splice(range, rendered);
     Ok(())
 }
 
-/// The entries of the block mapping at `indent` in `lines[start..end]`.
-fn entries(
+/// The entries of the block mapping with keys at column `indent` in
+/// `lines[start..end]`, checking each value. With `item`, `lines[start]` is a
+/// sequence item whose first key follows its `- ` at column `indent`.
+fn mapping(
     lines: &[String],
     start: usize,
     end: usize,
     indent: usize,
+    item: bool,
 ) -> Result<Vec<Entry>, String> {
-    let continued = continuations(lines)?;
     let mut entries: Vec<Entry> = Vec::new();
-    for (index, line) in lines.iter().enumerate().take(end).skip(start) {
-        if continued[index] {
-            // Part of a quoted scalar, whatever its indentation.
-            match entries.last_mut() {
-                Some(entry) => entry.end = index + 1,
-                None => return Err(at(index, "unexpected indentation")),
-            }
+    let mut index = start;
+    while index < end {
+        let (depth, text) = if item && index == start {
+            (indent, &lines[index][indent..])
+        } else {
+            split(&lines[index])
+        };
+        if !is_content(text) {
+            index += 1;
             continue;
         }
-        if line.starts_with('\t') {
-            return Err(at(index, "tab indentation"));
-        }
-        let text = line.trim_start_matches(' ');
-        let depth = line.len() - text.len();
-        if text.trim().is_empty() {
-            // Spaces past the indent may be block scalar content.
-            if depth > indent
-                && let Some(entry) = entries.last_mut()
-            {
-                entry.end = index + 1;
-            }
-            continue;
-        }
-        if text.starts_with('#') {
-            // A deeper comment may be part of a block scalar; keep it with
-            // its entry. A shallower one stays between entries.
-            if depth > indent
-                && let Some(entry) = entries.last_mut()
-            {
-                entry.end = index + 1;
-            }
-            continue;
-        }
-        if depth > indent || (depth == indent && is_sequence_item(text)) {
-            match entries.last_mut() {
-                Some(entry) => entry.end = index + 1,
-                None => return Err(at(index, "expected a `key:` mapping")),
-            }
-            continue;
-        }
-        if depth < indent {
+        if depth != indent {
             return Err(at(index, "unexpected indentation"));
         }
         let (key, inline) = parse_key(text).ok_or_else(|| at(index, "expected `key:`"))?;
@@ -158,200 +121,169 @@ fn entries(
             // leave it in effect.
             return Err(at(index, "duplicate key"));
         }
+        // The value runs to the next line at the key's column or left of it,
+        // except for a sequence written level with its key.
+        let nested = inline.is_empty();
+        let boundary = (index + 1..end)
+            .find(|&next| {
+                let (depth, text) = split(&lines[next]);
+                is_content(text)
+                    && (depth < indent || (depth == indent && !(nested && is_sequence_item(text))))
+            })
+            .unwrap_or(end);
+        let (value_end, child) = if nested {
+            nested_value(lines, index, boundary)?
+        } else {
+            (scalar(lines, index, boundary, indent, &inline)?, None)
+        };
         entries.push(Entry {
             key,
             start: index,
-            end: index + 1,
-            inline,
+            end: value_end,
+            child,
         });
+        index = boundary;
     }
     Ok(entries)
 }
 
-/// For each line, whether it continues a quoted scalar or flow collection
-/// opened on an earlier line (at any depth, with any anchor or tag before
-/// it).
-fn continuations(lines: &[String]) -> Result<Vec<bool>, String> {
-    let mut continued = Vec::with_capacity(lines.len());
-    let mut scan = Scan::default();
-    // The column a block scalar's or a multi-line plain scalar's lines must
-    // be indented past, while in that scalar.
-    let mut scalar: Option<usize> = None;
-    for line in lines {
-        let open = scan.quote.is_some() || scan.flow_depth > 0;
-        continued.push(open);
-        let text = line.trim_start_matches(' ');
-        let depth = line.len() - text.len();
-        if !open
-            && let Some(column) = scalar
-            && (text.is_empty() || depth > column)
-        {
+/// Check the value on the lines after the key on `lines[start]`, up to
+/// `end`: nothing, a nested block mapping or a block sequence. Returns one
+/// past its last line and, for a mapping, the indent of its keys.
+fn nested_value(
+    lines: &[String],
+    start: usize,
+    end: usize,
+) -> Result<(usize, Option<usize>), String> {
+    let Some(first) = (start + 1..end).find(|&index| is_content(split(&lines[index]).1)) else {
+        return Ok((start + 1, None));
+    };
+    let (depth, text) = split(&lines[first]);
+    if is_sequence_item(text) {
+        return Ok((sequence(lines, first, end, depth)?, None));
+    }
+    if parse_key(text).is_none() {
+        return Err(at(first, "scalar on the line after its key"));
+    }
+    let entries = mapping(lines, first, end, depth, false)?;
+    let value_end = entries.last().map_or(first + 1, |entry| entry.end);
+    Ok((value_end, Some(depth)))
+}
+
+/// Check the block sequence with its `- ` at column `indent` in
+/// `lines[start..end]`; returns one past its last line.
+fn sequence(lines: &[String], start: usize, end: usize, indent: usize) -> Result<usize, String> {
+    let mut value_end = start + 1;
+    let mut index = start;
+    while index < end {
+        let (depth, text) = split(&lines[index]);
+        if !is_content(text) {
+            index += 1;
             continue;
         }
-        scalar = match scan.line(line) {
-            Tail::Closed => None,
-            Tail::BlockScalar => Some(depth),
-            Tail::Plain(column) => Some(column.unwrap_or(depth)),
-        };
-    }
-    if scan.quote.is_some() || scan.flow_depth > 0 {
-        return Err(at(
-            lines.len().saturating_sub(1),
-            "unterminated quoted scalar or flow collection",
-        ));
-    }
-    Ok(continued)
-}
-
-/// What a quoted scalar or flow collection leaves open across lines.
-#[derive(Default)]
-struct Scan {
-    quote: Option<char>,
-    flow_depth: usize,
-}
-
-enum Tail {
-    Closed,
-    /// A block scalar (`|`, `>`) starts on the next line.
-    BlockScalar,
-    /// The line ends in a plain scalar, which may continue on lines indented
-    /// past its key's column (`None`: no key on the line).
-    Plain(Option<usize>),
-}
-
-impl Scan {
-    /// Scan one line from the state the previous one left. A quote, `|`/`>`
-    /// or plain text starts a scalar only where a node starts: at the line
-    /// start, after `key: `, `- `, an anchor or tag, or in a flow collection;
-    /// a quote elsewhere is plain text (`it's`).
-    fn line(&mut self, line: &str) -> Tail {
-        let mut text = line;
-        let mut offset = 0;
-        let mut node_start = true;
-        if let Some(quote) = self.quote {
-            let Some(close) = closing_quote(quote, line) else {
-                return Tail::Closed;
-            };
-            self.quote = None;
-            offset = close + 1;
-            text = &line[offset..];
-            node_start = false;
+        if depth != indent || !is_sequence_item(text) {
+            return Err(at(index, "unexpected indentation"));
         }
-        let mut plain: Option<usize> = None;
-        let mut key_column = None;
-        let mut chars = text.char_indices().peekable();
-        while let Some((at, ch)) = chars.next() {
-            let next = chars.peek().map(|&(_, ch)| ch);
-            let ends_token = next.is_none_or(|ch| ch == ' ');
-            if node_start {
-                match ch {
-                    ' ' => {}
-                    '"' | '\'' => match closing_quote(ch, &text[at + 1..]) {
-                        Some(close) => {
-                            let resume = at + 1 + close;
-                            while chars.peek().is_some_and(|&(next_at, _)| next_at <= resume) {
-                                chars.next();
-                            }
-                            node_start = false;
-                        }
-                        None => {
-                            self.quote = Some(ch);
-                            return Tail::Closed;
-                        }
-                    },
-                    '|' | '>' if self.flow_depth == 0 => return Tail::BlockScalar,
-                    '-' | '?' if ends_token => {}
-                    '&' | '!' => {
-                        while chars.peek().is_some_and(|&(_, ch)| ch != ' ') {
-                            chars.next();
-                        }
-                    }
-                    '[' | '{' => self.flow_depth += 1,
-                    ']' | '}' if self.flow_depth > 0 => {
-                        self.flow_depth -= 1;
-                        node_start = false;
-                    }
-                    '#' => return Tail::Closed,
-                    _ => {
-                        node_start = false;
-                        plain = Some(offset + at);
-                    }
-                }
-                continue;
-            }
-            match ch {
-                ':' if ends_token
-                    || (self.flow_depth > 0 && matches!(next, Some(',' | ']' | '}'))) =>
-                {
-                    node_start = true;
-                    if plain.is_some() {
-                        key_column = plain.take();
-                    }
-                }
-                '#' if text[..at].ends_with(' ') => return Tail::Closed,
-                ',' if self.flow_depth > 0 => {
-                    node_start = true;
-                    plain = None;
-                }
-                ']' | '}' if self.flow_depth > 0 => {
-                    self.flow_depth -= 1;
-                    plain = None;
-                }
-                _ => {}
-            }
+        let boundary = (index + 1..end)
+            .find(|&next| {
+                let (depth, text) = split(&lines[next]);
+                is_content(text) && depth <= indent
+            })
+            .unwrap_or(end);
+        let rest = text[1..].trim_start_matches(' ');
+        if !is_content(rest) || is_sequence_item(rest) {
+            return Err(at(index, "empty or nested sequence item"));
         }
-        if plain.is_some() && self.flow_depth == 0 {
-            Tail::Plain(key_column)
+        value_end = if parse_key(rest).is_some() {
+            let column = indent + text.len() - rest.len();
+            let entries = mapping(lines, index, boundary, column, true)?;
+            entries.last().map_or(index + 1, |entry| entry.end)
         } else {
-            Tail::Closed
+            scalar(lines, index, boundary, indent, rest)?
+        };
+        index = boundary;
+    }
+    Ok(value_end)
+}
+
+/// Check the scalar `inline` that follows its key (at column `indent`) or
+/// `- ` on `lines[start]` and may wrap onto the lines before `end`; returns
+/// one past its last line.
+fn scalar(
+    lines: &[String],
+    start: usize,
+    end: usize,
+    indent: usize,
+    inline: &str,
+) -> Result<usize, String> {
+    let quote = match inline.chars().next() {
+        Some(quote @ ('"' | '\'')) => quote,
+        Some('[' | '{') => {
+            let code = inline.split(" #").next().unwrap_or(inline).trim_end();
+            let wraps = (start + 1..end).any(|index| is_content(split(&lines[index]).1));
+            if !matches!(code, "[]" | "{}") || wraps {
+                return Err(at(start, "non-empty flow collection"));
+            }
+            return Ok(start + 1);
         }
+        Some('|' | '>') => return Err(at(start, "block scalar")),
+        Some('&' | '*' | '!' | '%' | '@' | '`') => {
+            return Err(at(start, "anchor, alias, tag or reserved indicator"));
+        }
+        // Plain: every line before `end` is already deeper than its key.
+        _ => {
+            let last = (start + 1..end)
+                .rev()
+                .find(|&index| is_content(split(&lines[index]).1));
+            return Ok(last.unwrap_or(start) + 1);
+        }
+    };
+    // Quoted: it runs to its closing quote, and a `#` line before that is
+    // part of it.
+    let mut text = inline[1..].to_owned();
+    for line in &lines[start + 1..end] {
+        text.push('\n');
+        text.push_str(line);
     }
-}
-
-fn closing_quote(quote: char, text: &str) -> Option<usize> {
-    if quote == '"' {
-        closing_double_quote(text)
+    let close = if quote == '"' {
+        closing_double_quote(&text)
     } else {
-        closing_single_quote(text)
+        closing_single_quote(&text)
     }
-}
-
-/// Whether an inline parent value can be replaced by a mapping without losing
-/// settings: empty, an empty flow collection, or a plain or quoted scalar.
-fn replaceable_parent(inline: &str) -> bool {
-    matches!(inline, "{}" | "[]") || !inline.starts_with(['{', '[', '&', '*', '!'])
-}
-
-fn has_anchor(line: &str) -> bool {
-    line.split(|ch: char| ch.is_whitespace() || matches!(ch, '[' | '{' | ',' | ':'))
-        .any(|token| token.len() > 1 && token.starts_with('&'))
-}
-
-/// A block scalar header (`|+`, `>2+`, ...) that keeps trailing blank lines.
-fn keeps_trailing_blanks(line: &str) -> bool {
-    let text = line.trim_start();
-    if text.starts_with('#') {
-        return false;
-    }
-    let code = text.split(" #").next().unwrap_or(text).trim_end();
-    code.rsplit(' ').next().is_some_and(|token| {
-        token.starts_with(['|', '>']) && token.contains('+') && token.len() <= 3
-    })
-}
-
-/// The indent of `entry`'s nested block mapping, or `None` when its value is
-/// anything else (inline, a sequence, empty).
-fn mapping_indent(lines: &[String], entry: &Entry, indent: usize) -> Option<usize> {
-    if !entry.inline.is_empty() {
-        return None;
-    }
-    let line = lines[entry.start + 1..entry.end].iter().find(|line| {
-        let text = line.trim_start();
-        !text.is_empty() && !text.starts_with('#')
+    .ok_or_else(|| {
+        at(
+            start,
+            "quoted value not closed on a line deeper than its key",
+        )
     })?;
+    let close_line = start + text[..close].matches('\n').count();
+    if let Some(index) = (start + 1..=close_line).find(|&index| {
+        let (depth, text) = split(&lines[index]);
+        !text.trim().is_empty() && depth <= indent
+    }) {
+        return Err(at(index, "continuation line not deeper than its key"));
+    }
+    let after = text[close + 1..].split('\n').next().unwrap_or("");
+    if !(after.trim().is_empty() || after.starts_with(' ') && after.trim().starts_with('#')) {
+        return Err(at(close_line, "text after a quoted value"));
+    }
+    if let Some(index) = (close_line + 1..end).find(|&index| is_content(split(&lines[index]).1)) {
+        return Err(at(index, "unexpected indentation"));
+    }
+    Ok(close_line + 1)
+}
+
+/// A line's indentation and the text after it.
+fn split(line: &str) -> (usize, &str) {
     let text = line.trim_start_matches(' ');
-    let depth = line.len() - text.len();
-    (depth > indent && !is_sequence_item(text)).then_some(depth)
+    (line.len() - text.len(), text)
+}
+
+/// Not blank and not a comment. (Inside a quoted scalar a `#` line is
+/// content; [`scalar`] handles that.)
+fn is_content(text: &str) -> bool {
+    let text = text.trim();
+    !text.is_empty() && !text.starts_with('#')
 }
 
 fn is_sequence_item(text: &str) -> bool {
@@ -370,6 +302,7 @@ fn parse_key(text: &str) -> Option<(String, String)> {
         (quoted[..close].replace("''", "'"), &quoted[close + 1..])
     } else {
         if text.starts_with(['?', '{', '[', '&', '*', '!', '|', '>', '%', '@', '`'])
+            || is_sequence_item(text)
             || text.starts_with("---")
             || text.starts_with("...")
         {
@@ -450,6 +383,10 @@ mod tests {
         &["fallback_providers"],
     ];
 
+    fn set_provider(existing: &str) -> Result<String, String> {
+        merge(existing, &values(), &[&["model", "provider"]])
+    }
+
     #[test]
     fn replaces_owned_keys_and_keeps_the_rest_as_written() {
         let existing = "\
@@ -462,8 +399,8 @@ providers:
     base_url: https://mine
   r:
     base_url: https://stale
-    note: |
-      text
+    note: 'text
+      # not a comment'
 fallback_providers:
 - mine
 agent:
@@ -504,6 +441,67 @@ agent:
         assert_eq!(merge(&merged, &values(), PATHS).unwrap(), merged);
     }
 
+    /// PyYAML 6 `safe_dump(sort_keys=False)` output, wrapped strings and a
+    /// list of mappings included.
+    #[test]
+    fn merges_a_safe_dump_config() {
+        let existing = "\
+model:
+  default: anthropic/claude-opus-4
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+agent:
+  max_turns: 60
+  system_prompt: You are a careful assistant. Always explain your reasoning before
+    acting, and never run destructive commands without asking the user first.
+  personalities:
+    concise: 'Be brief: answer in one or two sentences unless asked for more. Don''t
+      pad.'
+  disabled_toolsets:
+  - web
+  - browser
+providers:
+  mine:
+    base_url: https://mine.example/v1
+    key_env: MINE_KEY
+custom_providers:
+- name: local
+  base_url: http://localhost:8080/v1
+  note: A long description of this local provider that PyYAML will wrap across several
+    lines because it is long.
+- name: other
+  api_key: ''
+fallback_providers: []
+toolsets: {}
+terminal:
+  cwd: .
+  env_passthrough: []
+  timeout: 180
+display:
+  banner: 'line one
+
+    line two: with colon'
+  greeting: \"Hello\\tworld, this is a deliberately long string with a tab so that PyYAML\\
+    \\ picks double quotes and then wraps it.\"
+  skin: default
+memory:
+  enabled: true
+  user_profile: null
+";
+        let merged = merge(existing, &values(), PATHS).unwrap();
+        let expected = existing
+            .replace(
+                "  default: anthropic/claude-opus-4\n  provider: openrouter\n",
+                "  default: \"router\"\n  provider: \"custom:r\"\n",
+            )
+            .replace(
+                "    key_env: MINE_KEY\n",
+                "    key_env: MINE_KEY\n  r:\n    base_url: \"https://x\"\n    key_env: \"K\"\n",
+            );
+        assert_eq!(merged, expected);
+        assert_eq!(merge(&merged, &values(), PATHS).unwrap(), merged);
+    }
+
     #[test]
     fn missing_and_non_mapping_parents_are_replaced() {
         let merged = merge("model: some-model\n'providers': {}\n", &values(), PATHS).unwrap();
@@ -540,47 +538,24 @@ fallback_providers: []
     }
 
     #[test]
-    fn multi_line_scalars_stay_whole() {
-        let existing =
-            "\u{feff}model:\n  note: 'hello\n    provider: world'\n  text: |\n    hello\n      \n";
-        let merged = merge(existing, &values(), &[&["model", "provider"]]).unwrap();
+    fn wrapped_scalars_stay_whole() {
+        let appended = "\u{feff}model:\n  note: 'hello\n    provider: world'\n";
         assert_eq!(
-            merged,
-            "model:\n  note: 'hello\n    provider: world'\n  text: |\n    hello\n      \n  provider: \"custom:r\"\n"
+            set_provider(appended).unwrap(),
+            "model:\n  note: 'hello\n    provider: world'\n  provider: \"custom:r\"\n"
         );
-    }
-
-    #[test]
-    fn dedented_quoted_continuations_stay_with_their_scalar() {
         for existing in [
-            "model:\n  notes:\n    prompt: 'hello\n  provider: world'\n",
-            "model:\n  note: &n 'hello\n  provider: world'\n",
-            "model:\n  note: !!str \"a \\\" b\n  provider: world\"\n",
+            "notes:\n  festive: use the expression\n    'tis the season.\nmodel:\n  provider: old\n  effort: high\nterminal:\n  cwd: /home/o'connor\n",
+            "model:\n  note: it's here\n  provider: old\n",
+            "model:\n  note: \"a \\\" b\\\n    \\ provider: c\"\n  provider: old\n",
+            // Finding 3, quoted-key variant: the item's keys are at column 4.
+            "model:\n  items:\n  - \"a\": b\n    c: 'x\n      provider: y'\n  - z\n  provider: old\n",
         ] {
-            let merged = merge(existing, &values(), &[&["model", "provider"]]).unwrap();
-            assert_eq!(merged, format!("{existing}  provider: \"custom:r\"\n"));
+            assert_eq!(
+                set_provider(existing).unwrap(),
+                existing.replace("provider: old", "provider: \"custom:r\"")
+            );
         }
-        let block = "model:\n  note: |\n    \"opens no quote\n  provider: old\n";
-        let merged = merge(block, &values(), &[&["model", "provider"]]).unwrap();
-        assert_eq!(
-            merged,
-            "model:\n  note: |\n    \"opens no quote\n  provider: \"custom:r\"\n"
-        );
-        let wrapped = "notes:\n  festive: use the expression\n    'tis the season.\nmodel:\n  provider: old\n  effort: high\nterminal:\n  cwd: /home/o'connor\n";
-        let merged = merge(wrapped, &values(), &[&["model", "provider"]]).unwrap();
-        assert_eq!(
-            merged,
-            wrapped.replace("provider: old", "provider: \"custom:r\"")
-        );
-        let flow = "model:\n  body: &b {t: 0.2,\n  provider: {order: [a]}}\n  effort: high\n";
-        let merged = merge(flow, &values(), &[&["model", "provider"]]).unwrap();
-        assert_eq!(merged, format!("{flow}  provider: \"custom:r\"\n"));
-        let plain = "model:\n  note: it's here\n  provider: old\n";
-        let merged = merge(plain, &values(), &[&["model", "provider"]]).unwrap();
-        assert_eq!(
-            merged,
-            "model:\n  note: it's here\n  provider: \"custom:r\"\n"
-        );
     }
 
     #[test]
@@ -594,23 +569,87 @@ fallback_providers: []
         assert_eq!(merged, "agent: {}\n");
     }
 
+    /// Finding 4: a missing final newline stays missing.
+    #[test]
+    fn final_newline_is_kept_as_written() {
+        assert_eq!(
+            set_provider("model:\n  provider: old\nnote: hi").unwrap(),
+            "model:\n  provider: \"custom:r\"\nnote: hi"
+        );
+        assert_eq!(
+            set_provider("note: hi").unwrap(),
+            "note: hi\nmodel:\n  provider: \"custom:r\""
+        );
+        assert_eq!(
+            set_provider("").unwrap(),
+            "model:\n  provider: \"custom:r\"\n"
+        );
+    }
+
+    /// Finding 5: a comment after a value is not part of it.
+    #[test]
+    fn comments_after_a_replaced_value_are_kept() {
+        assert_eq!(
+            set_provider("model:\n  provider: old\n    # about effort\n  effort: high\n").unwrap(),
+            "model:\n  provider: \"custom:r\"\n    # about effort\n  effort: high\n"
+        );
+        assert_eq!(
+            merge(
+                "providers:\n  r:\n    base_url: x\n      # keep\n  mine: {}\n",
+                &values(),
+                &[&["providers", "r"]],
+            )
+            .unwrap(),
+            "providers:\n  r:\n    base_url: \"https://x\"\n    key_env: \"K\"\n      # keep\n  mine: {}\n"
+        );
+    }
+
     #[test]
     fn unsupported_yaml_is_an_error_not_a_rewrite() {
         for text in [
-            "fallback_providers: []\nfallback_providers:\n- other\n",
-            "model: {provider: old, reasoning_effort: high}\n",
+            // Round-5 findings 1-4.
+            "model:\n  provider:\n    hello\n    'tis\n  effort: high # '\n",
+            "model:\n  body: {\"x\":\"}\",\n  provider: old}\n  effort: high\n",
+            "model:\n  items:\n  - a: |2\n      hi\n    body: [x,\n  provider: old]\n  effort: high\n",
+            "model:\n  items:\n  - \"a\": b\n    body: [x,\n  provider: old]\n  effort: high\n",
+            "model:\n  provider: old\nnote: |\n  hi",
+            // Block scalars.
+            "model:\n  note: |\n    hello\n",
+            "model:\n  note: >-\n    hello\n",
+            "agent:\n  note: |+\n    hello\n\n",
+            // Quoted continuations not deeper than their key.
+            "model:\n  notes:\n    prompt: 'hello\n  provider: world'\n",
+            "model:\n  note: 'a\n# b'\n  provider: c\n",
+            "model:\n  note: 'never closed\n",
+            "list:\n- 'a\n- b'\n",
+            // Anchors, aliases, tags, merge keys.
             "model: &m\n  default: x\n",
             "model:\n  default: &saved old\nother: *saved\n",
-            "agent:\n  note: |+\n    hello\n\n",
-            "  SECRET-VALUE\n",
+            "model:\n  note: &n 'hello'\n",
+            "model:\n  note: !!str x\n",
+            "list:\n- *a\n",
             "<<: *defaults\nmodel:\n  default: x\n",
-            "providers:\n  r: {\"base_url\":&saved \"x\"}\nother: *saved\n",
+            // Non-empty flow collections.
+            "model: {provider: old, reasoning_effort: high}\n",
             "model: {provider: old,\n  reasoning_effort: high}\n",
-            "model:\n  note: 'never closed\n",
-            "model:\n  notes:\n    prompt: 'hello\n  provider: world\n",
+            "providers:\n  r: {\"base_url\":&saved \"x\"}\nother: *saved\n",
+            "list: [a]\n",
+            "list:\n- {a: 1}\n",
+            "list: []\n  - a\n",
+            // Document markers, directives, tabs.
+            "---\nmodel: x\n",
+            "model: x\n...\n",
+            "%YAML 1.2\n---\nmodel: x\n",
             "model:\n\tdefault: x\n",
+            // Other shapes `safe_dump` does not write.
+            "fallback_providers: []\nfallback_providers:\n- other\n",
             "? complex\n: key\n",
             "- a\n- b\n",
+            "list:\n- - a\n",
+            "list:\n-\n  a: 1\n",
+            "model:\n  provider: 'a' b\n",
+            "model: 'a'\n  b\n",
+            "  SECRET-VALUE\n",
             "  indented: start\n",
             "just a scalar\n",
         ] {
