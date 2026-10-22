@@ -1386,47 +1386,16 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
                 "local router: omitting web_search with external_web_access=false (no live search requested)"
             );
         }
-        let refused = responses_untranslatable_hosted_tools(&parsed, target);
-        if !refused.is_empty() {
-            warn!(
-                "local router: refusing Responses request with hosted tool(s) {} the route cannot run",
-                refused.join(",")
+        if let Some((code, response)) = responses_translation_refusal(&parsed, target) {
+            warn!("local router: refusing Responses request the route cannot honour ({code})");
+            // The request was announced to metrics above; close it out.
+            record_request_error(
+                state.opts.metrics.as_ref(),
+                &request_id,
+                Some(StatusCode::BAD_REQUEST.as_u16()),
+                code,
             );
-            return Ok(unsupported_hosted_tool_response(&refused, target));
-        }
-        if target == HostedToolTarget::AnthropicMessages
-            && let Some(reason) = responses_web_search_refusal(&parsed)
-        {
-            warn!("local router: refusing Responses web_search the route cannot honour: {reason}");
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                json!({"error": {
-                    "type": "invalid_request_error",
-                    "code": "unsupported_web_search",
-                    "param": "tools",
-                    "message": format!(
-                        "Rayline Local cannot translate this web_search to Anthropic: {reason}"
-                    ),
-                }}),
-            ));
-        }
-        if target == HostedToolTarget::AnthropicMessages
-            && responses_required_tool_unavailable(&parsed)
-        {
-            warn!("local router: refusing Responses request whose required tool cannot be sent");
-            return Ok(json_response(
-                StatusCode::BAD_REQUEST,
-                json!({"error": {
-                    "type": "invalid_request_error",
-                    "code": "required_tool_unavailable",
-                    "param": "tool_choice",
-                    "message": "tool_choice requires a tool call this Anthropic route cannot \
-                                make: the tool it forces, or every tool it permits, is not \
-                                sent upstream (custom tools, and a web_search without live \
-                                access or with max_tool_calls 0, are not). Declare a tool the \
-                                route can run, or relax tool_choice.",
-                }}),
-            ));
+            return Ok(response);
         }
     }
 
@@ -4168,6 +4137,63 @@ fn responses_untranslatable_hosted_tools(body: &Value, target: HostedToolTarget)
             !(target == HostedToolTarget::AnthropicMessages && kind.starts_with("web_search"))
         })
         .collect()
+}
+
+/// A 400 for a Responses request whose translation to `target` would drop or
+/// relax something the caller asked for, with its error code.
+fn responses_translation_refusal(
+    body: &Value,
+    target: HostedToolTarget,
+) -> Option<(&'static str, Response<BoxBody>)> {
+    let refused = responses_untranslatable_hosted_tools(body, target);
+    if !refused.is_empty() {
+        info!(
+            "local router: hosted tool(s) {} cannot run on this route",
+            refused.join(",")
+        );
+        return Some((
+            "unsupported_hosted_tool",
+            unsupported_hosted_tool_response(&refused, target),
+        ));
+    }
+    if target != HostedToolTarget::AnthropicMessages {
+        return None;
+    }
+    if let Some(reason) = responses_web_search_refusal(body) {
+        return Some((
+            "unsupported_web_search",
+            json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_web_search",
+                    "param": "tools",
+                    "message": format!(
+                        "Rayline Local cannot translate this web_search to Anthropic: {reason}"
+                    ),
+                }}),
+            ),
+        ));
+    }
+    if responses_required_tool_unavailable(body) {
+        return Some((
+            "required_tool_unavailable",
+            json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "required_tool_unavailable",
+                    "param": "tool_choice",
+                    "message": "tool_choice requires a tool call this Anthropic route cannot \
+                                make: the tool it forces, or every tool it permits, is not \
+                                sent upstream (custom tools, and a web_search without live \
+                                access or with max_tool_calls 0, are not). Declare a tool the \
+                                route can run, or relax tool_choice.",
+                }}),
+            ),
+        ));
+    }
+    None
 }
 
 fn unsupported_hosted_tool_response(

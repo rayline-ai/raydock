@@ -1139,6 +1139,57 @@ async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
     let _ = std::fs::remove_file(config);
 }
 
+/// A request refused for a hosted tool the route cannot run is announced to
+/// metrics like any other; it must also be closed out there, or `rayline top`
+/// shows it as active forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_hosted_tool_request_is_not_left_active_in_metrics() {
+    let config = write_config(
+        "hosted-tools-metrics",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": "http://127.0.0.1:9", "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        metrics: Some(metrics.clone()),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let refused = client
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({"model": "m", "input": "hi", "stream": false,
+                      "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let totals = metrics.snapshot().totals;
+    assert_eq!(totals.active_requests, 0);
+    assert_eq!(totals.errored_requests, 1);
+    let _ = std::fs::remove_file(config);
+}
+
 /// Codex declares `{type: "web_search", external_web_access: false}` on every
 /// turn and sets it to true only for live search. The default must keep
 /// working through a Responses → Anthropic route: the offline declaration is
