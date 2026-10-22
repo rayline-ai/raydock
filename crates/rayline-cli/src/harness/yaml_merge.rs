@@ -245,6 +245,15 @@ fn scalar(
         }
         // Plain: every line before `end` is already deeper than its key.
         _ => {
+            if !is_plain_text(inline) {
+                return Err(at(start, "not a plain scalar"));
+            }
+            if let Some(index) = (start + 1..end).find(|&index| {
+                let text = split(&lines[index]).1;
+                is_content(text) && !is_plain_text(text)
+            }) {
+                return Err(at(index, "not a plain scalar"));
+            }
             let last = (start + 1..end)
                 .rev()
                 .find(|&index| is_content(split(&lines[index]).1));
@@ -285,6 +294,28 @@ fn scalar(
         return Err(at(index, "unexpected indentation"));
     }
     Ok(close_line + 1)
+}
+
+/// Whether `text` (one line, comment allowed) can be plain-scalar text in a
+/// block mapping: no leading `- `, `? ` or `: ` indicator, no leading `,`, and
+/// no `: ` or trailing `:` that would make it a mapping. Anything else is
+/// refused rather than guessed at.
+fn is_plain_text(text: &str) -> bool {
+    let code = text
+        .split(" #")
+        .next()
+        .unwrap_or(text)
+        .trim_end_matches(' ');
+    let indicator = |c: char| {
+        code.strip_prefix(c)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+    };
+    !(indicator('-')
+        || indicator('?')
+        || indicator(':')
+        || code.starts_with(',')
+        || code.contains(": ")
+        || code.ends_with(':'))
 }
 
 /// A line's indentation and the text after it.
@@ -677,6 +708,12 @@ fallback_providers: []
             "model: x\n...\n",
             "%YAML 1.2\n---\nmodel: x\n",
             "model:\n\tdefault: x\n",
+            // Values that are not plain scalars (already invalid YAML).
+            "model:\n  provider: old\nnote: - foo\n",
+            "model: - foo\nnote: keep\n",
+            "model:\n  provider: old\nnote: a: b\n",
+            "model:\n  provider: old\nnote: wrapped\n    and: more\n",
+            "model:\n  provider: old\nnote: ? x\n",
             // Line breaks `str::lines` does not split on.
             "note: x\rmodel:\r  effort: high\r",
             "note: x\u{85}model: y\n",
