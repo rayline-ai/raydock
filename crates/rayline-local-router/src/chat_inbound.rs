@@ -50,6 +50,9 @@ pub(crate) async fn handle_chat_completions(
         .unwrap_or(false);
     let response = match &decision.target {
         RouteSelection::Local => {
+            if let Some(refusal) = untranslatable_chat_tools_response(&parsed) {
+                return Ok(refusal);
+            }
             let (anthropic, tool_names) =
                 chat_to_anthropic_request(&parsed, &decision.selected_model);
             let url = format!(
@@ -84,6 +87,9 @@ pub(crate) async fn handle_chat_completions(
                 .ok_or_else(|| anyhow!("endpoint {endpoint_id:?} not found"))?;
             match endpoint.protocol {
                 EndpointProtocol::AnthropicMessages => {
+                    if let Some(refusal) = untranslatable_chat_tools_response(&parsed) {
+                        return Ok(refusal);
+                    }
                     let (anthropic, tool_names) =
                         chat_to_anthropic_request(&parsed, &decision.selected_model);
                     let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
@@ -160,6 +166,58 @@ async fn passthrough_response(
         .body(body)?;
     add_decision_headers(response.headers_mut(), decision);
     Ok(response)
+}
+
+/// OpenAI-shaped 400 for a request the translated route cannot carry.
+fn chat_invalid_request(code: &str, param: &str, message: String) -> Response<BoxBody> {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        json!({"error": {"type": "invalid_request_error", "code": code,
+                         "param": param, "message": message}}),
+    )
+}
+
+/// The declared tool types Anthropic Messages has no equivalent for (Chat
+/// `custom` freeform tools and anything else that is not a `function`), in
+/// declaration order. Translating without them would silently drop them.
+pub(crate) fn untranslatable_chat_tool_types(body: &Value) -> Vec<String> {
+    let mut kinds: Vec<String> = Vec::new();
+    for tool in body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let kind = tool
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        if kind != "function" && !kinds.iter().any(|seen| seen == kind) {
+            kinds.push(kind.to_owned());
+        }
+    }
+    kinds
+}
+
+fn untranslatable_chat_tools_response(body: &Value) -> Option<Response<BoxBody>> {
+    let kinds = untranslatable_chat_tool_types(body);
+    if kinds.is_empty() {
+        return None;
+    }
+    warn!(
+        "local router: refusing Chat Completions request with tool type(s) {} the route cannot carry",
+        kinds.join(",")
+    );
+    Some(chat_invalid_request(
+        "unsupported_tool_type",
+        "tools",
+        format!(
+            "Rayline Local cannot send tool type(s) {} on this route: it translates Chat Completions to \
+             Anthropic Messages, which supports only function tools. Declare them as function tools, or \
+             route to an endpoint that speaks Chat Completions natively.",
+            kinds.join(", ")
+        ),
+    ))
 }
 
 // --- request: Chat Completions -> Anthropic Messages ---------------------------------
@@ -341,7 +399,7 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
         .collect();
     if !tools.is_empty() {
         out.insert("tools".to_owned(), Value::Array(tools));
-        let choice = match body.get("tool_choice") {
+        let mut choice = match body.get("tool_choice") {
             Some(Value::String(choice)) if choice == "none" => Some(json!({"type": "none"})),
             Some(Value::String(choice)) if choice == "required" => Some(json!({"type": "any"})),
             Some(Value::Object(choice)) => choice
@@ -351,6 +409,15 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
                 .map(|name| json!({"type": "tool", "name": rewrites.upstream(name)})),
             _ => None,
         };
+        // `parallel_tool_calls: false` is Anthropic's
+        // `tool_choice.disable_parallel_tool_use` (not valid with `none`).
+        if body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false) {
+            let mut base = choice.unwrap_or_else(|| json!({"type": "auto"}));
+            if base["type"] != "none" {
+                base["disable_parallel_tool_use"] = json!(true);
+            }
+            choice = Some(base);
+        }
         if let Some(choice) = choice {
             out.insert("tool_choice".to_owned(), choice);
         }
@@ -445,15 +512,7 @@ async fn anthropic_response_to_chat(
 ) -> Result<Response<BoxBody>> {
     let status = resp.status();
     if !status.is_success() {
-        return response_from_reqwest(
-            resp,
-            status,
-            Some(decision),
-            None,
-            Some(request_id.to_owned()),
-            None,
-        )
-        .await;
+        return anthropic_error_to_chat(resp, status, decision, request_id).await;
     }
     let id = chat_completion_id(decision);
     let model = decision.requested_model.clone();
@@ -507,6 +566,57 @@ async fn anthropic_response_to_chat(
         return Ok(response);
     }
     let mut response = json_response(StatusCode::OK, completion);
+    add_decision_headers(response.headers_mut(), decision);
+    Ok(response)
+}
+
+/// An Anthropic-shaped error body (`{"type":"error","error":{"type","message"}}`)
+/// in OpenAI's shape (`{"error":{"message","type","param","code"}}`). Any other
+/// body is wrapped as the message, so a Chat client always gets OpenAI's shape.
+pub(crate) fn anthropic_error_body_to_openai(body: &[u8]) -> Value {
+    let parsed = serde_json::from_slice::<Value>(body).ok();
+    let error = parsed.as_ref().and_then(|value| value.get("error"));
+    let kind = error
+        .and_then(|error| error.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("api_error");
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| String::from_utf8_lossy(body).trim().to_owned());
+    let code = error
+        .and_then(|error| error.get("code"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    json!({"error": {"message": message, "type": kind, "param": Value::Null, "code": code}})
+}
+
+async fn anthropic_error_to_chat(
+    resp: reqwest::Response,
+    status: reqwest::StatusCode,
+    decision: &RouteDecision,
+    request_id: &str,
+) -> Result<Response<BoxBody>> {
+    warn!(
+        "upstream returned HTTP {} (task={} selected={} request={request_id})",
+        status.as_u16(),
+        decision.task_class,
+        decision.selected_model
+    );
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let body = resp.bytes().await.unwrap_or_default();
+    let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = json_response(status, anthropic_error_body_to_openai(&body));
+    if let Some(retry_after) = retry_after
+        && let Ok(value) = HeaderValue::from_str(&retry_after)
+    {
+        response.headers_mut().insert("retry-after", value);
+    }
     add_decision_headers(response.headers_mut(), decision);
     Ok(response)
 }
@@ -772,6 +882,65 @@ mod tests {
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "call_1");
         assert_eq!(messages[2]["content"][1]["text"], "And now?");
         assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn custom_tools_are_refused_and_parallel_off_is_honoured() {
+        let body = json!({"messages": [], "tools": [
+            {"type": "function", "function": {"name": "shell"}},
+            {"type": "custom", "custom": {"name": "apply_patch", "format": {"type": "grammar"}}}
+        ]});
+        assert_eq!(
+            untranslatable_chat_tool_types(&body),
+            vec!["custom".to_owned()]
+        );
+        let refusal = untranslatable_chat_tools_response(&body).expect("refused");
+        assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            untranslatable_chat_tools_response(
+                &json!({"tools": [{"type": "function", "function": {"name": "shell"}}]})
+            )
+            .is_none()
+        );
+        let tools = json!([{"type": "function", "function": {"name": "shell"}}]);
+        let (sequential, _) = chat_to_anthropic_request(
+            &json!({"messages": [], "parallel_tool_calls": false, "tools": tools}),
+            "m",
+        );
+        assert_eq!(
+            sequential["tool_choice"],
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+        let (required, _) = chat_to_anthropic_request(
+            &json!({"messages": [], "parallel_tool_calls": false, "tool_choice": "required",
+                    "tools": tools}),
+            "m",
+        );
+        assert_eq!(
+            required["tool_choice"],
+            json!({"type": "any", "disable_parallel_tool_use": true})
+        );
+        let (none, _) = chat_to_anthropic_request(
+            &json!({"messages": [], "parallel_tool_calls": false, "tool_choice": "none",
+                    "tools": tools}),
+            "m",
+        );
+        assert_eq!(none["tool_choice"], json!({"type": "none"}));
+    }
+
+    #[test]
+    fn anthropic_errors_reach_chat_clients_in_openai_shape() {
+        let mapped = anthropic_error_body_to_openai(
+            br#"{"type":"error","error":{"type":"invalid_request_error","code":"unsupported_server_tool","message":"no"}}"#,
+        );
+        assert_eq!(
+            mapped,
+            json!({"error": {"message": "no", "type": "invalid_request_error",
+                             "param": null, "code": "unsupported_server_tool"}})
+        );
+        let plain = anthropic_error_body_to_openai(b"upstream exploded");
+        assert_eq!(plain["error"]["message"], "upstream exploded");
+        assert_eq!(plain["error"]["type"], "api_error");
     }
 
     #[test]
