@@ -1208,3 +1208,291 @@ async fn browser_reachable_requests_never_reach_the_provider() {
     assert!(reached.is_err(), "a guarded request reached the provider");
     let _ = std::fs::remove_file(path);
 }
+
+/// Accept one connection, drain the request, then write `pieces` one at a time
+/// with a pause between them, so the router receives them as separate chunks.
+/// The connection is dropped after the last piece.
+async fn serve_pieces(listener: TcpListener, pieces: Vec<Vec<u8>>) {
+    if let Ok((mut sock, _)) = listener.accept().await {
+        let mut buf = [0u8; 16384];
+        let _ = sock.read(&mut buf).await;
+        for piece in pieces {
+            let _ = sock.write_all(&piece).await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// A one-route config whose only endpoint is `endpoint` (id `up`, model `m`).
+fn chat_route_config(name: &str, endpoint: Value) -> PathBuf {
+    write_config(
+        name,
+        &json!({
+            "endpoints": [endpoint],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    )
+}
+
+fn anthropic_endpoint(upstream_port: u16) -> Value {
+    json!({"id": "up", "protocol": "anthropic_messages",
+           "base_url": format!("http://127.0.0.1:{upstream_port}"), "models": ["m"]})
+}
+
+/// POST a streaming Chat Completions request and read the raw body, returning
+/// it with whether the body ended in a transport error.
+async fn stream_chat(port: u16) -> (String, bool) {
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&json!({"model": "m", "stream": true,
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = Vec::new();
+    let mut aborted = false;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => body.extend_from_slice(&bytes),
+            Err(_) => {
+                aborted = true;
+                break;
+            }
+        }
+    }
+    (String::from_utf8(body).expect("utf-8 body"), aborted)
+}
+
+/// The text a Chat chunk stream carries.
+fn chat_stream_text(body: &str) -> String {
+    body.split("\n\n")
+        .filter_map(|event| event.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .filter_map(|chunk| {
+            chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+const SSE_HEAD: &str =
+    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+const SSE_START: &str = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n";
+const SSE_STOP: &str = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+fn sse_text_delta(text: &str) -> String {
+    format!(
+        "event: content_block_delta\ndata: {}\n\n",
+        json!({"type": "content_block_delta", "index": 0,
+               "delta": {"type": "text_delta", "text": text}})
+    )
+}
+
+/// An upstream that drops the connection mid-answer must not look like a
+/// finished completion: no finish chunk, no `[DONE]`, and the client sees the
+/// failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_stream_reports_upstream_disconnect() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    // A chunked body cut off before its terminating chunk is a transport error.
+    let event = format!("{SSE_START}{}", sse_text_delta("partial"));
+    tokio::spawn(serve_pieces(
+        upstream,
+        vec![
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n"
+                .to_vec(),
+            format!("{:x}\r\n{event}\r\n", event.len()).into_bytes(),
+        ],
+    ));
+    let config = chat_route_config("chat-disconnect", anthropic_endpoint(upstream_port));
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let (body, aborted) = stream_chat(port).await;
+    assert_eq!(chat_stream_text(&body), "partial");
+    assert!(!body.contains("[DONE]"), "{body}");
+    assert!(!body.contains("\"finish_reason\":\"stop\""), "{body}");
+    assert!(aborted || body.contains("\"error\""), "{body}");
+    let _ = std::fs::remove_file(config);
+}
+
+/// A connection closed cleanly before `message_stop`, and an SSE `error`
+/// event, both end the Chat stream with an error instead of `[DONE]`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_stream_reports_upstream_error_event_and_early_eof() {
+    for (name, tail, expected) in [
+        (
+            "error-event",
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+            "overloaded_error",
+        ),
+        ("early-eof", "", "ended before the response completed"),
+    ] {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        tokio::spawn(serve_once(
+            upstream,
+            format!("{SSE_HEAD}{SSE_START}{}{tail}", sse_text_delta("partial")),
+        ));
+        let config = chat_route_config(name, anthropic_endpoint(upstream_port));
+        let port = free_port();
+        start_router(port, config.clone()).await;
+        let (body, _) = stream_chat(port).await;
+        assert_eq!(chat_stream_text(&body), "partial", "{name}");
+        assert!(!body.contains("[DONE]"), "{name}: {body}");
+        assert!(body.contains(expected), "{name}: {body}");
+        let _ = std::fs::remove_file(config);
+    }
+}
+
+/// A multi-byte character split across upstream chunks reaches the client
+/// intact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_stream_keeps_utf8_split_across_chunks() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let bytes = format!("{SSE_START}{}{SSE_STOP}", sse_text_delta("café")).into_bytes();
+    let split = bytes
+        .windows(2)
+        .position(|pair| pair == "é".as_bytes())
+        .expect("é in body")
+        + 1;
+    tokio::spawn(serve_pieces(
+        upstream,
+        vec![
+            SSE_HEAD.as_bytes().to_vec(),
+            bytes[..split].to_vec(),
+            bytes[split..].to_vec(),
+        ],
+    ));
+    let config = chat_route_config("chat-utf8", anthropic_endpoint(upstream_port));
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let (body, aborted) = stream_chat(port).await;
+    assert!(!aborted);
+    assert_eq!(chat_stream_text(&body), "café");
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    let _ = std::fs::remove_file(config);
+}
+
+/// CRLF-delimited SSE (valid per the SSE spec) is translated like LF.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_stream_accepts_crlf_sse() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let body = format!("{SSE_START}{}{SSE_STOP}", sse_text_delta("hello")).replace('\n', "\r\n");
+    tokio::spawn(serve_once(upstream, format!("{SSE_HEAD}{body}")));
+    let config = chat_route_config("chat-crlf", anthropic_endpoint(upstream_port));
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let (body, aborted) = stream_chat(port).await;
+    assert!(!aborted);
+    assert_eq!(chat_stream_text(&body), "hello");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    let _ = std::fs::remove_file(config);
+}
+
+/// An `auth: client_bearer` OpenAI Chat endpoint receives the caller's own
+/// Authorization and account headers, like the Responses passthrough.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_client_bearer_forwards_caller_auth() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "chatcmpl_1", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"},
+                         "finish_reason": "stop"}]
+        })),
+        tx,
+    ));
+    let config = chat_route_config(
+        "chat-client-bearer",
+        json!({"id": "up", "protocol": "openai_chat", "auth": "client_bearer",
+               "base_url": format!("http://127.0.0.1:{upstream_port}/v1"), "models": ["m"]}),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .header("authorization", "Bearer caller-token")
+        .header("chatgpt-account-id", "workspace-123")
+        .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let captured = rx.await.expect("upstream saw the request");
+    assert!(
+        captured.starts_with("POST /v1/chat/completions "),
+        "{captured}"
+    );
+    assert!(
+        captured.contains("authorization: Bearer caller-token\r\n"),
+        "{captured}"
+    );
+    assert!(
+        captured.contains("chatgpt-account-id: workspace-123\r\n"),
+        "{captured}"
+    );
+    assert_eq!(captured.matches("content-type:").count(), 1, "{captured}");
+    let _ = std::fs::remove_file(config);
+}
+
+/// A route to an `openai_responses` endpoint is refused with an OpenAI-shaped
+/// 400 instead of POSTing Chat JSON to a Responses-only backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_refuses_openai_responses_endpoint() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let config = chat_route_config(
+        "chat-responses",
+        json!({"id": "up", "protocol": "openai_responses",
+               "base_url": format!("http://127.0.0.1:{upstream_port}/v1"), "models": ["m"]}),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .timeout(Duration::from_secs(5))
+        .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .expect("refused without waiting on the endpoint");
+    assert_eq!(response.status(), 400);
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["code"], "unsupported_route");
+    let reached = tokio::time::timeout(Duration::from_millis(300), upstream.accept()).await;
+    assert!(reached.is_err(), "the Responses endpoint was called");
+    let _ = std::fs::remove_file(config);
+}
+
+/// The #100 browser guard covers the Chat listener: a CORS "simple" text/plain
+/// POST is refused before it reaches the provider.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_refuses_text_plain_post() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let config = chat_route_config("chat-text-plain", anthropic_endpoint(upstream_port));
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .header("content-type", "text/plain")
+        .body(json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 415);
+    let reached = tokio::time::timeout(Duration::from_millis(300), upstream.accept()).await;
+    assert!(reached.is_err(), "a text/plain POST reached the provider");
+    let _ = std::fs::remove_file(config);
+}

@@ -111,18 +111,39 @@ pub(crate) async fn handle_chat_completions(
                     )
                     .await
                 }
-                EndpointProtocol::OpenAIChat | EndpointProtocol::OpenAIResponses => {
+                EndpointProtocol::OpenAIResponses => {
+                    // A Responses-only backend has no Chat Completions surface,
+                    // and this listener does not translate Chat to Responses.
+                    return Ok(chat_invalid_request(
+                        "unsupported_route",
+                        "model",
+                        format!(
+                            "the route for model {:?} targets endpoint {endpoint_id:?}, which \
+                             speaks openai_responses; Chat Completions requests can only be \
+                             routed to openai_chat or anthropic_messages endpoints",
+                            decision.requested_model
+                        ),
+                    ));
+                }
+                EndpointProtocol::OpenAIChat => {
                     let mut body = parsed.clone();
                     body["model"] = json!(decision.selected_model);
                     let url = format!(
                         "{}/chat/completions",
                         endpoint.base_url.trim_end_matches('/')
                     );
-                    let mut outbound = state
-                        .http
-                        .post(url)
-                        .header("content-type", "application/json")
-                        .json(&body);
+                    let client_bearer = endpoint.auth == Some(AuthMode::ClientBearer);
+                    let http = if client_bearer {
+                        &state.http_ipv4
+                    } else {
+                        &state.http
+                    };
+                    let mut outbound = http.post(url);
+                    // Same header policy as the Responses passthrough: a
+                    // `client_bearer` endpoint authenticates with the caller's
+                    // own Authorization (and account headers).
+                    copy_openai_passthrough_headers(&mut outbound, &headers, true, client_bearer);
+                    outbound = outbound.json(&body);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
                     let resp = outbound.send().await?;
                     passthrough_response(resp, &decision).await
@@ -529,14 +550,33 @@ async fn anthropic_response_to_chat(
                 AnthropicToChatTranslator::new(id, model, include_usage, tool_names);
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = stream.next().await {
-                let Ok(bytes) = chunk else { break };
-                let out = translator.push_bytes(&bytes);
-                if !out.is_empty() && tx.send(Ok(Frame::data(Bytes::from(out)))).await.is_err() {
-                    return;
+                match chunk {
+                    Ok(bytes) => {
+                        let out = translator.push_bytes(&bytes);
+                        if !out.is_empty()
+                            && tx.send(Ok(Frame::data(Bytes::from(out)))).await.is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        // Like the Responses stream: no finish chunk and no
+                        // `[DONE]`, and the body is aborted, so the client
+                        // sees the answer was cut off.
+                        let message = format!("upstream stream failed: {error}");
+                        let out = translator.fail(&message);
+                        if !out.is_empty() {
+                            let _ = tx.send(Ok(Frame::data(Bytes::from(out)))).await;
+                        }
+                        let _ = tx.send(Err(std::io::Error::other(message))).await;
+                        return;
+                    }
                 }
             }
-            let tail = translator.finish();
-            let _ = tx.send(Ok(Frame::data(Bytes::from(tail)))).await;
+            let tail = translator.end_of_stream();
+            if !tail.is_empty() {
+                let _ = tx.send(Ok(Frame::data(Bytes::from(tail)))).await;
+            }
         });
         let body: BoxBody =
             StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed();
@@ -628,6 +668,8 @@ pub(crate) struct AnthropicToChatTranslator {
     created: u64,
     include_usage: bool,
     tool_names: ToolNameRewrites,
+    /// Leading bytes of a UTF-8 character split across chunks.
+    pending: Vec<u8>,
     buffer: String,
     /// Anthropic content-block index -> Chat `tool_calls` index.
     tool_index: HashMap<usize, usize>,
@@ -651,6 +693,7 @@ impl AnthropicToChatTranslator {
             created: unix_now(),
             include_usage,
             tool_names,
+            pending: Vec::new(),
             buffer: String::new(),
             tool_index: HashMap::new(),
             stop_reason: None,
@@ -680,11 +723,20 @@ impl AnthropicToChatTranslator {
     }
 
     pub(crate) fn push_bytes(&mut self, bytes: &[u8]) -> String {
-        self.buffer.push_str(&String::from_utf8_lossy(bytes));
+        self.pending.extend_from_slice(bytes);
+        // Decode up to an incomplete trailing character; its remaining bytes
+        // arrive in the next chunk.
+        let complete = match std::str::from_utf8(&self.pending) {
+            Err(error) if error.error_len().is_none() => error.valid_up_to(),
+            _ => self.pending.len(),
+        };
+        let rest = self.pending.split_off(complete);
+        self.buffer.push_str(&String::from_utf8_lossy(&self.pending));
+        self.pending = rest;
         let mut out = String::new();
-        while let Some(idx) = self.buffer.find("\n\n") {
-            let raw = self.buffer[..idx].to_owned();
-            self.buffer.replace_range(..idx + 2, "");
+        while !self.finished
+            && let Some(raw) = drain_sse_event(&mut self.buffer)
+        {
             if let Some((event, data)) = parse_sse_event(&raw)
                 && let Ok(value) = serde_json::from_str::<Value>(&data)
             {
@@ -692,6 +744,28 @@ impl AnthropicToChatTranslator {
             }
         }
         out
+    }
+
+    /// An OpenAI-shaped error event that ends the stream without a finish
+    /// chunk or `[DONE]`, so the client can tell the answer is incomplete.
+    pub(crate) fn fail(&mut self, message: &str) -> String {
+        self.fail_with("api_error", message)
+    }
+
+    fn fail_with(&mut self, kind: &str, message: &str) -> String {
+        if self.finished {
+            return String::new();
+        }
+        self.finished = true;
+        let data = json!({"error": {"message": message, "type": kind,
+                                    "param": Value::Null, "code": Value::Null}});
+        format!("data: {data}\n\n")
+    }
+
+    /// The upstream body ended. A stream that never reached `message_stop`
+    /// was cut off, so it is reported as a failure, not as finished.
+    pub(crate) fn end_of_stream(&mut self) -> String {
+        self.fail("upstream stream ended before the response completed")
     }
 
     fn process(&mut self, event: &str, value: &Value, out: &mut String) {
@@ -764,6 +838,19 @@ impl AnthropicToChatTranslator {
                 }
             }
             "message_stop" => out.push_str(&self.finish()),
+            "error" => {
+                let kind = value
+                    .pointer("/error/type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("api_error")
+                    .to_owned();
+                let message = value
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream stream reported an error")
+                    .to_owned();
+                out.push_str(&self.fail_with(&kind, &message));
+            }
             _ => {}
         }
     }
@@ -970,6 +1057,57 @@ mod tests {
         );
         assert_eq!(completion["usage"]["total_tokens"], 14);
         assert_eq!(completion["object"], "chat.completion");
+    }
+
+    #[test]
+    fn chat_translator_reassembles_split_utf8_crlf_and_reports_errors() {
+        let new = || {
+            AnthropicToChatTranslator::new(
+                "chatcmpl_x".to_owned(),
+                "m".to_owned(),
+                false,
+                ToolNameRewrites::default(),
+            )
+        };
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"café"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_stop",
+            json!({"type":"message_stop"}),
+        );
+        let bytes = upstream.replace('\n', "\r\n").into_bytes();
+        let split = bytes
+            .windows(2)
+            .position(|pair| pair == "é".as_bytes())
+            .expect("é")
+            + 1;
+        let mut translator = new();
+        let mut out = translator.push_bytes(&bytes[..split]);
+        out.push_str(&translator.push_bytes(&bytes[split..]));
+        out.push_str(&translator.end_of_stream());
+        assert!(out.contains("\"content\":\"café\""), "{out}");
+        assert!(out.ends_with("data: [DONE]\n\n"), "{out}");
+
+        let mut errored = new();
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "error",
+            json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+        );
+        let out = errored.push_bytes(upstream.as_bytes()) + &errored.end_of_stream();
+        assert!(out.contains("\"type\":\"overloaded_error\""), "{out}");
+        assert!(!out.contains("[DONE]"), "{out}");
+
+        let mut cut = new();
+        let out = cut.end_of_stream();
+        assert!(out.contains("\"error\""), "{out}");
+        assert!(!out.contains("[DONE]"), "{out}");
     }
 
     #[test]
