@@ -1045,6 +1045,226 @@ async fn anthropic_messages_leaves_legacy_family_body_untouched() {
     println!("PASS legacy family body forwarded untouched: {sent}");
 }
 
+/// Codex `web_search = "live"` through a Responses → Anthropic route: the
+/// hosted `web_search` tool reaches the upstream as Anthropic's server tool
+/// (never silently dropped), and a hosted tool with no Anthropic equivalent is
+/// refused with an actionable `unsupported_tool` before any upstream
+/// call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_hosted_tools_reach_anthropic_or_are_refused() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "Searched."}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
+        })),
+        tx,
+    ));
+    let config = write_config(
+        "hosted-tools",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://127.0.0.1:{port}/v1/responses");
+
+    let refused = client
+        .post(&url)
+        .json(&json!({"model": "m", "input": "hi", "stream": false,
+                      "tools": [{"type": "web_search"}, {"type": "code_interpreter"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "unsupported_tool");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("code_interpreter")
+    );
+
+    // Any tool type outside the translation's allowlist is refused, under
+    // automatic and forced tool choice alike, and so is a function the model
+    // may only call from a program.
+    let mut refusals = Vec::new();
+    for kind in ["computer", "programmatic_tool_calling", "made_up_tool_2031"] {
+        for tool_choice in [json!("auto"), json!({"type": kind})] {
+            refusals.push(json!({"model": "m", "input": "hi", "stream": false,
+                "tool_choice": tool_choice,
+                "tools": [{"type": "function", "name": "shell"}, {"type": kind}]}));
+        }
+    }
+    refusals.push(json!({"model": "m", "input": "hi", "stream": false,
+        "tools": [{"type": "function", "name": "delete_all",
+                   "allowed_callers": ["programmatic"]}]}));
+    for request in refusals {
+        let refused = client.post(&url).json(&request).send().await.unwrap();
+        assert_eq!(refused.status(), 400, "{request}");
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(
+            body["error"]["code"], "unsupported_tool",
+            "{request} {body}"
+        );
+    }
+
+    // Settings Anthropic's search cannot honour, and a required call with no
+    // tool left to make it, are refused before any upstream call.
+    for (request, code) in [
+        (
+            json!({"model": "m", "input": "hi", "stream": false,
+                   "tools": [{"type": "web_search", "filters": {
+                       "allowed_domains": ["a.example"], "blocked_domains": ["b.a.example"]}}]}),
+            "unsupported_web_search",
+        ),
+        (
+            json!({"model": "m", "input": "hi", "stream": false, "tool_choice": "required",
+                   "tools": [{"type": "web_search", "external_web_access": false}]}),
+            "required_tool_unavailable",
+        ),
+    ] {
+        let refused = client.post(&url).json(&request).send().await.unwrap();
+        assert_eq!(refused.status(), 400);
+        let body: Value = refused.json().await.unwrap();
+        assert_eq!(body["error"]["code"], code, "{body}");
+    }
+
+    let ok = client
+        .post(&url)
+        .json(
+            &json!({"model": "m", "input": "What changed in Rust 1.88?", "stream": false,
+                      "tools": [{"type": "web_search",
+                                 "filters": {"allowed_domains": ["blog.rust-lang.org"]}}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let forwarded = rx.await.expect("upstream saw the request");
+    let body = forwarded.split("\r\n\r\n").nth(1).expect("request body");
+    let sent: Value = serde_json::from_str(body).expect("json body");
+    assert_eq!(
+        sent["tools"],
+        json!([{"type": "web_search_20250305", "name": "web_search",
+                "allowed_domains": ["blog.rust-lang.org"]}])
+    );
+    let _ = std::fs::remove_file(config);
+}
+
+/// A request refused for a hosted tool the route cannot run is announced to
+/// metrics like any other; it must also be closed out there, or `rayline top`
+/// shows it as active forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refused_hosted_tool_request_is_not_left_active_in_metrics() {
+    let config = write_config(
+        "hosted-tools-metrics",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": "http://127.0.0.1:9", "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        metrics: Some(metrics.clone()),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let refused = client
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({"model": "m", "input": "hi", "stream": false,
+                      "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 400);
+    let totals = metrics.snapshot().totals;
+    assert_eq!(totals.active_requests, 0);
+    assert_eq!(totals.errored_requests, 1);
+    let _ = std::fs::remove_file(config);
+}
+
+/// Codex declares `{type: "web_search", external_web_access: false}` on every
+/// turn and sets it to true only for live search. The default must keep
+/// working through a Responses → Anthropic route: the offline declaration is
+/// omitted, never translated into a server tool the upstream would refuse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_codex_default_web_search_is_omitted_not_translated() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_json(&json!({
+            "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "20.50"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1}
+        })),
+        tx,
+    ));
+    let config = write_config(
+        "codex-default-web-search",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({"model": "m", "input": "total?", "stream": false,
+        "tools": [
+            {"type": "function", "name": "shell",
+             "parameters": {"type": "object", "properties": {}}},
+            {"type": "web_search", "external_web_access": false}
+        ]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let forwarded = rx.await.expect("upstream saw the request");
+    let body = forwarded.split("\r\n\r\n").nth(1).expect("request body");
+    let sent: Value = serde_json::from_str(body).expect("json body");
+    let tools = sent["tools"].as_array().expect("tools");
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    assert_eq!(tools[0]["name"], "shell");
+    let _ = std::fs::remove_file(config);
+}
+
 /// `rayline claude-desktop`: with an inbound guard the router refuses every
 /// request that lacks the per-instance token, names a non-loopback Host
 /// (DNS rebinding) or Origin, or sends a non-JSON body — before anything is
