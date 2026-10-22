@@ -33,6 +33,17 @@ const ROUTING_MODE_OVERRIDE: &str = "override";
 pub(crate) const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const CLAUDE_DISABLE_AGENT_VIEW_ENV: &str = "CLAUDE_CODE_DISABLE_AGENT_VIEW";
+/// Claude Code's own refusal recovery, switched off for a session whose main
+/// conversation the router serves: refusals are the router's to handle. The
+/// fallback resends a refused turn to another Claude model (it fires for models
+/// with the `refusal_fallback` capability, e.g. a Claude id, not for a router
+/// alias); the retry (2.1.282+, on by default) resends it once to the same
+/// model with a nudge that stays in the history, so every refused turn hits the
+/// router twice.
+const CLAUDE_REFUSAL_RECOVERY_OFF_ENV: [&str; 2] = [
+    "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK",
+    "CLAUDE_CODE_DISABLE_REFUSAL_RETRY",
+];
 pub(crate) const RAYLINE_ENV_NAME_ENV: &str = "RAYLINE_ENV_NAME";
 const DIAG_PROBE_TIMEOUT_SECONDS: u64 = 8;
 const LEGACY_STATUSLINE_MARKERS: [&str; 2] = ["wksp-route-statusline", "rl-route-statusline"];
@@ -868,10 +879,12 @@ async fn run_command_from_home(
         None
     };
     let mut inspect_dir = claude_config_dir(home, isolated);
+    let refusal_recovery = refusal_recovery_values(request.routing_mode, |key| env::var_os(key));
     let mut daemon_request = RequestSpec {
         env_name: &env_name,
         routing_mode: request.routing_mode,
         auto_compact_window: auto_compact_window.as_deref(),
+        refusal_recovery: &refusal_recovery,
         args: &request.args,
         requested_local_port,
         requested_proxy_port,
@@ -1008,6 +1021,7 @@ async fn run_command_from_home(
             configure_route_statusline(home, isolated, request.route_statusline_enabled);
         }
     }
+    apply_refusal_recovery_env(&mut command, &refusal_recovery);
     if request.diagnose {
         diag_print_postamble_for_mode(request.routing_mode, &router_url, isolated, home).await;
     }
@@ -1310,6 +1324,45 @@ fn should_set_model_env(
     routing_mode != RoutingMode::ProxySubagents
         || request_model_explicit
         || inherited_anthropic_model
+}
+
+/// The effective value of each refusal-recovery switch for this launch: what
+/// the child must run with, and what a reused Claude Code daemon must already
+/// hold, since its background workers inherit the daemon's env.
+///
+/// When the router serves the main conversation, a switch is the user's
+/// non-empty value or `1`. Under `--route subagents` the main conversation goes
+/// straight to Anthropic, so a switch is only the user's non-empty value (None:
+/// Claude Code's default). An empty value is unset, as for the compact window:
+/// Claude Code reads it as "not disabled".
+pub(crate) fn refusal_recovery_values(
+    routing_mode: RoutingMode,
+    inherited: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, Option<String>)> {
+    CLAUDE_REFUSAL_RECOVERY_OFF_ENV
+        .into_iter()
+        .map(|key| {
+            let user = inherited(key)
+                .filter(|value| !value.is_empty())
+                .map(|value| value.to_string_lossy().into_owned());
+            let value = if routing_mode == RoutingMode::ProxySubagents {
+                user
+            } else {
+                user.or_else(|| Some("1".to_owned()))
+            };
+            (key, value)
+        })
+        .collect()
+}
+
+/// Sets the refusal-recovery switches on the child, in every mode: a value
+/// with a `Some` goes on the child, a `None` leaves the inherited env alone.
+fn apply_refusal_recovery_env(command: &mut Command, values: &[(&'static str, Option<String>)]) {
+    for (key, value) in values {
+        if let Some(value) = value {
+            command.env(key, value);
+        }
+    }
 }
 
 fn configure_proxy_auth_env(command: &mut Command, routing_mode: RoutingMode) {
@@ -2634,6 +2687,190 @@ fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
         return home.map_or(path.clone(), |home| home.join(rest));
     }
     path
+}
+
+#[cfg(test)]
+mod refusal_recovery_env_tests {
+    use super::*;
+
+    const FALLBACK: &str = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK";
+    const RETRY: &str = "CLAUDE_CODE_DISABLE_REFUSAL_RETRY";
+
+    fn values(
+        mode: RoutingMode,
+        fallback: Option<&str>,
+        retry: Option<&str>,
+    ) -> Vec<(&'static str, Option<String>)> {
+        refusal_recovery_values(mode, |key| {
+            match key {
+                FALLBACK => fallback,
+                RETRY => retry,
+                _ => None,
+            }
+            .map(OsString::from)
+        })
+    }
+
+    fn child_env(values: &[(&'static str, Option<String>)]) -> Vec<(String, Option<String>)> {
+        let mut command = Command::new("claude");
+        apply_refusal_recovery_env(&mut command, values);
+        command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn routed_main_conversation_turns_each_switch_off_unless_the_user_set_it() {
+        // Each switch on its own: unset and empty become "1"; a non-empty value is kept.
+        for mode in [RoutingMode::Override, RoutingMode::Proxy] {
+            for (inherited, expected) in [
+                (None, "1"),
+                (Some(""), "1"),
+                (Some("0"), "0"),
+                (Some("1"), "1"),
+            ] {
+                assert_eq!(
+                    values(mode, inherited, None),
+                    vec![
+                        (FALLBACK, Some(expected.to_owned())),
+                        (RETRY, Some("1".to_owned()))
+                    ]
+                );
+                assert_eq!(
+                    values(mode, None, inherited),
+                    vec![
+                        (FALLBACK, Some("1".to_owned())),
+                        (RETRY, Some(expected.to_owned()))
+                    ]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_only_routing_leaves_claude_code_defaults() {
+        // Including implicit local routing, which resolves to subagents-only.
+        let mode = effective_routing_mode(RoutingMode::Proxy, true, false);
+        assert_eq!(mode, RoutingMode::ProxySubagents);
+        assert_eq!(
+            values(mode, None, Some("")),
+            vec![(FALLBACK, None), (RETRY, None)]
+        );
+        assert_eq!(
+            values(mode, Some("0"), None),
+            vec![(FALLBACK, Some("0".to_owned())), (RETRY, None)]
+        );
+    }
+
+    /// The real launcher, `--via env` against the hosted prod router: with a
+    /// stored key and an explicit compact window it needs no network and starts
+    /// no process, so the child command it builds can be read directly. Each
+    /// switch is driven independently through the inherited env.
+    #[tokio::test]
+    async fn the_launcher_sets_the_switches_on_the_child_it_builds() {
+        static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = ENV_LOCK.lock().await;
+        let home =
+            std::env::temp_dir().join(format!("rayline-cli-refusal-launch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let credentials = home
+            .join(".config")
+            .join(crate::CONFIG_DIR)
+            .join("credentials.json");
+        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        std::fs::write(
+            &credentials,
+            r#"{"router_keys":{"prod":{"apiKey":"rlk-test"}}}"#,
+        )
+        .unwrap();
+        let request = RunRequest {
+            env_name: Some("prod".to_owned()),
+            auth_token: None,
+            args: Vec::new(),
+            model: None,
+            local_provider: None,
+            local_provider_model: None,
+            auto_compact_window: Some(180_000),
+            local_router: false,
+            isolated: false,
+            local_injector_port: None,
+            routing_mode: RoutingMode::Override,
+            route_scope_explicit: true,
+            route_statusline_enabled: false,
+            diagnose: false,
+            upstream_ca_path: None,
+            router_config_path: None,
+            config_path: None,
+            root_env_explicit: true,
+        };
+        let saved: Vec<_> = [FALLBACK, RETRY, CLAUDE_CONFIG_DIR_ENV]
+            .map(|key| (key, std::env::var_os(key)))
+            .into();
+        // A private Claude config dir, so no real daemon on this machine is inspected.
+        // SAFETY: serialized by ENV_LOCK; restored below.
+        unsafe { std::env::set_var(CLAUDE_CONFIG_DIR_ENV, home.join(".claude")) };
+        let mut seen = Vec::new();
+        for (fallback, retry) in [(None, Some("")), (Some("0"), None)] {
+            for (key, value) in [(FALLBACK, fallback), (RETRY, retry)] {
+                // SAFETY: serialized by ENV_LOCK; restored below.
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+            let command =
+                run_command_from_home(&request, &home, PathBuf::from("/nonexistent/claude"))
+                    .await
+                    .expect("env-mode launch builds its command");
+            let env: std::collections::BTreeMap<String, Option<String>> = command
+                .get_envs()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.map(|value| value.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            seen.push((
+                env.get(FALLBACK).cloned().flatten(),
+                env.get(RETRY).cloned().flatten(),
+            ));
+        }
+        for (key, value) in saved {
+            // SAFETY: serialized by ENV_LOCK.
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+        assert_eq!(
+            seen,
+            vec![
+                (Some("1".to_owned()), Some("1".to_owned())),
+                (Some("0".to_owned()), Some("1".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_child_command_carries_the_effective_values() {
+        assert_eq!(
+            child_env(&values(RoutingMode::Proxy, Some(""), Some("0"))),
+            vec![
+                (FALLBACK.to_owned(), Some("1".to_owned())),
+                (RETRY.to_owned(), Some("0".to_owned()))
+            ]
+        );
+        // Subagents-only: nothing is set on the child.
+        assert!(child_env(&values(RoutingMode::ProxySubagents, None, None)).is_empty());
+    }
 }
 
 #[cfg(test)]

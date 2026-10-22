@@ -20,6 +20,10 @@ pub struct RequestSpec<'a> {
     pub env_name: &'a str,
     pub routing_mode: RoutingMode,
     pub auto_compact_window: Option<&'a str>,
+    /// The effective refusal-recovery switches (`refusal_recovery_values`). A
+    /// reused daemon's background workers inherit its env, so a daemon that
+    /// holds other values is not this launch's.
+    pub refusal_recovery: &'a [(&'static str, Option<String>)],
     pub args: &'a [OsString],
     pub requested_local_port: Option<u16>,
     pub requested_proxy_port: Option<u16>,
@@ -345,10 +349,32 @@ fn daemon_owner_matches_request(state: &DaemonState, request: &RequestSpec<'_>) 
     {
         return false;
     }
+    for (key, value) in request.refusal_recovery {
+        let held = state.env_vars.get(*key).filter(|held| !held.is_empty());
+        if held.map(String::as_str) != value.as_deref() {
+            return false;
+        }
+    }
     if !is_proxy_routing_mode(request.routing_mode) {
         return true;
     }
     daemon_proxy_port(&state.env_vars) == request.requested_proxy_port
+}
+
+/// The refusal-recovery switches a launch record names, as `{key: value|null}`.
+/// A record without them (written before they existed) matches no launch.
+fn launch_refusal_recovery_matches(entry: &Value, request: &RequestSpec<'_>) -> bool {
+    let Some(recorded) = entry.get("refusal_recovery").and_then(Value::as_object) else {
+        return false;
+    };
+    request
+        .refusal_recovery
+        .iter()
+        .all(|(key, value)| match recorded.get(*key) {
+            Some(Value::Null) => value.is_none(),
+            Some(Value::String(held)) => value.as_deref() == Some(held.as_str()),
+            _ => false,
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -508,6 +534,9 @@ fn daemon_was_launched_by_wksp(
         if entry.get("auto_compact_window").and_then(Value::as_str) != request.auto_compact_window {
             continue;
         }
+        if !launch_refusal_recovery_matches(&entry, request) {
+            continue;
+        }
         if is_proxy_routing_mode(request.routing_mode)
             && entry.get("proxy_port").and_then(Value::as_u64)
                 != request.requested_proxy_port.map(u64::from)
@@ -619,6 +648,24 @@ fn read_rayline_claude_launches(home: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// One launch record: what `daemon_was_launched_by_wksp` matches a daemon on.
+fn launch_entry(request: &RequestSpec<'_>, pid: u32, ts: i64) -> Value {
+    serde_json::json!({
+        "pid": pid,
+        "env": request.env_name,
+        "routing_mode": routing_mode_name(request.routing_mode),
+        "auto_compact_window": request.auto_compact_window,
+        "refusal_recovery": request
+            .refusal_recovery
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), serde_json::json!(value)))
+            .collect::<serde_json::Map<_, _>>(),
+        "proxy_port": request.requested_proxy_port,
+        "local_injector_port": request.requested_local_port,
+        "ts": ts,
+    })
+}
+
 pub fn record_rayline_claude_launch(record: LaunchRecord<'_>) {
     let now = unix_now_secs();
     let mut pruned = Vec::new();
@@ -637,15 +684,7 @@ pub fn record_rayline_claude_launch(record: LaunchRecord<'_>) {
             pruned.push(entry);
         }
     }
-    pruned.push(serde_json::json!({
-        "pid": record.pid,
-        "env": record.request.env_name,
-        "routing_mode": routing_mode_name(record.request.routing_mode),
-        "auto_compact_window": record.request.auto_compact_window,
-        "proxy_port": record.request.requested_proxy_port,
-        "local_injector_port": record.request.requested_local_port,
-        "ts": now,
-    }));
+    pruned.push(launch_entry(record.request, record.pid, now));
     let path = rayline_claude_launches_path(record.home);
     let Some(parent) = path.parent() else {
         return;
@@ -684,6 +723,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_HOME_ID: AtomicU64 = AtomicU64::new(0);
+    const FALLBACK: &str = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK";
+    const RETRY: &str = "CLAUDE_CODE_DISABLE_REFUSAL_RETRY";
 
     fn temp_home() -> PathBuf {
         let id = NEXT_HOME_ID.fetch_add(1, Ordering::Relaxed);
@@ -701,6 +742,10 @@ mod tests {
             env_name: "prod",
             routing_mode: RoutingMode::Proxy,
             auto_compact_window: Some("180000"),
+            refusal_recovery: Box::leak(
+                crate::claude::refusal_recovery_values(RoutingMode::Proxy, |_| None)
+                    .into_boxed_slice(),
+            ),
             args: &[],
             requested_local_port: None,
             requested_proxy_port: Some(20810),
@@ -735,6 +780,8 @@ mod tests {
             routing_mode_name(RoutingMode::Proxy).to_owned(),
         );
         env.insert(AUTO_COMPACT_WINDOW_ENV.to_owned(), "180000".to_owned());
+        env.insert(FALLBACK.to_owned(), "1".to_owned());
+        env.insert(RETRY.to_owned(), "1".to_owned());
         env.insert("HTTPS_PROXY".to_owned(), format!("http://127.0.0.1:{port}"));
         env.insert(
             "RAYLINE_ROUTER_URL".to_owned(),
@@ -748,16 +795,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(
             path,
-            serde_json::json!([{
-                "pid": pid,
-                "env": request.env_name,
-                "routing_mode": routing_mode_name(request.routing_mode),
-                "auto_compact_window": request.auto_compact_window,
-                "proxy_port": request.requested_proxy_port,
-                "local_injector_port": request.requested_local_port,
-                "ts": ts,
-            }])
-            .to_string(),
+            Value::Array(vec![launch_entry(request, pid, ts)]).to_string(),
         )
         .unwrap();
     }
@@ -896,6 +934,73 @@ mod tests {
         assert_eq!(
             classify_launch_safety(&state, &request, &home),
             Safety::Safe
+        );
+    }
+
+    // A reused daemon's background workers inherit its env, so its refusal
+    // switches must be this launch's: a daemon from before the switches, or
+    // one holding another value, is not reused.
+    #[test]
+    fn daemon_without_the_refusal_switches_conflicts() {
+        let home = temp_home();
+        let mut env = rayline_proxy_env(20810);
+        env.remove(RETRY);
+        assert_eq!(
+            classify_launch_safety(&state(env), &proxy_request(), &home),
+            Safety::Conflict
+        );
+    }
+
+    #[test]
+    fn daemon_holding_a_changed_user_override_conflicts() {
+        let home = temp_home();
+        let mut request = proxy_request();
+        let wanted = crate::claude::refusal_recovery_values(RoutingMode::Proxy, |key| {
+            (key == FALLBACK).then(|| OsString::from("0"))
+        });
+        request.refusal_recovery = &wanted;
+        assert_eq!(
+            classify_launch_safety(&state(rayline_proxy_env(20810)), &request, &home),
+            Safety::Conflict
+        );
+        // Positive control: the same daemon holding the override is reused.
+        let mut env = rayline_proxy_env(20810);
+        env.insert(FALLBACK.to_owned(), "0".to_owned());
+        assert_eq!(
+            classify_launch_safety(&state(env), &request, &home),
+            Safety::Safe
+        );
+    }
+
+    #[test]
+    fn launch_record_without_the_refusal_switches_does_not_attribute() {
+        let home = temp_home();
+        let request = proxy_request();
+        let state = unreadable_state(Some(9004), Some(1_700_000_030_000));
+        let mut entry = launch_entry(&request, 9004, 1_700_000_030);
+        entry.as_object_mut().unwrap().remove("refusal_recovery");
+        let path = rayline_claude_launches_path(&home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, Value::Array(vec![entry]).to_string()).unwrap();
+        assert_eq!(
+            classify_launch_safety(&state, &request, &home),
+            Safety::Conflict
+        );
+    }
+
+    #[test]
+    fn launch_record_with_other_refusal_switches_does_not_attribute() {
+        let home = temp_home();
+        let mut recorded = proxy_request();
+        let other = crate::claude::refusal_recovery_values(RoutingMode::Proxy, |key| {
+            (key == RETRY).then(|| OsString::from("0"))
+        });
+        recorded.refusal_recovery = &other;
+        let state = unreadable_state(Some(9005), Some(1_700_000_040_000));
+        write_launch_log(&home, &recorded, 9005, 1_700_000_040);
+        assert_eq!(
+            classify_launch_safety(&state, &proxy_request(), &home),
+            Safety::Conflict
         );
     }
 }
