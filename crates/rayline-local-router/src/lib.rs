@@ -4465,16 +4465,36 @@ fn responses_tools_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Ve
                 (false, true) => namespace_description.to_owned(),
                 (false, false) => format!("{namespace_description}\n\n{own}"),
             };
-            Some(json!({
-                "name": rewrites.upstream(Some(namespace), name),
-                "description": description,
-                "input_schema": member
-                    .get("parameters")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-            }))
+            Some(anthropic_function_tool(
+                rewrites.upstream(Some(namespace), name),
+                description,
+                member,
+            ))
         })
         .collect()
+}
+
+/// A client function as an Anthropic tool. A missing or `null` parameter
+/// schema becomes an empty object schema (Anthropic requires an object), and
+/// an explicit `strict: true` is kept so arguments are still validated.
+fn anthropic_function_tool(upstream_name: String, description: String, function: &Value) -> Value {
+    let field = |key: &str| {
+        function
+            .get(key)
+            .or_else(|| function.get("function").and_then(|inner| inner.get(key)))
+            .filter(|value| !value.is_null())
+    };
+    let mut tool = json!({
+        "name": upstream_name,
+        "description": description,
+        "input_schema": field("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+    });
+    if field("strict").and_then(Value::as_bool) == Some(true) {
+        tool["strict"] = json!(true);
+    }
+    tool
 }
 
 fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Option<Value> {
@@ -4500,16 +4520,11 @@ fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Opt
         .or_else(|| tool.pointer("/function/description"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let input_schema = tool
-        .get("parameters")
-        .or_else(|| tool.pointer("/function/parameters"))
-        .cloned()
-        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-    Some(json!({
-        "name": rewrites.upstream(None, name),
-        "description": description,
-        "input_schema": input_schema
-    }))
+    Some(anthropic_function_tool(
+        rewrites.upstream(None, name),
+        description.to_owned(),
+        tool,
+    ))
 }
 
 fn function_output_to_text(value: &Value) -> String {
@@ -7280,6 +7295,34 @@ mod tests {
                 .collect();
             assert_eq!(restored, expected, "{tools}");
         }
+    }
+
+    /// Anthropic requires an object `input_schema`, so a `null` parameter
+    /// schema must not pass through, and an explicit `strict: true` must keep
+    /// validating arguments, inside a namespace and outside one.
+    #[test]
+    fn function_tools_keep_a_schema_and_strict_mode() {
+        let strict_schema = json!({"type": "object", "properties": {"n": {"type": "integer"}},
+                                   "required": ["n"], "additionalProperties": false});
+        let (converted, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [
+                {"type": "namespace", "name": "agent", "tools": [
+                    {"type": "function", "name": "ping", "parameters": null},
+                    {"type": "function", "name": "count", "strict": true,
+                     "parameters": strict_schema}
+                ]},
+                {"type": "function", "name": "shell", "strict": false, "parameters": null}
+            ]}),
+            "m",
+        );
+        let empty = json!({"type": "object", "properties": {}});
+        let tools = converted["tools"].as_array().expect("tools");
+        assert_eq!(tools[0]["input_schema"], empty);
+        assert!(tools[0].get("strict").is_none());
+        assert_eq!(tools[1]["input_schema"], strict_schema);
+        assert_eq!(tools[1]["strict"], true);
+        assert_eq!(tools[2]["input_schema"], empty);
+        assert!(tools[2].get("strict").is_none());
     }
 
     /// A 64-character namespace plus a 64-character function made a 130
