@@ -689,14 +689,17 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
             {
                 return None;
             }
-            Some(json!({
-                "name": rewrites.upstream(None, name),
-                "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
-                "input_schema": function
-                    .get("parameters")
-                    .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-            }))
+            // Shared with the Responses translation: a missing or `null`
+            // schema becomes the empty object schema Anthropic requires.
+            Some(anthropic_function_tool(
+                rewrites.upstream(None, name),
+                function
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                function,
+            ))
         })
         .collect();
     if !tools.is_empty() {
@@ -1423,6 +1426,20 @@ mod tests {
         assert_eq!(messages[2]["content"][0]["tool_use_id"], "call_1");
         assert_eq!(messages[2]["content"][1]["text"], "And now?");
         assert_eq!(messages.len(), 3);
+    }
+
+    #[test]
+    fn missing_or_null_parameters_become_an_empty_object_schema() {
+        let (out, _) = chat_to_anthropic_request(
+            &json!({"messages": [], "tools": [
+                {"type": "function", "function": {"name": "ping", "parameters": null}},
+                {"type": "function", "function": {"name": "pong"}}
+            ]}),
+            "m",
+        );
+        let empty = json!({"type": "object", "properties": {}});
+        assert_eq!(out["tools"][0]["input_schema"], empty);
+        assert_eq!(out["tools"][1]["input_schema"], empty);
     }
 
     #[test]
