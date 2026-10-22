@@ -1394,7 +1394,7 @@ fn enable_local_router_from_router_settings(result: &Value) -> bool {
 }
 
 /// The hosted router's auto-compact window for the launch model:
-/// `GET /v1/settings?model=<model>` returns the window of the model serving a
+/// `GET /v1/settings?model=<model>&client_sizes=1` returns the window of the model serving a
 /// launch id Claude Code doesn't know, and a null or absent `autoCompactWindow`
 /// for one Claude Code sizes itself, which is `None` here. A failed request or a
 /// window that isn't a positive integer fails the launch rather than guessing.
@@ -1467,7 +1467,10 @@ async fn get_router_settings(
         .get(format!("{router_base}/v1/settings"))
         .bearer_auth(bearer_token);
     if let Some(model) = model {
-        request = request.query(&[("model", model)]);
+        // `client_sizes=1` tells the router this client accepts a null window
+        // (Claude Code sizes the model itself). Without it the router keeps
+        // answering a number, because 0.2.10 fails the launch on null.
+        request = request.query(&[("model", model), ("client_sizes", "1")]);
     }
     let response = request.send().await.map_err(|error| error.to_string())?;
     let status = response.status();
@@ -2667,7 +2670,8 @@ mod router_auto_compact_window_tests {
             window("200 OK", r#"{"settings":{},"autoCompactWindow":262144}"#).await;
         assert_eq!(window, Ok(Some("262144".to_owned())));
         assert!(
-            request_line.starts_with("GET /v1/settings?model=rayline-router%5B1m%5D "),
+            request_line
+                .starts_with("GET /v1/settings?model=rayline-router%5B1m%5D&client_sizes=1 "),
             "{request_line}"
         );
     }
