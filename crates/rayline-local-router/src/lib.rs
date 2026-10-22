@@ -5,7 +5,7 @@
 //! OSS-shaped milestone local/client-side only: static rules, configured
 //! provider endpoints, and local-model redirects.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -3716,6 +3716,16 @@ fn openai_image_url_to_anthropic(url: &str) -> Value {
 /// "Provider returned error". Rewrite offending names on the way upstream and
 /// restore the client's original name on the way back, so the client can still
 /// match the tool call to the tool it declared.
+/// The names of tool declarations in either the Responses (`name`) or the
+/// Chat (`function.name`) shape.
+fn tool_declaration_names(tools: &[Value]) -> impl Iterator<Item = &str> {
+    tools.iter().filter_map(|tool| {
+        tool.get("name")
+            .or_else(|| tool.pointer("/function/name"))
+            .and_then(Value::as_str)
+    })
+}
+
 #[derive(Clone, Debug, Default)]
 struct ToolNameRewrites {
     to_upstream: HashMap<String, String>,
@@ -3724,9 +3734,9 @@ struct ToolNameRewrites {
 
 impl ToolNameRewrites {
     fn from_responses_body(body: &Value) -> Self {
-        let mut rewrites = Self::default();
+        let mut names = Vec::new();
         if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-            rewrites.record_tools(tools);
+            names.extend(tool_declaration_names(tools));
         }
         for item in body
             .get("input")
@@ -3737,7 +3747,7 @@ impl ToolNameRewrites {
             match item.get("type").and_then(Value::as_str) {
                 Some("additional_tools") => {
                     if let Some(tools) = item.get("tools").and_then(Value::as_array) {
-                        rewrites.record_tools(tools);
+                        names.extend(tool_declaration_names(tools));
                     }
                 }
                 // Replayed calls from earlier turns must use the same upstream
@@ -3745,40 +3755,45 @@ impl ToolNameRewrites {
                 // in `tools`.
                 Some("function_call") | Some("custom_tool_call") => {
                     if let Some(name) = item.get("name").and_then(Value::as_str) {
-                        rewrites.record(name);
+                        names.push(name);
                     }
                 }
                 _ => {}
             }
         }
-        rewrites
+        Self::from_names(names)
     }
 
-    fn record_tools(&mut self, tools: &[Value]) {
-        for tool in tools {
-            if let Some(name) = tool
-                .get("name")
-                .or_else(|| tool.pointer("/function/name"))
-                .and_then(Value::as_str)
-            {
-                self.record(name);
+    /// Rewrites for every tool name the request uses. Names that are already
+    /// provider-safe pass through unchanged, so they are reserved first and a
+    /// rewritten name never collides with one of them.
+    fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+        let names: Vec<&str> = names.into_iter().collect();
+        let reserved: HashSet<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| is_provider_safe_tool_name(name))
+            .collect();
+        let mut rewrites = Self::default();
+        for name in names {
+            if reserved.contains(name) || rewrites.to_upstream.contains_key(name) {
+                continue;
             }
+            let base = sanitize_tool_name(name);
+            let mut candidate = base.clone();
+            let mut suffix = 2;
+            while rewrites.to_client.contains_key(&candidate)
+                || reserved.contains(candidate.as_str())
+            {
+                candidate = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            rewrites
+                .to_client
+                .insert(candidate.clone(), name.to_owned());
+            rewrites.to_upstream.insert(name.to_owned(), candidate);
         }
-    }
-
-    fn record(&mut self, name: &str) {
-        if is_provider_safe_tool_name(name) || self.to_upstream.contains_key(name) {
-            return;
-        }
-        let base = sanitize_tool_name(name);
-        let mut candidate = base.clone();
-        let mut suffix = 2;
-        while self.to_client.contains_key(&candidate) {
-            candidate = format!("{base}_{suffix}");
-            suffix += 1;
-        }
-        self.to_client.insert(candidate.clone(), name.to_owned());
-        self.to_upstream.insert(name.to_owned(), candidate);
+        rewrites
     }
 
     fn upstream<'a>(&'a self, name: &'a str) -> &'a str {

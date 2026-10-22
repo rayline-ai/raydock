@@ -311,23 +311,22 @@ fn push_blocks(messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
 /// The Chat Completions request as an Anthropic Messages request for `model`,
 /// plus the tool-name rewrites to undo on the way back.
 pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolNameRewrites) {
-    let mut rewrites = ToolNameRewrites::default();
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        rewrites.record_tools(tools);
-    }
+    let declared = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     // Replayed calls from earlier turns need the same upstream name even when
     // their tool is no longer declared.
-    for name in body
+    let replayed = body
         .get("messages")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
         .flatten()
-        .filter_map(|call| call.pointer("/function/name").and_then(Value::as_str))
-    {
-        rewrites.record(name);
-    }
+        .filter_map(|call| call.pointer("/function/name").and_then(Value::as_str));
+    let rewrites = ToolNameRewrites::from_names(tool_declaration_names(declared).chain(replayed));
     let mut system = Vec::new();
     let mut messages = Vec::new();
     for message in body
@@ -399,10 +398,13 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
     out.insert("messages".to_owned(), Value::Array(messages));
     out.insert(
         "max_tokens".to_owned(),
-        body.get("max_completion_tokens")
-            .or_else(|| body.get("max_tokens"))
-            .cloned()
-            .unwrap_or_else(|| json!(4096)),
+        // Both limits may be `null` (no limit); Anthropic requires a number.
+        json!(
+            ["max_completion_tokens", "max_tokens"]
+                .into_iter()
+                .find_map(|key| body.get(key).and_then(Value::as_u64))
+                .unwrap_or(4096)
+        ),
     );
     out.insert(
         "stream".to_owned(),
@@ -1137,6 +1139,37 @@ mod tests {
         assert_eq!(adapted["messages"][1]["content"][0]["name"], upstream);
         let (kept, _) = chat_to_anthropic_request(&body, "claude-haiku-4-5");
         assert_eq!(kept["temperature"], 0.2);
+    }
+
+    #[test]
+    fn chat_request_null_limits_and_tool_name_collisions() {
+        let (out, _) = chat_to_anthropic_request(
+            &json!({"messages": [], "max_completion_tokens": null, "max_tokens": 64}),
+            "m",
+        );
+        assert_eq!(out["max_tokens"], 64);
+        let (out, _) = chat_to_anthropic_request(&json!({"messages": [], "max_tokens": null}), "m");
+        assert_eq!(out["max_tokens"], 4096);
+
+        // `1lookup` is rewritten; its rewrite must not take the already-safe
+        // `tool_1lookup`, whichever is declared first.
+        let tools = json!([
+            {"type": "function", "function": {"name": "1lookup"}},
+            {"type": "function", "function": {"name": "tool_1lookup"}}
+        ]);
+        let (out, rewrites) =
+            chat_to_anthropic_request(&json!({"messages": [], "tools": tools}), "m");
+        let names: Vec<&str> = out["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert_ne!(names[0], names[1], "{names:?}");
+        assert_eq!(names[1], "tool_1lookup");
+        assert_eq!(rewrites.client(names[0]), "1lookup");
+        assert_eq!(rewrites.client("tool_1lookup"), "tool_1lookup");
     }
 
     #[test]
