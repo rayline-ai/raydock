@@ -1394,6 +1394,22 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
             );
             return Ok(unsupported_hosted_tool_response(&refused, target));
         }
+        if target == HostedToolTarget::AnthropicMessages
+            && responses_conflicting_web_search(&parsed)
+        {
+            warn!("local router: refusing Responses request with conflicting web_search tools");
+            return Ok(json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "conflicting_web_search",
+                    "param": "tools",
+                    "message": "Rayline Local translates web_search to a single Anthropic search \
+                                tool, but the request declares web_search more than once with \
+                                different settings. Declare it once, or with identical settings.",
+                }}),
+            ));
+        }
     }
 
     let response = match &decision.target {
@@ -3492,15 +3508,33 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
     }
     // Several `web_search` declarations (top-level and `additional_tools`)
     // are one server tool upstream; a repeated name is rejected there.
-    let mut web_search_declared = false;
-    converted_tools.retain(|tool| {
-        if tool.get("type").and_then(Value::as_str) != Some(ANTHROPIC_WEB_SEARCH_TOOL_TYPE) {
+    // Declarations that differ are refused before translation
+    // (`responses_conflicting_web_search`), so keeping the first loses nothing.
+    let mut seen_web_search = false;
+    let search_limit = body.get("max_tool_calls").and_then(Value::as_u64);
+    converted_tools.retain_mut(|tool| {
+        if !is_anthropic_web_search_tool(tool) {
             return true;
         }
-        !std::mem::replace(&mut web_search_declared, true)
+        // `max_tool_calls` caps the built-in tool calls, and web search is
+        // the only built-in tool that translates.
+        if let Some(limit) = search_limit {
+            tool["max_uses"] = json!(limit);
+        }
+        search_limit != Some(0) && !std::mem::replace(&mut seen_web_search, true)
     });
+    let tool_choice = body.get("tool_choice");
+    if let Some(allowed) = tool_choice.and_then(|choice| responses_allowed_tools(choice, &rewrites))
+    {
+        converted_tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| allowed.contains(name))
+        });
+    }
+    let web_search_declared = converted_tools.iter().any(is_anthropic_web_search_tool);
     if !converted_tools.is_empty() {
-        if let Some(choice) = body.get("tool_choice").and_then(|choice| {
+        if let Some(choice) = tool_choice.and_then(|choice| {
             responses_tool_choice_to_anthropic(choice, &rewrites, web_search_declared)
         }) {
             out.insert("tool_choice".to_owned(), choice);
@@ -3510,12 +3544,43 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
     (Value::Object(out), rewrites)
 }
 
+fn is_anthropic_web_search_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some(ANTHROPIC_WEB_SEARCH_TOOL_TYPE)
+}
+
+/// The upstream names an `allowed_tools` choice permits. Anthropic has no
+/// such choice, so the other tools are left out of the request instead.
+fn responses_allowed_tools(choice: &Value, rewrites: &ToolNameRewrites) -> Option<HashSet<String>> {
+    if choice.get("type").and_then(Value::as_str) != Some("allowed_tools") {
+        return None;
+    }
+    let allowed = choice
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let kind = tool.get("type").and_then(Value::as_str)?;
+            if kind.starts_with("web_search") {
+                return Some(ANTHROPIC_WEB_SEARCH_TOOL_NAME.to_owned());
+            }
+            let name = tool
+                .get("name")
+                .or_else(|| tool.pointer("/function/name"))
+                .and_then(Value::as_str)?;
+            Some(rewrites.upstream(name).to_owned())
+        })
+        .collect();
+    Some(allowed)
+}
+
 /// Responses `tool_choice` as Anthropic's. `none` must reach the upstream:
 /// left out, Anthropic defaults to `auto` and may call a tool (or search)
-/// the caller ruled out. A form with no Anthropic equivalent (such as
-/// `allowed_tools`) is left out, which is Anthropic's default, `auto`, and so
-/// is a forced `web_search` when no live search was declared (Codex declares
-/// it without live access by default).
+/// the caller ruled out. `allowed_tools` keeps its mode; its tool subset is
+/// applied to the declared tools ([`responses_allowed_tools`]). A form with
+/// no Anthropic equivalent is left out, which is Anthropic's default, `auto`,
+/// and so is a forced `web_search` when no live search was declared (Codex
+/// declares it without live access by default).
 fn responses_tool_choice_to_anthropic(
     choice: &Value,
     rewrites: &ToolNameRewrites,
@@ -3530,6 +3595,13 @@ fn responses_tool_choice_to_anthropic(
         };
     }
     let kind = choice.get("type").and_then(Value::as_str)?;
+    if kind == "allowed_tools" {
+        return match choice.get("mode").and_then(Value::as_str) {
+            Some("required") => Some(json!({"type": "any"})),
+            Some("auto") => Some(json!({"type": "auto"})),
+            _ => None,
+        };
+    }
     if kind.starts_with("web_search") {
         return web_search_declared
             .then(|| json!({"type": "tool", "name": ANTHROPIC_WEB_SEARCH_TOOL_NAME}));
@@ -3924,7 +3996,14 @@ fn responses_hosted_tool_type(tool: &Value) -> Option<&str> {
                 | "computer_use_preview"
                 | "computer_use"
                 | "mcp"
-        );
+        )
+        // The `shell` tool runs in an OpenAI-hosted container unless its
+        // environment is the client's own machine.
+        || (kind == "shell"
+            && tool
+                .pointer("/environment/type")
+                .and_then(Value::as_str)
+                .is_some_and(|environment| environment.starts_with("container")));
     hosted.then_some(kind)
 }
 
@@ -4040,6 +4119,35 @@ fn responses_declares_live_web_search(body: &Value) -> bool {
         .any(|kind| kind.starts_with("web_search"))
 }
 
+/// Whether the request declares live `web_search` more than once with
+/// different settings. Upstream there is one search tool, and choosing one
+/// declaration could drop a domain filter the caller set on another.
+fn responses_conflicting_web_search(body: &Value) -> bool {
+    let top = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let additional = body
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten();
+    let mut searches = top
+        .chain(additional)
+        .filter(|tool| {
+            responses_hosted_tool_type(tool).is_some_and(|kind| kind.starts_with("web_search"))
+        })
+        .map(responses_web_search_to_anthropic);
+    let Some(first) = searches.next() else {
+        return false;
+    };
+    searches.any(|search| search != first)
+}
+
 /// OpenAI's hosted `web_search` (and its dated / preview spellings) as
 /// Anthropic's server tool. Domain filters and the approximate user location
 /// carry over; options with no Anthropic equivalent are left out.
@@ -4047,11 +4155,14 @@ fn responses_web_search_to_anthropic(tool: &Value) -> Value {
     let mut out = Map::new();
     out.insert("type".to_owned(), json!(ANTHROPIC_WEB_SEARCH_TOOL_TYPE));
     out.insert("name".to_owned(), json!(ANTHROPIC_WEB_SEARCH_TOOL_NAME));
-    if let Some(domains) = tool
-        .pointer("/filters/allowed_domains")
-        .filter(|domains| domains.as_array().is_some_and(|list| !list.is_empty()))
-    {
-        out.insert("allowed_domains".to_owned(), domains.clone());
+    for key in ["allowed_domains", "blocked_domains"] {
+        if let Some(domains) = tool
+            .get("filters")
+            .and_then(|filters| filters.get(key))
+            .filter(|domains| domains.as_array().is_some_and(|list| !list.is_empty()))
+        {
+            out.insert(key.to_owned(), domains.clone());
+        }
     }
     if let Some(location) = tool.get("user_location").and_then(Value::as_object) {
         let mut mapped = Map::new();
@@ -6981,6 +7092,78 @@ mod tests {
             "arc-swift",
         );
         assert!(no_tools.get("tool_choice").is_none(), "{no_tools}");
+    }
+
+    /// Restrictions the caller set on tools must survive translation:
+    /// `allowed_tools` limits what may be called, search domain blocklists and
+    /// `max_tool_calls` limit the search, and differing search declarations
+    /// are refused rather than resolved by dropping one.
+    #[test]
+    fn responses_tool_restrictions_survive_anthropic_translation() {
+        let tools = json!([
+            {"type": "function", "name": "read_record"},
+            {"type": "function", "name": "delete_record"},
+            {"type": "function", "name": "codex.list"},
+            {"type": "web_search"}
+        ]);
+        let (subset, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": tools, "tool_choice": {
+                "type": "allowed_tools", "mode": "required",
+                "tools": [{"type": "function", "name": "read_record"},
+                          {"type": "function", "name": "codex.list"}]}}),
+            "arc-swift",
+        );
+        let names: Vec<&str> = subset["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["read_record", "codex_list"]);
+        assert_eq!(subset["tool_choice"], json!({"type": "any"}));
+
+        let (search, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "max_tool_calls": 2, "tools": [
+                {"type": "web_search", "filters": {"blocked_domains": ["example.com"]}}
+            ]}),
+            "arc-swift",
+        );
+        assert_eq!(
+            search["tools"],
+            json!([{"type": "web_search_20250305", "name": "web_search",
+                    "blocked_domains": ["example.com"], "max_uses": 2}])
+        );
+        let (no_calls, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "max_tool_calls": 0, "tools": [
+                {"type": "function", "name": "shell"}, {"type": "web_search"}
+            ]}),
+            "arc-swift",
+        );
+        assert_eq!(no_calls["tools"].as_array().map(Vec::len), Some(1));
+
+        let filtered = json!({"type": "web_search",
+                              "filters": {"allowed_domains": ["blog.rust-lang.org"]}});
+        let conflicting = json!({
+            "input": [{"type": "additional_tools", "tools": [{"type": "web_search"}]}],
+            "tools": [filtered]
+        });
+        assert!(responses_conflicting_web_search(&conflicting));
+        let repeated = json!({
+            "input": [{"type": "additional_tools", "tools": [filtered]}],
+            "tools": [filtered, {"type": "web_search", "external_web_access": false}]
+        });
+        assert!(!responses_conflicting_web_search(&repeated));
+
+        // A shell in an OpenAI-hosted container is a hosted tool; the
+        // client-run shell is not.
+        let shells = json!({"tools": [
+            {"type": "shell", "environment": {"type": "container_auto"}},
+            {"type": "shell", "environment": {"type": "local"}}
+        ]});
+        assert_eq!(
+            responses_untranslatable_hosted_tools(&shells, HostedToolTarget::AnthropicMessages),
+            vec!["shell".to_owned()]
+        );
     }
 
     #[test]
