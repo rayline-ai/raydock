@@ -4,9 +4,10 @@
 //! with `GET /v1/models` and then speak Chat Completions. The router routes the
 //! request like every other listener and:
 //!
-//! - passes it through to an endpoint that speaks an OpenAI protocol
-//!   (`openai_chat`, `openai_responses`), with the routed model and the
-//!   endpoint's auth;
+//! - passes it through to an `openai_chat` endpoint, with the routed model and
+//!   the endpoint's auth (the caller's own auth for `client_bearer`);
+//! - refuses a route to an `openai_responses` endpoint, which has no Chat
+//!   Completions surface;
 //! - translates it to Anthropic Messages for an `anthropic_messages` endpoint
 //!   or the on-device adapter, and translates the answer (JSON or SSE) back to
 //!   Chat Completions, including tool calls.
@@ -731,7 +732,8 @@ impl AnthropicToChatTranslator {
             _ => self.pending.len(),
         };
         let rest = self.pending.split_off(complete);
-        self.buffer.push_str(&String::from_utf8_lossy(&self.pending));
+        self.buffer
+            .push_str(&String::from_utf8_lossy(&self.pending));
         self.pending = rest;
         let mut out = String::new();
         while !self.finished
