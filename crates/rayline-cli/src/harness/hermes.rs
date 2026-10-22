@@ -78,14 +78,17 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
         "fallback_providers": []
     });
     let path = ctx.config_dir.join(CONFIG_FILE);
-    let contents = match fs::read_to_string(&path) {
-        Ok(existing) => yaml_merge::merge(&existing, &config, OWNED).map_err(|error| {
-            format!(
-                "cannot update {} ({error}); fix or remove the file",
-                path.display()
-            )
-        })?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => to_yaml(&config),
+    let (contents, merged_from) = match fs::read_to_string(&path) {
+        Ok(existing) => {
+            let merged = yaml_merge::merge(&existing, &config, OWNED).map_err(|error| {
+                format!(
+                    "cannot update {} ({error}); fix or remove the file",
+                    path.display()
+                )
+            })?;
+            (merged, Some(existing))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (to_yaml(&config), None),
         Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
     };
     Ok(Plan {
@@ -93,6 +96,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
             name: CONFIG_FILE,
             contents,
             overwrite: true,
+            merged_from,
         }],
         env_set: vec![("HERMES_HOME", ctx.config_dir.as_os_str().to_owned())],
         env_remove: Vec::new(),
@@ -140,6 +144,35 @@ mod tests {
     }
 
     /// Launch Hermes twice over a config Hermes and the user already wrote.
+    #[test]
+    fn an_edit_between_merge_and_write_is_kept() {
+        use super::super::tests::{TEST_URL, temp_dir};
+        use super::super::{ConversationIdFallback, RenderContext, write_files};
+        let dir = temp_dir("hermes-race");
+        let path = dir.join(CONFIG_FILE);
+        std::fs::write(&path, "agent:\n  max_turns: 40\n").unwrap();
+        let ctx = RenderContext {
+            env_name: "dev",
+            key: super::super::tests::TEST_KEY,
+            router_url: TEST_URL,
+            config_dir: &dir,
+            conversation_id: ConversationIdFallback::new("dev", None),
+            allow_empty_signature: false,
+        };
+        let plan = super::plan(&ctx).unwrap();
+        // Hermes saves a setting after Rayline read the file.
+        std::fs::write(&path, "agent:\n  max_turns: 60\n").unwrap();
+        let error = write_files(&dir, &plan.files).unwrap_err();
+        assert!(
+            error.to_string().contains("run the command again"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "agent:\n  max_turns: 60\n"
+        );
+    }
+
     #[test]
     fn relaunch_keeps_user_settings_and_is_idempotent() {
         use super::super::tests::{TEST_URL, temp_dir};

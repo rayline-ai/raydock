@@ -233,6 +233,10 @@ pub(crate) struct ConfigFile {
     /// `contents` first (Hermes). `false`: written once
     /// as a default; the harness or the user may change it afterwards.
     pub overwrite: bool,
+    /// The file's text that `contents` was merged from. If the file no longer
+    /// reads exactly this when it is replaced (the harness saved a setting
+    /// meanwhile), the write is refused rather than losing that edit.
+    pub merged_from: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -397,6 +401,15 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
         }
         let tmp = dir.join(format!(".{}.tmp-{}", file.name, std::process::id()));
         write_private(&tmp, &file.contents)?;
+        if let Some(base) = &file.merged_from
+            && fs::read_to_string(&path).ok().as_ref() != Some(base)
+        {
+            let _ = fs::remove_file(&tmp);
+            return Err(io::Error::other(format!(
+                "{} changed while Rayline was updating it; run the command again",
+                path.display()
+            )));
+        }
         fs::rename(&tmp, &path)?;
     }
     Ok(())
@@ -482,6 +495,7 @@ pub(crate) fn json_file(name: &'static str, value: &Value, overwrite: bool) -> C
         name,
         contents,
         overwrite,
+        merged_from: None,
     }
 }
 
@@ -490,6 +504,7 @@ pub(crate) fn yaml_file(name: &'static str, value: &Value, overwrite: bool) -> C
         name,
         contents: to_yaml(value),
         overwrite,
+        merged_from: None,
     }
 }
 
@@ -744,11 +759,13 @@ pub(crate) mod tests {
                     name: "owned.json",
                     contents: text.to_owned(),
                     overwrite: true,
+                    merged_from: None,
                 },
                 ConfigFile {
                     name: "default.json",
                     contents: text.to_owned(),
                     overwrite: false,
+                    merged_from: None,
                 },
             ]
         };
@@ -962,6 +979,7 @@ pub(crate) mod tests {
             name: "owned.json",
             contents: "new".to_owned(),
             overwrite: true,
+            merged_from: None,
         }];
         write_files(&dir, &files).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
