@@ -304,12 +304,24 @@ fn is_gateway_token(token: &str) -> bool {
         .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
+/// Create `dir` and narrow it to 0700, so no other user can rename or replace
+/// the files in it whatever the umask.
+fn private_dir(dir: &Path) -> io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Write `contents` readable only by the owner. A new file is created 0600 and
 /// an existing one is narrowed to 0600 before any byte is written.
 fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        private_dir(dir)?;
     }
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true);
@@ -332,7 +344,9 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
 /// This instance's gateway token, created on first use and kept across
 /// restarts so an imported Desktop configuration stays valid.
 pub fn ensure_gateway_token(paths: &AppPaths) -> io::Result<String> {
-    if let Ok(existing) = fs::read_to_string(&paths.token_file) {
+    if owned_and_private(&paths.token_file)
+        && let Ok(existing) = fs::read_to_string(&paths.token_file)
+    {
         let existing = existing.trim();
         if is_gateway_token(existing) {
             return Ok(existing.to_owned());
@@ -343,10 +357,30 @@ pub fn ensure_gateway_token(paths: &AppPaths) -> io::Result<String> {
     Ok(token)
 }
 
+/// Whether `path` is a regular file owned by this user that no one else can
+/// read or write. A token file failing this (planted, or loosened) is replaced.
+#[cfg(unix)]
+fn owned_and_private(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.file_type().is_file() && meta.uid() == uid && meta.mode() & 0o077 == 0
+    })
+}
+
+#[cfg(not(unix))]
+fn owned_and_private(_path: &Path) -> bool {
+    false
+}
+
 /// Arguments for `rld serve` (after the binary).
 pub fn rld_args(paths: &AppPaths, ports: Ports) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "serve",
+        // An `rld` without the token guard rejects this flag and exits, so a
+        // launchd restart onto an older binary never serves unguarded.
+        "--require-inbound-token",
         "--no-local-model",
         "--decision-plane",
         "local",
@@ -440,10 +474,14 @@ pub fn command_line_is_ours(line: &str, paths: &AppPaths) -> bool {
         let rest = &line[at + needle.len()..];
         rest.is_empty() || rest.starts_with(' ')
     });
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let runs_rld_serve = words.windows(2).any(|pair| {
-        Path::new(pair[0]).file_name() == Some(OsStr::new("rld")) && pair[1] == "serve"
-    });
+    // The program itself must be `rld serve`: an absolute `.../rld` as the first
+    // word (this launcher always spawns it by absolute path), not a later
+    // argument of some other program.
+    let mut words = line.split_whitespace();
+    let runs_rld_serve = words.next().is_some_and(|program| {
+        let program = Path::new(program);
+        program.is_absolute() && program.file_name() == Some(OsStr::new("rld"))
+    }) && words.next() == Some("serve");
     names_config && runs_rld_serve
 }
 
@@ -847,7 +885,7 @@ fn resolve(request: &AppRequest) -> Result<Resolved, String> {
 
 fn write_json(path: &Path, value: &Value) -> io::Result<()> {
     if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
+        private_dir(dir)?;
     }
     let mut body = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     body.push(b'\n');
@@ -876,17 +914,40 @@ fn write_instance_files(
 /// means the router must restart.
 pub fn instance_digest(router: &Value, key: &str, token: &str, rld_bin: &Path) -> String {
     let router = router.to_string();
+    let rld_identity = binary_identity(rld_bin);
     let mut hasher = Sha256::new();
     for part in [
         router.as_bytes(),
         key.as_bytes(),
         token.as_bytes(),
         rld_bin.as_os_str().as_encoded_bytes(),
+        &rld_identity,
     ] {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part);
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// What changes when the file at `path` is replaced or rewritten: its size,
+/// modification time and (on unix) device and inode. Empty when unreadable.
+fn binary_identity(path: &Path) -> Vec<u8> {
+    let Ok(meta) = fs::metadata(path) else {
+        return Vec::new();
+    };
+    let mut identity = meta.len().to_be_bytes().to_vec();
+    if let Ok(modified) = meta.modified()
+        && let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH)
+    {
+        identity.extend(since.as_nanos().to_be_bytes());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        identity.extend(meta.dev().to_be_bytes());
+        identity.extend(meta.ino().to_be_bytes());
+    }
+    identity
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1178,10 +1239,16 @@ async fn start(request: &AppRequest) -> Result<String, String> {
             PORTS.all()
         ));
     }
+    private_dir(&paths.dir).map_err(|error| error.to_string())?;
     fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
-    let log = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut log_options = fs::OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_options.mode(0o600);
+    }
+    let log = log_options
         .open(&paths.log_file)
         .map_err(|error| error.to_string())?;
     let mut command = rld_command(&rld_bin, &paths, &key, &token);
@@ -1251,6 +1318,7 @@ fn serve(request: &AppRequest) -> Result<String, String> {
         },
     )
     .map_err(|error| error.to_string())?;
+    private_dir(&paths.dir).map_err(|error| error.to_string())?;
     fs::create_dir_all(&paths.data_dir).map_err(|error| error.to_string())?;
     fs::write(&paths.pid_file, format!("{}\n", std::process::id()))
         .map_err(|error| error.to_string())?;
@@ -1526,6 +1594,46 @@ mod tests {
             assert_ne!(base, other);
         }
         assert!(!base.contains("rlk-a"));
+    }
+
+    #[test]
+    fn instance_digest_changes_when_rld_is_replaced_in_place() {
+        let home = temp_home();
+        let rld = home.join("rld");
+        fs::write(&rld, b"old build").expect("write rld");
+        let router = router_config_json("https://api.rayline.ai", IdStyle::Bare);
+        let before = instance_digest(&router, "rlk-a", TEST_TOKEN, &rld);
+        assert_eq!(before, instance_digest(&router, "rlk-a", TEST_TOKEN, &rld));
+        // An update that keeps the path (a new build renamed over it).
+        let staged = home.join("rld.new");
+        fs::write(&staged, b"new build, longer").expect("write new rld");
+        fs::rename(&staged, &rld).expect("replace rld");
+        assert_ne!(before, instance_digest(&router, "rlk-a", TEST_TOKEN, &rld));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gateway_token_is_replaced_unless_private_and_ours() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = temp_home();
+        let paths = AppPaths::new(&home);
+        let first = ensure_gateway_token(&paths).expect("token");
+        assert_eq!(ensure_gateway_token(&paths).expect("reuse"), first);
+        let dir_mode = fs::metadata(&paths.dir).expect("dir").permissions().mode();
+        assert_eq!(dir_mode & 0o777, 0o700);
+        // A token file others could have written is not trusted.
+        let planted = format!("{GATEWAY_TOKEN_PREFIX}{}", "a".repeat(64));
+        fs::write(&paths.token_file, format!("{planted}\n")).expect("plant");
+        fs::set_permissions(&paths.token_file, fs::Permissions::from_mode(0o664)).expect("loosen");
+        let replaced = ensure_gateway_token(&paths).expect("replace");
+        assert_ne!(replaced, planted);
+        let mode = fs::metadata(&paths.token_file)
+            .expect("file")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = fs::remove_dir_all(home);
     }
 
     #[cfg(unix)]
@@ -1880,6 +1988,12 @@ mod tests {
             format!("/home/u/.rayline/bin/rld serve --router-config-path {config}.bak"),
             format!("/home/u/.rayline/bin/rld status --router-config-path {config}"),
             format!("/usr/bin/not-rld serve --router-config-path {config}"),
+            // `rld serve` as another program's arguments.
+            format!(
+                "python3 diagnostics.py --sample /opt/rayline/rld serve --router-config-path {config} --inspect"
+            ),
+            format!("/usr/bin/python3 /opt/rayline/rld serve --router-config-path {config}"),
+            format!("rld serve --router-config-path {config}"),
         ] {
             assert_eq!(
                 stop_target(Some(42), &paths, |_| true, |_| Some(line.clone())),
@@ -1938,11 +2052,12 @@ mod tests {
         let paths = AppPaths::new(&home);
         fs::create_dir_all(&paths.dir).expect("state dir");
         // A stand-in whose command line reads like the real
-        // `rld serve --router-config-path <path>`.
+        // `<abs>/rld serve --router-config-path <path>`: a copy of `yes`, which
+        // accepts any arguments and runs until signalled.
         let stand_in = home.join("rld");
-        fs::write(&stand_in, "sleep 30\n").expect("stand-in script");
-        let mut ours = Command::new("sh")
-            .arg(&stand_in)
+        fs::copy("/usr/bin/yes", &stand_in).expect("stand-in binary");
+        let mut ours = Command::new(&stand_in)
+            .stdout(Stdio::null())
             .arg("serve")
             .arg("--router-config-path")
             .arg(&paths.router_config)

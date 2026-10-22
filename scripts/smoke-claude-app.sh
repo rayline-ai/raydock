@@ -50,6 +50,10 @@ if grep -q 'rlk-' "$H/.rayline/claude-desktop/"*.json; then echo "FAIL: key in i
 GATEWAY_TOKEN=$(cat "$H/.rayline/claude-desktop/gateway-token")
 AUTH_HEADER=$OUT/auth.header
 (umask 077 && printf 'x-api-key: %s\n' "$GATEWAY_TOKEN" > "$AUTH_HEADER")
+# Claude Code gets the token from a 0600 file its wrapper shell sources, so the
+# token is never an argument of env or of any other process.
+TOKEN_ENV=$OUT/claude-token.env
+(umask 077 && printf 'export ANTHROPIC_AUTH_TOKEN=%s\n' "$GATEWAY_TOKEN" > "$TOKEN_ENV")
 G=http://127.0.0.1:20831
 echo "== the router refuses unauthenticated, cross-site and non-JSON requests"
 expect() { # expect STATUS curl-args...
@@ -72,9 +76,9 @@ for pair in $MODELS; do
   (cd "$H/work" && env -i PATH="$PATH" HOME="$H" TERM=dumb \
     CLAUDE_CONFIG_DIR="$H/.claude" \
     ANTHROPIC_BASE_URL=http://127.0.0.1:20831 \
-    ANTHROPIC_AUTH_TOKEN="$GATEWAY_TOKEN" \
     ANTHROPIC_MODEL="$id" \
     ANTHROPIC_DEFAULT_HAIKU_MODEL="$id" \
+    /bin/bash -c '. "$1"; shift; exec "$@"' _ "$TOKEN_ENV" \
     "$CLAUDE" -p "Reply with exactly the word PONG." --output-format json </dev/null) > "$OUT/turn-$id.json"
   curl -fsS http://127.0.0.1:20833/v1/router/top/snapshot > "$OUT/snapshot.json"
   python3 -I - "$OUT/turn-$id.json" "$OUT/snapshot.json" "$H/.rayline/claude-desktop/router.json" "$id" "$tier" <<'PY'
