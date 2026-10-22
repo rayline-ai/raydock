@@ -32,6 +32,12 @@ pub(crate) fn merge(existing: &str, values: &Value, paths: &[&[&str]]) -> Result
     {
         return Err(at(index, "line break other than \\n"));
     }
+    if let Some(index) = lines
+        .iter()
+        .position(|line| line.chars().any(char::is_control))
+    {
+        return Err(at(index, "control character"));
+    }
     // Check the whole document, not only the entries the paths touch.
     mapping(&lines, 0, lines.len(), 0, false)?;
     for path in paths {
@@ -245,14 +251,21 @@ fn scalar(
         }
         // Plain: every line before `end` is already deeper than its key.
         _ => {
-            if !is_plain_text(inline) {
+            if !is_plain_text(inline, true) {
                 return Err(at(start, "not a plain scalar"));
             }
-            if let Some(index) = (start + 1..end).find(|&index| {
-                let text = split(&lines[index]).1;
-                is_content(text) && !is_plain_text(text)
-            }) {
-                return Err(at(index, "not a plain scalar"));
+            // A comment ends a plain scalar: no content may follow it.
+            let mut commented = inline.contains(" #");
+            for (index, line) in lines.iter().enumerate().take(end).skip(start + 1) {
+                let text = split(line).1;
+                if text.starts_with('#') {
+                    commented = true;
+                } else if is_content(text) {
+                    if commented || !is_plain_text(text, false) {
+                        return Err(at(index, "not a plain scalar"));
+                    }
+                    commented = text.contains(" #");
+                }
             }
             let last = (start + 1..end)
                 .rev()
@@ -297,10 +310,12 @@ fn scalar(
 }
 
 /// Whether `text` (one line, comment allowed) can be plain-scalar text in a
-/// block mapping: no leading `- `, `? ` or `: ` indicator, no leading `,`, and
-/// no `: ` or trailing `:` that would make it a mapping. Anything else is
-/// refused rather than guessed at.
-fn is_plain_text(text: &str) -> bool {
+/// block mapping: no `: ` or trailing `:` that would make it a mapping, and on
+/// the `first` line no leading `- `, `? ` or `: ` indicator and no leading
+/// `,`, `]` or `}`. A wrapped continuation line may start with those
+/// (`safe_dump` wraps plain text at any space). Anything else is refused
+/// rather than guessed at.
+fn is_plain_text(text: &str, first: bool) -> bool {
     let code = text
         .split(" #")
         .next()
@@ -310,12 +325,12 @@ fn is_plain_text(text: &str) -> bool {
         code.strip_prefix(c)
             .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
     };
-    !(indicator('-')
-        || indicator('?')
-        || indicator(':')
-        || code.starts_with(',')
-        || code.contains(": ")
-        || code.ends_with(':'))
+    let bad_start = first
+        && (indicator('-')
+            || indicator('?')
+            || indicator(':')
+            || code.starts_with([',', ']', '}']));
+    !(bad_start || code.contains(": ") || code.ends_with(':'))
 }
 
 /// A line's indentation and the text after it.
@@ -433,6 +448,17 @@ mod tests {
 
     fn set_provider(existing: &str) -> Result<String, String> {
         merge(existing, &values(), &[&["model", "provider"]])
+    }
+
+    #[test]
+    fn wrapped_plain_lines_may_start_with_indicators() {
+        // `safe_dump` wraps plain text at any space, so a continuation line
+        // can start with `- `, `? ` or `,`.
+        let text = "model:\n  provider: old\nnote: xxxxxxxx\n  - rest ? more\n  , tail\n";
+        assert_eq!(
+            set_provider(text).unwrap(),
+            "model:\n  provider: \"custom:r\"\nnote: xxxxxxxx\n  - rest ? more\n  , tail\n"
+        );
     }
 
     #[test]
@@ -714,6 +740,13 @@ fallback_providers: []
             "model:\n  provider: old\nnote: a: b\n",
             "model:\n  provider: old\nnote: wrapped\n    and: more\n",
             "model:\n  provider: old\nnote: ? x\n",
+            "model: ]\n",
+            "model: }\n",
+            "model: old # comment\n  more\n",
+            "model: old\n  # comment\n  more\n",
+            "model: old\n  more # comment\n\n  still more\n",
+            "model: old\u{0}\n",
+            "model: old\u{7f}\n",
             // Line breaks `str::lines` does not split on.
             "note: x\rmodel:\r  effort: high\r",
             "note: x\u{85}model: y\n",
