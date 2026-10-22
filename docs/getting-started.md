@@ -211,20 +211,36 @@ one headless Claude Code turn per model.
 ## OpenClaw
 
 `rayline openclaw` runs OpenClaw against the Rayline router with a generated
-config. It gives the router key to OpenClaw as an environment SecretRef, so the
-key stays out of OpenClaw's files.
+config. It gives the router key to OpenClaw as a file SecretRef that reads an
+owner-only `router-key` file next to that config, so the key stays out of
+OpenClaw's own files and out of the environment its tools inherit. The other
+launchers (`rayline opencode`, `pi`, `omp`, `hermes`) likewise write the key into
+their owner-only generated config, never into the harness's environment.
 
-If you configure OpenClaw by hand, do the same. Write the provider's `apiKey`
-as a SecretRef object, not as the `${VAR}` shorthand:
+If you configure OpenClaw by hand, do the same. Put the key in a file only you
+can read (`chmod 600`), declare it as a file secret provider, and write the
+provider's `apiKey` as a SecretRef to it:
 
 ```json
-"apiKey": { "source": "env", "provider": "default", "id": "RAYLINE_KEY" }
+"secrets": {
+  "providers": {
+    "rayline": { "source": "file", "path": "/absolute/path/to/router-key", "mode": "singleValue" }
+  }
+},
+"models": {
+  "providers": {
+    "rayline": {
+      "apiKey": { "source": "file", "provider": "rayline", "id": "value" }
+    }
+  }
+}
 ```
 
-OpenClaw resolves a `${RAYLINE_KEY}` string when it loads the config, and then
-writes the resolved key into its agent model cache
+Avoid a plain or `${VAR}` string: OpenClaw resolves it when it loads the config,
+and then writes the resolved key into its agent model cache
 (`~/.openclaw/agents/<agent>/agent/models.json`) in plain text. For a SecretRef
-it writes only the variable's name there.
+it writes only a marker there. Avoid an environment SecretRef too: every tool
+OpenClaw runs inherits its environment, so a shell `env` would show the key.
 
 ## Choosing Where Requests Go
 

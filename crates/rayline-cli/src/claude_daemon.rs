@@ -3,7 +3,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -204,7 +203,7 @@ fn read_proc_environ(pid: u32) -> Option<BTreeMap<String, String>> {
 
 #[cfg(target_os = "macos")]
 fn read_ps_environ(pid: u32) -> Option<BTreeMap<String, String>> {
-    let output = Command::new("/bin/ps")
+    let output = std::process::Command::new("/bin/ps")
         .arg("eww")
         .arg("-p")
         .arg(pid.to_string())
@@ -467,7 +466,7 @@ fn resolve_daemon_conflict(
 /// the default (or inherited) config dir.
 fn stop_conflicting_daemon(claude_bin: &Path, config_dir: &Path) -> Result<(), RunError> {
     eprintln!("Stopping the current daemon ({STOP_COMMAND})...");
-    match Command::new(claude_bin)
+    match crate::claude::claude_command(claude_bin)
         .args(["daemon", "stop", "--any"])
         .env(CLAUDE_CONFIG_DIR_ENV, config_dir)
         .status()
