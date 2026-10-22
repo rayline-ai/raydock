@@ -212,8 +212,10 @@ fn chat_invalid_request(code: &str, param: &str, message: String) -> Response<Bo
 }
 
 /// The declared tool types Anthropic Messages has no equivalent for (Chat
-/// `custom` freeform tools and anything else that is not a `function`), in
-/// declaration order. Translating without them would silently drop them.
+/// `custom` freeform tools and anything else that is not a `function`, plus a
+/// `function` without a name), in declaration order. Like the Responses tool
+/// allowlist, anything not known to translate is refused: translating without
+/// them would silently drop them.
 pub(crate) fn untranslatable_chat_tool_types(body: &Value) -> Vec<String> {
     let mut kinds: Vec<String> = Vec::new();
     for tool in body
@@ -222,11 +224,17 @@ pub(crate) fn untranslatable_chat_tool_types(body: &Value) -> Vec<String> {
         .into_iter()
         .flatten()
     {
-        let kind = tool
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("<missing>");
-        if kind != "function" && !kinds.iter().any(|seen| seen == kind) {
+        let kind = match tool.get("type").and_then(Value::as_str) {
+            // A function is carried only with its name; without one it would
+            // be dropped from the translated request.
+            Some("function") if tool.pointer("/function/name").is_some_and(Value::is_string) => {
+                continue;
+            }
+            Some("function") => "function (without a name)",
+            Some(kind) => kind,
+            None => "(missing type)",
+        };
+        if !kinds.iter().any(|seen| seen == kind) {
             kinds.push(kind.to_owned());
         }
     }
@@ -325,8 +333,13 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
         .flatten()
         .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
         .flatten()
-        .filter_map(|call| call.pointer("/function/name").and_then(Value::as_str));
-    let rewrites = ToolNameRewrites::from_names(tool_declaration_names(declared).chain(replayed));
+        .filter_map(|call| call.pointer("/function/name").and_then(Value::as_str))
+        .map(|name| ClientTool::new(None, name));
+    let mut client_tools = Vec::new();
+    collect_declared_tools(&mut client_tools, declared);
+    client_tools.extend(replayed);
+    // No server tool is declared on this path, so no upstream name is reserved.
+    let rewrites = ToolNameRewrites::assign(&client_tools, &[]);
     let mut system = Vec::new();
     let mut messages = Vec::new();
     for message in body
@@ -368,7 +381,7 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
                     blocks.push(json!({
                         "type": "tool_use",
                         "id": call.get("id").and_then(Value::as_str).unwrap_or("call_rayline"),
-                        "name": rewrites.upstream(name),
+                        "name": rewrites.upstream(None, name),
                         "input": input,
                     }));
                 }
@@ -437,7 +450,7 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
             let function = tool.get("function")?;
             let name = function.get("name")?.as_str()?;
             Some(json!({
-                "name": rewrites.upstream(name),
+                "name": rewrites.upstream(None, name),
                 "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
                 "input_schema": function
                     .get("parameters")
@@ -455,7 +468,7 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
                 .get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
-                .map(|name| json!({"type": "tool", "name": rewrites.upstream(name)})),
+                .map(|name| json!({"type": "tool", "name": rewrites.upstream(None, name)})),
             _ => None,
         };
         // `parallel_tool_calls: false` is Anthropic's
@@ -519,7 +532,7 @@ pub(crate) fn anthropic_message_to_chat(
                 "id": block.get("id").and_then(Value::as_str).unwrap_or("call_rayline"),
                 "type": "function",
                 "function": {
-                    "name": tool_names.client(block.get("name").and_then(Value::as_str).unwrap_or("tool")),
+                    "name": tool_names.client_call(block.get("name").and_then(Value::as_str).unwrap_or("tool")).0,
                     "arguments": block.get("input").cloned().unwrap_or_else(|| json!({})).to_string(),
                 },
             })),
@@ -827,7 +840,7 @@ impl AnthropicToChatTranslator {
                         .unwrap_or_default();
                     self.tool_index
                         .insert(block, (index, !arguments.is_empty()));
-                    let name = self.tool_names.client(
+                    let (name, _) = self.tool_names.client_call(
                         value
                             .pointer("/content_block/name")
                             .and_then(Value::as_str)
@@ -1012,7 +1025,7 @@ mod tests {
         assert_eq!(out["stop_sequences"], json!(["END"]));
         assert_eq!(out["stream"], true);
         assert_eq!(out["tool_choice"], json!({"type": "any"}));
-        let upstream = rewrites.upstream("read.file").to_owned();
+        let upstream = rewrites.upstream(None, "read.file");
         assert_ne!(upstream, "read.file", "unsafe names are rewritten");
         assert_eq!(out["tools"][0]["name"], upstream);
         let messages = out["messages"].as_array().expect("messages");
@@ -1039,6 +1052,17 @@ mod tests {
         assert_eq!(
             untranslatable_chat_tool_types(&body),
             vec!["custom".to_owned()]
+        );
+        assert_eq!(
+            untranslatable_chat_tool_types(&json!({"tools": [
+                {"type": "function", "function": {"description": "nameless"}},
+                {"type": "function", "function": {"name": 7}},
+                {"function": {"name": "untyped"}}
+            ]})),
+            vec![
+                "function (without a name)".to_owned(),
+                "(missing type)".to_owned()
+            ]
         );
         let refusal = untranslatable_chat_tools_response(&body).expect("refused");
         assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
@@ -1095,7 +1119,7 @@ mod tests {
             &json!({"messages": [], "tools": [{"type": "function", "function": {"name": "read.file"}}]}),
             "m",
         );
-        let upstream = rewrites.upstream("read.file").to_owned();
+        let upstream = rewrites.upstream(None, "read.file");
         let message = json!({
             "content": [{"type": "text", "text": "Reading."},
                         {"type": "tool_use", "id": "call_9", "name": upstream, "input": {"path": "a"}}],
@@ -1134,7 +1158,7 @@ mod tests {
         assert!(adapted.get("temperature").is_none(), "{adapted}");
         assert!(adapted.get("top_p").is_none(), "{adapted}");
         // `read.file` is no longer declared but is still replayed.
-        let upstream = rewrites.upstream("read.file");
+        let upstream = rewrites.upstream(None, "read.file");
         assert_ne!(upstream, "read.file");
         assert_eq!(adapted["messages"][1]["content"][0]["name"], upstream);
         let (kept, _) = chat_to_anthropic_request(&body, "claude-haiku-4-5");
@@ -1168,8 +1192,8 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert_ne!(names[0], names[1], "{names:?}");
         assert_eq!(names[1], "tool_1lookup");
-        assert_eq!(rewrites.client(names[0]), "1lookup");
-        assert_eq!(rewrites.client("tool_1lookup"), "tool_1lookup");
+        assert_eq!(rewrites.client_call(names[0]).0, "1lookup");
+        assert_eq!(rewrites.client_call("tool_1lookup").0, "tool_1lookup");
     }
 
     #[test]

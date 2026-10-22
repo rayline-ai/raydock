@@ -153,23 +153,94 @@ rayline router top
 rayline router stop
 ```
 
+## Claude Desktop (Code)
+
+`rayline claude-desktop` connects Claude Code inside the Claude desktop app to ARC.
+Desktop's Code sessions ignore `ANTHROPIC_BASE_URL`; they reach a gateway only
+through the app's third-party inference ("3P") mode, and Desktop accepts only
+model ids that look like Anthropic models. The launcher therefore:
+
+- runs a **dedicated** `rld` with its own state (`~/.rayline/claude-desktop`)
+  and ports (router 20831, adapter 20828, injector 20829, metrics 20833), so it
+  never touches the shared router on 20808–20814 or your Claude Code CLI config;
+- offers Desktop two models, shown in the picker as **arc-sage** (the default)
+  and **arc-swift** (the cheaper tier). Desktop requires Claude-style model
+  ids, so the import uses `claude-arc-sage` and `claude-arc-swift` internally,
+  and explicit `model_routes` entries map them to the first-party tier ids
+  `arc-sage` and `arc-swift` (`--prefixed-ids` forwards the `rayline/arc-*`
+  aliases instead, for a router that predates the bare ids), stamping `x-rayline-client: claude-desktop`. ARC is not
+  a Claude model, and Rayline is not affiliated with Anthropic;
+- keeps your `rlk-` key in the router's environment only. Desktop gets
+  `http://127.0.0.1:20831` and a random per-instance gateway token
+  (`~/.rayline/claude-desktop/gateway-token`, mode 600) through
+  `~/.rayline/claude-desktop/claude-desktop-import.json`, which you load with
+  **Developer → Configure Third-Party Inference… → Import configuration**,
+  then **Apply Changes** and **Save & Restart**. The launcher never writes
+  Desktop's own configuration. The router answers only requests that carry
+  that token, address a loopback Host on its port, carry no non-loopback
+  Origin, and send JSON, so other local processes and web pages (DNS
+  rebinding, cross-site `text/plain` posts) cannot spend on your account.
+  After every start or restart the launcher checks that the router refuses a
+  request without the token. If it does not (for example an `rld` older than
+  the CLI), the launcher stops it and exits with an error;
+- routes only to ARC: the router config replaces the built-in endpoints, so
+  no model id can reach another provider, and it restarts the router when the
+  key, token, config or `rld` changes. The login service pins the `rld` path
+  the launcher resolved. Claude Desktop's third-party mode is macOS-only, so
+  the launcher targets macOS (the router also runs on Linux, for testing);
+
+```bash
+rayline claude-desktop                    # start or reuse the router; print the steps
+rayline --env dev claude-desktop          # route to the dev environment instead
+rayline claude-desktop status             # health, request totals, Desktop check
+rayline claude-desktop validate           # Desktop's applied config vs. the router
+rayline claude-desktop install-service    # LaunchAgent ai.rayline.claude-desktop
+rayline claude-desktop stop
+rayline claude-desktop off                # switch Desktop back to your subscription
+rayline claude-desktop uninstall          # service + router state; Desktop untouched
+```
+
+3P mode applies to the whole Desktop app: it signs Desktop out of your
+claude.ai subscription, and Chat and Cowork are off while it is active. To
+switch back, open the account menu (it shows **Gateway**), choose **Sign out**,
+and sign in with your Anthropic account. Anthropic does not support routing
+Claude Code to non-Claude models through a gateway, so a Desktop update can
+change this behaviour; `scripts/smoke-claude-app.sh` checks the wire path with
+one headless Claude Code turn per model.
+
 ## OpenClaw
 
 `rayline openclaw` runs OpenClaw against the Rayline router with a generated
-config. It gives the router key to OpenClaw as an environment SecretRef, so the
-key stays out of OpenClaw's files.
+config. It gives the router key to OpenClaw as a file SecretRef that reads an
+owner-only `router-key` file next to that config, so the key stays out of
+OpenClaw's own files and out of the environment its tools inherit. The other
+launchers (`rayline opencode`, `pi`, `omp`, `hermes`) likewise write the key into
+their owner-only generated config, never into the harness's environment.
 
-If you configure OpenClaw by hand, do the same. Write the provider's `apiKey`
-as a SecretRef object, not as the `${VAR}` shorthand:
+If you configure OpenClaw by hand, do the same. Put the key in a file only you
+can read (`chmod 600`), declare it as a file secret provider, and write the
+provider's `apiKey` as a SecretRef to it:
 
 ```json
-"apiKey": { "source": "env", "provider": "default", "id": "RAYLINE_KEY" }
+"secrets": {
+  "providers": {
+    "rayline": { "source": "file", "path": "/absolute/path/to/router-key", "mode": "singleValue" }
+  }
+},
+"models": {
+  "providers": {
+    "rayline": {
+      "apiKey": { "source": "file", "provider": "rayline", "id": "value" }
+    }
+  }
+}
 ```
 
-OpenClaw resolves a `${RAYLINE_KEY}` string when it loads the config, and then
-writes the resolved key into its agent model cache
+Avoid a plain or `${VAR}` string: OpenClaw resolves it when it loads the config,
+and then writes the resolved key into its agent model cache
 (`~/.openclaw/agents/<agent>/agent/models.json`) in plain text. For a SecretRef
-it writes only the variable's name there.
+it writes only a marker there. Avoid an environment SecretRef too: every tool
+OpenClaw runs inherits its environment, so a shell `env` would show the key.
 
 ## Choosing Where Requests Go
 

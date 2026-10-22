@@ -31,6 +31,8 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 mod chat_inbound;
+pub mod inbound_guard;
+pub use inbound_guard::InboundGuard;
 
 pub const DEFAULT_PORT: u16 = 20811;
 pub const DEFAULT_LOCAL_ADAPTER_PORT: u16 = 20808;
@@ -64,6 +66,9 @@ pub struct LocalRouterOptions {
     /// Responses forward to the hosted RCR, and follow the RCR's 307 to the
     /// on-device adapter. Off for every other run.
     pub may_local_advertise: bool,
+    /// A per-instance token required on every request but `GET /healthz`
+    /// (`rayline claude-desktop`). `None` for every other run.
+    pub inbound_guard: Option<InboundGuard>,
 }
 
 impl Default for LocalRouterOptions {
@@ -75,6 +80,7 @@ impl Default for LocalRouterOptions {
             config_path: None,
             metrics: None,
             may_local_advertise: false,
+            inbound_guard: None,
         }
     }
 }
@@ -327,11 +333,25 @@ fn load_config(opts: &LocalRouterOptions) -> Result<RouterConfig> {
         let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let overrides = serde_json::from_str::<RouterConfig>(&raw)
             .with_context(|| format!("parse router config {}", path.display()))?;
-        merge_config(&mut config, overrides);
+        if replaces_defaults(&raw) {
+            config = overrides;
+        } else {
+            merge_config(&mut config, overrides);
+        }
     }
     apply_env_overrides(&mut config);
     normalize_config(&mut config, &opts.local_model_id)?;
     Ok(config)
+}
+
+/// A config with top-level `"replace_defaults": true` is the whole config: the
+/// built-in endpoints and routes are dropped instead of merged underneath, so
+/// no request can reach an endpoint the file does not name.
+fn replaces_defaults(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.get("replace_defaults").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
@@ -581,8 +601,7 @@ fn json_response(status: StatusCode, value: Value) -> Response<BoxBody> {
         .unwrap()
 }
 
-/// Hosts the router answers as. Same rules as the opt-in token guard in #94's
-/// `inbound_guard.rs`, so the two stay one policy.
+/// Hosts the router answers as.
 const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 
 /// The router listens on loopback without auth and spends stored provider
@@ -602,12 +621,18 @@ fn reject_untrusted_request(
             json!({"type":"error","error":{"type":kind,"message":message}}),
         ))
     };
-    // HTTP/2 carries the authority in the URI instead of a Host header.
-    let host = match uri.authority() {
-        Some(authority) => Some(authority.as_str()),
-        None => headers
-            .get(hyper::header::HOST)
-            .and_then(|value| value.to_str().ok()),
+    // HTTP/2 carries the authority in the URI instead of a Host header. When
+    // both are present they must agree, and every guarded header must appear at
+    // most once: the checks below read one value, so a second one would slip by.
+    let host_header = single_header(headers, hyper::header::HOST);
+    let host = match (uri.authority(), host_header) {
+        (_, Err(())) => None,
+        (Some(authority), Ok(None)) => Some(authority.as_str()),
+        (Some(authority), Ok(Some(value))) => value
+            .to_str()
+            .ok()
+            .filter(|value| value.eq_ignore_ascii_case(authority.as_str())),
+        (None, Ok(value)) => value.and_then(|value| value.to_str().ok()),
     };
     if !host.is_some_and(|host| is_loopback_authority(host, port)) {
         return refuse(
@@ -616,12 +641,14 @@ fn reject_untrusted_request(
             "this router only answers requests addressed to its loopback host and port",
         );
     }
-    let origin_ok = headers.get(hyper::header::ORIGIN).is_none_or(|origin| {
-        origin.to_str().ok().is_some_and(|origin| {
-            origin
-                .strip_prefix("http://")
-                .or_else(|| origin.strip_prefix("https://"))
-                .is_some_and(|authority| is_loopback_authority(authority, port))
+    let origin_ok = single_header(headers, hyper::header::ORIGIN).is_ok_and(|origin| {
+        origin.is_none_or(|origin| {
+            origin.to_str().ok().is_some_and(|origin| {
+                origin
+                    .strip_prefix("http://")
+                    .or_else(|| origin.strip_prefix("https://"))
+                    .is_some_and(|authority| is_loopback_authority(authority, port))
+            })
         })
     });
     if !origin_ok || *method == Method::OPTIONS {
@@ -631,9 +658,15 @@ fn reject_untrusted_request(
             "cross-origin requests are not accepted",
         );
     }
+    let Ok(content_type) = single_header(headers, hyper::header::CONTENT_TYPE) else {
+        return refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "request bodies must carry exactly one content-type",
+        );
+    };
     if *method == Method::POST {
-        let mime = headers
-            .get(hyper::header::CONTENT_TYPE)
+        let mime = content_type
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .map(str::trim);
@@ -654,6 +687,16 @@ fn reject_untrusted_request(
         }
     }
     None
+}
+
+/// The header's only value, `Ok(None)` when absent, or `Err` when repeated.
+fn single_header(headers: &HeaderMap, name: HeaderName) -> Result<Option<&HeaderValue>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    match values.next() {
+        Some(_) => Err(()),
+        None => Ok(first),
+    }
 }
 
 /// True for `127.0.0.1`, `localhost` or `[::1]` on exactly `port`.
@@ -678,6 +721,14 @@ async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
         .map(|value| value.as_str().to_owned())
         .unwrap_or_else(|| path.clone());
     let method = req.method().clone();
+    if let Some(guard) = state.opts.inbound_guard.as_ref() {
+        if let Err(refusal) = guard.check(&method, &path, req.headers()) {
+            return json_response(
+                refusal.status,
+                json!({"type": "error", "error": {"type": refusal.kind, "message": refusal.message}}),
+            );
+        }
+    }
     match (method, path.as_str()) {
         (Method::GET, "/healthz") => healthz_response(&state),
         (Method::GET, "/v1/models" | "/v1/models/") => {
@@ -1376,6 +1427,41 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
             agent_id: (subagent != "<none>").then(|| subagent.to_owned()),
             agent_type: (subagent != "<none>").then(|| subagent.to_owned()),
         });
+    }
+
+    // Never forward a translated request without a tool the caller declared,
+    // or with a restriction the caller set lifted: translate what the target
+    // has an equivalent for, refuse everything else with an actionable error.
+    let hosted_target = match &decision.target {
+        RouteSelection::Local => Some(HostedToolTarget::NoHostedTools),
+        RouteSelection::Endpoint(endpoint_id) => state
+            .config
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.id == *endpoint_id)
+            .and_then(|endpoint| match endpoint.protocol {
+                EndpointProtocol::OpenAIResponses => None,
+                EndpointProtocol::AnthropicMessages => Some(HostedToolTarget::AnthropicMessages),
+                EndpointProtocol::OpenAIChat => Some(HostedToolTarget::NoHostedTools),
+            }),
+    };
+    if let Some(target) = hosted_target {
+        if responses_declares_offline_web_search(&parsed) {
+            info!(
+                "local router: omitting web_search with external_web_access=false (no live search requested)"
+            );
+        }
+        if let Some((code, response)) = responses_translation_refusal(&parsed, target) {
+            warn!("local router: refusing Responses request the route cannot honour ({code})");
+            // The request was announced to metrics above; close it out.
+            record_request_error(
+                state.opts.metrics.as_ref(),
+                &request_id,
+                Some(StatusCode::BAD_REQUEST.as_u16()),
+                code,
+            );
+            return Ok(response);
+        }
     }
 
     let response = match &decision.target {
@@ -3455,7 +3541,7 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for tool in tools
             .iter()
-            .filter_map(|tool| responses_tool_to_anthropic(tool, &rewrites))
+            .flat_map(|tool| responses_tools_to_anthropic(tool, &rewrites))
         {
             converted_tools.push(tool);
         }
@@ -3472,10 +3558,272 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
             Value::String(system_parts.join("\n\n")),
         );
     }
+    // Several `web_search` declarations (top-level and `additional_tools`)
+    // are one server tool upstream; a repeated name is rejected there.
+    // Declarations that differ are refused before translation
+    // (`responses_conflicting_web_search`), so keeping the first loses nothing.
+    let mut seen_web_search = false;
+    let search_limit = body.get("max_tool_calls").and_then(Value::as_u64);
+    converted_tools.retain_mut(|tool| {
+        if !is_anthropic_web_search_tool(tool) {
+            return true;
+        }
+        // `max_tool_calls` caps the built-in tool calls, and web search is
+        // the only built-in tool that translates.
+        if let Some(limit) = search_limit {
+            tool["max_uses"] = json!(limit);
+        }
+        search_limit != Some(0) && !std::mem::replace(&mut seen_web_search, true)
+    });
+    let tool_choice = body.get("tool_choice");
+    let declared_functions = responses_declared_functions(body);
+    if let Some(allowed) = tool_choice
+        .and_then(|choice| responses_allowed_tools(choice, &rewrites, &declared_functions))
+    {
+        converted_tools.retain(|tool| {
+            if is_anthropic_web_search_tool(tool) {
+                return allowed.web_search;
+            }
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| allowed.functions.contains(name))
+        });
+    }
+    let web_search_declared = converted_tools.iter().any(is_anthropic_web_search_tool);
     if !converted_tools.is_empty() {
+        let mut choice = tool_choice.and_then(|choice| {
+            responses_tool_choice_to_anthropic(
+                choice,
+                &rewrites,
+                &declared_functions,
+                web_search_declared,
+            )
+        });
+        // A forced function is called exactly once in Responses, and
+        // `parallel_tool_calls: false` allows one call per turn; Anthropic
+        // allows parallel calls unless told otherwise.
+        let single_call = body.get("parallel_tool_calls").and_then(Value::as_bool) == Some(false)
+            || choice
+                .as_ref()
+                .is_some_and(|choice| choice["type"] == "tool");
+        if single_call {
+            let choice = choice.get_or_insert_with(|| json!({"type": "auto"}));
+            if choice["type"] != "none" {
+                choice["disable_parallel_tool_use"] = json!(true);
+            }
+        }
+        if let Some(choice) = choice {
+            out.insert("tool_choice".to_owned(), choice);
+        }
         out.insert("tools".to_owned(), Value::Array(converted_tools));
     }
     (Value::Object(out), rewrites)
+}
+
+/// Whether `tool_choice` requires a tool call (`required`, `allowed_tools`
+/// in `required` mode, or a specific tool) that the translated request no
+/// longer requires: the forced tool was omitted (an offline or zero-budget
+/// search, a tool type Anthropic has no equivalent for) or nothing permitted
+/// is left. Forwarded, the requirement would silently relax to `auto`.
+fn responses_required_tool_unavailable(body: &Value) -> bool {
+    let Some(choice) = body.get("tool_choice") else {
+        return false;
+    };
+    let requires_call = match choice.as_str() {
+        Some(mode) => mode == "required",
+        None => match choice.get("type").and_then(Value::as_str) {
+            Some("allowed_tools") => choice.get("mode").and_then(Value::as_str) == Some("required"),
+            Some(_) => true,
+            None => false,
+        },
+    };
+    if !requires_call {
+        return false;
+    }
+    let (translated, _) = responses_to_anthropic_request(body, "");
+    let Some(forced) = translated.get("tool_choice") else {
+        return true;
+    };
+    // The forced tool must be the kind the caller forced, not just share its
+    // upstream name: a forced function named `web_search` that was never
+    // declared is not satisfied by the hosted search.
+    let forces_search = choice
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"));
+    match forced.get("type").and_then(Value::as_str) {
+        Some("any") => false,
+        Some("tool") => !translated
+            .get("tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|tool| {
+                tool.get("name") == forced.get("name")
+                    && is_anthropic_web_search_tool(tool) == forces_search
+            }),
+        _ => true,
+    }
+}
+
+fn is_anthropic_web_search_tool(tool: &Value) -> bool {
+    tool.get("type").and_then(Value::as_str) == Some(ANTHROPIC_WEB_SEARCH_TOOL_TYPE)
+}
+
+/// The tools an `allowed_tools` choice permits: client functions by upstream
+/// name, and the hosted search separately, so that permitting the search
+/// never permits a client function that happens to be named `web_search`.
+struct AllowedTools {
+    functions: HashSet<String>,
+    web_search: bool,
+}
+
+/// Anthropic has no `allowed_tools` choice, so the tools it does not permit
+/// are left out of the request instead.
+fn responses_allowed_tools(
+    choice: &Value,
+    rewrites: &ToolNameRewrites,
+    declared_functions: &HashSet<ClientTool>,
+) -> Option<AllowedTools> {
+    if choice.get("type").and_then(Value::as_str) != Some("allowed_tools") {
+        return None;
+    }
+    let mut allowed = AllowedTools {
+        functions: HashSet::new(),
+        web_search: false,
+    };
+    for tool in choice
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let Some(kind) = tool.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if kind.starts_with("web_search") {
+            allowed.web_search = true;
+        } else if kind == "namespace" {
+            // A namespace permits every function declared in it.
+            let Some(namespace) = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|namespace| !namespace.is_empty())
+            else {
+                continue;
+            };
+            allowed.functions.extend(
+                declared_functions
+                    .iter()
+                    .filter(|declared| declared.namespace.as_deref() == Some(namespace))
+                    .map(|declared| rewrites.upstream_of(declared)),
+            );
+        } else if let Some(name) = tool
+            .get("name")
+            .or_else(|| tool.pointer("/function/name"))
+            .and_then(Value::as_str)
+        {
+            // Only a declared function, by the namespace and name the client
+            // gave it: an undeclared name may be another function's upstream
+            // alias (a qualified `namespace__function` name among them).
+            let function = ClientTool::new(tool.get("namespace").and_then(Value::as_str), name);
+            if declared_functions.contains(&function) {
+                allowed.functions.insert(rewrites.upstream_of(&function));
+            }
+        }
+    }
+    Some(allowed)
+}
+
+/// Responses `tool_choice` as Anthropic's. `none` must reach the upstream:
+/// left out, Anthropic defaults to `auto` and may call a tool (or search)
+/// the caller ruled out. `allowed_tools` keeps its mode; its tool subset is
+/// applied to the declared tools ([`responses_allowed_tools`]). A form with
+/// no Anthropic equivalent is left out, which is Anthropic's default, `auto`,
+/// and so is a forced `web_search` when no live search was declared (Codex
+/// declares it without live access by default).
+fn responses_tool_choice_to_anthropic(
+    choice: &Value,
+    rewrites: &ToolNameRewrites,
+    declared_functions: &HashSet<ClientTool>,
+    web_search_declared: bool,
+) -> Option<Value> {
+    if let Some(mode) = choice.as_str() {
+        return match mode {
+            "none" => Some(json!({"type": "none"})),
+            "auto" => Some(json!({"type": "auto"})),
+            "required" => Some(json!({"type": "any"})),
+            _ => None,
+        };
+    }
+    let kind = choice.get("type").and_then(Value::as_str)?;
+    if kind == "allowed_tools" {
+        return match choice.get("mode").and_then(Value::as_str) {
+            Some("required") => Some(json!({"type": "any"})),
+            Some("auto") => Some(json!({"type": "auto"})),
+            _ => None,
+        };
+    }
+    if kind.starts_with("web_search") {
+        return web_search_declared
+            .then(|| json!({"type": "tool", "name": ANTHROPIC_WEB_SEARCH_TOOL_NAME}));
+    }
+    if kind != "function" {
+        return None;
+    }
+    let name = choice
+        .get("name")
+        .or_else(|| choice.pointer("/function/name"))
+        .and_then(Value::as_str)?;
+    let tool = ClientTool::new(choice.get("namespace").and_then(Value::as_str), name);
+    // Forcing an undeclared function forces nothing (refused as
+    // `required_tool_unavailable`), even when its name is another tool's
+    // upstream alias.
+    if !declared_functions.contains(&tool) {
+        return None;
+    }
+    Some(json!({"type": "tool", "name": rewrites.upstream_of(&tool)}))
+}
+
+/// The function tools the request declares, as the client declared them:
+/// top-level functions by name, and the functions inside a `namespace` tool
+/// by namespace and name. A choice names a namespaced function the same way
+/// (`{"type": "function", "namespace": ..., "name": ...}`); its qualified
+/// upstream name (`namespace__function`) is not a declared name.
+fn responses_declared_functions(body: &Value) -> HashSet<ClientTool> {
+    let mut declared = HashSet::new();
+    for tool in responses_declared_tools(body) {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function") => {
+                if let Some(name) = tool
+                    .get("name")
+                    .or_else(|| tool.pointer("/function/name"))
+                    .and_then(Value::as_str)
+                {
+                    declared.insert(ClientTool::new(None, name));
+                }
+            }
+            Some("namespace") => {
+                let namespace = tool.get("name").and_then(Value::as_str);
+                declared.extend(
+                    responses_namespace_functions(tool)
+                        .filter_map(|member| member.get("name").and_then(Value::as_str))
+                        .map(|name| ClientTool::new(namespace, name)),
+                );
+            }
+            _ => {}
+        }
+    }
+    declared
+}
+
+/// The `function` members of a Responses `namespace` tool.
+fn responses_namespace_functions(tool: &Value) -> impl Iterator<Item = &Value> {
+    tool.get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|member| member.get("type").and_then(Value::as_str) == Some("function"))
 }
 
 fn responses_wants_stream(body: &Value) -> bool {
@@ -3510,7 +3858,7 @@ fn append_responses_input_as_anthropic(
             if let Some(tools) = item.get("tools").and_then(Value::as_array) {
                 for tool in tools
                     .iter()
-                    .filter_map(|tool| responses_tool_to_anthropic(tool, rewrites))
+                    .flat_map(|tool| responses_tools_to_anthropic(tool, rewrites))
                 {
                     converted_tools.push(tool);
                 }
@@ -3565,7 +3913,10 @@ fn append_responses_input_as_anthropic(
                 .get("call_id")
                 .and_then(Value::as_str)
                 .unwrap_or("call_rayline");
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let name = rewrites.upstream(
+                item.get("namespace").and_then(Value::as_str),
+                item.get("name").and_then(Value::as_str).unwrap_or("tool"),
+            );
             let arguments = item
                 .get("arguments")
                 .or_else(|| item.get("input"))
@@ -3577,7 +3928,7 @@ fn append_responses_input_as_anthropic(
                 "content": [{
                     "type": "tool_use",
                     "id": id,
-                    "name": rewrites.upstream(name),
+                    "name": name,
                     "input": arguments,
                 }]
             }));
@@ -3716,27 +4067,61 @@ fn openai_image_url_to_anthropic(url: &str) -> Value {
 /// "Provider returned error". Rewrite offending names on the way upstream and
 /// restore the client's original name on the way back, so the client can still
 /// match the tool call to the tool it declared.
-/// The names of tool declarations in either the Responses (`name`) or the
-/// Chat (`function.name`) shape.
-fn tool_declaration_names(tools: &[Value]) -> impl Iterator<Item = &str> {
-    tools.iter().filter_map(|tool| {
-        tool.get("name")
-            .or_else(|| tool.pointer("/function/name"))
-            .and_then(Value::as_str)
-    })
-}
-
+///
+/// Functions declared inside a Responses `namespace` tool (Codex's
+/// `multi_agent_v1` sub-agent tools) are keyed by namespace and name, declared
+/// upstream by their qualified name (`namespace__function`), and restored to
+/// both on the call that comes back.
 #[derive(Clone, Debug, Default)]
 struct ToolNameRewrites {
-    to_upstream: HashMap<String, String>,
-    to_client: HashMap<String, String>,
+    to_upstream: HashMap<ClientTool, String>,
+    to_client: HashMap<String, ClientTool>,
+}
+
+/// A tool as the client declared it: its name, and the namespace it was
+/// declared in, if any. Distinct client tools never share an upstream name,
+/// even where their qualified names coincide (`a__b` and `b` in namespace `a`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ClientTool {
+    namespace: Option<String>,
+    name: String,
+}
+
+impl ClientTool {
+    fn new(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            namespace: namespace
+                .filter(|namespace| !namespace.is_empty())
+                .map(str::to_owned),
+            name: name.to_owned(),
+        }
+    }
+
+    fn qualified(&self) -> String {
+        qualified_tool_name(self.namespace.as_deref(), &self.name)
+    }
+}
+
+/// Joins a namespace and a function into the one name a format without
+/// namespaces calls (the same scheme as VSR's `QualifiedToolName`).
+const NAMESPACE_SEPARATOR: &str = "__";
+
+/// The longest tool name sent upstream. Anthropic accepts 128 characters, but
+/// the OpenAI-compatible providers behind it accept 64 (`^[a-zA-Z0-9_-]{1,64}$`).
+const MAX_UPSTREAM_TOOL_NAME_LEN: usize = 64;
+
+fn qualified_tool_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace.filter(|namespace| !namespace.is_empty()) {
+        Some(namespace) => format!("{namespace}{NAMESPACE_SEPARATOR}{name}"),
+        None => name.to_owned(),
+    }
 }
 
 impl ToolNameRewrites {
     fn from_responses_body(body: &Value) -> Self {
-        let mut names = Vec::new();
-        if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-            names.extend(tool_declaration_names(tools));
+        let mut tools: Vec<ClientTool> = Vec::new();
+        if let Some(declared) = body.get("tools").and_then(Value::as_array) {
+            collect_declared_tools(&mut tools, declared);
         }
         for item in body
             .get("input")
@@ -3746,8 +4131,8 @@ impl ToolNameRewrites {
         {
             match item.get("type").and_then(Value::as_str) {
                 Some("additional_tools") => {
-                    if let Some(tools) = item.get("tools").and_then(Value::as_array) {
-                        names.extend(tool_declaration_names(tools));
+                    if let Some(declared) = item.get("tools").and_then(Value::as_array) {
+                        collect_declared_tools(&mut tools, declared);
                     }
                 }
                 // Replayed calls from earlier turns must use the same upstream
@@ -3755,57 +4140,127 @@ impl ToolNameRewrites {
                 // in `tools`.
                 Some("function_call") | Some("custom_tool_call") => {
                     if let Some(name) = item.get("name").and_then(Value::as_str) {
-                        names.push(name);
+                        let namespace = item.get("namespace").and_then(Value::as_str);
+                        tools.push(ClientTool::new(namespace, name));
                     }
                 }
                 _ => {}
             }
         }
-        Self::from_names(names)
+        // A live hosted `web_search` goes upstream as Anthropic's server tool
+        // under the fixed name `web_search`, so no client function may use it.
+        let reserved: &[&str] = if responses_declares_live_web_search(body) {
+            &[ANTHROPIC_WEB_SEARCH_TOOL_NAME]
+        } else {
+            &[]
+        };
+        Self::assign(&tools, reserved)
     }
 
-    /// Rewrites for every tool name the request uses. Names that are already
-    /// provider-safe pass through unchanged, so they are reserved first and a
-    /// rewritten name never collides with one of them.
-    fn from_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
-        let names: Vec<&str> = names.into_iter().collect();
-        let reserved: HashSet<&str> = names
-            .iter()
-            .copied()
-            .filter(|name| is_provider_safe_tool_name(name))
-            .collect();
+    /// Gives every client tool an upstream name that is provider-safe, at most
+    /// [`MAX_UPSTREAM_TOOL_NAME_LEN`] long, and unique among all upstream tool
+    /// names, `reserved` included. A safe name outside any namespace keeps
+    /// itself unless it is reserved; any other tool gets its sanitized
+    /// qualified name, truncated to the limit and, on a clash, suffixed. The
+    /// assignment depends only on the declaration order, and every upstream
+    /// name maps back to exactly one client tool.
+    fn assign(tools: &[ClientTool], reserved: &[&str]) -> Self {
+        let keeps_itself = |tool: &ClientTool| {
+            tool.namespace.is_none()
+                && is_provider_safe_tool_name(&tool.name)
+                && !reserved.contains(&tool.name.as_str())
+        };
+        let mut taken: HashSet<String> = reserved.iter().map(|name| (*name).to_owned()).collect();
+        taken.extend(
+            tools
+                .iter()
+                .filter(|tool| keeps_itself(tool))
+                .map(|tool| tool.name.clone()),
+        );
         let mut rewrites = Self::default();
-        for name in names {
-            if reserved.contains(name) || rewrites.to_upstream.contains_key(name) {
+        for tool in tools {
+            if keeps_itself(tool) || rewrites.to_upstream.contains_key(tool) {
                 continue;
             }
-            let base = sanitize_tool_name(name);
-            let mut candidate = base.clone();
+            let base = sanitize_tool_name(&tool.qualified());
+            let mut candidate = truncate_tool_name(&base, "");
             let mut suffix = 2;
-            while rewrites.to_client.contains_key(&candidate)
-                || reserved.contains(candidate.as_str())
-            {
-                candidate = format!("{base}_{suffix}");
+            while taken.contains(&candidate) {
+                candidate = truncate_tool_name(&base, &format!("_{suffix}"));
                 suffix += 1;
             }
-            rewrites
-                .to_client
-                .insert(candidate.clone(), name.to_owned());
-            rewrites.to_upstream.insert(name.to_owned(), candidate);
+            taken.insert(candidate.clone());
+            rewrites.to_client.insert(candidate.clone(), tool.clone());
+            rewrites.to_upstream.insert(tool.clone(), candidate);
         }
         rewrites
     }
 
-    fn upstream<'a>(&'a self, name: &'a str) -> &'a str {
-        self.to_upstream.get(name).map_or(name, String::as_str)
+    /// The upstream name of a client tool. A tool the request never declared
+    /// or replayed keeps its qualified name.
+    fn upstream(&self, namespace: Option<&str>, name: &str) -> String {
+        self.upstream_of(&ClientTool::new(namespace, name))
     }
 
-    fn client<'a>(&'a self, name: &'a str) -> &'a str {
-        self.to_client.get(name).map_or(name, String::as_str)
+    fn upstream_of(&self, tool: &ClientTool) -> String {
+        self.to_upstream
+            .get(tool)
+            .cloned()
+            .unwrap_or_else(|| tool.qualified())
+    }
+
+    /// The client's `(function name, namespace)` for an upstream tool name.
+    fn client_call(&self, upstream: &str) -> (String, Option<String>) {
+        match self.to_client.get(upstream) {
+            Some(tool) => (tool.name.clone(), tool.namespace.clone()),
+            None => (upstream.to_owned(), None),
+        }
+    }
+}
+
+/// `base` cut so that it and `suffix` fit [`MAX_UPSTREAM_TOOL_NAME_LEN`].
+/// `base` is ASCII (see [`sanitize_tool_name`]), so any cut is a char boundary.
+fn truncate_tool_name(base: &str, suffix: &str) -> String {
+    let keep = MAX_UPSTREAM_TOOL_NAME_LEN
+        .saturating_sub(suffix.len())
+        .min(base.len());
+    format!("{}{suffix}", &base[..keep])
+}
+
+/// Every tool a `tools` list declares, with the functions inside `namespace`
+/// tools under their namespace.
+fn collect_declared_tools(out: &mut Vec<ClientTool>, tools: &[Value]) {
+    for tool in tools {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            for member in tool
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(name) = member.get("name").and_then(Value::as_str) {
+                    out.push(ClientTool::new(Some(namespace), name));
+                }
+            }
+            continue;
+        }
+        if let Some(name) = tool
+            .get("name")
+            .or_else(|| tool.pointer("/function/name"))
+            .and_then(Value::as_str)
+        {
+            out.push(ClientTool::new(None, name));
+        }
     }
 }
 
 fn is_provider_safe_tool_name(name: &str) -> bool {
+    if name.len() > MAX_UPSTREAM_TOOL_NAME_LEN {
+        return false;
+    }
     let mut chars = name.chars();
     if !matches!(chars.next(), Some(first) if first.is_ascii_alphabetic()) {
         return false;
@@ -3830,7 +4285,444 @@ fn sanitize_tool_name(name: &str) -> String {
     out
 }
 
+/// Every tool the request declares: the top-level `tools` and those of Codex
+/// `additional_tools` input items.
+fn responses_declared_tools(body: &Value) -> impl Iterator<Item = &Value> {
+    let top = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten();
+    let additional = body
+        .get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+        .filter_map(|item| item.get("tools").and_then(Value::as_array))
+        .flatten();
+    top.chain(additional)
+}
+
+/// OpenAI's hosted `web_search`, in any of its dated / preview spellings.
+fn is_responses_web_search(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"))
+}
+
+/// A `web_search` tool that does not ask for live web access.
+/// Only the GA `web_search` honours `external_web_access`; the preview
+/// versions ignore it and always search live.
+///
+/// This is not a request for live search: Codex declares it on every turn and
+/// flips the flag only for `--search` / `web_search = "live"`. Translation
+/// omits it (and logs that), the way the hosted ARC path omits it.
+fn is_responses_web_search_without_live_access(tool: &Value) -> bool {
+    tool.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search") && !kind.contains("preview"))
+        && tool.get("external_web_access").and_then(Value::as_bool) == Some(false)
+}
+
+/// A `web_search` tool that asks for live search, which translates to
+/// Anthropic's server tool.
+fn is_responses_live_web_search(tool: &Value) -> bool {
+    is_responses_web_search(tool) && !is_responses_web_search_without_live_access(tool)
+}
+
+/// Whether the request declares a `web_search` without live access, which
+/// translation omits.
+fn responses_declares_offline_web_search(body: &Value) -> bool {
+    responses_declared_tools(body).any(is_responses_web_search_without_live_access)
+}
+
+/// Where a Responses request is being translated to, for its tools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HostedToolTarget {
+    /// Anthropic Messages: OpenAI `web_search` has a native equivalent.
+    AnthropicMessages,
+    /// Chat Completions or the on-device adapter: no hosted tools at all.
+    NoHostedTools,
+}
+
+/// The type of `tool` when translation to `target` cannot carry it, `None`
+/// when it can.
+///
+/// This is an ALLOWLIST of the tool types the translation carries faithfully:
+/// `function` everywhere, a live `web_search` (any spelling) to Anthropic,
+/// and a `web_search` without live access, which is deliberately omitted
+/// ([`is_responses_web_search_without_live_access`]). Every other type, known
+/// or not, hosted or client-run, is refused rather than silently left out of
+/// the translated request: a model run without a tool the caller declared
+/// answers as if it did not exist.
+fn responses_unsupported_tool_type(tool: &Value, target: HostedToolTarget) -> Option<String> {
+    let Some(kind) = tool.get("type").and_then(Value::as_str) else {
+        return Some("(missing type)".to_owned());
+    };
+    let supported = match kind {
+        "function" => tool
+            .get("name")
+            .or_else(|| tool.pointer("/function/name"))
+            .is_some_and(Value::is_string),
+        "namespace" if target == HostedToolTarget::AnthropicMessages => {
+            return responses_malformed_namespace(tool)
+                .map(|problem| format!("namespace ({problem})"));
+        }
+        _ if is_responses_web_search_without_live_access(tool) => true,
+        _ if is_responses_web_search(tool) => target == HostedToolTarget::AnthropicMessages,
+        _ => false,
+    };
+    (!supported).then(|| match kind {
+        "function" => "function (without a name)".to_owned(),
+        kind => kind.to_owned(),
+    })
+}
+
+/// Why a `namespace` tool cannot be flattened into Anthropic functions
+/// without losing part of it, `None` when it can: it needs a name and a
+/// `tools` list whose members are all named functions. Anything else in it
+/// would be left out of the translated request.
+fn responses_malformed_namespace(tool: &Value) -> Option<&'static str> {
+    if tool
+        .get("name")
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Some("without a name");
+    }
+    let Some(members) = tool.get("tools").and_then(Value::as_array) else {
+        return Some("without a tools list");
+    };
+    members
+        .iter()
+        .any(|member| {
+            member.get("type").and_then(Value::as_str) != Some("function")
+                || !member.get("name").is_some_and(Value::is_string)
+        })
+        .then_some("with a member that is not a named function")
+}
+
+/// The declared tool types `target` cannot carry, each once. A non-empty
+/// answer is refused with `unsupported_tool` rather than forwarded without
+/// them.
+fn responses_untranslatable_tools(body: &Value, target: HostedToolTarget) -> Vec<String> {
+    let mut kinds: Vec<String> = Vec::new();
+    for kind in responses_declared_tools(body)
+        .filter_map(|tool| responses_unsupported_tool_type(tool, target))
+    {
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
+}
+
+/// Whether a function tool's `allowed_callers` lets the model call it
+/// directly. Omitted means `["direct"]`; `["programmatic"]` restricts it to
+/// code in a `program` item, which no translated route can run.
+fn responses_function_allows_direct_calls(tool: &Value) -> bool {
+    match tool.get("allowed_callers") {
+        None | Some(Value::Null) => true,
+        Some(callers) => callers
+            .as_array()
+            .is_some_and(|callers| callers.iter().any(|caller| caller == "direct")),
+    }
+}
+
+/// The declared functions the model may not call directly. Translated, they
+/// would become ordinary tools the model can call, lifting the restriction.
+/// Functions inside a `namespace` tool are named by their qualified name.
+fn responses_indirect_only_functions(body: &Value) -> Vec<String> {
+    let name_of = |tool: &Value| {
+        tool.get("name")
+            .or_else(|| tool.pointer("/function/name"))
+            .and_then(Value::as_str)
+            .unwrap_or("(unnamed)")
+            .to_owned()
+    };
+    let mut indirect = Vec::new();
+    for tool in responses_declared_tools(body) {
+        match tool.get("type").and_then(Value::as_str) {
+            Some("function") if !responses_function_allows_direct_calls(tool) => {
+                indirect.push(name_of(tool));
+            }
+            Some("namespace") => {
+                let namespace = tool.get("name").and_then(Value::as_str);
+                indirect.extend(
+                    responses_namespace_functions(tool)
+                        .filter(|member| !responses_function_allows_direct_calls(member))
+                        .map(|member| qualified_tool_name(namespace, &name_of(member))),
+                );
+            }
+            _ => {}
+        }
+    }
+    indirect
+}
+
+/// A 400 for a Responses request whose translation to `target` would drop or
+/// relax something the caller asked for, with its error code.
+fn responses_translation_refusal(
+    body: &Value,
+    target: HostedToolTarget,
+) -> Option<(&'static str, Response<BoxBody>)> {
+    let refused = responses_untranslatable_tools(body, target);
+    if !refused.is_empty() {
+        info!(
+            "local router: tool type(s) {} cannot be translated for this route",
+            refused.join(",")
+        );
+        return Some((
+            "unsupported_tool",
+            unsupported_tool_response(&refused, target),
+        ));
+    }
+    let indirect = responses_indirect_only_functions(body);
+    if !indirect.is_empty() {
+        return Some((
+            "unsupported_tool",
+            json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_tool",
+                    "param": "tools",
+                    "message": format!(
+                        "Rayline Local cannot keep the allowed_callers restriction of the \
+                         function(s) {}: translated, the model could call them directly. Allow \
+                         direct calls (\"direct\" in allowed_callers), or route to an endpoint \
+                         that serves the Responses API natively.",
+                        indirect.join(", ")
+                    ),
+                }}),
+            ),
+        ));
+    }
+    if target == HostedToolTarget::AnthropicMessages
+        && let Some(reason) = responses_web_search_refusal(body)
+    {
+        return Some((
+            "unsupported_web_search",
+            json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_web_search",
+                    "param": "tools",
+                    "message": format!(
+                        "Rayline Local cannot translate this web_search to Anthropic: {reason}"
+                    ),
+                }}),
+            ),
+        ));
+    }
+    if responses_required_tool_unavailable(body) {
+        return Some((
+            "required_tool_unavailable",
+            json_response(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {
+                    "type": "invalid_request_error",
+                    "code": "required_tool_unavailable",
+                    "param": "tool_choice",
+                    "message": "tool_choice requires a tool call this route cannot make: the \
+                                tool it forces, or every tool it permits, is not sent upstream \
+                                (a web_search without live access or with max_tool_calls 0 is \
+                                not, nor is an undeclared tool). Declare a tool the route can \
+                                run, or relax tool_choice.",
+                }}),
+            ),
+        ));
+    }
+    None
+}
+
+fn unsupported_tool_response(kinds: &[String], target: HostedToolTarget) -> Response<BoxBody> {
+    let names = kinds.join(", ");
+    let reason = match target {
+        HostedToolTarget::AnthropicMessages => {
+            "the configured route speaks Anthropic Messages, and only function, namespace (of functions) and web_search tools translate to it"
+        }
+        HostedToolTarget::NoHostedTools => {
+            "the configured route (Chat Completions or an on-device model) carries only function tools"
+        }
+    };
+    json_response(
+        StatusCode::BAD_REQUEST,
+        json!({"error": {
+            "type": "invalid_request_error",
+            "code": "unsupported_tool",
+            "param": "tools",
+            "message": format!(
+                "Rayline Local cannot translate the tool type(s) {names} for this route: {reason}. \
+                 Remove them from the request, or route to an endpoint that serves the Responses API natively."
+            ),
+        }}),
+    )
+}
+
+/// Anthropic's server web search tool. Its `name` is fixed by the API.
+const ANTHROPIC_WEB_SEARCH_TOOL_TYPE: &str = "web_search_20250305";
+const ANTHROPIC_WEB_SEARCH_TOOL_NAME: &str = "web_search";
+
+/// Whether the request declares a hosted `web_search` that asks for live
+/// access, which translates to Anthropic's server tool.
+fn responses_declares_live_web_search(body: &Value) -> bool {
+    responses_declared_tools(body).any(is_responses_live_web_search)
+}
+
+/// Why a request's `web_search` cannot be translated to Anthropic without
+/// losing what the caller asked for, if it cannot.
+fn responses_web_search_refusal(body: &Value) -> Option<&'static str> {
+    if responses_conflicting_web_search(body) {
+        return Some(
+            "the request declares web_search more than once with different settings, and \
+             Anthropic has a single search tool. Declare it once, or with identical settings.",
+        );
+    }
+    if responses_live_web_search_tools(body).any(|tool| {
+        ["allowed_domains", "blocked_domains"].iter().all(|key| {
+            tool.get("filters")
+                .and_then(|filters| filters.get(*key))
+                .and_then(Value::as_array)
+                .is_some_and(|list| !list.is_empty())
+        })
+    }) {
+        return Some(
+            "web_search sets both allowed_domains and blocked_domains, and Anthropic's search \
+             accepts only one of them. Set one list.",
+        );
+    }
+    let forces_search = body
+        .pointer("/tool_choice/type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"));
+    if forces_search && !responses_declares_live_web_search(body) {
+        return Some(
+            "tool_choice forces web_search, but no web_search with live access is declared, so \
+             there is no search tool to force. Declare web_search with live access, or choose \
+             another tool_choice.",
+        );
+    }
+    None
+}
+
+fn responses_live_web_search_tools(body: &Value) -> impl Iterator<Item = &Value> {
+    responses_declared_tools(body).filter(|tool| is_responses_live_web_search(tool))
+}
+
+/// Whether the request declares live `web_search` more than once with
+/// different settings. Upstream there is one search tool, and choosing one
+/// declaration could drop a domain filter the caller set on another.
+fn responses_conflicting_web_search(body: &Value) -> bool {
+    let mut searches = responses_live_web_search_tools(body).map(responses_web_search_to_anthropic);
+    let Some(first) = searches.next() else {
+        return false;
+    };
+    searches.any(|search| search != first)
+}
+
+/// OpenAI's hosted `web_search` (and its dated / preview spellings) as
+/// Anthropic's server tool. Domain filters and the approximate user location
+/// carry over; options with no Anthropic equivalent are left out.
+fn responses_web_search_to_anthropic(tool: &Value) -> Value {
+    let mut out = Map::new();
+    out.insert("type".to_owned(), json!(ANTHROPIC_WEB_SEARCH_TOOL_TYPE));
+    out.insert("name".to_owned(), json!(ANTHROPIC_WEB_SEARCH_TOOL_NAME));
+    for key in ["allowed_domains", "blocked_domains"] {
+        if let Some(domains) = tool
+            .get("filters")
+            .and_then(|filters| filters.get(key))
+            .filter(|domains| domains.as_array().is_some_and(|list| !list.is_empty()))
+        {
+            out.insert(key.to_owned(), domains.clone());
+        }
+    }
+    if let Some(location) = tool.get("user_location").and_then(Value::as_object) {
+        let mut mapped = Map::new();
+        mapped.insert("type".to_owned(), json!("approximate"));
+        for key in ["city", "region", "country", "timezone"] {
+            if let Some(value) = location.get(key).filter(|value| value.is_string()) {
+                mapped.insert(key.to_owned(), value.clone());
+            }
+        }
+        // Anthropic rejects a location with no fields; OpenAI accepts one.
+        if mapped.len() > 1 {
+            out.insert("user_location".to_owned(), Value::Object(mapped));
+        }
+    }
+    Value::Object(out)
+}
+
+/// One Responses tool as Anthropic tools: a `namespace` tool becomes one tool
+/// per member function, declared by its qualified name with the namespace's
+/// description first; anything else is [`responses_tool_to_anthropic`].
+fn responses_tools_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Vec<Value> {
+    if tool.get("type").and_then(Value::as_str) != Some("namespace") {
+        return responses_tool_to_anthropic(tool, rewrites)
+            .into_iter()
+            .collect();
+    }
+    let Some(namespace) = tool.get("name").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let namespace_description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    responses_namespace_functions(tool)
+        .filter_map(|member| {
+            let name = member.get("name").and_then(Value::as_str)?;
+            let own = member
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let description = match (namespace_description.is_empty(), own.is_empty()) {
+                (true, _) => own.to_owned(),
+                (false, true) => namespace_description.to_owned(),
+                (false, false) => format!("{namespace_description}\n\n{own}"),
+            };
+            Some(anthropic_function_tool(
+                rewrites.upstream(Some(namespace), name),
+                description,
+                member,
+            ))
+        })
+        .collect()
+}
+
+/// A client function as an Anthropic tool. A missing or `null` parameter
+/// schema becomes an empty object schema (Anthropic requires an object).
+///
+/// `strict` is not forwarded: Anthropic's strict mode rejects schema keywords
+/// OpenAI's accepts (numeric bounds, for one), so forwarding it would turn
+/// working tools into upstream 400s. Translating it safely is a follow-up.
+fn anthropic_function_tool(upstream_name: String, description: String, function: &Value) -> Value {
+    let parameters = function
+        .get("parameters")
+        .or_else(|| function.pointer("/function/parameters"))
+        .filter(|value| !value.is_null());
+    json!({
+        "name": upstream_name,
+        "description": description,
+        "input_schema": parameters
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+    })
+}
+
 fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Option<Value> {
+    if is_responses_web_search_without_live_access(tool) {
+        return None;
+    }
+    if tool
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"))
+    {
+        return Some(responses_web_search_to_anthropic(tool));
+    }
     if tool.get("type").and_then(Value::as_str) != Some("function") {
         return None;
     }
@@ -3843,16 +4735,11 @@ fn responses_tool_to_anthropic(tool: &Value, rewrites: &ToolNameRewrites) -> Opt
         .or_else(|| tool.pointer("/function/description"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    let input_schema = tool
-        .get("parameters")
-        .or_else(|| tool.pointer("/function/parameters"))
-        .cloned()
-        .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-    Some(json!({
-        "name": rewrites.upstream(name),
-        "description": description,
-        "input_schema": input_schema
-    }))
+    Some(anthropic_function_tool(
+        rewrites.upstream(None, name),
+        description.to_owned(),
+        tool,
+    ))
 }
 
 fn function_output_to_text(value: &Value) -> String {
@@ -4099,6 +4986,8 @@ fn is_empty_json_object(value: &Value) -> bool {
 struct AnthropicToolBlock {
     id: String,
     name: String,
+    /// The client namespace the function was declared in, if any.
+    namespace: Option<String>,
     input_json: String,
 }
 
@@ -4217,15 +5106,12 @@ impl AnthropicToResponsesTranslator {
                         .and_then(Value::as_str)
                         .unwrap_or("call_rayline")
                         .to_owned();
-                    let name = self
-                        .tool_names
-                        .client(
-                            value
-                                .pointer("/content_block/name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("tool"),
-                        )
-                        .to_owned();
+                    let (name, namespace) = self.tool_names.client_call(
+                        value
+                            .pointer("/content_block/name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("tool"),
+                    );
                     // Anthropic streams a `tool_use` block's arguments via
                     // `input_json_delta` fragments; the `input` on
                     // `content_block_start` is a placeholder (`{}`) that must not
@@ -4242,6 +5128,7 @@ impl AnthropicToResponsesTranslator {
                         AnthropicToolBlock {
                             id,
                             name,
+                            namespace,
                             input_json,
                         },
                     );
@@ -4295,7 +5182,7 @@ impl AnthropicToResponsesTranslator {
                         tool.input_json
                     };
                     let output_index = self.output.len();
-                    let item = json!({
+                    let mut item = json!({
                         "type": "function_call",
                         "id": tool.id,
                         "name": tool.name,
@@ -4303,6 +5190,9 @@ impl AnthropicToResponsesTranslator {
                         "call_id": tool.id,
                         "status": "completed",
                     });
+                    if let Some(namespace) = tool.namespace {
+                        item["namespace"] = json!(namespace);
+                    }
                     self.output.push(Some(item.clone()));
                     self.emit(
                         out,
@@ -4471,15 +5361,16 @@ fn synthetic_responses_sse(
     {
         match block.get("type").and_then(Value::as_str) {
             Some("tool_use") => {
+                let (name, namespace) = tool_names
+                    .client_call(block.get("name").and_then(Value::as_str).unwrap_or("tool"));
                 let tool = AnthropicToolBlock {
                     id: block
                         .get("id")
                         .and_then(Value::as_str)
                         .unwrap_or("call_rayline")
                         .to_owned(),
-                    name: tool_names
-                        .client(block.get("name").and_then(Value::as_str).unwrap_or("tool"))
-                        .to_owned(),
+                    name,
+                    namespace,
                     input_json: block
                         .get("input")
                         .cloned()
@@ -4588,17 +5479,22 @@ fn synthetic_response_items(
     {
         match block.get("type").and_then(Value::as_str) {
             Some("tool_use") if output_kind == SyntheticOutputKind::Message => {
-                output.push(json!({
+                let (name, namespace) = tool_names
+                    .client_call(block.get("name").and_then(Value::as_str).unwrap_or("tool"));
+                let mut item = json!({
                     "type": "function_call",
-                    "name": tool_names
-                        .client(block.get("name").and_then(Value::as_str).unwrap_or("tool")),
+                    "name": name,
                     "arguments": block
                         .get("input")
                         .cloned()
                         .unwrap_or_else(|| json!({}))
                         .to_string(),
                     "call_id": block.get("id").and_then(Value::as_str).unwrap_or("call_rayline"),
-                }));
+                });
+                if let Some(namespace) = namespace {
+                    item["namespace"] = json!(namespace);
+                }
+                output.push(item);
             }
             _ => {
                 if let Some(part) = block.get("text").and_then(Value::as_str)
@@ -5626,11 +6522,14 @@ mod tests {
 
     const GUARD_PORT: u16 = 20811;
 
-    fn guard_status(method: Method, uri: &str, headers: GuardHeaders) -> Option<StatusCode> {
+    fn guard_status(method: Method, uri: &str, headers: &[(&str, &str)]) -> Option<StatusCode> {
         let uri = uri.parse::<hyper::Uri>().unwrap();
         let mut map = HeaderMap::new();
         for (name, value) in headers {
-            map.append(*name, HeaderValue::from_static(value));
+            map.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
         }
         reject_untrusted_request(GUARD_PORT, &method, &uri, &map).map(|response| response.status())
     }
@@ -5764,6 +6663,92 @@ mod tests {
             guard_status(Method::GET, "http://evil.example:20811/healthz", &[]),
             Some(StatusCode::MISDIRECTED_REQUEST)
         );
+    }
+
+    #[test]
+    fn request_guard_rejects_repeated_or_conflicting_headers() {
+        const HOST: (&str, &str) = ("host", "127.0.0.1:20811");
+        const JSON: (&str, &str) = ("content-type", "application/json");
+        const LOOPBACK_ORIGIN: (&str, &str) = ("origin", "http://127.0.0.1:20811");
+        let cases: &[(GuardHeaders, StatusCode)] = &[
+            // A second Host the first-value check never looked at.
+            (
+                &[HOST, ("host", "evil.example:20811"), JSON],
+                StatusCode::MISDIRECTED_REQUEST,
+            ),
+            (&[HOST, HOST, JSON], StatusCode::MISDIRECTED_REQUEST),
+            // A loopback Origin followed by a cross-site or opaque one.
+            (
+                &[
+                    HOST,
+                    JSON,
+                    LOOPBACK_ORIGIN,
+                    ("origin", "https://evil.example"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &[HOST, JSON, LOOPBACK_ORIGIN, ("origin", "null")],
+                StatusCode::FORBIDDEN,
+            ),
+            // JSON followed by a CORS "simple" type.
+            (
+                &[HOST, JSON, ("content-type", "text/plain")],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (&[HOST, JSON, JSON], StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ];
+        for (headers, expected) in cases {
+            assert_eq!(
+                guard_status(Method::POST, "/v1/messages", headers),
+                Some(*expected),
+                "{headers:?}"
+            );
+        }
+        assert_eq!(
+            guard_status(
+                Method::GET,
+                "/healthz",
+                &[HOST, ("content-type", "text/plain"), JSON]
+            ),
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+    }
+
+    #[test]
+    fn request_guard_requires_uri_authority_and_host_to_agree() {
+        const URI: &str = "http://127.0.0.1:20811/v1/messages";
+        const JSON: (&str, &str) = ("content-type", "application/json");
+        for host in ["evil.example:20811", "localhost:20811", "127.0.0.1:20812"] {
+            assert_eq!(
+                guard_status(Method::POST, URI, &[("host", host), JSON]),
+                Some(StatusCode::MISDIRECTED_REQUEST),
+                "{host}"
+            );
+        }
+        // A rebound authority is refused even with a loopback Host header.
+        assert_eq!(
+            guard_status(
+                Method::POST,
+                "http://evil.example:20811/v1/messages",
+                &[("host", "127.0.0.1:20811"), JSON]
+            ),
+            Some(StatusCode::MISDIRECTED_REQUEST)
+        );
+        // Agreeing authority and Host (case-insensitive) pass, as does either alone.
+        assert_eq!(
+            guard_status(Method::POST, URI, &[("host", "127.0.0.1:20811"), JSON]),
+            None
+        );
+        assert_eq!(
+            guard_status(
+                Method::POST,
+                "http://LOCALHOST:20811/v1/messages",
+                &[("host", "localhost:20811"), JSON]
+            ),
+            None
+        );
+        assert_eq!(guard_status(Method::POST, URI, &[JSON]), None);
     }
 
     #[test]
@@ -5997,6 +6982,39 @@ mod tests {
         let explore = config.routes.subagents.get("Explore").unwrap();
         assert_eq!(explore.endpoint, "local");
         assert_eq!(explore.model, "local-model");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn replace_defaults_config_drops_built_in_endpoints_and_routes() {
+        let path = std::env::temp_dir().join(format!(
+            "rayline-local-router-replace-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"{"replace_defaults":true,
+                "endpoints":[{"id":"arc","protocol":"anthropic_messages",
+                              "base_url":"https://api.rayline.ai","models":["arc-sage"]}],
+                "routes":{"main":{"endpoint":"arc","model":"arc-sage"}}}"#,
+        )
+        .unwrap();
+        let opts = LocalRouterOptions {
+            config_path: Some(path.clone()),
+            ..LocalRouterOptions::default()
+        };
+
+        let config = load_config(&opts).unwrap();
+
+        let ids: Vec<&str> = config.endpoints.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["arc"]);
+        assert!(config.routes.subagent.is_none());
+        assert!(route_direct_model(&config, "claude-sonnet-5").is_none());
+        assert!(route_direct_model(&config, "gpt-5.5").is_none());
         let _ = fs::remove_file(path);
     }
 
@@ -6461,9 +7479,15 @@ mod tests {
             names[0].as_str()
         );
         // ...and the round trip restores exactly what the client declared.
-        assert_eq!(rewrites.client(&names[0]), "codex.list_resource_templates");
-        assert_eq!(rewrites.client(&names[1]), "codex/list_resource_templates");
-        assert_eq!(rewrites.client("shell"), "shell");
+        assert_eq!(
+            rewrites.client_call(&names[0]).0,
+            "codex.list_resource_templates"
+        );
+        assert_eq!(
+            rewrites.client_call(&names[1]).0,
+            "codex/list_resource_templates"
+        );
+        assert_eq!(rewrites.client_call("shell").0, "shell");
     }
 
     #[test]
@@ -6487,7 +7511,7 @@ mod tests {
             "claude-test",
         );
         let upstream_name = rewrites
-            .upstream("codex.list_resource_templates")
+            .upstream(None, "codex.list_resource_templates")
             .to_owned();
         assert_ne!(upstream_name, "codex.list_resource_templates");
 
@@ -6519,7 +7543,7 @@ mod tests {
             "claude-test",
         );
         let upstream_name = rewrites
-            .upstream("codex.list_resource_templates")
+            .upstream(None, "codex.list_resource_templates")
             .to_owned();
         let mut translator = AnthropicToResponsesTranslator::new(
             "resp_test".to_owned(),
@@ -6551,6 +7575,946 @@ mod tests {
 
         assert!(out.contains("\"name\":\"codex.list_resource_templates\""));
         assert!(!out.contains(&format!("\"name\":\"{upstream_name}\"")));
+    }
+
+    fn upstream_tool_names(converted: &Value) -> Vec<String> {
+        converted["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// Flattening namespaces into `namespace__function` names can make two
+    /// distinct client tools share one name. Each must get its own upstream
+    /// name, and each upstream name must map back to exactly the tool the
+    /// client declared.
+    #[test]
+    fn flattened_namespace_names_never_collide_upstream() {
+        let namespace = |name: &str, function: &str| {
+            json!({"type": "namespace", "name": name,
+                   "tools": [{"type": "function", "name": function}]})
+        };
+        let cases = [
+            // A top-level `a__b` next to function `b` in namespace `a`.
+            (
+                json!([{"type": "function", "name": "a__b"}, namespace("a", "b")]),
+                [("a__b", None), ("b", Some("a"))],
+            ),
+            // Namespace pairs that flatten to the same name.
+            (
+                json!([namespace("a__b", "c"), namespace("a", "b__c")]),
+                [("c", Some("a__b")), ("b__c", Some("a"))],
+            ),
+            // Names that collide only after sanitizing.
+            (
+                json!([namespace("a.b", "c"), {"type": "function", "name": "a_b__c"}]),
+                [("c", Some("a.b")), ("a_b__c", None)],
+            ),
+        ];
+        for (tools, expected) in cases {
+            let (converted, rewrites) =
+                responses_to_anthropic_request(&json!({"input": "x", "tools": tools}), "m");
+            let names = upstream_tool_names(&converted);
+            assert_eq!(names.len(), 2, "{names:?}");
+            assert_ne!(names[0], names[1], "{tools}");
+            for name in &names {
+                assert!(is_provider_safe_tool_name(name), "{name}");
+            }
+            let restored: HashSet<(String, Option<String>)> = names
+                .iter()
+                .map(|name| rewrites.client_call(name))
+                .collect();
+            let expected: HashSet<(String, Option<String>)> = expected
+                .iter()
+                .map(|(name, namespace)| ((*name).to_owned(), namespace.map(str::to_owned)))
+                .collect();
+            assert_eq!(restored, expected, "{tools}");
+        }
+    }
+
+    /// Anthropic requires an object `input_schema`, so a `null` parameter
+    /// schema must not pass through, inside a namespace or outside one.
+    /// `strict` is not forwarded (Anthropic's strict mode rejects schemas
+    /// OpenAI's accepts).
+    #[test]
+    fn function_tools_always_send_an_object_schema() {
+        let strict_schema = json!({"type": "object", "properties": {"n": {"type": "integer"}},
+                                   "required": ["n"], "additionalProperties": false});
+        let (converted, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [
+                {"type": "namespace", "name": "agent", "tools": [
+                    {"type": "function", "name": "ping", "parameters": null},
+                    {"type": "function", "name": "count", "strict": true,
+                     "parameters": strict_schema}
+                ]},
+                {"type": "function", "name": "shell", "strict": false, "parameters": null}
+            ]}),
+            "m",
+        );
+        let empty = json!({"type": "object", "properties": {}});
+        let tools = converted["tools"].as_array().expect("tools");
+        assert_eq!(tools[0]["input_schema"], empty);
+        assert!(tools[0].get("strict").is_none());
+        assert_eq!(tools[1]["input_schema"], strict_schema);
+        assert!(tools[1].get("strict").is_none());
+        assert_eq!(tools[2]["input_schema"], empty);
+        assert!(tools[2].get("strict").is_none());
+    }
+
+    /// A 64-character namespace plus a 64-character function made a 130
+    /// character name, which the upstream rejects. Every upstream name fits
+    /// the 64-character limit, distinct long names stay distinct, and the
+    /// round trip is exact, for replayed calls too.
+    #[test]
+    fn long_tool_names_fit_the_upstream_limit() {
+        let long_namespace = "n".repeat(64);
+        let long_function = "f".repeat(64);
+        let longer_function = format!("{long_function}x");
+        let long_top_level = "t".repeat(70);
+        let request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "go"},
+                {"type": "function_call", "call_id": "call_0", "name": long_function,
+                 "namespace": long_namespace, "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_0", "output": "ok"}
+            ],
+            "tools": [
+                {"type": "namespace", "name": long_namespace, "tools": [
+                    {"type": "function", "name": long_function},
+                    {"type": "function", "name": longer_function}
+                ]},
+                {"type": "function", "name": long_top_level}
+            ]
+        });
+        let (converted, rewrites) = responses_to_anthropic_request(&request, "m");
+        let names = upstream_tool_names(&converted);
+        assert_eq!(names.len(), 3, "{names:?}");
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), 3, "{names:?}");
+        for name in &names {
+            assert!(name.len() <= MAX_UPSTREAM_TOOL_NAME_LEN, "{name}");
+            assert!(is_provider_safe_tool_name(name), "{name}");
+        }
+        assert_eq!(
+            rewrites.client_call(&names[0]),
+            (long_function.clone(), Some(long_namespace.clone()))
+        );
+        assert_eq!(
+            rewrites.client_call(&names[1]),
+            (longer_function, Some(long_namespace))
+        );
+        assert_eq!(rewrites.client_call(&names[2]), (long_top_level, None));
+        // The replayed call uses the same shortened name as its declaration.
+        assert_eq!(converted["messages"][1]["content"][0]["name"], names[0]);
+    }
+
+    /// Codex 0.163 declares its sub-agent functions inside a `namespace` tool
+    /// (`multi_agent_v1`). They used to be dropped on the way to an Anthropic
+    /// upstream, so sub-agents silently did not exist. They must be declared
+    /// by qualified name, replayed calls must use it, and a call that comes
+    /// back must carry the client's function name and namespace again.
+    #[test]
+    fn responses_namespace_tools_round_trip_through_anthropic() {
+        let request = json!({
+            "model": "arc-swift",
+            "input": [
+                {"type": "message", "role": "user", "content": "spawn a helper"},
+                {"type": "function_call", "call_id": "call_0", "name": "spawn_agent",
+                 "namespace": "multi_agent_v1", "arguments": "{\"message\":\"hi\"}"},
+                {"type": "function_call_output", "call_id": "call_0", "output": "agent-1"}
+            ],
+            "tools": [
+                {"type": "function", "name": "shell",
+                 "parameters": {"type": "object", "properties": {}}},
+                {"type": "namespace", "name": "multi_agent_v1",
+                 "description": "Tools for spawning and managing sub-agents.",
+                 "tools": [
+                     {"type": "function", "name": "spawn_agent", "description": "Spawn a sub-agent.",
+                      "parameters": {"type": "object",
+                                     "properties": {"message": {"type": "string"}}}},
+                     {"type": "function", "name": "wait_agent", "description": "",
+                      "parameters": {"type": "object", "properties": {}}}
+                 ]}
+            ]
+        });
+        let (converted, rewrites) = responses_to_anthropic_request(&request, "arc-swift");
+        let names: Vec<&str> = converted["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "shell",
+                "multi_agent_v1__spawn_agent",
+                "multi_agent_v1__wait_agent"
+            ]
+        );
+        let spawn = &converted["tools"][1];
+        assert_eq!(
+            spawn["description"],
+            "Tools for spawning and managing sub-agents.\n\nSpawn a sub-agent."
+        );
+        assert_eq!(
+            spawn["input_schema"]["properties"]["message"]["type"],
+            "string"
+        );
+        assert_eq!(
+            converted["tools"][2]["description"],
+            "Tools for spawning and managing sub-agents."
+        );
+        // The replayed call uses the qualified name.
+        let replayed = converted["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .flat_map(|message| message["content"].as_array().into_iter().flatten())
+            .find(|block| block["type"] == "tool_use")
+            .expect("replayed tool_use");
+        assert_eq!(replayed["name"], "multi_agent_v1__spawn_agent");
+
+        // A streamed call comes back under the client's name and namespace.
+        let mut translator = AnthropicToResponsesTranslator::new(
+            "resp_test".to_owned(),
+            "arc-swift".to_owned(),
+            1,
+            SyntheticOutputKind::Message,
+            rewrites.clone(),
+        );
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,
+                   "content_block":{"type":"tool_use","id":"call_1",
+                                    "name":"multi_agent_v1__wait_agent","input":{}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        );
+        let out = translator.push_bytes(upstream.as_bytes());
+        assert!(out.contains("\"name\":\"wait_agent\""), "{out}");
+        assert!(out.contains("\"namespace\":\"multi_agent_v1\""), "{out}");
+        assert!(!out.contains("multi_agent_v1__wait_agent"), "{out}");
+        // Non-namespaced tools are unchanged.
+        assert_eq!(rewrites.client_call("shell"), ("shell".to_owned(), None));
+
+        // The non-streaming path restores it the same way.
+        let items = synthetic_response_items(
+            &json!({"content": [{"type": "tool_use", "id": "call_2",
+                                 "name": "multi_agent_v1__spawn_agent", "input": {}}]}),
+            SyntheticOutputKind::Message,
+            &rewrites,
+        );
+        assert_eq!(items[0]["name"], "spawn_agent");
+        assert_eq!(items[0]["namespace"], "multi_agent_v1");
+    }
+
+    /// Codex `web_search = "live"` declares the hosted `{type: "web_search"}`
+    /// tool. The Anthropic translation used to drop every non-function tool,
+    /// so the model answered that it had no search tool. It must arrive as
+    /// Anthropic's server tool, with its domain filter and location.
+    #[test]
+    fn responses_web_search_translates_to_anthropic_server_tool() {
+        let request = json!({
+            "model": "arc-swift",
+            "input": "What changed in Rust 1.88?",
+            "tools": [
+                {"type": "function", "name": "shell",
+                 "parameters": {"type": "object", "properties": {}}},
+                {"type": "web_search",
+                 "filters": {"allowed_domains": ["blog.rust-lang.org"]},
+                 "user_location": {"type": "approximate", "country": "US", "city": "Austin"}},
+            ]
+        });
+        let (converted, _rewrites) = responses_to_anthropic_request(&request, "arc-swift");
+        let tools = converted["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 2, "{tools:?}");
+        let search = tools
+            .iter()
+            .find(|tool| tool["type"] == "web_search_20250305")
+            .expect("web_search must not be dropped");
+        assert_eq!(search["name"], "web_search");
+        assert_eq!(search["allowed_domains"], json!(["blog.rust-lang.org"]));
+        assert_eq!(
+            search["user_location"],
+            json!({"type": "approximate", "country": "US", "city": "Austin"})
+        );
+        // Codex declares web_search with external_web_access=false on every
+        // turn; that is not a request for live search and is omitted.
+        let (offline, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "web_search", "external_web_access": false}
+            ]}),
+            "arc-swift",
+        );
+        assert_eq!(
+            offline["tools"].as_array().map(Vec::len),
+            Some(1),
+            "{offline}"
+        );
+        assert_eq!(offline["tools"][0]["name"], "shell");
+        let (live, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [{"type": "web_search", "external_web_access": true}]}),
+            "arc-swift",
+        );
+        assert_eq!(live["tools"][0]["type"], "web_search_20250305");
+        // Preview spellings translate the same way.
+        let (preview, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [{"type": "web_search_preview"}]}),
+            "arc-swift",
+        );
+        assert_eq!(
+            preview["tools"],
+            json!([{"type": "web_search_20250305", "name": "web_search"}])
+        );
+    }
+
+    /// The hosted `web_search` is declared upstream under Anthropic's fixed
+    /// name `web_search`. A client function of the same name used to be sent
+    /// alongside it, and the upstream rejects duplicate tool names. The client
+    /// function is renamed upstream and restored on the way back.
+    #[test]
+    fn client_function_named_web_search_does_not_collide_with_hosted_search() {
+        let request = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": "look it up"},
+                {"type": "function_call", "call_id": "call_0", "name": "web_search",
+                 "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_0", "output": "ok"},
+                {"type": "additional_tools", "tools": [{"type": "web_search"}]}
+            ],
+            "tools": [
+                {"type": "function", "name": "web_search",
+                 "parameters": {"type": "object", "properties": {}}},
+                {"type": "function", "name": "web_search_2",
+                 "parameters": {"type": "object", "properties": {}}},
+                {"type": "web_search"}
+            ],
+            "tool_choice": {"type": "function", "name": "web_search"}
+        });
+        let (converted, rewrites) = responses_to_anthropic_request(&request, "arc-swift");
+        let tools = converted["tools"].as_array().expect("tools");
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        let unique: HashSet<&str> = names.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "duplicate upstream names: {names:?}"
+        );
+        // One server tool, though web_search is declared twice.
+        assert_eq!(
+            tools
+                .iter()
+                .filter(|tool| tool["type"] == ANTHROPIC_WEB_SEARCH_TOOL_TYPE)
+                .count(),
+            1
+        );
+        let client_search = tools
+            .iter()
+            .find(|tool| tool.get("input_schema").is_some() && tool["name"] != "web_search_2")
+            .expect("client web_search function");
+        let upstream = client_search["name"].as_str().expect("name");
+        assert_ne!(upstream, "web_search");
+        assert_eq!(rewrites.client_call(upstream).0, "web_search");
+        assert_eq!(rewrites.client_call("web_search_2").0, "web_search_2");
+        // The replayed call and the forced choice use the renamed function.
+        assert_eq!(converted["messages"][1]["content"][0]["name"], upstream);
+        assert_eq!(
+            converted["tool_choice"],
+            json!({"type": "tool", "name": upstream, "disable_parallel_tool_use": true})
+        );
+
+        // Without live search there is no server tool, so the name is free.
+        let (offline, offline_rewrites) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [
+                {"type": "function", "name": "web_search"},
+                {"type": "web_search", "external_web_access": false}
+            ]}),
+            "arc-swift",
+        );
+        assert_eq!(offline["tools"][0]["name"], "web_search");
+        assert_eq!(offline_rewrites.client_call("web_search").0, "web_search");
+    }
+
+    /// `tool_choice` used to be dropped, so `none` became Anthropic's default
+    /// `auto` and the model could call a tool (or search) the caller ruled out.
+    #[test]
+    fn responses_tool_choice_translates_to_anthropic() {
+        let choice_for = |choice: Value| {
+            let (converted, _) = responses_to_anthropic_request(
+                &json!({"input": "x", "tool_choice": choice, "tools": [
+                    {"type": "function", "name": "shell"},
+                    {"type": "function", "name": "codex.list"},
+                    {"type": "web_search"}
+                ]}),
+                "arc-swift",
+            );
+            converted.get("tool_choice").cloned()
+        };
+        assert_eq!(choice_for(json!("none")), Some(json!({"type": "none"})));
+        assert_eq!(choice_for(json!("auto")), Some(json!({"type": "auto"})));
+        assert_eq!(choice_for(json!("required")), Some(json!({"type": "any"})));
+        // A forced tool is called exactly once.
+        assert_eq!(
+            choice_for(json!({"type": "function", "name": "shell"})),
+            Some(json!({"type": "tool", "name": "shell", "disable_parallel_tool_use": true}))
+        );
+        // A rewritten function name is forced by its upstream name.
+        assert_eq!(
+            choice_for(json!({"type": "function", "name": "codex.list"})),
+            Some(json!({"type": "tool", "name": "codex_list", "disable_parallel_tool_use": true}))
+        );
+        assert_eq!(
+            choice_for(json!({"type": "web_search_preview"})),
+            Some(json!({"type": "tool", "name": "web_search", "disable_parallel_tool_use": true}))
+        );
+        // No Anthropic equivalent: left at the default.
+        assert_eq!(choice_for(json!({"type": "custom", "name": "x"})), None);
+        // parallel_tool_calls: false allows one call per turn.
+        let (serial, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "parallel_tool_calls": false,
+                    "tools": [{"type": "function", "name": "shell"}]}),
+            "arc-swift",
+        );
+        assert_eq!(
+            serial["tool_choice"],
+            json!({"type": "auto", "disable_parallel_tool_use": true})
+        );
+        // A required call with nothing left to call is refused, not dropped.
+        let nothing_permitted = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "web_search", "external_web_access": false}
+        ], "tool_choice": {"type": "allowed_tools", "mode": "required",
+                           "tools": [{"type": "web_search"}]}});
+        assert!(responses_required_tool_unavailable(&nothing_permitted));
+        let permitted = json!({"input": "x", "tools": [{"type": "function", "name": "shell"}],
+                               "tool_choice": "required"});
+        assert!(!responses_required_tool_unavailable(&permitted));
+        let forced = json!({"input": "x", "tools": [{"type": "function", "name": "shell"}],
+                            "tool_choice": {"type": "function", "name": "shell"}});
+        assert!(!responses_required_tool_unavailable(&forced));
+        // A forced tool that does not survive translation is refused even
+        // when other tools remain: a custom tool, a zero-budget search, or an
+        // undeclared function.
+        for choice in [
+            json!({"type": "custom", "name": "execute"}),
+            json!({"type": "web_search_preview"}),
+            json!({"type": "function", "name": "missing"}),
+        ] {
+            let request = json!({"input": "x", "max_tool_calls": 0, "tool_choice": choice,
+                "tools": [{"type": "custom", "name": "execute"},
+                          {"type": "web_search_preview"},
+                          {"type": "function", "name": "shell"}]});
+            assert!(responses_required_tool_unavailable(&request), "{choice}");
+        }
+        // A forced function is not satisfied by the hosted search that shares
+        // its upstream name.
+        let function_named_search = json!({"input": "x", "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "function", "name": "web_search"}});
+        assert!(responses_required_tool_unavailable(&function_named_search));
+        let forced_search = json!({"input": "x", "tools": [{"type": "web_search"}],
+            "tool_choice": {"type": "web_search"}});
+        assert!(!responses_required_tool_unavailable(&forced_search));
+        let declared_function = json!({"input": "x", "tools": [
+            {"type": "web_search"}, {"type": "function", "name": "web_search"}
+        ], "tool_choice": {"type": "function", "name": "web_search"}});
+        assert!(!responses_required_tool_unavailable(&declared_function));
+        // An upstream alias is not a declared name: with live search, the
+        // client's `web_search` function goes upstream as `web_search_2`, and
+        // permitting or forcing `web_search_2` must not reach it.
+        let aliased_tools = json!([
+            {"type": "web_search"},
+            {"type": "function", "name": "web_search"},
+            {"type": "function", "name": "shell"}
+        ]);
+        let (alias_permitted, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": aliased_tools, "tool_choice": {
+                "type": "allowed_tools", "mode": "auto",
+                "tools": [{"type": "function", "name": "web_search_2"},
+                          {"type": "function", "name": "shell"}]}}),
+            "arc-swift",
+        );
+        let names: Vec<&str> = alias_permitted["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["shell"]);
+        let alias_forced = json!({"input": "x", "tools": aliased_tools,
+            "tool_choice": {"type": "function", "name": "web_search_2"}});
+        assert!(responses_required_tool_unavailable(&alias_forced));
+        // Every route refuses a required call it cannot make, not only
+        // Anthropic.
+        let nothing_left = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "web_search", "external_web_access": false}
+        ], "tool_choice": {"type": "allowed_tools", "mode": "required",
+                           "tools": [{"type": "web_search"}]}});
+        assert_eq!(
+            responses_translation_refusal(&nothing_left, HostedToolTarget::NoHostedTools)
+                .map(|(code, _)| code),
+            Some("required_tool_unavailable")
+        );
+        // Forcing a search that was not declared live would name a missing tool.
+        let (offline, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tool_choice": {"type": "web_search"}, "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "web_search", "external_web_access": false}
+            ]}),
+            "arc-swift",
+        );
+        assert!(offline.get("tool_choice").is_none(), "{offline}");
+        // No tools upstream: no tool_choice either.
+        let (no_tools, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tool_choice": "none"}),
+            "arc-swift",
+        );
+        assert!(no_tools.get("tool_choice").is_none(), "{no_tools}");
+    }
+
+    /// Restrictions the caller set on tools must survive translation:
+    /// `allowed_tools` limits what may be called, search domain blocklists and
+    /// `max_tool_calls` limit the search, and differing search declarations
+    /// are refused rather than resolved by dropping one.
+    #[test]
+    fn responses_tool_restrictions_survive_anthropic_translation() {
+        let tools = json!([
+            {"type": "function", "name": "read_record"},
+            {"type": "function", "name": "delete_record"},
+            {"type": "function", "name": "codex.list"},
+            {"type": "web_search"}
+        ]);
+        let (subset, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": tools, "tool_choice": {
+                "type": "allowed_tools", "mode": "required",
+                "tools": [{"type": "function", "name": "read_record"},
+                          {"type": "function", "name": "codex.list"}]}}),
+            "arc-swift",
+        );
+        let names: Vec<&str> = subset["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["read_record", "codex_list"]);
+        assert_eq!(subset["tool_choice"], json!({"type": "any"}));
+
+        let (search, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "max_tool_calls": 2, "tools": [
+                {"type": "web_search", "filters": {"blocked_domains": ["example.com"]}}
+            ]}),
+            "arc-swift",
+        );
+        assert_eq!(
+            search["tools"],
+            json!([{"type": "web_search_20250305", "name": "web_search",
+                    "blocked_domains": ["example.com"], "max_uses": 2}])
+        );
+        let (no_calls, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "max_tool_calls": 0, "tools": [
+                {"type": "function", "name": "shell"}, {"type": "web_search"}
+            ]}),
+            "arc-swift",
+        );
+        assert_eq!(no_calls["tools"].as_array().map(Vec::len), Some(1));
+
+        let filtered = json!({"type": "web_search",
+                              "filters": {"allowed_domains": ["blog.rust-lang.org"]}});
+        let conflicting = json!({
+            "input": [{"type": "additional_tools", "tools": [{"type": "web_search"}]}],
+            "tools": [filtered]
+        });
+        assert!(responses_conflicting_web_search(&conflicting));
+        let repeated = json!({
+            "input": [{"type": "additional_tools", "tools": [filtered]}],
+            "tools": [filtered, {"type": "web_search", "external_web_access": false}]
+        });
+        assert!(!responses_conflicting_web_search(&repeated));
+        assert!(responses_web_search_refusal(&conflicting).is_some());
+        assert!(responses_web_search_refusal(&repeated).is_none());
+        // Anthropic accepts only one domain list.
+        let both_lists = json!({"tools": [{"type": "web_search", "filters": {
+            "allowed_domains": ["example.com"], "blocked_domains": ["private.example.com"]}}]});
+        assert!(responses_web_search_refusal(&both_lists).is_some());
+        // Forcing a search that is not declared live has nothing to force.
+        let forced_offline = json!({"tool_choice": {"type": "web_search"}, "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "web_search", "external_web_access": false}
+        ]});
+        assert!(responses_web_search_refusal(&forced_offline).is_some());
+
+        // Permitting the hosted search never permits a client function that
+        // is named web_search.
+        let (search_only, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [
+                {"type": "function", "name": "web_search"},
+                {"type": "web_search", "external_web_access": false}
+            ], "tool_choice": {"type": "allowed_tools", "mode": "auto",
+                               "tools": [{"type": "web_search"}]}}),
+            "arc-swift",
+        );
+        assert!(search_only.get("tools").is_none(), "{search_only}");
+
+        // Preview versions ignore external_web_access and search live; an
+        // empty location is left out (Anthropic rejects it).
+        let (preview, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": [{"type": "web_search_preview",
+                    "external_web_access": false,
+                    "user_location": {"type": "approximate"}}]}),
+            "arc-swift",
+        );
+        assert_eq!(
+            preview["tools"],
+            json!([{"type": "web_search_20250305", "name": "web_search"}])
+        );
+
+        // Shell and tool search have no translation, whether OpenAI or the
+        // client runs them.
+        let shells = json!({"tools": [
+            {"type": "shell", "environment": {"type": "container_auto"}},
+            {"type": "shell", "environment": {"type": "local"}},
+            {"type": "tool_search"},
+            {"type": "tool_search", "execution": "client"}
+        ]});
+        assert_eq!(
+            responses_untranslatable_tools(&shells, HostedToolTarget::AnthropicMessages),
+            vec!["shell".to_owned(), "tool_search".to_owned()]
+        );
+    }
+
+    #[test]
+    fn hosted_tools_without_an_equivalent_are_refused_not_dropped() {
+        let request = json!({
+            "input": [
+                {"type": "additional_tools", "role": "developer",
+                 "tools": [{"type": "code_interpreter", "container": {"type": "auto"}}]},
+                {"type": "message", "role": "user", "content": "hi"}
+            ],
+            "tools": [
+                {"type": "web_search"},
+                {"type": "file_search", "vector_store_ids": ["vs_1"]},
+                {"type": "function", "name": "shell"},
+                {"type": "web_search"}
+            ]
+        });
+        assert_eq!(
+            responses_untranslatable_tools(&request, HostedToolTarget::AnthropicMessages),
+            vec!["file_search".to_owned(), "code_interpreter".to_owned()]
+        );
+        assert_eq!(
+            responses_untranslatable_tools(&request, HostedToolTarget::NoHostedTools),
+            vec![
+                "web_search".to_owned(),
+                "file_search".to_owned(),
+                "code_interpreter".to_owned()
+            ]
+        );
+        // Codex's default (no live access) is never refused, on any route.
+        let codex_default = json!({"tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "web_search", "external_web_access": false}
+        ]});
+        assert!(
+            responses_untranslatable_tools(&codex_default, HostedToolTarget::NoHostedTools)
+                .is_empty()
+        );
+        assert!(responses_declares_offline_web_search(&codex_default));
+        let plain = json!({"tools": [{"type": "function", "name": "shell"}]});
+        assert!(responses_untranslatable_tools(&plain, HostedToolTarget::NoHostedTools).is_empty());
+    }
+
+    /// Only the tool types the translation carries pass; any other type,
+    /// including ones this translator has never heard of, is refused whether
+    /// tool_choice is automatic or forces it, never silently left out.
+    #[test]
+    fn tool_types_outside_the_allowlist_are_refused_not_dropped() {
+        let refusal_code = |request: &Value, target| {
+            responses_translation_refusal(request, target).map(|(code, _)| code)
+        };
+        for kind in [
+            "made_up_tool_2031",
+            "computer",
+            "computer_use_preview",
+            "programmatic_tool_calling",
+            "custom",
+            "local_shell",
+            "apply_patch",
+        ] {
+            let tools = json!([{"type": "function", "name": "shell"},
+                               {"type": kind, "name": "x"}]);
+            for tool_choice in [json!("auto"), json!({"type": kind, "name": "x"})] {
+                let request = json!({"input": "x", "tools": tools, "tool_choice": tool_choice});
+                for target in [
+                    HostedToolTarget::AnthropicMessages,
+                    HostedToolTarget::NoHostedTools,
+                ] {
+                    assert_eq!(
+                        refusal_code(&request, target),
+                        Some("unsupported_tool"),
+                        "{kind} {tool_choice} {target:?}"
+                    );
+                }
+            }
+            // Declared through Codex `additional_tools` too.
+            let additional = json!({"input": [
+                {"type": "additional_tools", "tools": [{"type": kind}]}
+            ]});
+            assert_eq!(
+                responses_untranslatable_tools(&additional, HostedToolTarget::AnthropicMessages),
+                vec![kind.to_owned()]
+            );
+        }
+        // A tool without a type, or a function without a name, has nothing
+        // to translate to either.
+        let malformed = json!({"tools": [{"name": "x"}, {"type": "function"}]});
+        assert_eq!(
+            responses_untranslatable_tools(&malformed, HostedToolTarget::AnthropicMessages),
+            vec![
+                "(missing type)".to_owned(),
+                "function (without a name)".to_owned()
+            ]
+        );
+
+        // The supported tools still pass.
+        let supported = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "function", "function": {"name": "nested"}},
+            {"type": "function", "name": "both", "allowed_callers": ["direct", "programmatic"]},
+            {"type": "web_search", "external_web_access": false},
+            {"type": "web_search_preview"}
+        ]});
+        assert!(refusal_code(&supported, HostedToolTarget::AnthropicMessages).is_none());
+        let functions_only = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell", "allowed_callers": ["direct"]},
+            {"type": "web_search", "external_web_access": false}
+        ]});
+        assert!(refusal_code(&functions_only, HostedToolTarget::NoHostedTools).is_none());
+    }
+
+    /// A function the model may not call directly would become an ordinary
+    /// tool once translated, so it is refused.
+    #[test]
+    fn functions_the_model_may_not_call_directly_are_refused() {
+        for callers in [json!(["programmatic"]), json!([]), json!("direct")] {
+            let request = json!({"input": "x", "tools": [
+                {"type": "function", "name": "shell"},
+                {"type": "function", "name": "delete_all", "allowed_callers": callers}
+            ]});
+            assert_eq!(
+                responses_indirect_only_functions(&request),
+                vec!["delete_all".to_owned()],
+                "{callers}"
+            );
+            for target in [
+                HostedToolTarget::AnthropicMessages,
+                HostedToolTarget::NoHostedTools,
+            ] {
+                assert_eq!(
+                    responses_translation_refusal(&request, target).map(|(code, _)| code),
+                    Some("unsupported_tool"),
+                    "{callers} {target:?}"
+                );
+            }
+        }
+        for callers in [
+            Value::Null,
+            json!(["direct"]),
+            json!(["programmatic", "direct"]),
+        ] {
+            let request = json!({"tools": [
+                {"type": "function", "name": "shell", "allowed_callers": callers}
+            ]});
+            assert!(
+                responses_indirect_only_functions(&request).is_empty(),
+                "{callers}"
+            );
+        }
+    }
+
+    fn multi_agent_namespace() -> Value {
+        json!({"type": "namespace", "name": "multi_agent_v1",
+               "description": "Sub-agents.",
+               "tools": [{"type": "function", "name": "spawn_agent"},
+                         {"type": "function", "name": "wait_agent"}]})
+    }
+
+    /// A `namespace` of functions flattens into Anthropic functions, so it is
+    /// on the allowlist for Anthropic routes. Chat Completions and on-device
+    /// routes cannot carry it, and a namespace that would lose part of itself
+    /// when flattened is refused rather than partly dropped.
+    #[test]
+    fn namespace_tools_pass_the_allowlist_only_where_they_translate() {
+        let refusal_code = |request: &Value, target| {
+            responses_translation_refusal(request, target).map(|(code, _)| code)
+        };
+        let request = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell"},
+            multi_agent_namespace(),
+            {"type": "namespace", "name": "empty", "tools": []}
+        ]});
+        assert_eq!(
+            refusal_code(&request, HostedToolTarget::AnthropicMessages),
+            None
+        );
+        assert_eq!(
+            responses_untranslatable_tools(&request, HostedToolTarget::NoHostedTools),
+            vec!["namespace".to_owned()]
+        );
+        assert_eq!(
+            refusal_code(&request, HostedToolTarget::NoHostedTools),
+            Some("unsupported_tool")
+        );
+        // Declared through Codex `additional_tools` too.
+        let additional = json!({"input": [
+            {"type": "additional_tools", "tools": [multi_agent_namespace()]}
+        ]});
+        assert!(
+            responses_untranslatable_tools(&additional, HostedToolTarget::AnthropicMessages)
+                .is_empty()
+        );
+        assert_eq!(
+            responses_untranslatable_tools(&additional, HostedToolTarget::NoHostedTools),
+            vec!["namespace".to_owned()]
+        );
+
+        for (namespace, problem) in [
+            (
+                json!({"type": "namespace", "tools": []}),
+                "namespace (without a name)",
+            ),
+            (
+                json!({"type": "namespace", "name": "", "tools": []}),
+                "namespace (without a name)",
+            ),
+            (
+                json!({"type": "namespace", "name": "n"}),
+                "namespace (without a tools list)",
+            ),
+            (
+                json!({"type": "namespace", "name": "n",
+                       "tools": [{"type": "function", "name": "f"}, {"type": "web_search"}]}),
+                "namespace (with a member that is not a named function)",
+            ),
+            (
+                json!({"type": "namespace", "name": "n", "tools": [{"type": "function"}]}),
+                "namespace (with a member that is not a named function)",
+            ),
+            (
+                json!({"type": "namespace", "name": "n",
+                       "tools": [{"type": "namespace", "name": "inner", "tools": []}]}),
+                "namespace (with a member that is not a named function)",
+            ),
+        ] {
+            let request = json!({"input": "x", "tools": [namespace]});
+            assert_eq!(
+                responses_untranslatable_tools(&request, HostedToolTarget::AnthropicMessages),
+                vec![problem.to_owned()],
+                "{request}"
+            );
+        }
+
+        // A namespaced function the model may only call from a program keeps
+        // that restriction only if refused.
+        let indirect = json!({"input": "x", "tools": [
+            {"type": "namespace", "name": "multi_agent_v1", "tools": [
+                {"type": "function", "name": "spawn_agent"},
+                {"type": "function", "name": "close_agent", "allowed_callers": ["programmatic"]}
+            ]}
+        ]});
+        assert_eq!(
+            responses_indirect_only_functions(&indirect),
+            vec!["multi_agent_v1__close_agent".to_owned()]
+        );
+        assert_eq!(
+            refusal_code(&indirect, HostedToolTarget::AnthropicMessages),
+            Some("unsupported_tool")
+        );
+    }
+
+    /// A choice names a namespaced function by its `namespace` and `name`,
+    /// as the call that comes back does. That pair is the declared name: the
+    /// bare function name and the qualified upstream name are not, even when
+    /// they happen to match another tool, so forcing either is refused.
+    #[test]
+    fn tool_choice_names_namespaced_functions_by_namespace_and_name() {
+        let tools = json!([
+            {"type": "function", "name": "spawn_agent"},
+            multi_agent_namespace()
+        ]);
+        let request =
+            |tool_choice: Value| json!({"input": "x", "tools": tools, "tool_choice": tool_choice});
+
+        // Forced by namespace and name: the namespaced function, upstream.
+        let forced = request(json!({"type": "function", "namespace": "multi_agent_v1",
+                                    "name": "spawn_agent"}));
+        let (converted, _) = responses_to_anthropic_request(&forced, "m");
+        assert_eq!(
+            converted["tool_choice"],
+            json!({"type": "tool", "name": "multi_agent_v1__spawn_agent",
+                   "disable_parallel_tool_use": true})
+        );
+        assert!(!responses_required_tool_unavailable(&forced));
+        // The bare name is the top-level function of that name.
+        let (bare, _) = responses_to_anthropic_request(
+            &request(json!({"type": "function", "name": "spawn_agent"})),
+            "m",
+        );
+        assert_eq!(bare["tool_choice"]["name"], "spawn_agent");
+        // Undeclared pairs force nothing and are refused.
+        for undeclared in [
+            json!({"type": "function", "name": "wait_agent"}),
+            json!({"type": "function", "name": "multi_agent_v1__wait_agent"}),
+            json!({"type": "function", "namespace": "other", "name": "wait_agent"}),
+        ] {
+            assert!(
+                responses_required_tool_unavailable(&request(undeclared.clone())),
+                "{undeclared}"
+            );
+        }
+
+        // allowed_tools: a namespaced function by namespace and name, or a
+        // whole namespace, keeps exactly those functions.
+        let allowed = |permitted: Value| {
+            let (converted, _) = responses_to_anthropic_request(
+                &request(json!({"type": "allowed_tools", "mode": "required",
+                                "tools": permitted})),
+                "m",
+            );
+            upstream_tool_names(&converted)
+        };
+        assert_eq!(
+            allowed(json!([{"type": "function", "namespace": "multi_agent_v1",
+                            "name": "wait_agent"}])),
+            vec!["multi_agent_v1__wait_agent"]
+        );
+        assert_eq!(
+            allowed(json!([{"type": "namespace", "name": "multi_agent_v1"}])),
+            vec!["multi_agent_v1__spawn_agent", "multi_agent_v1__wait_agent"]
+        );
+        assert_eq!(
+            allowed(json!([{"type": "function", "name": "spawn_agent"}])),
+            vec!["spawn_agent"]
+        );
+        // The qualified upstream name is not a declared name: nothing is
+        // permitted, so the required call is refused.
+        let qualified = request(json!({"type": "allowed_tools", "mode": "required",
+                                       "tools": [{"type": "function",
+                                                  "name": "multi_agent_v1__wait_agent"}]}));
+        let (converted, _) = responses_to_anthropic_request(&qualified, "m");
+        assert!(converted.get("tools").is_none(), "{converted}");
+        assert!(responses_required_tool_unavailable(&qualified));
     }
 
     /// Clients that take the turn's output from `response.completed` (Unreal

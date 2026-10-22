@@ -300,9 +300,12 @@ pub async fn run(mut request: RunRequest) -> ExitCode {
 /// so Codex never needs it. Codex snapshots its environment for the shells it
 /// spawns (`$CODEX_HOME/shell_snapshots`), so a key it inherited would be
 /// written to disk in plain text. The launcher reads an explicit
-/// `RAYLINE_ROUTER_API_KEY` before this, when it starts the router.
+/// `RAYLINE_ROUTER_API_KEY` before this, when it starts the router. The
+/// harness launchers' old `RAYLINE_KEY` goes too, for a `rayline codex` started
+/// from a shell that still exports it.
 pub(crate) fn withhold_router_key(command: &mut Command) {
     command.env_remove("RAYLINE_ROUTER_API_KEY");
+    command.env_remove(crate::harness::KEY_ENV);
 }
 
 /// A `codex` child process with the router key withheld (#84). Every Codex
@@ -927,12 +930,14 @@ mod tests {
     #[test]
     fn codex_command_withholds_the_router_key() {
         let command = codex_command();
-        assert!(
-            command
-                .get_envs()
-                .any(|(key, value)| key == "RAYLINE_ROUTER_API_KEY" && value.is_none()),
-            "codex_command does not remove RAYLINE_ROUTER_API_KEY"
-        );
+        for var in ["RAYLINE_ROUTER_API_KEY", "RAYLINE_KEY"] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == var && value.is_none()),
+                "codex_command does not remove {var}"
+            );
+        }
     }
 
     /// #84: a router key in the launcher's environment must not reach Codex,
