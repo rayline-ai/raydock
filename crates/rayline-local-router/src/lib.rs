@@ -3511,7 +3511,9 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
         search_limit != Some(0) && !std::mem::replace(&mut seen_web_search, true)
     });
     let tool_choice = body.get("tool_choice");
-    if let Some(allowed) = tool_choice.and_then(|choice| responses_allowed_tools(choice, &rewrites))
+    let declared_functions = responses_declared_function_names(body);
+    if let Some(allowed) = tool_choice
+        .and_then(|choice| responses_allowed_tools(choice, &rewrites, &declared_functions))
     {
         converted_tools.retain(|tool| {
             if is_anthropic_web_search_tool(tool) {
@@ -3525,7 +3527,12 @@ fn responses_to_anthropic_request(body: &Value, model: &str) -> (Value, ToolName
     let web_search_declared = converted_tools.iter().any(is_anthropic_web_search_tool);
     if !converted_tools.is_empty() {
         let mut choice = tool_choice.and_then(|choice| {
-            responses_tool_choice_to_anthropic(choice, &rewrites, web_search_declared)
+            responses_tool_choice_to_anthropic(
+                choice,
+                &rewrites,
+                &declared_functions,
+                web_search_declared,
+            )
         });
         // A forced function is called exactly once in Responses, and
         // `parallel_tool_calls: false` allows one call per turn; Anthropic
@@ -3608,7 +3615,11 @@ struct AllowedTools {
 
 /// Anthropic has no `allowed_tools` choice, so the tools it does not permit
 /// are left out of the request instead.
-fn responses_allowed_tools(choice: &Value, rewrites: &ToolNameRewrites) -> Option<AllowedTools> {
+fn responses_allowed_tools(
+    choice: &Value,
+    rewrites: &ToolNameRewrites,
+    declared_functions: &HashSet<String>,
+) -> Option<AllowedTools> {
     if choice.get("type").and_then(Value::as_str) != Some("allowed_tools") {
         return None;
     }
@@ -3631,6 +3642,9 @@ fn responses_allowed_tools(choice: &Value, rewrites: &ToolNameRewrites) -> Optio
             .get("name")
             .or_else(|| tool.pointer("/function/name"))
             .and_then(Value::as_str)
+            // Only a declared function, by the name the client gave it: an
+            // undeclared name may be another function's upstream alias.
+            .filter(|name| declared_functions.contains(*name))
         {
             allowed.functions.insert(rewrites.upstream(name).to_owned());
         }
@@ -3648,6 +3662,7 @@ fn responses_allowed_tools(choice: &Value, rewrites: &ToolNameRewrites) -> Optio
 fn responses_tool_choice_to_anthropic(
     choice: &Value,
     rewrites: &ToolNameRewrites,
+    declared_functions: &HashSet<String>,
     web_search_declared: bool,
 ) -> Option<Value> {
     if let Some(mode) = choice.as_str() {
@@ -3676,8 +3691,25 @@ fn responses_tool_choice_to_anthropic(
     let name = choice
         .get("name")
         .or_else(|| choice.pointer("/function/name"))
-        .and_then(Value::as_str)?;
+        .and_then(Value::as_str)
+        // Forcing an undeclared function forces nothing (refused as
+        // `required_tool_unavailable`), even when its name is another tool's
+        // upstream alias.
+        .filter(|name| declared_functions.contains(*name))?;
     Some(json!({"type": "tool", "name": rewrites.upstream(name)}))
+}
+
+/// The client names of the function tools the request declares.
+fn responses_declared_function_names(body: &Value) -> HashSet<String> {
+    responses_declared_tools(body)
+        .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        .filter_map(|tool| {
+            tool.get("name")
+                .or_else(|| tool.pointer("/function/name"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned)
+        .collect()
 }
 
 fn responses_wants_stream(body: &Value) -> bool {
@@ -4209,10 +4241,9 @@ fn responses_translation_refusal(
             ),
         ));
     }
-    if target != HostedToolTarget::AnthropicMessages {
-        return None;
-    }
-    if let Some(reason) = responses_web_search_refusal(body) {
+    if target == HostedToolTarget::AnthropicMessages
+        && let Some(reason) = responses_web_search_refusal(body)
+    {
         return Some((
             "unsupported_web_search",
             json_response(
@@ -4237,11 +4268,11 @@ fn responses_translation_refusal(
                     "type": "invalid_request_error",
                     "code": "required_tool_unavailable",
                     "param": "tool_choice",
-                    "message": "tool_choice requires a tool call this Anthropic route cannot \
-                                make: the tool it forces, or every tool it permits, is not \
-                                sent upstream (a web_search without live access or with \
-                                max_tool_calls 0 is not, nor is an undeclared tool). Declare \
-                                a tool the route can run, or relax tool_choice.",
+                    "message": "tool_choice requires a tool call this route cannot make: the \
+                                tool it forces, or every tool it permits, is not sent upstream \
+                                (a web_search without live access or with max_tool_calls 0 is \
+                                not, nor is an undeclared tool). Declare a tool the route can \
+                                run, or relax tool_choice.",
                 }}),
             ),
         ));
@@ -7313,6 +7344,43 @@ mod tests {
             {"type": "web_search"}, {"type": "function", "name": "web_search"}
         ], "tool_choice": {"type": "function", "name": "web_search"}});
         assert!(!responses_required_tool_unavailable(&declared_function));
+        // An upstream alias is not a declared name: with live search, the
+        // client's `web_search` function goes upstream as `web_search_2`, and
+        // permitting or forcing `web_search_2` must not reach it.
+        let aliased_tools = json!([
+            {"type": "web_search"},
+            {"type": "function", "name": "web_search"},
+            {"type": "function", "name": "shell"}
+        ]);
+        let (alias_permitted, _) = responses_to_anthropic_request(
+            &json!({"input": "x", "tools": aliased_tools, "tool_choice": {
+                "type": "allowed_tools", "mode": "auto",
+                "tools": [{"type": "function", "name": "web_search_2"},
+                          {"type": "function", "name": "shell"}]}}),
+            "arc-swift",
+        );
+        let names: Vec<&str> = alias_permitted["tools"]
+            .as_array()
+            .expect("tools")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["shell"]);
+        let alias_forced = json!({"input": "x", "tools": aliased_tools,
+            "tool_choice": {"type": "function", "name": "web_search_2"}});
+        assert!(responses_required_tool_unavailable(&alias_forced));
+        // Every route refuses a required call it cannot make, not only
+        // Anthropic.
+        let nothing_left = json!({"input": "x", "tools": [
+            {"type": "function", "name": "shell"},
+            {"type": "web_search", "external_web_access": false}
+        ], "tool_choice": {"type": "allowed_tools", "mode": "required",
+                           "tools": [{"type": "web_search"}]}});
+        assert_eq!(
+            responses_translation_refusal(&nothing_left, HostedToolTarget::NoHostedTools)
+                .map(|(code, _)| code),
+            Some("required_tool_unavailable")
+        );
         // Forcing a search that was not declared live would name a missing tool.
         let (offline, _) = responses_to_anthropic_request(
             &json!({"input": "x", "tool_choice": {"type": "web_search"}, "tools": [
