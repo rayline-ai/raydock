@@ -30,6 +30,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+pub mod inbound_guard;
+pub use inbound_guard::InboundGuard;
+
 pub const DEFAULT_PORT: u16 = 20811;
 pub const DEFAULT_LOCAL_ADAPTER_PORT: u16 = 20808;
 pub const DEFAULT_VIRTUAL_MODEL: &str = "rayline-router";
@@ -62,6 +65,9 @@ pub struct LocalRouterOptions {
     /// Responses forward to the hosted RCR, and follow the RCR's 307 to the
     /// on-device adapter. Off for every other run.
     pub may_local_advertise: bool,
+    /// A per-instance token required on every request but `GET /healthz`
+    /// (`rayline claude-desktop`). `None` for every other run.
+    pub inbound_guard: Option<InboundGuard>,
 }
 
 impl Default for LocalRouterOptions {
@@ -73,6 +79,7 @@ impl Default for LocalRouterOptions {
             config_path: None,
             metrics: None,
             may_local_advertise: false,
+            inbound_guard: None,
         }
     }
 }
@@ -325,11 +332,25 @@ fn load_config(opts: &LocalRouterOptions) -> Result<RouterConfig> {
         let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let overrides = serde_json::from_str::<RouterConfig>(&raw)
             .with_context(|| format!("parse router config {}", path.display()))?;
-        merge_config(&mut config, overrides);
+        if replaces_defaults(&raw) {
+            config = overrides;
+        } else {
+            merge_config(&mut config, overrides);
+        }
     }
     apply_env_overrides(&mut config);
     normalize_config(&mut config, &opts.local_model_id)?;
     Ok(config)
+}
+
+/// A config with top-level `"replace_defaults": true` is the whole config: the
+/// built-in endpoints and routes are dropped instead of merged underneath, so
+/// no request can reach an endpoint the file does not name.
+fn replaces_defaults(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| value.get("replace_defaults").and_then(Value::as_bool))
+        .unwrap_or(false)
 }
 
 fn merge_config(config: &mut RouterConfig, overrides: RouterConfig) {
@@ -579,8 +600,7 @@ fn json_response(status: StatusCode, value: Value) -> Response<BoxBody> {
         .unwrap()
 }
 
-/// Hosts the router answers as. Same rules as the opt-in token guard in #94's
-/// `inbound_guard.rs`, so the two stay one policy.
+/// Hosts the router answers as.
 const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 
 /// The router listens on loopback without auth and spends stored provider
@@ -600,12 +620,18 @@ fn reject_untrusted_request(
             json!({"type":"error","error":{"type":kind,"message":message}}),
         ))
     };
-    // HTTP/2 carries the authority in the URI instead of a Host header.
-    let host = match uri.authority() {
-        Some(authority) => Some(authority.as_str()),
-        None => headers
-            .get(hyper::header::HOST)
-            .and_then(|value| value.to_str().ok()),
+    // HTTP/2 carries the authority in the URI instead of a Host header. When
+    // both are present they must agree, and every guarded header must appear at
+    // most once: the checks below read one value, so a second one would slip by.
+    let host_header = single_header(headers, hyper::header::HOST);
+    let host = match (uri.authority(), host_header) {
+        (_, Err(())) => None,
+        (Some(authority), Ok(None)) => Some(authority.as_str()),
+        (Some(authority), Ok(Some(value))) => value
+            .to_str()
+            .ok()
+            .filter(|value| value.eq_ignore_ascii_case(authority.as_str())),
+        (None, Ok(value)) => value.and_then(|value| value.to_str().ok()),
     };
     if !host.is_some_and(|host| is_loopback_authority(host, port)) {
         return refuse(
@@ -614,12 +640,14 @@ fn reject_untrusted_request(
             "this router only answers requests addressed to its loopback host and port",
         );
     }
-    let origin_ok = headers.get(hyper::header::ORIGIN).is_none_or(|origin| {
-        origin.to_str().ok().is_some_and(|origin| {
-            origin
-                .strip_prefix("http://")
-                .or_else(|| origin.strip_prefix("https://"))
-                .is_some_and(|authority| is_loopback_authority(authority, port))
+    let origin_ok = single_header(headers, hyper::header::ORIGIN).is_ok_and(|origin| {
+        origin.is_none_or(|origin| {
+            origin.to_str().ok().is_some_and(|origin| {
+                origin
+                    .strip_prefix("http://")
+                    .or_else(|| origin.strip_prefix("https://"))
+                    .is_some_and(|authority| is_loopback_authority(authority, port))
+            })
         })
     });
     if !origin_ok || *method == Method::OPTIONS {
@@ -629,9 +657,15 @@ fn reject_untrusted_request(
             "cross-origin requests are not accepted",
         );
     }
+    let Ok(content_type) = single_header(headers, hyper::header::CONTENT_TYPE) else {
+        return refuse(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "invalid_request_error",
+            "request bodies must carry exactly one content-type",
+        );
+    };
     if *method == Method::POST {
-        let mime = headers
-            .get(hyper::header::CONTENT_TYPE)
+        let mime = content_type
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .map(str::trim);
@@ -652,6 +686,16 @@ fn reject_untrusted_request(
         }
     }
     None
+}
+
+/// The header's only value, `Ok(None)` when absent, or `Err` when repeated.
+fn single_header(headers: &HeaderMap, name: HeaderName) -> Result<Option<&HeaderValue>, ()> {
+    let mut values = headers.get_all(name).iter();
+    let first = values.next();
+    match values.next() {
+        Some(_) => Err(()),
+        None => Ok(first),
+    }
 }
 
 /// True for `127.0.0.1`, `localhost` or `[::1]` on exactly `port`.
@@ -676,6 +720,14 @@ async fn handle(state: AppState, req: Request<Incoming>) -> Response<BoxBody> {
         .map(|value| value.as_str().to_owned())
         .unwrap_or_else(|| path.clone());
     let method = req.method().clone();
+    if let Some(guard) = state.opts.inbound_guard.as_ref() {
+        if let Err(refusal) = guard.check(&method, &path, req.headers()) {
+            return json_response(
+                refusal.status,
+                json!({"type": "error", "error": {"type": refusal.kind, "message": refusal.message}}),
+            );
+        }
+    }
     match (method, path.as_str()) {
         (Method::GET, "/healthz") => healthz_response(&state),
         (Method::GET, "/v1/models" | "/v1/models/") => {
@@ -6203,11 +6255,14 @@ mod tests {
 
     const GUARD_PORT: u16 = 20811;
 
-    fn guard_status(method: Method, uri: &str, headers: GuardHeaders) -> Option<StatusCode> {
+    fn guard_status(method: Method, uri: &str, headers: &[(&str, &str)]) -> Option<StatusCode> {
         let uri = uri.parse::<hyper::Uri>().unwrap();
         let mut map = HeaderMap::new();
         for (name, value) in headers {
-            map.append(*name, HeaderValue::from_static(value));
+            map.append(
+                HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
         }
         reject_untrusted_request(GUARD_PORT, &method, &uri, &map).map(|response| response.status())
     }
@@ -6341,6 +6396,92 @@ mod tests {
             guard_status(Method::GET, "http://evil.example:20811/healthz", &[]),
             Some(StatusCode::MISDIRECTED_REQUEST)
         );
+    }
+
+    #[test]
+    fn request_guard_rejects_repeated_or_conflicting_headers() {
+        const HOST: (&str, &str) = ("host", "127.0.0.1:20811");
+        const JSON: (&str, &str) = ("content-type", "application/json");
+        const LOOPBACK_ORIGIN: (&str, &str) = ("origin", "http://127.0.0.1:20811");
+        let cases: &[(GuardHeaders, StatusCode)] = &[
+            // A second Host the first-value check never looked at.
+            (
+                &[HOST, ("host", "evil.example:20811"), JSON],
+                StatusCode::MISDIRECTED_REQUEST,
+            ),
+            (&[HOST, HOST, JSON], StatusCode::MISDIRECTED_REQUEST),
+            // A loopback Origin followed by a cross-site or opaque one.
+            (
+                &[
+                    HOST,
+                    JSON,
+                    LOOPBACK_ORIGIN,
+                    ("origin", "https://evil.example"),
+                ],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                &[HOST, JSON, LOOPBACK_ORIGIN, ("origin", "null")],
+                StatusCode::FORBIDDEN,
+            ),
+            // JSON followed by a CORS "simple" type.
+            (
+                &[HOST, JSON, ("content-type", "text/plain")],
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (&[HOST, JSON, JSON], StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ];
+        for (headers, expected) in cases {
+            assert_eq!(
+                guard_status(Method::POST, "/v1/messages", headers),
+                Some(*expected),
+                "{headers:?}"
+            );
+        }
+        assert_eq!(
+            guard_status(
+                Method::GET,
+                "/healthz",
+                &[HOST, ("content-type", "text/plain"), JSON]
+            ),
+            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
+        );
+    }
+
+    #[test]
+    fn request_guard_requires_uri_authority_and_host_to_agree() {
+        const URI: &str = "http://127.0.0.1:20811/v1/messages";
+        const JSON: (&str, &str) = ("content-type", "application/json");
+        for host in ["evil.example:20811", "localhost:20811", "127.0.0.1:20812"] {
+            assert_eq!(
+                guard_status(Method::POST, URI, &[("host", host), JSON]),
+                Some(StatusCode::MISDIRECTED_REQUEST),
+                "{host}"
+            );
+        }
+        // A rebound authority is refused even with a loopback Host header.
+        assert_eq!(
+            guard_status(
+                Method::POST,
+                "http://evil.example:20811/v1/messages",
+                &[("host", "127.0.0.1:20811"), JSON]
+            ),
+            Some(StatusCode::MISDIRECTED_REQUEST)
+        );
+        // Agreeing authority and Host (case-insensitive) pass, as does either alone.
+        assert_eq!(
+            guard_status(Method::POST, URI, &[("host", "127.0.0.1:20811"), JSON]),
+            None
+        );
+        assert_eq!(
+            guard_status(
+                Method::POST,
+                "http://LOCALHOST:20811/v1/messages",
+                &[("host", "localhost:20811"), JSON]
+            ),
+            None
+        );
+        assert_eq!(guard_status(Method::POST, URI, &[JSON]), None);
     }
 
     #[test]
@@ -6574,6 +6715,39 @@ mod tests {
         let explore = config.routes.subagents.get("Explore").unwrap();
         assert_eq!(explore.endpoint, "local");
         assert_eq!(explore.model, "local-model");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn replace_defaults_config_drops_built_in_endpoints_and_routes() {
+        let path = std::env::temp_dir().join(format!(
+            "rayline-local-router-replace-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"{"replace_defaults":true,
+                "endpoints":[{"id":"arc","protocol":"anthropic_messages",
+                              "base_url":"https://api.rayline.ai","models":["arc-sage"]}],
+                "routes":{"main":{"endpoint":"arc","model":"arc-sage"}}}"#,
+        )
+        .unwrap();
+        let opts = LocalRouterOptions {
+            config_path: Some(path.clone()),
+            ..LocalRouterOptions::default()
+        };
+
+        let config = load_config(&opts).unwrap();
+
+        let ids: Vec<&str> = config.endpoints.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["arc"]);
+        assert!(config.routes.subagent.is_none());
+        assert!(route_direct_model(&config, "claude-sonnet-5").is_none());
+        assert!(route_direct_model(&config, "gpt-5.5").is_none());
         let _ = fs::remove_file(path);
     }
 

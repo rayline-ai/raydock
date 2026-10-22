@@ -3,7 +3,8 @@
 //! that override, so both are removed. omp also reads Claude Code's config from
 //! `CLAUDE_CONFIG_DIR` (MCP servers, skills); in testing, a
 //! `CLAUDE_CONFIG_DIR` inherited from `rayline claude` pulling another config
-//! into omp, so it is removed too. `apiKey` and header values name env vars.
+//! into omp, so it is removed too. Header values name env vars; `apiKey` is the
+//! literal key.
 //!
 //! omp sends its session id as `X-Claude-Code-Session-Id`, which the gateway
 //! keys the episode on. In `auth: apiKey` mode it does so from 18.1.10; an
@@ -15,8 +16,7 @@ use std::process::{Command, Stdio};
 use serde_json::json;
 
 use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, KEY_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
-    yaml_file,
+    CONTEXT_WINDOW, CONV_ID_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext, yaml_file,
 };
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -26,7 +26,9 @@ pub(crate) const MIN_SESSION_HEADER_VERSION: (u64, u64, u64) = (18, 1, 10);
 /// Warn when `omp --version` reports a version that sends no session id in
 /// apiKey mode. Silent when the version cannot be read.
 pub(crate) fn warn_if_old(binary: &Path) {
-    let Ok(output) = Command::new(binary)
+    let mut command = Command::new(binary);
+    crate::codex::withhold_router_key(&mut command);
+    let Ok(output) = command
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -71,7 +73,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "providers": {
             PROVIDER_ID: {
                 "baseUrl": ctx.messages_base(),
-                "apiKey": KEY_ENV,
+                "apiKey": ctx.key,
                 "api": "anthropic-messages",
                 // Without `auth: apiKey` omp poses as Claude Code (renamed tools,
                 // billing system block). apiKey mode is the honest request shape.
@@ -127,7 +129,7 @@ mod tests {
             "providers:
   rayline:
     api: \"anthropic-messages\"
-    apiKey: \"RAYLINE_KEY\"
+    apiKey: \"rlk-test\"
     auth: \"apiKey\"
     baseUrl: \"https://api-dev.rayline.ai\"
     headers: {}
