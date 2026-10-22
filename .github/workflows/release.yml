@@ -1,9 +1,12 @@
 name: Release
 
+# Manual fallback only. Prod releases are built, signed and notarized by the
+# Rayline release pipeline, which also creates the vX.Y.Z tag and this repo's
+# GitHub release with the same files it serves from get.rayline.ai. A tag
+# trigger here would start a second, different build under the same version,
+# so this workflow never runs on tag pushes and refuses to touch an existing
+# release.
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
     inputs:
       tag:
@@ -15,7 +18,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
 env:
@@ -56,14 +59,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag }}
           persist-credentials: false
 
       - name: Resolve release version
         id: version
         shell: bash
         env:
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
@@ -155,7 +158,7 @@ jobs:
         shell: bash
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           # Install minisign
@@ -204,7 +207,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
           if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
@@ -223,12 +226,15 @@ jobs:
           - \`SHA256SUMS.minisig\` is the minisign signature over \`SHA256SUMS\`.
           EOF
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" dist/* --clobber
-          else
-            args=(release create "$RELEASE_TAG" dist/* --title "Rayline ${version}" --notes-file release-notes.md)
-            if [[ "$version" == *"-"* ]]; then
-              args+=(--prerelease)
-            fi
-            gh "${args[@]}"
+          # Never overwrite a release: it may hold the release pipeline's
+          # signed, notarized build of this version.
+          existing_tags="$(gh api "repos/${GH_REPO}/releases?per_page=100" --jq '.[].tag_name')"
+          if grep -qxF -- "$RELEASE_TAG" <<<"$existing_tags"; then
+            echo "::error::Release $RELEASE_TAG already exists; refusing to replace its assets with this build." >&2
+            exit 1
           fi
+          args=(release create "$RELEASE_TAG" dist/* --title "Rayline ${version}" --notes-file release-notes.md)
+          if [[ "$version" == *"-"* ]]; then
+            args+=(--prerelease)
+          fi
+          gh "${args[@]}"
