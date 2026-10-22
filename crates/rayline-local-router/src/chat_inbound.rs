@@ -164,12 +164,26 @@ async fn passthrough_response(
     decision: &RouteDecision,
 ) -> Result<Response<BoxBody>> {
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/json")
-        .to_owned();
+    // The body is relayed byte for byte, so the upstream's end-to-end headers
+    // (Retry-After, Content-Encoding, rate-limit headers, ...) stay valid.
+    let mut headers_out = HeaderMap::new();
+    for (name, value) in resp.headers() {
+        if is_hop_by_hop_str(name.as_str()) {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_str().as_bytes()),
+            HeaderValue::from_bytes(value.as_bytes()),
+        ) {
+            headers_out.append(name, value);
+        }
+    }
+    if !headers_out.contains_key(hyper::header::CONTENT_TYPE) {
+        headers_out.insert(
+            hyper::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+    }
     let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
     tokio::spawn(async move {
         use futures::StreamExt;
@@ -182,10 +196,8 @@ async fn passthrough_response(
         }
     });
     let body: BoxBody = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed();
-    let mut response = Response::builder()
-        .status(status)
-        .header("content-type", content_type)
-        .body(body)?;
+    let mut response = Response::builder().status(status).body(body)?;
+    *response.headers_mut() = headers_out;
     add_decision_headers(response.headers_mut(), decision);
     Ok(response)
 }
@@ -302,6 +314,19 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
     let mut rewrites = ToolNameRewrites::default();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         rewrites.record_tools(tools);
+    }
+    // Replayed calls from earlier turns need the same upstream name even when
+    // their tool is no longer declared.
+    for name in body
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("tool_calls").and_then(Value::as_array))
+        .flatten()
+        .filter_map(|call| call.pointer("/function/name").and_then(Value::as_str))
+    {
+        rewrites.record(name);
     }
     let mut system = Vec::new();
     let mut messages = Vec::new();
@@ -444,7 +469,11 @@ pub(crate) fn chat_to_anthropic_request(body: &Value, model: &str) -> (Value, To
             out.insert("tool_choice".to_owned(), choice);
         }
     }
-    (Value::Object(out), rewrites)
+    let mut out = Value::Object(out);
+    // Drop sampling params and legacy thinking the selected family rejects, as
+    // the Messages listener does.
+    adapt_anthropic_body_for_model(&mut out, model);
+    (out, rewrites)
 }
 
 // --- response: Anthropic Messages -> Chat Completions ----------------------------------
@@ -672,8 +701,9 @@ pub(crate) struct AnthropicToChatTranslator {
     /// Leading bytes of a UTF-8 character split across chunks.
     pending: Vec<u8>,
     buffer: String,
-    /// Anthropic content-block index -> Chat `tool_calls` index.
-    tool_index: HashMap<usize, usize>,
+    /// Anthropic content-block index -> (Chat `tool_calls` index, whether any
+    /// arguments were emitted for it).
+    tool_index: HashMap<usize, (usize, bool)>,
     stop_reason: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
@@ -785,7 +815,16 @@ impl AnthropicToChatTranslator {
                 {
                     let block = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
                     let index = self.tool_index.len();
-                    self.tool_index.insert(block, index);
+                    // The start's `input` is normally a `{}` placeholder that
+                    // the `input_json_delta`s replace; a non-empty one is the
+                    // complete input.
+                    let arguments = value
+                        .pointer("/content_block/input")
+                        .filter(|input| !input.is_null() && !is_empty_json_object(input))
+                        .map(Value::to_string)
+                        .unwrap_or_default();
+                    self.tool_index
+                        .insert(block, (index, !arguments.is_empty()));
                     let name = self.tool_names.client(
                         value
                             .pointer("/content_block/name")
@@ -796,9 +835,23 @@ impl AnthropicToChatTranslator {
                         "index": index,
                         "id": value.pointer("/content_block/id").and_then(Value::as_str).unwrap_or("call_rayline"),
                         "type": "function",
-                        "function": {"name": name, "arguments": ""},
+                        "function": {"name": name, "arguments": arguments},
                     }]});
                     out.push_str(&self.chunk(delta, None));
+                }
+            }
+            "content_block_stop" => {
+                // A tool that streamed no arguments still needs valid JSON.
+                let block = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if let Some((index, has_arguments)) = self.tool_index.get_mut(&block)
+                    && !*has_arguments
+                {
+                    *has_arguments = true;
+                    let index = *index;
+                    out.push_str(&self.chunk(
+                        json!({"tool_calls": [{"index": index, "function": {"arguments": "{}"}}]}),
+                        None,
+                    ));
                 }
             }
             "content_block_delta" => {
@@ -814,11 +867,13 @@ impl AnthropicToChatTranslator {
                     Some("input_json_delta") => {
                         let block =
                             value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                        if let (Some(index), Some(partial)) = (
-                            self.tool_index.get(&block),
+                        if let (Some((index, has_arguments)), Some(partial)) = (
+                            self.tool_index.get_mut(&block),
                             value.pointer("/delta/partial_json").and_then(Value::as_str),
                         ) && !partial.is_empty()
                         {
+                            *has_arguments = true;
+                            let index = *index;
                             out.push_str(&self.chunk(
                                 json!({"tool_calls": [{"index": index, "function": {"arguments": partial}}]}),
                                 None,
@@ -1059,6 +1114,67 @@ mod tests {
         );
         assert_eq!(completion["usage"]["total_tokens"], 14);
         assert_eq!(completion["object"], "chat.completion");
+    }
+
+    #[test]
+    fn chat_request_adapts_sampling_and_rewrites_historical_tool_names() {
+        let body = json!({
+            "temperature": 0.2, "top_p": 0.9,
+            "messages": [
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "read.file", "arguments": "{}"}}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
+            ]
+        });
+        let (adapted, rewrites) = chat_to_anthropic_request(&body, "claude-sonnet-5");
+        assert!(adapted.get("temperature").is_none(), "{adapted}");
+        assert!(adapted.get("top_p").is_none(), "{adapted}");
+        // `read.file` is no longer declared but is still replayed.
+        let upstream = rewrites.upstream("read.file");
+        assert_ne!(upstream, "read.file");
+        assert_eq!(adapted["messages"][1]["content"][0]["name"], upstream);
+        let (kept, _) = chat_to_anthropic_request(&body, "claude-haiku-4-5");
+        assert_eq!(kept["temperature"], 0.2);
+    }
+
+    #[test]
+    fn streamed_tool_without_argument_deltas_gets_empty_object() {
+        let mut translator = AnthropicToChatTranslator::new(
+            "chatcmpl_x".to_owned(),
+            "m".to_owned(),
+            false,
+            ToolNameRewrites::default(),
+        );
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call_1","name":"now","input":{}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_stop",
+            json!({"type":"message_stop"}),
+        );
+        let out = translator.push_bytes(upstream.as_bytes());
+        let arguments: String = out
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .filter_map(|chunk| {
+                chunk["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(arguments, "{}");
     }
 
     #[test]

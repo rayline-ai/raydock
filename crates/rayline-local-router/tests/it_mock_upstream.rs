@@ -1447,6 +1447,40 @@ async fn inbound_chat_client_bearer_forwards_caller_auth() {
     let _ = std::fs::remove_file(config);
 }
 
+/// An OpenAI Chat upstream's error status and end-to-end headers (here a
+/// 429's Retry-After) reach the Chat client unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_passthrough_keeps_upstream_headers() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let body = json!({"error": {"message": "slow down", "type": "rate_limit_error"}}).to_string();
+    tokio::spawn(serve_once(
+        upstream,
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 120\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    ));
+    let config = chat_route_config(
+        "chat-headers",
+        json!({"id": "up", "protocol": "openai_chat",
+               "base_url": format!("http://127.0.0.1:{upstream_port}/v1"), "models": ["m"]}),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 429);
+    assert_eq!(header(&response, "retry-after"), Some("120"));
+    let error: Value = response.json().await.unwrap();
+    assert_eq!(error["error"]["message"], "slow down");
+    let _ = std::fs::remove_file(config);
+}
+
 /// A route to an `openai_responses` endpoint is refused with an OpenAI-shaped
 /// 400 instead of POSTing Chat JSON to a Responses-only backend.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
