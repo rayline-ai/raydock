@@ -484,6 +484,16 @@ async fn proxy_refuses_router_bound_thread_continuation_so_claude_resends_histor
         .unwrap();
     assert_eq!(resent.status(), StatusCode::OK);
     assert_eq!(router.captured.lock().unwrap().len(), 1);
+
+    // Only message creation is refused; token counting still reaches the router.
+    let counted = client
+        .post("https://api.anthropic.com/v1/messages/count_tokens?beta=true")
+        .json(&continuation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(counted.status(), StatusCode::OK);
+    assert_eq!(router.captured.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

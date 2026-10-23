@@ -607,8 +607,10 @@ async fn forward_anthropic_request(
     // Claude Code believes the proxy is first-party Anthropic, so after a tool
     // result it may send a message-threads continuation: only the new messages
     // plus `thread.previous_message_id`, expecting the server to hold the
-    // history. The router holds none. Refuse it with the router's own 400 so
-    // Claude Code resends the full history instead of a reply losing context.
+    // history. Neither the hosted nor the local router holds it (a local model
+    // or openai_chat endpoint drops `thread`), so refuse it for any router
+    // target with the hosted router's own 400; Claude Code then resends the
+    // full history instead of accepting a reply that lost context.
     if decision.target == RouteTarget::Router
         && parts.uri.path() == "/v1/messages"
         && is_thread_continuation(&routed.body)
