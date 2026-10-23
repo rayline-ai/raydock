@@ -2859,6 +2859,35 @@ mod tests {
     use super::*;
     use rayline_metrics::MetricsSink as _;
 
+    #[test]
+    fn thread_continuation_is_either_signal_and_never_create() {
+        let refused = [
+            br#"{"thread":{"type":"continue"}}"#.as_slice(),
+            br#"{"thread":{"previous_message_id":"msg_prev"}}"#,
+            br#"{"thread":{"type":"continue","previous_message_id":"msg_prev"}}"#,
+        ];
+        for body in refused {
+            assert!(
+                is_thread_continuation(body),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let passed = [
+            br#"{"thread":{"type":"create"}}"#.as_slice(),
+            br#"{"thread":{}}"#,
+            br#"{"messages":[]}"#,
+            b"not json",
+        ];
+        for body in passed {
+            assert!(
+                !is_thread_continuation(body),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
     fn observe_test_sse_chunk(
         bytes: &[u8],
         buffer: &mut String,
