@@ -2191,10 +2191,17 @@ fn is_router_routed_path(method: &Method, path: &str, routing_mode: ProxyRouting
     }
 }
 
+/// Claude Code also sends `thread: {"type": "create"}` on every full-history
+/// turn; only a continuation (which leans on server-held history) is refused.
 fn is_thread_continuation(body: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .is_some_and(|value| value.get("thread").is_some_and(Value::is_object))
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let Some(thread) = value.get("thread") else {
+        return false;
+    };
+    thread.get("type").and_then(Value::as_str) == Some("continue")
+        || thread.get("previous_message_id").is_some()
 }
 
 /// Same status and message the hosted router returns for this shape, so

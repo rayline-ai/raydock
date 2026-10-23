@@ -464,8 +464,11 @@ async fn proxy_refuses_router_bound_thread_continuation_so_claude_resends_histor
     );
     assert!(router.captured.lock().unwrap().is_empty());
 
+    // Claude Code tags every full-history turn, the resend included, with
+    // `thread.type = "create"`; it must pass or the resend would loop.
     let full_history = json!({
         "model": "rayline-router",
+        "thread": {"type": "create"},
         "messages": [
             {"role": "user", "content": "list files"},
             {"role": "assistant", "content": [
