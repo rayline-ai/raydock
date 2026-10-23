@@ -2857,15 +2857,21 @@ mod refusal_recovery_env_tests {
             config_path: None,
             root_env_explicit: true,
         };
-        let saved: Vec<_> = [FALLBACK, RETRY, CLAUDE_CONFIG_DIR_ENV]
+        let saved: Vec<_> = [FALLBACK, RETRY, MESSAGE_THREADS_ENV, CLAUDE_CONFIG_DIR_ENV]
             .map(|key| (key, std::env::var_os(key)))
             .into();
         // A private Claude config dir, so no real daemon on this machine is inspected.
         // SAFETY: serialized by ENV_LOCK; restored below.
         unsafe { std::env::set_var(CLAUDE_CONFIG_DIR_ENV, home.join(".claude")) };
         let mut seen = Vec::new();
-        for (fallback, retry) in [(None, Some("")), (Some("0"), None)] {
-            for (key, value) in [(FALLBACK, fallback), (RETRY, retry)] {
+        // The message-threads switch goes through the same launch switches: a
+        // user value is carried onto the child (and so into daemon reuse).
+        for (fallback, retry, threads) in [(None, Some(""), None), (Some("0"), None, Some("1"))] {
+            for (key, value) in [
+                (FALLBACK, fallback),
+                (RETRY, retry),
+                (MESSAGE_THREADS_ENV, threads),
+            ] {
                 // SAFETY: serialized by ENV_LOCK; restored below.
                 match value {
                     Some(value) => unsafe { std::env::set_var(key, value) },
@@ -2888,6 +2894,7 @@ mod refusal_recovery_env_tests {
             seen.push((
                 env.get(FALLBACK).cloned().flatten(),
                 env.get(RETRY).cloned().flatten(),
+                env.get(MESSAGE_THREADS_ENV).cloned().flatten(),
             ));
         }
         for (key, value) in saved {
@@ -2901,8 +2908,12 @@ mod refusal_recovery_env_tests {
         assert_eq!(
             seen,
             vec![
-                (Some("1".to_owned()), Some("1".to_owned())),
-                (Some("0".to_owned()), Some("1".to_owned())),
+                (Some("1".to_owned()), Some("1".to_owned()), None),
+                (
+                    Some("0".to_owned()),
+                    Some("1".to_owned()),
+                    Some("1".to_owned())
+                ),
             ]
         );
     }
