@@ -951,6 +951,27 @@ mod tests {
         );
     }
 
+    // A daemon from an older launcher never got the message-threads switch, so
+    // its background sessions would still send router-bound continuations.
+    #[test]
+    fn daemon_without_the_message_threads_switch_conflicts() {
+        let home = temp_home();
+        let mut request = proxy_request();
+        let wanted = crate::claude::launch_env_switches(RoutingMode::Proxy, |_| None);
+        request.refusal_recovery = &wanted;
+        assert_eq!(
+            classify_launch_safety(&state(rayline_proxy_env(20810)), &request, &home),
+            Safety::Conflict
+        );
+        // Positive control: a daemon holding the switch is reused.
+        let mut env = rayline_proxy_env(20810);
+        env.insert("CLAUDE_CODE_TETHER_LIVE".to_owned(), "0".to_owned());
+        assert_eq!(
+            classify_launch_safety(&state(env), &request, &home),
+            Safety::Safe
+        );
+    }
+
     #[test]
     fn daemon_holding_a_changed_user_override_conflicts() {
         let home = temp_home();

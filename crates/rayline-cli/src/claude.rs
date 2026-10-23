@@ -884,7 +884,7 @@ async fn run_command_from_home(
         None
     };
     let mut inspect_dir = claude_config_dir(home, isolated);
-    let refusal_recovery = refusal_recovery_values(request.routing_mode, |key| env::var_os(key));
+    let refusal_recovery = launch_env_switches(request.routing_mode, |key| env::var_os(key));
     let mut daemon_request = RequestSpec {
         env_name: &env_name,
         routing_mode: request.routing_mode,
@@ -1303,7 +1303,6 @@ async fn configure_proxy_env(
         command.env("ANTHROPIC_MODEL", model);
     }
     set_auto_compact_window_env(command, auto_compact_window);
-    disable_message_threads_env(command, env::var_os(MESSAGE_THREADS_ENV).is_some());
     command.env(
         "RAYLINE_CLAUDE_ROUTING_MODE",
         routing_mode_name(request.routing_mode),
@@ -1359,6 +1358,27 @@ pub(crate) fn refusal_recovery_values(
             (key, value)
         })
         .collect()
+}
+
+/// The refusal-recovery switches plus the message-threads switch: every env
+/// switch the child runs with and a reused daemon must already hold. Any proxy
+/// mode can send router-bound continuations (subagent turns too), so threads
+/// default off there; elsewhere they are the user's value or Claude Code's.
+pub(crate) fn launch_env_switches(
+    routing_mode: RoutingMode,
+    inherited: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut values = refusal_recovery_values(routing_mode, &inherited);
+    let user = inherited(MESSAGE_THREADS_ENV)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned());
+    let threads = if is_proxy_routing_mode(routing_mode) {
+        user.or_else(|| Some("0".to_owned()))
+    } else {
+        user
+    };
+    values.push((MESSAGE_THREADS_ENV, threads));
+    values
 }
 
 /// Sets the refusal-recovery switches on the child, in every mode: a value
@@ -1446,14 +1466,6 @@ fn is_claude_code_model_alias(model: &str) -> bool {
 
 /// Pin `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, or clear it so Claude Code applies
 /// its own window for the model.
-/// Have Claude Code send the full history on every request, unless the user
-/// set the switch themselves.
-fn disable_message_threads_env(command: &mut Command, user_set: bool) {
-    if !user_set {
-        command.env(MESSAGE_THREADS_ENV, "0");
-    }
-}
-
 fn set_auto_compact_window_env(command: &mut Command, auto_compact_window: Option<&str>) {
     match auto_compact_window {
         Some(window) => command.env(AUTO_COMPACT_WINDOW_ENV, window),
@@ -2782,6 +2794,28 @@ mod refusal_recovery_env_tests {
         );
     }
 
+    #[test]
+    fn proxy_modes_turn_message_threads_off_unless_the_user_set_it() {
+        let threads = |mode, user: Option<&str>| {
+            launch_env_switches(mode, |key| {
+                (key == MESSAGE_THREADS_ENV)
+                    .then_some(user)
+                    .flatten()
+                    .map(OsString::from)
+            })
+            .into_iter()
+            .find(|(key, _)| *key == MESSAGE_THREADS_ENV)
+            .and_then(|(_, value)| value)
+        };
+        for mode in [RoutingMode::Proxy, RoutingMode::ProxySubagents] {
+            assert_eq!(threads(mode, None).as_deref(), Some("0"));
+            assert_eq!(threads(mode, Some("")).as_deref(), Some("0"));
+            assert_eq!(threads(mode, Some("1")).as_deref(), Some("1"));
+        }
+        // `--via env` is not first-party to Claude Code, so it never threads.
+        assert_eq!(threads(RoutingMode::Override, None), None);
+    }
+
     /// The real launcher, `--via env` against the hosted prod router: with a
     /// stored key and an explicit compact window it needs no network and starts
     /// no process, so the child command it builds can be read directly. Each
@@ -3068,26 +3102,6 @@ mod claude_code_model_alias_tests {
                 .get_envs()
                 .any(|(key, value)| key == AUTO_COMPACT_WINDOW_ENV
                     && value == Some(std::ffi::OsStr::new("180000")))
-        );
-    }
-
-    #[test]
-    fn proxy_launch_turns_message_threads_off_unless_user_chose() {
-        let mut command = Command::new("true");
-        disable_message_threads_env(&mut command, false);
-        assert!(
-            command
-                .get_envs()
-                .any(|(key, value)| key == MESSAGE_THREADS_ENV
-                    && value == Some(std::ffi::OsStr::new("0")))
-        );
-
-        let mut command = Command::new("true");
-        disable_message_threads_env(&mut command, true);
-        assert!(
-            !command
-                .get_envs()
-                .any(|(key, _)| key == MESSAGE_THREADS_ENV)
         );
     }
 }
