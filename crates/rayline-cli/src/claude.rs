@@ -31,6 +31,11 @@ pub(crate) const ROUTING_MODE_PROXY: &str = "proxy";
 pub(crate) const ROUTING_MODE_PROXY_SUBAGENTS: &str = "proxy-subagents";
 const ROUTING_MODE_OVERRIDE: &str = "override";
 pub(crate) const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+/// Claude Code's switch for message threads ("tether"): server-held history
+/// that later requests continue by `previous_message_id`. It turns on for
+/// first-party traffic, which is what proxy mode looks like, but the router
+/// holds no thread, so every continuation costs a refused round trip.
+const MESSAGE_THREADS_ENV: &str = "CLAUDE_CODE_TETHER_LIVE";
 pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const CLAUDE_DISABLE_AGENT_VIEW_ENV: &str = "CLAUDE_CODE_DISABLE_AGENT_VIEW";
 /// Claude Code's own refusal recovery, switched off for a session whose main
@@ -1298,6 +1303,7 @@ async fn configure_proxy_env(
         command.env("ANTHROPIC_MODEL", model);
     }
     set_auto_compact_window_env(command, auto_compact_window);
+    disable_message_threads_env(command, env::var_os(MESSAGE_THREADS_ENV).is_some());
     command.env(
         "RAYLINE_CLAUDE_ROUTING_MODE",
         routing_mode_name(request.routing_mode),
@@ -1440,6 +1446,14 @@ fn is_claude_code_model_alias(model: &str) -> bool {
 
 /// Pin `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, or clear it so Claude Code applies
 /// its own window for the model.
+/// Have Claude Code send the full history on every request, unless the user
+/// set the switch themselves.
+fn disable_message_threads_env(command: &mut Command, user_set: bool) {
+    if !user_set {
+        command.env(MESSAGE_THREADS_ENV, "0");
+    }
+}
+
 fn set_auto_compact_window_env(command: &mut Command, auto_compact_window: Option<&str>) {
     match auto_compact_window {
         Some(window) => command.env(AUTO_COMPACT_WINDOW_ENV, window),
@@ -3054,6 +3068,26 @@ mod claude_code_model_alias_tests {
                 .get_envs()
                 .any(|(key, value)| key == AUTO_COMPACT_WINDOW_ENV
                     && value == Some(std::ffi::OsStr::new("180000")))
+        );
+    }
+
+    #[test]
+    fn proxy_launch_turns_message_threads_off_unless_user_chose() {
+        let mut command = Command::new("true");
+        disable_message_threads_env(&mut command, false);
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == MESSAGE_THREADS_ENV
+                    && value == Some(std::ffi::OsStr::new("0")))
+        );
+
+        let mut command = Command::new("true");
+        disable_message_threads_env(&mut command, true);
+        assert!(
+            !command
+                .get_envs()
+                .any(|(key, _)| key == MESSAGE_THREADS_ENV)
         );
     }
 }
