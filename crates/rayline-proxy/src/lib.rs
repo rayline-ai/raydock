@@ -604,6 +604,18 @@ async fn forward_anthropic_request(
         state.opts.local_available_now(),
         state.opts.custom_mode
     );
+    // Claude Code believes the proxy is first-party Anthropic, so after a tool
+    // result it may send a message-threads continuation: only the new messages
+    // plus `thread.previous_message_id`, expecting the server to hold the
+    // history. The router holds none. Refuse it with the router's own 400 so
+    // Claude Code resends the full history instead of a reply losing context.
+    if decision.target == RouteTarget::Router
+        && parts.uri.path() == "/v1/messages"
+        && is_thread_continuation(&routed.body)
+    {
+        info!("proxy refused thread continuation path={path_and_query} agent_id={agent_id}");
+        return Ok(thread_continuation_refusal());
+    }
     if let Some(metrics) = state.opts.metrics.as_ref().filter(|_| proxy_owns_metrics) {
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: request_id.clone(),
@@ -2175,6 +2187,27 @@ fn is_router_routed_path(method: &Method, path: &str, routing_mode: ProxyRouting
             _ => false,
         },
     }
+}
+
+fn is_thread_continuation(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .is_some_and(|value| value.get("thread").is_some_and(Value::is_object))
+}
+
+/// Same status and message the hosted router returns for this shape, so
+/// Claude Code takes its existing full-history resend path.
+fn thread_continuation_refusal() -> Response<BoxBody> {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "tool result must follow its request tool call or carry a retained-history link: message 0 content block 0 of type \"tool_result\": field \"content.tool_use_id\"",
+            },
+        }),
+    )
 }
 
 fn request_body_model(body: &[u8]) -> Option<String> {
