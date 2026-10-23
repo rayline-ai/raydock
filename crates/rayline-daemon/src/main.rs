@@ -33,6 +33,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+mod hybrid;
 mod statusline;
 
 // Pinned llama.cpp release. Kept to the newest build that is >=7 days old
@@ -102,6 +103,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Supervise the ARC execution core; inference runtimes remain externally owned.
+    Hybrid(hybrid::Args),
     /// Run llama-server + adapter + injector under one supervisor (foreground).
     Serve(ServeArgs),
     /// Run only the transparent Claude Code HTTPS proxy (foreground).
@@ -371,6 +374,7 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.cmd {
+        Cmd::Hybrid(args) => hybrid::run(args).await,
         Cmd::Serve(args) => run_serve(args).await,
         Cmd::Proxy(args) => run_proxy(args).await,
         Cmd::Statusline(args) => {

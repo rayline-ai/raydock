@@ -1473,6 +1473,7 @@ name = "rayline-cli"
 version = "0.2.12"
 dependencies = [
  "base64",
+ "clap",
  "crossterm",
  "dirs",
  "libc",
@@ -1501,9 +1502,11 @@ dependencies = [
  "bytes",
  "clap",
  "dirs",
+ "futures",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rand 0.9.4",
  "rayline-adapter",
  "rayline-hf",
  "rayline-injector",

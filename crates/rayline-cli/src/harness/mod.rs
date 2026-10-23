@@ -157,7 +157,7 @@ impl Harness {
         }
     }
 
-    fn plan(self, ctx: &RenderContext<'_>) -> Result<Plan, String> {
+    pub(crate) fn plan(self, ctx: &RenderContext<'_>) -> Result<Plan, String> {
         Ok(match self {
             Self::OpenCode => opencode::plan(ctx),
             Self::Pi => pi::plan(ctx),

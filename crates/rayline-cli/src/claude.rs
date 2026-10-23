@@ -1357,7 +1357,10 @@ pub(crate) fn refusal_recovery_values(
 
 /// Sets the refusal-recovery switches on the child, in every mode: a value
 /// with a `Some` goes on the child, a `None` leaves the inherited env alone.
-fn apply_refusal_recovery_env(command: &mut Command, values: &[(&'static str, Option<String>)]) {
+pub(crate) fn apply_refusal_recovery_env(
+    command: &mut Command,
+    values: &[(&'static str, Option<String>)],
+) {
     for (key, value) in values {
         if let Some(value) = value {
             command.env(key, value);

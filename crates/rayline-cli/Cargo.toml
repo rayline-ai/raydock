@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 base64 = "0.22"
 crossterm = "0.28"
+clap.workspace = true
 dirs.workspace = true
 minisign-verify = "0.2.5"
 rand = "0.9"
