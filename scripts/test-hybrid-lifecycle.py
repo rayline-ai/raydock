@@ -95,6 +95,22 @@ print('harness request reached execution core')
             assert event["path"] == "/v1/messages"
             assert sorted(event["credential_env_present"]) == sorted(credential_env)
             assert json.loads(event["body"])["metadata"]["user_id"] == "session_fixture"
+            pi = harness_dir / "pi"
+            pi.write_text("""#!/usr/bin/env python3
+import json, os, pathlib
+assert 'RAYLINE_TEST_HOSTED_ALIAS' not in os.environ
+assert 'RAYLINE_TEST_LOCAL_ALIAS' not in os.environ
+provider = json.loads((pathlib.Path(os.environ['PI_CODING_AGENT_DIR']) / 'models.json').read_text())['providers']['rayline']
+model = provider['models'][0]
+assert model['maxTokens'] == 8192
+assert model['contextWindow'] == 16384
+assert model['input'] == ['text']
+assert provider['compat']['sendSessionAffinityHeaders'] is True
+print('qualified Pi profile loaded')
+""")
+            pi.chmod(0o700)
+            assert "qualified Pi profile loaded" in cli("run", "pi", "--", "--no-session")
+            cli("run", "pi", "--", "--resume", success=False)
             request = urllib.request.Request(first["listen_url"] + "/unready", data=b"{}",
                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
             with urllib.request.urlopen(request) as response:

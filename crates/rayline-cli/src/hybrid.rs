@@ -7,6 +7,7 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use rayline_local_router::ModelCapabilities;
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -247,7 +248,14 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             let state = ready(&paths)?;
             health(&client, &paths, &state).await?;
             let token = fs::read_to_string(paths.token())?;
-            let mut command = harness_command(&paths, &harness, &args, url(&state)?, &token)?;
+            let mut command = harness_command(
+                &paths,
+                &harness,
+                &args,
+                url(&state)?,
+                &token,
+                &model_capabilities(&state)?,
+            )?;
             for name in credential_env_names(&state)? {
                 // A harness may use the same variable name for its local gateway
                 // token. Preserve that explicit replacement, never the inherited key.
@@ -273,6 +281,7 @@ fn ready(paths: &Paths) -> io::Result<Value> {
         return Err(io::Error::other("incompatible hybrid runtime metadata"));
     }
     credential_env_names(&state)?;
+    model_capabilities(&state)?;
     if state
         .get("instance_id")
         .and_then(Value::as_str)
@@ -311,6 +320,18 @@ fn credential_env_names(state: &Value) -> io::Result<Vec<&str>> {
         .collect()
 }
 
+fn model_capabilities(state: &Value) -> io::Result<ModelCapabilities> {
+    let capabilities: ModelCapabilities = serde_json::from_value(
+        state
+            .get("capabilities")
+            .ok_or_else(|| io::Error::other("missing hybrid model capabilities"))?
+            .clone(),
+    )
+    .map_err(io::Error::other)?;
+    capabilities.validate().map_err(io::Error::other)?;
+    Ok(capabilities)
+}
+
 fn url(state: &Value) -> io::Result<&str> {
     state
         .get("listen_url")
@@ -335,6 +356,7 @@ async fn health(client: &reqwest::Client, paths: &Paths, state: &Value) -> io::R
         || health.get("instance_id") != state.get("instance_id")
         || health.get("ready") != Some(&json!(true))
         || health.get("contract_version") != Some(&json!(1))
+        || model_capabilities(&health)? != model_capabilities(state)?
     {
         return Err(io::Error::other("hybrid health/process identity mismatch"));
     }
@@ -347,6 +369,7 @@ fn harness_command(
     args: &[OsString],
     endpoint: &str,
     token: &str,
+    capabilities: &ModelCapabilities,
 ) -> io::Result<Command> {
     require_fresh_session(name, args)?;
     let mut command = Command::new(name);
@@ -403,7 +426,9 @@ fn harness_command(
                 },
                 allow_empty_signature: true,
             };
-            let plan = harness.plan(&ctx).map_err(io::Error::other)?;
+            let plan = harness
+                .hybrid_plan(&ctx, capabilities)
+                .map_err(io::Error::other)?;
             crate::harness::write_files(&config_dir, &plan.files)?;
             // Used only by harnesses which cannot transmit native session identity.
             let conversation_id = format!("hybrid-{:032x}", rand::random::<u128>());
@@ -434,6 +459,16 @@ fn require_fresh_session(harness: &str, args: &[OsString]) -> io::Result<()> {
                         | "--continue"
                         | "--fork-session"
                         | "--resume-session-at"
+                        | "-r"
+                        | "-c"
+                ),
+                "pi" => matches!(
+                    flag,
+                    "--resume"
+                        | "--continue"
+                        | "--fork"
+                        | "--session"
+                        | "--session-id"
                         | "-r"
                         | "-c"
                 ),
@@ -559,9 +594,19 @@ mod tests {
             dir: PathBuf::from("/unused"),
         };
         for name in ["claude", "codex"] {
-            let command =
-                harness_command(&paths, name, &[], "http://127.0.0.1:20815", "local-token")
-                    .unwrap();
+            let command = harness_command(
+                &paths,
+                name,
+                &[],
+                "http://127.0.0.1:20815",
+                "local-token",
+                &ModelCapabilities {
+                    context_window: 16384,
+                    max_output_tokens: 8192,
+                    input_modalities: vec!["text".into()],
+                },
+            )
+            .unwrap();
             let env: std::collections::HashMap<_, _> = command.get_envs().collect();
             assert_eq!(
                 env.get(std::ffi::OsStr::new("RAYLINE_ROUTER_API_KEY")),
@@ -582,6 +627,8 @@ mod tests {
             ("claude", "-r"),
             ("codex", "resume"),
             ("codex", "fork"),
+            ("pi", "--fork"),
+            ("pi", "--session=saved"),
         ] {
             assert!(require_fresh_session(harness, &[OsString::from(arg)]).is_err());
         }

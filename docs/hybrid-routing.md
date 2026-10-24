@@ -73,6 +73,14 @@ Rayline launchers. Claude uses Messages; Codex uses Responses. All launches use
 the virtual model `rayline-router` and the local gateway credential. Protocol
 and model capabilities remain the core's responsibility.
 
+Pi's hybrid model advertises the explicit `context_window`, `max_output_tokens`
+and `input_modalities` returned by the core's authenticated health response. The
+core computes shared limits across usable execution deployments; a source used
+only for an explicit selection alias does not advertise execution capabilities.
+Missing or invalid capabilities prevent startup. Pi's ordinary hosted launcher
+keeps its existing configuration. The hybrid gateway does not reduce a submitted
+output allowance: requests outside admitted limits fail visibly in the core.
+
 For an SDK or another harness, read the gateway address from `ready.json` and
 its private credential from `gateway-token` inside the state directory. Use
 Bearer auth or `x-api-key`. The gateway exposes `/v1/messages`,
@@ -99,7 +107,7 @@ Every start creates a new execution instance and new gateway/core credentials.
 the gateway; it does not restart automatically or route to a substitute target.
 After stopping or losing an instance, start a fresh harness session so its
 transcript and the core's process-local execution evidence have the same lifetime.
-Claude resume/continue/fork flags and Codex resume/fork commands are rejected by
+Claude and Pi resume/continue/fork flags and Codex resume/fork commands are rejected by
 this launcher. A restarted core rejects historical assistant/tool messages for an
 unknown session or branch; restoring a saved session requires its durable hidden
 instruction ledger, which this version does not persist. Existing harnesses also
@@ -119,7 +127,8 @@ The core emits exactly one startup JSON line to stdout:
 ```
 
 Logs go to stderr. Authenticated `/healthz` must return `ready: true`,
-`contract_version: 1`, and a nonempty `instance_id`. `rld` verifies the reported
+`contract_version: 1`, a nonempty `instance_id`, and explicit `capabilities`.
+`rld` verifies the reported
 PID matches the child it spawned and the URL is a loopback HTTP origin. It
 publishes complete readiness metadata atomically after the health check.
 
@@ -171,6 +180,8 @@ turn on the local fixture and the result turn on the cloud fixture. The optional
 the gateway owns fixture provider credentials and profile validation. Bootstrap
 keys and profile data exist only in the isolated test environment and temporary
 configuration.
+Use `--pi` instead for the installed Pi harness. This fixture-backed Pi read-tool
+exchange has also passed; it is separate from a live local/cloud routing proof.
 
 For diagnosis, `--artifacts-dir /absolute/path` saves the script's synthetic
 Decisions and provider-bound request bodies with owner-only permissions. These
@@ -232,9 +243,10 @@ Decisions selection and cloud model generation in this proof were controlled
 HTTP fixtures. The policy package was synthetic and used public registry
 controls. This does not establish live ARC routing quality, a production cloud
 deployment, measured cloud cache reuse, or qualification of other inference
-servers. Only Claude received an actual harness-and-local-model acceptance run;
-the other launcher configurations and baseline wire-format checks do not imply
-equivalent real-harness coverage.
+servers. Claude was the only real harness in that fixture-backed local-model
+run. The separate live Pi evidence below extends that coverage; other launcher
+configurations and baseline wire-format checks do not imply equivalent
+real-harness coverage.
 
 Repeat the qualified local run with a separately supplied deployment and private
 key file; the gateway bootstrap is available only in the isolated test setup:
@@ -255,3 +267,61 @@ and binding of the launched runtime's port and identity before it can safely own
 that process. This reference path uses a caller-owned inference runtime.
 Durable resume/fork state, tailnet enrollment, core release packaging and Windows
 lifecycle qualification also remain separate work.
+
+## Live Pi acceptance
+
+`scripts/test-hybrid-live.py` consumes a supplied real core configuration and
+credential environment. It starts only `rld` and the Go core. It creates no
+Decisions or inference fixtures and does not start the model runtime. The two
+tasks run in fresh Pi sessions with isolated synthetic working directories.
+An oracle in the already-running parent process verifies a ledger answer and a
+resource-constrained dependency scheduler against cases kept outside the agent's
+editable task directory. Agent-written tests do not determine success.
+
+The required `--proof routing` mode verifies that the same configured custom
+`value_usd` and caller price identity were applied to both tasks. All successful
+inference for the simple task must execute locally; the scheduler's final
+generation must execute in the cloud. The report links each actual ARC selection
+to completed execution and records selected and executed model identities
+separately, including explicit aliases. Unexpected route choices fail the proof.
+
+The distinct `--proof transport` mode requires real `top` with empty routing and
+reports actual route choices without claiming low-V or discounted-price support.
+It is useful while the live Decisions service does not support those controls;
+it does not satisfy the routing acceptance criteria. Neither mode rewrites the
+supplied configuration or quietly drops requested controls.
+
+Live runs require a positive process-wide `max_generation_attempts` in the core
+config. Failed and partial inference attempts consume that cap. The runner also
+enforces a per-task generation monitor and wall timeout, terminating only its
+owned Pi process group on failure. Supply an operator-verified
+`--generation-cost-bound-usd`; the total bound across configured inference
+attempts must fit `--max-run-cost-usd` (default $5). This is an inference cost
+bound, not a billing measurement; any separately charged Decisions calls must
+also fit the operator's budget. Evidence is saved in a new private output
+directory even when a task or route assertion fails.
+
+```bash
+python3 scripts/test-hybrid-live.py \
+  --core /absolute/path/to/rayline-core \
+  --config /absolute/path/to/live-hybrid.json \
+  --output-dir /absolute/path/to/new-proof-directory \
+  --proof routing \
+  --generation-cost-bound-usd 0.25
+```
+
+On 2026-10-23, installed Pi 0.80.2 completed the ledger task through the real
+Decisions service and real inference: cloud Haiku → on-device Qwen 27B → cloud
+Haiku, including file read and write tools. The parent oracle verified the
+result. The local turn used an explicit test alias from ARC's selected DeepSeek
+Flash action to the qualified Qwen deployment; selection and execution were
+recorded separately. This establishes mixed local/cloud execution, not a
+calibrated ARC decision for Qwen. The scheduler task stopped visibly when ARC
+selected an additional model without an execution binding; it did not pass.
+
+That run used `top` with empty routing. It does not establish the requested
+low-V, discounted-Qwen-price acceptance, an entirely local simple task, or a
+completed cloud scheduler task. The process cap was eight inference attempts
+with 2,048 output tokens per request and a $4 operator-verified inference cost
+bound. The current Rust workspace gate passed 745 tests with no failures and
+two existing ignored tests; workspace all-target clippy and formatting passed.

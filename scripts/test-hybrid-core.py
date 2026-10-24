@@ -36,8 +36,9 @@ def main():
     parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/rayline")
     parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     parser.add_argument("--claude", action="store_true", help="also run the installed Claude Code harness")
+    parser.add_argument("--pi", action="store_true", help="also run the installed Pi harness")
     parser.add_argument("--gateway-fixture-control-url", help="loopback test bootstrap for the real exact-dispatch app")
-    parser.add_argument("--local-deployment", type=Path, help="qualified BYO deployment JSON for the actual Claude turn")
+    parser.add_argument("--local-deployment", type=Path, help="qualified BYO deployment JSON for the actual harness turn")
     parser.add_argument("--local-auth-file", type=Path, help="private key file loaded into the deployment's auth_env")
     parser.add_argument("--artifacts-dir", type=Path, help="save synthetic request bodies without credentials for diagnosis")
     args = parser.parse_args()
@@ -49,8 +50,10 @@ def main():
             destination = args.artifacts_dir / name
             with os.fdopen(os.open(destination, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "wb") as stream:
                 stream.write(encoded(value))
-    if args.local_deployment and not args.claude:
-        parser.error("--local-deployment requires --claude")
+    if args.claude and args.pi:
+        parser.error("choose one actual harness per run")
+    if args.local_deployment and not (args.claude or args.pi):
+        parser.error("--local-deployment requires --claude or --pi")
     if args.local_auth_file and not args.local_deployment:
         parser.error("--local-auth-file requires --local-deployment")
     registry_bytes = args.registry.read_bytes()
@@ -174,8 +177,9 @@ def main():
                                "X-Rayline-Dispatched-Model": cloud_wire_model,
                                "X-Rayline-Worker": "cloud", "X-Rayline-Action-Id": cloud["action_id"]}
             if harness_scenario["active"] and harness_scenario["turns"] == 1:
+                tool_name, parameter = ("read", "path") if args.pi else ("Read", "file_path")
                 message = {"role": "assistant", "content": None, "tool_calls": [{"id": "call_native_read",
-                    "type": "function", "function": {"name": "Read", "arguments": json.dumps({"file_path": harness_scenario["path"]})}}]}
+                    "type": "function", "function": {"name": tool_name, "arguments": json.dumps({parameter: harness_scenario["path"]})}}]}
                 finish = "tool_calls"
             elif len(dispatches) == 1:
                 # Age must start after this generation completes, not before it.
@@ -249,6 +253,7 @@ def main():
         config = {"contract_version": 1, "package_path": str(package), "package_sha256": package_sha,
             "registry_path": str(args.registry.resolve()), "registry_sha256": registry_sha,
             "allow_experimental_controls": True, "decisions": {"url": external + "/decisions",
+                "api_mode": "execution_context_v1",
                 "auth_env": "RAYLINE_TEST_DECISIONS_KEY", "model": "synthetic-arc-model", "result": "top",
                 "routing": {}, "offer_sha256": offer_sha}, "bindings": [], "deployments": []}
         for name, selected in actions.items():
@@ -257,6 +262,7 @@ def main():
                 "protocol": "openai.chat.v1", "wire_model": f"fixture-{name}-model",
                 "registry_model": selected["model"], "registry_provider": "openai" if name == "local" else "openrouter",
                 "runtime_identity": "synthetic-http-fixture", "max_output_tokens": 32768,
+                "context_window": 65536, "input_modalities": ["text"],
                 "token_units": "fixture-tokenizer"}
             if name == "cloud":
                 deployment.update(auth_env="RAYLINE_TEST_CLOUD_KEY", dispatch_profile_sha256=profile_sha,
@@ -333,7 +339,7 @@ def main():
             actual_local = None
             if args.local_deployment:
                 # The original fixture suite finishes unchanged. A new core then
-                # qualifies and binds the caller-owned real runtime for Claude.
+                # qualifies and binds the caller-owned real runtime for the selected harness.
                 cli("stop")
                 actual_local = json.loads(args.local_deployment.read_text())
                 assert actual_local["kind"] == "local" and actual_local["registry_model"] == local["model"]
@@ -344,14 +350,19 @@ def main():
                     env[actual_local["auth_env"]] = args.local_auth_file.read_text().strip()
                 env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(min(2048, actual_local["max_output_tokens"]))
                 current = start()
-            if args.claude:
+            if args.claude or args.pi:
                 before_harness_dispatches = len(dispatches)
                 sample = root / "synthetic.txt"
                 sample.write_text("SYNTHETIC-FILE-READ-PROOF\n")
                 harness_scenario.update(active=True, path=str(sample))
-                output = cli("run", "claude", "--", "--print", "--max-turns", "3", "--tools", "Read",
-                    "--allowedTools", "Read", "--no-session-persistence", "--setting-sources", "",
-                    f"Read {sample} and then reply with Synthetic execution complete.")
+                prompt = f"Read {sample} and then reply with Synthetic execution complete."
+                if args.pi:
+                    output = cli("run", "pi", "--", "--provider", "rayline", "--model", "rayline-router",
+                        "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates",
+                        "--no-context-files", "--tools", "read", "--thinking", "off", "--print", prompt)
+                else:
+                    output = cli("run", "claude", "--", "--print", "--max-turns", "3", "--tools", "Read",
+                        "--allowedTools", "Read", "--no-session-persistence", "--setting-sources", "", prompt)
                 assert "Synthetic execution complete." in output, output
                 assert harness_scenario["turns"] == 2, harness_scenario
                 expected_fixture_targets = ["cloud"] if actual_local else ["local", "cloud"]
@@ -427,8 +438,10 @@ def main():
     print("Real Rust + Go hybrid acceptance passed: three wires, local/cloud/local, tools, private append, completion age, external ownership, restart and parent death. HTTP Decisions and the baseline model responses were synthetic fixtures.")
     if args.claude:
         print("Installed Claude Code completed a real Read tool exchange across local/cloud execution.")
+    if args.pi:
+        print("Installed Pi completed a real read tool exchange across local/cloud execution.")
     if args.local_deployment:
-        print("The Claude local turn used the caller-owned real Qwen runtime with qualified prompt counting; it remained healthy after Rayline stopped.")
+        print("The selected harness local turn used the caller-owned real Qwen runtime with qualified prompt counting; it remained healthy after Rayline stopped.")
     if args.gateway_fixture_control_url:
         print("Actual exact-dispatch gateway settled one receipt and balance debit per cloud call.")
 

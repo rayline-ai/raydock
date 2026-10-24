@@ -28,6 +28,14 @@ impl Runtime {
         Self::start_with_deadline(version, 0, 120)
     }
     fn start_with_deadline(version: u32, delay: u64, deadline: u64) -> Self {
+        Self::start_with_capabilities(version, delay, deadline, None)
+    }
+    fn start_with_capabilities(
+        version: u32,
+        delay: u64,
+        deadline: u64,
+        capabilities: Option<Value>,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "rayline-hybrid-{}-{:x}",
             std::process::id(),
@@ -37,14 +45,13 @@ impl Runtime {
         let script = dir.join("core");
         fs::write(&script, include_str!("fixtures/execution-contract.py")).unwrap();
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-        fs::write(
-            dir.join("config.json"),
-            json!({"events":dir.join("events.jsonl"),
-                "cancelled":dir.join("cancelled"), "contract_version":version,
-                "handshake_delay":delay})
-            .to_string(),
-        )
-        .unwrap();
+        let mut config = json!({"events":dir.join("events.jsonl"),
+            "cancelled":dir.join("cancelled"), "contract_version":version,
+            "handshake_delay":delay});
+        if let Some(capabilities) = capabilities {
+            config["capabilities"] = capabilities;
+        }
+        fs::write(dir.join("config.json"), config.to_string()).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_rld"))
             .arg("hybrid")
             .arg("--core")
@@ -212,6 +219,23 @@ async fn incompatible_core_never_becomes_ready_and_is_reaped() {
     runtime.core_exited().await;
     assert!(!runtime.dir.join("ready.json").exists());
     assert!(!runtime.dir.join("token").exists());
+}
+
+#[tokio::test]
+async fn invalid_capabilities_never_publish_readiness_and_reap_core() {
+    for capabilities in [
+        Value::Null,
+        json!({"context_window": 16384, "max_output_tokens": 32000,
+            "input_modalities": ["text"]}),
+        json!({"context_window": 16384, "max_output_tokens": 8192,
+            "input_modalities": ["audio"]}),
+    ] {
+        let mut runtime = Runtime::start_with_capabilities(1, 0, 120, Some(capabilities));
+        assert!(!runtime.exited().await.success());
+        runtime.core_exited().await;
+        assert!(!runtime.dir.join("ready.json").exists());
+        assert!(!runtime.dir.join("token").exists());
+    }
 }
 
 #[tokio::test]

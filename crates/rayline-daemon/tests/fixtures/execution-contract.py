@@ -46,7 +46,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.authorized():
             return
-        body = json.dumps({"ready": Handler.ready, "contract_version": 1, "instance_id": f"fixture-{os.getpid()}"}).encode()
+        body = json.dumps({"ready": Handler.ready, "contract_version": 1, "instance_id": f"fixture-{os.getpid()}",
+                           "capabilities": config.get("capabilities", {"context_window": 16384, "max_output_tokens": 8192,
+                                            "input_modalities": ["text"]})}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))

@@ -19,7 +19,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rand::RngCore;
-use rayline_local_router::InboundGuard;
+use rayline_local_router::{InboundGuard, ModelCapabilities};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -69,6 +69,7 @@ struct Ready {
     core_pid: u32,
     instance_id: String,
     credential_env: Vec<String>,
+    capabilities: ModelCapabilities,
 }
 
 struct Gateway {
@@ -79,6 +80,7 @@ struct Gateway {
     port: u16,
     core_pid: u32,
     instance_id: String,
+    capabilities: ModelCapabilities,
     shutdown: mpsc::Sender<()>,
 }
 
@@ -137,6 +139,7 @@ pub async fn run(args: Args) -> Result<()> {
             result = &mut signals => { result?; return Ok(()); }
         };
         let instance_id = validate_health(&health)?.to_owned();
+        let capabilities = model_capabilities(&health)?;
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel(1);
         let state = Arc::new(Gateway {
             core_url: handshake.listen_url,
@@ -146,6 +149,7 @@ pub async fn run(args: Args) -> Result<()> {
             port,
             core_pid: handshake.pid,
             instance_id: instance_id.clone(),
+            capabilities: capabilities.clone(),
             shutdown: shutdown_tx,
         });
         let ready = Ready {
@@ -156,6 +160,7 @@ pub async fn run(args: Args) -> Result<()> {
             core_pid: handshake.pid,
             instance_id,
             credential_env,
+            capabilities,
         };
         write_private_new(&args.ready_file, &serde_json::to_vec(&ready)?)?;
         cleanup.ready = Some(args.ready_file.clone());
@@ -296,6 +301,9 @@ async fn handle(state: Arc<Gateway>, request: Request<Incoming>) -> Response<Bod
             if validate_health(&health)? != state.instance_id {
                 bail!("execution core instance changed");
             }
+            if model_capabilities(&health)? != state.capabilities {
+                bail!("execution core capabilities changed");
+            }
             Ok::<_, anyhow::Error>(())
         }
         .await;
@@ -306,6 +314,7 @@ async fn handle(state: Arc<Gateway>, request: Request<Incoming>) -> Response<Bod
                     "ready": true, "contract_version": CONTRACT_VERSION,
                     "pid": std::process::id(), "core_pid": state.core_pid,
                     "instance_id": state.instance_id,
+                    "capabilities": state.capabilities,
                 }),
             ),
             _ => error_response(
@@ -347,6 +356,17 @@ fn validate_health(health: &serde_json::Value) -> Result<&str> {
         .and_then(serde_json::Value::as_str)
         .filter(|id| !id.is_empty())
         .context("execution core health has no instance identity")
+}
+
+fn model_capabilities(health: &serde_json::Value) -> Result<ModelCapabilities> {
+    let capabilities: ModelCapabilities = serde_json::from_value(
+        health
+            .get("capabilities")
+            .context("execution core health has no model capabilities")?
+            .clone(),
+    )?;
+    capabilities.validate().map_err(anyhow::Error::msg)?;
+    Ok(capabilities)
 }
 
 async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response<Body>> {

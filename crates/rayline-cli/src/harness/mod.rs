@@ -166,6 +166,18 @@ impl Harness {
             Self::OpenClaw => openclaw::plan(ctx),
         })
     }
+
+    pub(crate) fn hybrid_plan(
+        self,
+        ctx: &RenderContext<'_>,
+        capabilities: &rayline_local_router::ModelCapabilities,
+    ) -> Result<Plan, String> {
+        if self == Self::Pi {
+            Ok(pi::plan_with_capabilities(ctx, Some(capabilities)))
+        } else {
+            self.plan(ctx)
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

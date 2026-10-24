@@ -30,7 +30,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+mod capabilities;
 mod chat_inbound;
+pub use capabilities::ModelCapabilities;
 pub mod inbound_guard;
 pub use inbound_guard::InboundGuard;
 
