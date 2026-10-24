@@ -31,6 +31,11 @@ pub(crate) const ROUTING_MODE_PROXY: &str = "proxy";
 pub(crate) const ROUTING_MODE_PROXY_SUBAGENTS: &str = "proxy-subagents";
 const ROUTING_MODE_OVERRIDE: &str = "override";
 pub(crate) const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+/// Claude Code's switch for message threads ("tether"): server-held history
+/// that later requests continue by `previous_message_id`. It turns on for
+/// first-party traffic, which is what proxy mode looks like, but the router
+/// holds no thread, so every continuation costs a refused round trip.
+const MESSAGE_THREADS_ENV: &str = "CLAUDE_CODE_TETHER_LIVE";
 pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const CLAUDE_DISABLE_AGENT_VIEW_ENV: &str = "CLAUDE_CODE_DISABLE_AGENT_VIEW";
 /// Claude Code's own refusal recovery, switched off for a session whose main
@@ -879,7 +884,7 @@ async fn run_command_from_home(
         None
     };
     let mut inspect_dir = claude_config_dir(home, isolated);
-    let refusal_recovery = refusal_recovery_values(request.routing_mode, |key| env::var_os(key));
+    let refusal_recovery = launch_env_switches(request.routing_mode, |key| env::var_os(key));
     let mut daemon_request = RequestSpec {
         env_name: &env_name,
         routing_mode: request.routing_mode,
@@ -1353,6 +1358,27 @@ pub(crate) fn refusal_recovery_values(
             (key, value)
         })
         .collect()
+}
+
+/// The refusal-recovery switches plus the message-threads switch: every env
+/// switch the child runs with and a reused daemon must already hold. Any proxy
+/// mode can send router-bound continuations (subagent turns too), so threads
+/// default off there; elsewhere they are the user's value or Claude Code's.
+pub(crate) fn launch_env_switches(
+    routing_mode: RoutingMode,
+    inherited: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, Option<String>)> {
+    let mut values = refusal_recovery_values(routing_mode, &inherited);
+    let user = inherited(MESSAGE_THREADS_ENV)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string_lossy().into_owned());
+    let threads = if is_proxy_routing_mode(routing_mode) {
+        user.or_else(|| Some("0".to_owned()))
+    } else {
+        user
+    };
+    values.push((MESSAGE_THREADS_ENV, threads));
+    values
 }
 
 /// Sets the refusal-recovery switches on the child, in every mode: a value
@@ -2768,6 +2794,28 @@ mod refusal_recovery_env_tests {
         );
     }
 
+    #[test]
+    fn proxy_modes_turn_message_threads_off_unless_the_user_set_it() {
+        let threads = |mode, user: Option<&str>| {
+            launch_env_switches(mode, |key| {
+                (key == MESSAGE_THREADS_ENV)
+                    .then_some(user)
+                    .flatten()
+                    .map(OsString::from)
+            })
+            .into_iter()
+            .find(|(key, _)| *key == MESSAGE_THREADS_ENV)
+            .and_then(|(_, value)| value)
+        };
+        for mode in [RoutingMode::Proxy, RoutingMode::ProxySubagents] {
+            assert_eq!(threads(mode, None).as_deref(), Some("0"));
+            assert_eq!(threads(mode, Some("")).as_deref(), Some("0"));
+            assert_eq!(threads(mode, Some("1")).as_deref(), Some("1"));
+        }
+        // `--via env` is not first-party to Claude Code, so it never threads.
+        assert_eq!(threads(RoutingMode::Override, None), None);
+    }
+
     /// The real launcher, `--via env` against the hosted prod router: with a
     /// stored key and an explicit compact window it needs no network and starts
     /// no process, so the child command it builds can be read directly. Each
@@ -2809,15 +2857,21 @@ mod refusal_recovery_env_tests {
             config_path: None,
             root_env_explicit: true,
         };
-        let saved: Vec<_> = [FALLBACK, RETRY, CLAUDE_CONFIG_DIR_ENV]
+        let saved: Vec<_> = [FALLBACK, RETRY, MESSAGE_THREADS_ENV, CLAUDE_CONFIG_DIR_ENV]
             .map(|key| (key, std::env::var_os(key)))
             .into();
         // A private Claude config dir, so no real daemon on this machine is inspected.
         // SAFETY: serialized by ENV_LOCK; restored below.
         unsafe { std::env::set_var(CLAUDE_CONFIG_DIR_ENV, home.join(".claude")) };
         let mut seen = Vec::new();
-        for (fallback, retry) in [(None, Some("")), (Some("0"), None)] {
-            for (key, value) in [(FALLBACK, fallback), (RETRY, retry)] {
+        // The message-threads switch goes through the same launch switches: a
+        // user value is carried onto the child (and so into daemon reuse).
+        for (fallback, retry, threads) in [(None, Some(""), None), (Some("0"), None, Some("1"))] {
+            for (key, value) in [
+                (FALLBACK, fallback),
+                (RETRY, retry),
+                (MESSAGE_THREADS_ENV, threads),
+            ] {
                 // SAFETY: serialized by ENV_LOCK; restored below.
                 match value {
                     Some(value) => unsafe { std::env::set_var(key, value) },
@@ -2840,6 +2894,7 @@ mod refusal_recovery_env_tests {
             seen.push((
                 env.get(FALLBACK).cloned().flatten(),
                 env.get(RETRY).cloned().flatten(),
+                env.get(MESSAGE_THREADS_ENV).cloned().flatten(),
             ));
         }
         for (key, value) in saved {
@@ -2853,8 +2908,12 @@ mod refusal_recovery_env_tests {
         assert_eq!(
             seen,
             vec![
-                (Some("1".to_owned()), Some("1".to_owned())),
-                (Some("0".to_owned()), Some("1".to_owned())),
+                (Some("1".to_owned()), Some("1".to_owned()), None),
+                (
+                    Some("0".to_owned()),
+                    Some("1".to_owned()),
+                    Some("1".to_owned())
+                ),
             ]
         );
     }

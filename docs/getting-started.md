@@ -290,6 +290,12 @@ router's to handle, so Rayline turns off Claude Code's own refusal recovery:
 it sets `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` (no resend to another Claude
 model) and `CLAUDE_CODE_DISABLE_REFUSAL_RETRY=1` (no same-model resend). A value
 you set yourself is kept. `--route subagents` leaves Claude Code's defaults.
+In proxy mode (`--route all` and `--route subagents`) Rayline also sets
+`CLAUDE_CODE_TETHER_LIVE=0`, turning off Claude Code's message threads: in
+proxy mode Claude Code treats the router as first-party Anthropic and would
+send later tool turns as continuations of server-held history, which the
+router does not keep. With it off, every request carries the full
+conversation. A value you set yourself is kept.
 A running Claude Code daemon is reused only if it holds the same values (its
 background agents inherit its env); otherwise Rayline treats it as a conflict.
 

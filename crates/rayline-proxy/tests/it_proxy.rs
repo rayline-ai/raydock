@@ -15,6 +15,7 @@ use hyper_util::server::conn::auto;
 use rcgen::{CertificateParams, KeyPair};
 use rustls::ServerConfig;
 use rustls::pki_types::PrivateKeyDer;
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
@@ -410,6 +411,92 @@ async fn proxy_routes_router_and_anthropic_paths_with_correct_auth() {
         Some("Bearer claude-oauth".to_string())
     );
     assert_eq!(anthropic_seen[0].header("x-api-key"), None);
+}
+
+#[tokio::test]
+async fn proxy_refuses_router_bound_thread_continuation_so_claude_resends_history() {
+    init_tracing();
+    let router = spawn_fake_https_server(
+        "localhost",
+        FakeResponse {
+            status: StatusCode::OK,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: Bytes::from_static(br#"{"ok":"router"}"#),
+        },
+    )
+    .await;
+    let proxy_port = free_port();
+    let ca_dir = tempfile::tempdir().unwrap();
+    let opts = proxy_options(
+        proxy_port,
+        ca_dir.path(),
+        format!("https://127.0.0.1:{}", router.port),
+        format!("https://127.0.0.1:{}", router.port),
+        &[&router],
+    );
+    let ca_cert_path = opts.ca_cert_path.clone();
+    spawn_proxy(opts).await;
+    let client = proxied_client(proxy_port, &ca_cert_path);
+
+    // The message-threads continuation Claude Code sends after a tool result
+    // when it believes it is talking to first-party Anthropic.
+    let continuation = json!({
+        "model": "rayline-router",
+        "thread": {"type": "continue", "previous_message_id": "msg_prev"},
+        "messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+        ]}],
+    });
+    let refused = client
+        .post("https://api.anthropic.com/v1/messages?beta=true")
+        .json(&continuation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let error: Value = refused.json().await.unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("retained-history link")
+    );
+    assert!(router.captured.lock().unwrap().is_empty());
+
+    // Claude Code tags every full-history turn, the resend included, with
+    // `thread.type = "create"`; it must pass or the resend would loop.
+    let full_history = json!({
+        "model": "rayline-router",
+        "thread": {"type": "create"},
+        "messages": [
+            {"role": "user", "content": "list files"},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
+            ]},
+        ],
+    });
+    let resent = client
+        .post("https://api.anthropic.com/v1/messages?beta=true")
+        .json(&full_history)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resent.status(), StatusCode::OK);
+    assert_eq!(router.captured.lock().unwrap().len(), 1);
+
+    // Only message creation is refused; token counting still reaches the router.
+    let counted = client
+        .post("https://api.anthropic.com/v1/messages/count_tokens?beta=true")
+        .json(&continuation)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(counted.status(), StatusCode::OK);
+    assert_eq!(router.captured.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]

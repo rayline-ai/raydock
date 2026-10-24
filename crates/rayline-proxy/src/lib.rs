@@ -604,6 +604,20 @@ async fn forward_anthropic_request(
         state.opts.local_available_now(),
         state.opts.custom_mode
     );
+    // Claude Code believes the proxy is first-party Anthropic, so after a tool
+    // result it may send a message-threads continuation: only the new messages
+    // plus `thread.previous_message_id`, expecting the server to hold the
+    // history. Neither the hosted nor the local router holds it (a local model
+    // or openai_chat endpoint drops `thread`), so refuse it for any router
+    // target with the hosted router's own 400; Claude Code then resends the
+    // full history instead of accepting a reply that lost context.
+    if decision.target == RouteTarget::Router
+        && parts.uri.path() == "/v1/messages"
+        && is_thread_continuation(&routed.body)
+    {
+        info!("proxy refused thread continuation path={path_and_query} agent_id={agent_id}");
+        return Ok(thread_continuation_refusal());
+    }
     if let Some(metrics) = state.opts.metrics.as_ref().filter(|_| proxy_owns_metrics) {
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: request_id.clone(),
@@ -2177,6 +2191,34 @@ fn is_router_routed_path(method: &Method, path: &str, routing_mode: ProxyRouting
     }
 }
 
+/// Claude Code also sends `thread: {"type": "create"}` on every full-history
+/// turn; only a continuation (which leans on server-held history) is refused.
+fn is_thread_continuation(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let Some(thread) = value.get("thread") else {
+        return false;
+    };
+    thread.get("type").and_then(Value::as_str) == Some("continue")
+        || thread.get("previous_message_id").is_some()
+}
+
+/// Same status and message the hosted router returns for this shape, so
+/// Claude Code takes its existing full-history resend path.
+fn thread_continuation_refusal() -> Response<BoxBody> {
+    json_response(
+        StatusCode::BAD_REQUEST,
+        json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "tool result must follow its request tool call or carry a retained-history link: message 0 content block 0 of type \"tool_result\": field \"content.tool_use_id\"",
+            },
+        }),
+    )
+}
+
 fn request_body_model(body: &[u8]) -> Option<String> {
     serde_json::from_slice::<Value>(body)
         .ok()
@@ -2816,6 +2858,35 @@ fn temp_sibling_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use rayline_metrics::MetricsSink as _;
+
+    #[test]
+    fn thread_continuation_is_either_signal_and_never_create() {
+        let refused = [
+            br#"{"thread":{"type":"continue"}}"#.as_slice(),
+            br#"{"thread":{"previous_message_id":"msg_prev"}}"#,
+            br#"{"thread":{"type":"continue","previous_message_id":"msg_prev"}}"#,
+        ];
+        for body in refused {
+            assert!(
+                is_thread_continuation(body),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+        let passed = [
+            br#"{"thread":{"type":"create"}}"#.as_slice(),
+            br#"{"thread":{}}"#,
+            br#"{"messages":[]}"#,
+            b"not json",
+        ];
+        for body in passed {
+            assert!(
+                !is_thread_continuation(body),
+                "{}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
 
     fn observe_test_sse_chunk(
         bytes: &[u8],
