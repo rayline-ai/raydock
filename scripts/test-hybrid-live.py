@@ -36,9 +36,15 @@ def events_since(path, offset):
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if event.get("msg") in ("decision selected", "execution completed", "execution aborted", "execution refused"):
+                if event.get("msg") in ("decision selected", "decision refused", "execution completed", "execution aborted", "execution refused"):
                     events.append(event)
     return events
+
+
+def require_admitted_decisions(events):
+    for event in events:
+        if event["msg"] == "decision refused":
+            raise RuntimeError(f"ARC decision refused: {event.get('reason')} (route_id={event.get('route_id')})")
 
 
 def schedule_reference(tasks, capacity):
@@ -201,6 +207,7 @@ def main():
                 try:
                     while process.poll() is None:
                         task_events = events_since(log, offset)
+                        require_admitted_decisions(task_events)
                         selected = [event for event in task_events if event["msg"] == "decision selected"]
                         assert len(selected) <= args.max_generations_per_task, "generation limit exceeded"
                         assert time.monotonic() < deadline, "task wall timeout exceeded"
@@ -213,6 +220,7 @@ def main():
                         except subprocess.TimeoutExpired:
                             os.killpg(process.pid, signal.SIGKILL); process.wait()
                     task_report["events"] = events_since(log, offset)
+            require_admitted_decisions(task_report["events"])
             assert verify(), f"{name} objective failed"
             task_report["objective_passed"] = True
             selected = [event for event in task_report["events"] if event["msg"] == "decision selected"]

@@ -294,7 +294,9 @@ supplied configuration or quietly drops requested controls.
 Live runs require a positive process-wide `max_generation_attempts` in the core
 config. Failed and partial inference attempts consume that cap. The runner also
 enforces a per-task generation monitor and wall timeout, terminating only its
-owned Pi process group on failure. Supply an operator-verified
+owned Pi process group on failure. A structured `decision refused` event is
+preserved as evidence and stops the task immediately instead of waiting for
+harness retries against the unchanged configuration. Supply an operator-verified
 `--generation-cost-bound-usd`; the total bound across configured inference
 attempts must fit `--max-run-cost-usd` (default $5). This is an inference cost
 bound, not a billing measurement; any separately charged Decisions calls must
