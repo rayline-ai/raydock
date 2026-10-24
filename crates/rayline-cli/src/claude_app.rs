@@ -3,23 +3,24 @@
 //!
 //! Claude Desktop's Code sessions ignore `ANTHROPIC_BASE_URL`; the only way to
 //! point them at a gateway is the app's third-party inference ("3P") mode,
-//! configured per machine through **Developer → Configure Third-Party
-//! Inference…**. Three facts shape this module:
+//! configured through the local profile library or **Developer → Configure
+//! Third-Party Inference…**. Three facts shape this module:
 //!
 //! 1. Desktop only accepts model ids that look like Anthropic models, so the
 //!    app is configured with hidden compatibility ids ([`DESKTOP_MODELS`]),
 //!    shown in the picker as `arc-sage` and `arc-swift`, and a dedicated local
 //!    router maps each to its ARC tier through an explicit `model_routes` entry.
 //!    ARC is not a Claude model; the ids only satisfy Desktop's model-id check.
-//! 2. 3P mode applies to the whole app (it signs Desktop out of the claude.ai
+//! 2. 3P mode applies to the whole app (it switches away from the claude.ai
 //!    subscription), so the router runs as its **own** instance — its own state
 //!    directory, ports, pid file and LaunchAgent — and never touches the shared
 //!    `rayline claude` / `rayline codex` router or any Claude Code CLI config.
 //! 3. The Rayline `rlk-` key stays inside the router process. Desktop receives a
 //!    loopback URL and a per-instance gateway token (which only unlocks this
-//!    router), through a JSON file the user loads with Desktop's documented
-//!    **Import configuration**; this module never writes Desktop's own
-//!    configuration.
+//!    router). The default command installs a recoverable local Desktop profile
+//!    and launches the app; `--manual` retains the documented import workflow.
+
+mod desktop;
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -143,7 +144,7 @@ pub fn gateway_url(ports: Ports) -> String {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppAction {
-    /// Start (or reuse) the instance and print the Desktop setup steps.
+    /// Start (or reuse) the gateway, configure Desktop and launch it.
     Start,
     /// Foreground: exec `rld` for the login service. Not for direct use.
     Serve,
@@ -152,7 +153,7 @@ pub enum AppAction {
     Stop,
     InstallService,
     UninstallService,
-    /// Print how to return Desktop to the claude.ai subscription; stop the router.
+    /// Restore the prior Desktop selection and stop the router.
     Off,
     Uninstall,
 }
@@ -177,6 +178,8 @@ impl AppAction {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppRequest {
     pub action: AppAction,
+    /// Start the router and print import instructions without changing Desktop.
+    pub manual: bool,
     /// `validate`: check this file instead of Desktop's applied configuration.
     pub desktop_config: Option<PathBuf>,
     /// Upstream tier-id spelling (`--prefixed-ids` selects the fallback).
@@ -186,8 +189,8 @@ pub struct AppRequest {
     pub root_env_explicit: bool,
 }
 
-/// Every file the Desktop instance owns. Nothing outside `dir` (plus the
-/// LaunchAgent plist) is ever written.
+/// Files belonging to the gateway. Desktop profile selection and recovery are
+/// managed separately by `desktop`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppPaths {
     pub dir: PathBuf,
@@ -1085,12 +1088,12 @@ Rayline ARC gateway for Claude Desktop is running.
   token that unlocks this local router.
 
 Before you continue: third-party mode applies to the whole Claude Desktop app.
-It signs Desktop out of your claude.ai subscription, and Chat and Cowork are
+It switches away from your claude.ai subscription, and Chat and Cowork are
 off while it is active. Run `rayline claude-desktop off` to see how to switch back.
 
 Connect Claude Desktop (once):
   1. Open Claude Desktop. From the menu bar choose Help > Troubleshooting >
-     Enable Developer Mode.
+     Enable Developer Mode (skip if the Developer menu already exists).
   2. Choose Developer > Configure Third-Party Inference...
   3. Choose Import configuration and select the import file above.
   4. Click Apply Changes, then Save & Restart.
@@ -1134,7 +1137,31 @@ pub async fn run(request: AppRequest) -> ExitCode {
 
 async fn run_inner(request: &AppRequest) -> Result<String, String> {
     match request.action {
-        AppAction::Start => start(request).await,
+        AppAction::Start => {
+            let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+            if !request.manual {
+                desktop::preflight(&home).map_err(|error| error.to_string())?;
+            }
+            let instructions = start(request).await?;
+            if request.manual {
+                return Ok(instructions);
+            }
+            let paths = AppPaths::new(&home);
+            let token = fs::read_to_string(&paths.token_file).map_err(|error| error.to_string())?;
+            let launch = desktop::launch(
+                &home,
+                &desktop_import_json(&gateway_url(PORTS), token.trim()),
+            )
+            .map_err(|error| {
+                format!(
+                    "{error}. The gateway remains running; use --manual for import instructions"
+                )
+            })?;
+            Ok(format!(
+                "Rayline ARC gateway is running at {}.\n{launch}",
+                gateway_url(PORTS)
+            ))
+        }
         AppAction::Serve => serve(request),
         AppAction::Status => status(request).await,
         AppAction::Validate => validate(request),
@@ -1142,8 +1169,16 @@ async fn run_inner(request: &AppRequest) -> Result<String, String> {
         AppAction::InstallService => install_service(request).await,
         AppAction::UninstallService => uninstall_service(),
         AppAction::Off => {
+            let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+            let restored = desktop::restore(&home).map_err(|error| error.to_string())?;
             let stopped = stop()?;
-            Ok(format!("{}\n{stopped}\n", off_instructions()))
+            if restored {
+                Ok(format!(
+                    "Restored your previous Claude Desktop profile and deployment mode. You may need to sign in again.\n{stopped}\n"
+                ))
+            } else {
+                Ok(format!("{}\n{stopped}\n", off_instructions()))
+            }
         }
         AppAction::Uninstall => uninstall(),
     }
@@ -1526,7 +1561,14 @@ fn uninstall_service() -> Result<String, String> {
 
 fn uninstall() -> Result<String, String> {
     let paths = home_paths()?;
-    let mut out = uninstall_service()?;
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    let restored = desktop::restore(&home).map_err(|error| error.to_string())?;
+    let mut out = if restored {
+        "Restored your previous Claude Desktop profile.\n".to_owned()
+    } else {
+        String::new()
+    };
+    out.push_str(&uninstall_service()?);
     out.push_str(&stop()?);
     match fs::remove_dir_all(&paths.dir) {
         Ok(()) => out.push_str(&format!("Removed {}.\n", paths.dir.display())),
@@ -1534,7 +1576,7 @@ fn uninstall() -> Result<String, String> {
         Err(error) => return Err(error.to_string()),
     }
     out.push_str(
-        "Claude Desktop's own configuration was not changed. To remove the gateway \
+        "The saved Rayline ARC profile remains in Desktop. To remove the gateway \
          configuration, open Developer > Configure Third-Party Inference... in Desktop.\n\n",
     );
     out.push_str(off_instructions());
