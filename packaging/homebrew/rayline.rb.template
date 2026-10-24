@@ -34,15 +34,18 @@ class Rayline < Formula
       bin.install "#{archive_root}/rayline"
       bin.install "#{archive_root}/rld"
       bin.install "#{archive_root}/rayline-core"
+      pkgshare.install "#{archive_root}/rayline-core-LICENSE"
     else
       bin.install "rayline"
       bin.install "rld"
       bin.install "rayline-core"
+      pkgshare.install "rayline-core-LICENSE"
     end
   end
 
   test do
     assert_match version.to_s, shell_output("#{bin}/rayline --version")
     assert_path_exists bin/"rayline-core"
+    assert_path_exists pkgshare/"rayline-core-LICENSE"
   end
 end

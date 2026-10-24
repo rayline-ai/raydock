@@ -128,8 +128,9 @@ fi
 download "$base_url/$rayline_asset" "$tmp_dir/$rayline_asset"
 download "$base_url/$daemon_asset" "$tmp_dir/$daemon_asset"
 download "$base_url/$core_asset" "$tmp_dir/$core_asset"
+download "$base_url/rayline-core-LICENSE" "$tmp_dir/rayline-core-LICENSE"
 
-for asset in "$rayline_asset" "$daemon_asset" "$core_asset"; do
+for asset in "$rayline_asset" "$daemon_asset" "$core_asset" rayline-core-LICENSE; do
   awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print; count++ } END { if (count != 1) exit 1 }' \
     "$tmp_dir/SHA256SUMS" >> "$tmp_dir/SHA256SUMS.selected" || {
       echo "release checksums must include exactly one entry for $asset" >&2
@@ -150,6 +151,7 @@ done
 )
 
 mkdir -p "$INSTALL_DIR"
+install -m 0644 "$tmp_dir/rayline-core-LICENSE" "$INSTALL_DIR/rayline-core-LICENSE"
 install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/rayline"
 install -m 0755 "$tmp_dir/$daemon_asset" "$INSTALL_DIR/rld"
 install -m 0755 "$tmp_dir/$core_asset" "$INSTALL_DIR/rayline-core"

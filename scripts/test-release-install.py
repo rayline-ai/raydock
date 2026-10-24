@@ -38,6 +38,9 @@ def main():
             expected[name] = source.read_bytes()
             (assets / f"{name}-{platform}").write_bytes(expected[name])
         sums = "".join(f"{hashlib.sha256(data).hexdigest()}  {name}-{platform}\n" for name, data in expected.items())
+        license_data = (ROOT / "LICENSE").read_bytes()
+        (assets / "rayline-core-LICENSE").write_bytes(license_data)
+        sums += f"{hashlib.sha256(license_data).hexdigest()}  rayline-core-LICENSE\n"
         (assets / "SHA256SUMS").write_text(sums)
         env = dict(os.environ, PATH=str(commands), HOME=str(root), RAYLINE_RELEASE_BASE_URL=assets.as_uri())
 
@@ -49,6 +52,13 @@ def main():
         install(True)
         for name, data in expected.items():
             assert (installed / name).read_bytes() == data
+        assert (installed / "rayline-core-LICENSE").read_bytes() == license_data
+        (assets / "rayline-core-LICENSE").write_bytes(b"tampered license")
+        install(False)
+        for name, data in expected.items():
+            assert (installed / name).read_bytes() == data, "license verification changed installed files"
+        assert (installed / "rayline-core-LICENSE").read_bytes() == license_data
+        (assets / "rayline-core-LICENSE").write_bytes(license_data)
         version = subprocess.check_output([str(installed / "rayline"), "--version"], text=True).split()[1]
         check = [str(installed / "rayline"), "update", "--check", "--channel", "prod", "--version", version]
         check_env = dict(os.environ, HOME=str(root), RAYLINE_UPDATE_INSTALL_PATH=str(installed / "rayline"))

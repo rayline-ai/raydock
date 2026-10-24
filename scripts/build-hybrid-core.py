@@ -45,6 +45,7 @@ def main():
         artifact.unlink()
         parser.error("built execution core is missing clean pinned VCS provenance")
     shutil.copyfile(manifest_path, args.output_dir / "rayline-core-source.json")
+    shutil.copyfile(source / "rayline-core/LICENSE", args.output_dir / "rayline-core-LICENSE")
     print(artifact)
 
 

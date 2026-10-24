@@ -140,7 +140,8 @@ The helper refuses a mismatched commit, dirty source tree or different Go
 compiler. It builds without CGO and preserves Go VCS build metadata. Its
 `rayline-core-source.json` output is identical across platform builds and must
 be included in the signed checksum manifest. Archives and installers carry all
-three binaries; self-update verifies all three before installing them.
+three binaries and `rayline-core-LICENSE`, copied from that pinned module;
+self-update verifies the binaries and license before installing them.
 
 The historical Mac asset IDs remain stable for existing self-updaters. The Go
 core and hybrid execution require macOS 13+, despite those historical names;

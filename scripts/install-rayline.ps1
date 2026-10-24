@@ -37,11 +37,13 @@ try {
     $RaylinePath = Join-Path $TempDir $RaylineAsset
     $DaemonPath = Join-Path $TempDir $DaemonAsset
     $CorePath = Join-Path $TempDir $CoreAsset
+    $LicensePath = Join-Path $TempDir "rayline-core-LICENSE"
 
     Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS" -OutFile $SumsPath
     Invoke-WebRequest -Uri "$BaseUrl/$RaylineAsset" -OutFile $RaylinePath
     Invoke-WebRequest -Uri "$BaseUrl/$DaemonAsset" -OutFile $DaemonPath
     Invoke-WebRequest -Uri "$BaseUrl/$CoreAsset" -OutFile $CorePath
+    Invoke-WebRequest -Uri "$BaseUrl/rayline-core-LICENSE" -OutFile $LicensePath
 
     $Expected = @{}
     foreach ($Line in Get-Content $SumsPath) {
@@ -51,7 +53,7 @@ try {
         }
     }
 
-    foreach ($Asset in @($RaylineAsset, $DaemonAsset, $CoreAsset)) {
+    foreach ($Asset in @($RaylineAsset, $DaemonAsset, $CoreAsset, "rayline-core-LICENSE")) {
         if (-not $Expected.ContainsKey($Asset)) {
             Fail "release checksums do not include $Asset"
         }
@@ -63,6 +65,7 @@ try {
     }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Copy-Item -Force $LicensePath (Join-Path $InstallDir "rayline-core-LICENSE")
     Copy-Item -Force $RaylinePath (Join-Path $InstallDir "rayline.exe")
     Copy-Item -Force $DaemonPath (Join-Path $InstallDir "rld.exe")
     Copy-Item -Force $CorePath (Join-Path $InstallDir "rayline-core.exe")
