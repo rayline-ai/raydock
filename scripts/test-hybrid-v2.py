@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Joined v2 smoke: real Rayline CLI + rld + Go core + installed Pi, with HTTP fixtures.
+"""Joined v2 smoke: real Rayline CLI + rld + Go core + stock installed Pi, with HTTP fixtures.
 
-Exercises the seams the hybrid v2 spec adds, end to end:
+Exercises the seams the hybrid v2 spec adds, end to end, with an unmodified harness:
   * `rayline hybrid start` composes Rayline Local's defaults into the core config
     (decisions.api_mode execution_context_v2, explicit routing.policy preset, and an
     optional settings `hybrid.routing` schedule override);
-  * `rayline hybrid run pi` loads the event extension; Pi's typed events reach the
-    core as `rayline_event` and Decisions sees them as `basis: explicit_client`;
-  * the core strips the member before Decisions and inference, and sends the v2
-    envelope (turn, event, last_served, history, targets) and validates the receipt.
+  * the core infers events from stock Pi's own requests (`basis: marker_inferred`):
+    task_start, tool_result, Pi's session-less summarization call as a stateless
+    sidecall, and Pi's auto-compaction (forced by a provider context overflow) as a
+    compaction with its retained tail, whose attribution moves to its new position;
+  * the v2 envelope (turn, event, last_served, history, targets) and receipt checks.
 
 Decisions and model responses are synthetic fixtures; this is not a live ARC or
 model-quality evaluation, and capacity facts (which need a qualified llama.cpp
@@ -70,7 +71,7 @@ def main():
     package_bytes = encoded(manifest)
     package_sha = digest(package_bytes)
     decisions, dispatches = [], []
-    scenario = {"path": "", "turns": 0}
+    scenario = {"path": "", "overflowed": False}
 
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -110,9 +111,23 @@ def main():
             # local_model's base URL plus the protocol path (from_local_model).
             assert self.path == "/v1/chat/completions", self.path
             dispatches.append(body)
-            scenario["turns"] += 1
-            if scenario["turns"] == 1:
-                message = {"role": "assistant", "content": None, "tool_calls": [{"id": "call_native_read", "type": "function",
+            tool_results = sum(1 for m in body["messages"] if m["role"] == "tool")
+            summarizing = any("context summarization assistant" in json.dumps(m.get("content")) for m in body["messages"] if m["role"] == "system")
+            if not summarizing and tool_results >= 2 and not scenario["overflowed"]:
+                # A provider context overflow: stock Pi compacts and retries.
+                scenario["overflowed"] = True
+                error = encoded({"error": {"message": "prompt is too long: 213462 tokens > 200000 maximum",
+                                           "type": "invalid_request_error", "code": "context_length_exceeded"}})
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(error)))
+                self.end_headers()
+                self.wfile.write(error)
+                return
+            if summarizing:
+                message, finish = {"role": "assistant", "content": "## Goal\nRead the file three times.\n## Progress\nRead twice."}, "stop"
+            elif tool_results < 3:
+                message = {"role": "assistant", "content": None, "tool_calls": [{"id": f"call_read_{len(dispatches)}", "type": "function",
                     "function": {"name": "read", "arguments": json.dumps({"path": scenario["path"]})}}]}
                 finish = "tool_calls"
             else:
@@ -191,35 +206,47 @@ def main():
             assert composed["decisions"]["api_mode"] == "execution_context_v2"
             assert composed["deployments"][0]["url"] == external + "/v1/chat/completions"
             sample = root / "synthetic.txt"
-            sample.write_text("SYNTHETIC-FILE-READ-PROOF\n")
+            sample.write_text("".join(f"line {n:05d} of the synthetic file with some words to make it long\n" for n in range(200)))
             scenario["path"] = str(sample)
+            # Stock Pi; only its own documented compaction setting is seeded so
+            # the retained tail holds the last tool exchange.
+            pi_dir = state / "harness" / "pi"
+            pi_dir.mkdir(parents=True, mode=0o700)
+            (pi_dir / "settings.json").write_text(json.dumps({"defaultProvider": "rayline", "defaultModel": "rayline-router",
+                                                               "compaction": {"keepRecentTokens": 4000}}))
             output = cli("run", "pi", "--", "--provider", "rayline", "--model", "rayline-router", "--no-session",
                          "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
                          "--tools", "read", "--thinking", "off", "--print",
-                         f"Read {sample} and then reply with Synthetic execution complete.")
+                         f"Read {sample} three times, then reply with Synthetic execution complete.")
             assert "Synthetic execution complete." in output, output
         finally:
             cli("stop")
             server.shutdown()
             server.server_close()
-    assert len(decisions) == 2 and len(dispatches) == 2, (len(decisions), len(dispatches))
-    first, second = (d["routing"]["execution"] for d in decisions)
+    events = [d["routing"]["execution"]["event"] for d in decisions]
+    kinds = [event["kind"] for event in events]
+    assert kinds == ["task_start", "tool_result", "tool_result", "sidecall", "compaction", "tool_result", "tool_result"], kinds
+    assert all(event["basis"] == "marker_inferred" for event in events), events
     for body in decisions:
         assert body["routing"]["policy"] == {"preset": PRESET, "overrides": {"schedule": {"model": ["cache_boundaries", "user_messages"]}}}
         assert "rayline_event" not in body
-    for body in dispatches:
-        assert "rayline_event" not in body
+    first, second, summary, compacted = (decisions[i]["routing"]["execution"] for i in (0, 1, 3, 4))
     assert first["version"] == "arc-execution-context.v2"
-    assert first["event"] == {"kind": "task_start", "basis": "explicit_client", "compaction": None}, first["event"]
-    assert second["event"] == {"kind": "tool_result", "basis": "explicit_client", "compaction": None}, second["event"]
     assert first["last_served"] is None and second["last_served"]["action_id"] == local["action_id"]
     assert [entry["action_id"] for entry in second["history"]] == [local["action_id"]]
     assert second["turn"]["epoch"] == first["turn"]["epoch"] and second["turn"]["attempt"] == 1
+    # Pi's summarization call carries no session header: a stateless side call.
+    assert summary["last_served"] is None and summary["history"] == []
+    # Pi's compacted transcript: summary at 0, the retained tool exchange from 1.
+    assert events[4]["compaction"] == {"summary_message": 0, "retained_from": 1, "new": True}, events[4]
+    assert compacted["turn"]["epoch"] != second["turn"]["epoch"]
+    assert compacted["last_served"]["action_id"] == local["action_id"] and compacted["last_served"]["message"] == 1
+    assert compacted["history"] == [{"message": 1, "action_id": local["action_id"]}], compacted["history"]
     assert [target["placement"] for target in second["targets"]] in (["local", "cloud"], ["cloud", "local"])
     assert all(target["capacity"] is None for target in second["targets"])
-    print("Joined v2 smoke passed: Rayline Local composed the hybrid preset and schedule override, the installed Pi "
-          "extension's explicit events reached Decisions, and the core stripped them before Decisions and inference. "
-          "Decisions and model responses were synthetic fixtures.")
+    print("Joined v2 smoke passed: Rayline Local composed the hybrid preset and schedule override; the core inferred "
+          "stock Pi's events from its own requests, ran Pi's session-less summary call as a stateless side call, and "
+          "recognised Pi's auto-compaction with its retained tail. Decisions and model responses were synthetic fixtures.")
 
 
 if __name__ == "__main__":

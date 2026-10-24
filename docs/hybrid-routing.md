@@ -83,19 +83,16 @@ start, a Rayline API key, and a `local_model` pointing at a local Qwen.
 `start` prints the applied preset and its source, the local model and any saved
 key it used.
 
-**Typed events.** The core's v2 envelope carries what just happened. Pi cannot
-set per-request headers, so `hybrid run pi` loads a Rayline extension
-(`rayline-hybrid-events.ts` in the harness state directory) that adds a
-`rayline_event` member to each provider payload: `task_start`, `user_message`
-after a typed prompt, `tool_result` otherwise, and `compaction` (summary index,
-retained-tail start and `new: true`) for the first request after a Pi
-compaction. A provider retry of an identical transcript keeps its event. The
-core removes the member before Decisions and inference. Pi's compaction summary
-call bypasses extension hooks and Pi's session header; the hybrid Pi profile
-adds a lowest-priority `x-session-id` so that call runs in its own execution
-session, and the core treats any unlabelled request on a branch that uses
-explicit events as a side call that advances nothing. Other harnesses use
-the core's documented wire markers (`basis: marker_inferred`).
+**Events come from the wire.** Harnesses run unmodified; Rayline Local adds
+nothing to them. The Go core infers each request's event from what the harness
+already sends (`basis: marker_inferred`): `task_start` before any assistant
+message, `tool_result` versus `user_message` from the trailing turn (injected
+reminders and harness-authored turns are not the user's words), the harness's
+own auxiliary calls (such as Pi's compaction summary call, which sends no session
+header) as stateless side calls, and a compaction by comparing the request with
+the previous one, including Pi's retained tail. A harness may optionally state
+events itself through the core's `X-Rayline-Event` header or `rayline_event`
+member; no default depends on it.
 
 ## Start and connect
 
@@ -218,13 +215,15 @@ python3 scripts/test-hybrid-core.py \
 ```
 
 For the v2 seams, `scripts/test-hybrid-v2.py --core <v2 core> --registry <registry>`
-joins the real CLI, `rld`, Go core and installed Pi against synthetic Decisions
-and inference fixtures. It checks that `start` composes the hybrid preset, a
-settings schedule override and `local_model`, that Pi's extension events reach
-Decisions as `basis: explicit_client` (`task_start`, then `tool_result` with
-`last_served` and `history`), and that `rayline_event` never reaches Decisions or
-inference. Capacity facts need a qualified llama.cpp counter; the Go core's
-tests and the live acceptance cover them.
+joins the real CLI, `rld`, Go core and stock installed Pi against synthetic
+Decisions and inference fixtures. It checks that `start` composes the hybrid
+preset, a settings schedule override and `local_model`, and that the core infers
+Pi's events from its own requests: `task_start`, `tool_result` with
+`last_served` and `history`, Pi's session-less summarization call as a stateless
+side call, and Pi's auto-compaction (forced by a provider context overflow) as a
+compaction with its retained tail at its new position. Capacity facts need a
+qualified llama.cpp counter; the Go core's tests and the live acceptance cover
+them.
 
 The process tests use a local executable contract fixture to verify supervision,
 auth, transparent forwarding, native fork identity, cancellation, shutdown,
