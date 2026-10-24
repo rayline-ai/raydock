@@ -178,6 +178,21 @@ impl Harness {
             self.plan(ctx)
         }
     }
+
+    pub(crate) fn hybrid_args(self, args: &[OsString]) -> io::Result<Vec<OsString>> {
+        if self == Self::OpenClaw {
+            let env_container =
+                std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
+            if env_container || openclaw::uses_container(args) {
+                return Err(io::Error::other(
+                    "OpenClaw container mode cannot use the hybrid gateway configuration; run an agent locally",
+                ));
+            }
+            Ok(openclaw::launch_args(args))
+        } else {
+            Ok(args.to_vec())
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

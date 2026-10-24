@@ -458,6 +458,7 @@ fn harness_command(
         _ => {
             let harness = crate::harness::Harness::from_command(name)
                 .ok_or_else(|| io::Error::other(format!("unsupported hybrid harness {name:?}")))?;
+            let args = harness.hybrid_args(args)?;
             let config_dir = paths.dir.join("harness").join(name);
             private_dir(&config_dir)?;
             let ctx = crate::harness::RenderContext {
@@ -477,9 +478,14 @@ fn harness_command(
             crate::harness::write_files(&config_dir, &plan.files)?;
             // Used only by harnesses which cannot transmit native session identity.
             let conversation_id = format!("hybrid-{:032x}", rand::random::<u128>());
-            command =
-                crate::harness::build_command(Path::new(name), &plan, Some(&conversation_id), &[]);
+            command = crate::harness::build_command(
+                Path::new(name),
+                &plan,
+                Some(&conversation_id),
+                &args,
+            );
             command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
+            return Ok(command);
         }
     }
     command.args(args);

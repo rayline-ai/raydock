@@ -25,6 +25,7 @@ def main():
         state = root / "state"
         env = dict(os.environ, HOME=str(root))
         env.pop("RLD_BIN", None)
+        env.pop("OPENCLAW_CONTAINER", None)
         installed = root / "installed"
         installed.mkdir()
         shutil.copy(CLI, installed / "rayline")
@@ -116,6 +117,28 @@ print('qualified Pi profile loaded')
             pi.chmod(0o700)
             assert "qualified Pi profile loaded" in cli("run", "pi", "--", "--no-session")
             cli("run", "pi", "--", "--resume", success=False)
+            # Capture the actual spawned args: an agent must use the config in
+            # this process, never an already-running OpenClaw Gateway.
+            openclaw = harness_dir / "openclaw"
+            openclaw.write_text("""#!/usr/bin/env python3
+import json, os, pathlib, sys
+assert pathlib.Path(os.environ['OPENCLAW_CONFIG_PATH']).is_file()
+print(json.dumps(sys.argv[1:]))
+""")
+            openclaw.chmod(0o700)
+            for args, expected in [
+                (["agent", "-m", "hello"], ["agent", "--local", "-m", "hello"]),
+                (["--profile=work", "agent", "-m", "hello"], ["--profile=work", "agent", "--local", "-m", "hello"]),
+                (["agent", "--local", "-m", "hello"], ["agent", "--local", "-m", "hello"]),
+                (["agent", "exec", "-m", "hello"], ["agent", "exec", "-m", "hello"]),
+            ]:
+                assert json.loads(cli("run", "openclaw", "--", *args)) == expected
+            for args in (["--container", "box", "agent", "-m", "hello"],
+                         ["--container=box", "agent", "-m", "hello"]):
+                cli("run", "openclaw", "--", *args, success=False)
+            env["OPENCLAW_CONTAINER"] = "box"
+            cli("run", "openclaw", "--", "agent", "-m", "hello", success=False)
+            env.pop("OPENCLAW_CONTAINER")
             request = urllib.request.Request(first["listen_url"] + "/unready", data=b"{}",
                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
             with urllib.request.urlopen(request) as response:

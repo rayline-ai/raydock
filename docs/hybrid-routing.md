@@ -68,7 +68,10 @@ needs more time; this does not trigger a runtime or model download.
 
 `run` also renders the existing native configurations for `pi`, `opencode`,
 `omp`, `hermes`, and `openclaw`. These renderers are shared with the existing
-Rayline launchers. Claude uses Messages; Codex uses Responses. All launches use
+Rayline launchers. OpenClaw agent turns receive `--local` through the shared
+argument adapter so they use this launch configuration; container mode is
+rejected because it cannot see the hybrid gateway configuration. Claude uses
+Messages; Codex uses Responses. All launches use
 the virtual model `rayline-router` and the local gateway credential. Protocol
 and model capabilities remain the core's responsibility.
 
@@ -264,8 +267,8 @@ Managed inference remains a separate ownership mode. The existing local launcher
 can supply process management, but hybrid still needs a qualified launch profile
 and binding of the launched runtime's port and identity before it can safely own
 that process. This reference path uses a caller-owned inference runtime.
-Durable resume/fork state, tailnet enrollment, core release packaging and Windows
-lifecycle qualification also remain separate work.
+Durable resume/fork state, tailnet enrollment and Windows lifecycle qualification
+also remain separate work.
 
 ## Installed execution core
 
@@ -298,9 +301,12 @@ editable task directory. Agent-written tests do not determine success.
 The required `--proof routing` mode verifies that the same configured custom
 `value_usd` and caller price identity were applied to both tasks. Supply inline
 `prices` or a service `price_profile_id`; acceptance requires an explicit
-`price_profile_version` and configured `price_sha256` for a profile, and verifies
-the echoed ID, version and content hash on every decision. Ordinary requests may
-use a bare profile ID to resolve the latest version each turn. All successful
+`price_profile_version` (a positive integer), configured `price_sha256`, and
+`--price-profile-content-hash sha256:<hex>` for a profile. These are separate
+hashes: `price_sha256` is the bare 64-character RFC8785 digest of the routing
+prices; the profile content hash identifies the saved fixed-order price table.
+Acceptance verifies both hashes plus the echoed profile ID and version on every
+decision. Ordinary requests may use a bare profile ID to resolve the latest version each turn. All successful
 inference for the simple task must execute locally; the scheduler's final
 generation must execute in the cloud. The report links each actual ARC selection
 to completed execution and records selected and executed model identities

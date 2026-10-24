@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import random
+import re
 import signal
 import subprocess
 import sys
@@ -47,24 +48,27 @@ def require_admitted_decisions(events):
             raise RuntimeError(f"ARC decision refused: {event.get('reason')} (route_id={event.get('route_id')})")
 
 
-def require_routing_config(decisions):
+def require_routing_config(decisions, profile_content_hash=None):
     routing = decisions["routing"]
     assert decisions["result"] == "custom", "routing proof requires an explicit custom V result"
     assert "value_usd" in routing and decisions.get("price_sha256"), "routing proof requires pinned V and caller price identity"
     if "price_profile_id" in routing:
-        assert routing["price_profile_id"] and routing.get("price_profile_version"), "routing proof requires a profile ID and explicit version"
+        version = routing.get("price_profile_version")
+        assert routing["price_profile_id"] and type(version) is int and 0 < version <= 2**53 - 1, "routing proof requires a profile ID and explicit positive integer version"
         assert "prices" not in routing, "routing proof cannot combine a price profile and inline prices"
+        assert profile_content_hash and re.fullmatch(r"sha256:[a-f0-9]{64}", profile_content_hash), "routing proof requires --price-profile-content-hash sha256:<hex> separately from price_sha256"
     else:
         assert "prices" in routing, "routing proof requires caller prices or a pinned price profile"
+        assert profile_content_hash is None, "profile content hash requires a price profile"
 
 
-def require_applied_routing(decisions, selected):
+def require_applied_routing(decisions, selected, profile_content_hash=None):
     routing = decisions["routing"]
     assert selected and all(event["applied_value_usd"] == routing["value_usd"] and event["price_basis"] == "caller"
                             and event["price_sha256"] == decisions["price_sha256"] for event in selected), "V or discounted prices were not applied"
     if "price_profile_id" in routing:
         expected = {"id": routing["price_profile_id"], "version": routing["price_profile_version"],
-                    "content_hash": decisions["price_sha256"]}
+                    "content_hash": profile_content_hash}
         assert all(event.get("price_profile") == expected for event in selected), "requested price profile was not applied"
 
 
@@ -156,6 +160,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True, help="new private directory for evidence and synthetic tasks")
     parser.add_argument("--proof", choices=("routing", "transport"), required=True,
                         help="routing requires applied V/prices and local/cloud outcomes; transport explicitly makes no such claim")
+    parser.add_argument("--price-profile-content-hash", help="expected saved profile table hash (sha256:<hex>), distinct from decisions.price_sha256")
     parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/rayline")
     parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     parser.add_argument("--task-timeout-secs", type=int, default=300)
@@ -175,9 +180,10 @@ def main():
     assert cost_bound <= args.max_run_cost_usd, "configured attempt/token cost bound exceeds the run budget"
     routing = config["decisions"]["routing"]
     if args.proof == "routing":
-        require_routing_config(config["decisions"])
+        require_routing_config(config["decisions"], args.price_profile_content_hash)
     else:
         assert config["decisions"]["result"] == "top" and routing == {}, "transport proof must explicitly use top with empty routing"
+        assert args.price_profile_content_hash is None, "transport proof cannot assert a price profile"
     assert {deployment["kind"] for deployment in config["deployments"]} >= {"local", "cloud"}
     args.output_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     output = args.output_dir.resolve()
@@ -189,6 +195,7 @@ def main():
     report = {"proof": args.proof, "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
               "package_sha256": config["package_sha256"], "decisions_url": config["decisions"]["url"],
               "result": config["decisions"]["result"], "routing": routing, "tasks": [], "passed": False,
+              "expected_price_profile_content_hash": args.price_profile_content_hash,
               "generation_attempt_limit": attempt_limit, "inference_cost_bound_usd": str(cost_bound),
               "max_run_cost_usd": str(args.max_run_cost_usd),
               "limitations": (["Real top-only transport proof; no V or discounted-price acceptance."] if args.proof == "transport" else [])}
@@ -254,7 +261,7 @@ def main():
             task_report["requested_route_pattern_met"] = all(kind == "local" for kind in kinds) if name == "easy" else kinds[-1] == "cloud"
             if args.proof == "routing":
                 assert task_report["requested_route_pattern_met"], f"ARC did not choose the required {name} route"
-                require_applied_routing(config["decisions"], selected)
+                require_applied_routing(config["decisions"], selected, args.price_profile_content_hash)
         assert args.config.read_bytes() == config_bytes, "configuration changed between tasks"
         report["passed"] = True
     except BaseException as error:
