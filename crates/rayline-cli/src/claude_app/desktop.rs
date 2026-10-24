@@ -1,7 +1,7 @@
 //! Claude Desktop's documented local profile library. Keep the compatibility
 //! boundary here: no app patching, managed preferences, or subscription cookies.
 #[cfg(any(target_os = "macos", test))]
-use super::{AppPaths, private_dir, random_bytes, write_private};
+use super::{AppPaths, random_bytes, write_private};
 use serde_json::Value;
 #[cfg(any(target_os = "macos", test))]
 use serde_json::json;
@@ -100,6 +100,22 @@ fn restore_key(target: &mut Value, key: &str, previous: &Value) {
     }
 }
 
+/// An absent leaf underneath a symlink must not redirect a later atomic write.
+#[cfg(any(target_os = "macos", test))]
+fn check_no_symlinks(path: &Path) -> io::Result<()> {
+    for ancestor in path.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(invalid("Refusing a symlink in Desktop configuration paths"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(any(target_os = "macos", test))]
 impl ProfileStore {
     pub(super) fn new(home: &Path) -> Self {
@@ -130,6 +146,11 @@ impl ProfileStore {
     }
 
     fn state(&self) -> io::Result<Option<Value>> {
+        match fs::symlink_metadata(&self.journal) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+            Ok(_) => check_no_symlinks(&self.journal)?,
+        }
         let state = read_object(&self.journal)?;
         if let Some(state) = &state {
             if state["version"] != STATE_VERSION
@@ -152,19 +173,8 @@ impl ProfileStore {
     }
 
     fn check_paths(&self) -> io::Result<()> {
-        // Inspect every existing ancestor too: an absent leaf beneath a symlink
-        // must not cause an atomic write outside the intended directory.
         for path in [&self.library, &self.config, &self.journal] {
-            for ancestor in path.ancestors() {
-                match fs::symlink_metadata(ancestor) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(invalid("Refusing a symlink in Desktop configuration paths"));
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
-                }
-            }
+            check_no_symlinks(path)?;
         }
         Ok(())
     }
@@ -277,13 +287,13 @@ impl ProfileStore {
     /// Restore only selection keys. Preferences and other saved profiles may
     /// have changed while Claude was running and must survive `off`.
     fn recovery(&self) -> io::Result<Option<(Value, Value, Value)>> {
-        self.check_paths()?;
         let Some(state) = self.state()? else {
             return Ok(None);
         };
         if state["previous"].is_null() {
             return Ok(None);
         }
+        self.check_paths()?;
         let previous = &state["previous"];
         let meta = self.meta()?.ok_or_else(|| {
             invalid("Desktop profile library disappeared; recovery record retained")
@@ -337,27 +347,17 @@ impl ProfileStore {
     }
 }
 
-/// Serialize Rayline profile edits. Desktop itself is stopped before writes.
-#[cfg(all(unix, any(target_os = "macos", test)))]
-fn profile_lock(home: &Path) -> io::Result<fs::File> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
-    let dir = AppPaths::new(home).dir;
-    private_dir(&dir)?;
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(dir.join("desktop-profile.lock"))?;
-    // SAFETY: flock uses a live file descriptor and does not retain pointers.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(invalid(
-            "Another Rayline command is changing the Desktop profile",
-        ));
-    }
-    Ok(file)
+#[cfg(any(target_os = "macos", test))]
+fn desktop_running_for_user(processes: &str, uid: u32) -> bool {
+    processes.lines().any(|line| {
+        let Some((owner, command)) = line.trim().split_once(char::is_whitespace) else {
+            return false;
+        };
+        owner.parse::<u32>().ok() == Some(uid)
+            && command
+                .trim()
+                .ends_with("/Claude.app/Contents/MacOS/Claude")
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -375,9 +375,16 @@ mod macos {
     pub(super) fn preflight(home: &Path) -> io::Result<PathBuf> {
         let app = app_path(home)?;
         // Only inspect keys, never print policy values (which may be secrets).
-        let user = home
-            .file_name()
-            .ok_or_else(|| invalid("Cannot determine macOS user"))?;
+        let account = Command::new("/usr/bin/id").arg("-un").output()?;
+        if !account.status.success() {
+            return Err(invalid("Cannot determine macOS account name"));
+        }
+        let user = std::str::from_utf8(&account.stdout)
+            .map_err(|_| invalid("Invalid macOS account name"))?
+            .trim();
+        if user.is_empty() || user.contains('/') || matches!(user, "." | "..") {
+            return Err(invalid("Invalid macOS account name"));
+        }
         for path in [
             PathBuf::from("/Library/Managed Preferences/com.anthropic.claudefordesktop.plist"),
             PathBuf::from("/Library/Managed Preferences")
@@ -423,14 +430,18 @@ mod macos {
     }
 
     fn running() -> io::Result<bool> {
-        let output = Command::new("/bin/ps").args(["-axo", "comm="]).output()?;
+        let output = Command::new("/bin/ps")
+            .args(["-axo", "uid=,comm="])
+            .output()?;
         if !output.status.success() {
             return Err(invalid("Cannot check whether Claude Desktop is running"));
         }
-        Ok(String::from_utf8_lossy(&output.stdout).lines().any(|line| {
-            line.trim_end()
-                .ends_with("/Claude.app/Contents/MacOS/Claude")
-        }))
+        // SAFETY: geteuid takes no arguments and returns the calling process's uid.
+        let uid = unsafe { libc::geteuid() };
+        Ok(desktop_running_for_user(
+            &String::from_utf8_lossy(&output.stdout),
+            uid,
+        ))
     }
 
     fn quit() -> io::Result<()> {
@@ -494,7 +505,6 @@ mod macos {
     pub(super) fn launch(home: &Path, desired: &Value) -> io::Result<String> {
         let store = ProfileStore::new(home);
         store.check_paths()?;
-        let _lock = profile_lock(home)?;
         let app = preflight(home)?;
         let changed = !store.matches(desired)?;
         if changed {
@@ -526,8 +536,6 @@ mod macos {
 
     pub(super) fn restore(home: &Path) -> io::Result<bool> {
         let store = ProfileStore::new(home);
-        store.check_paths()?;
-        let _lock = profile_lock(home)?;
         // Recovery must not depend on an installed app or today's managed
         // policy. Validate it before interrupting the app, and recheck after quit.
         if store.recovery()?.is_none() {
@@ -836,14 +844,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn desktop_process_detection_ignores_other_users() {
+        let other = "  502 /Applications/Claude.app/Contents/MacOS/Claude\n";
+        assert!(!desktop_running_for_user(other, 501));
+        assert!(desktop_running_for_user(other, 502));
+        let own = "  501 /Volumes/Claude Installer/Claude.app/Contents/MacOS/Claude\n";
+        assert!(desktop_running_for_user(own, 501));
+        assert!(!desktop_running_for_user(
+            "501 /Applications/Claude.app/Contents/Frameworks/Claude Helper",
+            501
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn concurrent_profile_changes_are_excluded_until_guard_drops() {
         let f = Fixture::new();
-        let guard = profile_lock(&f.home).expect("first lock");
-        assert!(profile_lock(&f.home).is_err());
+        let instance = AppPaths::new(&f.home).dir;
+        fs::create_dir_all(&instance).expect("instance directory");
+        let guard = super::super::lifecycle_lock(&f.home).expect("first lock");
+        assert!(super::super::lifecycle_lock(&f.home).is_err());
+        fs::remove_dir_all(instance).expect("uninstall instance files");
+        assert!(
+            super::super::lifecycle_lock(&f.home).is_err(),
+            "uninstall must not replace the lock inode"
+        );
         drop(guard);
-        assert!(profile_lock(&f.home).is_ok());
+        assert!(super::super::lifecycle_lock(&f.home).is_ok());
     }
 
     #[cfg(unix)]
@@ -856,6 +884,12 @@ mod tests {
         fs::create_dir_all(f.store.library.parent().expect("parent")).expect("parent");
         symlink(&target, &f.store.library).expect("link");
         assert!(f.store.activate(&desired("test-token")).is_err());
+        assert!(
+            f.store
+                .recovery()
+                .expect("manual setup needs no Desktop recovery")
+                .is_none()
+        );
         assert_eq!(fs::read_dir(&target).expect("target").count(), 0);
         assert!(!f.store.journal.exists());
     }

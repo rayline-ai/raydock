@@ -223,7 +223,11 @@ Automatic setup refuses externally changed profiles, hybrid pointers, or
 deployment modes, unreadable previous profiles, unknown profile metadata, and
 organization-managed inference settings instead of overwriting them. Interrupted writes retain recovery state for `off`. Do not delete
 that file while recovery is pending. A failed launch attempts to restore the
-previous selection; the gateway remains running for manual setup.
+previous selection; the gateway remains running for manual setup. Lifecycle
+commands share a nonblocking cross-process lease at `~/.rayline/claude-desktop.lock`
+so another start cannot interleave with restoration or uninstall. That small
+lock file deliberately survives uninstall. Manual-only cleanup does not inspect
+Desktop paths when no recovery is pending.
 
 The library location and restart behavior are documented in
 [Anthropic's configuration guide](https://claude.com/docs/third-party/claude-desktop/configuration-format).

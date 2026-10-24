@@ -1135,7 +1135,56 @@ pub async fn run(request: AppRequest) -> ExitCode {
     }
 }
 
+/// A cross-process operation lease, outside the removable instance directory.
+/// LOCK_NB makes contenders fail immediately. This is intentionally held across
+/// async gateway startup: it serializes lifecycle commands, not an in-process
+/// mutex, and no executor thread blocks waiting for another command's lease.
+#[cfg(unix)]
+fn lifecycle_lock(home: &Path) -> io::Result<fs::File> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let root = home.join(crate::DOT_CONFIG_DIR);
+    private_dir(&root)?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join("claude-desktop.lock"))?;
+    // SAFETY: flock receives a live descriptor and does not retain pointers.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(io::Error::other(
+            "Another Rayline command is changing the Desktop lifecycle",
+        ));
+    }
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn lifecycle_lock(_home: &Path) -> io::Result<fs::File> {
+    Err(io::Error::other(
+        "Claude Desktop lifecycle commands require macOS or Linux",
+    ))
+}
+
 async fn run_inner(request: &AppRequest) -> Result<String, String> {
+    // `serve` is the launchd child of a leased start/install-service command;
+    // it must not attempt to reacquire its parent's lease before becoming healthy.
+    let _lease = if matches!(
+        request.action,
+        AppAction::Start
+            | AppAction::Stop
+            | AppAction::Off
+            | AppAction::Uninstall
+            | AppAction::InstallService
+            | AppAction::UninstallService
+    ) {
+        let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+        Some(lifecycle_lock(&home).map_err(|error| error.to_string())?)
+    } else {
+        None
+    };
     match request.action {
         AppAction::Start => {
             let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
