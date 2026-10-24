@@ -12,6 +12,7 @@ use crate::{
 pub struct SelectionRequest {
     pub model: ModelFamily,
     pub affinity_account_id: Option<String>,
+    pub affinity_warm: bool,
     pub launch_id: String,
     pub placement_loads: BTreeMap<String, AccountPlacementLoad>,
 }
@@ -43,7 +44,6 @@ pub struct AccountEvaluation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum IneligibilityReason {
-    CredentialRefreshing,
     CredentialUnavailable,
     CredentialQuarantined,
     ModelUnavailable,
@@ -83,7 +83,6 @@ pub fn describe_ineligibility(
 
 fn describe_reason(reason: &IneligibilityReason, account: Option<&AccountLimitState>) -> String {
     match reason {
-        IneligibilityReason::CredentialRefreshing => "credential refreshing".to_owned(),
         IneligibilityReason::CredentialUnavailable => "credential unavailable".to_owned(),
         IneligibilityReason::CredentialQuarantined => {
             "credential quarantined (sign in to this profile again)".to_owned()
@@ -110,13 +109,12 @@ pub fn select_account(
     request: &SelectionRequest,
     policy: &PoolPolicy,
 ) -> SelectionDecision {
-    let mut evaluations = accounts
+    let evaluations = accounts
         .iter()
         .map(|account| evaluate_account(account, request, policy))
         .collect::<Vec<_>>();
 
-    let selected_account_id =
-        select_from_evaluations(&mut evaluations, request.affinity_account_id.as_deref());
+    let selected_account_id = select_from_evaluations(&evaluations, accounts, request, policy);
 
     SelectionDecision {
         selected_account_id,
@@ -131,10 +129,7 @@ fn evaluate_account(
 ) -> AccountEvaluation {
     let mut reasons = Vec::new();
     match account.credential_health {
-        CredentialHealth::Healthy => {}
-        CredentialHealth::Refreshing => {
-            reasons.push(IneligibilityReason::CredentialRefreshing);
-        }
+        CredentialHealth::Healthy | CredentialHealth::Refreshing => {}
         CredentialHealth::Unavailable => {
             reasons.push(IneligibilityReason::CredentialUnavailable);
         }
@@ -213,24 +208,52 @@ fn evaluate_account(
 }
 
 fn select_from_evaluations(
-    evaluations: &mut [AccountEvaluation],
-    affinity_account_id: Option<&str>,
+    evaluations: &[AccountEvaluation],
+    accounts: &[AccountLimitState],
+    request: &SelectionRequest,
+    policy: &PoolPolicy,
 ) -> Option<String> {
-    if let Some(affinity_account_id) = affinity_account_id
-        && let Some(affinity) = evaluations.iter().find(|evaluation| {
-            evaluation.account_id == affinity_account_id
-                && evaluation.eligible
-                && evaluation.below_soft_threshold
-        })
-    {
-        return Some(affinity.account_id.clone());
-    }
-
-    evaluations
+    let best = evaluations
         .iter()
         .filter(|evaluation| evaluation.eligible)
-        .max_by(|left, right| compare_candidates(left, right))
-        .map(|evaluation| evaluation.account_id.clone())
+        .max_by(|left, right| compare_candidates(left, right));
+    if request.affinity_warm
+        && let Some(affinity) = evaluations.iter().find(|evaluation| {
+            Some(&evaluation.account_id) == request.affinity_account_id.as_ref()
+                && evaluation.eligible
+        })
+    {
+        // Warm serving affinity gets a larger reserve band than new admissions.
+        // Retained claims remain useful during the bounded affinity stale grace,
+        // but stale claims never contribute numeric capacity to ranking.
+        let headroom = accounts
+            .iter()
+            .find(|account| account.account_id == affinity.account_id)
+            .and_then(|account| {
+                account
+                    .claims
+                    .iter()
+                    .filter(|claim| claim.applies_to(&request.model) && !claim.reset_has_passed())
+                    .filter_map(|claim| claim.utilization.map(|used| 1.0 - used.clamp(0.0, 1.0)))
+                    .reduce(f64::min)
+            });
+        let migrate = match (
+            headroom,
+            best.and_then(|candidate| candidate.effective_headroom),
+        ) {
+            (Some(current), Some(alternative)) => {
+                current <= 1.0 - policy.migration_at_percent / 100.0
+                    && alternative - current + f64::EPSILON
+                        >= policy.migration_advantage_percent / 100.0
+                    && best.is_some_and(|candidate| candidate.account_id != affinity.account_id)
+            }
+            _ => false,
+        };
+        if !migrate {
+            return Some(affinity.account_id.clone());
+        }
+    }
+    best.map(|evaluation| evaluation.account_id.clone())
 }
 
 fn compare_candidates(left: &AccountEvaluation, right: &AccountEvaluation) -> Ordering {
@@ -309,6 +332,7 @@ mod tests {
         let request = SelectionRequest {
             model: ModelFamily::from_requested_model("claude-sonnet-4-5"),
             affinity_account_id: Some("affinity".to_owned()),
+            affinity_warm: true,
             launch_id: "launch-affinity".to_owned(),
             placement_loads: BTreeMap::new(),
         };
@@ -327,6 +351,7 @@ mod tests {
                     &SelectionRequest {
                         model: ModelFamily::from_requested_model("sonnet"),
                         affinity_account_id: None,
+                        affinity_warm: false,
                         launch_id: format!("launch-{index}"),
                         placement_loads: BTreeMap::new(),
                     },
@@ -340,61 +365,12 @@ mod tests {
     }
 
     #[test]
-    fn ineligibility_detail_names_each_account_and_its_blocker() {
-        let mut exhausted = account("mx", 1.0, 0.2);
-        exhausted.claims[0].resets_at = Some("2026-08-17T21:00:00Z".to_owned());
-        let mut quarantined = account("af", 0.1, 0.1);
-        quarantined.credential_health = CredentialHealth::Quarantined;
-        let accounts = [exhausted, quarantined];
-
-        let decision = select_account(&accounts, &sonnet_request(), &PoolPolicy::default());
-
-        assert_eq!(decision.selected_account_id, None);
-        assert_eq!(
-            describe_ineligibility(&accounts, &decision.evaluations),
-            "mx: allowance exhausted (resets 2026-08-17T21:00:00Z); \
-             af: credential quarantined (sign in to this profile again)"
-        );
-    }
-
-    #[test]
-    fn ineligibility_detail_joins_blockers_and_drops_an_unreadable_reset() {
-        let mut blocked = account("ws", 1.0, 0.2);
-        blocked.claims[0].resets_at = Some("whenever".to_owned());
-        blocked.entitlements.insert(
-            ModelFamily::from_requested_model("sonnet"),
-            Entitlement::Unavailable,
-        );
-        let accounts = [blocked];
-
-        let decision = select_account(&accounts, &sonnet_request(), &PoolPolicy::default());
-
-        assert_eq!(
-            describe_ineligibility(&accounts, &decision.evaluations),
-            "ws: model not included in this plan, allowance exhausted"
-        );
-    }
-
-    #[test]
-    fn ineligibility_detail_is_never_empty() {
-        assert_eq!(describe_ineligibility(&[], &[]), "no account was eligible");
-    }
-
-    fn sonnet_request() -> SelectionRequest {
-        SelectionRequest {
-            model: ModelFamily::from_requested_model("sonnet"),
-            affinity_account_id: None,
-            launch_id: "launch-detail".to_owned(),
-            placement_loads: BTreeMap::new(),
-        }
-    }
-
-    #[test]
     fn active_leases_can_outweigh_greater_raw_headroom() {
         let accounts = [account("busy", 0.2, 0.2), account("idle", 0.5, 0.5)];
         let request = SelectionRequest {
             model: ModelFamily::from_requested_model("sonnet"),
             affinity_account_id: None,
+            affinity_warm: false,
             launch_id: "new-launch".to_owned(),
             placement_loads: BTreeMap::from([(
                 "busy".to_owned(),

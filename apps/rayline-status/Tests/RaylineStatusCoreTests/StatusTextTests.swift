@@ -275,7 +275,8 @@ final class StatusTextTests: XCTestCase {
       availability: .all,
       activeLaunches: 1,
       limits: limits,
-      warning: nil
+      warning: nil,
+      limitResets: ResetInventoryPresentation(inventory: nil)
     )
   }
 }

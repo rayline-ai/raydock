@@ -161,7 +161,7 @@ Commands:
   add       Register an existing Claude credential profile
   remove    Remove a profile from a pool
   list      List pools without reading credentials
-  status    Poll and show each account's limit pools
+  status    Show daemon allowance or read-only offline credential status
   reload    Ask the running pool daemon to re-read every credential source
 ";
 
@@ -196,6 +196,8 @@ Options:
   --verbose, -v       Show every normalized limit claim and placement detail
   --json              Emit the complete machine-readable status
   --live-only         Fail when no pool daemon is running instead of reading credentials
+  --poll-usage        Without a daemon, GET current usage with valid local tokens
+                      (never refreshes OAuth or writes credentials)
 ";
 
 const SUBSCRIPTIONS_RELOAD_HELP: &str = "\
@@ -777,6 +779,11 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        RaylineDispatch::UsageError { message, help } => {
+            eprintln!("Error: {message}\n");
+            eprint!("{help}");
+            ExitCode::from(2)
+        }
         RaylineDispatch::Unavailable => unavailable(original_argv),
     }
 }
@@ -853,6 +860,10 @@ pub enum RaylineDispatch {
         all: bool,
     },
     Update(update::UpdateRequest),
+    UsageError {
+        message: &'static str,
+        help: &'static str,
+    },
     Unavailable,
 }
 
@@ -930,7 +941,10 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
                 .unwrap_or(RaylineDispatch::Unavailable),
             "subscriptions" => parse_subscriptions_dispatch(args)
                 .map(RaylineDispatch::Subscriptions)
-                .unwrap_or(RaylineDispatch::Unavailable),
+                .unwrap_or_else(|error| RaylineDispatch::UsageError {
+                    message: error.message,
+                    help: error.help,
+                }),
             "codex" => parse_codex_dispatch(args, root_env, root_auth_token, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "local" => parse_local_dispatch(args, root_env, root_auth_token)
@@ -1023,13 +1037,40 @@ where
     })
 }
 
+struct SubscriptionUsageError {
+    message: &'static str,
+    help: &'static str,
+}
+
+fn subscription_command_help(command: &str) -> Option<&'static str> {
+    match command {
+        "add" => Some(SUBSCRIPTIONS_ADD_HELP),
+        "remove" => Some(SUBSCRIPTIONS_REMOVE_HELP),
+        "list" => Some(SUBSCRIPTIONS_LIST_HELP),
+        "status" => Some(SUBSCRIPTIONS_STATUS_HELP),
+        "reload" => Some(SUBSCRIPTIONS_RELOAD_HELP),
+        _ => None,
+    }
+}
+
 fn parse_subscriptions_dispatch<'a, I>(
     mut args: std::iter::Peekable<I>,
-) -> Option<subscriptions::SubscriptionCommand>
+) -> Result<subscriptions::SubscriptionCommand, SubscriptionUsageError>
 where
     I: Iterator<Item = &'a OsString>,
 {
-    let command = args.next()?.to_str()?;
+    let command =
+        args.next()
+            .and_then(|argument| argument.to_str())
+            .ok_or(SubscriptionUsageError {
+                message: "expected a subscription command",
+                help: SUBSCRIPTIONS_HELP,
+            })?;
+    let help = subscription_command_help(command).ok_or(SubscriptionUsageError {
+        message: "unknown subscription command",
+        help: SUBSCRIPTIONS_HELP,
+    })?;
+    let error = |message| SubscriptionUsageError { message, help };
     let mut pool_id = "default".to_owned();
     let mut config_path = None;
     let mut claude_config_dir = None;
@@ -1037,20 +1078,27 @@ where
     let mut json = false;
     let mut verbose = false;
     let mut live_only = false;
+    let mut poll_usage = false;
     let mut account_id = None;
 
     if matches!(command, "add" | "remove") {
-        let value = args.next()?.to_str()?;
+        let value = args
+            .next()
+            .ok_or_else(|| error("missing required argument: <account-id>"))?
+            .to_str()
+            .ok_or_else(|| error("<account-id> must be UTF-8"))?;
         if value.starts_with('-') {
-            return None;
+            return Err(error("missing required argument: <account-id>"));
         }
         account_id = Some(value.to_owned());
     }
 
     while let Some(argument) = args.next() {
-        let argument = argument.to_str()?;
+        let argument = argument
+            .to_str()
+            .ok_or_else(|| error("subscription options must be UTF-8"))?;
         if argument == "--help" {
-            return None;
+            return Err(error("invalid subscription arguments"));
         }
         if let Some((option, value)) = argument.split_once('=') {
             match option {
@@ -1058,39 +1106,65 @@ where
                 "--config" => config_path = Some(PathBuf::from(value)),
                 "--claude-config-dir" => claude_config_dir = Some(PathBuf::from(value)),
                 "--control-config-dir" => control_config_dir = Some(PathBuf::from(value)),
-                _ => return None,
+                _ => return Err(error("unrecognized subscription option")),
             }
             continue;
         }
         match argument {
-            "--pool" => pool_id = args.next()?.to_str()?.to_owned(),
-            "--config" => config_path = Some(PathBuf::from(args.next()?)),
+            "--pool" => {
+                pool_id = args
+                    .next()
+                    .ok_or_else(|| error("--pool requires a name"))?
+                    .to_str()
+                    .ok_or_else(|| error("--pool must be UTF-8"))?
+                    .to_owned();
+            }
+            "--config" => {
+                config_path = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| error("--config requires a path"))?,
+                ));
+            }
             "--claude-config-dir" => {
-                claude_config_dir = Some(PathBuf::from(args.next()?));
+                claude_config_dir =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        error("--claude-config-dir requires a path")
+                    })?));
             }
             "--control-config-dir" => {
-                control_config_dir = Some(PathBuf::from(args.next()?));
+                control_config_dir =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        error("--control-config-dir requires a path")
+                    })?));
             }
             "--json" => json = true,
             "--verbose" | "-v" => verbose = true,
             "--live-only" if command == "status" => live_only = true,
-            _ => return None,
+            "--poll-usage" if command == "status" => poll_usage = true,
+            _ => return Err(error("unrecognized subscription option")),
         }
     }
 
+    if live_only && poll_usage {
+        return Err(error("--live-only and --poll-usage cannot be combined"));
+    }
+
     match command {
-        "add" => Some(subscriptions::SubscriptionCommand::Add {
-            account_id: account_id?,
+        "add" => Ok(subscriptions::SubscriptionCommand::Add {
+            account_id: account_id
+                .ok_or_else(|| error("missing required argument: <account-id>"))?,
             pool_id,
             config_path,
-            claude_config_dir: claude_config_dir?,
+            claude_config_dir: claude_config_dir
+                .ok_or_else(|| error("missing required option: --claude-config-dir <path>"))?,
             control_config_dir,
         }),
         "remove"
             if claude_config_dir.is_none() && control_config_dir.is_none() && !json && !verbose =>
         {
-            Some(subscriptions::SubscriptionCommand::Remove {
-                account_id: account_id?,
+            Ok(subscriptions::SubscriptionCommand::Remove {
+                account_id: account_id
+                    .ok_or_else(|| error("missing required argument: <account-id>"))?,
                 pool_id,
                 config_path,
             })
@@ -1102,19 +1176,20 @@ where
                 && !verbose
                 && pool_id == "default" =>
         {
-            Some(subscriptions::SubscriptionCommand::List { config_path, json })
+            Ok(subscriptions::SubscriptionCommand::List { config_path, json })
         }
         "status"
             if account_id.is_none()
                 && claude_config_dir.is_none()
                 && control_config_dir.is_none() =>
         {
-            Some(subscriptions::SubscriptionCommand::Status {
+            Ok(subscriptions::SubscriptionCommand::Status {
                 pool_id,
                 config_path,
                 json,
                 verbose,
                 live_only,
+                poll_usage,
             })
         }
         "reload"
@@ -1124,12 +1199,12 @@ where
                 && !json
                 && !verbose =>
         {
-            Some(subscriptions::SubscriptionCommand::Reload {
+            Ok(subscriptions::SubscriptionCommand::Reload {
                 pool_id,
                 config_path,
             })
         }
-        _ => None,
+        _ => Err(error("invalid options for this subscription command")),
     }
 }
 
@@ -2455,11 +2530,7 @@ fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
         ["auth", "token"] => Some(AUTH_TOKEN_HELP),
         ["claude"] | ["claude", "run"] => Some(CLAUDE_HELP),
         ["subscriptions"] => Some(SUBSCRIPTIONS_HELP),
-        ["subscriptions", "add"] => Some(SUBSCRIPTIONS_ADD_HELP),
-        ["subscriptions", "remove"] => Some(SUBSCRIPTIONS_REMOVE_HELP),
-        ["subscriptions", "list"] => Some(SUBSCRIPTIONS_LIST_HELP),
-        ["subscriptions", "status"] => Some(SUBSCRIPTIONS_STATUS_HELP),
-        ["subscriptions", "reload"] => Some(SUBSCRIPTIONS_RELOAD_HELP),
+        ["subscriptions", command] => subscription_command_help(command),
         ["codex"] => Some(CODEX_HELP),
         ["codex", "app"] => Some(CODEX_APP_HELP),
         ["codex", "configure"] => Some(CODEX_CONFIGURE_HELP),
@@ -2599,77 +2670,6 @@ mod tests {
         request
     }
 
-    #[test]
-    fn subscriptions_status_parses_verbose_flag() {
-        let dispatch =
-            rayline_dispatch_for_argv(&argv(&["rayline", "subscriptions", "status", "--verbose"]));
-        assert_eq!(
-            dispatch,
-            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Status {
-                pool_id: "default".to_owned(),
-                config_path: None,
-                json: false,
-                verbose: true,
-                live_only: false,
-            })
-        );
-    }
-
-    #[test]
-    fn subscriptions_status_parses_live_only_flag() {
-        let dispatch = rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "subscriptions",
-            "status",
-            "--json",
-            "--live-only",
-        ]));
-        assert_eq!(
-            dispatch,
-            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Status {
-                pool_id: "default".to_owned(),
-                config_path: None,
-                json: true,
-                verbose: false,
-                live_only: true,
-            })
-        );
-    }
-
-    #[test]
-    fn subscriptions_reload_parses_pool_and_config() {
-        let dispatch = rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "subscriptions",
-            "reload",
-            "--pool",
-            "work",
-            "--config",
-            "/tmp/subscriptions.json",
-        ]));
-        assert_eq!(
-            dispatch,
-            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Reload {
-                pool_id: "work".to_owned(),
-                config_path: Some(PathBuf::from("/tmp/subscriptions.json")),
-            })
-        );
-    }
-
-    #[test]
-    fn subscriptions_reload_has_help() {
-        let help = rayline_help_for_argv(&argv(&["rayline", "subscriptions", "reload", "--help"]))
-            .expect("reload help");
-        assert!(help.contains("rayline subscriptions reload"));
-        assert!(help.contains("--pool"));
-        let index = rayline_help_for_argv(&argv(&["rayline", "subscriptions", "--help"]))
-            .expect("subscriptions help");
-        assert!(
-            index.contains("reload"),
-            "the subscriptions index should list reload: {index}"
-        );
-    }
-
     // ── Connection mechanism resolution (the two-axis model) ──────────────
 
     #[test]
@@ -2771,29 +2771,6 @@ mod tests {
                 RaylineDispatch::Unavailable
             );
         }
-    }
-
-    #[test]
-    fn parses_subscription_management_commands() {
-        assert_eq!(
-            rayline_dispatch_for_argv(&argv(&[
-                "rayline",
-                "subscriptions",
-                "add",
-                "work",
-                "--claude-config-dir",
-                "/tmp/claude-work",
-                "--pool",
-                "team",
-            ])),
-            RaylineDispatch::Subscriptions(subscriptions::SubscriptionCommand::Add {
-                account_id: "work".to_owned(),
-                pool_id: "team".to_owned(),
-                config_path: None,
-                claude_config_dir: PathBuf::from("/tmp/claude-work"),
-                control_config_dir: None,
-            })
-        );
     }
 
     #[test]

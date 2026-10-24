@@ -84,11 +84,32 @@ impl SubscriptionPoolConfig {
                 value: self.policy.switch_at_percent,
             });
         }
+        for (field, value) in [
+            ("migration_at_percent", self.policy.migration_at_percent),
+            (
+                "migration_advantage_percent",
+                self.policy.migration_advantage_percent,
+            ),
+        ] {
+            if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                return Err(ConfigError::InvalidPolicyPercent {
+                    pool: pool_id.to_owned(),
+                    field,
+                    value,
+                });
+            }
+        }
+        if self.policy.migration_at_percent < self.policy.switch_at_percent {
+            return Err(ConfigError::MigrationBelowAdmission {
+                pool: pool_id.to_owned(),
+            });
+        }
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionAccountConfig {
     pub id: String,
     pub credential_source: CredentialSourceConfig,
@@ -99,14 +120,46 @@ pub struct CredentialSourceConfig {
     pub claude_config_dir: PathBuf,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PoolPolicy {
-    #[serde(default)]
     pub billing: BillingPolicy,
-    #[serde(default = "default_switch_at_percent")]
     pub switch_at_percent: f64,
-    #[serde(default)]
+    pub migration_at_percent: f64,
+    pub migration_advantage_percent: f64,
+    pub sticky_warm_seconds: u64,
     pub sticky: StickyPolicy,
+}
+
+impl<'de> Deserialize<'de> for PoolPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            #[serde(default)]
+            billing: BillingPolicy,
+            #[serde(default = "default_switch_at_percent")]
+            switch_at_percent: f64,
+            #[serde(default)]
+            migration_at_percent: Option<f64>,
+            #[serde(default = "default_migration_advantage_percent")]
+            migration_advantage_percent: f64,
+            #[serde(default = "default_sticky_warm_seconds")]
+            sticky_warm_seconds: u64,
+            #[serde(default)]
+            sticky: StickyPolicy,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Ok(Self {
+            billing: fields.billing,
+            switch_at_percent: fields.switch_at_percent,
+            migration_at_percent: fields
+                .migration_at_percent
+                .unwrap_or_else(|| default_migration_at_percent().max(fields.switch_at_percent)),
+            migration_advantage_percent: fields.migration_advantage_percent,
+            sticky_warm_seconds: fields.sticky_warm_seconds,
+            sticky: fields.sticky,
+        })
+    }
 }
 
 impl Default for PoolPolicy {
@@ -114,6 +167,9 @@ impl Default for PoolPolicy {
         Self {
             billing: BillingPolicy::default(),
             switch_at_percent: default_switch_at_percent(),
+            migration_at_percent: default_migration_at_percent(),
+            migration_advantage_percent: default_migration_advantage_percent(),
+            sticky_warm_seconds: default_sticky_warm_seconds(),
             sticky: StickyPolicy::default(),
         }
     }
@@ -127,6 +183,16 @@ impl PoolPolicy {
 
 fn default_switch_at_percent() -> f64 {
     90.0
+}
+
+fn default_migration_at_percent() -> f64 {
+    95.0
+}
+fn default_migration_advantage_percent() -> f64 {
+    5.0
+}
+fn default_sticky_warm_seconds() -> u64 {
+    3600
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -163,6 +229,14 @@ pub enum ConfigError {
     DuplicateCredentialSource { pool: String, path: PathBuf },
     #[error("subscription pool {pool:?} switch_at_percent must be between 0 and 100, got {value}")]
     InvalidSwitchPercent { pool: String, value: f64 },
+    #[error("subscription pool {pool:?} {field} must be finite and between 0 and 100, got {value}")]
+    InvalidPolicyPercent {
+        pool: String,
+        field: &'static str,
+        value: f64,
+    },
+    #[error("subscription pool {pool:?} migration_at_percent must be at least switch_at_percent")]
+    MigrationBelowAdmission { pool: String },
 }
 
 fn validate_identifier(kind: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -190,6 +264,9 @@ mod tests {
         assert_eq!(policy.billing, BillingPolicy::IncludedOnly);
         assert_eq!(policy.sticky, StickyPolicy::LaunchModelFamily);
         assert_eq!(policy.switch_at_percent, 90.0);
+        assert_eq!(policy.migration_at_percent, 95.0);
+        assert_eq!(policy.migration_advantage_percent, 5.0);
+        assert_eq!(policy.sticky_warm_seconds, 3600);
         assert_eq!(policy.switch_at_fraction(), 0.9);
     }
 
@@ -226,5 +303,81 @@ mod tests {
                 account: "work".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn rejects_nonfinite_out_of_range_and_inverted_policy() {
+        let mut pool = SubscriptionPoolConfig {
+            control_config_dir: PathBuf::from("/tmp/control"),
+            accounts: vec![SubscriptionAccountConfig {
+                id: "a".to_owned(),
+                credential_source: CredentialSourceConfig {
+                    claude_config_dir: PathBuf::from("/tmp/a"),
+                },
+            }],
+            policy: PoolPolicy::default(),
+        };
+        for invalid in [f64::NAN, f64::INFINITY, -1.0, 101.0] {
+            pool.policy.migration_at_percent = invalid;
+            assert!(pool.validate("pool").is_err());
+            pool.policy = PoolPolicy::default();
+            pool.policy.migration_advantage_percent = invalid;
+            assert!(pool.validate("pool").is_err());
+            pool.policy = PoolPolicy::default();
+            pool.policy.switch_at_percent = invalid;
+            assert!(pool.validate("pool").is_err());
+            pool.policy = PoolPolicy::default();
+        }
+        pool.policy.migration_at_percent = 89.0;
+        assert!(matches!(
+            pool.validate("pool"),
+            Err(ConfigError::MigrationBelowAdmission { .. })
+        ));
+        pool.policy.migration_at_percent = 90.0;
+        pool.policy.migration_advantage_percent = 0.0;
+        pool.policy.sticky_warm_seconds = 0;
+        assert!(pool.validate("pool").is_ok());
+    }
+
+    #[test]
+    fn rejects_per_account_tuning_and_unknown_policy_fields() {
+        assert!(
+            serde_json::from_value::<SubscriptionAccountConfig>(serde_json::json!({
+                "id": "a",
+                "credential_source": { "claude_config_dir": "/tmp/a" },
+                "priority": 1
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<PoolPolicy>(serde_json::json!({
+                "reserve_percent": 10
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn existing_high_admission_policy_loads_and_explicit_inversion_rejects() {
+        let mut pool: SubscriptionPoolConfig = serde_json::from_value(serde_json::json!({
+            "control_config_dir": "/tmp/control",
+            "accounts": [{
+                "id": "a",
+                "credential_source": { "claude_config_dir": "/tmp/a" }
+            }],
+            "policy": { "switch_at_percent": 98 }
+        }))
+        .expect("existing pool config");
+        assert!(pool.validate("pool").is_ok());
+        assert_eq!(pool.policy.migration_at_percent, 98.0);
+        pool.policy = serde_json::from_value(serde_json::json!({
+            "switch_at_percent": 98,
+            "migration_at_percent": 95
+        }))
+        .expect("explicit policy");
+        assert!(matches!(
+            pool.validate("pool"),
+            Err(ConfigError::MigrationBelowAdmission { .. })
+        ));
     }
 }

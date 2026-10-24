@@ -3182,7 +3182,7 @@ fn spawn_router(
     // refuses to bind metrics there and runs without them, and no port is
     // advertised.
     advertise_serve_metrics_port(&mut requested_meta, chosen_metrics_port);
-    let metrics_port = chosen_metrics_port.unwrap_or_else(|| resolve_metrics_port(false));
+    let metrics_port = chosen_metrics_port.unwrap_or_else(|| resolve_metrics_port(false, false));
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -5069,7 +5069,7 @@ mod tests {
             Some("https://r")
         );
         assert!(output.contains("disabled"));
-        assert_eq!(serve_metrics_url(true, &after), None);
+        assert_eq!(serve_metrics_url(true, &after, None, "https://r"), None);
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -6839,7 +6839,7 @@ fn metrics_port_from_env(value: Option<&str>, default_port: u16) -> u16 {
 /// `data_ports` are the ports this serve binds for routing; metrics never takes
 /// one, or serve's own router bind would fail.
 fn choose_serve_metrics_port(data_ports: &[u16]) -> Option<u16> {
-    let preferred = resolve_metrics_port(false);
+    let preferred = resolve_metrics_port(false, false);
     pick_metrics_port(
         preferred,
         local_port_is_free(preferred),
@@ -6885,7 +6885,6 @@ fn ephemeral_local_port() -> Option<u16> {
         .map(|addr| addr.port())
         .ok()
 }
-
 
 /// Pick a free fallback when the default metrics port is already owned by a
 /// different-environment serve daemon. Explicit port overrides remain exact:

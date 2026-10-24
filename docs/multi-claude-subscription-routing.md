@@ -95,6 +95,11 @@ claim and placement counter, or `--json` for the complete structured payload.
 Background consumers should add `--live-only`; when no pool daemon is running,
 it fails instead of opening credential stores to build a standalone snapshot.
 
+For current quota without a daemon, explicitly use `--poll-usage`. It makes
+read-only usage GETs with existing, unexpired local tokens, never refreshes OAuth
+or writes credentials, and leaves failed/expired accounts unknown. It cannot
+be combined with `--live-only`; ordinary standalone status stays offline.
+
 Then start Claude Code:
 
 ```bash

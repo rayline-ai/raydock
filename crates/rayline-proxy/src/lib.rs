@@ -958,18 +958,20 @@ async fn forward_subscription_request(
     request: SubscriptionForward<'_>,
 ) -> Result<Response<BoxBody>> {
     let mut excluded = HashSet::new();
-    let mut final_failover_response = None;
+    let mut final_quota_response = None;
+    let mut final_entitlement_response = None;
+    let mut auth_failed = false;
     let mut pending_assignment_reason = None;
 
     while excluded.len() < request.pool.account_count() {
-        let selected = match request
+        let mut selected = match request
             .pool
             .select(request.launch_id, request.requested_model, &excluded)
             .await
         {
             Ok(selected) => selected,
             Err(error) => {
-                return match final_failover_response {
+                return match final_quota_response.or(final_entitlement_response) {
                     Some(response) => {
                         buffered_upstream_response(response, request.metrics, request.request_id)
                     }
@@ -981,6 +983,9 @@ async fn forward_subscription_request(
                             error
                         );
                         match &error {
+                            _ if auth_failed => Ok(subscription_credentials_unavailable_response(
+                                request.pool.pool_id(),
+                            )),
                             rayline_subscriptions::SubscriptionRuntimeError::NoUsableCredentials { .. } => {
                                 Ok(subscription_credentials_unavailable_response(
                                     request.pool.pool_id(),
@@ -1005,9 +1010,8 @@ async fn forward_subscription_request(
             }
         };
         let account_id = selected.account_id.clone();
-        let assignment_reason = pending_assignment_reason
-            .take()
-            .unwrap_or(selected.assignment_reason);
+        let failover_reason = pending_assignment_reason.take();
+        let assignment_reason = failover_reason.unwrap_or(selected.assignment_reason);
         debug!(
             "subscription placement pool={} account={} model={} reason={:?} score={} active_global_leases={} active_model_leases={}",
             request.pool.pool_id(),
@@ -1021,8 +1025,7 @@ async fn forward_subscription_request(
             selected.active_global_leases,
             selected.active_model_leases
         );
-        write_subscription_status(&request, &account_id, assignment_reason).await;
-        let mut access_token = selected.access_token;
+        let mut access_token = selected.access_token.clone();
         let mut refreshed_after_unauthorized = false;
 
         loop {
@@ -1030,7 +1033,7 @@ async fn forward_subscription_request(
                 .state
                 .http
                 .request(request.method.clone(), request.upstream_url)
-                .body(request.body.to_vec());
+                .body(request.body.clone());
             for (name, value) in request.original_headers.iter() {
                 if request.body_was_rewritten && *name == hyper::header::CONTENT_LENGTH {
                     continue;
@@ -1038,6 +1041,7 @@ async fn forward_subscription_request(
                 if name.as_str().eq_ignore_ascii_case(REQUEST_ID_HEADER)
                     || is_hop_by_hop(name)
                     || is_subscription_auth_header(name)
+                    || name == hyper::header::HOST
                 {
                     continue;
                 }
@@ -1047,6 +1051,7 @@ async fn forward_subscription_request(
                 .header(REQUEST_ID_HEADER, request.request_id)
                 .bearer_auth(access_token.expose());
 
+            let observation = request.pool.begin_observation(&account_id)?;
             let response = match outbound.send().await {
                 Ok(response) => response,
                 Err(error) => {
@@ -1066,11 +1071,25 @@ async fn forward_subscription_request(
             let headers = subscription_header_snapshot(response.headers());
 
             if status.is_success() {
-                request.pool.observe_response_headers(
-                    &account_id,
-                    request.requested_model,
-                    &headers,
-                )?;
+                selected.accept();
+                let assignment_reason = failover_reason.unwrap_or(selected.assignment_reason);
+                if let Err(error) = request
+                    .pool
+                    .observe_response_headers(
+                        &account_id,
+                        request.requested_model,
+                        &headers,
+                        observation,
+                    )
+                    .await
+                {
+                    warn!(
+                        "subscription pool={} account={} accepted response observation failed: {}",
+                        request.pool.pool_id(),
+                        account_id,
+                        error
+                    );
+                }
                 write_subscription_status(&request, &account_id, assignment_reason).await;
                 debug!(
                     "subscription pool={} account={} model={} status={}",
@@ -1091,8 +1110,37 @@ async fn forward_subscription_request(
                 .await;
             }
 
-            let buffered = buffer_subscription_response(response).await?;
-            match classify_response(status.as_u16(), &headers, Some(&buffered.body)) {
+            let buffered = match buffer_subscription_response(response).await? {
+                SubscriptionErrorResponse::Complete(buffered) => buffered,
+                SubscriptionErrorResponse::PassThrough(response) => {
+                    if let Some(metrics) = request.metrics.as_ref() {
+                        metrics.record(MetricsUpdate::RequestErrored {
+                            request_id: request.request_id.to_owned(),
+                            status_code: Some(status.as_u16()),
+                            error: format!(
+                                "Anthropic subscription request returned HTTP {}",
+                                status.as_u16()
+                            ),
+                        });
+                    }
+                    return Ok(response);
+                }
+            };
+            let encoding = buffered
+                .headers
+                .get(reqwest::header::CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok());
+            let Some(classification_body) = decode_body_bounded(
+                &buffered.body,
+                encoding,
+                MAX_SUBSCRIPTION_ERROR_BYTES as u64,
+            ) else {
+                return buffered_upstream_response(buffered, request.metrics, request.request_id);
+            };
+            if serde_json::from_slice::<Value>(&classification_body).is_err() {
+                return buffered_upstream_response(buffered, request.metrics, request.request_id);
+            }
+            match classify_response(status.as_u16(), &headers, Some(&classification_body)) {
                 ResponseClassification::RefreshCredential if !refreshed_after_unauthorized => {
                     refreshed_after_unauthorized = true;
                     match request
@@ -1111,18 +1159,41 @@ async fn forward_subscription_request(
                                 account_id,
                                 error
                             );
-                            final_failover_response = Some(buffered);
+                            if !matches!(
+                                &error,
+                                rayline_subscriptions::SubscriptionRuntimeError::Refresh(
+                                    rayline_subscriptions::OAuthRefreshError::InvalidGrant
+                                )
+                            ) && !request
+                                .pool
+                                .corroborate_credential_rejection(&account_id, &access_token)
+                                .await?
+                            {
+                                return buffered_upstream_response(
+                                    buffered,
+                                    request.metrics,
+                                    request.request_id,
+                                );
+                            }
+                            auth_failed = true;
                             pending_assignment_reason =
                                 Some(SessionAssignmentReason::CredentialFailover);
                         }
                     }
                 }
                 ResponseClassification::RefreshCredential => {
-                    let _ = request.pool.mark_credential_unavailable(
-                        &account_id,
-                        "Anthropic rejected the refreshed OAuth credential",
-                    );
-                    final_failover_response = Some(buffered);
+                    if !request
+                        .pool
+                        .corroborate_credential_rejection(&account_id, &access_token)
+                        .await?
+                    {
+                        return buffered_upstream_response(
+                            buffered,
+                            request.metrics,
+                            request.request_id,
+                        );
+                    }
+                    auth_failed = true;
                     pending_assignment_reason = Some(SessionAssignmentReason::CredentialFailover);
                 }
                 ResponseClassification::FailoverQuota { .. } => {
@@ -1130,20 +1201,44 @@ async fn forward_subscription_request(
                     // to mark response-header claims exhausted. Transient 429s
                     // can carry partial unified headers and must not poison the
                     // account's allowance snapshot.
-                    request.pool.observe_response_headers(
-                        &account_id,
-                        request.requested_model,
-                        &headers,
-                    )?;
-                    write_subscription_status(&request, &account_id, assignment_reason).await;
-                    final_failover_response = Some(buffered);
+                    if let Err(error) = request
+                        .pool
+                        .record_quota_rejection(
+                            &account_id,
+                            request.requested_model,
+                            &headers,
+                            observation,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "subscription pool={} account={} quota observation failed: {}",
+                            request.pool.pool_id(),
+                            account_id,
+                            error
+                        );
+                    }
+                    final_quota_response = Some(buffered);
                     pending_assignment_reason = Some(SessionAssignmentReason::QuotaFailover);
                 }
                 ResponseClassification::EntitlementRejected { .. } => {
-                    request
+                    if let Err(error) = request
                         .pool
-                        .mark_entitlement_unavailable(&account_id, request.requested_model)?;
-                    final_failover_response = Some(buffered);
+                        .mark_entitlement_unavailable(
+                            &account_id,
+                            request.requested_model,
+                            observation,
+                        )
+                        .await
+                    {
+                        warn!(
+                            "subscription pool={} account={} entitlement observation failed: {}",
+                            request.pool.pool_id(),
+                            account_id,
+                            error
+                        );
+                    }
+                    final_entitlement_response = Some(buffered);
                     pending_assignment_reason = Some(SessionAssignmentReason::EntitlementFailover);
                 }
                 ResponseClassification::TransientRateLimit
@@ -1172,8 +1267,11 @@ async fn forward_subscription_request(
         }
     }
 
-    match final_failover_response {
+    match final_quota_response.or(final_entitlement_response) {
         Some(response) => buffered_upstream_response(response, request.metrics, request.request_id),
+        None if auth_failed => Ok(subscription_credentials_unavailable_response(
+            request.pool.pool_id(),
+        )),
         None => Ok(subscription_exhausted_response(
             request.pool.pool_id(),
             request.requested_model,
@@ -1504,27 +1602,192 @@ fn subscription_header_snapshot(headers: &reqwest::header::HeaderMap) -> HeaderS
         .collect()
 }
 
-async fn buffer_subscription_response(response: reqwest::Response) -> Result<BufferedUpstream> {
+enum SubscriptionErrorResponse {
+    Complete(BufferedUpstream),
+    PassThrough(Response<BoxBody>),
+}
+
+async fn buffer_subscription_response(
+    response: reqwest::Response,
+) -> Result<SubscriptionErrorResponse> {
     use futures::StreamExt as _;
 
     let status = response.status();
     let headers = response.headers().clone();
     let mut body = Vec::new();
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if body.len().saturating_add(chunk.len()) > MAX_SUBSCRIPTION_ERROR_BYTES {
-            return Err(anyhow!(
-                "Anthropic subscription error response exceeded {MAX_SUBSCRIPTION_ERROR_BYTES} bytes"
-            ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.next()).await {
+            Ok(Some(Ok(chunk)))
+                if body.len().saturating_add(chunk.len()) <= MAX_SUBSCRIPTION_ERROR_BYTES =>
+            {
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => {
+                return Ok(SubscriptionErrorResponse::Complete(BufferedUpstream {
+                    status,
+                    headers,
+                    body: Bytes::from(body),
+                }));
+            }
+            next => {
+                let failure = match &next {
+                    Err(_) => "read deadline exceeded",
+                    Ok(Some(Err(_))) => "incomplete body",
+                    _ => "body exceeds classification limit",
+                };
+                warn!(
+                    "subscription upstream HTTP {}: {}; preserving status without replay",
+                    status.as_u16(),
+                    failure
+                );
+                // Never classify incomplete or oversized bodies. On overflow,
+                // forward the remaining original bytes without collecting them.
+                if body.is_empty() && !matches!(&next, Ok(Some(Ok(_)))) {
+                    let mut diagnostic_headers = headers;
+                    diagnostic_headers.remove(reqwest::header::CONTENT_ENCODING);
+                    diagnostic_headers.insert(
+                        reqwest::header::CONTENT_TYPE,
+                        reqwest::header::HeaderValue::from_static("application/json"),
+                    );
+                    let diagnostic = BufferedUpstream {
+                        status,
+                        headers: diagnostic_headers,
+                        body: Bytes::from(serde_json::to_vec(&json!({
+                            "type": "error",
+                            "error": { "type": "proxy_error", "message": failure }
+                        }))?),
+                    };
+                    return Ok(SubscriptionErrorResponse::PassThrough(
+                        buffered_upstream_response(diagnostic, None, "")?,
+                    ));
+                }
+                let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
+                // Terminal failure is separate from the bounded data queue so
+                // downstream backpressure cannot discard it or prolong the task.
+                let (terminal_tx, terminal_rx) =
+                    tokio::sync::oneshot::channel::<std::io::Result<()>>();
+                let terminal = futures::stream::once(async move {
+                    let result = terminal_rx.await.unwrap_or_else(|_| {
+                        Err(std::io::Error::other("upstream error body task ended"))
+                    });
+                    if result.is_err() {
+                        // Give the already queued original status/data a flush
+                        // boundary before reporting a broken downstream body.
+                        tokio::task::yield_now().await;
+                    }
+                    result.err().map(Err)
+                })
+                .filter_map(futures::future::ready);
+                let body_out = BodyExt::boxed(StreamBody::new(
+                    tokio_stream::wrappers::ReceiverStream::new(rx).chain(terminal),
+                ));
+                tokio::spawn(async move {
+                    let result = async {
+                        if !body.is_empty() {
+                            tokio::time::timeout_at(
+                                deadline,
+                                tx.send(Ok(Frame::data(Bytes::from(body)))),
+                            )
+                            .await
+                            .map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "error body deadline exceeded",
+                                )
+                            })?
+                            .map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::BrokenPipe,
+                                    "downstream closed",
+                                )
+                            })?;
+                        }
+                        let chunk = match next {
+                            Ok(Some(Ok(chunk))) => chunk,
+                            Ok(Some(Err(_))) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::UnexpectedEof,
+                                    "incomplete upstream error body",
+                                ));
+                            }
+                            Err(_) => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "upstream error body deadline exceeded",
+                                ));
+                            }
+                            Ok(None) => return Ok(()),
+                        };
+                        tokio::time::timeout_at(deadline, tx.send(Ok(Frame::data(chunk))))
+                            .await
+                            .map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::TimedOut,
+                                    "error body deadline exceeded",
+                                )
+                            })?
+                            .map_err(|_| {
+                                std::io::Error::new(
+                                    std::io::ErrorKind::BrokenPipe,
+                                    "downstream closed",
+                                )
+                            })?;
+                        loop {
+                            match tokio::time::timeout_at(deadline, stream.next()).await {
+                                Ok(Some(Ok(chunk))) => {
+                                    tokio::time::timeout_at(
+                                        deadline,
+                                        tx.send(Ok(Frame::data(chunk))),
+                                    )
+                                    .await
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::TimedOut,
+                                            "error body deadline exceeded",
+                                        )
+                                    })?
+                                    .map_err(|_| {
+                                        std::io::Error::new(
+                                            std::io::ErrorKind::BrokenPipe,
+                                            "downstream closed",
+                                        )
+                                    })?;
+                                }
+                                Ok(None) => return Ok(()),
+                                Ok(Some(Err(_))) => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::UnexpectedEof,
+                                        "incomplete upstream error body",
+                                    ));
+                                }
+                                Err(_) => {
+                                    return Err(std::io::Error::new(
+                                        std::io::ErrorKind::TimedOut,
+                                        "upstream error body deadline exceeded",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    .await;
+                    drop(tx);
+                    let _ = terminal_tx.send(result);
+                });
+                let mut builder = Response::builder().status(status);
+                for (name, value) in &headers {
+                    if !is_hop_by_hop_str(name.as_str()) && name != reqwest::header::CONTENT_LENGTH
+                    {
+                        builder = builder.header(name.as_str(), value.as_bytes());
+                    }
+                }
+                return Ok(SubscriptionErrorResponse::PassThrough(
+                    builder.body(body_out)?,
+                ));
+            }
         }
-        body.extend_from_slice(&chunk);
     }
-    Ok(BufferedUpstream {
-        status,
-        headers,
-        body: Bytes::from(body),
-    })
 }
 
 fn buffered_upstream_response(
@@ -2446,6 +2709,13 @@ const MAX_DECODE_BYTES: u64 = 32 * 1024 * 1024; // 32 MiB
 ///
 /// Returning `None` means "skip metrics for this request" — never an error to the caller.
 fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Option<Vec<u8>> {
+    decode_body_bounded(body, content_encoding, MAX_DECODE_BYTES)
+}
+
+fn decode_body_bounded(body: &[u8], content_encoding: Option<&str>, limit: u64) -> Option<Vec<u8>> {
+    if body.len() as u64 > limit {
+        return None;
+    }
     let encodings = normalized_content_encodings(content_encoding);
     if encodings.is_empty() || encodings.iter().all(|encoding| encoding == "identity") {
         return Some(body.to_vec());
@@ -2457,15 +2727,15 @@ fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Optio
             "identity" => decoded,
             "gzip" | "x-gzip" => {
                 match read_bounded(
-                    flate2::read::GzDecoder::new(Cursor::new(decoded)),
-                    MAX_DECODE_BYTES,
+                    flate2::read::MultiGzDecoder::new(Cursor::new(decoded)),
+                    limit,
                 ) {
                     Ok(Some(bytes)) => bytes,
                     Ok(None) => {
                         warn!(
                             "upstream gzip response body exceeded MAX_DECODE_BYTES ({} MiB); \
                              skipping metrics for this request",
-                            MAX_DECODE_BYTES / (1024 * 1024)
+                            limit / (1024 * 1024)
                         );
                         return None;
                     }
@@ -2475,18 +2745,15 @@ fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Optio
                     }
                 }
             }
-            "deflate" => decode_deflate_body(decoded)?,
+            "deflate" => decode_deflate_body(decoded, limit)?,
             "br" => {
-                match read_bounded(
-                    brotli::Decompressor::new(Cursor::new(decoded), 4096),
-                    MAX_DECODE_BYTES,
-                ) {
+                match read_bounded(brotli::Decompressor::new(Cursor::new(decoded), 4096), limit) {
                     Ok(Some(bytes)) => bytes,
                     Ok(None) => {
                         warn!(
                             "upstream brotli response body exceeded MAX_DECODE_BYTES ({} MiB); \
                              skipping metrics for this request",
-                            MAX_DECODE_BYTES / (1024 * 1024)
+                            limit / (1024 * 1024)
                         );
                         return None;
                     }
@@ -2504,13 +2771,13 @@ fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Optio
                         return None;
                     }
                 };
-                match read_bounded(decoder, MAX_DECODE_BYTES) {
+                match read_bounded(decoder, limit) {
                     Ok(Some(bytes)) => bytes,
                     Ok(None) => {
                         warn!(
                             "upstream zstd response body exceeded MAX_DECODE_BYTES ({} MiB); \
                              skipping metrics for this request",
-                            MAX_DECODE_BYTES / (1024 * 1024)
+                            limit / (1024 * 1024)
                         );
                         return None;
                     }
@@ -2531,31 +2798,28 @@ fn decode_body_for_metrics(body: &[u8], content_encoding: Option<&str>) -> Optio
     Some(decoded)
 }
 
-fn decode_deflate_body(body: Vec<u8>) -> Option<Vec<u8>> {
+fn decode_deflate_body(body: Vec<u8>, limit: u64) -> Option<Vec<u8>> {
     match read_bounded(
         flate2::read::ZlibDecoder::new(Cursor::new(body.clone())),
-        MAX_DECODE_BYTES,
+        limit,
     ) {
         Ok(Some(decoded)) => Some(decoded),
         Ok(None) => {
             warn!(
                 "upstream deflate (zlib) response body exceeded MAX_DECODE_BYTES ({} MiB); \
                  skipping metrics for this request",
-                MAX_DECODE_BYTES / (1024 * 1024)
+                limit / (1024 * 1024)
             );
             None
         }
         Err(zlib_error) => {
-            match read_bounded(
-                flate2::read::DeflateDecoder::new(Cursor::new(body)),
-                MAX_DECODE_BYTES,
-            ) {
+            match read_bounded(flate2::read::DeflateDecoder::new(Cursor::new(body)), limit) {
                 Ok(Some(decoded)) => Some(decoded),
                 Ok(None) => {
                     warn!(
                         "upstream deflate response body exceeded MAX_DECODE_BYTES ({} MiB); \
                          skipping metrics for this request",
-                        MAX_DECODE_BYTES / (1024 * 1024)
+                        limit / (1024 * 1024)
                     );
                     None
                 }

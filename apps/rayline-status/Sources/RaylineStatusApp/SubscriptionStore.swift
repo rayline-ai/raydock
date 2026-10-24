@@ -44,6 +44,7 @@ final class SubscriptionStore: ObservableObject {
       historyFile.save(history)
       burnRates = history.burnRates(at: fetchedAt)
     } catch {
+      status = nil
       errorMessage = error.localizedDescription
     }
   }

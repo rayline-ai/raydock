@@ -11,7 +11,11 @@ mod headers;
 mod limits;
 mod model;
 mod oauth;
+mod persistence;
+mod placement;
+mod resets;
 mod response;
+mod routing_state;
 mod runtime;
 mod selection;
 mod status;
@@ -31,10 +35,12 @@ pub use model::ModelFamily;
 pub use oauth::{
     DEFAULT_CLAUDE_OAUTH_CLIENT_ID, DEFAULT_CLAUDE_TOKEN_URL, OAuthRefreshClient, OAuthRefreshError,
 };
+pub use resets::{LimitResetGrant, LimitResetProgram, LimitResetStatus};
 pub use response::{
     ResponseClassification, classify_response, normalize_unified_extra_usage,
     normalize_unified_headers,
 };
+pub use routing_state::ObservationToken;
 pub use runtime::{
     AccountCredentialReload, AccountPlacementRuntimeStatus, AccountRuntimeStatus,
     CredentialReloadSummary, PoolPlacementRuntimeStatus, PoolRuntimeStatus, SelectedSubscription,

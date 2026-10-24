@@ -1,7 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use serde_json::{Map, Value};
@@ -12,6 +12,15 @@ use zeroize::{Zeroize, Zeroizing};
 const CREDENTIAL_FILE_NAME: &str = ".credentials.json";
 const CREDENTIAL_LOCK_FILE_NAME: &str = ".credentials.json.rayline.lock";
 const MAX_CREDENTIAL_BYTES: u64 = 1024 * 1024;
+const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+const REFRESH_FIELDS: [&str; 5] = [
+    "accessToken",
+    "refreshToken",
+    "expiresAt",
+    "refreshTokenExpiresAt",
+    "scopes",
+];
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE_PREFIX: &str = "Claude Code-credentials-";
 #[cfg(target_os = "macos")]
@@ -80,7 +89,22 @@ impl CredentialStore {
     }
 
     pub fn load(&self) -> Result<CredentialDocument, CredentialError> {
-        let _lock = self.acquire_lock()?;
+        let transaction = self.begin_refresh(DEFAULT_LOCK_TIMEOUT)?;
+        transaction.load()
+    }
+
+    /// Inspect the source without creating a lockfile or changing permissions.
+    /// Like all source I/O, this must run outside an async executor.
+    pub(crate) fn load_read_only(&self) -> Result<CredentialDocument, CredentialError> {
+        self.load_source(false)
+    }
+
+    fn load_unlocked(&self) -> Result<CredentialDocument, CredentialError> {
+        self.load_source(true)
+    }
+
+    fn load_source(&self, secure_permissions: bool) -> Result<CredentialDocument, CredentialError> {
+        validate_config_directory(&self.config_dir)?;
 
         #[cfg(target_os = "macos")]
         {
@@ -90,8 +114,8 @@ impl CredentialStore {
         }
 
         let path = self.config_dir.join(CREDENTIAL_FILE_NAME);
-        if path.is_file() {
-            return self.load_file(&path);
+        if fs::symlink_metadata(&path).is_ok() {
+            return self.load_file(&path, secure_permissions);
         }
 
         Err(CredentialError::CredentialsNotFound {
@@ -103,8 +127,13 @@ impl CredentialStore {
         &self,
         document: &mut CredentialDocument,
     ) -> Result<(), CredentialError> {
-        let _lock = self.acquire_lock()?;
-        let current = self.read_origin(&document.origin)?;
+        let transaction = self.begin_refresh(DEFAULT_LOCK_TIMEOUT)?;
+        transaction.save_if_unchanged(document)
+    }
+
+    fn save_unlocked(&self, document: &mut CredentialDocument) -> Result<(), CredentialError> {
+        validate_config_directory(&self.config_dir)?;
+        let current = Zeroizing::new(self.read_origin(&document.origin)?);
         let actual_version = credential_fingerprint(&current);
         if actual_version != document.version {
             return Err(CredentialError::ConcurrentUpdate {
@@ -112,7 +141,12 @@ impl CredentialStore {
             });
         }
 
-        let serialized = serde_json::to_vec(&document.value).map_err(CredentialError::Serialize)?;
+        let serialized = Zeroizing::new(
+            serde_json::to_vec(&document.value).map_err(CredentialError::Serialize)?,
+        );
+        if serialized.len() as u64 > MAX_CREDENTIAL_BYTES {
+            return Err(CredentialError::CredentialPayloadTooLarge);
+        }
         match &document.origin {
             CredentialOrigin::File(path) => write_file_atomic(path, &serialized)?,
             #[cfg(target_os = "macos")]
@@ -122,17 +156,34 @@ impl CredentialStore {
             }
         }
         document.version = credential_fingerprint(&serialized);
+        document.auth_version = auth_fingerprint(&document.value)?;
+        document.refresh_fields = 0;
         Ok(())
     }
 
-    fn acquire_lock(&self) -> Result<File, CredentialError> {
+    /// Blocking operation: callers on an async executor must use spawn_blocking.
+    pub(crate) fn begin_refresh(
+        &self,
+        timeout: Duration,
+    ) -> Result<CredentialTransaction, CredentialError> {
+        let lock = self.acquire_lock(timeout)?;
+        Ok(CredentialTransaction {
+            store: self.clone(),
+            _lock: lock,
+        })
+    }
+
+    fn acquire_lock(&self, timeout: Duration) -> Result<File, CredentialError> {
+        validate_config_directory(&self.config_dir)?;
         let path = self.config_dir.join(CREDENTIAL_LOCK_FILE_NAME);
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
         let file = options
             .open(&path)
@@ -140,22 +191,51 @@ impl CredentialStore {
                 path: path.clone(),
                 source,
             })?;
+        validate_open_file(&file, &path)?;
         set_private_open_file_permissions(&file, &path)?;
-        file.lock_exclusive()
-            .map_err(|source| CredentialError::Lock { path, source })?;
-        Ok(file)
+        let start = Instant::now();
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => return Ok(file),
+                Err(source) if source.kind() == std::io::ErrorKind::WouldBlock => {
+                    if start.elapsed() >= timeout {
+                        return Err(CredentialError::LockTimeout { path });
+                    }
+                    std::thread::sleep(
+                        LOCK_RETRY_INTERVAL.min(timeout.saturating_sub(start.elapsed())),
+                    );
+                }
+                Err(source) => return Err(CredentialError::Lock { path, source }),
+            }
+        }
     }
 
-    fn load_file(&self, path: &Path) -> Result<CredentialDocument, CredentialError> {
-        let bytes = read_credential_file(path)?;
+    fn load_file(
+        &self,
+        path: &Path,
+        secure_permissions: bool,
+    ) -> Result<CredentialDocument, CredentialError> {
+        let bytes = read_credential_file(path, secure_permissions)?;
         CredentialDocument::parse(bytes, CredentialOrigin::File(path.to_owned()))
     }
 
     fn read_origin(&self, origin: &CredentialOrigin) -> Result<Vec<u8>, CredentialError> {
         match origin {
-            CredentialOrigin::File(path) => read_credential_file(path),
+            CredentialOrigin::File(path) => {
+                if path != &self.config_dir.join(CREDENTIAL_FILE_NAME) {
+                    return Err(CredentialError::UnsafeCredentialFile(path.clone()));
+                }
+                read_credential_file(path, true)
+            }
             #[cfg(target_os = "macos")]
             CredentialOrigin::Keychain { service, account } => {
+                if service != &keychain_service_for_dir(&self.config_dir)
+                    && !(self.allow_legacy_keychain && service == CLAUDE_LEGACY_KEYCHAIN_SERVICE)
+                {
+                    return Err(CredentialError::UnsafeCredentialFile(
+                        self.config_dir.clone(),
+                    ));
+                }
                 keychain::read_password(service, account)
                     .map_err(CredentialError::KeychainRead)?
                     .ok_or_else(|| {
@@ -187,22 +267,89 @@ impl CredentialStore {
     }
 }
 
+/// Owns the cross-process permit from reload through network rotation and save.
+/// Its methods never reacquire the lock. Keep the owner alive across the entire
+/// operation; execute its synchronous methods outside the async executor.
+pub(crate) struct CredentialTransaction {
+    store: CredentialStore,
+    _lock: File,
+}
+
+impl CredentialTransaction {
+    pub(crate) fn load(&self) -> Result<CredentialDocument, CredentialError> {
+        self.store.load_unlocked()
+    }
+
+    pub(crate) fn reload(
+        &self,
+        document: &CredentialDocument,
+    ) -> Result<CredentialDocument, CredentialError> {
+        validate_config_directory(&self.store.config_dir)?;
+        CredentialDocument::parse(
+            self.store.read_origin(&document.origin)?,
+            document.origin.clone(),
+        )
+    }
+
+    /// Reconcile metadata-only edits without discarding a successfully rotated
+    /// grant. Changed access/refresh tokens must be validated by the caller.
+    pub(crate) fn rebase_if_same_auth(
+        &self,
+        document: &mut CredentialDocument,
+    ) -> Result<bool, CredentialError> {
+        let mut current = self.reload(document)?;
+        if !document.has_same_auth_version(&current) {
+            return Ok(false);
+        }
+        let refresh_fields = document.refresh_fields;
+        let refreshed = document.oauth_object_mut()?;
+        let latest = current.oauth_object_mut()?;
+        for (index, field) in REFRESH_FIELDS.iter().enumerate() {
+            if refresh_fields & (1 << index) == 0 {
+                continue;
+            }
+            if let Some(value) = refreshed.remove(*field) {
+                if let Some(mut replaced) = latest.insert((*field).to_owned(), value) {
+                    zeroize_json_value(&mut replaced);
+                }
+            }
+        }
+        current.refresh_fields = refresh_fields;
+        *document = current;
+        Ok(true)
+    }
+
+    pub(crate) fn save_if_unchanged(
+        &self,
+        document: &mut CredentialDocument,
+    ) -> Result<(), CredentialError> {
+        self.store.save_unlocked(document)
+    }
+}
+
+#[derive(Clone)]
 pub struct CredentialDocument {
     value: Value,
     origin: CredentialOrigin,
     version: String,
+    auth_version: String,
+    refresh_fields: u8,
 }
 
 impl CredentialDocument {
     fn parse(bytes: Vec<u8>, origin: CredentialOrigin) -> Result<Self, CredentialError> {
+        let bytes = Zeroizing::new(bytes);
         if bytes.len() as u64 > MAX_CREDENTIAL_BYTES {
             return Err(CredentialError::CredentialPayloadTooLarge);
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(CredentialError::InvalidJson)?;
+        let auth_version = auth_fingerprint(&value)?;
         let document = Self {
             value,
             origin,
             version: credential_fingerprint(&bytes),
+            auth_version,
+            refresh_fields: 0,
         };
         document.oauth_object()?;
         document.access_token()?;
@@ -245,8 +392,13 @@ impl CredentialDocument {
         self.oauth_object().ok()?.get("subscriptionType")?.as_str()
     }
 
-    pub(crate) fn has_same_version(&self, other: &Self) -> bool {
-        self.version == other.version
+    pub(crate) fn has_same_auth_version(&self, other: &Self) -> bool {
+        self.auth_version == other.auth_version
+    }
+
+    #[cfg(test)]
+    pub(crate) fn auth_version(&self) -> &str {
+        &self.auth_version
     }
 
     pub(crate) fn apply_refresh(
@@ -257,6 +409,11 @@ impl CredentialDocument {
         refresh_token_expires_at_unix_ms: Option<i64>,
         scopes: Option<Vec<String>>,
     ) -> Result<(), CredentialError> {
+        let refresh_fields = 1
+            | (u8::from(refresh_token.is_some()) << 1)
+            | (1 << 2)
+            | (u8::from(refresh_token_expires_at_unix_ms.is_some()) << 3)
+            | (u8::from(scopes.is_some()) << 4);
         let oauth = self.oauth_object_mut()?;
         oauth.insert("accessToken".to_owned(), Value::String(access_token));
         if let Some(refresh_token) = refresh_token {
@@ -278,6 +435,7 @@ impl CredentialDocument {
                 Value::Array(scopes.into_iter().map(Value::String).collect()),
             );
         }
+        self.refresh_fields |= refresh_fields;
         Ok(())
     }
 
@@ -382,6 +540,8 @@ pub enum CredentialError {
         #[source]
         source: std::io::Error,
     },
+    #[error("timed out acquiring Claude credential ownership: {path}")]
+    LockTimeout { path: PathBuf },
     #[error("Claude credential changed concurrently for {config_dir}; reload and retry")]
     ConcurrentUpdate { config_dir: PathBuf },
     #[error("failed to serialize Claude credential: {0}")]
@@ -407,13 +567,63 @@ fn credential_fingerprint(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn read_credential_file(path: &Path) -> Result<Vec<u8>, CredentialError> {
+fn auth_fingerprint(value: &Value) -> Result<String, CredentialError> {
+    let oauth = value
+        .get("claudeAiOauth")
+        .and_then(Value::as_object)
+        .ok_or(CredentialError::MissingOAuthObject)?;
+    // Token identity only: profile/tier/scopes/expiry metadata edits cannot
+    // revive a provider-rejected grant. Whole-document CAS remains separate.
+    let tokens = (oauth.get("accessToken"), oauth.get("refreshToken"));
+    let bytes = Zeroizing::new(serde_json::to_vec(&tokens).map_err(CredentialError::Serialize)?);
+    Ok(credential_fingerprint(&bytes))
+}
+
+fn validate_config_directory(path: &Path) -> Result<(), CredentialError> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| CredentialError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_dir() {
+        return Err(CredentialError::UnsafeCredentialFile(path.to_owned()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid has no arguments or memory safety preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+            return Err(CredentialError::UnsafeCredentialFile(path.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn validate_open_file(file: &File, path: &Path) -> Result<(), CredentialError> {
+    let metadata = file.metadata().map_err(|source| CredentialError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(CredentialError::UnsafeCredentialFile(path.to_owned()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        // SAFETY: geteuid has no arguments or memory safety preconditions.
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.nlink() != 1 {
+            return Err(CredentialError::UnsafeCredentialFile(path.to_owned()));
+        }
+    }
+    Ok(())
+}
+
+fn read_credential_file(path: &Path, secure_permissions: bool) -> Result<Vec<u8>, CredentialError> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW);
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let mut file = options.open(path).map_err(|source| CredentialError::Read {
         path: path.to_owned(),
@@ -423,13 +633,13 @@ fn read_credential_file(path: &Path) -> Result<Vec<u8>, CredentialError> {
         path: path.to_owned(),
         source,
     })?;
-    if !metadata.is_file() {
-        return Err(CredentialError::UnsafeCredentialFile(path.to_owned()));
-    }
+    validate_open_file(&file, path)?;
     if metadata.len() > MAX_CREDENTIAL_BYTES {
         return Err(CredentialError::CredentialFileTooLarge(path.to_owned()));
     }
-    set_private_open_file_permissions(&file, path)?;
+    if secure_permissions {
+        set_private_open_file_permissions(&file, path)?;
+    }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
     Read::take(&mut file, MAX_CREDENTIAL_BYTES + 1)
         .read_to_end(&mut bytes)
@@ -543,8 +753,10 @@ fn set_private_open_file_permissions(file: &File, path: &Path) -> Result<(), Cre
 #[cfg(target_os = "macos")]
 mod keychain {
     use std::ffi::OsString;
-    use std::io::Write as _;
-    use std::process::{Command, Stdio};
+    use std::io::{Read as _, Write as _};
+    use std::process::{Command, Output, Stdio};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     use zeroize::Zeroizing;
 
@@ -558,13 +770,98 @@ mod keychain {
             .unwrap_or_else(|| OsString::from("/usr/bin/security"))
     }
 
+    /// A locked transaction must not wait indefinitely for a keychain prompt
+    /// or a stuck subprocess. Pipe workers keep all subprocess I/O bounded by
+    /// the same deadline, including a child which never reads stdin.
+    fn run_security(
+        command: &mut Command,
+        input: Option<Zeroizing<String>>,
+    ) -> Result<Output, String> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        command.stdout(Stdio::piped()).stderr(Stdio::null());
+        command.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("failed to run security(1): {error}"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "security(1) stdout unavailable".to_owned())?;
+        let (output_tx, output_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Zeroizing::new(Vec::new());
+            let result = stdout
+                .take(super::MAX_CREDENTIAL_BYTES * 2 + 1)
+                .read_to_end(&mut bytes);
+            let _ = output_tx.send(result.map(|_| bytes));
+        });
+        let input_rx = if let Some(input) = input {
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| "security(1) stdin unavailable".to_owned())?;
+            let (input_tx, input_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let mut stdin = stdin;
+                let _ = input_tx.send(stdin.write_all(input.as_bytes()));
+            });
+            Some(input_rx)
+        } else {
+            None
+        };
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(match result {
+                        Err(error) => format!("failed to wait for security(1): {error}"),
+                        _ => "security(1) exceeded its deadline".to_owned(),
+                    });
+                }
+            }
+        };
+        if let Some(input_rx) = input_rx {
+            input_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .map_err(|_| "security(1) input exceeded its deadline".to_owned())?
+                .map_err(|error| format!("failed to write to security(1): {error}"))?;
+        }
+        let mut stdout = output_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| "security(1) output exceeded its deadline".to_owned())?
+            .map_err(|error| format!("failed to read security(1): {error}"))?;
+        if stdout.len() as u64 > super::MAX_CREDENTIAL_BYTES * 2 {
+            return Err("security(1) output exceeds the size limit".to_owned());
+        }
+        Ok(Output {
+            status,
+            stdout: std::mem::take(&mut *stdout),
+            stderr: Vec::new(),
+        })
+    }
+
     /// Read the generic-password secret, or `None` when the item is missing.
     pub(super) fn read_password(service: &str, account: &str) -> Result<Option<Vec<u8>>, String> {
-        let output = Command::new(security_bin())
-            .args(["find-generic-password", "-s", service, "-a", account, "-w"])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("failed to run security(1): {error}"))?;
+        let output = run_security(
+            Command::new(security_bin()).args([
+                "find-generic-password",
+                "-s",
+                service,
+                "-a",
+                account,
+                "-w",
+            ]),
+            None,
+        )?;
         if output.status.code() == Some(EXIT_ITEM_NOT_FOUND) {
             return Ok(None);
         }
@@ -598,26 +895,7 @@ mod keychain {
         push_quoted(&mut line, secret)?;
         line.push('\n');
 
-        let mut child = Command::new(security_bin())
-            .arg("-i")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("failed to run security(1): {error}"))?;
-        let stdin_result = child
-            .stdin
-            .take()
-            .ok_or_else(|| "security(1) stdin unavailable".to_owned())
-            .and_then(|mut stdin| {
-                stdin
-                    .write_all(line.as_bytes())
-                    .map_err(|error| format!("failed to write to security(1): {error}"))
-            });
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("failed to wait for security(1): {error}"))?;
-        stdin_result?;
+        let output = run_security(Command::new(security_bin()).arg("-i"), Some(line))?;
         if !output.status.success() {
             return Err(format!(
                 "security add-generic-password failed ({}): {}",
@@ -865,6 +1143,302 @@ mod tests {
         // SAFETY: same single-threaded test environment as the set_var above.
         unsafe { std::env::remove_var("RAYLINE_SECURITY_CLI") };
         result.expect("fake security CLI round trip");
+    }
+
+    #[test]
+    fn refresh_transaction_owns_reload_through_persistence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_test_credential(dir.path(), &credential_json("old", "refresh-old", 1000));
+        let store = CredentialStore::new(dir.path()).expect("store");
+        let transaction = store.begin_refresh(Duration::ZERO).expect("ownership");
+        let mut document = transaction.load().expect("reload without nested flock");
+        let peer = store.clone();
+        let blocked = std::thread::spawn(move || {
+            matches!(
+                peer.begin_refresh(Duration::from_millis(30)),
+                Err(CredentialError::LockTimeout { .. })
+            )
+        });
+        assert!(blocked.join().expect("peer thread"));
+        document
+            .apply_refresh(
+                "rotated".to_owned(),
+                Some("refresh-rotated".to_owned()),
+                2000,
+                None,
+                None,
+            )
+            .expect("grant");
+        transaction
+            .save_if_unchanged(&mut document)
+            .expect("save under ownership");
+        assert!(matches!(
+            store.begin_refresh(Duration::ZERO),
+            Err(CredentialError::LockTimeout { .. })
+        ));
+        drop(transaction);
+        let peer = store
+            .begin_refresh(Duration::ZERO)
+            .expect("released ownership");
+        assert_eq!(
+            peer.load()
+                .expect("peer reload")
+                .access_token()
+                .expect("token")
+                .expose(),
+            "rotated"
+        );
+    }
+
+    #[test]
+    fn ownership_reload_observes_peer_rotation_and_ignores_metadata_as_auth_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_test_credential(dir.path(), &credential_json("old", "refresh-old", 1000));
+        let store = CredentialStore::new(dir.path()).expect("store");
+        let initial = store.load().expect("initial");
+        let mut metadata: Value =
+            serde_json::from_slice(&credential_json("old", "refresh-old", 1000)).expect("json");
+        metadata["preserved"]["value"] = Value::String("changed".to_owned());
+        metadata["claudeAiOauth"]["subscriptionType"] = Value::String("max".to_owned());
+        metadata["claudeAiOauth"]["rateLimitTier"] = Value::String("tier-updated".to_owned());
+        metadata["claudeAiOauth"]["expiresAt"] = Value::Number(9000.into());
+        metadata["claudeAiOauth"]["scopes"] = serde_json::json!(["user:inference", "user:profile"]);
+        write_test_credential(
+            dir.path(),
+            &serde_json::to_vec_pretty(&metadata).expect("json"),
+        );
+        let transaction = store.begin_refresh(Duration::ZERO).expect("ownership");
+        let latest = transaction.load().expect("latest");
+        assert!(initial.has_same_auth_version(&latest));
+        assert_ne!(initial.version, latest.version);
+        write_test_credential(dir.path(), &credential_json("peer", "refresh-peer", 3000));
+        let peer = transaction.reload(&latest).expect("external winner");
+        assert!(!latest.has_same_auth_version(&peer));
+        assert_eq!(peer.access_token().expect("token").expose(), "peer");
+    }
+
+    #[test]
+    fn failed_cas_retains_rotation_and_rebases_only_unrelated_metadata() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_test_credential(dir.path(), &credential_json("old", "refresh-old", 1000));
+        let store = CredentialStore::new(dir.path()).expect("store");
+        let transaction = store.begin_refresh(Duration::ZERO).expect("ownership");
+        let mut document = transaction.load().expect("load");
+        let baseline = document.auth_version().to_owned();
+        document
+            .apply_refresh(
+                "rotated".to_owned(),
+                Some("refresh-rotated".to_owned()),
+                2000,
+                None,
+                None,
+            )
+            .expect("grant");
+        let mut external: Value =
+            serde_json::from_slice(&credential_json("old", "refresh-old", 1000)).expect("json");
+        external["preserved"] = serde_json::json!({"new": "metadata"});
+        external["claudeAiOauth"]["subscriptionType"] = Value::String("max".to_owned());
+        external["claudeAiOauth"]["rateLimitTier"] = Value::String("tier-updated".to_owned());
+        external["claudeAiOauth"]["scopes"] = serde_json::json!(["user:inference", "user:profile"]);
+        write_test_credential(dir.path(), &serde_json::to_vec(&external).expect("json"));
+        assert!(matches!(
+            transaction.save_if_unchanged(&mut document),
+            Err(CredentialError::ConcurrentUpdate { .. })
+        ));
+        assert_eq!(
+            document.refresh_token().expect("rotated refresh").expose(),
+            "refresh-rotated"
+        );
+        assert_eq!(document.auth_version(), baseline);
+        assert!(
+            transaction
+                .rebase_if_same_auth(&mut document)
+                .expect("metadata rebase")
+        );
+        transaction
+            .save_if_unchanged(&mut document)
+            .expect("retry persist");
+        let saved = transaction.reload(&document).expect("saved");
+        assert_eq!(saved.value["preserved"]["new"], "metadata");
+        assert_eq!(saved.value["claudeAiOauth"]["subscriptionType"], "max");
+        assert_eq!(
+            saved.value["claudeAiOauth"]["rateLimitTier"],
+            "tier-updated"
+        );
+        assert_eq!(saved.scopes(), vec!["user:inference", "user:profile"]);
+        assert_eq!(saved.expires_at_unix_ms().expect("rotated expiry"), 2000);
+        assert_eq!(
+            saved.refresh_token().expect("token").expose(),
+            "refresh-rotated"
+        );
+        assert_ne!(saved.auth_version(), baseline);
+        document
+            .apply_refresh(
+                "next".to_owned(),
+                Some("refresh-next".to_owned()),
+                4000,
+                None,
+                None,
+            )
+            .expect("next grant");
+        write_test_credential(dir.path(), &credential_json("peer", "refresh-peer", 5000));
+        assert!(
+            !transaction
+                .rebase_if_same_auth(&mut document)
+                .expect("peer is not metadata")
+        );
+        assert_eq!(
+            document.refresh_token().expect("retained grant").expose(),
+            "refresh-next"
+        );
+        assert_eq!(
+            transaction
+                .reload(&document)
+                .expect("peer winner")
+                .access_token()
+                .expect("token")
+                .expose(),
+            "peer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_lock_and_hardlinked_credentials_are_rejected_without_chmod() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        fs::write(&target, credential_json("old", "refresh-old", 1000)).expect("target");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).expect("permissions");
+        symlink(&target, dir.path().join(CREDENTIAL_LOCK_FILE_NAME)).expect("symlink lock");
+        let store = CredentialStore::new(dir.path()).expect("store");
+        assert!(store.begin_refresh(Duration::ZERO).is_err());
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+        fs::remove_file(dir.path().join(CREDENTIAL_LOCK_FILE_NAME)).expect("remove symlink");
+        fs::hard_link(&target, dir.path().join(CREDENTIAL_FILE_NAME)).expect("hard link");
+        assert!(matches!(
+            store.load(),
+            Err(CredentialError::UnsafeCredentialFile(_))
+        ));
+        assert_eq!(
+            fs::metadata(&target)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn storage_error_retains_rotated_grant_for_retry_under_new_ownership() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let original = credential_json("old", "refresh-old", 1000);
+        write_test_credential(dir.path(), &original);
+        let store = CredentialStore::new(dir.path()).expect("store");
+        let transaction = store.begin_refresh(Duration::ZERO).expect("ownership");
+        let mut pending = transaction.load().expect("load");
+        pending
+            .apply_refresh(
+                "rotated".to_owned(),
+                Some("refresh-rotated".to_owned()),
+                2000,
+                None,
+                None,
+            )
+            .expect("grant");
+        fs::remove_file(dir.path().join(CREDENTIAL_FILE_NAME))
+            .expect("simulate inaccessible storage");
+        assert!(matches!(
+            transaction.save_if_unchanged(&mut pending),
+            Err(CredentialError::Read { .. })
+        ));
+        drop(transaction);
+        assert_eq!(
+            pending.access_token().expect("retained access").expose(),
+            "rotated"
+        );
+        assert_eq!(
+            pending.refresh_token().expect("retained refresh").expose(),
+            "refresh-rotated"
+        );
+        write_test_credential(dir.path(), &original);
+        let transaction = store.begin_refresh(Duration::ZERO).expect("new ownership");
+        transaction
+            .save_if_unchanged(&mut pending)
+            .expect("persist without another grant");
+        assert_eq!(
+            transaction
+                .reload(&pending)
+                .expect("persisted")
+                .refresh_token()
+                .expect("token")
+                .expose(),
+            "refresh-rotated"
+        );
+    }
+
+    #[test]
+    fn transaction_cannot_save_a_document_owned_by_another_store() {
+        let first = tempfile::tempdir().expect("first");
+        let second = tempfile::tempdir().expect("second");
+        write_test_credential(
+            first.path(),
+            &credential_json("first", "refresh-first", 1000),
+        );
+        write_test_credential(
+            second.path(),
+            &credential_json("second", "refresh-second", 1000),
+        );
+        let first_store = CredentialStore::new(first.path()).expect("first store");
+        let second_store = CredentialStore::new(second.path()).expect("second store");
+        let mut document = first_store.load().expect("first document");
+        document
+            .apply_refresh("rotated".to_owned(), None, 2000, None, None)
+            .expect("grant");
+        let transaction = second_store
+            .begin_refresh(Duration::ZERO)
+            .expect("second ownership");
+        assert!(matches!(
+            transaction.save_if_unchanged(&mut document),
+            Err(CredentialError::UnsafeCredentialFile(_))
+        ));
+        assert_eq!(
+            first_store
+                .load()
+                .expect("first unchanged")
+                .access_token()
+                .expect("token")
+                .expose(),
+            "first"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_load_never_creates_lockfile_or_changes_source_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CREDENTIAL_FILE_NAME);
+        let original = credential_json("access", "refresh", 1000);
+        fs::write(&path, &original).expect("credential");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("permissions");
+        let store = CredentialStore::new(dir.path()).expect("store");
+        let loaded = store.load_read_only().expect("read-only load");
+        assert_eq!(loaded.access_token().expect("token").expose(), "access");
+        assert!(!dir.path().join(CREDENTIAL_LOCK_FILE_NAME).exists());
+        assert_eq!(fs::read(&path).expect("unchanged bytes"), original);
+        assert_eq!(
+            fs::metadata(&path).expect("metadata").permissions().mode() & 0o777,
+            0o644
+        );
     }
 
     #[test]

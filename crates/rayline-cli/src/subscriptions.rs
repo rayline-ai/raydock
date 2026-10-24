@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use rayline_subscriptions::{
     AccountRuntimeStatus, ClaimScope, CredentialHealth, CredentialReloadSummary,
-    CredentialSourceConfig, LimitClaim, ModelFamily, PoolRuntimeStatus, SUBSCRIPTION_CONFIG_SCHEMA,
-    SubscriptionAccountConfig, SubscriptionPoolConfig, SubscriptionPoolRuntime,
-    SubscriptionPoolsConfig, SubscriptionRuntimeOptions,
+    CredentialSourceConfig, LimitClaim, LimitResetGrant, LimitResetProgram, LimitResetStatus,
+    ModelFamily, PoolRuntimeStatus, SUBSCRIPTION_CONFIG_SCHEMA, SubscriptionAccountConfig,
+    SubscriptionPoolConfig, SubscriptionPoolRuntime, SubscriptionPoolsConfig,
+    SubscriptionRuntimeOptions,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -42,6 +43,7 @@ pub enum SubscriptionCommand {
         json: bool,
         verbose: bool,
         live_only: bool,
+        poll_usage: bool,
     },
     Reload {
         pool_id: String,
@@ -76,7 +78,18 @@ pub async fn run(command: &SubscriptionCommand) -> Result<String, String> {
             json,
             verbose,
             live_only,
-        } => status(pool_id, config_path.as_deref(), *json, *verbose, *live_only).await,
+            poll_usage,
+        } => {
+            status(
+                pool_id,
+                config_path.as_deref(),
+                *json,
+                *verbose,
+                *live_only,
+                *poll_usage,
+            )
+            .await
+        }
         SubscriptionCommand::Reload {
             pool_id,
             config_path,
@@ -262,26 +275,20 @@ async fn status(
     json: bool,
     verbose: bool,
     live_only: bool,
+    poll_usage: bool,
 ) -> Result<String, String> {
     let (_, pool) = resolve_pool(config_path, pool_id)?;
-    let status = match live_pool_status(pool_id).await {
-        Some(status) => status,
-        None if live_only => {
-            return Err(format!(
-                "subscription pool {pool_id:?} has no running daemon; start Claude through Rayline or omit --live-only to read a standalone snapshot"
-            ));
-        }
-        None => {
-            let runtime = SubscriptionPoolRuntime::start(
-                pool_id,
-                pool,
-                SubscriptionRuntimeOptions::default(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-            runtime.status_without_live_placement()
-        }
-    };
+    let status = status_snapshot(
+        pool_id,
+        pool,
+        subscription_metrics_port(),
+        live_only,
+        SubscriptionRuntimeOptions {
+            poll_usage_read_only: poll_usage,
+            ..SubscriptionRuntimeOptions::default()
+        },
+    )
+    .await?;
     if json {
         return serde_json::to_string_pretty(&status)
             .map(|value| format!("{value}\n"))
@@ -294,7 +301,35 @@ async fn status(
     Ok(render_compact_status(&status, color))
 }
 
+async fn status_snapshot(
+    pool_id: &str,
+    pool: SubscriptionPoolConfig,
+    port: u16,
+    live_only: bool,
+    mut options: SubscriptionRuntimeOptions,
+) -> Result<PoolRuntimeStatus, String> {
+    if let Some(status) = live_pool_status_at(pool_id, port).await {
+        return Ok(status);
+    }
+    if live_only {
+        return Err(format!(
+            "subscription pool {pool_id:?} has no running daemon; start Claude through Rayline or omit --live-only to read a standalone snapshot"
+        ));
+    }
+    // Standalone status never rotates or persists credentials. Usage GETs with
+    // existing valid grants require explicit --poll-usage opt-in.
+    options.read_only = true;
+    let runtime = SubscriptionPoolRuntime::start(pool_id, pool, options)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(runtime.status_without_live_placement())
+}
+
 fn render_verbose_status(status: &PoolRuntimeStatus) -> String {
+    render_verbose_status_at(status, OffsetDateTime::now_utc())
+}
+
+fn render_verbose_status_at(status: &PoolRuntimeStatus, now: OffsetDateTime) -> String {
     let mut output = format!("Subscription pool: {}\n", status.pool_id);
     if let Some(placement) = &status.placement {
         output.push_str(&format!(
@@ -323,7 +358,7 @@ fn render_verbose_status(status: &PoolRuntimeStatus) -> String {
         }
     } else {
         output.push_str(
-            "Live placement: unavailable (no running pool daemon was found); allowance is a standalone snapshot.\n",
+            "Live placement: unavailable (no running pool daemon was found); read-only local credentials, capacity not measured.\n",
         );
     }
     for account in &status.accounts {
@@ -331,7 +366,9 @@ fn render_verbose_status(status: &PoolRuntimeStatus) -> String {
             "\n{}  credential={:?}  usage={}\n",
             account.id,
             account.credential_health,
-            if account.usage_snapshot_fresh {
+            if account.claims.is_empty() {
+                "unknown (not measured)"
+            } else if account.usage_snapshot_fresh {
                 "fresh"
             } else {
                 "stale"
@@ -367,6 +404,160 @@ fn render_verbose_status(status: &PoolRuntimeStatus) -> String {
             output.push_str(&format!("  warning: {error}\n"));
         }
     }
+    output.push_str(&render_saved_limit_resets(status, now));
+    output
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SavedResetCounts {
+    banked: u64,
+    usable_now: Option<u64>,
+}
+
+fn reset_inventory_fresh(inventory: &LimitResetStatus, now: OffsetDateTime) -> bool {
+    let age_ms = now.unix_timestamp_nanos() / 1_000_000 - i128::from(inventory.checked_at_unix_ms);
+    inventory.fresh && (0..=600_000).contains(&age_ms) && !inventory.programs.is_empty()
+}
+
+fn reset_grant_unexpired(grant: &LimitResetGrant, now: OffsetDateTime) -> bool {
+    grant
+        .expires_at
+        .as_deref()
+        .is_none_or(|expiry| parse_reset_timestamp(expiry).is_some_and(|expiry| expiry > now))
+}
+
+fn reset_time_reached(value: Option<&str>, now: OffsetDateTime) -> bool {
+    value.is_none_or(|value| parse_reset_timestamp(value).is_some_and(|timestamp| timestamp <= now))
+}
+
+fn reset_grant_usable(
+    program: &LimitResetProgram,
+    grant: &LimitResetGrant,
+    now: OffsetDateTime,
+) -> bool {
+    program.eligible
+        && grant.usable_now
+        && !grant.paused
+        && grant.remaining_count > 0
+        && reset_grant_unexpired(grant, now)
+        && reset_time_reached(grant.starts_at.as_deref(), now)
+        && reset_time_reached(program.cooldown_until.as_deref(), now)
+        && reset_time_reached(program.next_available_at.as_deref(), now)
+}
+
+fn saved_reset_counts(inventory: &LimitResetStatus, now: OffsetDateTime) -> SavedResetCounts {
+    let mut banked = 0_u64;
+    let mut usable = 0_u64;
+    for program in &inventory.programs {
+        for grant in &program.grants {
+            if reset_grant_unexpired(grant, now) {
+                banked = banked.saturating_add(grant.remaining_count);
+            }
+            if reset_grant_usable(program, grant, now) {
+                usable = usable.saturating_add(grant.remaining_count);
+            }
+        }
+    }
+    SavedResetCounts {
+        banked,
+        usable_now: reset_inventory_fresh(inventory, now).then_some(usable),
+    }
+}
+
+fn render_saved_limit_resets(status: &PoolRuntimeStatus, now: OffsetDateTime) -> String {
+    let mut output =
+        String::from("\nSaved limit resets (discretionary offers, not scheduled quota renewal):\n");
+    for account in &status.accounts {
+        let Some(inventory) = &account.limit_resets else {
+            output.push_str(&format!("  {}: unknown (not measured)\n", account.id));
+            continue;
+        };
+        if inventory.programs.is_empty() {
+            output.push_str(&format!(
+                "  {}: unknown (no evaluated programs)\n",
+                account.id
+            ));
+            continue;
+        }
+        let counts = saved_reset_counts(inventory, now);
+        match counts.usable_now {
+            Some(usable) => output.push_str(&format!(
+                "  {}: {} banked · {} usable now (OAuth inventory)\n",
+                account.id, counts.banked, usable
+            )),
+            None => output.push_str(&format!(
+                "  {}: stale/uncertain · {} last-known banked · usable now unknown\n",
+                account.id, counts.banked
+            )),
+        }
+        for program in &inventory.programs {
+            output.push_str(&format!(
+                "    {}: eligible={}",
+                program.program, program.eligible
+            ));
+            if let Some(reason) = &program.reason {
+                output.push_str(&format!(" · reason={reason}"));
+                if reason == "surface" {
+                    output.push_str(" (web-only: check Claude web Usage)");
+                }
+            }
+            if let Some(until) = &program.cooldown_until {
+                output.push_str(&format!(" · cooldown until {until}"));
+            }
+            if let Some(next) = &program.next_available_at {
+                output.push_str(&format!(" · next available {next}"));
+            }
+            output.push('\n');
+            for grant in &program.grants {
+                let windows = grant
+                    .clears
+                    .iter()
+                    .map(|window| match window.as_str() {
+                        "five_hour" | "session" => "session (5h)",
+                        "seven_day" | "weekly" => "weekly (7d)",
+                        other => other,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                output.push_str(&format!(
+                    "      {}: remaining={} · resets={} · {}",
+                    grant.title,
+                    grant.remaining_count,
+                    if windows.is_empty() {
+                        "unspecified"
+                    } else {
+                        &windows
+                    },
+                    if counts.usable_now.is_none() {
+                        "usability unknown"
+                    } else if reset_grant_usable(program, grant, now) {
+                        "usable now"
+                    } else {
+                        "not usable now"
+                    },
+                ));
+                if let Some(expiry) = &grant.expires_at {
+                    output.push_str(&format!(" · expires {expiry}"));
+                    if !reset_grant_unexpired(grant, now) {
+                        output.push_str(" (expired or invalid expiry; excluded)");
+                    }
+                }
+                if let Some(start) = &grant.starts_at {
+                    output.push_str(&format!(" · starts {start}"));
+                }
+                if grant.paused {
+                    output.push_str(" · paused");
+                }
+                if grant.requires_limit {
+                    output.push_str(" · requires hitting a limit");
+                }
+                output.push('\n');
+            }
+        }
+    }
+    output.push_str(
+        "  OAuth discovery may not include all web offers. Check/redeem manually at https://claude.ai/settings/usage\n  Sign in to the correct account shown above; redemption is irreversible. Normal weekly renewal is unchanged.\n",
+    );
     output
 }
 
@@ -427,7 +618,7 @@ fn render_compact_status_at(
             "Snapshot: live allowance + placement · active lease TTL {}\n\n",
             compact_duration(placement.active_lease_ttl_seconds)
         )),
-        None => output.push_str("Snapshot: standalone allowance · live placement unavailable\n\n"),
+        None => output.push_str("Snapshot: read-only local credentials · capacity not measured · live placement unavailable\n\n"),
     }
 
     let rows = status
@@ -592,6 +783,8 @@ fn render_compact_status_at(
         "2",
         color,
     ));
+    output.push_str(&render_saved_limit_resets(status, now));
+    output.push('\n');
     output.push_str(&status_paint(
         "Tip: use --verbose to show every normalized claim and placement detail.\n",
         "2",
@@ -706,7 +899,12 @@ fn limit_status_cell(claim: Option<&LimitClaim>, missing: &str, fresh: bool) -> 
     };
     if claim.is_hard_exhausted() {
         return StatusCell {
-            text: "exhausted".to_owned(),
+            text: if fresh {
+                "exhausted"
+            } else {
+                "exhausted stale"
+            }
+            .to_owned(),
             tone: if fresh {
                 StatusTone::Bad
             } else {
@@ -731,7 +929,11 @@ fn limit_status_cell(claim: Option<&LimitClaim>, missing: &str, fresh: bool) -> 
         StatusTone::Good
     };
     StatusCell {
-        text: format!("{:.0}%", remaining * 100.0),
+        text: format!(
+            "{:.0}%{}",
+            remaining * 100.0,
+            if fresh { "" } else { " stale" }
+        ),
         tone,
     }
 }
@@ -746,6 +948,9 @@ fn allowance_status_cell(
         CredentialHealth::Refreshing => ("refreshing", StatusTone::Warning),
         CredentialHealth::Unavailable => ("credential unavailable", StatusTone::Bad),
         CredentialHealth::Quarantined => ("quarantined", StatusTone::Bad),
+        CredentialHealth::Healthy if account.claims.is_empty() => {
+            ("usage unknown", StatusTone::Warning)
+        }
         CredentialHealth::Healthy if !account.usage_snapshot_fresh => {
             ("usage stale", StatusTone::Warning)
         }
@@ -759,6 +964,13 @@ fn allowance_status_cell(
                 .any(LimitClaim::is_hard_exhausted) =>
         {
             ("none", StatusTone::Bad)
+        }
+        CredentialHealth::Healthy
+            if [five_hour, seven_day]
+                .into_iter()
+                .any(|claim| claim.is_none_or(|claim| claim.utilization.is_none())) =>
+        {
+            ("usage unknown", StatusTone::Warning)
         }
         CredentialHealth::Healthy if fable.is_some_and(LimitClaim::is_hard_exhausted) => {
             ("non-Fable", StatusTone::Warning)
@@ -896,10 +1108,6 @@ fn subscription_metrics_port() -> u16 {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(DEFAULT_SUBSCRIPTION_METRICS_PORT)
-}
-
-async fn live_pool_status(pool_id: &str) -> Option<PoolRuntimeStatus> {
-    live_pool_status_at(pool_id, subscription_metrics_port()).await
 }
 
 async fn live_pool_status_at(pool_id: &str, port: u16) -> Option<PoolRuntimeStatus> {
@@ -1108,6 +1316,219 @@ fn write_config(path: &Path, config: &SubscriptionPoolsConfig) -> Result<(), Str
 mod tests {
     use super::*;
 
+    fn reset_inventory(now: OffsetDateTime) -> LimitResetStatus {
+        LimitResetStatus {
+            checked_at_unix_ms: (now.unix_timestamp_nanos() / 1_000_000) as i64,
+            fresh: true,
+            programs: vec![LimitResetProgram {
+                program: "cedar_ember".to_owned(),
+                eligible: true,
+                reason: None,
+                cooldown_until: None,
+                next_available_at: None,
+                grants: vec![LimitResetGrant {
+                    id: "saved-reset".to_owned(),
+                    title: "Saved session reset".to_owned(),
+                    remaining_count: 2,
+                    usable_now: true,
+                    requires_limit: false,
+                    clears: vec!["five_hour".to_owned(), "seven_day".to_owned()],
+                    starts_at: None,
+                    expires_at: Some("2030-01-02T12:00:00Z".to_owned()),
+                    paused: false,
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn saved_resets_expire_at_the_deadline_not_after_it() {
+        let now = OffsetDateTime::parse("2030-01-02T12:00:00Z", &Rfc3339).expect("now");
+        let mut inventory = reset_inventory(now);
+        assert_eq!(
+            saved_reset_counts(&inventory, now),
+            SavedResetCounts {
+                banked: 0,
+                usable_now: Some(0)
+            }
+        );
+        inventory.checked_at_unix_ms -= 1;
+        assert_eq!(
+            saved_reset_counts(&inventory, now - time::Duration::milliseconds(1)),
+            SavedResetCounts {
+                banked: 2,
+                usable_now: Some(2)
+            }
+        );
+        inventory.programs[0].grants[0].expires_at = Some("invalid".to_owned());
+        assert_eq!(saved_reset_counts(&inventory, now).banked, 0);
+        assert_eq!(saved_reset_counts(&inventory, now).usable_now, Some(0));
+    }
+
+    #[test]
+    fn saved_resets_never_claim_usability_for_stale_or_future_inventory() {
+        let now = OffsetDateTime::parse("2030-01-01T12:00:00Z", &Rfc3339).expect("now");
+        let mut inventory = reset_inventory(now);
+        inventory.checked_at_unix_ms -= 600_000;
+        assert_eq!(saved_reset_counts(&inventory, now).usable_now, Some(2));
+        inventory.checked_at_unix_ms -= 1;
+        assert_eq!(
+            saved_reset_counts(&inventory, now),
+            SavedResetCounts {
+                banked: 2,
+                usable_now: None
+            }
+        );
+        inventory.checked_at_unix_ms += 600_002;
+        assert_eq!(saved_reset_counts(&inventory, now).usable_now, None);
+        inventory.checked_at_unix_ms -= 1;
+        inventory.fresh = false;
+        assert_eq!(saved_reset_counts(&inventory, now).usable_now, None);
+
+        let mut account = status_account("saved", 0.5, 0.5, 0.5);
+        account.limit_resets = Some(inventory);
+        let status = PoolRuntimeStatus {
+            pool_id: "default".to_owned(),
+            accounts: vec![account],
+            placement: None,
+        };
+        for output in [
+            render_compact_status_at(&status, false, now),
+            render_verbose_status_at(&status, now),
+        ] {
+            let section = output.split("Saved limit resets").nth(1).expect("section");
+            assert!(section.contains("stale/uncertain"));
+            assert!(section.contains("usable now unknown"));
+            assert!(!section.contains("2 usable now"));
+            assert!(section.contains("last-known banked"));
+        }
+    }
+
+    #[test]
+    fn banked_resets_are_not_necessarily_usable() {
+        let now = OffsetDateTime::parse("2030-01-01T12:00:00Z", &Rfc3339).expect("now");
+        let inventory = reset_inventory(now);
+        assert_eq!(saved_reset_counts(&inventory, now).usable_now, Some(2));
+        let mut variants = Vec::new();
+        let mut paused = inventory.clone();
+        paused.programs[0].grants[0].paused = true;
+        variants.push(paused);
+        let mut future = inventory.clone();
+        future.programs[0].grants[0].starts_at = Some("2030-01-01T13:00:00Z".to_owned());
+        variants.push(future);
+        let mut cooldown = inventory.clone();
+        cooldown.programs[0].cooldown_until = Some("2030-01-01T13:00:00Z".to_owned());
+        variants.push(cooldown);
+        let mut next = inventory.clone();
+        next.programs[0].next_available_at = Some("2030-01-01T13:00:00Z".to_owned());
+        variants.push(next);
+        let mut unavailable = inventory.clone();
+        unavailable.programs[0].grants[0].usable_now = false;
+        variants.push(unavailable);
+        let mut ineligible = inventory;
+        ineligible.programs[0].eligible = false;
+        variants.push(ineligible);
+        for variant in variants {
+            assert_eq!(
+                saved_reset_counts(&variant, now),
+                SavedResetCounts {
+                    banked: 2,
+                    usable_now: Some(0)
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn web_only_resets_stay_actionable_in_both_status_formats() {
+        let now = OffsetDateTime::parse("2030-01-01T12:00:00Z", &Rfc3339).expect("now");
+        let mut inventory = reset_inventory(now);
+        let program = &mut inventory.programs[0];
+        program.eligible = false;
+        program.reason = Some("surface".to_owned());
+        program.cooldown_until = Some("2030-01-01T13:00:00Z".to_owned());
+        program.grants[0].paused = true;
+        program.grants[0].requires_limit = true;
+        let mut account = status_account("web-account", 0.5, 0.5, 0.5);
+        account.limit_resets = Some(inventory);
+        let status = PoolRuntimeStatus {
+            pool_id: "default".to_owned(),
+            accounts: vec![account],
+            placement: None,
+        };
+        for output in [
+            render_compact_status_at(&status, false, now),
+            render_verbose_status_at(&status, now),
+        ] {
+            let section = output.split("Saved limit resets").nth(1).expect("section");
+            assert!(section.contains("2 banked"));
+            assert!(section.contains("0 usable now"));
+            assert!(section.contains("web-only"));
+            assert!(section.contains("Claude web Usage"));
+            assert!(section.contains("https://claude.ai/settings/usage"));
+            assert!(section.contains("correct account"));
+            assert!(section.contains("session (5h)"));
+            assert!(section.contains("weekly (7d)"));
+            assert!(section.contains("2030-01-02T12:00:00Z"));
+            assert!(section.contains("paused"));
+            assert!(section.contains("requires hitting a limit"));
+            assert!(section.contains("cooldown"));
+        }
+    }
+
+    #[test]
+    fn old_daemon_status_without_reset_inventory_is_unknown_not_zero() {
+        let now = OffsetDateTime::parse("2030-01-01T12:00:00Z", &Rfc3339).expect("now");
+        let account = status_account("old", 0.5, 0.5, 0.5);
+        let mut json = serde_json::to_value(account).expect("serialize");
+        json.as_object_mut()
+            .expect("account object")
+            .remove("limit_resets");
+        let account: AccountRuntimeStatus =
+            serde_json::from_value(json).expect("old daemon account");
+        assert!(account.limit_resets.is_none());
+        let status = PoolRuntimeStatus {
+            pool_id: "default".to_owned(),
+            accounts: vec![account],
+            placement: None,
+        };
+        for output in [
+            render_compact_status_at(&status, false, now),
+            render_verbose_status_at(&status, now),
+        ] {
+            let section = output.split("Saved limit resets").nth(1).expect("section");
+            assert!(section.contains("unknown"));
+            assert!(!section.contains("0 banked"));
+            assert!(!section.contains("0 usable now"));
+        }
+        let mut inventory = reset_inventory(now);
+        inventory.programs.clear();
+        assert_eq!(saved_reset_counts(&inventory, now).usable_now, None);
+    }
+
+    #[test]
+    fn fresh_saved_resets_report_banked_and_usable_counts_separately() {
+        let now = OffsetDateTime::parse("2030-01-01T12:00:00Z", &Rfc3339).expect("now");
+        let mut account = status_account("ready", 0.5, 0.5, 0.5);
+        account.limit_resets = Some(reset_inventory(now));
+        let status = PoolRuntimeStatus {
+            pool_id: "default".to_owned(),
+            accounts: vec![account],
+            placement: None,
+        };
+        for output in [
+            render_compact_status_at(&status, false, now),
+            render_verbose_status_at(&status, now),
+        ] {
+            let section = output.split("Saved limit resets").nth(1).expect("section");
+            assert!(section.contains("2 banked"));
+            assert!(section.contains("2 usable now"));
+            assert!(section.contains("Saved session reset"));
+            assert!(section.contains("discretionary"));
+            assert!(section.contains("not scheduled quota renewal"));
+        }
+    }
+
     fn claim(key: &str, scope: ClaimScope, utilization: f64, resets_at: &str) -> LimitClaim {
         LimitClaim {
             key: key.to_owned(),
@@ -1153,6 +1574,7 @@ mod tests {
                 ),
             ],
             extra_usage: rayline_subscriptions::ExtraUsageState::default(),
+            limit_resets: None,
             last_error: None,
         }
     }
@@ -1170,7 +1592,7 @@ mod tests {
         };
 
         let output = render_compact_status(&status, false);
-        assert!(output.contains("Snapshot: standalone allowance"));
+        assert!(output.contains("capacity not measured"));
         assert!(output.contains("5H LEFT"));
         assert!(output.contains("FABLE LEFT"));
         assert!(output.contains("FABLE RESET"));
@@ -1412,12 +1834,176 @@ mod tests {
             stream.write_all(&body).await.expect("write status body");
         });
 
-        let status = live_pool_status_at("default", port)
-            .await
-            .expect("live pool status");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_pool(temp.path(), "default");
+        let (_, pool) = resolve_pool(Some(&config_path), "default").expect("pool");
+        let status = status_snapshot(
+            "default",
+            pool,
+            port,
+            true,
+            SubscriptionRuntimeOptions::default(),
+        )
+        .await
+        .expect("live pool status without local credentials");
         let placement = status.placement.expect("live placement");
         assert_eq!(placement.accounts[0].active_launch_leases, 3);
         assert_eq!(placement.accounts[0].active_model_leases["fable"], 1);
+    }
+
+    #[tokio::test]
+    async fn standalone_expired_status_never_contacts_provider_or_mutates_credentials() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_pool(temp.path(), "default");
+        let credential_path = temp.path().join("source/.credentials.json");
+        let document = serde_json::to_vec(&serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "expired-access",
+                "refreshToken": "expired-refresh",
+                "expiresAt": 1,
+                "scopes": ["user:inference", "user:profile"],
+                "subscriptionType": "max"
+            },
+            "unrelated": {"preserve": true}
+        }))
+        .expect("credential JSON");
+        fs::write(&credential_path, &document).expect("write expired credential");
+        let modified = fs::metadata(&credential_path)
+            .expect("credential metadata")
+            .modified()
+            .expect("credential modification time");
+        let (_, pool) = resolve_pool(Some(&config_path), "default").expect("pool");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider fixture");
+        let address = listener.local_addr().expect("provider address");
+        let endpoint = format!("http://{address}");
+        let token_url = format!("https://{address}/oauth/token");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        // Answer unexpected calls promptly so a regression reports its request
+        // count instead of depending on an external service or hanging.
+        let provider = tokio::spawn(async move {
+            let mut stopped = stopped;
+            let mut requests = Vec::new();
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    accepted = listener.accept() => {
+                        let (mut stream, _) = accepted.expect("accept provider request");
+                        let mut request = [0_u8; 4096];
+                        let count = stream.read(&mut request).await.expect("read provider request");
+                        requests.push(String::from_utf8_lossy(&request[..count]).into_owned());
+                        stream.write_all(http_response("500 Internal Server Error", "{}").as_bytes())
+                            .await.expect("write provider response");
+                    }
+                }
+            }
+            requests
+        });
+        let options = SubscriptionRuntimeOptions {
+            token_url,
+            anthropic_base_url: endpoint,
+            poll_interval: Duration::from_millis(1),
+            near_limit_poll_interval: Duration::from_millis(1),
+            home_dir: Some(temp.path().to_owned()),
+            ..SubscriptionRuntimeOptions::default()
+        };
+        let (port, daemon) = fake_daemon(http_response("404 Not Found", "{}")).await;
+        let snapshot = status_snapshot("default", pool, port, false, options)
+            .await
+            .expect("standalone expired status");
+        assert!(
+            daemon
+                .await
+                .expect("daemon request")
+                .starts_with("GET /v1/subscriptions/status ")
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        stop.send(()).expect("stop provider fixture");
+        assert!(
+            provider.await.expect("provider fixture").is_empty(),
+            "standalone status must perform zero OAuth grants and zero usage polls"
+        );
+        assert_eq!(
+            fs::read(&credential_path).expect("read credential"),
+            document
+        );
+        assert_eq!(
+            fs::metadata(&credential_path)
+                .expect("credential metadata")
+                .modified()
+                .expect("modification time"),
+            modified
+        );
+        assert!(!temp.path().join("control/.credentials.json").exists());
+        assert!(snapshot.placement.is_none());
+        assert!(snapshot.accounts[0].claims.is_empty());
+        assert!(!snapshot.accounts[0].usage_snapshot_fresh);
+        assert!(!snapshot.accounts[0].complete_global_snapshot);
+        assert!(snapshot.accounts[0].limit_resets.is_none());
+        assert_eq!(
+            snapshot.accounts[0].credential_health,
+            CredentialHealth::Unavailable
+        );
+        let compact = render_compact_status(&snapshot, false);
+        assert!(compact.contains("capacity not measured"));
+        assert!(compact.contains("credential unavailable"));
+        assert!(!compact.contains("100%"));
+        let verbose = render_verbose_status(&snapshot);
+        assert!(verbose.contains("unknown (not measured)"));
+        assert!(verbose.contains("expired"));
+        for output in [&compact, &verbose] {
+            let section = output.split("Saved limit resets").nth(1).expect("section");
+            assert!(section.contains("unknown"));
+            assert!(!section.contains("0 banked"));
+            assert!(!section.contains("0 usable now"));
+        }
+    }
+
+    #[tokio::test]
+    async fn live_only_status_does_not_load_local_credentials_without_a_daemon() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = registry_with_pool(temp.path(), "default");
+        let (_, pool) = resolve_pool(Some(&config_path), "default").expect("pool");
+        let (port, daemon) = fake_daemon(http_response("404 Not Found", "{}")).await;
+        let error = status_snapshot(
+            "default",
+            pool,
+            port,
+            true,
+            SubscriptionRuntimeOptions::default(),
+        )
+        .await
+        .expect_err("live-only requires a running daemon");
+        assert!(error.contains("has no running daemon"));
+        assert!(
+            daemon
+                .await
+                .expect("daemon request")
+                .starts_with("GET /v1/subscriptions/status ")
+        );
+        assert!(!temp.path().join("source/.credentials.json").exists());
+        assert!(!temp.path().join("control/.credentials.json").exists());
+    }
+
+    #[test]
+    fn unknown_and_stale_capacity_are_not_presented_as_fresh_measurements() {
+        let mut account = status_account("a", 0.25, 0.5, 0.75);
+        account.usage_snapshot_fresh = false;
+        let stale = limit_status_cell(account.claims.first(), "?", false);
+        assert_eq!(stale.text, "75% stale");
+        account.usage_snapshot_fresh = true;
+        account.claims[0].utilization = None;
+        let row = compact_status_row(&account, None, OffsetDateTime::now_utc());
+        assert_eq!(row.five_hour.text, "?");
+        assert_eq!(row.availability.text, "usage unknown");
+        account.claims.clear();
+        let row = compact_status_row(&account, None, OffsetDateTime::now_utc());
+        assert_eq!(row.five_hour.text, "?");
+        assert_eq!(row.seven_day.text, "?");
+        assert_eq!(row.availability.text, "usage unknown");
     }
 
     /// A registry with one pool, pointing at directories that hold no

@@ -47,6 +47,7 @@ fn select(
         &SelectionRequest {
             model: ModelFamily::from_requested_model(model),
             affinity_account_id: affinity_account_id.map(str::to_owned),
+            affinity_warm: true,
             launch_id: "policy-test-launch".to_owned(),
             placement_loads: BTreeMap::new(),
         },
@@ -162,9 +163,19 @@ fn soft_threshold_does_not_strand_remaining_capacity() {
     ];
 
     assert_eq!(
-        select(&accounts, "sonnet", Some("a"))
-            .selected_account_id
-            .as_deref(),
+        select_account(
+            &accounts,
+            &SelectionRequest {
+                model: ModelFamily::from_requested_model("sonnet"),
+                affinity_account_id: Some("a".to_owned()),
+                affinity_warm: false,
+                launch_id: "cold-launch".to_owned(),
+                placement_loads: BTreeMap::new(),
+            },
+            &PoolPolicy::default()
+        )
+        .selected_account_id
+        .as_deref(),
         Some("b")
     );
 }
@@ -336,5 +347,136 @@ fn successful_response_is_never_reclassified_from_an_error_shaped_body() {
     assert_eq!(
         classify_response(200, &HeaderSnapshot::new(), Some(&body)),
         ResponseClassification::Success
+    );
+}
+
+fn capacity_account(id: &str, used: f64) -> AccountLimitState {
+    AccountLimitState::from_usage(
+        id,
+        NormalizedUsage {
+            claims: vec![claim("five_hour", ClaimScope::Global, used)],
+            extra_usage: ExtraUsageState::default(),
+            complete_global_snapshot: true,
+        },
+    )
+}
+
+fn placement_choice(
+    accounts: &[AccountLimitState],
+    warm: bool,
+    policy: &PoolPolicy,
+) -> Option<String> {
+    select_account(
+        accounts,
+        &SelectionRequest {
+            model: ModelFamily::from_requested_model("sonnet"),
+            affinity_account_id: Some("a".to_owned()),
+            affinity_warm: warm,
+            launch_id: "reliable-launch".to_owned(),
+            placement_loads: BTreeMap::new(),
+        },
+        policy,
+    )
+    .selected_account_id
+}
+
+#[test]
+fn warmth_preserves_reserve_band_but_cold_launch_uses_admission() {
+    let accounts = [capacity_account("a", 0.93), capacity_account("b", 0.20)];
+    assert_eq!(
+        placement_choice(&accounts, true, &PoolPolicy::default()).as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        placement_choice(&accounts, false, &PoolPolicy::default()).as_deref(),
+        Some("b")
+    );
+}
+
+#[test]
+fn migration_requires_configured_headroom_advantage() {
+    let policy = PoolPolicy::default();
+    let small = [capacity_account("a", 0.96), capacity_account("b", 0.93)];
+    assert_eq!(
+        placement_choice(&small, true, &policy).as_deref(),
+        Some("a")
+    );
+    let sufficient = [capacity_account("a", 0.96), capacity_account("b", 0.90)];
+    assert_eq!(
+        placement_choice(&sufficient, true, &policy).as_deref(),
+        Some("b")
+    );
+    let custom = PoolPolicy {
+        migration_advantage_percent: 10.0,
+        ..policy
+    };
+    assert_eq!(
+        placement_choice(&sufficient, true, &custom).as_deref(),
+        Some("a")
+    );
+}
+
+#[test]
+fn warm_affinity_never_overrides_hard_or_billing_constraints() {
+    let mut accounts = [capacity_account("a", 1.0), capacity_account("b", 0.98)];
+    assert_eq!(
+        placement_choice(&accounts, true, &PoolPolicy::default()).as_deref(),
+        Some("b")
+    );
+    accounts[0] = capacity_account("a", 0.20);
+    accounts[0].extra_usage.in_use = Some(true);
+    assert_eq!(
+        placement_choice(&accounts, true, &PoolPolicy::default()).as_deref(),
+        Some("b")
+    );
+}
+
+#[test]
+fn stale_warm_affinity_does_not_gain_numeric_ranking_capacity() {
+    let mut accounts = [capacity_account("a", 0.93), capacity_account("b", 0.20)];
+    accounts[0].usage_snapshot_fresh = false;
+    let request = SelectionRequest {
+        model: ModelFamily::from_requested_model("sonnet"),
+        affinity_account_id: Some("a".to_owned()),
+        affinity_warm: true,
+        launch_id: "stale-launch".to_owned(),
+        placement_loads: BTreeMap::new(),
+    };
+    let decision = select_account(&accounts, &request, &PoolPolicy::default());
+    assert_eq!(decision.selected_account_id.as_deref(), Some("a"));
+    assert_eq!(decision.evaluations[0].effective_headroom, None);
+    assert_eq!(decision.evaluations[0].placement_score, None);
+    assert_eq!(
+        placement_choice(&accounts, false, &PoolPolicy::default()).as_deref(),
+        Some("b")
+    );
+}
+
+#[test]
+fn refreshing_account_remains_selectable_for_owned_refresh_wait() {
+    let mut accounts = [capacity_account("a", 0.2)];
+    accounts[0].credential_health = rayline_subscriptions::CredentialHealth::Refreshing;
+    assert_eq!(
+        placement_choice(&accounts, true, &PoolPolicy::default()).as_deref(),
+        Some("a")
+    );
+    accounts[0].claims[0].utilization = Some(1.0);
+    assert_eq!(
+        placement_choice(&accounts, true, &PoolPolicy::default()),
+        None
+    );
+}
+
+#[test]
+fn existing_high_admission_config_preserves_usable_warm_reserve() {
+    let policy: PoolPolicy = serde_json::from_str(r#"{"switch_at_percent":98}"#).expect("policy");
+    let accounts = [capacity_account("a", 0.97), capacity_account("b", 0.20)];
+    assert_eq!(
+        placement_choice(&accounts, true, &policy).as_deref(),
+        Some("a")
+    );
+    assert_eq!(
+        placement_choice(&accounts, false, &policy).as_deref(),
+        Some("b")
     );
 }

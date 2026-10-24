@@ -3,13 +3,6 @@ import XCTest
 @testable import RaylineStatusCore
 
 final class SubscriptionStatusTests: XCTestCase {
-  func testClientUsesTheNonCredentialFallbackStatusMode() {
-    XCTAssertEqual(
-      RaylineStatusClient.arguments(poolID: "work"),
-      ["subscriptions", "status", "--pool", "work", "--json", "--live-only"]
-    )
-  }
-
   func testDecodesLiveStatusAndBuildsAccountPresentation() throws {
     let status = try JSONDecoder().decode(PoolRuntimeStatus.self, from: Data(fixture.utf8))
     let now = try XCTUnwrap(ResetTimestamp.parse("2030-01-01T12:00:00Z"))
@@ -251,7 +244,8 @@ final class SubscriptionStatusTests: XCTestCase {
           usageSnapshotFresh: true,
           completeGlobalSnapshot: true,
           claims: [claim(near.0, near.1), claim(far.0, far.1)],
-          lastError: nil
+          lastError: nil,
+          limitResets: nil
         )
       ],
       placement: nil

@@ -77,7 +77,78 @@ async fn quarantined_account_never_retries_a_dead_refresh_token() {
         "an unchanged credential source must not reach the OAuth endpoint again"
     );
 }
+#[tokio::test]
+async fn selecting_never_downgrades_or_retries_quarantine() {
+    let pool = start_pool_with_a_quarantined_account().await;
+    let attempts = pool.token.request_count();
+    let excluded = std::collections::HashSet::from(["healthy".to_owned()]);
+    assert!(
+        pool.runtime
+            .select("launch", "sonnet", &excluded)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        pool.account("broken").credential_health,
+        CredentialHealth::Quarantined
+    );
+    assert_eq!(pool.token.request_count(), attempts);
+    write_credential(&pool.broken_dir, "token-restored", FRESH_EXPIRY_MS);
+    let selected = pool
+        .runtime
+        .select("launch", "sonnet", &excluded)
+        .await
+        .expect("adopt signed-in profile");
+    assert_eq!(selected.account_id, "broken");
+    assert_eq!(selected.access_token.expose(), "token-restored");
+    assert_eq!(pool.token.request_count(), attempts);
+}
 
+#[tokio::test]
+async fn unavailable_account_adopts_replaced_source_during_selection() {
+    let pool = start_pool_with_a_quarantined_account().await;
+    pool.runtime
+        .mark_credential_unavailable("healthy", "auth rejected")
+        .expect("mark unavailable");
+    write_credential(&pool.healthy_dir, "token-new-signin", FRESH_EXPIRY_MS);
+    let selected = pool
+        .runtime
+        .select("launch", "sonnet", &Default::default())
+        .await
+        .expect("adoption");
+    assert_eq!(selected.account_id, "healthy");
+    assert_eq!(selected.access_token.expose(), "token-new-signin");
+}
+
+#[tokio::test]
+async fn oauth_metadata_changes_do_not_resurrect_a_rejected_refresh_grant() {
+    let pool = start_pool_with_a_quarantined_account().await;
+    let attempts = pool.token.request_count();
+    let path = pool.broken_dir.join(".credentials.json");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("credential")).expect("json");
+    document["claudeAiOauth"]["subscriptionType"] = "new-tier".into();
+    document["claudeAiOauth"]["rateLimitTier"] = "higher".into();
+    document["claudeAiOauth"]["scopes"] =
+        serde_json::json!(["user:inference", "user:profile", "user:sessions"]);
+    std::fs::write(&path, serde_json::to_vec(&document).expect("updated json"))
+        .expect("metadata edit");
+    pool.runtime.reload_credentials().await;
+    pool.runtime.refresh_all_usage().await;
+    let excluded = std::collections::HashSet::from(["healthy".to_owned()]);
+    assert!(
+        pool.runtime
+            .select("launch", "sonnet", &excluded)
+            .await
+            .is_err()
+    );
+    assert!(pool.runtime.force_refresh("broken").await.is_err());
+    assert_eq!(
+        pool.account("broken").credential_health,
+        CredentialHealth::Quarantined
+    );
+    assert_eq!(pool.token.request_count(), attempts);
+}
 #[tokio::test]
 async fn reload_credentials_reports_an_unchanged_credential_source() {
     let pool = start_pool_with_a_quarantined_account().await;
@@ -364,8 +435,14 @@ async fn serve_one<S>(mut stream: S, response: String, requests: Arc<AtomicUsize
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    if read_request(&mut stream).await {
-        requests.fetch_add(1, Ordering::SeqCst);
+    if let Some(request) = read_request(&mut stream).await {
+        let discovery = request.starts_with(b"GET /api/oauth/usage?");
+        let response = if discovery {
+            http_response("200 OK", r#"{"cedar_ember":null,"juniper_tide":null}"#)
+        } else {
+            requests.fetch_add(1, Ordering::SeqCst);
+            response
+        };
         let _ = stream.write_all(response.as_bytes()).await;
         let _ = stream.flush().await;
     }
@@ -374,18 +451,18 @@ where
 
 /// Reads one whole request before replying, so the client never sees a closed
 /// socket while it is still writing its body.
-async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> bool {
+async fn read_request<S: AsyncRead + Unpin>(stream: &mut S) -> Option<Vec<u8>> {
     let mut request = Vec::new();
     let mut chunk = [0_u8; 4096];
     loop {
         match stream.read(&mut chunk).await {
-            Ok(0) | Err(_) => return false,
+            Ok(0) | Err(_) => return None,
             Ok(read) => request.extend_from_slice(&chunk[..read]),
         }
         if let Some(head_length) = head_length(&request)
             && request.len() >= head_length + content_length(&request[..head_length])
         {
-            return true;
+            return Some(request);
         }
     }
 }

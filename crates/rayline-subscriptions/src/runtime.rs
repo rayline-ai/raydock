@@ -1,6 +1,6 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -10,20 +10,23 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 use crate::oauth::unix_now_ms;
+use crate::persistence::{AccountBlocks, BlockStore, StoreAccount};
+use crate::placement::{AffinityKey, PlacementReservation, PlacementState};
+use crate::resets::{LimitResetProgram, LimitResetStatus, PROGRAMS, parse_program};
+use crate::routing_state::{ObservationToken, RoutingState};
 use crate::{
-    AccountLimitState, AccountPlacementLoad, CredentialDocument, CredentialError, CredentialHealth,
-    CredentialStore, Entitlement, ExtraUsageState, HeaderSnapshot, LimitClaim, ModelFamily,
-    OAuthRefreshClient, OAuthRefreshError, PoolPolicy, SESSION_STATUS_SCHEMA, SecretString,
-    SelectionRequest, SessionAssignmentKind, SessionAssignmentReason, SessionAssignmentStatus,
-    SessionCapacityStatus, SessionLimitStatus, SessionPlacementStatus, SessionStatusSnapshot,
-    SubscriptionPoolConfig, UsageSnapshot, describe_ineligibility, normalize_unified_extra_usage,
+    AccountLimitState, CredentialDocument, CredentialError, CredentialHealth, CredentialStore,
+    ExtraUsageState, HeaderSnapshot, LimitClaim, ModelFamily, OAuthRefreshClient,
+    OAuthRefreshError, PoolPolicy, SESSION_STATUS_SCHEMA, SecretString, SelectionRequest,
+    SessionAssignmentKind, SessionAssignmentReason, SessionAssignmentStatus, SessionCapacityStatus,
+    SessionLimitStatus, SessionPlacementStatus, SessionStatusSnapshot, SubscriptionPoolConfig,
+    UsageSnapshot, describe_ineligibility, normalize_unified_extra_usage,
     normalize_unified_headers, select_account,
 };
 
 const DEFAULT_USAGE_PATH: &str = "/api/oauth/usage";
 const USAGE_BETA: &str = "oauth-2025-04-20";
 const MAX_USAGE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_AFFINITY_ENTRIES: usize = 4096;
 const DEFAULT_ACTIVE_LEASE_TTL: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Clone, Debug)]
@@ -38,6 +41,12 @@ pub struct SubscriptionRuntimeOptions {
     pub active_lease_ttl: Duration,
     pub trusted_ca_pem: Option<Vec<u8>>,
     pub home_dir: Option<PathBuf>,
+    pub read_only: bool,
+    /// Opt into a one-shot usage GET with existing, unexpired credentials.
+    /// Only applies to read-only runtimes; never rotates or persists tokens.
+    pub poll_usage_read_only: bool,
+    pub state_dir: Option<PathBuf>,
+    pub recovery_backoff: Duration,
 }
 
 impl Default for SubscriptionRuntimeOptions {
@@ -53,6 +62,10 @@ impl Default for SubscriptionRuntimeOptions {
             active_lease_ttl: DEFAULT_ACTIVE_LEASE_TTL,
             trusted_ca_pem: None,
             home_dir: std::env::var_os("HOME").map(PathBuf::from),
+            read_only: false,
+            poll_usage_read_only: false,
+            state_dir: None,
+            recovery_backoff: Duration::from_secs(60),
         }
     }
 }
@@ -61,7 +74,10 @@ pub struct SubscriptionPoolRuntime {
     pool_id: String,
     policy: PoolPolicy,
     accounts: Vec<Arc<AccountWorker>>,
-    placement: Mutex<PlacementState>,
+    placement: Arc<Mutex<PlacementState>>,
+    read_only: bool,
+    block_store: Option<Arc<BlockStore>>,
+    persistence_gate: Arc<tokio::sync::Mutex<()>>,
     monitor_started: AtomicBool,
     poll_interval: Duration,
     near_limit_poll_interval: Duration,
@@ -116,15 +132,53 @@ impl SubscriptionPoolRuntime {
                 http.clone(),
                 refresh_client.clone(),
                 usage_url.clone(),
-                refresh_margin_ms,
+                WorkerRecoveryOptions {
+                    refresh_margin_ms,
+                    read_only: options.read_only,
+                    recovery_backoff: options.recovery_backoff,
+                },
             )));
         }
 
-        let runtime = Arc::new(Self {
+        let control_dir = config.control_config_dir.clone();
+        let control_identity = tokio::task::spawn_blocking(move || {
+            std::fs::canonicalize(&control_dir).unwrap_or(control_dir)
+        })
+        .await
+        .map_err(SubscriptionRuntimeError::BackgroundTask)?;
+        let pool_identity = format!(
+            "{}|{}|{}",
             pool_id,
+            control_identity.to_string_lossy(),
+            serde_json::to_string(&config.policy).map_err(|_| {
+                SubscriptionRuntimeError::RecoveryState("invalid pool identity".to_owned())
+            })?
+        );
+        let runtime = Arc::new(Self {
+            pool_id: pool_id.clone(),
             policy: config.policy,
             accounts,
-            placement: Mutex::new(PlacementState::default()),
+            placement: Arc::new(Mutex::new(PlacementState::default())),
+            read_only: options.read_only,
+            block_store: match options.state_dir {
+                Some(path) => {
+                    if options.read_only {
+                        None
+                    } else {
+                        let identity = pool_identity;
+                        Some(Arc::new(
+                            tokio::task::spawn_blocking(move || BlockStore::new(path, &identity))
+                                .await
+                                .map_err(SubscriptionRuntimeError::BackgroundTask)?
+                                .map_err(|error| {
+                                    SubscriptionRuntimeError::RecoveryState(error.to_string())
+                                })?,
+                        ))
+                    }
+                }
+                None => None,
+            },
+            persistence_gate: Arc::new(tokio::sync::Mutex::new(())),
             monitor_started: AtomicBool::new(false),
             poll_interval: options.poll_interval,
             near_limit_poll_interval: options.near_limit_poll_interval,
@@ -134,17 +188,19 @@ impl SubscriptionPoolRuntime {
             .await
             .into_iter()
             .for_each(drop);
-        runtime.refresh_all_usage().await;
-
-        if !runtime
-            .accounts
-            .iter()
-            .any(|account| account.state().credential_health == CredentialHealth::Healthy)
-        {
-            return Err(SubscriptionRuntimeError::NoUsableCredentials {
-                pool: runtime.pool_id.clone(),
-            });
+        runtime.restore_blocks().await;
+        if !runtime.read_only {
+            runtime.refresh_all_usage().await;
+        } else if options.poll_usage_read_only {
+            join_all(
+                runtime
+                    .accounts
+                    .iter()
+                    .map(|account| account.refresh_usage()),
+            )
+            .await;
         }
+
         Ok(runtime)
     }
 
@@ -157,7 +213,7 @@ impl SubscriptionPoolRuntime {
     }
 
     pub fn spawn_monitor(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
-        if self.monitor_started.swap(true, Ordering::SeqCst) {
+        if self.read_only || self.monitor_started.swap(true, Ordering::SeqCst) {
             return None;
         }
         let runtime = Arc::clone(self);
@@ -175,7 +231,15 @@ impl SubscriptionPoolRuntime {
     }
 
     pub async fn refresh_all_usage(&self) {
+        if self.read_only {
+            return;
+        }
         join_all(self.accounts.iter().map(|account| account.refresh_usage())).await;
+        if let Err(error) = self.flush_recovery_state().await {
+            for account in &self.accounts {
+                account.set_last_error(error.to_string());
+            }
+        }
     }
 
     /// Re-reads every credential source, so a profile the user signed in to
@@ -206,6 +270,31 @@ impl SubscriptionPoolRuntime {
             model: model.clone(),
         };
         let mut excluded = excluded_accounts.clone();
+        if self.read_only {
+            return Err(SubscriptionRuntimeError::ReadOnly);
+        }
+        join_all(
+            self.accounts
+                .iter()
+                .filter(|account| {
+                    matches!(
+                        account.state().credential_health,
+                        CredentialHealth::Unavailable | CredentialHealth::Quarantined
+                    )
+                })
+                .map(|account| account.reload_credential()),
+        )
+        .await;
+        join_all(
+            self.accounts
+                .iter()
+                .filter(|account| {
+                    !excluded.contains(&account.id)
+                        && account.persistence_pending.load(Ordering::SeqCst)
+                })
+                .map(|account| account.access_token(false)),
+        )
+        .await;
 
         loop {
             let states = self
@@ -214,15 +303,23 @@ impl SubscriptionPoolRuntime {
                 .map(|account| account.state())
                 .filter(|state| !excluded.contains(&state.account_id))
                 .collect::<Vec<_>>();
-            if !states
-                .iter()
-                .any(|state| state.credential_health == CredentialHealth::Healthy)
-            {
+            if !states.iter().any(|state| {
+                matches!(
+                    state.credential_health,
+                    CredentialHealth::Healthy | CredentialHealth::Refreshing
+                )
+            }) {
                 return Err(SubscriptionRuntimeError::NoUsableCredentials {
                     pool: self.pool_id.clone(),
                 });
             }
-            let (account_id, placement_score, active_global_leases, active_model_leases) = {
+            let (
+                account_id,
+                placement_score,
+                active_global_leases,
+                active_model_leases,
+                reservation,
+            ) = {
                 let now = Instant::now();
                 let mut placement = self
                     .placement
@@ -233,6 +330,21 @@ impl SubscriptionPoolRuntime {
                     .preferred_account(&key)
                     .filter(|account| !excluded.contains(*account))
                     .map(ToOwned::to_owned);
+                let affinity_warm = placement.affinity_warm(
+                    &key,
+                    now,
+                    Duration::from_secs(self.policy.sticky_warm_seconds),
+                ) && affinity_account_id
+                    .as_deref()
+                    .and_then(|id| self.account(id))
+                    .is_some_and(|account| {
+                        account
+                            .state
+                            .read()
+                            .expect("state lock poisoned")
+                            .snapshot_for_affinity(state_now_ms())
+                            .usage_snapshot_fresh
+                    });
                 let placement_loads = placement.loads_for(&key);
                 let decision = select_account(
                     &states,
@@ -240,11 +352,30 @@ impl SubscriptionPoolRuntime {
                         model: model.clone(),
                         affinity_account_id,
                         launch_id: launch_id.to_owned(),
+                        affinity_warm,
                         placement_loads,
                     },
                     &self.policy,
                 );
-                let Some(account_id) = decision.selected_account_id else {
+                let candidate = decision.selected_account_id.clone().or_else(|| {
+                    states
+                        .iter()
+                        .find(|state| {
+                            matches!(
+                                state.credential_health,
+                                CredentialHealth::Healthy | CredentialHealth::Refreshing
+                            ) && state.extra_usage.in_use != Some(true)
+                                && self.account(&state.account_id).is_some_and(|account| {
+                                    account
+                                        .state
+                                        .read()
+                                        .expect("state lock poisoned")
+                                        .probe_due(&model, state_now_ms())
+                                })
+                        })
+                        .map(|state| state.account_id.clone())
+                });
+                let Some(account_id) = candidate else {
                     return Err(SubscriptionRuntimeError::NoEligibleAccount {
                         pool: self.pool_id.clone(),
                         model: model.to_string(),
@@ -262,24 +393,36 @@ impl SubscriptionPoolRuntime {
                 let active_model_leases = evaluation
                     .map(|evaluation| evaluation.active_model_leases)
                     .unwrap_or_default();
-                placement.reserve(key.clone(), account_id.clone(), now);
+                let ticket = placement.reserve(key.clone(), account_id.clone(), now);
+                let reservation = PlacementReservation::new(Arc::clone(&self.placement), ticket);
                 (
                     account_id,
                     placement_score,
                     active_global_leases,
                     active_model_leases,
+                    reservation,
                 )
             };
             let worker = self
                 .account(&account_id)
                 .ok_or_else(|| SubscriptionRuntimeError::UnknownAccount(account_id.clone()))?;
+            let probe_id = worker
+                .state
+                .write()
+                .expect("state lock poisoned")
+                .reserve_probe(&model, state_now_ms());
+            let Some(probe_id) = probe_id else {
+                drop(reservation);
+                excluded.insert(account_id);
+                continue;
+            };
+            let probe = ProbeGuard {
+                worker: Arc::clone(worker),
+                id: probe_id,
+            };
             match worker.access_token(false).await {
                 Ok(access_token) => {
-                    let assignment_reason = self
-                        .placement
-                        .lock()
-                        .expect("subscription placement lock poisoned")
-                        .commit(key, account_id.clone(), Instant::now());
+                    let assignment_reason = reservation.assignment_reason();
                     return Ok(SelectedSubscription {
                         account_id,
                         access_token,
@@ -288,15 +431,13 @@ impl SubscriptionPoolRuntime {
                         placement_score,
                         active_global_leases,
                         active_model_leases,
+                        reservation: Some(reservation),
+                        _probe: Some(probe),
                     });
                 }
                 Err(error) => {
-                    self.placement
-                        .lock()
-                        .expect("subscription placement lock poisoned")
-                        .rollback_provisional(&key, &account_id);
+                    drop(reservation);
                     worker.set_last_error(error.to_string());
-                    worker.set_credential_health(CredentialHealth::Unavailable);
                     excluded.insert(account_id);
                 }
             }
@@ -324,11 +465,169 @@ impl SubscriptionPoolRuntime {
             .await
     }
 
-    pub fn observe_response_headers(
+    pub fn begin_observation(
+        &self,
+        account_id: &str,
+    ) -> Result<ObservationToken, SubscriptionRuntimeError> {
+        Ok(self
+            .account(account_id)
+            .ok_or_else(|| SubscriptionRuntimeError::UnknownAccount(account_id.to_owned()))?
+            .begin_observation())
+    }
+
+    pub async fn record_quota_rejection(
         &self,
         account_id: &str,
         requested_model: &str,
         headers: &HeaderSnapshot,
+        observation: ObservationToken,
+    ) -> Result<(), SubscriptionRuntimeError> {
+        let account = self
+            .account(account_id)
+            .ok_or_else(|| SubscriptionRuntimeError::UnknownAccount(account_id.to_owned()))?;
+        account
+            .state
+            .write()
+            .expect("state lock poisoned")
+            .reject_quota(
+                &ModelFamily::from_requested_model(requested_model),
+                headers,
+                observation,
+                state_now_ms(),
+            );
+        self.flush_recovery_state().await
+    }
+
+    pub async fn corroborate_credential_rejection(
+        &self,
+        account_id: &str,
+        rejected: &SecretString,
+    ) -> Result<bool, SubscriptionRuntimeError> {
+        let account = self
+            .account(account_id)
+            .ok_or_else(|| SubscriptionRuntimeError::UnknownAccount(account_id.to_owned()))?;
+        let corroborated = account.corroborate_credential_rejection(rejected).await;
+        if corroborated {
+            self.flush_recovery_state().await?;
+        }
+        Ok(corroborated)
+    }
+
+    async fn restore_blocks(&self) {
+        let Some(store) = &self.block_store else {
+            return;
+        };
+        let store = Arc::clone(store);
+        let identities = self
+            .accounts
+            .iter()
+            .map(|account| StoreAccount {
+                account_id: account.id.clone(),
+                source_identity: account.store.config_dir().to_string_lossy().into_owned(),
+            })
+            .collect::<Vec<_>>();
+        match tokio::task::spawn_blocking(move || store.load(&identities, state_now_ms())).await {
+            Ok(Ok(restored)) => {
+                for record in restored {
+                    if let Some(account) = self.account(&record.account_id) {
+                        account
+                            .state
+                            .write()
+                            .expect("state lock poisoned")
+                            .restore_blocks(
+                                record.blocks,
+                                account.generation.load(Ordering::SeqCst),
+                                state_now_ms(),
+                            );
+                    }
+                }
+            }
+            _ => {
+                for account in &self.accounts {
+                    account.set_last_error(
+                        "recovery state could not be restored; allowance requires reconciliation"
+                            .to_owned(),
+                    );
+                    account
+                        .state
+                        .write()
+                        .expect("state lock poisoned")
+                        .mark_recovery_dirty();
+                }
+            }
+        }
+    }
+
+    /// Waits for a complete recovery snapshot write (for orderly shutdown).
+    pub async fn flush_recovery_state(&self) -> Result<(), SubscriptionRuntimeError> {
+        if self.read_only {
+            return Ok(());
+        }
+        let Some(store) = &self.block_store else {
+            return Ok(());
+        };
+        if !self
+            .accounts
+            .iter()
+            .any(|account| account.recovery_needs_persistence())
+        {
+            return Ok(());
+        }
+        let store = Arc::clone(store);
+        let gate = Arc::clone(&self.persistence_gate);
+        let accounts = self.accounts.clone();
+        // Owned writer keeps ordering even when the requesting future is cancelled.
+        tokio::spawn(async move {
+            let _guard = gate.lock_owned().await;
+            if !accounts
+                .iter()
+                .any(|account| account.recovery_needs_persistence())
+            {
+                return Ok(());
+            }
+            let mut revisions = Vec::with_capacity(accounts.len());
+            let records = accounts
+                .iter()
+                .map(|account| {
+                    let state = account.state.read().expect("state lock poisoned");
+                    revisions.push(state.recovery_revision());
+                    AccountBlocks {
+                        account_id: account.id.clone(),
+                        source_identity: account.store.config_dir().to_string_lossy().into_owned(),
+                        blocks: state.export_blocks(),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let result = tokio::task::spawn_blocking(move || store.save(&records))
+                .await
+                .map_err(SubscriptionRuntimeError::BackgroundTask)
+                .and_then(|saved| {
+                    saved
+                        .map_err(|error| SubscriptionRuntimeError::RecoveryState(error.to_string()))
+                });
+            if let Err(error) = &result {
+                for account in &accounts {
+                    account.set_last_error(error.to_string());
+                }
+            }
+            if result.is_ok() {
+                for (account, revision) in accounts.iter().zip(revisions) {
+                    account
+                        .durable_recovery_revision
+                        .store(revision, Ordering::SeqCst);
+                }
+            }
+            result
+        })
+        .await
+        .map_err(SubscriptionRuntimeError::BackgroundTask)?
+    }
+    pub async fn observe_response_headers(
+        &self,
+        account_id: &str,
+        requested_model: &str,
+        headers: &HeaderSnapshot,
+        observation: ObservationToken,
     ) -> Result<(), SubscriptionRuntimeError> {
         let account = self
             .account(account_id)
@@ -336,23 +635,36 @@ impl SubscriptionPoolRuntime {
         let model = ModelFamily::from_requested_model(requested_model);
         let claims = normalize_unified_headers(headers, Some(&model));
         let extra_usage = normalize_unified_extra_usage(headers);
-        account.apply_response_observation(claims, extra_usage);
-        Ok(())
+        {
+            let mut state = account
+                .state
+                .write()
+                .expect("subscription state lock poisoned");
+            state.observe_response(claims, extra_usage, observation, state_now_ms());
+            state.confirm_success(&model, observation, state_now_ms());
+        }
+        self.flush_recovery_state().await
     }
 
-    pub fn mark_entitlement_unavailable(
+    pub async fn mark_entitlement_unavailable(
         &self,
         account_id: &str,
         requested_model: &str,
+        observation: ObservationToken,
     ) -> Result<(), SubscriptionRuntimeError> {
         let account = self
             .account(account_id)
             .ok_or_else(|| SubscriptionRuntimeError::UnknownAccount(account_id.to_owned()))?;
-        account.set_entitlement(
-            ModelFamily::from_requested_model(requested_model),
-            Entitlement::Unavailable,
-        );
-        Ok(())
+        account
+            .state
+            .write()
+            .expect("subscription state lock poisoned")
+            .reject_entitlement(
+                &ModelFamily::from_requested_model(requested_model),
+                observation,
+                state_now_ms(),
+            );
+        self.flush_recovery_state().await
     }
 
     pub fn mark_credential_unavailable(
@@ -424,6 +736,7 @@ impl SubscriptionPoolRuntime {
                     model: model.clone(),
                     affinity_account_id: None,
                     launch_id: launch_id.to_owned(),
+                    affinity_warm: false,
                     placement_loads: placement.loads_for(&key),
                 },
                 &self.policy,
@@ -595,8 +908,20 @@ pub struct SelectedSubscription {
     pub placement_score: Option<f64>,
     pub active_global_leases: usize,
     pub active_model_leases: usize,
+    reservation: Option<PlacementReservation>,
+    _probe: Option<ProbeGuard>,
 }
 
+impl SelectedSubscription {
+    pub fn accept(&mut self) {
+        if let Some(reservation) = &mut self.reservation {
+            if let Some(reason) = reservation.accept(Instant::now()) {
+                self.assignment_reason = reason;
+            }
+        }
+        // The probe lives through response observation, which may occur after acceptance.
+    }
+}
 impl std::fmt::Debug for SelectedSubscription {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -629,6 +954,8 @@ pub struct AccountRuntimeStatus {
     pub complete_global_snapshot: bool,
     pub claims: Vec<LimitClaim>,
     pub extra_usage: ExtraUsageState,
+    #[serde(default)]
+    pub limit_resets: Option<LimitResetStatus>,
     pub last_error: Option<String>,
 }
 
@@ -665,16 +992,36 @@ struct AccountWorker {
     id: String,
     store: CredentialStore,
     credential: Mutex<Option<CredentialDocument>>,
-    refresh_gate: Semaphore,
-    state: RwLock<AccountLimitState>,
+    rejected_refresh_grant: Mutex<Option<SecretString>>,
+    refresh_gate: Arc<Semaphore>,
+    state: RwLock<RoutingState>,
+    generation: AtomicU64,
+    durable_recovery_revision: AtomicU64,
+    persistence_pending: AtomicBool,
+    retry_after: Mutex<Option<Instant>>,
     subscription_type: RwLock<Option<String>>,
+    limit_resets: Mutex<ResetCache>,
     last_error: RwLock<Option<String>>,
     http: reqwest::Client,
     refresh_client: OAuthRefreshClient,
     usage_url: String,
     refresh_margin_ms: i64,
+    read_only: bool,
+    recovery_backoff: Duration,
 }
 
+#[derive(Default)]
+struct ResetCache {
+    generation: u64,
+    sequence: u64,
+    inventory: Option<LimitResetStatus>,
+}
+
+struct WorkerRecoveryOptions {
+    refresh_margin_ms: i64,
+    read_only: bool,
+    recovery_backoff: Duration,
+}
 impl AccountWorker {
     fn new(
         id: String,
@@ -682,20 +1029,28 @@ impl AccountWorker {
         http: reqwest::Client,
         refresh_client: OAuthRefreshClient,
         usage_url: String,
-        refresh_margin_ms: i64,
+        options: WorkerRecoveryOptions,
     ) -> Self {
         Self {
-            state: RwLock::new(AccountLimitState::unknown(id.clone())),
+            state: RwLock::new(RoutingState::unknown(id.clone())),
             id,
             store,
             credential: Mutex::new(None),
-            refresh_gate: Semaphore::new(1),
+            refresh_gate: Arc::new(Semaphore::new(1)),
+            rejected_refresh_grant: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            persistence_pending: AtomicBool::new(false),
+            durable_recovery_revision: AtomicU64::new(0),
+            retry_after: Mutex::new(None),
             subscription_type: RwLock::new(None),
+            limit_resets: Mutex::new(ResetCache::default()),
             last_error: RwLock::new(None),
             http,
             refresh_client,
             usage_url,
-            refresh_margin_ms,
+            refresh_margin_ms: options.refresh_margin_ms,
+            read_only: options.read_only,
+            recovery_backoff: options.recovery_backoff.min(Duration::from_secs(300)),
         }
     }
 
@@ -708,285 +1063,472 @@ impl AccountWorker {
         if self
             .credential
             .lock()
-            .expect("subscription credential lock poisoned")
+            .expect("credential lock poisoned")
             .is_some()
         {
             return Ok(());
         }
-        let store = self.store.clone();
-        match tokio::task::spawn_blocking(move || store.load()).await {
-            Ok(Ok(document)) => {
-                *self
-                    .subscription_type
-                    .write()
-                    .expect("subscription type lock poisoned") =
-                    document.subscription_type().map(str::to_owned);
-                *self
-                    .credential
-                    .lock()
-                    .expect("subscription credential lock poisoned") = Some(document);
-                self.set_credential_health(CredentialHealth::Healthy);
-                self.clear_last_error();
+        match self.load_credential_from_store().await {
+            Ok(document) => {
+                let expired = document.expires_at_unix_ms()? <= unix_now_ms();
+                self.activate_credential(document)?;
+                if self.read_only && expired {
+                    self.set_credential_health(CredentialHealth::Unavailable);
+                    self.set_last_error(
+                        "credential expired; read-only status does not refresh".to_owned(),
+                    );
+                }
                 Ok(())
             }
-            Ok(Err(source)) => {
+            Err(error) => {
                 self.set_credential_health(CredentialHealth::Unavailable);
-                self.set_last_error(source.to_string());
-                Err(SubscriptionRuntimeError::CredentialSource {
-                    account: self.id.clone(),
-                    source,
-                })
-            }
-            Err(source) => {
-                self.set_credential_health(CredentialHealth::Unavailable);
-                self.set_last_error("credential loader failed".to_owned());
-                Err(SubscriptionRuntimeError::BackgroundTask(source))
+                self.set_last_error(error.to_string());
+                Err(error)
             }
         }
     }
 
     async fn access_token(
-        &self,
-        force_refresh: bool,
+        self: &Arc<Self>,
+        force: bool,
     ) -> Result<SecretString, SubscriptionRuntimeError> {
-        self.load().await?;
-        let needs_refresh = {
-            let credential = self
-                .credential
-                .lock()
-                .expect("subscription credential lock poisoned");
-            let document = credential
-                .as_ref()
-                .ok_or_else(|| SubscriptionRuntimeError::CredentialUnavailable(self.id.clone()))?;
-            force_refresh
-                || document.expires_at_unix_ms()?
-                    <= unix_now_ms().saturating_add(self.refresh_margin_ms)
-        };
-        if !needs_refresh {
-            return self.current_access_token();
+        if self.read_only {
+            return Err(SubscriptionRuntimeError::ReadOnly);
         }
-
-        let _permit = self
-            .refresh_gate
-            .acquire()
+        if !force
+            && self
+                .state
+                .read()
+                .expect("state lock poisoned")
+                .credential_health(state_now_ms())
+                == CredentialHealth::Healthy
+            && !self.persistence_pending.load(Ordering::SeqCst)
+            && self
+                .retry_after
+                .lock()
+                .expect("retry lock poisoned")
+                .is_none()
+            && self
+                .rejected_refresh_grant
+                .lock()
+                .expect("rejected grant lock poisoned")
+                .is_none()
+        {
+            let credential = self.credential.lock().expect("credential lock poisoned");
+            if let Some(document) = credential.as_ref() {
+                if document.expires_at_unix_ms().is_ok_and(|expiry| {
+                    expiry > unix_now_ms().saturating_add(self.refresh_margin_ms)
+                }) {
+                    return document.access_token().map_err(Into::into);
+                }
+            }
+        }
+        // The owned task retains the semaphore and transaction even if the request is cancelled.
+        let baseline = self.current_access_token().ok();
+        let worker = Arc::clone(self);
+        tokio::spawn(async move { worker.recover(force, baseline).await })
             .await
-            .map_err(|_| SubscriptionRuntimeError::RuntimeClosed)?;
-        let needs_refresh = {
-            let credential = self
-                .credential
-                .lock()
-                .expect("subscription credential lock poisoned");
-            let document = credential
-                .as_ref()
-                .ok_or_else(|| SubscriptionRuntimeError::CredentialUnavailable(self.id.clone()))?;
-            force_refresh
-                || document.expires_at_unix_ms()?
-                    <= unix_now_ms().saturating_add(self.refresh_margin_ms)
-        };
-        if !needs_refresh {
-            return self.current_access_token();
-        }
-
-        self.refresh_loaded_credential().await
+            .map_err(SubscriptionRuntimeError::BackgroundTask)?
     }
 
     async fn refresh_after_unauthorized(
-        &self,
-        rejected_token: &SecretString,
+        self: &Arc<Self>,
+        rejected: &SecretString,
     ) -> Result<SecretString, SubscriptionRuntimeError> {
-        self.load().await?;
-        let _permit = self
-            .refresh_gate
-            .acquire()
-            .await
-            .map_err(|_| SubscriptionRuntimeError::RuntimeClosed)?;
-        let current = self.current_access_token()?;
-        if current != *rejected_token {
-            return Ok(current);
+        if self.read_only {
+            return Err(SubscriptionRuntimeError::ReadOnly);
         }
-        self.refresh_loaded_credential().await
+        let worker = Arc::clone(self);
+        let rejected = rejected.clone();
+        tokio::spawn(async move { worker.recover(true, Some(rejected)).await })
+            .await
+            .map_err(SubscriptionRuntimeError::BackgroundTask)?
     }
 
-    async fn refresh_loaded_credential(&self) -> Result<SecretString, SubscriptionRuntimeError> {
+    async fn recover(
+        &self,
+        force: bool,
+        baseline: Option<SecretString>,
+    ) -> Result<SecretString, SubscriptionRuntimeError> {
+        let _permit = Arc::clone(&self.refresh_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| SubscriptionRuntimeError::RuntimeClosed)?;
+        let health = self.state().credential_health;
+        let valid = self.credential_valid();
+        let current = self.current_access_token().ok();
+        if force && baseline.is_some() && current != baseline && valid {
+            return self.current_access_token();
+        }
+        let needs_refresh = self
+            .credential
+            .lock()
+            .expect("credential lock poisoned")
+            .as_ref()
+            .is_none_or(|document| {
+                document.expires_at_unix_ms().map_or(true, |expiry| {
+                    expiry <= unix_now_ms().saturating_add(self.refresh_margin_ms)
+                })
+            });
+        if !force
+            && !needs_refresh
+            && matches!(
+                health,
+                CredentialHealth::Healthy | CredentialHealth::Refreshing
+            )
+            && !self.persistence_pending.load(Ordering::SeqCst)
+        {
+            return self.current_access_token();
+        }
+        let store = self.store.clone();
+        let tx =
+            match tokio::task::spawn_blocking(move || store.begin_refresh(Duration::from_secs(5)))
+                .await
+            {
+                Ok(Ok(tx)) => tx,
+                Ok(Err(error)) => {
+                    return self.temporary_recovery_failure(error.into(), force, valid, health);
+                }
+                Err(error) => {
+                    return self.temporary_recovery_failure(
+                        SubscriptionRuntimeError::BackgroundTask(error),
+                        force,
+                        valid,
+                        health,
+                    );
+                }
+            };
+        let (tx, latest) = tokio::task::spawn_blocking(move || {
+            let latest = tx.load();
+            (tx, latest)
+        })
+        .await
+        .map_err(SubscriptionRuntimeError::BackgroundTask)?;
+        let latest = match latest {
+            Ok(latest) => latest,
+            Err(error) => {
+                return self.temporary_recovery_failure(error.into(), force, valid, health);
+            }
+        };
+        if self.refresh_grant_rejected(&latest) {
+            return Err(SubscriptionRuntimeError::CredentialUnavailable(
+                self.id.clone(),
+            ));
+        }
+        let changed = self
+            .credential
+            .lock()
+            .expect("credential lock poisoned")
+            .as_ref()
+            .is_none_or(|document| !document.has_same_auth_version(&latest));
+        if changed && !self.persistence_pending.load(Ordering::SeqCst) {
+            self.activate_credential(latest)?;
+            if self.credential_valid() {
+                // A usage success validates only the adopted access grant, not inference entitlement.
+                let token = self.current_access_token()?;
+                if self.validate_access_grant(&token).await {
+                    return Ok(token);
+                }
+                self.set_credential_health(CredentialHealth::Unavailable);
+                return Err(SubscriptionRuntimeError::CredentialUnavailable(
+                    self.id.clone(),
+                ));
+            }
+        }
+        if self.state().credential_health == CredentialHealth::Quarantined {
+            return Err(SubscriptionRuntimeError::CredentialUnavailable(
+                self.id.clone(),
+            ));
+        }
+        let backed_off = self
+            .retry_after
+            .lock()
+            .expect("retry lock poisoned")
+            .is_some_and(|deadline| deadline > Instant::now());
+        if backed_off {
+            if !force && valid && self.credential_valid() && health == CredentialHealth::Healthy {
+                return self.current_access_token();
+            }
+            return Err(SubscriptionRuntimeError::RecoveryBackoff);
+        }
         let mut document = self
             .credential
             .lock()
-            .expect("subscription credential lock poisoned")
-            .take()
+            .expect("credential lock poisoned")
+            .clone()
             .ok_or_else(|| SubscriptionRuntimeError::CredentialUnavailable(self.id.clone()))?;
-        self.set_credential_health(CredentialHealth::Refreshing);
-        let mut reloaded_after_invalid_grant = false;
+        let mut transaction = tx;
+        let mut refreshed_once = false;
         loop {
-            match self.refresh_client.refresh_document(&mut document).await {
-                Ok(()) => return self.persist_refreshed_credential(document),
-                Err(OAuthRefreshError::InvalidGrant) if !reloaded_after_invalid_grant => {
-                    match self.reload_changed_credential(&document).await {
-                        Ok(Some(latest)) => {
-                            document = latest;
-                            self.update_subscription_type(&document);
-                            if document.expires_at_unix_ms().is_ok_and(|expires_at| {
-                                expires_at > unix_now_ms().saturating_add(self.refresh_margin_ms)
-                            }) {
-                                return self.activate_credential(document);
+            let tx = transaction;
+            self.set_credential_health(CredentialHealth::Refreshing);
+            if !self.persistence_pending.load(Ordering::SeqCst) {
+                if refreshed_once {
+                    return self.temporary_recovery_failure(
+                        SubscriptionRuntimeError::CredentialUnavailable(self.id.clone()),
+                        true,
+                        false,
+                        CredentialHealth::Unavailable,
+                    );
+                }
+                refreshed_once = true;
+                if let Err(error) = self.refresh_client.refresh_document(&mut document).await {
+                    self.set_last_error(error.to_string());
+                    *self.retry_after.lock().expect("retry lock poisoned") =
+                        Some(Instant::now() + self.recovery_backoff);
+                    if error.is_definitive() {
+                        *self
+                            .rejected_refresh_grant
+                            .lock()
+                            .expect("rejected grant lock poisoned") = document.refresh_token().ok();
+                        self.set_credential_health(CredentialHealth::Quarantined);
+                        let stale = document.clone();
+                        let winner = tokio::task::spawn_blocking(move || tx.reload(&stale))
+                            .await
+                            .map_err(SubscriptionRuntimeError::BackgroundTask)?;
+                        if let Ok(winner) = winner {
+                            if !document.has_same_auth_version(&winner)
+                                && !self.refresh_grant_rejected(&winner)
+                                && winner
+                                    .expires_at_unix_ms()
+                                    .is_ok_and(|expiry| expiry > unix_now_ms())
+                            {
+                                let token = winner.access_token()?;
+                                if self.validate_access_grant(&token).await {
+                                    return self.activate_credential(winner);
+                                }
                             }
-                            reloaded_after_invalid_grant = true;
                         }
-                        Ok(None) => {
-                            return self.fail_refresh(document, OAuthRefreshError::InvalidGrant);
-                        }
-                        Err(error) => {
-                            *self
-                                .credential
-                                .lock()
-                                .expect("subscription credential lock poisoned") = Some(document);
-                            self.set_credential_health(CredentialHealth::Unavailable);
-                            self.set_last_error(format!(
-                                "Claude OAuth refresh token was rejected and the credential source could not be reloaded: {error}"
-                            ));
-                            return Err(error);
+                    } else if !force
+                        && valid
+                        && self.credential_valid()
+                        && health == CredentialHealth::Healthy
+                    {
+                        self.set_credential_health(CredentialHealth::Healthy);
+                        return self.current_access_token();
+                    } else {
+                        self.set_credential_health(CredentialHealth::Unavailable);
+                    }
+                    return Err(error.into());
+                }
+            }
+            let (tx, saved_document, saved) = tokio::task::spawn_blocking(move || {
+                let mut document = document;
+                let _ = tx.rebase_if_same_auth(&mut document);
+                let saved = tx.save_if_unchanged(&mut document);
+                (tx, document, saved)
+            })
+            .await
+            .map_err(SubscriptionRuntimeError::BackgroundTask)?;
+            match saved {
+                Ok(()) => {
+                    self.persistence_pending.store(false, Ordering::SeqCst);
+                    if saved_document.expires_at_unix_ms()? <= unix_now_ms() {
+                        // Save the rotated refresh grant first, then mint from that grant, never old disk state.
+                        self.activate_credential(saved_document.clone())?;
+                        document = saved_document;
+                        transaction = tx;
+                        continue;
+                    }
+                    return self.activate_credential(saved_document);
+                }
+                Err(error) => {
+                    let (winner, document) = tokio::task::spawn_blocking(move || {
+                        let winner = tx.reload(&saved_document);
+                        (winner, saved_document)
+                    })
+                    .await
+                    .map_err(SubscriptionRuntimeError::BackgroundTask)?;
+                    if let Ok(winner) = winner {
+                        if !document.has_same_auth_version(&winner)
+                            && winner
+                                .expires_at_unix_ms()
+                                .is_ok_and(|expiry| expiry > unix_now_ms())
+                        {
+                            let token = winner.access_token()?;
+                            if self.validate_access_grant(&token).await {
+                                self.persistence_pending.store(false, Ordering::SeqCst);
+                                return self.activate_credential(winner);
+                            }
                         }
                     }
+                    // Keep the rotating grant owned, including when its access token has expired.
+                    self.persistence_pending.store(true, Ordering::SeqCst);
+                    let token = self.activate_credential(document)?;
+                    self.set_last_error(format!("credential persistence pending: {error}"));
+                    *self.retry_after.lock().expect("retry lock poisoned") =
+                        Some(Instant::now() + self.recovery_backoff);
+                    if !self.credential_valid() {
+                        self.set_credential_health(CredentialHealth::Unavailable);
+                        return Err(SubscriptionRuntimeError::CredentialUnavailable(
+                            self.id.clone(),
+                        ));
+                    }
+                    return Ok(token);
                 }
-                Err(error) => return self.fail_refresh(document, error),
             }
         }
     }
-
-    async fn reload_changed_credential(
+    fn temporary_recovery_failure(
         &self,
-        stale: &CredentialDocument,
-    ) -> Result<Option<CredentialDocument>, SubscriptionRuntimeError> {
-        let latest = self.load_credential_from_store().await?;
-        Ok((!stale.has_same_version(&latest)).then_some(latest))
+        error: SubscriptionRuntimeError,
+        force: bool,
+        valid: bool,
+        health: CredentialHealth,
+    ) -> Result<SecretString, SubscriptionRuntimeError> {
+        self.set_last_error(error.to_string());
+        *self.retry_after.lock().expect("retry lock poisoned") =
+            Some(Instant::now() + self.recovery_backoff);
+        if !force && valid && self.credential_valid() && health == CredentialHealth::Healthy {
+            self.current_access_token()
+        } else {
+            if health != CredentialHealth::Quarantined {
+                self.set_credential_health(CredentialHealth::Unavailable);
+            }
+            Err(error)
+        }
     }
 
+    fn credential_valid(&self) -> bool {
+        self.credential
+            .lock()
+            .expect("credential lock poisoned")
+            .as_ref()
+            .is_some_and(|document| {
+                document
+                    .expires_at_unix_ms()
+                    .is_ok_and(|expiry| expiry > unix_now_ms())
+            })
+    }
+
+    async fn validate_access_grant(&self, token: &SecretString) -> bool {
+        match self.send_usage_request(token).await {
+            Ok(response) if response.status().is_success() => {
+                read_bounded_usage_response(response).await.is_ok()
+            }
+            _ => false,
+        }
+    }
+
+    async fn corroborate_credential_rejection(&self, rejected: &SecretString) -> bool {
+        if self.read_only
+            || self
+                .current_access_token()
+                .is_ok_and(|current| current != *rejected)
+        {
+            return false;
+        }
+        let observation = self.begin_observation();
+        match self.send_usage_request(rejected).await {
+            Ok(response) if response.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                if read_bounded_usage_response(response).await.is_err() {
+                    return false;
+                }
+                if self
+                    .current_access_token()
+                    .is_ok_and(|current| current == *rejected)
+                {
+                    self.state
+                        .write()
+                        .expect("state lock poisoned")
+                        .reject_authentication(observation, state_now_ms());
+                    self.set_last_error(
+                        "credential authentication rejected by usage endpoint".to_owned(),
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn refresh_grant_rejected(&self, document: &CredentialDocument) -> bool {
+        let rejected = self
+            .rejected_refresh_grant
+            .lock()
+            .expect("rejected grant lock poisoned");
+        rejected.as_ref().is_some_and(|rejected| {
+            document
+                .refresh_token()
+                .is_ok_and(|token| token == *rejected)
+        })
+    }
     async fn load_credential_from_store(
         &self,
     ) -> Result<CredentialDocument, SubscriptionRuntimeError> {
         let store = self.store.clone();
-        tokio::task::spawn_blocking(move || store.load())
-            .await
-            .map_err(SubscriptionRuntimeError::BackgroundTask)?
-            .map_err(|source| SubscriptionRuntimeError::CredentialSource {
-                account: self.id.clone(),
-                source,
-            })
-    }
-
-    /// Whether the store holds a different document than the one in memory.
-    /// The credential mutex is only held for the comparison, never across the
-    /// load, so a slow store cannot block a request that needs the token.
-    fn differs_from_loaded_credential(&self, latest: &CredentialDocument) -> bool {
-        self.credential
-            .lock()
-            .expect("subscription credential lock poisoned")
-            .as_ref()
-            .is_none_or(|current| !current.has_same_version(latest))
-    }
-
-    fn persist_refreshed_credential(
-        &self,
-        mut document: CredentialDocument,
-    ) -> Result<SecretString, SubscriptionRuntimeError> {
-        if let Err(source) = self.store.save_if_unchanged(&mut document) {
-            let reload_result = self.store.load();
-            *self
-                .credential
-                .lock()
-                .expect("subscription credential lock poisoned") = reload_result.ok();
-            self.set_credential_health(CredentialHealth::Unavailable);
-            self.set_last_error(source.to_string());
-            return Err(source.into());
-        }
-        self.activate_credential(document)
+        let read_only = self.read_only;
+        tokio::task::spawn_blocking(move || {
+            if read_only {
+                store.load_read_only()
+            } else {
+                store.load()
+            }
+        })
+        .await
+        .map_err(SubscriptionRuntimeError::BackgroundTask)?
+        .map_err(|source| SubscriptionRuntimeError::CredentialSource {
+            account: self.id.clone(),
+            source,
+        })
     }
 
     fn activate_credential(
         &self,
         document: CredentialDocument,
     ) -> Result<SecretString, SubscriptionRuntimeError> {
-        let access_token = document.access_token()?;
-        self.update_subscription_type(&document);
-        *self
-            .credential
-            .lock()
-            .expect("subscription credential lock poisoned") = Some(document);
-        self.set_credential_health(CredentialHealth::Healthy);
-        self.clear_last_error();
-        Ok(access_token)
-    }
-
-    fn fail_refresh(
-        &self,
-        document: CredentialDocument,
-        error: OAuthRefreshError,
-    ) -> Result<SecretString, SubscriptionRuntimeError> {
-        *self
-            .credential
-            .lock()
-            .expect("subscription credential lock poisoned") = Some(document);
-        if matches!(error, OAuthRefreshError::InvalidGrant) {
-            self.set_credential_health(CredentialHealth::Quarantined);
-        } else {
-            self.set_credential_health(CredentialHealth::Unavailable);
+        let token = document.access_token()?;
+        if self.refresh_grant_rejected(&document) {
+            return Err(SubscriptionRuntimeError::CredentialUnavailable(
+                self.id.clone(),
+            ));
         }
-        self.set_last_error(error.to_string());
-        Err(error.into())
-    }
-
-    fn update_subscription_type(&self, document: &CredentialDocument) {
+        *self
+            .rejected_refresh_grant
+            .lock()
+            .expect("rejected grant lock poisoned") = None;
+        let changed = self
+            .credential
+            .lock()
+            .expect("credential lock poisoned")
+            .as_ref()
+            .is_none_or(|current| !current.has_same_auth_version(&document));
         *self
             .subscription_type
             .write()
             .expect("subscription type lock poisoned") =
             document.subscription_type().map(str::to_owned);
+        *self.credential.lock().expect("credential lock poisoned") = Some(document);
+        if changed {
+            let mut resets = self.limit_resets.lock().expect("reset cache lock poisoned");
+            resets.generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            resets.sequence = 0;
+            resets.inventory = None;
+            drop(resets);
+            self.begin_observation();
+        }
+        *self.retry_after.lock().expect("retry lock poisoned") = None;
+        self.set_credential_health(CredentialHealth::Healthy);
+        self.clear_last_error();
+        Ok(token)
     }
 
     fn current_access_token(&self) -> Result<SecretString, SubscriptionRuntimeError> {
         self.credential
             .lock()
-            .expect("subscription credential lock poisoned")
+            .expect("credential lock poisoned")
             .as_ref()
             .ok_or_else(|| SubscriptionRuntimeError::CredentialUnavailable(self.id.clone()))?
             .access_token()
             .map_err(Into::into)
     }
 
-    /// Gives a quarantined account one way back into service: a credential
-    /// document the store received after the refresh token was rejected, which
-    /// is what a fresh sign-in writes. The rejected refresh token itself is
-    /// dead, so this never contacts the OAuth endpoint. Returns `true` only
-    /// when a new credential was activated and the caller may continue.
-    async fn heal_quarantined_credential(&self) -> bool {
-        let Ok(_permit) = self.refresh_gate.acquire().await else {
-            return false;
-        };
-        if self.state().credential_health != CredentialHealth::Quarantined {
-            return true;
-        }
-        let latest = match self.load_credential_from_store().await {
-            Ok(latest) => latest,
-            Err(error) => {
-                self.set_last_error(error.to_string());
-                return false;
-            }
-        };
-        if !self.differs_from_loaded_credential(&latest) {
-            return false;
-        }
-        match self.activate_credential(latest) {
-            Ok(_access_token) => true,
-            Err(error) => {
-                self.set_last_error(error.to_string());
-                false
-            }
-        }
-    }
-
-    async fn reload_credential(&self) -> AccountCredentialReload {
+    async fn reload_credential(self: &Arc<Self>) -> AccountCredentialReload {
         let previous_health = self.state().credential_health;
         let (detail, activated) = self.reload_credential_source().await;
-        if activated {
+        if activated && !self.read_only {
             self.refresh_usage().await;
         }
         AccountCredentialReload {
@@ -997,14 +1539,13 @@ impl AccountWorker {
         }
     }
 
-    /// Loads the credential source once and reports what it means for this
-    /// account. A source that cannot be read leaves health alone: the token
-    /// already in memory may still work, and a status call must not evict a
-    /// usable account. Returns whether a new credential became active.
     async fn reload_credential_source(&self) -> (String, bool) {
         let Ok(_permit) = self.refresh_gate.acquire().await else {
             return (SubscriptionRuntimeError::RuntimeClosed.to_string(), false);
         };
+        if self.persistence_pending.load(Ordering::SeqCst) {
+            return ("credential persistence pending".to_owned(), false);
+        }
         let latest = match self.load_credential_from_store().await {
             Ok(latest) => latest,
             Err(error) => {
@@ -1013,50 +1554,76 @@ impl AccountWorker {
                 return (detail, false);
             }
         };
-        if !self.differs_from_loaded_credential(&latest) {
-            let detail = if self.state().credential_health == CredentialHealth::Healthy {
-                "unchanged"
-            } else {
-                "credential source unchanged; sign in to this profile again"
-            };
-            return (detail.to_owned(), false);
+        let changed = self
+            .credential
+            .lock()
+            .expect("credential lock poisoned")
+            .as_ref()
+            .is_none_or(|current| !current.has_same_auth_version(&latest));
+        if !changed || self.refresh_grant_rejected(&latest) {
+            return (
+                if self.state().credential_health == CredentialHealth::Healthy {
+                    "unchanged"
+                } else {
+                    "credential source unchanged; sign in to this profile again"
+                }
+                .to_owned(),
+                false,
+            );
         }
         match self.activate_credential(latest) {
-            Ok(_access_token) => (
+            Ok(_) => (
                 "reloaded a new credential from the credential source".to_owned(),
                 true,
             ),
             Err(error) => {
-                let detail =
-                    format!("credential source changed but could not be activated: {error}");
-                self.set_last_error(detail.clone());
-                (detail, false)
+                self.set_last_error(error.to_string());
+                (error.to_string(), false)
             }
         }
     }
 
-    async fn refresh_usage(&self) {
-        if self.state().credential_health == CredentialHealth::Quarantined
-            && !self.heal_quarantined_credential().await
+    async fn refresh_usage(self: &Arc<Self>) {
+        if !self.read_only
+            && matches!(
+                self.state().credential_health,
+                CredentialHealth::Quarantined | CredentialHealth::Unavailable
+            )
         {
-            return;
+            self.reload_credential_source().await;
         }
-        let mut access_token = match self.access_token(false).await {
-            Ok(access_token) => access_token,
+        let access = if self.read_only {
+            if !self.credential_valid() {
+                self.mark_usage_stale(
+                    "credential missing or expired; sign in with Claude to restore usage monitoring".to_owned(),
+                );
+                return;
+            }
+            self.current_access_token()
+        } else {
+            self.access_token(false).await
+        };
+        let mut token = match access {
+            Ok(token) => token,
             Err(error) => {
                 self.mark_usage_stale(error.to_string());
                 return;
             }
         };
-        let mut response = self.send_usage_request(&access_token).await;
-        if response
-            .as_ref()
-            .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
+        let mut observation = self.begin_observation();
+        self.begin_reset_observation(observation);
+        let mut response = self.send_usage_request(&token).await;
+        if !self.read_only
+            && response
+                .as_ref()
+                .is_ok_and(|response| response.status() == reqwest::StatusCode::UNAUTHORIZED)
         {
-            match self.refresh_after_unauthorized(&access_token).await {
-                Ok(refreshed) => {
-                    access_token = refreshed;
-                    response = self.send_usage_request(&access_token).await;
+            match self.refresh_after_unauthorized(&token).await {
+                Ok(next) => {
+                    token = next;
+                    observation = self.begin_observation();
+                    self.begin_reset_observation(observation);
+                    response = self.send_usage_request(&token).await;
                 }
                 Err(error) => {
                     self.mark_usage_stale(error.to_string());
@@ -1064,9 +1631,23 @@ impl AccountWorker {
                 }
             }
         }
-
         let response = match response {
-            Ok(response) => response,
+            Ok(response) if response.status().is_success() => response,
+            Ok(response) => {
+                let status = response.status();
+                if status == reqwest::StatusCode::UNAUTHORIZED
+                    && read_bounded_usage_response(response).await.is_ok()
+                {
+                    self.state
+                        .write()
+                        .expect("state lock poisoned")
+                        .reject_authentication(observation, state_now_ms());
+                    *self.retry_after.lock().expect("retry lock poisoned") =
+                        Some(Instant::now() + self.recovery_backoff);
+                }
+                self.mark_usage_stale(format!("usage request returned HTTP {status}"));
+                return;
+            }
             Err(error) => {
                 self.mark_usage_stale(format!(
                     "usage request failed: {}",
@@ -1075,10 +1656,6 @@ impl AccountWorker {
                 return;
             }
         };
-        if !response.status().is_success() {
-            self.mark_usage_stale(format!("usage request returned HTTP {}", response.status()));
-            return;
-        }
         let bytes = match read_bounded_usage_response(response).await {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -1093,85 +1670,177 @@ impl AccountWorker {
                 return;
             }
         };
-        let mut normalized = usage.normalize();
-        if normalized.extra_usage.enabled == Some(false) {
-            normalized.extra_usage.in_use = Some(false);
-        }
-        let mut state = AccountLimitState::from_usage(self.id.clone(), normalized);
-        let previous = self.state();
-        state.entitlements = previous.entitlements;
-        state.credential_health = previous.credential_health;
-        *self
-            .state
+        self.state
             .write()
-            .expect("subscription state lock poisoned") = state;
-        self.clear_last_error();
+            .expect("state lock poisoned")
+            .apply_usage(usage.normalize(), observation, state_now_ms());
+        if !self.persistence_pending.load(Ordering::SeqCst)
+            && self
+                .retry_after
+                .lock()
+                .expect("retry lock poisoned")
+                .is_none()
+        {
+            self.clear_last_error();
+        }
+        if !self.read_only {
+            self.discover_resets(&token, &usage, observation).await;
+        }
+    }
+
+    fn begin_reset_observation(&self, observation: ObservationToken) {
+        let mut cache = self.limit_resets.lock().expect("reset cache lock poisoned");
+        if observation.credential_generation == cache.generation
+            && observation.sequence > cache.sequence
+        {
+            cache.sequence = observation.sequence;
+            if let Some(inventory) = cache.inventory.as_mut() {
+                inventory.fresh = false;
+            }
+        }
+    }
+
+    async fn discover_resets(
+        &self,
+        token: &SecretString,
+        usage: &UsageSnapshot,
+        observation: ObservationToken,
+    ) {
+        let now = unix_now_ms();
+        let mut answers = Vec::with_capacity(PROGRAMS.len());
+        for program in PROGRAMS {
+            let inline = parse_program(program, usage.unknown.get(program), now);
+            let answer = match inline {
+                Some(answer) => Some(answer),
+                None => self.probe_reset_program(token, program).await,
+            };
+            answers.push(answer);
+        }
+        // Token and generation must still describe the account that answered.
+        // Credential activation never acquires this cache while holding its credential lock.
+        let credential = self.credential.lock().expect("credential lock poisoned");
+        if !credential.as_ref().is_some_and(|document| {
+            document
+                .access_token()
+                .is_ok_and(|current| current == *token)
+        }) {
+            return;
+        }
+        let mut cache = self.limit_resets.lock().expect("reset cache lock poisoned");
+        if cache.generation != observation.credential_generation
+            || cache.sequence != observation.sequence
+        {
+            return;
+        }
+        let complete = answers.iter().all(Option::is_some);
+        let mut inventory = cache.inventory.take().unwrap_or(LimitResetStatus {
+            checked_at_unix_ms: now,
+            fresh: false,
+            programs: Vec::new(),
+        });
+        for answer in answers.into_iter().flatten() {
+            if let Some(previous) = inventory
+                .programs
+                .iter_mut()
+                .find(|p| p.program == answer.program)
+            {
+                *previous = answer;
+            } else {
+                inventory.programs.push(answer);
+            }
+        }
+        if !inventory.programs.is_empty() {
+            inventory.checked_at_unix_ms = unix_now_ms();
+            inventory.fresh = complete;
+            cache.inventory = Some(inventory);
+        }
+    }
+
+    async fn probe_reset_program(
+        &self,
+        token: &SecretString,
+        program: &str,
+    ) -> Option<LimitResetProgram> {
+        let flag = match program {
+            "cedar_ember" => "cedar_ember",
+            "juniper_tide" => "at_wall",
+            _ => return None,
+        };
+        // Discovery is a safe GET only. In particular, a probe 401 must not
+        // refresh credentials or change quota/routing/authentication state.
+        let response = self
+            .http
+            .get(&self.usage_url)
+            .query(&[(flag, "1"), ("skip_spend", "1")])
+            .bearer_auth(token.expose())
+            .header("anthropic-beta", USAGE_BETA)
+            .header(reqwest::header::USER_AGENT, "claude-code/2.1.0")
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bytes = read_bounded_usage_response(response).await.ok()?;
+        let payload: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        parse_program(program, payload.get(program), unix_now_ms())
+    }
+
+    fn begin_observation(&self) -> ObservationToken {
+        self.state
+            .write()
+            .expect("state lock poisoned")
+            .begin_observation(self.generation.load(Ordering::SeqCst))
     }
 
     async fn send_usage_request(
         &self,
-        access_token: &SecretString,
+        token: &SecretString,
     ) -> Result<reqwest::Response, reqwest::Error> {
         self.http
             .get(&self.usage_url)
-            .bearer_auth(access_token.expose())
+            .bearer_auth(token.expose())
             .header("anthropic-beta", USAGE_BETA)
             .header(reqwest::header::USER_AGENT, "claude-code/2.1.0")
             .send()
             .await
     }
-
     fn state(&self) -> AccountLimitState {
         self.state
             .read()
-            .expect("subscription state lock poisoned")
-            .clone()
+            .expect("state lock poisoned")
+            .snapshot(state_now_ms())
     }
-
     fn set_credential_health(&self, health: CredentialHealth) {
         self.state
             .write()
-            .expect("subscription state lock poisoned")
+            .expect("state lock poisoned")
+            .limits
             .credential_health = health;
     }
-
-    fn set_entitlement(&self, model: ModelFamily, entitlement: Entitlement) {
-        self.state
-            .write()
-            .expect("subscription state lock poisoned")
-            .entitlements
-            .insert(model, entitlement);
-    }
-
-    fn apply_response_observation(&self, claims: Vec<LimitClaim>, extra_usage: ExtraUsageState) {
-        self.state
-            .write()
-            .expect("subscription state lock poisoned")
-            .apply_response_observation(claims, extra_usage);
-    }
-
     fn mark_usage_stale(&self, error: String) {
+        if let Some(inventory) = self
+            .limit_resets
+            .lock()
+            .expect("reset cache lock poisoned")
+            .inventory
+            .as_mut()
+        {
+            inventory.fresh = false;
+        }
         self.state
             .write()
-            .expect("subscription state lock poisoned")
+            .expect("state lock poisoned")
+            .limits
             .usage_snapshot_fresh = false;
         self.set_last_error(error);
     }
-
     fn set_last_error(&self, error: String) {
-        *self
-            .last_error
-            .write()
-            .expect("subscription error lock poisoned") = Some(error);
+        *self.last_error.write().expect("error lock poisoned") = Some(error);
     }
-
     fn clear_last_error(&self) {
-        *self
-            .last_error
-            .write()
-            .expect("subscription error lock poisoned") = None;
+        *self.last_error.write().expect("error lock poisoned") = None;
     }
-
     fn status(&self) -> AccountRuntimeStatus {
         let state = self.state();
         AccountRuntimeStatus {
@@ -1181,21 +1850,47 @@ impl AccountWorker {
             subscription_type: self
                 .subscription_type
                 .read()
-                .expect("subscription type lock poisoned")
+                .expect("type lock poisoned")
                 .clone(),
             usage_snapshot_fresh: state.usage_snapshot_fresh,
             complete_global_snapshot: state.complete_global_snapshot,
             claims: state.claims,
             extra_usage: state.extra_usage,
-            last_error: self
-                .last_error
-                .read()
-                .expect("subscription error lock poisoned")
+            limit_resets: self
+                .limit_resets
+                .lock()
+                .expect("reset cache lock poisoned")
+                .inventory
                 .clone(),
+            last_error: self.last_error.read().expect("error lock poisoned").clone(),
         }
+    }
+    fn recovery_needs_persistence(&self) -> bool {
+        self.state
+            .read()
+            .expect("state lock poisoned")
+            .recovery_revision()
+            != self.durable_recovery_revision.load(Ordering::SeqCst)
     }
 }
 
+struct ProbeGuard {
+    worker: Arc<AccountWorker>,
+    id: u64,
+}
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        self.worker
+            .state
+            .write()
+            .expect("state lock poisoned")
+            .release_probe(self.id);
+    }
+}
+
+fn state_now_ms() -> u64 {
+    unix_now_ms().try_into().unwrap_or(0)
+}
 async fn read_bounded_usage_response(response: reqwest::Response) -> Result<Vec<u8>, String> {
     use futures::StreamExt as _;
 
@@ -1215,297 +1910,6 @@ async fn read_bounded_usage_response(response: reqwest::Response) -> Result<Vec<
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
-}
-
-#[derive(Default)]
-struct PlacementState {
-    primaries: HashMap<String, AffinityEntry>,
-    model_overrides: HashMap<AffinityKey, AffinityEntry>,
-    active_leases: HashMap<AffinityKey, ActiveLease>,
-    sequence: u64,
-}
-
-impl PlacementState {
-    fn runtime_status<'a>(
-        &self,
-        account_ids: impl Iterator<Item = &'a str>,
-        active_lease_ttl: Duration,
-    ) -> PoolPlacementRuntimeStatus {
-        let mut accounts = account_ids
-            .map(|id| {
-                (
-                    id.to_owned(),
-                    AccountPlacementRuntimeStatus {
-                        id: id.to_owned(),
-                        active_launch_leases: 0,
-                        active_model_leases: BTreeMap::new(),
-                        primary_assignments: 0,
-                        model_overrides: 0,
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut active_launches = HashSet::<(String, String)>::new();
-        for (key, lease) in &self.active_leases {
-            active_launches.insert((key.launch_id.clone(), lease.account_id.clone()));
-            let account = accounts.entry(lease.account_id.clone()).or_insert_with(|| {
-                AccountPlacementRuntimeStatus {
-                    id: lease.account_id.clone(),
-                    active_launch_leases: 0,
-                    active_model_leases: BTreeMap::new(),
-                    primary_assignments: 0,
-                    model_overrides: 0,
-                }
-            });
-            *account
-                .active_model_leases
-                .entry(key.model.to_string())
-                .or_default() += 1;
-        }
-        for (_, account_id) in active_launches {
-            if let Some(account) = accounts.get_mut(&account_id) {
-                account.active_launch_leases += 1;
-            }
-        }
-        for primary in self.primaries.values() {
-            if let Some(account) = accounts.get_mut(&primary.account_id) {
-                account.primary_assignments += 1;
-            }
-        }
-        for model_override in self.model_overrides.values() {
-            if let Some(account) = accounts.get_mut(&model_override.account_id) {
-                account.model_overrides += 1;
-            }
-        }
-        PoolPlacementRuntimeStatus {
-            active_lease_ttl_seconds: active_lease_ttl.as_secs(),
-            accounts: accounts.into_values().collect(),
-        }
-    }
-
-    fn preferred_account(&self, key: &AffinityKey) -> Option<&str> {
-        self.active_leases
-            .get(key)
-            .map(|lease| lease.account_id.as_str())
-            .or_else(|| {
-                self.model_overrides
-                    .get(key)
-                    .map(|entry| entry.account_id.as_str())
-            })
-            .or_else(|| {
-                self.primaries
-                    .get(&key.launch_id)
-                    .map(|entry| entry.account_id.as_str())
-            })
-    }
-
-    fn prune_active_leases(&mut self, now: Instant, ttl: Duration) {
-        self.active_leases.retain(|_, lease| {
-            now.checked_duration_since(lease.last_seen)
-                .is_some_and(|age| age <= ttl)
-        });
-    }
-
-    fn loads_for(&self, current: &AffinityKey) -> BTreeMap<String, AccountPlacementLoad> {
-        self.collect_loads(&current.model, Some(current))
-    }
-
-    fn status_load_for(&self, current: &AffinityKey, account_id: &str) -> AccountPlacementLoad {
-        self.collect_loads(&current.model, None)
-            .remove(account_id)
-            .unwrap_or_default()
-    }
-
-    fn collect_loads(
-        &self,
-        model: &ModelFamily,
-        excluded: Option<&AffinityKey>,
-    ) -> BTreeMap<String, AccountPlacementLoad> {
-        let mut loads = BTreeMap::<String, AccountPlacementLoad>::new();
-        let mut global_leases = HashSet::<(String, String)>::new();
-
-        for (key, lease) in &self.active_leases {
-            if excluded == Some(key) {
-                continue;
-            }
-            global_leases.insert((key.launch_id.clone(), lease.account_id.clone()));
-            if key.model == *model {
-                loads
-                    .entry(lease.account_id.clone())
-                    .or_default()
-                    .active_model_leases += 1;
-            }
-        }
-        for (_, account_id) in global_leases {
-            loads.entry(account_id).or_default().active_global_leases += 1;
-        }
-        loads
-    }
-
-    fn reserve(&mut self, key: AffinityKey, account_id: String, now: Instant) {
-        let now_unix = now_unix_seconds();
-        match self.active_leases.get_mut(&key) {
-            Some(existing) if existing.account_id == account_id => {
-                existing.last_seen = now;
-                existing.last_seen_at_unix = now_unix;
-            }
-            _ => {
-                self.active_leases.insert(
-                    key,
-                    ActiveLease {
-                        account_id,
-                        last_seen: now,
-                        assigned_at_unix: now_unix,
-                        last_seen_at_unix: now_unix,
-                        provisional: true,
-                    },
-                );
-            }
-        }
-    }
-
-    fn commit(
-        &mut self,
-        key: AffinityKey,
-        account_id: String,
-        now: Instant,
-    ) -> SessionAssignmentReason {
-        self.sequence = self.sequence.saturating_add(1);
-        let sequence = self.sequence;
-        let now_unix = now_unix_seconds();
-        let assigned_at_unix = self
-            .active_leases
-            .get(&key)
-            .filter(|lease| lease.account_id == account_id)
-            .map(|lease| lease.assigned_at_unix)
-            .unwrap_or(now_unix);
-        let primary_account = self
-            .primaries
-            .get(&key.launch_id)
-            .map(|entry| entry.account_id.clone());
-
-        let assignment_reason = match primary_account {
-            None => {
-                self.primaries.insert(
-                    key.launch_id.clone(),
-                    AffinityEntry {
-                        account_id: account_id.clone(),
-                        last_seen_sequence: sequence,
-                    },
-                );
-                self.model_overrides.remove(&key);
-                SessionAssignmentReason::BalancedNewLaunch
-            }
-            Some(primary) if primary == account_id => {
-                if let Some(entry) = self.primaries.get_mut(&key.launch_id) {
-                    entry.last_seen_sequence = sequence;
-                }
-                self.model_overrides.remove(&key);
-                SessionAssignmentReason::PrimaryAffinity
-            }
-            Some(_) => {
-                self.model_overrides.insert(
-                    key.clone(),
-                    AffinityEntry {
-                        account_id: account_id.clone(),
-                        last_seen_sequence: sequence,
-                    },
-                );
-                SessionAssignmentReason::ModelOverride
-            }
-        };
-
-        self.active_leases.insert(
-            key,
-            ActiveLease {
-                account_id,
-                last_seen: now,
-                assigned_at_unix,
-                last_seen_at_unix: now_unix,
-                provisional: false,
-            },
-        );
-        self.enforce_affinity_bound();
-        assignment_reason
-    }
-
-    fn rollback_provisional(&mut self, key: &AffinityKey, account_id: &str) {
-        if self
-            .active_leases
-            .get(key)
-            .is_some_and(|lease| lease.provisional && lease.account_id.as_str() == account_id)
-        {
-            self.active_leases.remove(key);
-        }
-    }
-
-    fn clear_model_assignment(&mut self, key: &AffinityKey, account_id: &str) {
-        if self
-            .active_leases
-            .get(key)
-            .is_some_and(|lease| lease.account_id == account_id)
-        {
-            self.active_leases.remove(key);
-        }
-        if self
-            .model_overrides
-            .get(key)
-            .is_some_and(|entry| entry.account_id == account_id)
-        {
-            self.model_overrides.remove(key);
-        }
-    }
-
-    fn enforce_affinity_bound(&mut self) {
-        while self.primaries.len() + self.model_overrides.len() > MAX_AFFINITY_ENTRIES {
-            let oldest_primary = self
-                .primaries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_seen_sequence)
-                .map(|(launch_id, entry)| (launch_id.clone(), entry.last_seen_sequence));
-            let oldest_override = self
-                .model_overrides
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_seen_sequence)
-                .map(|(key, entry)| (key.clone(), entry.last_seen_sequence));
-
-            match (oldest_primary, oldest_override) {
-                (Some((launch_id, primary_sequence)), Some((key, override_sequence))) => {
-                    if primary_sequence <= override_sequence {
-                        self.primaries.remove(&launch_id);
-                    } else {
-                        self.model_overrides.remove(&key);
-                    }
-                }
-                (Some((launch_id, _)), None) => {
-                    self.primaries.remove(&launch_id);
-                }
-                (None, Some((key, _))) => {
-                    self.model_overrides.remove(&key);
-                }
-                (None, None) => break,
-            }
-        }
-    }
-}
-
-struct AffinityEntry {
-    account_id: String,
-    last_seen_sequence: u64,
-}
-
-struct ActiveLease {
-    account_id: String,
-    last_seen: Instant,
-    assigned_at_unix: i64,
-    last_seen_at_unix: i64,
-    provisional: bool,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct AffinityKey {
-    launch_id: String,
-    model: ModelFamily,
 }
 
 #[derive(Debug, Error)]
@@ -1543,6 +1947,12 @@ pub enum SubscriptionRuntimeError {
     DuplicateCredentialSource { path: PathBuf },
     #[error("cannot expand home-relative credential path {0}")]
     HomeUnavailable(PathBuf),
+    #[error("subscription runtime is read-only")]
+    ReadOnly,
+    #[error("subscription recovery state failed: {0}")]
+    RecoveryState(String),
+    #[error("subscription account recovery is temporarily backed off")]
+    RecoveryBackoff,
 }
 
 fn expand_home_path(path: &Path, home: Option<&Path>) -> Result<PathBuf, SubscriptionRuntimeError> {
@@ -1607,6 +2017,8 @@ mod tests {
             placement_score: Some(0.5),
             active_global_leases: 1,
             active_model_leases: 1,
+            reservation: None,
+            _probe: None,
         };
         let debug = format!("{selected:?}");
         assert!(!debug.contains("secret"));
@@ -1631,91 +2043,11 @@ mod tests {
                 source: crate::LimitSource::UsageEndpoint,
             }],
             extra_usage: ExtraUsageState::default(),
+            limit_resets: None,
             last_error: None,
         };
         let json = serde_json::to_string(&status).expect("status JSON");
         assert!(!json.contains("accessToken"));
         assert!(!json.contains("refreshToken"));
-    }
-
-    fn affinity_key(launch_id: &str, model: &str) -> AffinityKey {
-        AffinityKey {
-            launch_id: launch_id.to_owned(),
-            model: ModelFamily::from_requested_model(model),
-        }
-    }
-
-    #[test]
-    fn placement_keeps_primary_and_scopes_override_to_one_model() {
-        let mut placement = PlacementState::default();
-        let now = Instant::now();
-        let sonnet = affinity_key("launch", "sonnet");
-        placement.reserve(sonnet.clone(), "a".to_owned(), now);
-        assert_eq!(
-            placement.commit(sonnet.clone(), "a".to_owned(), now),
-            SessionAssignmentReason::BalancedNewLaunch
-        );
-
-        let fable = affinity_key("launch", "fable");
-        placement.reserve(fable.clone(), "b".to_owned(), now);
-        assert_eq!(
-            placement.commit(fable.clone(), "b".to_owned(), now),
-            SessionAssignmentReason::ModelOverride
-        );
-        assert_eq!(placement.preferred_account(&sonnet), Some("a"));
-        assert_eq!(placement.preferred_account(&fable), Some("b"));
-
-        placement.clear_model_assignment(&fable, "b");
-        assert_eq!(placement.preferred_account(&fable), Some("a"));
-        assert_eq!(placement.preferred_account(&sonnet), Some("a"));
-    }
-
-    #[test]
-    fn placement_counts_global_launches_once_and_model_leases_separately() {
-        let mut placement = PlacementState::default();
-        let now = Instant::now();
-        for key in [
-            affinity_key("launch-one", "sonnet"),
-            affinity_key("launch-one", "fable"),
-            affinity_key("launch-two", "sonnet"),
-        ] {
-            placement.reserve(key.clone(), "a".to_owned(), now);
-            placement.commit(key, "a".to_owned(), now);
-        }
-
-        let loads = placement.loads_for(&affinity_key("new-launch", "sonnet"));
-        let account = loads.get("a").expect("account load");
-        assert_eq!(account.active_global_leases, 2);
-        assert_eq!(account.active_model_leases, 2);
-
-        let status = placement.runtime_status(["a", "b"].into_iter(), Duration::from_secs(900));
-        assert_eq!(status.active_lease_ttl_seconds, 900);
-        let account_a = status
-            .accounts
-            .iter()
-            .find(|account| account.id == "a")
-            .expect("account a placement");
-        assert_eq!(account_a.active_launch_leases, 2);
-        assert_eq!(account_a.active_model_leases["sonnet"], 2);
-        assert_eq!(account_a.active_model_leases["fable"], 1);
-        assert_eq!(account_a.primary_assignments, 2);
-        assert_eq!(account_a.model_overrides, 0);
-    }
-
-    #[test]
-    fn expired_active_lease_stops_contributing_without_losing_affinity() {
-        let mut placement = PlacementState::default();
-        let now = Instant::now();
-        let key = affinity_key("launch", "sonnet");
-        placement.reserve(key.clone(), "a".to_owned(), now);
-        placement.commit(key.clone(), "a".to_owned(), now);
-
-        placement.prune_active_leases(now + Duration::from_secs(901), Duration::from_secs(900));
-        assert!(
-            placement
-                .loads_for(&affinity_key("other", "sonnet"))
-                .is_empty()
-        );
-        assert_eq!(placement.preferred_account(&key), Some("a"));
     }
 }

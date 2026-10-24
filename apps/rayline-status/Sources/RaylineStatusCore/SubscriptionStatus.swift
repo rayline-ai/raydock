@@ -20,6 +20,7 @@ public struct AccountRuntimeStatus: Decodable, Sendable {
   public let completeGlobalSnapshot: Bool
   public let claims: [LimitClaim]
   public let lastError: String?
+  public let limitResets: LimitResetStatus?
 
   enum CodingKeys: String, CodingKey {
     case id
@@ -29,6 +30,7 @@ public struct AccountRuntimeStatus: Decodable, Sendable {
     case completeGlobalSnapshot = "complete_global_snapshot"
     case claims
     case lastError = "last_error"
+    case limitResets = "limit_resets"
   }
 }
 
@@ -176,6 +178,7 @@ public struct AccountPresentation: Identifiable, Sendable {
   public let activeLaunches: Int
   public let limits: [LimitPresentation]
   public let warning: String?
+  public let limitResets: ResetInventoryPresentation
 }
 
 public struct PoolPresentation: Sendable {
@@ -240,7 +243,8 @@ extension PoolRuntimeStatus {
         availability: availability,
         activeLaunches: placement?.activeLaunchLeases ?? 0,
         limits: limits,
-        warning: account.lastError
+        warning: account.lastError,
+        limitResets: ResetInventoryPresentation(inventory: account.limitResets, at: now)
       )
     }
     return PoolPresentation(poolID: poolID, accounts: rows)

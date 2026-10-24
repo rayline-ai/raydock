@@ -283,7 +283,8 @@ final class UsageHistoryTests: XCTestCase {
             fableClaim(utilization: near.0, reset: near.1),
             fableClaim(utilization: far.0, reset: far.1),
           ],
-          lastError: nil
+          lastError: nil,
+          limitResets: nil
         )
       ],
       placement: nil
@@ -324,7 +325,8 @@ final class UsageHistoryTests: XCTestCase {
               resetsAt: String(Int64(resetsAt.timeIntervalSince1970))
             )
           ],
-          lastError: nil
+          lastError: nil,
+          limitResets: nil
         )
       ],
       placement: nil

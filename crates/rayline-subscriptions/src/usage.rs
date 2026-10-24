@@ -79,7 +79,7 @@ impl UsageSnapshot {
                 .unwrap_or("scoped_limit")
                 .to_owned();
             claims.push(LimitClaim {
-                key,
+                key: crate::limits::normalize_claim_key(&key),
                 scope,
                 utilization: limit.percent.and_then(normalize_percent),
                 status: ClaimStatus::Allowed,

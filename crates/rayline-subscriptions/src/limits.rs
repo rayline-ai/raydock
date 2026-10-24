@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -20,7 +21,7 @@ impl LimitClaim {
     pub fn applies_to(&self, model: &ModelFamily) -> bool {
         match &self.scope {
             ClaimScope::Global => true,
-            ClaimScope::Model(family) => family == model,
+            ClaimScope::Model(family) => model_scope_matches(family, model),
             ClaimScope::Surface(_) | ClaimScope::Unknown => false,
         }
     }
@@ -49,7 +50,7 @@ impl LimitClaim {
     }
 }
 
-fn parse_reset_unix_seconds(value: &str) -> Option<i64> {
+pub(crate) fn parse_reset_unix_seconds(value: &str) -> Option<i64> {
     let value = value.trim();
     if let Ok(timestamp) = value.parse::<i64>() {
         // Provider headers have appeared in both seconds and millisecond-like
@@ -63,6 +64,59 @@ fn parse_reset_unix_seconds(value: &str) -> Option<i64> {
     OffsetDateTime::parse(value, &Rfc3339)
         .ok()
         .map(|timestamp| timestamp.unix_timestamp())
+}
+
+/// Canonical provider claim names shared by usage polling and response evidence.
+pub(crate) fn normalize_claim_key(value: &str) -> String {
+    let value = value.trim().to_ascii_lowercase().replace('-', "_");
+    match value.as_str() {
+        "5h" | "five_hour" => "five_hour".to_owned(),
+        "7d" | "seven_day" => "seven_day".to_owned(),
+        "7d_oi" | "seven_day_overage_included" => "seven_day_overage_included".to_owned(),
+        "7d_opus" => "seven_day_opus".to_owned(),
+        "7d_sonnet" => "seven_day_sonnet".to_owned(),
+        _ => value,
+    }
+}
+
+pub(crate) fn model_scope_matches(scope: &ModelFamily, requested: &ModelFamily) -> bool {
+    if scope == requested {
+        return true;
+    }
+    let Some(encoded) = scope.as_str().strip_prefix("sha256_") else {
+        return false;
+    };
+    if encoded.len() != 64 {
+        return false;
+    }
+    let digest = Sha256::digest(requested.as_str().as_bytes());
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .zip(digest)
+        .all(|(pair, byte)| pair == [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 15)]])
+}
+
+pub(crate) fn persistent_model_scope(model: &ModelFamily) -> ModelFamily {
+    if matches!(model.as_str(), "fable" | "opus" | "sonnet" | "haiku")
+        || (model.as_str().starts_with("sha256_")
+            && model.as_str().len() == 71
+            && model.as_str()[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        return model.clone();
+    }
+    let digest = Sha256::digest(model.as_str().as_bytes());
+    let mut encoded = String::with_capacity(71);
+    encoded.push_str("sha256_");
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 15)]));
+    }
+    ModelFamily::from_display_name(&encoded)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -159,7 +213,15 @@ impl AccountLimitState {
     }
 
     pub fn entitlement_for(&self, model: &ModelFamily) -> Entitlement {
-        self.entitlements.get(model).copied().unwrap_or_default()
+        self.entitlements
+            .get(model)
+            .copied()
+            .or_else(|| {
+                self.entitlements.iter().find_map(|(scope, entitlement)| {
+                    model_scope_matches(scope, model).then_some(*entitlement)
+                })
+            })
+            .unwrap_or_default()
     }
 
     pub fn apply_response_observation(

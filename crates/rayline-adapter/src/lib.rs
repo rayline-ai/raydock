@@ -829,6 +829,7 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
             requested_model: Some(client_model.clone()),
             agent_id: None,
             agent_type: None,
+            session_id: None,
         });
         metrics.record(MetricsUpdate::RouteDecided {
             request_id: request_id.clone(),
@@ -841,6 +842,7 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
             task_class: None,
             agent_id: None,
             agent_type: None,
+            session_id: None,
         });
         metrics.record(MetricsUpdate::TokenUsage {
             request_id: request_id.clone(),

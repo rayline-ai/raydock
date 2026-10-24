@@ -15,59 +15,79 @@ public enum RaylineStatusClientError: LocalizedError, Sendable {
       "Could not read Rayline status: \(message)"
     }
   }
+
+  var isMissingSubscriptionDaemon: Bool {
+    guard case .commandFailed(let message) = self else { return false }
+    return message.contains("has no running daemon")
+  }
 }
 
 public struct RaylineStatusClient: Sendable {
   public init() {}
 
-  static func arguments(poolID: String) -> [String] {
-    [
+  static func arguments(poolID: String, liveOnly: Bool) -> [String] {
+    var arguments = [
       "subscriptions", "status",
       "--pool", poolID,
       "--json",
-      "--live-only",
     ]
+    arguments.append(liveOnly ? "--live-only" : "--poll-usage")
+    return arguments
   }
 
   public func fetch(poolID: String = "default") async throws -> PoolRuntimeStatus {
     let executable = try RaylineExecutableLocator.resolve()
+    let liveArguments = Self.arguments(poolID: poolID, liveOnly: true)
+    let standaloneArguments = Self.arguments(poolID: poolID, liveOnly: false)
     return try await Task.detached(priority: .utility) {
-      let process = Process()
-      let standardOutput = Pipe()
-      let standardError = Pipe()
-      process.executableURL = executable
-      process.arguments = Self.arguments(poolID: poolID)
-      process.standardOutput = standardOutput
-      process.standardError = standardError
-
       do {
-        try process.run()
-      } catch {
-        throw RaylineStatusClientError.commandFailed(
-          "Could not start Rayline: \(error.localizedDescription)")
-      }
-
-      let output = standardOutput.fileHandleForReading.readDataToEndOfFile()
-      let errorOutput = standardError.fileHandleForReading.readDataToEndOfFile()
-      process.waitUntilExit()
-
-      guard process.terminationStatus == 0 else {
-        let boundedError = Data(errorOutput.prefix(1_024))
-        let message = String(data: boundedError, encoding: .utf8)?
-          .trimmingCharacters(in: .whitespacesAndNewlines)
-        let fallback = "Rayline status exited with code \(process.terminationStatus)."
-        let detail = message.flatMap { $0.isEmpty ? nil : $0 } ?? fallback
-        throw RaylineStatusClientError.commandFailed(detail)
-      }
-      guard output.count <= 2 * 1_024 * 1_024 else {
-        throw RaylineStatusClientError.invalidResponse("response exceeded 2 MiB")
-      }
-      do {
-        return try JSONDecoder().decode(PoolRuntimeStatus.self, from: output)
-      } catch {
-        throw RaylineStatusClientError.invalidResponse(error.localizedDescription)
+        return try Self.run(executable: executable, arguments: liveArguments)
+      } catch let error as RaylineStatusClientError
+        where error.isMissingSubscriptionDaemon
+      {
+        // Poll usage read-only for ordinary Claude sessions. The CLI uses
+        // existing valid grants without OAuth refresh or credential writes.
+        return try Self.run(executable: executable, arguments: standaloneArguments)
       }
     }.value
+  }
+
+  private static func run(executable: URL, arguments: [String]) throws -> PoolRuntimeStatus {
+    let process = Process()
+    let standardOutput = Pipe()
+    let standardError = Pipe()
+    process.executableURL = executable
+    process.arguments = arguments
+    process.standardOutput = standardOutput
+    process.standardError = standardError
+
+    do {
+      try process.run()
+    } catch {
+      throw RaylineStatusClientError.commandFailed(
+        "Could not start Rayline: \(error.localizedDescription)")
+    }
+
+    let output = standardOutput.fileHandleForReading.readDataToEndOfFile()
+    let errorOutput = standardError.fileHandleForReading.readDataToEndOfFile()
+    process.waitUntilExit()
+
+    guard process.terminationStatus == 0 else {
+      let boundedError = Data(errorOutput.prefix(1_024))
+      let message = String(data: boundedError, encoding: .utf8)?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      let fallback = "Rayline status exited with code \(process.terminationStatus)."
+      let detail = message.flatMap { $0.isEmpty ? nil : $0 } ?? fallback
+      throw RaylineStatusClientError.commandFailed(detail)
+    }
+    guard output.count <= 2 * 1_024 * 1_024 else {
+      throw RaylineStatusClientError.invalidResponse("response exceeded 2 MiB")
+    }
+    do {
+      return try JSONDecoder().decode(PoolRuntimeStatus.self, from: output)
+    } catch {
+      throw RaylineStatusClientError.invalidResponse(error.localizedDescription)
+    }
   }
 }
 

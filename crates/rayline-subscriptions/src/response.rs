@@ -217,13 +217,7 @@ fn scope_for_header_claim(
 }
 
 fn canonical_header_claim(claim: &str) -> String {
-    match claim {
-        "5h" => "five_hour",
-        "7d" => "seven_day",
-        "7d_oi" => "seven_day_overage_included",
-        other => other,
-    }
-    .to_owned()
+    crate::limits::normalize_claim_key(claim)
 }
 
 fn header_value_is(headers: &HeaderSnapshot, name: &str, expected: &str) -> bool {
