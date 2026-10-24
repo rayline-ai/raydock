@@ -211,15 +211,17 @@ switch back after automatic setup, run `rayline claude-desktop off`: it restores
 both the previously selected profile and deployment mode, then reopens Desktop.
 You may need to sign in again. `stop` only stops the router. `uninstall` restores
 before deleting the recovery record; the saved Rayline profile stays available.
+Restoration and gateway cleanup also work if Claude.app was moved or removed;
+if Desktop cannot be reopened, the command reports that without undoing recovery.
 For manual imports, `off` prints the steps to sign out of Gateway mode and sign
 in with your Anthropic account.
 
 Recovery state is owner-only in `~/.rayline/claude-desktop/desktop-profile.json`.
 Repeated starts reuse the same profile and preserve the original recovery
 selection. Changes to unrelated preferences and saved profiles are preserved.
-An externally changed active selection, unreadable or unknown profile metadata,
-or organization-managed inference settings cause an error instead of an
-overwrite. Interrupted writes retain recovery state for `off`. Do not delete
+Automatic setup refuses externally changed profiles, hybrid pointers, or
+deployment modes, unreadable previous profiles, unknown profile metadata, and
+organization-managed inference settings instead of overwriting them. Interrupted writes retain recovery state for `off`. Do not delete
 that file while recovery is pending. A failed launch attempts to restore the
 previous selection; the gateway remains running for manual setup.
 

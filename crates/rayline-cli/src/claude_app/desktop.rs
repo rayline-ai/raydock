@@ -169,22 +169,41 @@ impl ProfileStore {
         Ok(())
     }
 
+    fn require_profile(&self, id: &Value) -> io::Result<()> {
+        if !valid_id(id) {
+            return Err(invalid("Invalid Desktop profile id"));
+        }
+        let path = self.library.join(format!(
+            "{}.json",
+            id.as_str().ok_or_else(|| invalid("Missing profile id"))?
+        ));
+        if read_object(&path)?.is_none() {
+            return Err(invalid(
+                "Previous Desktop profile file is missing; cannot guarantee recovery",
+            ));
+        }
+        Ok(())
+    }
+
     /// Preflight is read-only and runs before quitting Desktop.
     pub(super) fn matches(&self, desired: &Value) -> io::Result<bool> {
         self.check_paths()?;
         let meta = self.meta()?;
         let state = self.state()?;
+        let config = read_object(&self.config)?.unwrap_or_else(|| json!({}));
         if let Some(state) = state.as_ref().filter(|state| !state["previous"].is_null()) {
-            if meta
-                .as_ref()
-                .is_none_or(|meta| meta["appliedId"] != state["profileId"])
+            if meta.as_ref().is_none_or(|meta| {
+                meta["appliedId"] != state["profileId"] || !meta["hybridPointer"].is_null()
+            }) || (state["phase"] == "active" && config["deploymentMode"] != "3p")
             {
                 return Err(invalid(
                     "Desktop selection changed or setup was interrupted. Run `rayline claude-desktop off` to recover; if it reports a selection conflict, select Rayline ARC in Desktop before retrying off",
                 ));
             }
+            self.require_profile(&state["previous"]["appliedId"])?;
+        } else if let Some(meta) = &meta {
+            self.require_profile(&meta["appliedId"])?;
         }
-        let config = read_object(&self.config)?.unwrap_or_else(|| json!({}));
         if !config["deploymentMode"].is_null()
             && !matches!(config["deploymentMode"].as_str(), Some("1p" | "3p"))
         {
@@ -276,9 +295,15 @@ impl ProfileStore {
         let meta = self.meta()?.ok_or_else(|| {
             invalid("Desktop profile library disappeared; recovery record retained")
         })?;
-        if meta["appliedId"] != state["profileId"]
-            && (state["phase"] != "prepared" || meta["appliedId"] != previous["appliedId"])
-        {
+        let config = read_object(&self.config)?.unwrap_or_else(|| json!({}));
+        let own_selection =
+            meta["appliedId"] == state["profileId"] && meta["hybridPointer"].is_null();
+        let previous_selection = meta["appliedId"] == previous["appliedId"]
+            && meta["hybridPointer"] == previous["hybridPointer"];
+        let prepared = state["phase"] == "prepared";
+        let mode_matches = config["deploymentMode"] == "3p"
+            || (prepared && config["deploymentMode"] == previous["mode"]);
+        if !(own_selection || (prepared && previous_selection)) || !mode_matches {
             return Err(invalid(
                 "Desktop selection was changed outside Rayline; recovery record retained, no settings restored",
             ));
@@ -292,18 +317,7 @@ impl ProfileStore {
                 "Previous Desktop profile is missing; recovery record retained",
             ));
         }
-        let previous_path = self.library.join(format!(
-            "{}.json",
-            previous["appliedId"]
-                .as_str()
-                .ok_or_else(|| invalid("Invalid recovery id"))?
-        ));
-        if read_object(&previous_path)?.is_none() {
-            return Err(invalid(
-                "Previous Desktop profile file is missing; recovery record retained",
-            ));
-        }
-        let config = read_object(&self.config)?.unwrap_or_else(|| json!({}));
+        self.require_profile(&previous["appliedId"])?;
         Ok(Some((state, meta, config)))
     }
 
@@ -524,12 +538,23 @@ mod macos {
         if !store.has_previous()? {
             return Ok(false);
         }
-        let app = preflight(home)?;
-        // Validate recovery before interrupting the app; restore rechecks after quit.
+        // Recovery must not depend on an installed app or today's managed
+        // policy. Restore our local selection even if the app was removed.
         store.recovery()?;
         quit()?;
         store.restore()?;
-        open(&app)?;
+        match app_path(home) {
+            Ok(app) => {
+                if let Err(error) = open(&app) {
+                    eprintln!(
+                        "Desktop settings restored, but reopening failed: {error}. Open Claude manually when available."
+                    );
+                }
+            }
+            Err(_) => eprintln!(
+                "Desktop settings restored; Claude.app is unavailable, so it was not reopened."
+            ),
+        }
         Ok(true)
     }
 }
@@ -756,16 +781,67 @@ mod tests {
 
     #[test]
     fn external_selection_is_not_overwritten_by_off_or_retry() {
-        let f = Fixture::new();
-        let original = f.seed(json!("1p"));
-        f.store.activate(&desired("test-token")).expect("activate");
-        let mut meta = f.store.meta().expect("read").expect("meta");
-        meta["appliedId"] = original["appliedId"].clone();
-        write_json(&f.store.library.join("_meta.json"), &meta).expect("user changes selection");
-        assert!(f.store.restore().is_err());
-        assert!(f.store.activate(&desired("new-token")).is_err());
-        assert_eq!(f.store.meta().expect("read").expect("meta"), meta);
-        assert!(f.store.has_previous().expect("retains recovery"));
+        for change in ["profile", "hybrid", "mode"] {
+            let f = Fixture::new();
+            let original = f.seed(json!("1p"));
+            f.store.activate(&desired("test-token")).expect("activate");
+            let mut meta = f.store.meta().expect("read").expect("meta");
+            let mut config = read_object(&f.store.config).expect("read").expect("config");
+            match change {
+                "profile" => meta["appliedId"] = original["appliedId"].clone(),
+                "hybrid" => {
+                    meta["hybridPointer"] = json!({"bootstrapUrl":"https://changed.example.test"})
+                }
+                "mode" => config["deploymentMode"] = json!("1p"),
+                _ => unreachable!(),
+            }
+            write_json(&f.store.library.join("_meta.json"), &meta).expect("external selection");
+            write_json(&f.store.config, &config).expect("external mode");
+            let journal = fs::read(&f.store.journal).expect("journal");
+            assert!(
+                f.store.restore().is_err(),
+                "off must reject changed {change}"
+            );
+            assert!(
+                f.store.activate(&desired("new-token")).is_err(),
+                "start must reject changed {change}"
+            );
+            assert_eq!(f.store.meta().expect("read").expect("meta"), meta);
+            assert_eq!(
+                read_object(&f.store.config).expect("read").expect("config"),
+                config
+            );
+            assert_eq!(
+                fs::read(&f.store.journal).expect("unchanged journal"),
+                journal
+            );
+        }
+    }
+
+    #[test]
+    fn activation_requires_a_recoverable_previous_profile() {
+        for missing in [true, false] {
+            let f = Fixture::new();
+            let original = f.seed(json!("1p"));
+            let path = f.store.library.join(format!(
+                "{}.json",
+                original["appliedId"].as_str().expect("id")
+            ));
+            if missing {
+                fs::remove_file(path).expect("remove previous profile");
+            } else {
+                fs::write(path, b"invalid JSON").expect("corrupt previous profile");
+            }
+            let config = fs::read(&f.store.config).expect("original config");
+            assert!(
+                f.store.matches(&desired("test-token")).is_err(),
+                "preflight must reject missing={missing}"
+            );
+            assert!(f.store.activate(&desired("test-token")).is_err());
+            assert_eq!(f.store.meta().expect("read").expect("meta"), original);
+            assert_eq!(fs::read(&f.store.config).expect("unchanged config"), config);
+            assert!(!f.store.journal.exists());
+        }
     }
 
     #[cfg(unix)]
