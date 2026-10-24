@@ -24,9 +24,13 @@ must name the selected worker rather than submit a second routing request. The
 configuration contains credential environment-variable names, never keys. The
 core validates the policy-package and thinking-registry hashes at startup.
 
-For hosted Decisions and Rayline cloud inference, provide
-`RAYLINE_ROUTER_API_KEY` explicitly in the launch environment. Hybrid does not
-load saved production credentials for destinations named by a separate config.
+For hosted Decisions and Rayline cloud inference, the core reads the Rayline
+API key from the environment variable each endpoint names (normally
+`RAYLINE_ROUTER_API_KEY`). An explicit launch-environment value always wins.
+Otherwise `start` supplies the key saved by `rayline auth login` only for an
+HTTPS endpoint on the same host as that signed-in environment's router (for
+example the dev key for `https://api-dev.rayline.ai`); it never offers a saved
+key to another host and prints only the variable name.
 The core rejects missing credential environment references before startup. The
 launcher withholds every configured credential environment variable from the
 harness, including custom Decisions and inference key names. Readiness metadata
@@ -38,6 +42,56 @@ supported by the core; Rust performs no policy selection.
 Hybrid endpoints are selected by the core configuration. The root `--env` and
 `--auth-token` options are not accepted with `hybrid`; use the configuration and
 `RAYLINE_ROUTER_API_KEY` for a non-production endpoint.
+
+## Rayline Local defaults
+
+`start` composes the core configuration from the supplied profile and the
+user's `~/.config/rayline/settings.json`, and writes the result to
+`core-config.json` in the state directory (owner-only). The user's setup is:
+start, a Rayline API key, and a `local_model` pointing at a local Qwen.
+
+- **Hybrid routing works with no overrides.** Unless the profile pins an older
+  Decisions mode, the core uses `decisions.api_mode: "execution_context_v2"`
+  and sends `routing.policy: {"preset": "arc-policy.hybrid-default.v1"}`
+  explicitly. Rayline Local never relies on an absent policy, which the
+  Decisions API reads as today's package default.
+- **One optional override block,** `hybrid.routing` (every key optional):
+
+  ```json
+  {"hybrid": {"routing": {"policy": "utility",
+                          "schedule": {"model": ["cache_boundaries", "user_messages"]},
+                          "value_usd": 0.1}}}
+  ```
+
+  `policy: "utility"` is the hybrid default preset. `prefer_local` is refused
+  until the ARC policy service serves it. `schedule` becomes
+  `routing.policy.overrides.schedule`; each dimension (`model`, `thinking`)
+  lists switch-point classes from `cache_boundaries`, `user_messages` and
+  `all_turns`, and the service refuses a class the package does not admit.
+  `value_usd` becomes `routing.value_usd` and selects the returned `custom`
+  result. Unknown keys are refused.
+- **Local model.** A profile deployment marked `"from_local_model": true`
+  takes its endpoint and served model from `local_model`
+  (`rayline local custom http://127.0.0.1:11434/v1 qwen3.8:27b`); its protocol
+  path is appended. Its runtime identity and thinking-control qualification
+  still come from the profile, and a configured llama.cpp prompt counter
+  verifies the served model at startup. Without a custom `local_model`, such a
+  profile fails to start with the command to run.
+- A profile that explicitly selects `current` or `execution_context_v1` is
+  passed through unchanged, and a `hybrid.routing` block is refused for it.
+
+`start` prints the applied preset and its source, the local model and any saved
+key it used.
+
+**Typed events.** The core's v2 envelope carries what just happened. Pi cannot
+set per-request headers, so `hybrid run pi` loads a Rayline extension
+(`rayline-hybrid-events.ts` in the harness state directory) that adds a
+`rayline_event` member to each provider payload: `task_start`, `user_message`
+after a typed prompt, `tool_result` otherwise, and `compaction` (summary index,
+retained-tail start and `new: true`) for the first request after a Pi
+compaction. A provider retry of an identical transcript keeps its event. The
+core removes the member before Decisions and inference. Other harnesses use
+the core's documented wire markers (`basis: marker_inferred`).
 
 ## Start and connect
 
@@ -158,6 +212,15 @@ python3 scripts/test-hybrid-core.py \
   --core /absolute/path/to/rayline-core \
   --registry /absolute/path/to/rayline-core/thinkingcontrol/thinking_controls.compiled.json
 ```
+
+For the v2 seams, `scripts/test-hybrid-v2.py --core <v2 core> --registry <registry>`
+joins the real CLI, `rld`, Go core and installed Pi against synthetic Decisions
+and inference fixtures. It checks that `start` composes the hybrid preset, a
+settings schedule override and `local_model`, that Pi's extension events reach
+Decisions as `basis: explicit_client` (`task_start`, then `tool_result` with
+`last_served` and `history`), and that `rayline_event` never reaches Decisions or
+inference. Capacity facts need a qualified llama.cpp counter; the Go core's
+tests and the live acceptance cover them.
 
 The process tests use a local executable contract fixture to verify supervision,
 auth, transparent forwarding, native fork identity, cancellation, shutdown,

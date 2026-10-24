@@ -30,6 +30,8 @@ enum Action {
         /// Override the execution core installed beside rayline.
         #[arg(long)]
         core: Option<PathBuf>,
+        /// Qualified execution-core profile. Rayline Local applies its hybrid
+        /// defaults, `hybrid.routing` overrides and `local_model` to it.
         #[arg(long)]
         config: PathBuf,
         /// Loopback gateway port; 0 chooses a free port.
@@ -67,6 +69,9 @@ impl Paths {
     }
     fn supervisor(&self) -> PathBuf {
         self.dir.join("supervisor.json")
+    }
+    fn core_config(&self) -> PathBuf {
+        self.dir.join("core-config.json")
     }
 }
 
@@ -144,7 +149,49 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 Some(path) => fs::canonicalize(path)?,
                 None => installed_binary("rayline-core")?,
             };
-            let config = fs::canonicalize(config)?;
+            let profile_path = fs::canonicalize(config)?;
+            let profile: Value =
+                serde_json::from_slice(&fs::read(&profile_path)?).map_err(|error| {
+                    io::Error::other(format!("invalid hybrid configuration: {error}"))
+                })?;
+            let settings = crate::status::read_settings(&home);
+            let composed = crate::hybrid_profile::compose(
+                profile,
+                settings.as_ref(),
+                profile_path.parent().unwrap_or(Path::new("/")),
+            )
+            .map_err(io::Error::other)?;
+            let credentials =
+                crate::hybrid_profile::saved_credentials(&composed.config, &home, |name| {
+                    std::env::var(name).ok()
+                })
+                .map_err(io::Error::other)?;
+            serde_json::to_writer_pretty(
+                private_file(&paths.core_config(), true)?,
+                &composed.config,
+            )
+            .map_err(io::Error::other)?;
+            let config = paths.core_config();
+            match (&composed.policy, &composed.preset) {
+                (crate::hybrid_profile::PolicySource::LegacyMode(mode), _) => {
+                    println!("Routing policy: none (profile pins Decisions api_mode {mode})")
+                }
+                (source, Some(preset)) => println!(
+                    "Routing policy: {preset} ({})",
+                    match source {
+                        crate::hybrid_profile::PolicySource::Default => "Rayline Local default",
+                        crate::hybrid_profile::PolicySource::Settings => "settings hybrid.routing",
+                        _ => "profile",
+                    }
+                ),
+                _ => {}
+            }
+            if let Some((id, url, model)) = &composed.local_model {
+                println!("Local model: {model} at {url} (deployment {id}, from local_model)");
+            }
+            for (name, _) in &credentials {
+                println!("Using the saved Rayline key for {name}");
+            }
             let rld = if std::env::var_os("RLD_BIN").is_some() {
                 crate::router::resolve_rld_bin(&home)?
             } else {
@@ -169,6 +216,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log));
+            for (name, key) in &credentials {
+                command.env(name, key);
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::process::CommandExt;
@@ -458,9 +508,21 @@ fn harness_command(
         _ => {
             let harness = crate::harness::Harness::from_command(name)
                 .ok_or_else(|| io::Error::other(format!("unsupported hybrid harness {name:?}")))?;
-            let args = harness.hybrid_args(args)?;
+            let mut args = harness.hybrid_args(args)?;
             let config_dir = paths.dir.join("harness").join(name);
             private_dir(&config_dir)?;
+            if harness == crate::harness::Harness::Pi {
+                // Pi's typed events reach the core through this extension.
+                let extension = config_dir.join(PI_EVENT_EXTENSION);
+                std::io::Write::write_all(
+                    &mut private_file(&extension, true)?,
+                    PI_EVENT_EXTENSION_SOURCE.as_bytes(),
+                )?;
+                args.splice(
+                    0..0,
+                    [OsString::from("--extension"), extension.into_os_string()],
+                );
+            }
             let ctx = crate::harness::RenderContext {
                 env_name: "hybrid",
                 key: token,
@@ -491,6 +553,9 @@ fn harness_command(
     command.args(args);
     Ok(command)
 }
+
+const PI_EVENT_EXTENSION: &str = "rayline-hybrid-events.ts";
+const PI_EVENT_EXTENSION_SOURCE: &str = include_str!("harness/pi_hybrid_events.ts");
 
 fn require_fresh_session(harness: &str, args: &[OsString]) -> io::Result<()> {
     let codex_resume = harness == "codex"
@@ -668,6 +733,42 @@ mod tests {
                 Some(&None)
             );
         }
+    }
+
+    #[test]
+    fn pi_receives_the_event_adapter_extension() {
+        let dir = std::env::temp_dir().join(format!("rayline-hybrid-pi-{}", std::process::id()));
+        let paths = Paths { dir: dir.clone() };
+        private_dir(&dir).unwrap();
+        let command = harness_command(
+            &paths,
+            "pi",
+            &[OsString::from("-p"), OsString::from("hello")],
+            "http://127.0.0.1:20815",
+            "local-token",
+            &ModelCapabilities {
+                context_window: 16384,
+                max_output_tokens: 2048,
+                input_modalities: vec!["text".into()],
+            },
+        )
+        .unwrap();
+        let args: Vec<_> = command.get_args().map(|arg| arg.to_os_string()).collect();
+        let extension = dir.join("harness/pi").join(PI_EVENT_EXTENSION);
+        assert_eq!(args[0], "--extension");
+        assert_eq!(args[1], extension.as_os_str());
+        assert!(args.iter().any(|arg| arg == "hello"));
+        let source = fs::read_to_string(&extension).unwrap();
+        assert!(source.contains("rayline_event") && source.contains("before_provider_request"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&extension).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

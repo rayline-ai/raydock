@@ -28,7 +28,7 @@ const IDENTITY_TOOLKIT_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp";
 const IDENTITY_TOOLKIT_CUSTOM_TOKEN_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken";
-const PROD_ENV: &str = "prod";
+pub(crate) const PROD_ENV: &str = "prod";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusRequest {

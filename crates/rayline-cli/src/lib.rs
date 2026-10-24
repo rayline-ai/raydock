@@ -14,6 +14,7 @@ pub mod codex_app;
 pub mod discover;
 pub mod harness;
 pub mod hybrid;
+pub(crate) mod hybrid_profile;
 pub mod local_model;
 pub mod onboarding;
 pub mod providers;

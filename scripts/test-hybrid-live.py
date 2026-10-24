@@ -178,6 +178,10 @@ def main():
     assert args.max_run_cost_usd.is_finite() and args.max_run_cost_usd > 0
     cost_bound = attempt_limit * args.generation_cost_bound_usd
     assert cost_bound <= args.max_run_cost_usd, "configured attempt/token cost bound exceeds the run budget"
+    # `rayline hybrid start` applies Rayline Local's v2 policy defaults unless a
+    # profile pins its Decisions mode; these proofs check the mode they name.
+    assert config["decisions"].get("api_mode") in ("current", "execution_context_v1"), \
+        "pin decisions.api_mode (current or execution_context_v1) for this live proof"
     routing = config["decisions"]["routing"]
     if args.proof == "routing":
         require_routing_config(config["decisions"], args.price_profile_content_hash)
