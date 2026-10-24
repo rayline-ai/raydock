@@ -274,13 +274,6 @@ impl ProfileStore {
         write_json(&self.journal, &state)
     }
 
-    pub(super) fn has_previous(&self) -> io::Result<bool> {
-        self.check_paths()?;
-        Ok(self
-            .state()?
-            .is_some_and(|state| !state["previous"].is_null()))
-    }
-
     /// Restore only selection keys. Preferences and other saved profiles may
     /// have changed while Claude was running and must survive `off`.
     fn recovery(&self) -> io::Result<Option<(Value, Value, Value)>> {
@@ -535,12 +528,11 @@ mod macos {
         let store = ProfileStore::new(home);
         store.check_paths()?;
         let _lock = profile_lock(home)?;
-        if !store.has_previous()? {
+        // Recovery must not depend on an installed app or today's managed
+        // policy. Validate it before interrupting the app, and recheck after quit.
+        if store.recovery()?.is_none() {
             return Ok(false);
         }
-        // Recovery must not depend on an installed app or today's managed
-        // policy. Restore our local selection even if the app was removed.
-        store.recovery()?;
         quit()?;
         store.restore()?;
         match app_path(home) {
