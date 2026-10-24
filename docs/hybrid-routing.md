@@ -312,18 +312,24 @@ python3 scripts/test-hybrid-live.py \
   --generation-cost-bound-usd 0.25
 ```
 
-On 2026-10-23, installed Pi 0.80.2 completed the ledger task through the real
-Decisions service and real inference: cloud Haiku → on-device Qwen 27B → cloud
-Haiku, including file read and write tools. The parent oracle verified the
-result. The local turn used an explicit test alias from ARC's selected DeepSeek
-Flash action to the qualified Qwen deployment; selection and execution were
-recorded separately. This establishes mixed local/cloud execution, not a
-calibrated ARC decision for Qwen. The scheduler task stopped visibly when ARC
-selected an additional model without an execution binding; it did not pass.
+On 2026-10-23, installed Pi 0.80.2 completed both tasks through the real
+Decisions service and real inference using the same configuration. The ledger
+used three generations: cloud Haiku → on-device Qwen 27B → cloud Haiku, including
+file read and write tools. The parent oracle verified quantity 10 and total
+1,284 cents. The local turn used an explicit test alias from ARC's selected
+DeepSeek Flash action to the qualified Qwen deployment; selection and execution
+were recorded separately. This establishes mixed local/cloud execution, not a
+calibrated ARC decision for Qwen.
+
+The scheduler completed in six cloud generations: Haiku → Sol → Haiku → Haiku →
+Opus → Haiku. Its implementation passed all 19 independent oracle cases and the
+input-mutation check. Both tasks had matching decision and completed-execution
+records, and the runner cleaned up its owned core and gateway successfully.
 
 That run used `top` with empty routing. It does not establish the requested
-low-V, discounted-Qwen-price acceptance, an entirely local simple task, or a
-completed cloud scheduler task. The process cap was eight inference attempts
-with 2,048 output tokens per request and a $4 operator-verified inference cost
-bound. The current Rust workspace gate passed 745 tests with no failures and
-two existing ignored tests; workspace all-target clippy and formatting passed.
+low-V, discounted-Qwen-price acceptance or an entirely local simple task. The
+limits were 4,096 output tokens per request, six generations per task, twelve
+process-wide inference attempts, and 300 seconds per task, with a $4.80
+operator-verified inference cost bound. The current Rust workspace gate passed
+745 tests with no failures and two existing ignored tests; workspace all-target
+clippy and formatting passed.
