@@ -41,6 +41,7 @@ pub enum UpdateError {
 struct UpdateArtifacts {
     launcher: PathBuf,
     daemon: PathBuf,
+    core: PathBuf,
 }
 
 impl std::fmt::Display for UpdateError {
@@ -115,16 +116,37 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
         None => fetch_latest_version(&channel).await?,
     };
 
-    let decision = evaluate_check(
+    let mut decision = evaluate_check(
         &current,
         &target,
         request.pinned_version.is_some() || request.channel.is_some(),
         request.force,
     );
+    let core_install_path =
+        install_path.with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
+    if decision.exit_code == 0 && !core_install_path.is_file() {
+        if target.normalized != current.normalized {
+            return Err(UpdateError::Install(format!(
+                "Cannot repair the execution core from an older release pointer; run `rayline update --version {}`.",
+                current.normalized
+            )));
+        }
+        decision = UpdateResult {
+            message: format!(
+                "Execution core is missing; reinstall the complete {} release with `rayline update`.\n",
+                current.public
+            ),
+            exit_code: 1,
+            stderr: false,
+        };
+    }
     if decision.exit_code == 0 || request.check_only {
         return Ok(decision);
     }
 
+    if !request.check_only && !core_install_path.is_file() {
+        eprintln!("Execution core is missing; verifying the complete release.");
+    }
     let temp_dir = temp_update_dir()?;
     let artifacts = download_and_verify(&target.normalized, platform_tag, &temp_dir).await;
     let result = match artifacts {
@@ -132,9 +154,10 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
             if request.dry_run {
                 Ok(UpdateResult {
                     message: format!(
-                        "Would install {} and {}.\n",
+                        "Would install {}, {} and {}.\n",
                         artifacts.launcher.display(),
-                        artifacts.daemon.display()
+                        artifacts.daemon.display(),
+                        artifacts.core.display()
                     ),
                     exit_code: 0,
                     stderr: false,
@@ -156,6 +179,9 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                         crate::DAEMON_BIN,
                         std::env::consts::EXE_SUFFIX
                     ));
+                let core_install_path = daemon_install_path
+                    .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
+                replace_binary(&artifacts.core, &core_install_path)?;
                 replace_binary(&artifacts.launcher, &install_path)?;
                 replace_binary(&artifacts.daemon, &daemon_install_path)?;
                 cleanup_legacy_uv_install(crate::UV_TOOL_NAME, &install_path);
@@ -347,20 +373,8 @@ fn latest_url_for(channel: &str) -> Option<String> {
     Some(format!("{}/{latest_key}", base_url()))
 }
 
-fn artifact_url_for(version: &str, platform_tag: &str) -> String {
-    format!(
-        "{}/cli/v{version}/{}-{platform_tag}",
-        base_url(),
-        crate::CLI_BIN
-    )
-}
-
-fn daemon_artifact_url_for(version: &str, platform_tag: &str) -> String {
-    format!(
-        "{}/cli/v{version}/{}-{platform_tag}",
-        base_url(),
-        crate::DAEMON_BIN
-    )
+fn artifact_url_for(version: &str, platform_tag: &str, name: &str) -> String {
+    format!("{}/cli/v{version}/{name}-{platform_tag}", base_url())
 }
 
 fn checksums_url_for(version: &str) -> String {
@@ -443,6 +457,8 @@ async fn download_and_verify(
     let daemon_name = format!("{}-{platform_tag}", crate::DAEMON_BIN);
     let launcher_path = dest_dir.join(&launcher_name);
     let daemon_path = dest_dir.join(&daemon_name);
+    let core_name = format!("rayline-core-{platform_tag}");
+    let core_path = dest_dir.join(&core_name);
     let sums_path = dest_dir.join("SHA256SUMS");
     let sig_path = dest_dir.join("SHA256SUMS.minisig");
 
@@ -460,19 +476,31 @@ async fn download_and_verify(
     let sums = String::from_utf8(sums_bytes)
         .map_err(|_| UpdateError::Checksum("SHA256SUMS contains invalid UTF-8".to_owned()))?;
 
-    download_to(&artifact_url_for(version, platform_tag), &launcher_path).await?;
     download_to(
-        &daemon_artifact_url_for(version, platform_tag),
+        &artifact_url_for(version, platform_tag, crate::CLI_BIN),
+        &launcher_path,
+    )
+    .await?;
+    download_to(
+        &artifact_url_for(version, platform_tag, crate::DAEMON_BIN),
         &daemon_path,
+    )
+    .await?;
+
+    download_to(
+        &artifact_url_for(version, platform_tag, "rayline-core"),
+        &core_path,
     )
     .await?;
 
     verify_checksum(&sums, &launcher_name, &launcher_path)?;
     verify_checksum(&sums, &daemon_name, &daemon_path)?;
+    verify_checksum(&sums, &core_name, &core_path)?;
 
     Ok(UpdateArtifacts {
         launcher: launcher_path,
         daemon: daemon_path,
+        core: core_path,
     })
 }
 

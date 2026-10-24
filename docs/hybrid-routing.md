@@ -41,23 +41,22 @@ Hybrid endpoints are selected by the core configuration. The root `--env` and
 
 ## Start and connect
 
-Build `rayline` and `rld` from this checkout, and build `rayline-core` from the
-matching VSR checkout. The core and policy configuration are explicitly selected;
-this command does not download an unversioned core executable.
+Install or update Rayline using the release installer or Homebrew. The release
+includes its matching execution core. Select your qualified policy and endpoint
+configuration explicitly:
 
 ```bash
-cargo build --locked -p rayline-cli -p rayline-daemon
-export RLD_BIN="$PWD/target/debug/rld"
-
-target/debug/rayline hybrid start \
-  --core /absolute/path/to/rayline-core \
-  --config /absolute/path/to/hybrid.json
-
-target/debug/rayline hybrid status
-target/debug/rayline hybrid run claude -- -p "Explain this repository"
-target/debug/rayline hybrid run codex -- exec "Explain this repository"
-target/debug/rayline hybrid stop
+rayline hybrid start --config /absolute/path/to/hybrid.json
+rayline hybrid status
+rayline hybrid run claude -- -p "Explain this repository"
+rayline hybrid run codex -- exec "Explain this repository"
+rayline hybrid stop
 ```
+
+For source development, build `rayline` and `rld` with
+`cargo build --locked -p rayline-cli -p rayline-daemon`, set `RLD_BIN` to the built
+daemon, and pass `start --core /absolute/path/to/rayline-core` to select a core
+built from the matching VSR source. Startup never downloads an executable.
 
 The default gateway is `http://127.0.0.1:20815`. Use `--port 0` on `start` for
 an ephemeral port. Use `--state-dir /absolute/path` on each command for a separate
@@ -268,6 +267,24 @@ that process. This reference path uses a caller-owned inference runtime.
 Durable resume/fork state, tailnet enrollment, core release packaging and Windows
 lifecycle qualification also remain separate work.
 
+## Installed execution core
+
+Releases include `rayline-core` beside `rayline` and `rld`. `rayline hybrid start
+--config <path>` discovers those companion binaries beside the resolved launcher,
+including when the launcher is reached through a symlink. `--core <path>` remains
+an explicit development override; `RLD_BIN` remains an explicit daemon override.
+Missing installed components fail with a repair instruction, without downloading
+during hybrid startup. `rayline update` repairs a missing core even when the
+launcher is already at the requested release, using verified signed artifacts.
+Users upgrading from an older two-binary updater may need to run it a second time.
+
+Hybrid requires macOS 13 Ventura or later, or Linux. Windows hybrid commands
+fail explicitly because locking, private-state permissions and lifecycle have
+not been qualified; ordinary Windows commands remain available. Historical Mac
+asset names identify the existing update paths and do not express the Go core's
+minimum OS. The core is built with Go 1.27.3, whose [supported Mac minimum is
+macOS 13](https://go.dev/doc/go1.27#darwin).
+
 ## Live Pi acceptance
 
 `scripts/test-hybrid-live.py` consumes a supplied real core configuration and
@@ -279,7 +296,11 @@ resource-constrained dependency scheduler against cases kept outside the agent's
 editable task directory. Agent-written tests do not determine success.
 
 The required `--proof routing` mode verifies that the same configured custom
-`value_usd` and caller price identity were applied to both tasks. All successful
+`value_usd` and caller price identity were applied to both tasks. Supply inline
+`prices` or a service `price_profile_id`; acceptance requires an explicit
+`price_profile_version` and configured `price_sha256` for a profile, and verifies
+the echoed ID, version and content hash on every decision. Ordinary requests may
+use a bare profile ID to resolve the latest version each turn. All successful
 inference for the simple task must execute locally; the scheduler's final
 generation must execute in the cloud. The report links each actual ARC selection
 to completed execution and records selected and executed model identities

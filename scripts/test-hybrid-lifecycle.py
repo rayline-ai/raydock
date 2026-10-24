@@ -23,13 +23,18 @@ def main():
     with tempfile.TemporaryDirectory(prefix="rayline-hybrid-cli-") as tmp:
         root = Path(tmp)
         state = root / "state"
-        env = dict(os.environ, HOME=str(root), RLD_BIN=str(RLD))
+        env = dict(os.environ, HOME=str(root))
+        env.pop("RLD_BIN", None)
+        installed = root / "installed"
+        installed.mkdir()
+        shutil.copy(CLI, installed / "rayline")
+        shutil.copy(RLD, installed / "rld")
         credential_env = ["RAYLINE_TEST_HOSTED_ALIAS", "RAYLINE_TEST_LOCAL_ALIAS", "ANTHROPIC_AUTH_TOKEN"]
         for name in credential_env:
             env[name] = "synthetic-runtime-only-" + name
         for name in ("RAYLINE_ROUTER_API_KEY", "RAYLINE_EXEC_AUTH_TOKEN", "RAYLINE_API_KEY"):
             env.pop(name, None)
-        core = root / "core"
+        core = installed / "rayline-core"
         shutil.copy(ROOT / "crates/rayline-daemon/tests/fixtures/execution-contract.py", core)
         core.chmod(0o700)
         config = root / "core.json"
@@ -39,13 +44,13 @@ def main():
             "deployments": [{"auth_env": name} for name in credential_env[1:]]}))
 
         def cli(*args, success=True):
-            result = subprocess.run([str(CLI), "hybrid", "--state-dir", str(state), *args],
+            result = subprocess.run([str(installed / "rayline"), "hybrid", "--state-dir", str(state), *args],
                                     env=env, capture_output=True, text=True, timeout=75)
             assert (result.returncode == 0) == success, (args, result.stdout, result.stderr)
             return result.stdout
 
         def start():
-            cli("start", "--core", str(core), "--config", str(config), "--port", "0")
+            cli("start", "--config", str(config), "--port", "0")
             return json.loads((state / "ready.json").read_text())
 
         def wait_dead(pid):

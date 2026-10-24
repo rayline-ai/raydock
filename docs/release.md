@@ -23,10 +23,11 @@ release for that tag already exists. It builds with Rust 1.88 and embeds:
 
 The release workflow uploads:
 
-- `rayline-<platform>` and `rld-<platform>` bare binaries;
+- `rayline-<platform>`, `rld-<platform>` and `rayline-core-<platform>` bare binaries;
 - `rayline-<version>-<platform>.tar.gz` archives for macOS/Linux;
 - `rayline-<version>-windows_x86_64.zip` for Windows;
-- `SHA256SUMS` covering every uploaded binary and archive.
+- `rayline-core-source.json` with the pinned public source and toolchain;
+- `SHA256SUMS` covering every uploaded binary, archive and provenance file.
 
 Supported platform tags match the self-updater contract in
 `crates/rayline-cli/src/update.rs`:
@@ -49,6 +50,8 @@ default. After the GitHub Release is created, mirror the bare binary assets and
 ```text
 https://get.rayline.ai/cli/v<version>/rayline-<platform>
 https://get.rayline.ai/cli/v<version>/rld-<platform>
+https://get.rayline.ai/cli/v<version>/rayline-core-<platform>
+https://get.rayline.ai/cli/v<version>/rayline-core-source.json
 https://get.rayline.ai/cli/v<version>/SHA256SUMS
 https://get.rayline.ai/cli/v<version>/SHA256SUMS.minisig
 ```
@@ -120,3 +123,30 @@ base at a local or staged mirror:
 RAYLINE_UPDATE_BASE_URL=file:///tmp/rayline-release \
   /tmp/rayline-bin/rayline update --dry-run --version 0.2.0
 ```
+
+## Execution core build
+
+`release/core-source.json` is the source of truth for the public VSR repository,
+exact commit, Go toolchain, contract version and minimum macOS version. Before
+release, pin the reviewed, merged source commit. Both release pipelines must
+check out that exact source and invoke:
+
+```bash
+python3 scripts/build-hybrid-core.py --source-dir /path/to/clean/vsr \
+  --platform macosx_11_0_arm64 --output-dir dist
+```
+
+The helper refuses a mismatched commit, dirty source tree or different Go
+compiler. It builds without CGO and preserves Go VCS build metadata. Its
+`rayline-core-source.json` output is identical across platform builds and must
+be included in the signed checksum manifest. Archives and installers carry all
+three binaries; self-update verifies all three before installing them.
+
+The historical Mac asset IDs remain stable for existing self-updaters. The Go
+core and hybrid execution require macOS 13+, despite those historical names;
+existing Rust deployment targets are unchanged. Linux hybrid is supported.
+Windows core cross-compiles, but Windows hybrid lifecycle is not qualified and
+the CLI refuses hybrid commands there. A successful cross-build is not runtime
+acceptance. The Homebrew formula template remains authoritative in
+`packaging/homebrew/rayline.rb.template`, with `__RELEASE_BASE_URL__` supplied by
+the publishing pipeline.

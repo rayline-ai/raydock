@@ -27,8 +27,9 @@ struct Cli {
 enum Action {
     /// Start the Go execution core and authenticated loopback gateway.
     Start {
+        /// Override the execution core installed beside rayline.
         #[arg(long)]
-        core: PathBuf,
+        core: Option<PathBuf>,
         #[arg(long)]
         config: PathBuf,
         /// Loopback gateway port; 0 chooses a free port.
@@ -89,6 +90,34 @@ pub async fn run(args: Vec<OsString>) -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> io::Result<ExitCode> {
+    if !cfg!(unix) {
+        return Err(io::Error::other(
+            "hybrid routing currently requires macOS or Linux; Windows lifecycle is not yet supported",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/usr/bin/sw_vers")
+            .arg("-productVersion")
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(
+                "cannot determine macOS version for hybrid routing",
+            ));
+        }
+        let version = String::from_utf8(output.stdout).map_err(io::Error::other)?;
+        let major = version
+            .trim()
+            .split('.')
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or_else(|| io::Error::other("invalid macOS version for hybrid routing"))?;
+        if major < 13 {
+            return Err(io::Error::other(
+                "hybrid routing requires macOS 13 Ventura or later",
+            ));
+        }
+    }
     let home = dirs::home_dir().ok_or_else(|| io::Error::other("cannot find home directory"))?;
     let paths = Paths {
         dir: cli
@@ -111,9 +140,16 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
         } => {
             let _lock = crate::router::acquire_router_lock(&paths.dir.join("runtime.lock"))?;
             clear_stopped_state(&paths)?;
-            let core = fs::canonicalize(core)?;
+            let core = match core {
+                Some(path) => fs::canonicalize(path)?,
+                None => installed_binary("rayline-core")?,
+            };
             let config = fs::canonicalize(config)?;
-            let rld = crate::router::resolve_rld_bin(&home)?;
+            let rld = if std::env::var_os("RLD_BIN").is_some() {
+                crate::router::resolve_rld_bin(&home)?
+            } else {
+                installed_binary(crate::DAEMON_BIN)?
+            };
             let log = private_file(&paths.log(), false)?;
             let mut command = Command::new(rld);
             command
@@ -271,6 +307,15 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn installed_binary(name: &str) -> io::Result<PathBuf> {
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("rayline executable has no parent directory"))?;
+    fs::canonicalize(directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
+        .map_err(|error| io::Error::new(error.kind(), format!("installed {name} is unavailable; run `rayline update` or reinstall the complete Rayline release: {error}")))
 }
 
 fn ready(paths: &Paths) -> io::Result<Value> {

@@ -47,6 +47,27 @@ def require_admitted_decisions(events):
             raise RuntimeError(f"ARC decision refused: {event.get('reason')} (route_id={event.get('route_id')})")
 
 
+def require_routing_config(decisions):
+    routing = decisions["routing"]
+    assert decisions["result"] == "custom", "routing proof requires an explicit custom V result"
+    assert "value_usd" in routing and decisions.get("price_sha256"), "routing proof requires pinned V and caller price identity"
+    if "price_profile_id" in routing:
+        assert routing["price_profile_id"] and routing.get("price_profile_version"), "routing proof requires a profile ID and explicit version"
+        assert "prices" not in routing, "routing proof cannot combine a price profile and inline prices"
+    else:
+        assert "prices" in routing, "routing proof requires caller prices or a pinned price profile"
+
+
+def require_applied_routing(decisions, selected):
+    routing = decisions["routing"]
+    assert selected and all(event["applied_value_usd"] == routing["value_usd"] and event["price_basis"] == "caller"
+                            and event["price_sha256"] == decisions["price_sha256"] for event in selected), "V or discounted prices were not applied"
+    if "price_profile_id" in routing:
+        expected = {"id": routing["price_profile_id"], "version": routing["price_profile_version"],
+                    "content_hash": decisions["price_sha256"]}
+        assert all(event.get("price_profile") == expected for event in selected), "requested price profile was not applied"
+
+
 def schedule_reference(tasks, capacity):
     if type(capacity) is not int or capacity <= 0:
         raise ValueError("invalid capacity")
@@ -154,8 +175,7 @@ def main():
     assert cost_bound <= args.max_run_cost_usd, "configured attempt/token cost bound exceeds the run budget"
     routing = config["decisions"]["routing"]
     if args.proof == "routing":
-        assert config["decisions"]["result"] == "custom", "routing proof requires an explicit custom V result"
-        assert "value_usd" in routing and "prices" in routing and config["decisions"].get("price_sha256"), "routing proof requires pinned V and caller prices"
+        require_routing_config(config["decisions"])
     else:
         assert config["decisions"]["result"] == "top" and routing == {}, "transport proof must explicitly use top with empty routing"
     assert {deployment["kind"] for deployment in config["deployments"]} >= {"local", "cloud"}
@@ -234,8 +254,7 @@ def main():
             task_report["requested_route_pattern_met"] = all(kind == "local" for kind in kinds) if name == "easy" else kinds[-1] == "cloud"
             if args.proof == "routing":
                 assert task_report["requested_route_pattern_met"], f"ARC did not choose the required {name} route"
-                assert all(event["applied_value_usd"] == routing["value_usd"] and event["price_basis"] == "caller"
-                           and event["price_sha256"] == config["decisions"]["price_sha256"] for event in selected), "V or discounted prices were not applied"
+                require_applied_routing(config["decisions"], selected)
         assert args.config.read_bytes() == config_bytes, "configuration changed between tasks"
         report["passed"] = True
     except BaseException as error:

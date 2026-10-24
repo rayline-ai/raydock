@@ -28,6 +28,7 @@ if ($env:RAYLINE_RELEASE_BASE_URL) {
 
 $RaylineAsset = "rayline-$Platform"
 $DaemonAsset = "rld-$Platform"
+$CoreAsset = "rayline-core-$Platform"
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) "rayline-install-$PID-$([System.Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
@@ -35,10 +36,12 @@ try {
     $SumsPath = Join-Path $TempDir "SHA256SUMS"
     $RaylinePath = Join-Path $TempDir $RaylineAsset
     $DaemonPath = Join-Path $TempDir $DaemonAsset
+    $CorePath = Join-Path $TempDir $CoreAsset
 
     Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS" -OutFile $SumsPath
     Invoke-WebRequest -Uri "$BaseUrl/$RaylineAsset" -OutFile $RaylinePath
     Invoke-WebRequest -Uri "$BaseUrl/$DaemonAsset" -OutFile $DaemonPath
+    Invoke-WebRequest -Uri "$BaseUrl/$CoreAsset" -OutFile $CorePath
 
     $Expected = @{}
     foreach ($Line in Get-Content $SumsPath) {
@@ -48,7 +51,7 @@ try {
         }
     }
 
-    foreach ($Asset in @($RaylineAsset, $DaemonAsset)) {
+    foreach ($Asset in @($RaylineAsset, $DaemonAsset, $CoreAsset)) {
         if (-not $Expected.ContainsKey($Asset)) {
             Fail "release checksums do not include $Asset"
         }
@@ -62,6 +65,7 @@ try {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Force $RaylinePath (Join-Path $InstallDir "rayline.exe")
     Copy-Item -Force $DaemonPath (Join-Path $InstallDir "rld.exe")
+    Copy-Item -Force $CorePath (Join-Path $InstallDir "rayline-core.exe")
 
     Write-Host "Installed Rayline Local to $InstallDir"
     $PathEntries = $env:PATH -split [System.IO.Path]::PathSeparator

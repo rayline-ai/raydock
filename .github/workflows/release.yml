@@ -75,6 +75,36 @@ jobs:
           fi
           echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Read execution core source
+        id: core
+        shell: bash
+        run: |
+          python3 - <<'PYCORE'
+          import json, os
+          manifest = json.load(open('release/core-source.json'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key in ('repository', 'commit', 'go_version'):
+                  output.write(f'{key}={manifest[key]}\n')
+          PYCORE
+
+      - name: Checkout execution core source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: ${{ steps.core.outputs.repository }}
+          ref: ${{ steps.core.outputs.commit }}
+          path: core-source
+          persist-credentials: false
+
+      - name: Install Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version: ${{ steps.core.outputs.go_version }}
+          cache: false
+
+      - name: Build execution core
+        shell: bash
+        run: python3 scripts/build-hybrid-core.py --source-dir core-source --platform '${{ matrix.platform_tag }}' --output-dir dist
+
       - name: Install Rust
         shell: bash
         run: |
@@ -110,14 +140,16 @@ jobs:
           mkdir -p "package/${package_dir}"
           cp "target/release/rayline${EXE_SUFFIX}" "package/${package_dir}/rayline${EXE_SUFFIX}"
           cp "target/release/rld${EXE_SUFFIX}" "package/${package_dir}/rld${EXE_SUFFIX}"
+          cp "dist/rayline-core-${PLATFORM_TAG}" "package/${package_dir}/rayline-core${EXE_SUFFIX}"
+          cp dist/rayline-core-source.json "package/${package_dir}/"
           cp README.md LICENSE "package/${package_dir}/"
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             pwsh -NoProfile -Command \
               "Compress-Archive -Path 'package/${package_dir}/*' -DestinationPath 'dist/${package_dir}.${ARCHIVE_EXT}' -Force"
           else
-            chmod 0755 "dist/${rayline_asset}" "dist/${daemon_asset}"
-            chmod 0755 "package/${package_dir}/rayline" "package/${package_dir}/rld"
+            chmod 0755 "dist/${rayline_asset}" "dist/${daemon_asset}" "dist/rayline-core-${PLATFORM_TAG}"
+            chmod 0755 "package/${package_dir}/rayline" "package/${package_dir}/rld" "package/${package_dir}/rayline-core"
             tar -C package -czf "dist/${package_dir}.${ARCHIVE_EXT}" "${package_dir}"
           fi
 
@@ -220,9 +252,9 @@ jobs:
           Rayline ${version}
 
           Assets:
-          - \`rayline-<platform>\` and \`rld-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts.
-          - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain both binaries plus license/readme files.
-          - \`SHA256SUMS\` covers every uploaded binary and archive.
+          - \`rayline-<platform>\`, \`rld-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts.
+          - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain all three binaries, source provenance and license/readme files.
+          - \`SHA256SUMS\` covers every uploaded binary, archive and provenance file.
           - \`SHA256SUMS.minisig\` is the minisign signature over \`SHA256SUMS\`.
           EOF
 
