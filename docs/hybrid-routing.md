@@ -90,7 +90,11 @@ set per-request headers, so `hybrid run pi` loads a Rayline extension
 after a typed prompt, `tool_result` otherwise, and `compaction` (summary index,
 retained-tail start and `new: true`) for the first request after a Pi
 compaction. A provider retry of an identical transcript keeps its event. The
-core removes the member before Decisions and inference. Other harnesses use
+core removes the member before Decisions and inference. Pi's compaction summary
+call bypasses extension hooks and Pi's session header; the hybrid Pi profile
+adds a lowest-priority `x-session-id` so that call runs in its own execution
+session, and the core treats any unlabelled request on a branch that uses
+explicit events as a side call that advances nothing. Other harnesses use
 the core's documented wire markers (`basis: marker_inferred`).
 
 ## Start and connect

@@ -25,6 +25,8 @@ use super::{
 };
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
+/// Read by the hybrid core after Pi's own x-session-affinity.
+const HYBRID_SIDECALL_SESSION_HEADER: &str = "x-session-id";
 /// Runtime override for [`allow_empty_signature`]: `1` or `0`.
 pub(crate) const ALLOW_EMPTY_SIGNATURE_ENV: &str = "RAYLINE_PI_ALLOW_EMPTY_SIGNATURE";
 
@@ -49,6 +51,14 @@ pub(crate) fn plan_with_capabilities(
     capabilities: Option<&rayline_local_router::ModelCapabilities>,
 ) -> Plan {
     let mut compat = json!({ "sendSessionAffinityHeaders": true });
+    let mut headers = ctx.conversation_headers(&format!("${CONV_ID_ENV}"));
+    if capabilities.is_some() {
+        // Hybrid only. Pi's compaction summary call carries the provider's
+        // static headers but no x-session-affinity. This lowest-priority
+        // session fallback gives it its own execution session, so it never
+        // advances (or is refused by) the main session's execution state.
+        headers[HYBRID_SIDECALL_SESSION_HEADER] = json!(format!("${CONV_ID_ENV}"));
+    }
     if ctx.allow_empty_signature {
         compat["allowEmptySignature"] = json!(true);
     }
@@ -58,7 +68,7 @@ pub(crate) fn plan_with_capabilities(
                 "baseUrl": ctx.messages_base(),
                 "api": "anthropic-messages",
                 "apiKey": ctx.key,
-                "headers": ctx.conversation_headers(&format!("${CONV_ID_ENV}")),
+                "headers": headers,
                 "compat": compat,
                 "models": [{
                     "id": ROUTER_MODEL,
@@ -189,6 +199,10 @@ mod tests {
         assert_eq!(model["contextWindow"], 16384);
         assert_eq!(model["maxTokens"], 2048);
         assert_eq!(model["input"], serde_json::json!(["text"]));
+        assert_eq!(
+            models["providers"]["rayline"]["headers"]["x-session-id"],
+            "$RAYLINE_CONV_ID"
+        );
         assert_eq!(
             models["providers"]["rayline"]["compat"]["sendSessionAffinityHeaders"],
             true

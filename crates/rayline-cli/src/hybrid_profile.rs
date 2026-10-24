@@ -336,7 +336,7 @@ pub(crate) fn saved_credentials(
         environments.extend(configured.keys().cloned());
     }
     let mut result: Vec<(String, String)> = Vec::new();
-    for (name, url) in references {
+    for &(name, url) in &references {
         let (Some(name), Some(url)) = (name.and_then(Value::as_str), url.and_then(Value::as_str))
         else {
             continue;
@@ -368,12 +368,34 @@ pub(crate) fn saved_credentials(
             }
         }
     }
+    // The core reads one variable per name: every endpoint that names it must
+    // be the host the saved key was issued for, or the key is not supplied.
+    for (name, _) in &result {
+        let hosts: Vec<_> = references
+            .iter()
+            .filter(|(reference, _)| reference.and_then(Value::as_str) == Some(name.as_str()))
+            .map(|(_, url)| url.and_then(Value::as_str).and_then(https_host))
+            .collect();
+        if hosts.iter().any(|host| host.is_none() || *host != hosts[0]) {
+            return Err(format!(
+                "credential reference {name} is shared by endpoints on different hosts; set it explicitly"
+            ));
+        }
+    }
     Ok(result)
 }
 
+/// The HTTPS origin authority (host and effective port) of an endpoint.
 fn https_host(url: &str) -> Option<String> {
     let url = reqwest::Url::parse(url).ok()?;
-    (url.scheme() == "https").then(|| url.host_str().map(str::to_ascii_lowercase))?
+    if url.scheme() != "https" {
+        return None;
+    }
+    Some(format!(
+        "{}:{}",
+        url.host_str()?.to_ascii_lowercase(),
+        url.port_or_known_default()?
+    ))
 }
 
 #[cfg(test)]
@@ -549,6 +571,13 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // One variable shared with an endpoint on another host or port is refused.
+        let mut shared = profile();
+        shared["deployments"][1]["url"] = json!("https://gateway.example.com/v1/messages");
+        assert!(saved_credentials(&shared, &home, unset).is_err());
+        let mut port = profile();
+        port["deployments"][1]["url"] = json!("https://api-dev.rayline.ai:8443/v1/messages");
+        assert!(saved_credentials(&port, &home, unset).is_err());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

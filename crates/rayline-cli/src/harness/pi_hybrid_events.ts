@@ -41,8 +41,9 @@ export default function (pi: any) {
   let lastKey: string | undefined;
   let lastEvent: unknown;
 
-  pi.on("session_start", () => {
-    started = false;
+  pi.on("session_start", (event: { reason?: string }) => {
+    // A resumed or forked session already has history: never a task start.
+    started = event?.reason === "resume" || event?.reason === "fork";
     typed = false;
     compacted = false;
     lastKey = undefined;
