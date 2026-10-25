@@ -76,6 +76,7 @@ def main():
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/rayline")
     parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
+    parser.add_argument("--no-warmup", action="store_true", help="scenario b: send only the scheduler prompt (task start is the boundary)")
     parser.add_argument("--max-generations", type=int, default=12)
     parser.add_argument("--task-timeout-secs", type=int, default=600)
     args = parser.parse_args()
@@ -110,7 +111,7 @@ def main():
         cases, expected = hybrid_live.scheduler_cases()
         (work / "scheduler.py").write_text("def schedule(tasks, capacity):\n    raise NotImplementedError\n")
         scheduler_prompt = next(_scheduler_prompts())
-        prompts = [WARMUP_PROMPT, scheduler_prompt]
+        prompts = [scheduler_prompt] if args.no_warmup else [WARMUP_PROMPT, scheduler_prompt]
         oracle = lambda: hybrid_live.verify_scheduler(work / "scheduler.py", cases, expected) is None
     else:
         rng = random.Random(20261024)
