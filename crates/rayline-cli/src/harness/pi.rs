@@ -41,6 +41,13 @@ pub(crate) fn allow_empty_signature(env_name: &str, override_value: Option<&str>
 }
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
+    plan_with_capabilities(ctx, None)
+}
+
+pub(crate) fn plan_with_capabilities(
+    ctx: &RenderContext<'_>,
+    capabilities: Option<&rayline_local_router::ModelCapabilities>,
+) -> Plan {
     let mut compat = json!({ "sendSessionAffinityHeaders": true });
     if ctx.allow_empty_signature {
         compat["allowEmptySignature"] = json!(true);
@@ -57,9 +64,9 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                     "id": ROUTER_MODEL,
                     "name": format!("Rayline router ({})", ctx.env_name),
                     "reasoning": true,
-                    "input": ["text", "image"],
-                    "contextWindow": CONTEXT_WINDOW,
-                    "maxTokens": MAX_OUTPUT_TOKENS
+                    "input": capabilities.map(|caps| json!(caps.input_modalities)).unwrap_or_else(|| json!(["text", "image"])),
+                    "contextWindow": capabilities.map_or(CONTEXT_WINDOW, |caps| caps.context_window),
+                    "maxTokens": capabilities.map_or(MAX_OUTPUT_TOKENS, |caps| caps.max_output_tokens)
                 }]
             }
         }
@@ -153,5 +160,38 @@ mod tests {
         let settings = read("settings.json");
         assert_eq!(settings["defaultProvider"], "rayline");
         assert_eq!(settings["defaultModel"], "rayline-router");
+    }
+
+    #[test]
+    fn hybrid_model_advertises_only_qualified_capabilities() {
+        let dir = super::super::tests::temp_dir("pi-hybrid-capabilities");
+        let ctx = super::super::RenderContext {
+            env_name: "hybrid",
+            key: super::super::tests::TEST_KEY,
+            router_url: TEST_URL,
+            config_dir: &dir,
+            conversation_id: super::super::ConversationIdFallback {
+                forced: None,
+                env_needs_it: false,
+            },
+            allow_empty_signature: true,
+        };
+        let capabilities = rayline_local_router::ModelCapabilities {
+            context_window: 16384,
+            max_output_tokens: 2048,
+            input_modalities: vec!["text".into()],
+        };
+        let plan = Harness::Pi.hybrid_plan(&ctx, &capabilities).unwrap();
+        super::super::write_files(&dir, &plan.files).unwrap();
+        let models: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("models.json")).unwrap()).unwrap();
+        let model = &models["providers"]["rayline"]["models"][0];
+        assert_eq!(model["contextWindow"], 16384);
+        assert_eq!(model["maxTokens"], 2048);
+        assert_eq!(model["input"], serde_json::json!(["text"]));
+        assert_eq!(
+            models["providers"]["rayline"]["compat"]["sendSessionAffinityHeaders"],
+            true
+        );
     }
 }

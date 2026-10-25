@@ -157,7 +157,7 @@ impl Harness {
         }
     }
 
-    fn plan(self, ctx: &RenderContext<'_>) -> Result<Plan, String> {
+    pub(crate) fn plan(self, ctx: &RenderContext<'_>) -> Result<Plan, String> {
         Ok(match self {
             Self::OpenCode => opencode::plan(ctx),
             Self::Pi => pi::plan(ctx),
@@ -165,6 +165,33 @@ impl Harness {
             Self::Hermes => hermes::plan(ctx)?,
             Self::OpenClaw => openclaw::plan(ctx),
         })
+    }
+
+    pub(crate) fn hybrid_plan(
+        self,
+        ctx: &RenderContext<'_>,
+        capabilities: &rayline_local_router::ModelCapabilities,
+    ) -> Result<Plan, String> {
+        if self == Self::Pi {
+            Ok(pi::plan_with_capabilities(ctx, Some(capabilities)))
+        } else {
+            self.plan(ctx)
+        }
+    }
+
+    pub(crate) fn hybrid_args(self, args: &[OsString]) -> io::Result<Vec<OsString>> {
+        if self == Self::OpenClaw {
+            let env_container =
+                std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
+            if env_container || openclaw::uses_container(args) {
+                return Err(io::Error::other(
+                    "OpenClaw container mode cannot use the hybrid gateway configuration; run an agent locally",
+                ));
+            }
+            Ok(openclaw::launch_args(args))
+        } else {
+            Ok(args.to_vec())
+        }
     }
 }
 
