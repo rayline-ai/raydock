@@ -177,9 +177,9 @@ Pi's hybrid model advertises the explicit `max_output_tokens` and
 core computes shared limits across usable execution deployments; a source used
 only for an explicit selection alias does not advertise execution capabilities.
 Missing or invalid capabilities prevent startup. Pi's `contextWindow` is the
-largest `context_window` among the started profile's cloud deployments (200000
-for the default profile's Opus and Sonnet), or the core's window when it has no
-cloud deployment. The core reports the smallest window, which is the local
+largest `context_window` among the started profile's cloud deployments that an
+action executes on (200000 for the default profile's Opus and Sonnet), or the
+core's window when there is none or the profile sets `test_alias`. The core reports the smallest window, which is the local
 model's; a turn that outgrows it is handed off to cloud, and Pi 1.1 and later
 cap `max_tokens` by the window that remains, so a local window would starve
 that handoff. Pi's ordinary hosted launcher

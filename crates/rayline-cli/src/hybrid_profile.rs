@@ -436,20 +436,44 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
 }
 
 /// The context window a harness should budget against: the largest window of
-/// the composed config's cloud deployments, or `core_window` when that is
-/// larger or there is no cloud deployment (an all-local profile).
+/// the composed config's executable cloud deployments, or `core_window` when
+/// that is larger or no cloud deployment is executable (an all-local profile).
 ///
 /// The core advertises the smallest window across its deployments. A turn that
 /// overflows the local window is handed off to cloud (capacity handoff), so a
 /// harness that sizes requests from its window (pi 1.1 clamps `max_tokens` to
 /// what is left of it) must see the window that handoff can reach.
+///
+/// A deployment counts only when a `bindings` or `derived_actions` entry
+/// names it, as the core admits targets from actions. A profile with a
+/// `test_alias` keeps `core_window`: its alias source is selection-only and a
+/// binding does not say which model it serves.
 pub(crate) fn reachable_context_window(config: &Value, core_window: u64) -> u64 {
-    config
-        .get("deployments")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    if config
+        .get("test_alias")
+        .is_some_and(|alias| !alias.is_null())
+    {
+        return core_window;
+    }
+    let array = |key: &str| {
+        config
+            .get(key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+    };
+    let executable: Vec<&str> = array("bindings")
+        .chain(array("derived_actions"))
+        .filter_map(|action| action.get("deployment_id").and_then(Value::as_str))
+        .collect();
+    array("deployments")
         .filter(|deployment| deployment.get("kind").and_then(Value::as_str) == Some("cloud"))
+        .filter(|deployment| {
+            deployment
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| executable.contains(&id))
+        })
         .filter_map(|deployment| deployment.get("context_window").and_then(Value::as_u64))
         .fold(core_window, u64::max)
 }
@@ -752,9 +776,27 @@ mod tests {
         // A package profile without inline deployments keeps the core's window.
         assert_eq!(reachable_context_window(&json!({}), 16384), 16384);
         // A smaller cloud window never lowers the core's.
-        let small_cloud =
-            json!({"deployments": [{"id": "c", "kind": "cloud", "context_window": 8192}]});
+        let small_cloud = json!({
+            "deployments": [{"id": "c", "kind": "cloud", "context_window": 8192}],
+            "bindings": [{"action_id": "a", "worker": "w", "deployment_id": "c"}]
+        });
         assert_eq!(reachable_context_window(&small_cloud, 16384), 16384);
+        // A cloud deployment no action executes on does not count.
+        let mut unbound = mixed.clone();
+        unbound["derived_actions"] = json!([
+            {"model": "qwen3.8-27b", "worker": "qwen3.8-27b", "deployment_id": "local"}
+        ]);
+        assert_eq!(reachable_context_window(&unbound, 16384), 16384);
+        // Package profiles bind actions to deployments with `bindings`.
+        let mut bound = unbound.clone();
+        bound["bindings"] =
+            json!([{"action_id": "x", "worker": "w", "deployment_id": "cloud-sonnet"}]);
+        assert_eq!(reachable_context_window(&bound, 16384), 200_000);
+        // A test alias's source is selection-only: keep the core's window.
+        let mut aliased = mixed.clone();
+        aliased["test_alias"] =
+            json!({"selected_model": "claude-opus-5.5", "execution_action_id": "local"});
+        assert_eq!(reachable_context_window(&aliased, 16384), 16384);
     }
 
     #[test]
