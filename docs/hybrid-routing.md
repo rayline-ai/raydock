@@ -74,7 +74,7 @@ start, a Rayline API key, and a `local_model` pointing at a local Qwen.
   result. Unknown keys are refused.
 - **Local model.** A profile deployment marked `"from_local_model": true`
   takes its endpoint and served model from `local_model`
-  (`rayline local custom http://127.0.0.1:11434/v1 qwen3.8:27b`); its protocol
+  (`rayline local custom --url http://127.0.0.1:11434/v1 --model qwen3.8:27b`); its protocol
   path is appended. Its runtime identity and thinking-control qualification
   still come from the profile, and a configured llama.cpp prompt counter
   verifies the served model at startup. Without a custom `local_model`, such a
