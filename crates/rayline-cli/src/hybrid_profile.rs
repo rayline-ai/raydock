@@ -218,7 +218,7 @@ pub(crate) fn compose(
             });
         if !counted {
             return Err(
-                "prefer_local needs a local deployment with a qualified llama.cpp prompt_counter (a profile file); without counted capacity it never selects the local model. Use \"utility\" with the default profile"
+                "settings hybrid.routing.policy \"prefer_local\" needs a local deployment with a qualified llama.cpp prompt_counter (a profile file); without counted capacity it never selects the local model. Use \"utility\" with the default profile"
                     .to_owned(),
             );
         }
@@ -275,6 +275,15 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
                 );
             }
         };
+        if preset != PREFER_LOCAL_PRESET
+            && let Some(Value::Object(overrides)) = policy.get_mut("overrides")
+        {
+            // A selection threshold applies only to prefer-local; keep schedules.
+            overrides.remove("selection");
+            if overrides.is_empty() {
+                policy.remove("overrides");
+            }
+        }
         policy.insert("preset".to_owned(), json!(preset));
     }
     if !policy.contains_key("preset") {
@@ -1072,6 +1081,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(composed.preset.as_deref(), Some(HYBRID_DEFAULT_PRESET));
+        // Switching a prefer-local profile to utility drops its threshold only.
+        let mut local = profile();
+        local["decisions"]["routing"]["policy"] = json!({"preset": PREFER_LOCAL_PRESET,
+            "overrides": {"selection": {"min_p_pass": 0.7}, "schedule": {"model": ["all_turns"]}}});
+        let composed = compose(
+            local.clone(),
+            Some(&settings(Some(json!({"policy": "utility"})))),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
+        assert_eq!(
+            composed.config["decisions"]["routing"]["policy"],
+            json!({"preset": HYBRID_DEFAULT_PRESET, "overrides": {"schedule": {"model": ["all_turns"]}}})
+        );
+        local["decisions"]["routing"]["policy"]["overrides"]
+            .as_object_mut()
+            .unwrap()
+            .remove("schedule");
+        let composed = compose(
+            local,
+            Some(&settings(Some(json!({"policy": "utility"})))),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
+        assert_eq!(
+            composed.config["decisions"]["routing"]["policy"],
+            json!({"preset": HYBRID_DEFAULT_PRESET})
+        );
     }
 
     #[test]
