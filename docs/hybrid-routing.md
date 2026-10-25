@@ -24,9 +24,13 @@ must name the selected worker rather than submit a second routing request. The
 configuration contains credential environment-variable names, never keys. The
 core validates the policy-package and thinking-registry hashes at startup.
 
-For hosted Decisions and Rayline cloud inference, provide
-`RAYLINE_ROUTER_API_KEY` explicitly in the launch environment. Hybrid does not
-load saved production credentials for destinations named by a separate config.
+For hosted Decisions and Rayline cloud inference, the core reads the Rayline
+API key from the environment variable each endpoint names (normally
+`RAYLINE_ROUTER_API_KEY`). An explicit launch-environment value always wins.
+Otherwise `start` supplies the key saved by `rayline auth login` only for an
+HTTPS endpoint on the same host as that signed-in environment's router (for
+example the dev key for `https://api-dev.rayline.ai`); it never offers a saved
+key to another host and prints only the variable name.
 The core rejects missing credential environment references before startup. The
 launcher withholds every configured credential environment variable from the
 harness, including custom Decisions and inference key names. Readiness metadata
@@ -38,6 +42,81 @@ supported by the core; Rust performs no policy selection.
 Hybrid endpoints are selected by the core configuration. The root `--env` and
 `--auth-token` options are not accepted with `hybrid`; use the configuration and
 `RAYLINE_ROUTER_API_KEY` for a non-production endpoint.
+
+## Rayline Local defaults
+
+`start` composes the core configuration from a profile and the user's
+`~/.config/rayline/settings.json`, and writes the result to `core-config.json`
+in the state directory (owner-only). The user's setup is: a Rayline API key, a
+`local_model` pointing at a local Qwen, and `start`.
+
+- **Preview:** v2 is served on the development router only, until the
+  production catalog migration lands. Use `start --env dev --cell
+  pf-5505cbf8-v2`; a default `--env prod` start is refused by that router.
+- **No profile file:** `start` builds a package-less default profile.
+  - Decisions go to the signed-in router (`--env`, default `prod`) with model
+    `rayline-router`.
+  - `local_model` is the local Chat deployment (`registry_model`
+    `qwen/qwen3.8-27b`). Its context window is read from llama.cpp `/props`, or
+    given with `--local-context-window`.
+  - Claude Opus 5.5 and Sonnet 5.5 are exact model pins through the same router.
+  - `derived_actions` let the core derive ARC's actions from its embedded
+    registry: Qwen's admitted controls, plus the default-base controls of Opus
+    and Sonnet.
+  - `--cell` selects an isolated development cell.
+  - This profile has no prompt counter, so local capacity facts are unknown; a
+    runtime context refusal still re-consults.
+- **`--config`:** names a qualified profile instead.
+
+- **Hybrid routing works with no overrides.** For the default profile, a
+  `derived_actions` profile, or a profile that sets `decisions.api_mode:
+  "execution_context_v2"`, the core uses that mode
+  and sends `routing.policy: {"preset": "arc-policy.hybrid-default.v1"}`
+  explicitly. Rayline Local never relies on an absent policy, which the
+  Decisions API reads as today's package default.
+- **One optional override block,** `hybrid.routing` (every key optional):
+
+  ```json
+  {"hybrid": {"routing": {"policy": "utility",
+                          "schedule": {"model": ["cache_boundaries", "user_messages"]},
+                          "value_usd": 0.1}}}
+  ```
+
+  `policy: "utility"` is the hybrid default preset; `"prefer_local"` selects
+  `arc-policy.prefer-local.v1` (local when Stage 1 predicts it passes, else
+  utility), whose threshold `min_p_pass` (in (0, 1)) may be set beside it.
+  `schedule` becomes
+  `routing.policy.overrides.schedule`; each dimension (`model`, `thinking`)
+  lists switch-point classes from `cache_boundaries`, `user_messages` and
+  `all_turns`, and the service refuses a class the package does not admit.
+  `value_usd` becomes `routing.value_usd` and selects the returned `custom`
+  result. Unknown keys are refused.
+- **Local model.** A profile deployment marked `"from_local_model": true`
+  takes its endpoint and served model from `local_model`
+  (`rayline local custom --url http://127.0.0.1:11434/v1 --model qwen3.8:27b`); its protocol
+  path is appended. Its runtime identity and thinking-control qualification
+  still come from the profile, and a configured llama.cpp prompt counter
+  verifies the served model at startup. Without a custom `local_model`, such a
+  profile fails to start with the command to run.
+- A profile that selects `current` or `execution_context_v1`, or names a policy
+  package without setting `api_mode` (the core's default is `current`, as before
+  v2), is passed through unchanged, and a `hybrid.routing` block is refused for
+  it. A packaged profile must set `decisions.api_mode: "execution_context_v2"`
+  to use v2.
+
+`start` prints the applied preset and its source, the local model and any saved
+key it used.
+
+**Events come from the wire.** Harnesses run unmodified; Rayline Local adds
+nothing to them. The Go core infers each request's event from what the harness
+already sends (`basis: marker_inferred`): `task_start` before any assistant
+message, `tool_result` versus `user_message` from the trailing turn (injected
+reminders and harness-authored turns are not the user's words), the harness's
+own auxiliary calls (such as Pi's compaction summary call, which sends no session
+header) as stateless side calls, and a compaction by comparing the request with
+the previous one, including Pi's retained tail. A harness may optionally state
+events itself through the core's `X-Rayline-Event` header or `rayline_event`
+member; no default depends on it.
 
 ## Start and connect
 
@@ -158,6 +237,17 @@ python3 scripts/test-hybrid-core.py \
   --core /absolute/path/to/rayline-core \
   --registry /absolute/path/to/rayline-core/thinkingcontrol/thinking_controls.compiled.json
 ```
+
+For the v2 seams, `scripts/test-hybrid-v2.py --core <v2 core> --registry <registry>`
+joins the real CLI, `rld`, Go core and stock installed Pi against synthetic
+Decisions and inference fixtures. It checks that `start` composes the hybrid
+preset, a settings schedule override and `local_model`, and that the core infers
+Pi's events from its own requests: `task_start`, `tool_result` with
+`last_served` and `history`, Pi's session-less summarization call as a stateless
+side call, and Pi's auto-compaction (forced by a provider context overflow) as a
+compaction with its retained tail at its new position. Capacity facts need a
+qualified llama.cpp counter; the Go core's tests and the live acceptance cover
+them.
 
 The process tests use a local executable contract fixture to verify supervision,
 auth, transparent forwarding, native fork identity, cancellation, shutdown,

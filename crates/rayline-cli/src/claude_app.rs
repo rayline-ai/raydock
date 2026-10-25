@@ -320,9 +320,10 @@ fn private_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Write `contents` readable only by the owner: into a new 0600 file beside
-/// `path`, then renamed over it. Whatever was at `path` (a loosened file, a
-/// planted symlink) is replaced, never written through.
-fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
+/// `path` (in a directory narrowed to 0700), fsynced, then renamed over it and
+/// the directory fsynced. Whatever was at `path` (a loosened file, a planted
+/// symlink) is replaced, never written through.
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or(Path::new("."));
     private_dir(dir)?;
@@ -341,7 +342,7 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(&tmp)?;
     let written = file.write_all(contents).and_then(|()| file.sync_all());
@@ -349,6 +350,9 @@ fn write_private(path: &Path, contents: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(error);
     }
+    // Make the rename itself durable.
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 

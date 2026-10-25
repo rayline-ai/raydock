@@ -11,10 +11,13 @@ locally through `rayline claude --local` needs no account and never connects to
 Rayline's hosted service — routing decisions are made on your machine, and any
 cloud model traffic uses your own credentials.
 
-The explicit `rayline hybrid` mode connects a coding harness to ARC decisions
-and the standalone VSR execution core, with an externally managed local model
-server and named cloud targets. See [ARC hybrid execution](docs/hybrid-routing.md)
-for configuration, lifecycle, and validation.
+The explicit `rayline hybrid` mode connects an unmodified coding harness to ARC
+decisions and the standalone execution core, with your own local model server
+(llama.cpp, Ollama or MLX) and named cloud targets. Easy work stays on device;
+harder work, and context that outgrows the local window, goes to the cloud.
+Start with [hybrid setup](docs/hybrid-local-setup.md) (sign in, point at your
+local model, start); see [ARC hybrid execution](docs/hybrid-routing.md) for
+configuration, lifecycle, and validation.
 
 ## Demo
 

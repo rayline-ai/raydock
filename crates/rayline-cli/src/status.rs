@@ -28,7 +28,7 @@ const IDENTITY_TOOLKIT_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp";
 const IDENTITY_TOOLKIT_CUSTOM_TOKEN_URL: &str =
     "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken";
-const PROD_ENV: &str = "prod";
+pub(crate) const PROD_ENV: &str = "prod";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusRequest {
@@ -2827,6 +2827,32 @@ pub(crate) fn read_settings(home: &Path) -> Option<Value> {
     None
 }
 
+/// Like [`read_settings`], but a settings file that exists and cannot be read
+/// or parsed is an error naming the file, not "no settings". The error carries
+/// only the path and the parser's position, never the file's contents.
+pub(crate) fn read_settings_checked(home: &Path) -> io::Result<Option<(PathBuf, Value)>> {
+    for path in [settings_file(home), legacy_settings_file(home)] {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot read {}: {error}", path.display()),
+                ));
+            }
+        };
+        let value = serde_json::from_str(&contents).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not valid JSON: {error}", path.display()),
+            )
+        })?;
+        return Ok(Some((path, value)));
+    }
+    Ok(None)
+}
+
 /// Persist `value` as the canonical settings file (`~/.config/<brand>/
 /// settings.json`), atomically. Writes always target the canonical path even
 /// when only the legacy location existed, migrating it forward on first write.
@@ -3044,6 +3070,60 @@ mod tests {
             "rayline-status-{name}-{}-{unique}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn checked_settings_read_reports_a_bad_file_instead_of_dropping_it() {
+        let home = temp_home("settings-checked");
+        assert!(
+            read_settings_checked(&home)
+                .expect("missing is fine")
+                .is_none()
+        );
+        let path = settings_file(&home);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        for bad in [
+            "{\"hybrid\": {\"routing\": {\"value_usd\": 1e999}}}",
+            "{\"hybrid\": {\"routing\": {\"policy\": \"utility\",}}}",
+            "",
+        ] {
+            fs::write(&path, bad).expect("write");
+            let error = read_settings_checked(&home).expect_err(bad);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            let message = error.to_string();
+            assert!(message.contains(&path.display().to_string()), "{message}");
+            assert!(!message.contains("utility"), "{message}");
+            // The lenient reader other commands use is unchanged.
+            assert!(read_settings(&home).is_none());
+        }
+        fs::write(&path, "{\"hybrid\": {\"routing\": {\"value_usd\": 1}}}").expect("write");
+        let (found, value) = read_settings_checked(&home)
+            .expect("valid")
+            .expect("present");
+        assert_eq!(found, path);
+        assert_eq!(value["hybrid"]["routing"]["value_usd"], 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).expect("chmod");
+            // Root reads it anyway; only assert where the permission applies.
+            if fs::read(&path).is_err() {
+                let message = read_settings_checked(&home)
+                    .expect_err("unreadable")
+                    .to_string();
+                assert!(message.contains("cannot read"), "{message}");
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        }
+        fs::remove_file(&path).expect("remove");
+        let legacy = legacy_settings_file(&home);
+        fs::create_dir_all(legacy.parent().expect("parent")).expect("mkdir");
+        fs::write(&legacy, "{").expect("write");
+        let message = read_settings_checked(&home)
+            .expect_err("legacy malformed")
+            .to_string();
+        assert!(message.contains(&legacy.display().to_string()), "{message}");
+        let _ = fs::remove_dir_all(&home);
     }
 
     fn sample_session(subject: &str, access_token: &str, refresh_token: &str) -> SessionToken {

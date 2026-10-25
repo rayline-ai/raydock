@@ -178,6 +178,10 @@ def main():
     assert args.max_run_cost_usd.is_finite() and args.max_run_cost_usd > 0
     cost_bound = attempt_limit * args.generation_cost_bound_usd
     assert cost_bound <= args.max_run_cost_usd, "configured attempt/token cost bound exceeds the run budget"
+    # These proofs check current/v1 behaviour; a v2 profile has its own runner
+    # (scripts/test-hybrid-v2-live.py).
+    assert config["decisions"].get("api_mode") in (None, "current", "execution_context_v1"), \
+        "this live proof covers current/execution_context_v1 profiles"
     routing = config["decisions"]["routing"]
     if args.proof == "routing":
         require_routing_config(config["decisions"], args.price_profile_content_hash)
