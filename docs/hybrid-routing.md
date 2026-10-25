@@ -68,8 +68,9 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     runtime context refusal still re-consults.
 - **`--config`:** names a qualified profile instead.
 
-- **Hybrid routing works with no overrides.** Unless the profile pins an older
-  Decisions mode, the core uses `decisions.api_mode: "execution_context_v2"`
+- **Hybrid routing works with no overrides.** For the default profile, a
+  `derived_actions` profile, or a profile that sets `decisions.api_mode:
+  "execution_context_v2"`, the core uses that mode
   and sends `routing.policy: {"preset": "arc-policy.hybrid-default.v1"}`
   explicitly. Rayline Local never relies on an absent policy, which the
   Decisions API reads as today's package default.
@@ -97,8 +98,11 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   still come from the profile, and a configured llama.cpp prompt counter
   verifies the served model at startup. Without a custom `local_model`, such a
   profile fails to start with the command to run.
-- A profile that explicitly selects `current` or `execution_context_v1` is
-  passed through unchanged, and a `hybrid.routing` block is refused for it.
+- A profile that selects `current` or `execution_context_v1`, or names a policy
+  package without setting `api_mode` (the core's default is `current`, as before
+  v2), is passed through unchanged, and a `hybrid.routing` block is refused for
+  it. A packaged profile must set `decisions.api_mode: "execution_context_v2"`
+  to use v2.
 
 `start` prints the applied preset and its source, the local model and any saved
 key it used.
