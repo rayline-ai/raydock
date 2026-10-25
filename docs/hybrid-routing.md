@@ -50,6 +50,9 @@ Hybrid endpoints are selected by the core configuration. The root `--env` and
 in the state directory (owner-only). The user's setup is: a Rayline API key, a
 `local_model` pointing at a local Qwen, and `start`.
 
+- **Preview:** v2 is served on the development router only, until the
+  production catalog migration lands. Use `start --env dev --cell
+  pf-5505cbf8-v2`; a default `--env prod` start is refused by that router.
 - **No profile file:** `start` builds a package-less default profile.
   - Decisions go to the signed-in router (`--env`, default `prod`) with model
     `rayline-router`.

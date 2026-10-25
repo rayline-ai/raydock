@@ -8,6 +8,19 @@ executor runs it, and your coding harness runs unmodified.
 This page covers the user setup. For the process contract, configuration
 reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 
+> **Preview: development environment only.** Hybrid routing v2 is currently
+> served only by the development router. The production router accepts its new
+> request fields only after the model catalog migration, so a default
+> (`--env prod`) start does not work yet. For the preview, sign in to `dev` and
+> start with:
+>
+> ```bash
+> rayline hybrid start --env dev --cell pf-5505cbf8-v2
+> ```
+>
+> The isolated development cell scales to zero when idle. The first decision
+> after a pause can return 502 or 504 while it starts; retry after a minute.
+
 ## Requirements
 
 - macOS 13 or later, or Linux, with a Rayline release installed. The release
