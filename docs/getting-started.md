@@ -173,10 +173,14 @@ model ids that look like Anthropic models. The launcher therefore:
 - keeps your `rlk-` key in the router's environment only. Desktop gets
   `http://127.0.0.1:20831` and a random per-instance gateway token
   (`~/.rayline/claude-desktop/gateway-token`, mode 600) through
-  `~/.rayline/claude-desktop/claude-desktop-import.json`, which you load with
-  **Developer → Configure Third-Party Inference… → Import configuration**,
-  then **Apply Changes** and **Save & Restart**. The launcher never writes
-  Desktop's own configuration. The router answers only requests that carry
+  `~/.rayline/claude-desktop/claude-desktop-import.json`. By default the launcher
+  installs the same configuration as a named **Rayline ARC** profile in
+  `~/Library/Application Support/Claude-3p/configLibrary/`, selects it and
+  opens Desktop. A running Desktop is asked to quit gracefully before changes;
+  if it refuses, no selection changes are made. `--manual` instead prints
+  **Developer → Configure Third-Party Inference… → Import configuration**
+  instructions (skip enabling Developer Mode if the Developer menu exists).
+  The router answers only requests that carry
   that token, address a loopback Host on its port, carry no non-loopback
   Origin, and send JSON, so other local processes and web pages (DNS
   rebinding, cross-site `text/plain` posts) cannot spend on your account.
@@ -190,20 +194,51 @@ model ids that look like Anthropic models. The launcher therefore:
   the launcher targets macOS (the router also runs on Linux, for testing);
 
 ```bash
-rayline claude-desktop                    # start or reuse the router; print the steps
+rayline claude-desktop                    # configure and launch Desktop
+rayline claude-desktop --manual           # router only; print import instructions
 rayline --env dev claude-desktop          # route to the dev environment instead
 rayline claude-desktop status             # health, request totals, Desktop check
 rayline claude-desktop validate           # Desktop's applied config vs. the router
 rayline claude-desktop install-service    # LaunchAgent ai.rayline.claude-desktop
 rayline claude-desktop stop
 rayline claude-desktop off                # switch Desktop back to your subscription
-rayline claude-desktop uninstall          # service + router state; Desktop untouched
+rayline claude-desktop uninstall          # restore selection, remove service + router state
 ```
 
-3P mode applies to the whole Desktop app: it signs Desktop out of your
+3P mode applies to the whole Desktop app: it switches away from your
 claude.ai subscription, and Chat and Cowork are off while it is active. To
-switch back, open the account menu (it shows **Gateway**), choose **Sign out**,
-and sign in with your Anthropic account. Anthropic does not support routing
+switch back after automatic setup, run `rayline claude-desktop off`: it restores
+both the previously selected profile and deployment mode, then reopens Desktop.
+You may need to sign in again. `stop` only stops the router. `uninstall` restores
+before deleting the recovery record; the saved Rayline profile stays available.
+Restoration and gateway cleanup also work if Claude.app was moved or removed;
+if Desktop cannot be reopened, the command reports that without undoing recovery.
+For manual imports, `off` prints the steps to sign out of Gateway mode and sign
+in with your Anthropic account.
+
+Recovery state is owner-only in `~/.rayline/claude-desktop/desktop-profile.json`.
+Repeated starts reuse the same profile and preserve the original recovery
+selection. Changes to unrelated preferences and saved profiles are preserved.
+The **Rayline ARC** profile itself is managed by Rayline and rewritten on each
+start (for example after a gateway token change); save edits under another
+profile name. Automatic setup refuses externally changed profile selections,
+hybrid pointers, or deployment modes, unreadable previous profiles, unknown
+profile metadata, and organization-managed inference settings instead of
+overwriting them. Interrupted writes retain recovery state for `off`. Desktop
+configuration and recovery writes never follow symlinks and are synced to disk
+in order. Do not delete
+that file while recovery is pending. A failed launch attempts to restore the
+previous selection; the gateway remains running for manual setup. Lifecycle
+commands share a nonblocking cross-process lease at `~/.rayline/claude-desktop.lock`
+so another start cannot interleave with restoration or uninstall. That small
+lock file deliberately survives uninstall. Manual-only cleanup does not inspect
+Desktop paths when no recovery is pending.
+
+The library location and restart behavior are documented in
+[Anthropic's configuration guide](https://claude.com/docs/third-party/claude-desktop/configuration-format).
+The exact metadata and deployment-mode writes are a compatibility boundary,
+verified against Desktop 3.6556.2; they are not a public profile-launch API.
+Anthropic does not support routing
 Claude Code to non-Claude models through a gateway, so a Desktop update can
 change this behaviour; `scripts/smoke-claude-app.sh` checks the wire path with
 one headless Claude Code turn per model.

@@ -356,11 +356,21 @@ real login service. It copies only the prod `router_keys.prod.apiKey` from
 or the gateway token.
 
 Desktop UI checklist (per Desktop release, on a macOS user without other
-Desktop state): run `rayline claude-desktop`; import the file; **Apply Changes**,
-**Save & Restart**; continue with the gateway; open **Code**, pick **arc-sage**, send
+Desktop state): run `rayline claude-desktop`; confirm **Rayline ARC** is selected
+and Desktop opens in third-party mode without importing a file. If prompted,
+continue with the gateway; open **Code**, pick **arc-sage**, send
 "Reply with exactly PONG"; confirm `rayline claude-desktop status` counts the
-request; sign out and back in with Anthropic to confirm the subscription
-returns.
+request. Repeat the command and confirm it reuses the profile without restarting
+Desktop. Run `rayline claude-desktop off` and confirm the prior profile and mode
+return, while unrelated Desktop preferences remain intact. Also check
+`--manual` still prints import instructions without touching Desktop.
+
+Profile storage tests use throwaway homes and no provider calls. They cover
+first setup, repeated starts/token changes, preservation of existing profiles
+and new preferences, interrupted selection writes, external selection conflicts,
+malformed metadata and symlink refusal. macOS launch/restart behavior requires
+the live Desktop check above; a successful `open` command or saved selection
+alone does not prove the app consumed the profile.
 
 ## Troubleshooting
 

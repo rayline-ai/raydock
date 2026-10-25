@@ -157,26 +157,28 @@ Run Claude Code inside the Claude desktop app on ARC. The import adds two
 models to Desktop's picker: arc-sage (default) and arc-swift (cheaper). ARC is
 not a Claude model, and Rayline is not affiliated with Anthropic. Starts a dedicated
 local router (its own ports and state in ~/.rayline/claude-desktop, separate
-from `rayline claude` and `rayline codex`) and writes a configuration file for
-Claude Desktop's Developer > Configure Third-Party Inference > Import
-configuration. Your Rayline key stays in the router; Desktop gets a gateway
+from `rayline claude` and `rayline codex`), selects a recoverable Rayline ARC
+profile, and opens Claude Desktop. A running Desktop is gracefully restarted
+when its configuration changes. --manual prints import instructions instead.
+Your Rayline key stays in the router; Desktop gets a gateway
 token that only unlocks this local router. macOS only (the router also runs on
 Linux, for testing).
 
-Third-party mode applies to the whole Desktop app and signs it out of your
-claude.ai subscription; `rayline claude-desktop off` shows how to switch back.
+Third-party mode applies to the whole Desktop app and switches away from your
+claude.ai subscription; `rayline claude-desktop off` restores the previous mode.
 
 Commands:
-  start              Start or reuse the router and print setup steps (default)
+  start              Configure and launch Desktop with ARC (default)
   status             Show router health, request totals and the Desktop check
   validate           Check Desktop's applied configuration against the router
   stop               Stop the router (and unload the login service)
   install-service    Start the router at login (macOS LaunchAgent)
   uninstall-service  Remove the login service
-  off                Show how to return Desktop to your subscription; stop
+  off                Restore the previous Desktop profile and mode; stop
   uninstall          Remove the service, the router state and its files
 
 Options:
+  --manual                  start: router only; print manual import instructions
   --prefixed-ids            start/install-service: forward the prefixed
                             rayline/arc-* aliases instead of the bare
                             arc-sage/arc-swift ids (for a router that does
@@ -1526,6 +1528,7 @@ where
 {
     let mut action = None;
     let mut desktop_config = None;
+    let mut manual = false;
     let mut id_style = crate::claude_app::IdStyle::Bare;
     let mut args = args;
     while let Some(arg) = args.next() {
@@ -1542,12 +1545,16 @@ where
         match arg_str {
             "--desktop-config" => desktop_config = Some(PathBuf::from(args.next()?)),
             "--prefixed-ids" => id_style = crate::claude_app::IdStyle::Prefixed,
+            "--manual" => manual = true,
             _ if arg_str.starts_with('-') => return None,
             _ if action.is_none() => action = Some(crate::claude_app::AppAction::parse(arg_str)?),
             _ => return None,
         }
     }
     let action = action.unwrap_or(crate::claude_app::AppAction::Start);
+    if manual && action != crate::claude_app::AppAction::Start {
+        return None;
+    }
     if desktop_config.is_some() && !matches!(action, crate::claude_app::AppAction::Validate) {
         return None;
     }
@@ -1563,6 +1570,7 @@ where
     }
     Some(crate::claude_app::AppRequest {
         action,
+        manual,
         desktop_config,
         id_style,
         env_name: root_env,
@@ -3125,12 +3133,18 @@ mod tests {
 
     #[test]
     fn claude_app_dispatch_defaults_to_start() {
-        match rayline_dispatch_for_argv(&argv(&["rayline", "claude-desktop"])) {
-            RaylineDispatch::ClaudeApp(request) => {
-                assert_eq!(request.action, crate::claude_app::AppAction::Start);
-                assert!(!request.root_env_explicit);
+        for args in [
+            vec!["rayline", "claude-desktop"],
+            vec!["rayline", "claude-desktop", "--manual"],
+        ] {
+            match rayline_dispatch_for_argv(&argv(&args)) {
+                RaylineDispatch::ClaudeApp(request) => {
+                    assert_eq!(request.action, crate::claude_app::AppAction::Start);
+                    assert!(!request.root_env_explicit);
+                    assert_eq!(request.manual, args.contains(&"--manual"));
+                }
+                other => panic!("expected ClaudeApp, got {other:?}"),
             }
-            other => panic!("expected ClaudeApp, got {other:?}"),
         }
     }
 
@@ -3198,6 +3212,7 @@ mod tests {
     fn claude_app_dispatch_rejects_unknown_input() {
         for args in [
             &["rayline", "claude-desktop", "bogus"][..],
+            &["rayline", "claude-desktop", "off", "--manual"][..],
             &["rayline", "claude-desktop", "start", "stop"][..],
             &["rayline", "claude-desktop", "--local"][..],
             &["rayline", "claude-desktop", "--model", "rayline/arc-swift"][..],

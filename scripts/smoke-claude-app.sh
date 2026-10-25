@@ -40,7 +40,7 @@ PY
 run() { env -i PATH="$PATH" HOME="$H" RLD_BIN="$RLD_BIN" TERM=dumb RAYLINE_CLAUDE_DESKTOP_NO_LAUNCHD=1 "$@"; }
 
 echo "== rayline claude-desktop (start)"
-run "$RAYLINE" claude-desktop $START_FLAGS </dev/null | tee "$OUT/start.txt"
+run "$RAYLINE" claude-desktop --manual $START_FLAGS </dev/null | tee "$OUT/start.txt"
 echo "== validate the generated import file"
 run "$RAYLINE" claude-desktop validate --desktop-config "$H/.rayline/claude-desktop/claude-desktop-import.json"
 if grep -q 'rlk-' "$H/.rayline/claude-desktop/"*.json; then echo "FAIL: key in instance files"; exit 1; fi

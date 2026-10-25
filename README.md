@@ -100,20 +100,26 @@ before restarting it.
 Use Claude Code inside the **Claude desktop app** on ARC. Desktop's Code sessions
 only reach a gateway through the app's third-party inference mode, so
 `rayline claude-desktop` runs a dedicated local router (its own ports and state,
-separate from `rayline claude`) and writes a file to load with Desktop's
-**Developer → Configure Third-Party Inference… → Import configuration**:
+separate from `rayline claude`), saves and selects a **Rayline ARC** inference
+profile, and opens Desktop. If configuration changed, a running Desktop is
+first asked to quit gracefully:
 
 ```bash
-rayline claude-desktop                  # start the router, print the Desktop steps
+rayline claude-desktop                  # configure and open Desktop on ARC
+rayline claude-desktop --manual         # router only; print manual import steps
 rayline claude-desktop validate         # check Desktop's applied configuration
 rayline claude-desktop install-service  # keep the router running across logins (macOS)
-rayline claude-desktop off              # how to return Desktop to your subscription
+rayline claude-desktop off              # restore the previous profile and mode
 ```
 
-Third-party mode applies to the whole Desktop app and signs it out of your
+Third-party mode applies to the whole Desktop app and switches away from your
 claude.ai subscription while it is active. Your Rayline key stays in the router.
 Desktop gets a random per-instance token that only unlocks this loopback router,
 which also refuses non-loopback Host/Origin headers and non-JSON bodies.
+The previous profile and mode are recorded before switching; `off` restores
+those selections while preserving other Desktop preferences. Local automation
+is unavailable when organization policy controls the configuration. `--manual`
+retains the import workflow for that case and for Desktop compatibility issues.
 
 Check for CLI updates:
 
