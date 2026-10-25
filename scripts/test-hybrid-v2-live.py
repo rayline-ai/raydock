@@ -232,6 +232,8 @@ def main():
             report["cleanup_succeeded"] = stopped.returncode == 0
         hybrid_live.write_json(output / "report.json", report)
     print(json.dumps({k: report.get(k) for k in ("scenario", "passed", "oracle_passed", "route_pattern_met", "switches")}, indent=1))
+    if not report.get("passed"):
+        raise SystemExit(1)
 
 
 def _scheduler_prompts():
