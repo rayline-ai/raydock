@@ -422,7 +422,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 &args,
                 url(&state)?,
                 &token,
-                &model_capabilities(&state)?,
+                &harness_capabilities(&paths, model_capabilities(&state)?)?,
             )?;
             for name in credential_env_names(&state)? {
                 // A harness may use the same variable name for its local gateway
@@ -506,6 +506,24 @@ fn model_capabilities(state: &Value) -> io::Result<ModelCapabilities> {
     )
     .map_err(io::Error::other)?;
     capabilities.validate().map_err(io::Error::other)?;
+    Ok(capabilities)
+}
+
+/// The core's capabilities with the context window a harness should budget
+/// against ([`crate::hybrid_profile::reachable_context_window`]), read from
+/// the config this instance was started with. `start` refuses to rewrite it
+/// while an instance runs. Output and modality limits stay the core's.
+fn harness_capabilities(
+    paths: &Paths,
+    mut capabilities: ModelCapabilities,
+) -> io::Result<ModelCapabilities> {
+    let config: Value = match fs::read(paths.core_config()) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(capabilities),
+        Err(error) => return Err(error),
+    };
+    capabilities.context_window =
+        crate::hybrid_profile::reachable_context_window(&config, capabilities.context_window);
     Ok(capabilities)
 }
 
@@ -940,6 +958,59 @@ mod tests {
                 Some(&None)
             );
         }
+    }
+
+    fn pi_models_for(profile: &Value) -> Value {
+        let paths = Paths {
+            dir: temp_dir("pi-window"),
+        };
+        write_private_json(&paths.core_config(), profile, true).unwrap();
+        let core = ModelCapabilities {
+            context_window: 16384,
+            max_output_tokens: 4096,
+            input_modalities: vec!["text".into()],
+        };
+        let capabilities = harness_capabilities(&paths, core).unwrap();
+        harness_command(
+            &paths,
+            "pi",
+            &[],
+            "http://127.0.0.1:20815",
+            "local-token",
+            &capabilities,
+        )
+        .unwrap();
+        let models: Value =
+            serde_json::from_slice(&fs::read(paths.dir.join("harness/pi/models.json")).unwrap())
+                .unwrap();
+        let _ = fs::remove_dir_all(&paths.dir);
+        models["providers"]["rayline"]["models"][0].clone()
+    }
+
+    #[test]
+    fn pi_gets_the_cloud_window_when_handoff_can_reach_cloud() {
+        let profile = crate::hybrid_profile::default_profile(
+            "https://api-dev.rayline.ai",
+            "http://127.0.0.1:11434/v1",
+            "qwen3.8:27b",
+            16384,
+            None,
+            None,
+        )
+        .unwrap();
+        let model = pi_models_for(&profile);
+        assert_eq!(model["contextWindow"], 200_000);
+        // Output and modality limits stay the core's common envelope.
+        assert_eq!(model["maxTokens"], 4096);
+        assert_eq!(model["input"], json!(["text"]));
+    }
+
+    #[test]
+    fn pi_keeps_the_local_window_without_a_cloud_deployment() {
+        let profile = json!({"deployments": [
+            {"id": "local", "kind": "local", "context_window": 16384, "max_output_tokens": 4096}
+        ]});
+        assert_eq!(pi_models_for(&profile)["contextWindow"], 16384);
     }
 
     #[test]

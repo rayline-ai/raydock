@@ -53,7 +53,10 @@ pub fn check_config<'a>(
 
 /// `map[name]`, refusing any other key that Go's case-insensitive field
 /// matching would also read as `name`.
-fn exact_field<'v>(map: &'v Map<String, Value>, name: &str) -> Result<Option<&'v Value>, String> {
+pub fn exact_field<'v>(
+    map: &'v Map<String, Value>,
+    name: &str,
+) -> Result<Option<&'v Value>, String> {
     if let Some(alias) = map.keys().find(|key| *key != name && go_fold_eq(key, name)) {
         return Err(format!(
             "configuration key {alias:?} is ambiguous with {name:?}; spell it exactly {name:?}"
