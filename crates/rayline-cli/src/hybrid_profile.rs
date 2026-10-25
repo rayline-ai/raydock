@@ -82,17 +82,25 @@ pub(crate) fn compose(
     {
         return Err("settings hybrid.routing must be an object".to_owned());
     }
+    // A profile without api_mode keeps the core's own default (`current`), as
+    // it did before v2, unless it is a package-less v2 profile.
+    let derived = root.get("derived_actions").is_some();
     let decisions = root
         .get_mut("decisions")
         .and_then(Value::as_object_mut)
         .ok_or("hybrid configuration requires a decisions object")?;
-    match decisions.get("api_mode").and_then(Value::as_str) {
-        None | Some(API_MODE_V2) => {}
+    let mode = match decisions.get("api_mode").and_then(Value::as_str) {
+        None if derived => None,
+        None => Some("current".to_owned()),
+        Some(API_MODE_V2) => None,
+        Some(mode) => Some(mode.to_owned()),
+    };
+    match mode {
+        None => {}
         Some(mode) => {
-            let mode = mode.to_owned();
             if block.is_some() {
                 return Err(format!(
-                    "settings hybrid.routing cannot apply to a profile pinned to Decisions api_mode {mode:?}"
+                    "settings hybrid.routing cannot apply to a profile in Decisions api_mode {mode:?}; set decisions.api_mode to \"execution_context_v2\" in the profile"
                 ));
             }
             return Ok(Composed {
@@ -120,6 +128,27 @@ pub(crate) fn compose(
         routing.insert("value_usd".to_owned(), json!(value));
         // The core executes the returned custom result for a configured V.
         decisions.insert("result".to_owned(), json!("custom"));
+    }
+    if preset.as_deref() == Some(PREFER_LOCAL_PRESET) {
+        // Prefer-local excludes a local target whose capacity is unknown, so
+        // without a qualified token counter it would never choose local.
+        let counted = profile
+            .get("deployments")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|deployment| deployment.get("kind").and_then(Value::as_str) == Some("local"))
+            .all(|deployment| {
+                deployment
+                    .get("prompt_counter")
+                    .is_some_and(Value::is_object)
+            });
+        if !counted {
+            return Err(
+                "prefer_local needs a local deployment with a qualified llama.cpp prompt_counter (a profile file); without counted capacity it never selects the local model. Use \"utility\" with the default profile"
+                    .to_owned(),
+            );
+        }
     }
     Ok(Composed {
         config: profile,
@@ -210,8 +239,8 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
         Some(value) => Some(
             value
                 .as_f64()
-                .filter(|value| value.is_finite() && *value >= 0.0)
-                .ok_or("settings hybrid.routing.value_usd must be a nonnegative number")?,
+                .filter(|value| (0.1..=5.0).contains(value))
+                .ok_or("settings hybrid.routing.value_usd must be a number between 0.1 and 5")?,
         ),
     };
     Ok((policy, source, value))
@@ -282,7 +311,7 @@ fn apply_local_model(
             return Err("from_local_model applies only to a local deployment".to_owned());
         }
         let (base_url, model) = custom_local_model(settings).ok_or(
-            "this profile takes its local endpoint from local_model; run `rayline local custom <url> <model>` first",
+            "this profile takes its local endpoint from local_model; run `rayline local custom --url <URL> --model <NAME>` first",
         )?;
         let path = match deployment.get("protocol").and_then(Value::as_str) {
             Some("openai.chat.v1") => "/v1/chat/completions",
@@ -412,8 +441,12 @@ pub(crate) fn saved_credentials(
     environment: impl Fn(&str) -> Option<String>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut references = Vec::new();
+    // Every endpoint naming a variable, local ones included: a supplied key
+    // must reach no other host through a shared variable name.
+    let mut all_references = Vec::new();
     if let Some(decisions) = config.get("decisions") {
         references.push((decisions.get("auth_env"), decisions.get("url")));
+        all_references.push((decisions.get("auth_env"), decisions.get("url")));
     }
     for deployment in config
         .get("deployments")
@@ -424,6 +457,7 @@ pub(crate) fn saved_credentials(
         if deployment.get("kind").and_then(Value::as_str) == Some("cloud") {
             references.push((deployment.get("auth_env"), deployment.get("url")));
         }
+        all_references.push((deployment.get("auth_env"), deployment.get("url")));
     }
     let mut environments = vec![crate::status::PROD_ENV.to_owned()];
     if let Some(configured) = crate::status::read_settings(home)
@@ -469,7 +503,7 @@ pub(crate) fn saved_credentials(
     // The core reads one variable per name: every endpoint that names it must
     // be the host the saved key was issued for, or the key is not supplied.
     for (name, _) in &result {
-        let hosts: Vec<_> = references
+        let hosts: Vec<_> = all_references
             .iter()
             .filter(|(reference, _)| reference.and_then(Value::as_str) == Some(name.as_str()))
             .map(|(_, url)| url.and_then(Value::as_str).and_then(https_host))
@@ -504,7 +538,7 @@ mod tests {
         json!({
             "contract_version": 1,
             "package_path": "package.json",
-            "decisions": {"url": "https://api-dev.rayline.ai/v1/routes", "auth_env": "RAYLINE_ROUTER_API_KEY",
+            "decisions": {"api_mode": "execution_context_v2", "url": "https://api-dev.rayline.ai/v1/routes", "auth_env": "RAYLINE_ROUTER_API_KEY",
                           "model": "arc-1.0", "result": "top", "routing": {}},
             "deployments": [
                 {"id": "local-qwen", "kind": "local", "protocol": "openai.chat.v1", "from_local_model": true,
@@ -609,11 +643,70 @@ mod tests {
     #[test]
     fn prefer_local_maps_to_its_preset_and_threshold() {
         let block = json!({"policy": "prefer_local", "min_p_pass": 0.65});
-        let composed = compose(profile(), Some(&settings(Some(block))), Path::new("/p")).unwrap();
+        // Without a qualified counter the local target's capacity is unknown,
+        // which prefer-local excludes: refused rather than never choosing local.
+        assert!(
+            compose(
+                profile(),
+                Some(&settings(Some(block.clone()))),
+                Path::new("/p")
+            )
+            .is_err()
+        );
+        let mut counted = profile();
+        counted["deployments"][0]["prompt_counter"] = json!({"model_path": "/m.gguf"});
+        let composed = compose(counted, Some(&settings(Some(block))), Path::new("/p")).unwrap();
         assert_eq!(
             composed.config["decisions"]["routing"]["policy"],
             json!({"preset": PREFER_LOCAL_PRESET, "overrides": {"selection": {"min_p_pass": 0.65}}})
         );
+    }
+
+    #[test]
+    fn a_profile_without_api_mode_keeps_the_core_default() {
+        let mut legacy = profile();
+        legacy["decisions"]
+            .as_object_mut()
+            .unwrap()
+            .remove("api_mode");
+        let composed = compose(legacy.clone(), Some(&settings(None)), Path::new("/p")).unwrap();
+        assert_eq!(
+            composed.policy,
+            PolicySource::LegacyMode("current".to_owned())
+        );
+        assert!(composed.config["decisions"].get("api_mode").is_none());
+        assert!(
+            composed.config["decisions"]["routing"]
+                .get("policy")
+                .is_none()
+        );
+        assert!(
+            compose(
+                legacy,
+                Some(&settings(Some(json!({"value_usd": 1.0})))),
+                Path::new("/p")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_saved_key_never_reaches_a_local_endpoint_sharing_its_variable() {
+        let home =
+            std::env::temp_dir().join(format!("rayline-hybrid-localvar-{}", std::process::id()));
+        let dir = home.join(".config").join(crate::CONFIG_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"environments":{"dev":{"router_url":"https://api-dev.rayline.ai","cli_auth_url":"https://dev.example/cli-auth"}}}"#).unwrap();
+        std::fs::write(
+            dir.join("credentials.json"),
+            r#"{"router_keys":{"dev":{"apiKey":"rlk-dev-synthetic"}}}"#,
+        )
+        .unwrap();
+        let mut shared = profile();
+        shared["deployments"][0]["auth_env"] = json!("RAYLINE_ROUTER_API_KEY");
+        shared["deployments"][0]["url"] = json!("https://remote.example/v1/chat/completions");
+        assert!(saved_credentials(&shared, &home, |_| None).is_err());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -627,6 +720,8 @@ mod tests {
             json!({"schedule": {"model": ["user_messages", "user_messages"]}}),
             json!({"schedule": {"tools": ["all_turns"]}}),
             json!({"value_usd": -1}),
+            json!({"value_usd": 0}),
+            json!({"value_usd": 6}),
             json!({"value_usd": "0.1"}),
             json!({"selection": {"min_p_pass": 0.5}}),
         ] {

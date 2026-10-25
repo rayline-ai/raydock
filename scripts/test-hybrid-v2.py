@@ -161,11 +161,11 @@ def main():
         state = root / "state"
         package = root / "synthetic-package.json"
         package.write_bytes(package_bytes)
-        # No api_mode and no policy: Rayline Local must supply both.
+        # v2 profile with no policy: Rayline Local must supply the preset.
         config = {"contract_version": 1, "package_path": package.name, "package_sha256": package_sha,
             "registry_path": str(args.registry.resolve()), "registry_sha256": registry_sha,
             "allow_experimental_controls": True,
-            "decisions": {"url": external + "/decisions", "auth_env": "RAYLINE_TEST_DECISIONS_KEY",
+            "decisions": {"api_mode": "execution_context_v2", "url": external + "/decisions", "auth_env": "RAYLINE_TEST_DECISIONS_KEY",
                           "model": "synthetic-arc-model", "result": "top", "routing": {}},
             "bindings": [{"action_id": local["action_id"], "worker": "local", "deployment_id": "local"},
                          {"action_id": cloud["action_id"], "worker": "cloud", "deployment_id": "cloud"}],

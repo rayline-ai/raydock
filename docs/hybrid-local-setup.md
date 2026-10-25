@@ -8,19 +8,6 @@ executor runs it, and your coding harness runs unmodified.
 This page covers the user setup. For the process contract, configuration
 reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 
-> **Preview: development environment only.** Hybrid routing v2 is currently
-> served only by the development router. The production router accepts its new
-> request fields only after the model catalog migration, so a default
-> (`--env prod`) start does not work yet. For the preview, sign in to `dev` and
-> start with:
->
-> ```bash
-> rayline hybrid start --env dev --cell pf-5505cbf8-v2
-> ```
->
-> The isolated development cell scales to zero when idle. The first decision
-> after a pause can return 502 or 504 while it starts; retry after a minute.
-
 ## Requirements
 
 - macOS 13 or later, or Linux, with a Rayline release installed. The release
@@ -31,21 +18,31 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 
 ## Three steps
 
-1. **Sign in.** Run this once:
+> **Preview: development router only.** Hybrid routing v2 is served by the
+> development router today. The production router accepts its request fields
+> after the model catalog migration. Until then, use the preview commands
+> below. The development environment must already be configured in
+> `~/.config/rayline/settings.json` (see "Custom hosted environments" in
+> [Getting started](getting-started.md)). The isolated preview cell scales to
+> zero when idle, so the first decision after a pause can return 502 or 504
+> while it starts; retry after a minute.
+
+1. **Sign in.**
 
    ```bash
-   rayline auth login
+   rayline --env dev auth login        # preview
+   rayline auth login                  # once production serves v2
    ```
 
-   The saved Rayline API key is used only for an HTTPS endpoint on the same host
-   as that environment's router. An API key variable set in the launch
-   environment (for example `RAYLINE_ROUTER_API_KEY`) always wins. Startup
-   prints only the variable's name.
+   `start` mints your Rayline API key on first use if none is saved. That key
+   is used only for HTTPS endpoints on that environment's router host. An API
+   key variable set in the launch environment (`RAYLINE_ROUTER_API_KEY`)
+   always wins. Startup prints only the variable's name.
 
 2. **Point Rayline at your local model.**
 
    ```bash
-   rayline local custom --url http://127.0.0.1:11434/v1 --model qwen3.8:27b
+   rayline local custom --url http://127.0.0.1:8080/v1 --model qwen3.8-27b
    ```
 
    This is the local endpoint hybrid routing uses. ARC treats it as Qwen 3.8
@@ -54,7 +51,7 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 3. **Start and connect a harness.**
 
    ```bash
-   rayline hybrid start
+   rayline hybrid start --env dev --cell pf-5505cbf8-v2   # preview
    rayline hybrid run pi -- "Fix the failing test in parser.py"
    rayline hybrid status
    rayline hybrid stop
@@ -65,9 +62,11 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    - Your `local_model` is the local target.
    - Claude Opus 5.5 and Sonnet 5.5, through the same router, are the cloud
      targets.
-   - The local context window is read from llama.cpp. For Ollama or MLX, pass
-     `--local-context-window <tokens>`.
-   - Add `--env dev` to use a signed-in development environment.
+
+   The local context window is read from llama.cpp's `/props`. Ollama and MLX
+   do not report it, so add `--local-context-window <tokens>`, for example
+   `--local-context-window 16384`. Once production serves v2, plain
+   `rayline hybrid start` uses the production router.
 
    `start` prints the profile, the routing policy and the local model it bound.
    `run` also supports `claude`, `codex`, `opencode`, `omp`, `hermes` and
@@ -98,10 +97,10 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 
 | Key | Meaning |
 | --- | --- |
-| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. |
+| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs counted local capacity, which requires a profile with a qualified llama.cpp prompt counter ([Advanced](#advanced-a-profile-file)); the default profile refuses it. |
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
-| `value_usd` | Your V: what a successful task is worth to you in dollars, between 0.1 and 5. A higher V favours more capable, more expensive models. It selects ARC's custom result. |
+| `value_usd` | Your V: what a successful task is worth to you in dollars, from 0.1 to 5 (checked at `start`). A higher V favours more capable, more expensive models. It selects ARC's custom result. |
 
 Unknown keys are refused. A profile pinned to the older `current` or
 `execution_context_v1` Decisions mode is passed through unchanged, and an

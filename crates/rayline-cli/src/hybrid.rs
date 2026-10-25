@@ -166,6 +166,11 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             let settings = crate::status::read_settings(&home);
             let (profile, base_dir) = match config {
                 Some(config) => {
+                    if env != "prod" || cell.is_some() || local_context_window.is_some() {
+                        eprintln!(
+                            "Note: --env, --cell and --local-context-window apply to the default profile; the profile file at --config sets these itself"
+                        );
+                    }
                     let profile_path = fs::canonicalize(config)?;
                     let profile: Value = serde_json::from_slice(&fs::read(&profile_path)?)
                         .map_err(|error| {
@@ -195,6 +200,19 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                                 "cannot read the local runtime's context window; pass --local-context-window <tokens>",
                             ))?,
                     };
+                    if env == crate::status::PROD_ENV {
+                        eprintln!(
+                            "Note: hybrid routing v2 is in preview on the development router; the production router accepts it after the catalog migration. Use --env dev for the preview."
+                        );
+                    }
+                    // `rayline auth login` is enough: mint the router key on first use.
+                    if std::env::var_os("RAYLINE_ROUTER_API_KEY")
+                        .is_none_or(|value| value.is_empty())
+                    {
+                        crate::claude::ensure_router_key(&env, &home, None, false)
+                            .await
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                    }
                     let profile = crate::hybrid_profile::default_profile(
                         &hosted.router_url,
                         &base_url,
