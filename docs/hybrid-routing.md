@@ -389,12 +389,17 @@ during hybrid startup. `rayline update` repairs a missing core even when the
 launcher is already at the requested release, using verified signed artifacts.
 Users upgrading from an older two-binary updater may need to run it a second time.
 
-Releases before 0.2.13 ship no core. `rayline update --version 0.2.12` (a
-rollback) decides this from the target's signed `SHA256SUMS`: when it lists no
-`rayline-core` entry and the version is older than 0.2.13, the update installs
-only `rayline` and `rld` and leaves any installed `rayline-core` in place (the
-older launcher never runs it, and a later update replaces it). A 0.2.13 or later
-release whose `SHA256SUMS` lacks the core fails closed. A build newer than its
+Releases before 0.2.13 ship no core. A rollback such as
+`rayline update --version 0.2.12+ee1afb00b6cd` decides this from the target's
+signed `SHA256SUMS`: when it lists no `rayline-core` entry and the version is
+older than 0.2.13, the update installs only `rayline` and `rld`, then removes
+the installed `rayline-core` and `rayline-core-LICENSE`, so no later launcher
+(for example one installed by the older two-binary updater) runs a core that
+does not match it; that launcher reports the core missing and `rayline update`
+installs the matching one. A 0.2.13 or later release whose `SHA256SUMS` lacks
+the core fails closed. Releases are published under their full version, build
+label included (shown in the GitHub release notes and by `rayline --version`);
+a bare `--version 0.2.12` that is not found says to use the full form. A build newer than its
 channel's latest release reports that it is up to date and names the
 `rayline update --version <current>` command that repairs a missing core.
 

@@ -178,7 +178,7 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                         core.license.display()
                     ),
                     None => format!(
-                        "Would install {} and {}; {} predates the execution core, so an installed rayline-core is left in place.\n",
+                        "Would install {} and {}; {} predates the execution core, so an installed rayline-core would be removed.\n",
                         artifacts.launcher.display(),
                         artifacts.daemon.display(),
                         target.public
@@ -206,21 +206,23 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                         crate::DAEMON_BIN,
                         std::env::consts::EXE_SUFFIX
                     ));
-                // A pre-core release (rollback) installs no core and leaves an
-                // installed one untouched: the older launcher never runs it,
-                // and a later update replaces it with the matching core.
+                let core_install_path = daemon_install_path
+                    .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
+                let license_install_path = core_install_path.with_file_name(CORE_LICENSE_NAME);
                 if let Some(core) = &artifacts.core {
-                    let core_install_path = daemon_install_path
-                        .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
-                    replace_file(
-                        &core.license,
-                        &core_install_path.with_file_name(CORE_LICENSE_NAME),
-                        false,
-                    )?;
+                    replace_file(&core.license, &license_install_path, false)?;
                     replace_binary(&core.binary, &core_install_path)?;
                 }
                 replace_binary(&artifacts.launcher, &install_path)?;
                 replace_binary(&artifacts.daemon, &daemon_install_path)?;
+                if artifacts.core.is_none() {
+                    // Rollback to a pre-core release: remove the newer core
+                    // and its license so no later launcher (for example one
+                    // installed by the older two-binary updater) runs a core
+                    // that does not match it; it then reports the core as
+                    // missing and `rayline update` installs the matching one.
+                    remove_stale_core(&[&core_install_path, &license_install_path]);
+                }
                 cleanup_legacy_uv_install(crate::UV_TOOL_NAME, &install_path);
                 Ok(UpdateResult {
                     message: format!(
@@ -238,6 +240,38 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
     };
     let _ = fs::remove_dir_all(&temp_dir);
     result
+}
+
+/// Releases are published under their full version, build label included
+/// (`cli/v0.2.12+ee1afb00b6cd/`), and there is no index to resolve a bare
+/// `X.Y.Z` from. A missing release named without a build label says so.
+fn bare_version_hint(target: &Version, error: UpdateError) -> UpdateError {
+    match error {
+        UpdateError::Network(message)
+            if !target.normalized.contains('+') && message.ends_with("HTTP 404") =>
+        {
+            UpdateError::Network(format!(
+                "release {} was not found. Releases are published under their full version including the build label; run `rayline update --version {}+<build>` with the full version from the release notes (`rayline --version` prints it for an installed release).",
+                target.public, target.public
+            ))
+        }
+        error => error,
+    }
+}
+
+/// Remove an installed core and license after a rollback to a pre-core
+/// release. The rollback has already succeeded, so a failure is a warning.
+fn remove_stale_core(paths: &[&Path]) {
+    for path in paths {
+        match fs::remove_file(path) {
+            Ok(()) => eprintln!("Removed {} (not part of this release).", path.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "Warning: could not remove {}: {error}; delete it by hand.",
+                path.display()
+            ),
+        }
+    }
 }
 
 /// True when `version`'s release number is older than [`CORE_FIRST_VERSION`].
@@ -533,7 +567,9 @@ async fn download_and_verify(
 
     // Download checksums and its signature first so we can verify before
     // trusting any artifact bytes.
-    download_to(&checksums_url_for(version), &sums_path).await?;
+    download_to(&checksums_url_for(version), &sums_path)
+        .await
+        .map_err(|error| bare_version_hint(target, error))?;
     download_to(&checksums_sig_url_for(version), &sig_path).await?;
 
     // Verify signature BEFORE reading or trusting the checksums file.
@@ -1188,6 +1224,37 @@ mod tests {
 
     fn version(raw: &str) -> Version {
         Version::parse(raw).unwrap_or_else(|_| panic!("test version {raw} parses"))
+    }
+
+    #[test]
+    fn a_missing_bare_version_names_the_full_form() {
+        let not_found = || UpdateError::Network("GET x returned HTTP 404".to_owned());
+        let UpdateError::Network(message) = bare_version_hint(&version("0.2.12"), not_found())
+        else {
+            panic!("network error expected");
+        };
+        assert!(message.contains("--version 0.2.12+<build>"), "{message}");
+        // A full version, or another failure, keeps its own error.
+        assert_eq!(
+            bare_version_hint(&version("0.2.12+ee1afb00b6cd"), not_found()),
+            not_found()
+        );
+        let other = UpdateError::Network("GET x returned HTTP 500".to_owned());
+        assert_eq!(bare_version_hint(&version("0.2.12"), other.clone()), other);
+    }
+
+    #[test]
+    fn rollback_removes_a_stale_core_and_tolerates_none() -> Result<(), UpdateError> {
+        let root = temp_update_dir()?;
+        let core = root.join("rayline-core");
+        let license = root.join(CORE_LICENSE_NAME);
+        fs::write(&core, b"core")?;
+        fs::write(&license, b"license")?;
+        remove_stale_core(&[&core, &license]);
+        assert!(!core.exists() && !license.exists());
+        remove_stale_core(&[&core, &license]);
+        fs::remove_dir_all(root)?;
+        Ok(())
     }
 
     #[test]
