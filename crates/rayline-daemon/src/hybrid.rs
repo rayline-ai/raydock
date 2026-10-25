@@ -194,15 +194,8 @@ pub async fn run(args: Args) -> Result<()> {
 /// is started only when `decisions.url` is a Rayline router or loopback. This
 /// repeats the launcher's check on the file the core will actually read.
 fn check_decisions_url(path: &Path, router_urls: &[String]) -> Result<()> {
-    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
-        .context("invalid execution core configuration")?;
-    let url = config
-        .get("decisions")
-        .and_then(|decisions| decisions.get("url"))
-        .and_then(serde_json::Value::as_str)
-        .context("execution core configuration requires a decisions.url string")?;
-    rayline_local_router::decisions_url::check_decisions_url(
-        url,
+    rayline_local_router::decisions_url::check_config_bytes(
+        &std::fs::read(path)?,
         router_urls.iter().map(String::as_str),
     )
     .map_err(anyhow::Error::msg)

@@ -48,7 +48,10 @@ HTTP or HTTPS) for tests and a local Decisions service. Anything else, such as
 a direct `*.modal.run` URL, is refused by `start` with an error that names only
 the host and port. `rld hybrid` repeats the check on the file it gives the core,
 so a hand-edited `core-config.json` cannot widen it, and refuses a
-configuration without `decisions.url`. The URL must be written canonically:
+configuration without `decisions.url`, with duplicate JSON keys, or with a key
+that Go's case-insensitive decoder would also read as `decisions` or `url`
+(such as `Decisions` or `deciſions`). `start` passes `rld` only the
+`https://host:port` origin of each configured router. The URL must be written canonically:
 ASCII only (punycode, not Unicode, for an IDN), no `user:password@`, no
 backslashes or whitespace, and a host and port spelled the way they parse
 (`:443` is accepted, `:0443` or `0x7f.1` are not). Host case is ignored; a

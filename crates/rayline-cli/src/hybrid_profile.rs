@@ -628,7 +628,10 @@ pub(crate) fn configured_router_urls(home: &Path) -> Vec<String> {
     names
         .iter()
         .filter_map(|name| crate::status::resolve_hosted_environment(name, Some(home)).ok())
-        .map(|hosted| hosted.router_url)
+        // Only the origin: a router URL's path, query or userinfo never
+        // reaches `rld`'s arguments, and one with credentials is dropped.
+        .filter_map(|hosted| https_host(&hosted.router_url))
+        .map(|authority| format!("https://{authority}"))
         .collect()
 }
 
@@ -636,13 +639,8 @@ pub(crate) fn configured_router_urls(home: &Path) -> Vec<String> {
 /// configured environment (HTTPS, exact host and port) or a loopback address.
 /// `rld` repeats this check on the file it hands the core.
 pub(crate) fn check_decisions_url(config: &Value, router_urls: &[String]) -> Result<(), String> {
-    let url = config
-        .get("decisions")
-        .and_then(|decisions| decisions.get("url"))
-        .and_then(Value::as_str)
-        .ok_or("hybrid configuration requires a decisions.url string")?;
-    rayline_local_router::decisions_url::check_decisions_url(
-        url,
+    rayline_local_router::decisions_url::check_config(
+        config,
         router_urls.iter().map(String::as_str),
     )
 }
@@ -1238,7 +1236,13 @@ mod tests {
         )
         .unwrap();
         let routers = configured_router_urls(&home);
-        assert!(routers.contains(&"https://router.stage.example:8443".to_owned()));
+        assert_eq!(
+            routers,
+            vec![
+                "https://api.rayline.ai:443".to_owned(),
+                "https://router.stage.example:8443".to_owned()
+            ]
+        );
         // The default profile is built on the selected environment's router.
         for router in [
             "https://api.rayline.ai",
