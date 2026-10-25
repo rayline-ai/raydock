@@ -15,7 +15,7 @@ Usage:
 Options:
   --version      Release version to install, for example 0.2.0 or v0.2.0.
                  Defaults to the latest GitHub release.
-  --install-dir  Directory for rayline and rld.
+  --install-dir  Directory for rayline, rld and rayline-core.
                  Defaults to ~/.rayline/bin.
 
 Environment:
@@ -95,6 +95,7 @@ fi
 
 rayline_asset="rayline-$platform"
 daemon_asset="rld-$platform"
+core_asset="rayline-core-$platform"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf "$tmp_dir"' EXIT INT TERM
 
@@ -126,14 +127,16 @@ fi
 
 download "$base_url/$rayline_asset" "$tmp_dir/$rayline_asset"
 download "$base_url/$daemon_asset" "$tmp_dir/$daemon_asset"
+download "$base_url/$core_asset" "$tmp_dir/$core_asset"
+download "$base_url/rayline-core-LICENSE" "$tmp_dir/rayline-core-LICENSE"
 
-awk -v a="$rayline_asset" -v b="$daemon_asset" '$2 == a || $2 == b { print }' \
-  "$tmp_dir/SHA256SUMS" > "$tmp_dir/SHA256SUMS.selected"
-
-if [ ! -s "$tmp_dir/SHA256SUMS.selected" ]; then
-  echo "release checksums do not include expected assets for $platform" >&2
-  exit 1
-fi
+for asset in "$rayline_asset" "$daemon_asset" "$core_asset" rayline-core-LICENSE; do
+  awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print; count++ } END { if (count != 1) exit 1 }' \
+    "$tmp_dir/SHA256SUMS" >> "$tmp_dir/SHA256SUMS.selected" || {
+      echo "release checksums must include exactly one entry for $asset" >&2
+      exit 1
+    }
+done
 
 (
   cd "$tmp_dir"
@@ -148,8 +151,10 @@ fi
 )
 
 mkdir -p "$INSTALL_DIR"
+install -m 0644 "$tmp_dir/rayline-core-LICENSE" "$INSTALL_DIR/rayline-core-LICENSE"
 install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/rayline"
 install -m 0755 "$tmp_dir/$daemon_asset" "$INSTALL_DIR/rld"
+install -m 0755 "$tmp_dir/$core_asset" "$INSTALL_DIR/rayline-core"
 
 echo "Installed Rayline Local to $INSTALL_DIR"
 if ! command -v rayline >/dev/null 2>&1; then

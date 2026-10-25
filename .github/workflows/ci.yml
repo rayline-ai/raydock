@@ -79,6 +79,13 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked -- --test-threads=1
 
+      - name: Validate release install and hybrid lifecycle
+        run: |
+          cargo build --locked -p rayline-cli -p rayline-daemon
+          python3 scripts/test-release-install.py
+          python3 scripts/test-hybrid-lifecycle.py
+          python3 scripts/test-hybrid-live-checks.py
+
   msrv:
     name: MSRV
     runs-on: ubuntu-latest

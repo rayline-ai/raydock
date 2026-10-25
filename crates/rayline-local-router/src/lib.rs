@@ -30,7 +30,9 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+mod capabilities;
 mod chat_inbound;
+pub use capabilities::ModelCapabilities;
 pub mod inbound_guard;
 pub use inbound_guard::InboundGuard;
 
@@ -609,7 +611,7 @@ const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
 /// than our loopback host:port (DNS rebinding), a non-loopback `Origin`, a CORS
 /// preflight, or a POST body that is not JSON (a "simple" request that skips
 /// preflight).
-fn reject_untrusted_request(
+pub fn reject_untrusted_request(
     port: u16,
     method: &Method,
     uri: &hyper::Uri,

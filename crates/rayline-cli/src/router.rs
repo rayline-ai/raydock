@@ -5273,7 +5273,7 @@ fn title_case_bool(value: bool) -> &'static str {
 }
 
 #[cfg(unix)]
-fn process_exists(pid: i32) -> bool {
+pub(crate) fn process_exists(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
@@ -5299,12 +5299,12 @@ fn process_is_zombie(pid: i32) -> bool {
 }
 
 #[cfg(unix)]
-fn terminate_process(pid: i32) -> io::Result<()> {
+pub(crate) fn terminate_process(pid: i32) -> io::Result<()> {
     signal_process(pid, libc::SIGTERM)
 }
 
 #[cfg(unix)]
-fn force_stop_process_group(pid: i32) -> io::Result<()> {
+pub(crate) fn force_stop_process_group(pid: i32) -> io::Result<()> {
     let result = unsafe { libc::killpg(pid, libc::SIGKILL) };
     if result == 0 {
         return Ok(());
@@ -5330,7 +5330,7 @@ fn signal_process(pid: i32, signal: i32) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn process_exists(pid: i32) -> bool {
+pub(crate) fn process_exists(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
@@ -5348,7 +5348,7 @@ fn process_exists(pid: i32) -> bool {
 }
 
 #[cfg(windows)]
-fn terminate_process(pid: i32) -> io::Result<()> {
+pub(crate) fn terminate_process(pid: i32) -> io::Result<()> {
     // Windows has no graceful equivalent of SIGTERM for our daemon: `taskkill`
     // without `/F` only posts WM_CLOSE, which a windowless console process never
     // receives, so the command fails ("can only be terminated forcefully") and
@@ -5381,7 +5381,7 @@ fn terminate_process(pid: i32) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn force_stop_process_group(pid: i32) -> io::Result<()> {
+pub(crate) fn force_stop_process_group(pid: i32) -> io::Result<()> {
     let status = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
@@ -5406,7 +5406,7 @@ fn force_stop_process_group(pid: i32) -> io::Result<()> {
 /// enforced.  macOS and Linux are the supported targets; Windows support is a
 /// known gap documented in the crate README.
 #[cfg(unix)]
-fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -5421,7 +5421,7 @@ fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
 }
 
 #[cfg(not(unix))]
-fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
+pub(crate) fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
     // Non-unix stub: open the file so the guard type is consistent.
     // No actual locking — Windows is a known gap.
     std::fs::OpenOptions::new()

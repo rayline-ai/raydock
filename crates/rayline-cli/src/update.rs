@@ -41,6 +41,8 @@ pub enum UpdateError {
 struct UpdateArtifacts {
     launcher: PathBuf,
     daemon: PathBuf,
+    core: PathBuf,
+    core_license: PathBuf,
 }
 
 impl std::fmt::Display for UpdateError {
@@ -115,16 +117,37 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
         None => fetch_latest_version(&channel).await?,
     };
 
-    let decision = evaluate_check(
+    let mut decision = evaluate_check(
         &current,
         &target,
         request.pinned_version.is_some() || request.channel.is_some(),
         request.force,
     );
+    let core_install_path =
+        install_path.with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
+    if decision.exit_code == 0 && !core_install_path.is_file() {
+        if target.normalized != current.normalized {
+            return Err(UpdateError::Install(format!(
+                "Cannot repair the execution core from an older release pointer; run `rayline update --version {}`.",
+                current.normalized
+            )));
+        }
+        decision = UpdateResult {
+            message: format!(
+                "Execution core is missing; reinstall the complete {} release with `rayline update`.\n",
+                current.public
+            ),
+            exit_code: 1,
+            stderr: false,
+        };
+    }
     if decision.exit_code == 0 || request.check_only {
         return Ok(decision);
     }
 
+    if !request.check_only && !core_install_path.is_file() {
+        eprintln!("Execution core is missing; verifying the complete release.");
+    }
     let temp_dir = temp_update_dir()?;
     let artifacts = download_and_verify(&target.normalized, platform_tag, &temp_dir).await;
     let result = match artifacts {
@@ -132,9 +155,11 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
             if request.dry_run {
                 Ok(UpdateResult {
                     message: format!(
-                        "Would install {} and {}.\n",
+                        "Would install {}, {}, {} and {}.\n",
                         artifacts.launcher.display(),
-                        artifacts.daemon.display()
+                        artifacts.daemon.display(),
+                        artifacts.core.display(),
+                        artifacts.core_license.display()
                     ),
                     exit_code: 0,
                     stderr: false,
@@ -156,6 +181,14 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                         crate::DAEMON_BIN,
                         std::env::consts::EXE_SUFFIX
                     ));
+                let core_install_path = daemon_install_path
+                    .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
+                replace_file(
+                    &artifacts.core_license,
+                    &core_install_path.with_file_name("rayline-core-LICENSE"),
+                    false,
+                )?;
+                replace_binary(&artifacts.core, &core_install_path)?;
                 replace_binary(&artifacts.launcher, &install_path)?;
                 replace_binary(&artifacts.daemon, &daemon_install_path)?;
                 cleanup_legacy_uv_install(crate::UV_TOOL_NAME, &install_path);
@@ -347,20 +380,8 @@ fn latest_url_for(channel: &str) -> Option<String> {
     Some(format!("{}/{latest_key}", base_url()))
 }
 
-fn artifact_url_for(version: &str, platform_tag: &str) -> String {
-    format!(
-        "{}/cli/v{version}/{}-{platform_tag}",
-        base_url(),
-        crate::CLI_BIN
-    )
-}
-
-fn daemon_artifact_url_for(version: &str, platform_tag: &str) -> String {
-    format!(
-        "{}/cli/v{version}/{}-{platform_tag}",
-        base_url(),
-        crate::DAEMON_BIN
-    )
+fn artifact_url_for(version: &str, platform_tag: &str, name: &str) -> String {
+    format!("{}/cli/v{version}/{name}-{platform_tag}", base_url())
 }
 
 fn checksums_url_for(version: &str) -> String {
@@ -443,6 +464,10 @@ async fn download_and_verify(
     let daemon_name = format!("{}-{platform_tag}", crate::DAEMON_BIN);
     let launcher_path = dest_dir.join(&launcher_name);
     let daemon_path = dest_dir.join(&daemon_name);
+    let core_name = format!("rayline-core-{platform_tag}");
+    let core_path = dest_dir.join(&core_name);
+    let license_name = "rayline-core-LICENSE";
+    let license_path = dest_dir.join(license_name);
     let sums_path = dest_dir.join("SHA256SUMS");
     let sig_path = dest_dir.join("SHA256SUMS.minisig");
 
@@ -460,19 +485,38 @@ async fn download_and_verify(
     let sums = String::from_utf8(sums_bytes)
         .map_err(|_| UpdateError::Checksum("SHA256SUMS contains invalid UTF-8".to_owned()))?;
 
-    download_to(&artifact_url_for(version, platform_tag), &launcher_path).await?;
     download_to(
-        &daemon_artifact_url_for(version, platform_tag),
+        &artifact_url_for(version, platform_tag, crate::CLI_BIN),
+        &launcher_path,
+    )
+    .await?;
+    download_to(
+        &artifact_url_for(version, platform_tag, crate::DAEMON_BIN),
         &daemon_path,
+    )
+    .await?;
+
+    download_to(
+        &artifact_url_for(version, platform_tag, "rayline-core"),
+        &core_path,
+    )
+    .await?;
+    download_to(
+        &format!("{}/cli/v{version}/{license_name}", base_url()),
+        &license_path,
     )
     .await?;
 
     verify_checksum(&sums, &launcher_name, &launcher_path)?;
     verify_checksum(&sums, &daemon_name, &daemon_path)?;
+    verify_checksum(&sums, &core_name, &core_path)?;
+    verify_checksum(&sums, license_name, &license_path)?;
 
     Ok(UpdateArtifacts {
         launcher: launcher_path,
         daemon: daemon_path,
+        core: core_path,
+        core_license: license_path,
     })
 }
 
@@ -613,6 +657,16 @@ fn homebrew_prefix() -> Option<PathBuf> {
 }
 
 pub(crate) fn replace_binary(downloaded: &Path, install_path: &Path) -> Result<(), UpdateError> {
+    replace_file(downloaded, install_path, true)
+}
+
+fn replace_file(
+    downloaded: &Path,
+    install_path: &Path,
+    executable: bool,
+) -> Result<(), UpdateError> {
+    #[cfg(not(unix))]
+    let _ = executable;
     let parent = install_path.parent().ok_or_else(|| {
         UpdateError::Install(format!(
             "install path has no parent directory: {}",
@@ -637,10 +691,10 @@ pub(crate) fn replace_binary(downloaded: &Path, install_path: &Path) -> Result<(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(0o755);
+        let permissions = fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 });
         fs::set_permissions(&staged, permissions).map_err(|error| {
             UpdateError::Install(format!(
-                "failed to mark update executable at {}: {error}",
+                "failed to set update permissions at {}: {error}",
                 staged.display()
             ))
         })?;
@@ -1032,6 +1086,32 @@ impl From<io::Error> for UpdateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_license_installs_as_verified_nonexecutable_data() -> Result<(), UpdateError> {
+        let root = temp_update_dir()?;
+        let source = root.join("rayline-core-LICENSE");
+        let destination = root.join("installed/rayline-core-LICENSE");
+        let content = b"Pinned license fixture\n";
+        fs::write(&source, content)?;
+        let sums = format!("{:x}  rayline-core-LICENSE\n", Sha256::digest(content));
+        verify_checksum(&sums, "rayline-core-LICENSE", &source)?;
+        replace_file(&source, &destination, false)?;
+        assert_eq!(fs::read(&destination)?, content);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&destination)?.permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        fs::write(&source, b"tampered license")?;
+        assert!(verify_checksum(&sums, "rayline-core-LICENSE", &source).is_err());
+        assert_eq!(fs::read(&destination)?, content);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn uv_tool_managed_path_matches_tool_environment() {

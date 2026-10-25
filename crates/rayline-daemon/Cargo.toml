@@ -30,6 +30,8 @@ dirs.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+futures.workspace = true
+rand = "0.9"
 rayline-hf = { path = "../rayline-hf" }
 rayline-llama = { path = "../rayline-llama" }
 rayline-metrics = { path = "../rayline-metrics" }

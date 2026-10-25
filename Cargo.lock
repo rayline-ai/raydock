@@ -1445,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-adapter"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1466,13 +1466,14 @@ dependencies = [
 
 [[package]]
 name = "rayline-authcache"
-version = "0.2.12"
+version = "0.2.13"
 
 [[package]]
 name = "rayline-cli"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "base64",
+ "clap",
  "crossterm",
  "dirs",
  "libc",
@@ -1495,15 +1496,17 @@ dependencies = [
 
 [[package]]
 name = "rayline-daemon"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "bytes",
  "clap",
  "dirs",
+ "futures",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "rand 0.9.4",
  "rayline-adapter",
  "rayline-hf",
  "rayline-injector",
@@ -1521,7 +1524,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-hf"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1534,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-injector"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1553,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-llama"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1569,7 +1572,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-local-router"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1588,7 +1591,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-metrics"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "serde",
  "tokio",
@@ -1596,7 +1599,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-proxy"
-version = "0.2.12"
+version = "0.2.13"
 dependencies = [
  "anyhow",
  "async-compression",

@@ -13,6 +13,7 @@ pub mod codex;
 pub mod codex_app;
 pub mod discover;
 pub mod harness;
+pub mod hybrid;
 pub mod local_model;
 pub mod onboarding;
 pub mod providers;
@@ -64,6 +65,7 @@ Commands:
   hermes     Run Hermes Agent against the Rayline router
   openclaw   Run OpenClaw against the Rayline router
   router     Start, inspect, or stop the local Rayline router runtime
+  hybrid     Start the ARC execution core or connect a harness to it
   top        Show live router request metrics
   local      Configure local model routing
   update     Check for or install a rayline launcher update
@@ -509,6 +511,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
         RaylineDispatch::CodexRun(request) => codex::run(request).await,
         RaylineDispatch::CodexApp(request) => codex_app::run(request).await,
         RaylineDispatch::Harness(request) => harness::run(request).await,
+        RaylineDispatch::Hybrid(args) => hybrid::run(args).await,
         RaylineDispatch::CodexConfigure(request) => match codex::configure(&request) {
             Ok(message) => {
                 print!("{message}");
@@ -758,6 +761,7 @@ pub enum RaylineDispatch {
     CodexApp(codex_app::AppRunRequest),
     CodexConfigure(codex::ConfigureRequest),
     Harness(harness::RunRequest),
+    Hybrid(Vec<OsString>),
     RouterStart(router::RouterStartCliRequest),
     RouterStatus(router::RouterStatusRequest),
     RouterLogs(router::RouterLogsRequest),
@@ -874,6 +878,9 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
         }
 
         return match arg {
+            "hybrid" if !root_env_explicit && root_auth_token.is_none() => {
+                RaylineDispatch::Hybrid(args.cloned().collect())
+            }
             "auth" => parse_auth_dispatch(args, root_env, root_auth_token, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
             "claude-desktop" => {
