@@ -11,6 +11,10 @@ use sha2::{Digest, Sha256};
 
 const UPDATE_BASE_URL_ENV: &str = "RAYLINE_UPDATE_BASE_URL";
 const UPDATE_INSTALL_PATH_ENV: &str = "RAYLINE_UPDATE_INSTALL_PATH";
+/// First release that ships the execution core (`rayline-core`). Older
+/// releases have no core assets, so rolling back to one skips the core.
+const CORE_FIRST_VERSION: &str = "0.2.13";
+const CORE_LICENSE_NAME: &str = "rayline-core-LICENSE";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateRequest {
@@ -41,8 +45,14 @@ pub enum UpdateError {
 struct UpdateArtifacts {
     launcher: PathBuf,
     daemon: PathBuf,
-    core: PathBuf,
-    core_license: PathBuf,
+    /// The execution core and its license; `None` for a release that
+    /// predates the core (see [`release_ships_core`]).
+    core: Option<CoreArtifacts>,
+}
+
+struct CoreArtifacts {
+    binary: PathBuf,
+    license: PathBuf,
 }
 
 impl std::fmt::Display for UpdateError {
@@ -127,10 +137,16 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
         install_path.with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
     if decision.exit_code == 0 && !core_install_path.is_file() {
         if target.normalized != current.normalized {
-            return Err(UpdateError::Install(format!(
-                "Cannot repair the execution core from an older release pointer; run `rayline update --version {}`.",
-                current.normalized
-            )));
+            // This build is newer than the channel's latest pointer: there is
+            // nothing to update to, so report that and name the repair rather
+            // than failing the check.
+            return Ok(UpdateResult {
+                message: format!(
+                    "{}Execution core is missing; repair it with `rayline update --version {}`.\n",
+                    decision.message, current.normalized
+                ),
+                ..decision
+            });
         }
         decision = UpdateResult {
             message: format!(
@@ -145,22 +161,31 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
         return Ok(decision);
     }
 
-    if !request.check_only && !core_install_path.is_file() {
+    if !core_install_path.is_file() && !predates_core(&target) {
         eprintln!("Execution core is missing; verifying the complete release.");
     }
     let temp_dir = temp_update_dir()?;
-    let artifacts = download_and_verify(&target.normalized, platform_tag, &temp_dir).await;
+    let artifacts = download_and_verify(&target, platform_tag, &temp_dir).await;
     let result = match artifacts {
         Ok(artifacts) => {
             if request.dry_run {
-                Ok(UpdateResult {
-                    message: format!(
+                let message = match &artifacts.core {
+                    Some(core) => format!(
                         "Would install {}, {}, {} and {}.\n",
                         artifacts.launcher.display(),
                         artifacts.daemon.display(),
-                        artifacts.core.display(),
-                        artifacts.core_license.display()
+                        core.binary.display(),
+                        core.license.display()
                     ),
+                    None => format!(
+                        "Would install {} and {}; {} predates the execution core, so an installed rayline-core is left in place.\n",
+                        artifacts.launcher.display(),
+                        artifacts.daemon.display(),
+                        target.public
+                    ),
+                };
+                Ok(UpdateResult {
+                    message,
                     exit_code: 0,
                     stderr: false,
                 })
@@ -181,14 +206,19 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                         crate::DAEMON_BIN,
                         std::env::consts::EXE_SUFFIX
                     ));
-                let core_install_path = daemon_install_path
-                    .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
-                replace_file(
-                    &artifacts.core_license,
-                    &core_install_path.with_file_name("rayline-core-LICENSE"),
-                    false,
-                )?;
-                replace_binary(&artifacts.core, &core_install_path)?;
+                // A pre-core release (rollback) installs no core and leaves an
+                // installed one untouched: the older launcher never runs it,
+                // and a later update replaces it with the matching core.
+                if let Some(core) = &artifacts.core {
+                    let core_install_path = daemon_install_path
+                        .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
+                    replace_file(
+                        &core.license,
+                        &core_install_path.with_file_name(CORE_LICENSE_NAME),
+                        false,
+                    )?;
+                    replace_binary(&core.binary, &core_install_path)?;
+                }
                 replace_binary(&artifacts.launcher, &install_path)?;
                 replace_binary(&artifacts.daemon, &daemon_install_path)?;
                 cleanup_legacy_uv_install(crate::UV_TOOL_NAME, &install_path);
@@ -208,6 +238,35 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
     };
     let _ = fs::remove_dir_all(&temp_dir);
     result
+}
+
+/// True when `version`'s release number is older than [`CORE_FIRST_VERSION`].
+/// Pre-release and build labels are ignored, so `0.2.13-dev.1` needs the core.
+fn predates_core(version: &Version) -> bool {
+    Version::parse(CORE_FIRST_VERSION).is_ok_and(|first| version.base_cmp(&first) == Ordering::Less)
+}
+
+/// Decide from a release's signature-verified SHA256SUMS whether it ships the
+/// execution core. Listed (the platform core or its license): install both,
+/// each checksum-verified. Not listed: allowed only for a release older than
+/// [`CORE_FIRST_VERSION`]; a newer release without the core fails closed.
+fn release_ships_core(
+    sums: &str,
+    platform_tag: &str,
+    version: &Version,
+) -> Result<bool, UpdateError> {
+    if expected_sha256(sums, &format!("rayline-core-{platform_tag}")).is_ok()
+        || expected_sha256(sums, CORE_LICENSE_NAME).is_ok()
+    {
+        return Ok(true);
+    }
+    if predates_core(version) {
+        return Ok(false);
+    }
+    Err(UpdateError::Checksum(format!(
+        "SHA256SUMS for {} does not list rayline-core-{platform_tag}; releases from {CORE_FIRST_VERSION} on must ship it",
+        version.public
+    )))
 }
 
 pub fn evaluate_check(
@@ -455,10 +514,11 @@ pub(crate) fn detect_platform_tag() -> Result<&'static str, UpdateError> {
 }
 
 async fn download_and_verify(
-    version: &str,
+    target: &Version,
     platform_tag: &str,
     dest_dir: &Path,
 ) -> Result<UpdateArtifacts, UpdateError> {
+    let version = target.normalized.as_str();
     fs::create_dir_all(dest_dir).map_err(UpdateError::from)?;
     let launcher_name = format!("{}-{platform_tag}", crate::CLI_BIN);
     let daemon_name = format!("{}-{platform_tag}", crate::DAEMON_BIN);
@@ -466,7 +526,7 @@ async fn download_and_verify(
     let daemon_path = dest_dir.join(&daemon_name);
     let core_name = format!("rayline-core-{platform_tag}");
     let core_path = dest_dir.join(&core_name);
-    let license_name = "rayline-core-LICENSE";
+    let license_name = CORE_LICENSE_NAME;
     let license_path = dest_dir.join(license_name);
     let sums_path = dest_dir.join("SHA256SUMS");
     let sig_path = dest_dir.join("SHA256SUMS.minisig");
@@ -484,6 +544,8 @@ async fn download_and_verify(
 
     let sums = String::from_utf8(sums_bytes)
         .map_err(|_| UpdateError::Checksum("SHA256SUMS contains invalid UTF-8".to_owned()))?;
+    // Decided from the verified manifest before any artifact is fetched.
+    let with_core = release_ships_core(&sums, platform_tag, target)?;
 
     download_to(
         &artifact_url_for(version, platform_tag, crate::CLI_BIN),
@@ -496,27 +558,38 @@ async fn download_and_verify(
     )
     .await?;
 
-    download_to(
-        &artifact_url_for(version, platform_tag, "rayline-core"),
-        &core_path,
-    )
-    .await?;
-    download_to(
-        &format!("{}/cli/v{version}/{license_name}", base_url()),
-        &license_path,
-    )
-    .await?;
-
     verify_checksum(&sums, &launcher_name, &launcher_path)?;
     verify_checksum(&sums, &daemon_name, &daemon_path)?;
-    verify_checksum(&sums, &core_name, &core_path)?;
-    verify_checksum(&sums, license_name, &license_path)?;
+
+    let core = if with_core {
+        download_to(
+            &artifact_url_for(version, platform_tag, "rayline-core"),
+            &core_path,
+        )
+        .await?;
+        download_to(
+            &format!("{}/cli/v{version}/{license_name}", base_url()),
+            &license_path,
+        )
+        .await?;
+        verify_checksum(&sums, &core_name, &core_path)?;
+        verify_checksum(&sums, license_name, &license_path)?;
+        Some(CoreArtifacts {
+            binary: core_path,
+            license: license_path,
+        })
+    } else {
+        eprintln!(
+            "Release {} predates the execution core; installing without it.",
+            target.public
+        );
+        None
+    };
 
     Ok(UpdateArtifacts {
         launcher: launcher_path,
         daemon: daemon_path,
-        core: core_path,
-        core_license: license_path,
+        core,
     })
 }
 
@@ -1113,6 +1186,50 @@ mod tests {
         Ok(())
     }
 
+    fn version(raw: &str) -> Version {
+        Version::parse(raw).unwrap_or_else(|_| panic!("test version {raw} parses"))
+    }
+
+    #[test]
+    fn pre_core_rollback_is_decided_from_signed_checksums() {
+        let platform = "macosx_11_0_arm64";
+        let two_binaries = format!("aa  rayline-{platform}\nbb  rld-{platform}\n");
+        let with_core =
+            format!("{two_binaries}cc  rayline-core-{platform}\ndd  rayline-core-LICENSE\n");
+        let license_only = format!("{two_binaries}dd  rayline-core-LICENSE\n");
+        let other_platform = format!("{two_binaries}cc  rayline-core-linux_x86_64\n");
+        // (sums, target, expected: Some(ships core) or None for fail closed)
+        let cases: [(&str, &str, Option<bool>); 12] = [
+            (&two_binaries, "0.2.12", Some(false)),
+            (&two_binaries, "0.1.0", Some(false)),
+            (&two_binaries, "0.2.12-dev.3", Some(false)),
+            (&two_binaries, "0.2.12+local", Some(false)),
+            (&two_binaries, "0.2.13", None),
+            (&two_binaries, "0.2.13-dev.1", None),
+            (&two_binaries, "0.3.0", None),
+            (&two_binaries, "1.0", None),
+            (&other_platform, "0.2.14", None),
+            (&with_core, "0.2.13", Some(true)),
+            // A listed core is installed (and checksum-verified) even for an
+            // old version number; a partial listing then fails verification.
+            (&with_core, "0.2.12", Some(true)),
+            (&license_only, "0.2.12", Some(true)),
+        ];
+        for (sums, target, expected) in cases {
+            let decision = release_ships_core(sums, platform, &version(target));
+            match expected {
+                Some(ships) => assert_eq!(decision, Ok(ships), "{target}: {sums:?}"),
+                None => {
+                    let Err(UpdateError::Checksum(message)) = decision else {
+                        panic!("{target} without a core must fail closed: {decision:?}");
+                    };
+                    assert!(message.contains(&format!("rayline-core-{platform}")));
+                    assert!(message.contains(CORE_FIRST_VERSION));
+                }
+            }
+        }
+    }
+
     #[test]
     fn uv_tool_managed_path_matches_tool_environment() {
         let tools_dir = Path::new("/Users/test/.local/share/uv/tools");
@@ -1274,7 +1391,7 @@ mod tests {
         // SAFETY: test binary is single-threaded (tokio::test with default
         // worker count 1); no other test reads RAYLINE_UPDATE_BASE_URL.
         unsafe { std::env::set_var(UPDATE_BASE_URL_ENV, &base_url) };
-        let result = download_and_verify("1.0.0", "macosx_11_0_arm64", &dest_dir).await;
+        let result = download_and_verify(&version("1.0.0"), "macosx_11_0_arm64", &dest_dir).await;
         unsafe { std::env::remove_var(UPDATE_BASE_URL_ENV) };
 
         // Cleanup best-effort (test trees are small)

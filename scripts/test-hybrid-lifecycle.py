@@ -41,7 +41,7 @@ def main():
         config = root / "core.json"
         config.write_text(json.dumps({"events": str(root / "events.jsonl"),
             "cancelled": str(root / "cancelled"),
-            "decisions": {"auth_env": credential_env[0]},
+            "decisions": {"url": "http://127.0.0.1:9/decisions", "auth_env": credential_env[0]},
             "deployments": [{"auth_env": name} for name in credential_env[1:]]}))
 
         def cli(*args, success=True):

@@ -611,15 +611,40 @@ pub(crate) fn saved_credentials(
 
 /// The HTTPS origin authority (host and effective port) of an endpoint.
 fn https_host(url: &str) -> Option<String> {
-    let url = reqwest::Url::parse(url).ok()?;
-    if url.scheme() != "https" {
-        return None;
+    rayline_local_router::decisions_url::https_authority(url)
+}
+
+/// Router URLs of every configured Rayline environment: the built-in `prod`
+/// plus each valid `environments` entry in settings.json.
+pub(crate) fn configured_router_urls(home: &Path) -> Vec<String> {
+    let mut names = vec![crate::status::PROD_ENV.to_owned()];
+    if let Some(configured) = crate::status::read_settings(home)
+        .as_ref()
+        .and_then(|settings| settings.get("environments"))
+        .and_then(Value::as_object)
+    {
+        names.extend(configured.keys().cloned());
     }
-    Some(format!(
-        "{}:{}",
-        url.host_str()?.to_ascii_lowercase(),
-        url.port_or_known_default()?
-    ))
+    names
+        .iter()
+        .filter_map(|name| crate::status::resolve_hosted_environment(name, Some(home)).ok())
+        .map(|hosted| hosted.router_url)
+        .collect()
+}
+
+/// Refuse a configuration whose `decisions.url` is not a Rayline router of a
+/// configured environment (HTTPS, exact host and port) or a loopback address.
+/// `rld` repeats this check on the file it hands the core.
+pub(crate) fn check_decisions_url(config: &Value, router_urls: &[String]) -> Result<(), String> {
+    let url = config
+        .get("decisions")
+        .and_then(|decisions| decisions.get("url"))
+        .and_then(Value::as_str)
+        .ok_or("hybrid configuration requires a decisions.url string")?;
+    rayline_local_router::decisions_url::check_decisions_url(
+        url,
+        router_urls.iter().map(String::as_str),
+    )
 }
 
 #[cfg(test)]
@@ -1198,6 +1223,47 @@ mod tests {
         let mut port = profile();
         port["deployments"][1]["url"] = json!("https://api-dev.rayline.ai:8443/v1/messages");
         assert!(saved_credentials(&port, &home, unset).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn decisions_go_only_to_a_configured_router_or_loopback() {
+        let home =
+            std::env::temp_dir().join(format!("rayline-hybrid-decisions-{}", std::process::id()));
+        let config_dir = home.join(".config").join(crate::CONFIG_DIR);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"environments":{"stage":{"router_url":"https://router.stage.example:8443","cli_auth_url":"https://stage.example/cli-auth"}}}"#,
+        )
+        .unwrap();
+        let routers = configured_router_urls(&home);
+        assert!(routers.contains(&"https://router.stage.example:8443".to_owned()));
+        // The default profile is built on the selected environment's router.
+        for router in [
+            "https://api.rayline.ai",
+            "https://router.stage.example:8443",
+        ] {
+            let profile =
+                default_profile(router, "http://127.0.0.1:1", "q", 16384, None, None).unwrap();
+            check_decisions_url(&profile, &routers).unwrap();
+        }
+        // A profile file is held to the same allowlist.
+        let mut custom = profile();
+        check_decisions_url(&custom, &routers).unwrap();
+        custom["decisions"]["url"] = json!("http://127.0.0.1:9/decisions");
+        check_decisions_url(&custom, &routers).unwrap();
+        for url in [
+            json!("https://rayline--decisions.modal.run/v1/routes"),
+            json!("https://router.stage.example/v1/routes"),
+            json!("https://user@api.rayline.ai/v1/routes"),
+            json!(42),
+        ] {
+            custom["decisions"]["url"] = url.clone();
+            assert!(check_decisions_url(&custom, &routers).is_err(), "{url}");
+        }
+        custom["decisions"].as_object_mut().unwrap().remove("url");
+        assert!(check_decisions_url(&custom, &routers).is_err());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

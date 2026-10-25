@@ -32,6 +32,7 @@ use tracing::{info, warn};
 
 mod capabilities;
 mod chat_inbound;
+pub mod decisions_url;
 pub use capabilities::ModelCapabilities;
 pub mod inbound_guard;
 pub use inbound_guard::InboundGuard;

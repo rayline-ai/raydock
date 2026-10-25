@@ -51,6 +51,10 @@ pub struct Args {
     /// Private directory file receiving non-secret startup metadata.
     #[arg(long)]
     ready_file: PathBuf,
+    /// Router URL of a configured Rayline environment that may receive
+    /// Decisions requests, in addition to the built-in routers and loopback.
+    #[arg(long = "router-url")]
+    router_urls: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -87,6 +91,7 @@ struct Gateway {
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 
 pub async fn run(args: Args) -> Result<()> {
+    check_decisions_url(&args.config, &args.router_urls)?;
     let credential_env = credential_env_names(&args.config)?;
     let startup_timeout = Duration::from_secs(args.startup_timeout_secs);
     let startup_deadline = tokio::time::Instant::now() + startup_timeout;
@@ -183,6 +188,24 @@ pub async fn run(args: Args) -> Result<()> {
         .context("stop execution core")?;
     drop(cleanup);
     outcome
+}
+
+/// Decisions requests carry execution context and the router key, so the core
+/// is started only when `decisions.url` is a Rayline router or loopback. This
+/// repeats the launcher's check on the file the core will actually read.
+fn check_decisions_url(path: &Path, router_urls: &[String]) -> Result<()> {
+    let config: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)
+        .context("invalid execution core configuration")?;
+    let url = config
+        .get("decisions")
+        .and_then(|decisions| decisions.get("url"))
+        .and_then(serde_json::Value::as_str)
+        .context("execution core configuration requires a decisions.url string")?;
+    rayline_local_router::decisions_url::check_decisions_url(
+        url,
+        router_urls.iter().map(String::as_str),
+    )
+    .map_err(anyhow::Error::msg)
 }
 
 fn credential_env_names(path: &Path) -> Result<Vec<String>> {
