@@ -435,6 +435,25 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
     Some((base_url, field("model")?))
 }
 
+/// The context window a harness should budget against: the largest window of
+/// the composed config's cloud deployments, or `core_window` when that is
+/// larger or there is no cloud deployment (an all-local profile).
+///
+/// The core advertises the smallest window across its deployments. A turn that
+/// overflows the local window is handed off to cloud (capacity handoff), so a
+/// harness that sizes requests from its window (pi 1.1 clamps `max_tokens` to
+/// what is left of it) must see the window that handoff can reach.
+pub(crate) fn reachable_context_window(config: &Value, core_window: u64) -> u64 {
+    config
+        .get("deployments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|deployment| deployment.get("kind").and_then(Value::as_str) == Some("cloud"))
+        .filter_map(|deployment| deployment.get("context_window").and_then(Value::as_u64))
+        .fold(core_window, u64::max)
+}
+
 /// The default package-less profile: local Qwen from `local_model`, Opus and
 /// Sonnet through the signed-in router (exact model pins), decisions from the
 /// router's `rayline-router` model with the hybrid default preset applied by
@@ -710,6 +729,32 @@ mod tests {
         assert_eq!(decisions["routing"]["value_usd"], 0.1);
         assert_eq!(decisions["result"], "custom");
         assert_eq!(composed.policy, PolicySource::Settings);
+    }
+
+    #[test]
+    fn reachable_context_window_is_the_cloud_window_when_cloud_is_configured() {
+        let mixed = default_profile(
+            "https://api-dev.rayline.ai",
+            "http://127.0.0.1:11434/v1",
+            "qwen3.8:27b",
+            16384,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reachable_context_window(&mixed, 16384), 200_000);
+        // All-local: the core's (local) window stays.
+        let local_only = json!({"deployments": [
+            {"id": "local", "kind": "local", "context_window": 16384},
+            {"id": "local-2", "kind": "local", "context_window": 32768}
+        ]});
+        assert_eq!(reachable_context_window(&local_only, 16384), 16384);
+        // A package profile without inline deployments keeps the core's window.
+        assert_eq!(reachable_context_window(&json!({}), 16384), 16384);
+        // A smaller cloud window never lowers the core's.
+        let small_cloud =
+            json!({"deployments": [{"id": "c", "kind": "cloud", "context_window": 8192}]});
+        assert_eq!(reachable_context_window(&small_cloud, 16384), 16384);
     }
 
     #[test]
