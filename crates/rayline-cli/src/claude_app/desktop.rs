@@ -1,7 +1,7 @@
 //! Claude Desktop's documented local profile library. Keep the compatibility
 //! boundary here: no app patching, managed preferences, or subscription cookies.
 #[cfg(any(target_os = "macos", test))]
-use super::{AppPaths, random_bytes, write_private};
+use super::{AppPaths, random_bytes};
 use serde_json::Value;
 #[cfg(any(target_os = "macos", test))]
 use serde_json::json;
@@ -19,6 +19,7 @@ const MAX_JSON_BYTES: u64 = 1024 * 1024;
 
 #[cfg(any(target_os = "macos", test))]
 pub(super) struct ProfileStore {
+    home: PathBuf,
     library: PathBuf,
     config: PathBuf,
     journal: PathBuf,
@@ -82,11 +83,141 @@ fn valid_id(value: &Value) -> bool {
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn write_json(path: &Path, value: &Value) -> io::Result<()> {
-    write_private(
+fn write_json(home: &Path, path: &Path, value: &Value) -> io::Result<()> {
+    write_beneath(
+        home,
         path,
         &serde_json::to_vec_pretty(value).map_err(io::Error::other)?,
     )
+}
+
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn c_name(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid("Invalid Desktop path component"))
+}
+
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn owned_fd(fd: libc::c_int) -> io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return Err(if error.raw_os_error() == Some(libc::ELOOP) {
+            invalid("Refusing a symlink in Desktop configuration paths")
+        } else {
+            error
+        });
+    }
+    // SAFETY: `fd` is a freshly opened descriptor that nothing else owns.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+}
+
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn check(result: libc::c_int) -> io::Result<()> {
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Atomically write `contents` (0600) to `path`, which must lie beneath
+/// `home`. Every directory below `home` is opened with `O_NOFOLLOW` and the
+/// temporary file is created and renamed relative to that descriptor, so a
+/// symlink planted after validation cannot redirect the write. The directory
+/// is synced after the rename so the journal ordering survives a crash.
+#[cfg(all(unix, any(target_os = "macos", test)))]
+fn write_beneath(home: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    use std::path::Component;
+    let relative = path
+        .strip_prefix(home)
+        .map_err(|_| invalid("Desktop configuration path is outside the home directory"))?;
+    let name = relative
+        .file_name()
+        .ok_or_else(|| invalid("Invalid Desktop configuration path"))?;
+    let directory = c_name(home.as_os_str())?;
+    // SAFETY: `directory` is a valid NUL-terminated path for the call's duration.
+    let mut dir = owned_fd(unsafe {
+        libc::open(
+            directory.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    })?;
+    for component in relative.parent().into_iter().flat_map(Path::components) {
+        let Component::Normal(part) = component else {
+            return Err(invalid("Invalid Desktop configuration path"));
+        };
+        let part = c_name(part)?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `dir` is a live directory descriptor and `part` is NUL-terminated.
+        let mut fd = unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) };
+        if fd < 0 && io::Error::last_os_error().kind() == io::ErrorKind::NotFound {
+            // SAFETY: as above; mkdirat does not retain the pointer.
+            if let Err(error) =
+                check(unsafe { libc::mkdirat(dir.as_raw_fd(), part.as_ptr(), 0o700) })
+            {
+                if error.kind() != io::ErrorKind::AlreadyExists {
+                    return Err(error);
+                }
+            }
+            // SAFETY: as above.
+            fd = unsafe { libc::openat(dir.as_raw_fd(), part.as_ptr(), flags) };
+        }
+        dir = owned_fd(fd)?;
+    }
+    // Keep the containing directory owner-only, as `write_private` does.
+    // SAFETY: `dir` is a live descriptor.
+    check(unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) })?;
+    let name = c_name(name)?;
+    let tmp = c_name(std::ffi::OsStr::new(&format!(
+        ".{}.tmp-{}",
+        String::from_utf8_lossy(name.as_bytes()),
+        std::process::id()
+    )))?;
+    // SAFETY: `dir` is live and `tmp` is NUL-terminated.
+    if let Err(error) = check(unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) }) {
+        if error.kind() != io::ErrorKind::NotFound {
+            return Err(error);
+        }
+    }
+    // SAFETY: as above; O_EXCL|O_NOFOLLOW never opens an existing file or link.
+    let file = owned_fd(unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            tmp.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600 as libc::c_uint,
+        )
+    })?;
+    let mut file = fs::File::from(file);
+    let committed = file
+        .write_all(contents)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| {
+            // SAFETY: `dir` is live; both names are NUL-terminated and in `dir`.
+            check(unsafe {
+                libc::renameat(
+                    dir.as_raw_fd(),
+                    tmp.as_ptr(),
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                )
+            })
+        });
+    if let Err(error) = committed {
+        // SAFETY: `dir` is live and `tmp` is NUL-terminated.
+        unsafe { libc::unlinkat(dir.as_raw_fd(), tmp.as_ptr(), 0) };
+        return Err(error);
+    }
+    drop(file);
+    fs::File::from(dir).sync_all()
+}
+
+#[cfg(all(not(unix), any(target_os = "macos", test)))]
+fn write_beneath(_home: &Path, _path: &Path, _contents: &[u8]) -> io::Result<()> {
+    Err(invalid("Automatic Desktop setup requires macOS"))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -121,6 +252,7 @@ impl ProfileStore {
     pub(super) fn new(home: &Path) -> Self {
         let root = home.join("Library/Application Support/Claude-3p");
         Self {
+            home: home.to_path_buf(),
             library: root.join("configLibrary"),
             config: root.join("claude_desktop_config.json"),
             journal: AppPaths::new(home).dir.join("desktop-profile.json"),
@@ -243,9 +375,13 @@ impl ProfileStore {
             Some(meta) => meta,
             None => {
                 let id = uuid()?;
-                write_json(&self.library.join(format!("{id}.json")), &json!({}))?;
+                write_json(
+                    &self.home,
+                    &self.library.join(format!("{id}.json")),
+                    &json!({}),
+                )?;
                 let meta = json!({"appliedId": id, "entries": [{"id": id, "name": "Default"}]});
-                write_json(&self.library.join("_meta.json"), &meta)?;
+                write_json(&self.home, &self.library.join("_meta.json"), &meta)?;
                 meta
             }
         };
@@ -267,8 +403,12 @@ impl ProfileStore {
             ));
         }
         state["phase"] = json!("prepared");
-        write_json(&self.journal, &state)?;
-        write_json(&self.library.join(format!("{id}.json")), desired)?;
+        write_json(&self.home, &self.journal, &state)?;
+        write_json(
+            &self.home,
+            &self.library.join(format!("{id}.json")),
+            desired,
+        )?;
         let entries = meta["entries"]
             .as_array_mut()
             .ok_or_else(|| invalid("Missing profile entries"))?;
@@ -277,11 +417,11 @@ impl ProfileStore {
         }
         meta["appliedId"] = json!(id);
         restore_key(&mut meta, "hybridPointer", &Value::Null);
-        write_json(&self.library.join("_meta.json"), &meta)?;
+        write_json(&self.home, &self.library.join("_meta.json"), &meta)?;
         config["deploymentMode"] = json!("3p");
-        write_json(&self.config, &config)?;
+        write_json(&self.home, &self.config, &config)?;
         state["phase"] = json!("active");
-        write_json(&self.journal, &state)
+        write_json(&self.home, &self.journal, &state)
     }
 
     /// Restore only selection keys. Preferences and other saved profiles may
@@ -330,19 +470,19 @@ impl ProfileStore {
         };
         // Leave the journal recoverable until both writes succeed.
         state["phase"] = json!("prepared");
-        write_json(&self.journal, &state)?;
+        write_json(&self.home, &self.journal, &state)?;
         restore_key(&mut config, "deploymentMode", &state["previous"]["mode"]);
-        write_json(&self.config, &config)?;
+        write_json(&self.home, &self.config, &config)?;
         meta["appliedId"] = state["previous"]["appliedId"].clone();
         restore_key(
             &mut meta,
             "hybridPointer",
             &state["previous"]["hybridPointer"],
         );
-        write_json(&self.library.join("_meta.json"), &meta)?;
+        write_json(&self.home, &self.library.join("_meta.json"), &meta)?;
         state["previous"] = Value::Null;
         state["phase"] = json!("idle");
-        write_json(&self.journal, &state)?;
+        write_json(&self.home, &self.journal, &state)?;
         Ok(true)
     }
 }
@@ -622,13 +762,13 @@ mod tests {
         fn seed(&self, mode: Value) -> Value {
             let id = "11111111-1111-4111-8111-111111111111";
             let meta = json!({"appliedId":id,"entries":[{"id":id,"name":"Existing gateway"}],"hybridPointer":{"bootstrapUrl":"https://example.test/bootstrap"},"futureField":7});
-            write_json(&self.store.library.join(format!("{id}.json")), &json!({"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://example.test"})).expect("profile");
-            write_json(&self.store.library.join("_meta.json"), &meta).expect("meta");
+            write_json(&self.home, &self.store.library.join(format!("{id}.json")), &json!({"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://example.test"})).expect("profile");
+            write_json(&self.home, &self.store.library.join("_meta.json"), &meta).expect("meta");
             let mut config = json!({"unrelatedPreference":true});
             if !mode.is_null() {
                 config["deploymentMode"] = mode;
             }
-            write_json(&self.store.config, &config).expect("config");
+            write_json(&self.home, &self.store.config, &config).expect("config");
             meta
         }
     }
@@ -656,7 +796,7 @@ mod tests {
             assert!(f.store.matches(&desired("test-token")).expect("matches"));
             let mut config = read_object(&f.store.config).expect("read").expect("config");
             config["preferenceAddedInDesktop"] = json!(42);
-            write_json(&f.store.config, &config).expect("new preference");
+            write_json(&f.store.home, &f.store.config, &config).expect("new preference");
             assert!(f.store.restore().expect("restore"));
             let meta = f.store.meta().expect("read").expect("meta");
             assert_eq!(meta["appliedId"], original["appliedId"]);
@@ -740,13 +880,22 @@ mod tests {
                 f.store.activate(&desired("test-token")).expect("activate");
                 let mut state = f.store.state().expect("read").expect("state");
                 state["phase"] = json!("prepared");
-                write_json(&f.store.journal, &state).expect("crash journal");
+                write_json(&f.store.home, &f.store.journal, &state).expect("crash journal");
                 if !selected_rayline {
-                    write_json(&f.store.library.join("_meta.json"), &original)
-                        .expect("original selection");
+                    write_json(
+                        &f.store.home,
+                        &f.store.library.join("_meta.json"),
+                        &original,
+                    )
+                    .expect("original selection");
                 }
                 if !mode_changed {
-                    write_json(&f.store.config, &json!({"deploymentMode":"1p"})).expect("old mode");
+                    write_json(
+                        &f.store.home,
+                        &f.store.config,
+                        &json!({"deploymentMode":"1p"}),
+                    )
+                    .expect("old mode");
                 }
                 assert!(f.store.restore().expect("recover"));
                 assert_eq!(
@@ -795,8 +944,9 @@ mod tests {
                 "mode" => config["deploymentMode"] = json!("1p"),
                 _ => unreachable!(),
             }
-            write_json(&f.store.library.join("_meta.json"), &meta).expect("external selection");
-            write_json(&f.store.config, &config).expect("external mode");
+            write_json(&f.store.home, &f.store.library.join("_meta.json"), &meta)
+                .expect("external selection");
+            write_json(&f.store.home, &f.store.config, &config).expect("external mode");
             let journal = fs::read(&f.store.journal).expect("journal");
             assert!(
                 f.store.restore().is_err(),
@@ -872,6 +1022,33 @@ mod tests {
         );
         drop(guard);
         assert!(super::super::lifecycle_lock(&f.home).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_never_follow_a_directory_swapped_for_a_symlink_after_validation() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let f = Fixture::new();
+        let target = f.home.join("elsewhere");
+        fs::create_dir_all(&target).expect("target");
+        // The check passed earlier; the parent is now replaced by a link.
+        let root = f.store.library.parent().expect("parent").to_path_buf();
+        fs::create_dir_all(root.parent().expect("grandparent")).expect("grandparent");
+        symlink(&target, &root).expect("swap in a link");
+        let path = f.store.library.join("_meta.json");
+        assert!(write_beneath(&f.home, &path, b"{}").is_err());
+        assert_eq!(fs::read_dir(&target).expect("target").count(), 0);
+        assert!(write_beneath(&f.home, &f.home.join("../outside.json"), b"{}").is_err());
+
+        let fresh = f.home.join("a/b/c.json");
+        write_beneath(&f.home, &fresh, b"{\"ok\":true}").expect("fresh write");
+        assert_eq!(fs::read(&fresh).expect("read"), b"{\"ok\":true}");
+        for (path, mode) in [(fresh.clone(), 0o600), (f.home.join("a/b"), 0o700)] {
+            assert_eq!(
+                fs::metadata(path).expect("metadata").permissions().mode() & 0o777,
+                mode
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -219,9 +219,14 @@ in with your Anthropic account.
 Recovery state is owner-only in `~/.rayline/claude-desktop/desktop-profile.json`.
 Repeated starts reuse the same profile and preserve the original recovery
 selection. Changes to unrelated preferences and saved profiles are preserved.
-Automatic setup refuses externally changed profiles, hybrid pointers, or
-deployment modes, unreadable previous profiles, unknown profile metadata, and
-organization-managed inference settings instead of overwriting them. Interrupted writes retain recovery state for `off`. Do not delete
+The **Rayline ARC** profile itself is managed by Rayline and rewritten on each
+start (for example after a gateway token change); save edits under another
+profile name. Automatic setup refuses externally changed profile selections,
+hybrid pointers, or deployment modes, unreadable previous profiles, unknown
+profile metadata, and organization-managed inference settings instead of
+overwriting them. Interrupted writes retain recovery state for `off`. Desktop
+configuration and recovery writes never follow symlinks and are synced to disk
+in order. Do not delete
 that file while recovery is pending. A failed launch attempts to restore the
 previous selection; the gateway remains running for manual setup. Lifecycle
 commands share a nonblocking cross-process lease at `~/.rayline/claude-desktop.lock`
