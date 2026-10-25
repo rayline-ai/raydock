@@ -45,10 +45,25 @@ Hybrid endpoints are selected by the core configuration. The root `--env` and
 
 ## Rayline Local defaults
 
-`start` composes the core configuration from the supplied profile and the
-user's `~/.config/rayline/settings.json`, and writes the result to
-`core-config.json` in the state directory (owner-only). The user's setup is:
-start, a Rayline API key, and a `local_model` pointing at a local Qwen.
+`start` composes the core configuration from a profile and the user's
+`~/.config/rayline/settings.json`, and writes the result to `core-config.json`
+in the state directory (owner-only). The user's setup is: a Rayline API key, a
+`local_model` pointing at a local Qwen, and `start`.
+
+- **No profile file:** `start` builds a package-less default profile.
+  - Decisions go to the signed-in router (`--env`, default `prod`) with model
+    `rayline-router`.
+  - `local_model` is the local Chat deployment (`registry_model`
+    `qwen/qwen3.8-27b`). Its context window is read from llama.cpp `/props`, or
+    given with `--local-context-window`.
+  - Claude Opus 5.5 and Sonnet 5.5 are exact model pins through the same router.
+  - `derived_actions` let the core derive ARC's actions from its embedded
+    registry: Qwen's admitted controls, plus the default-base controls of Opus
+    and Sonnet.
+  - `--cell` selects an isolated development cell.
+  - This profile has no prompt counter, so local capacity facts are unknown; a
+    runtime context refusal still re-consults.
+- **`--config`:** names a qualified profile instead.
 
 - **Hybrid routing works with no overrides.** Unless the profile pins an older
   Decisions mode, the core uses `decisions.api_mode: "execution_context_v2"`

@@ -14,8 +14,7 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
   includes `rayline`, `rld` and `rayline-core`.
 - A local inference server with your Qwen model: llama.cpp, Ollama or MLX.
   Rayline does not start, download or stop it.
-- A qualified execution-core profile (`hybrid.json`). It binds ARC's actions to
-  your local deployment and to the cloud targets.
+- Nothing else. A profile file is optional (see [Advanced: a profile file](#advanced-a-profile-file)).
 
 ## Three steps
 
@@ -36,21 +35,28 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    rayline local custom --url http://127.0.0.1:11434/v1 --model qwen3.8:27b
    ```
 
-   A profile deployment marked `"from_local_model": true` takes its URL and
-   model from this setting. Its runtime identity and thinking-control profile
-   still come from the profile. With a llama.cpp prompt counter configured,
-   startup verifies the served model.
+   This is the local endpoint hybrid routing uses. ARC treats it as Qwen 3.8
+   27B, its local model.
 
 3. **Start and connect a harness.**
 
    ```bash
-   rayline hybrid start --config /absolute/path/to/hybrid.json
+   rayline hybrid start
    rayline hybrid run pi -- "Fix the failing test in parser.py"
    rayline hybrid status
    rayline hybrid stop
    ```
 
-   `start` prints the routing policy it applied and the local model it bound.
+   With no profile file, `start` builds the default profile:
+   - Decisions come from your signed-in router's `rayline-router` model.
+   - Your `local_model` is the local target.
+   - Claude Opus 5.5 and Sonnet 5.5, through the same router, are the cloud
+     targets.
+   - The local context window is read from llama.cpp. For Ollama or MLX, pass
+     `--local-context-window <tokens>`.
+   - Add `--env dev` to use a signed-in development environment.
+
+   `start` prints the profile, the routing policy and the local model it bound.
    `run` also supports `claude`, `codex`, `opencode`, `omp`, `hermes` and
    `openclaw`. Start a fresh harness session after every `start`.
 
@@ -103,6 +109,12 @@ No tool is replayed, and nothing is reselected mid-stream. If the local runtime
 itself refuses a request for context before any output, the core re-consults
 ARC with that fact instead of truncating.
 
+With the default profile the core cannot count tokens in advance, so the local
+target's capacity is reported as unknown. It still hands off when the runtime
+refuses a request for context (llama.cpp reports this before any output). A
+profile with a qualified llama.cpp prompt counter (see below) counts every
+request up front, so the handoff happens before dispatch.
+
 For llama.cpp:
 
 - Set `--ctx-size` to the profile's `context_window` and use `--parallel 1`.
@@ -124,6 +136,19 @@ The core infers what each request is from the harness's own wire traffic:
   including Pi's retained tail.
 
 No harness extension or patch is needed.
+
+## Advanced: a profile file
+
+`rayline hybrid start --config /absolute/path/to/hybrid.json` uses a qualified
+execution-core profile instead of the default. The `hybrid.routing` overrides
+still apply. Use one to:
+
+- pin a policy package and its actions;
+- choose other cloud targets;
+- qualify a llama.cpp prompt counter (model file, build and template pins) for
+  exact local token counts and capacity facts.
+
+The fields are described in [ARC hybrid execution](hybrid-routing.md).
 
 ## Troubleshooting
 

@@ -30,10 +30,21 @@ enum Action {
         /// Override the execution core installed beside rayline.
         #[arg(long)]
         core: Option<PathBuf>,
-        /// Qualified execution-core profile. Rayline Local applies its hybrid
-        /// defaults, `hybrid.routing` overrides and `local_model` to it.
+        /// Optional qualified execution-core profile. Without it, Rayline Local
+        /// builds the default profile from your signed-in environment and
+        /// `local_model`. Either way it applies `hybrid.routing` overrides.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
+        /// Signed-in environment whose router makes the decisions (default: prod).
+        #[arg(long, default_value = "prod")]
+        env: String,
+        /// Local runtime context window in tokens, when it cannot be read from
+        /// the runtime (llama.cpp reports it; Ollama and MLX do not).
+        #[arg(long)]
+        local_context_window: Option<u64>,
+        /// Isolated Decisions cell tag (development only).
+        #[arg(long)]
+        cell: Option<String>,
         /// Loopback gateway port; 0 chooses a free port.
         #[arg(long, default_value_t = 20815)]
         port: u16,
@@ -140,6 +151,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
         Action::Start {
             core,
             config,
+            env,
+            local_context_window,
+            cell,
             port,
             startup_timeout_secs,
         } => {
@@ -149,18 +163,55 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 Some(path) => fs::canonicalize(path)?,
                 None => installed_binary("rayline-core")?,
             };
-            let profile_path = fs::canonicalize(config)?;
-            let profile: Value =
-                serde_json::from_slice(&fs::read(&profile_path)?).map_err(|error| {
-                    io::Error::other(format!("invalid hybrid configuration: {error}"))
-                })?;
             let settings = crate::status::read_settings(&home);
-            let composed = crate::hybrid_profile::compose(
-                profile,
-                settings.as_ref(),
-                profile_path.parent().unwrap_or(Path::new("/")),
-            )
-            .map_err(io::Error::other)?;
+            let (profile, base_dir) = match config {
+                Some(config) => {
+                    let profile_path = fs::canonicalize(config)?;
+                    let profile: Value = serde_json::from_slice(&fs::read(&profile_path)?)
+                        .map_err(|error| {
+                            io::Error::other(format!("invalid hybrid configuration: {error}"))
+                        })?;
+                    (
+                        profile,
+                        profile_path.parent().unwrap_or(Path::new("/")).to_owned(),
+                    )
+                }
+                None => {
+                    let hosted = crate::status::resolve_hosted_environment(&env, Some(&home))
+                        .map_err(|error| {
+                            io::Error::other(format!("unknown environment {env:?}: {error:?}"))
+                        })?;
+                    let (base_url, model) =
+                        crate::hybrid_profile::custom_local_model(settings.as_ref()).ok_or_else(
+                            || io::Error::other(
+                                "hybrid routing needs your local model: run `rayline local custom --url <URL> --model <NAME>` first",
+                            ),
+                        )?;
+                    let window = match local_context_window {
+                        Some(window) => window,
+                        None => crate::hybrid_profile::probe_llamacpp_context(&client, &base_url)
+                            .await
+                            .ok_or_else(|| io::Error::other(
+                                "cannot read the local runtime's context window; pass --local-context-window <tokens>",
+                            ))?,
+                    };
+                    let profile = crate::hybrid_profile::default_profile(
+                        &hosted.router_url,
+                        &base_url,
+                        &model,
+                        window,
+                        cell.as_deref(),
+                    )
+                    .map_err(io::Error::other)?;
+                    println!(
+                        "Default hybrid profile: decisions via {} (model rayline-router), local window {window} tokens",
+                        hosted.router_url
+                    );
+                    (profile, paths.dir.clone())
+                }
+            };
+            let composed = crate::hybrid_profile::compose(profile, settings.as_ref(), &base_dir)
+                .map_err(io::Error::other)?;
             let credentials =
                 crate::hybrid_profile::saved_credentials(&composed.config, &home, |name| {
                     std::env::var(name).ok()
@@ -672,7 +723,19 @@ mod tests {
     use super::*;
     #[test]
     fn hybrid_is_explicit_and_requires_core_and_config() {
-        assert!(Cli::try_parse_from(["hybrid", "start"]).is_err());
+        // A profile file is optional: the default profile needs only a key and local_model.
+        assert!(Cli::try_parse_from(["hybrid", "start"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "hybrid",
+                "start",
+                "--env",
+                "dev",
+                "--local-context-window",
+                "16384"
+            ])
+            .is_ok()
+        );
         assert!(
             Cli::try_parse_from(["hybrid", "start", "--core", "/core", "--config", "/config"])
                 .is_ok()

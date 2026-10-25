@@ -29,6 +29,7 @@ use serde_json::{Map, Value, json};
 pub(crate) const HYBRID_DEFAULT_PRESET: &str = "arc-policy.hybrid-default.v1";
 pub(crate) const PREFER_LOCAL_PRESET: &str = "arc-policy.prefer-local.v1";
 const API_MODE_V2: &str = "execution_context_v2";
+const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 const SCHEDULE_CLASSES: &[&str] = &["cache_boundaries", "user_messages", "all_turns"];
 
 /// Where the applied policy came from, for the start message.
@@ -305,7 +306,7 @@ fn apply_local_model(
     Ok(applied)
 }
 
-fn custom_local_model(settings: Option<&Value>) -> Option<(String, String)> {
+pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, String)> {
     let entry = settings?.get("local_model")?;
     let field = |key: &str| {
         entry
@@ -321,6 +322,85 @@ fn custom_local_model(settings: Option<&Value>) -> Option<(String, String)> {
         return None;
     }
     Some((base_url, field("model")?))
+}
+
+/// The default package-less profile: local Qwen from `local_model`, Opus and
+/// Sonnet through the signed-in router (exact model pins), decisions from the
+/// router's `rayline-router` model with the hybrid default preset applied by
+/// [`compose`]. Actions are derived by the core from its embedded registry.
+pub(crate) fn default_profile(
+    router_url: &str,
+    base_url: &str,
+    model: &str,
+    context_window: u64,
+    cell: Option<&str>,
+) -> Result<Value, String> {
+    if context_window < 2048 {
+        return Err(format!(
+            "local context window {context_window} is too small"
+        ));
+    }
+    let router = router_url.trim_end_matches('/');
+    let local_url = format!(
+        "{}/v1/chat/completions",
+        crate::local_model::normalize_base_url(base_url)
+    );
+    let max_output = (context_window / 4).clamp(1024, 4096);
+    let cloud = |id: &str, wire: &str| {
+        json!({"id": id, "kind": "cloud", "cloud_transport": "model_pin", "url": format!("{router}/v1/messages"),
+               "protocol": "anthropic.messages.v1", "wire_model": wire, "registry_model": wire,
+               "registry_provider": "openrouter", "runtime_identity": "rayline-catalog-model-pin-v1",
+               "max_output_tokens": 4096, "context_window": 200000, "input_modalities": ["text"],
+               "token_units": "", "auth_env": ROUTER_KEY_ENV})
+    };
+    let mut decisions = json!({"api_mode": API_MODE_V2, "url": format!("{router}/v1/routes"),
+                               "auth_env": ROUTER_KEY_ENV, "model": "rayline-router", "result": "top", "routing": {}});
+    if let Some(cell) = cell {
+        decisions["cell_tag"] = json!(cell);
+    }
+    Ok(json!({
+        "contract_version": 1,
+        "allow_experimental_controls": true,
+        "decisions": decisions,
+        "deployments": [
+            {"id": "local", "kind": "local", "url": local_url, "protocol": "openai.chat.v1", "wire_model": model,
+             "registry_model": "qwen/qwen3.8-27b", "registry_provider": "openai",
+             "runtime_identity": format!("local_model:{model}"), "max_output_tokens": max_output,
+             "context_window": context_window, "input_modalities": ["text"], "token_units": ""},
+            cloud("cloud-opus", "anthropic/claude-opus-5.5"),
+            cloud("cloud-sonnet", "anthropic/claude-sonnet-5.5")
+        ],
+        "derived_actions": [
+            {"model": "qwen3.8-27b", "worker": "qwen3.8-27b", "deployment_id": "local"},
+            {"model": "claude-opus-5.5", "worker": "claude-opus-5.5", "deployment_id": "cloud-opus", "bases": ["default"]},
+            {"model": "claude-sonnet-5.5", "worker": "claude-sonnet-5.5", "deployment_id": "cloud-sonnet", "bases": ["default"]}
+        ]
+    }))
+}
+
+/// Reads llama.cpp's per-slot context window from `/props`; None when the
+/// runtime does not report one (it is then the user's to state).
+pub(crate) async fn probe_llamacpp_context(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Option<u64> {
+    let url = format!("{}/props", crate::local_model::normalize_base_url(base_url));
+    let props: Value = client
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    props
+        .get("default_generation_settings")
+        .and_then(|settings| settings.get("n_ctx"))
+        .or_else(|| props.get("n_ctx"))
+        .and_then(Value::as_u64)
+        .filter(|window| *window > 0)
 }
 
 /// Saved Rayline API keys for credential references whose endpoint is the
@@ -469,6 +549,61 @@ mod tests {
         assert_eq!(decisions["routing"]["value_usd"], 0.1);
         assert_eq!(decisions["result"], "custom");
         assert_eq!(composed.policy, PolicySource::Settings);
+    }
+
+    #[test]
+    fn default_profile_needs_only_the_router_and_local_model() {
+        let profile = default_profile(
+            "https://api-dev.rayline.ai/",
+            "http://127.0.0.1:11434/v1",
+            "qwen3.8:27b",
+            16384,
+            None,
+        )
+        .unwrap();
+        let composed = compose(profile, Some(&settings(None)), Path::new("/state")).unwrap();
+        let config = &composed.config;
+        assert_eq!(
+            config["decisions"]["url"],
+            "https://api-dev.rayline.ai/v1/routes"
+        );
+        assert_eq!(config["decisions"]["model"], "rayline-router");
+        assert_eq!(
+            config["decisions"]["routing"]["policy"],
+            json!({"preset": HYBRID_DEFAULT_PRESET})
+        );
+        assert!(config.get("package_path").is_none() && config.get("bindings").is_none());
+        let local = &config["deployments"][0];
+        assert_eq!(local["url"], "http://127.0.0.1:11434/v1/chat/completions");
+        assert_eq!(local["wire_model"], "qwen3.8:27b");
+        assert_eq!(local["context_window"], 16384);
+        assert_eq!(local["max_output_tokens"], 4096);
+        assert_eq!(config["derived_actions"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            config["deployments"][1]["url"],
+            "https://api-dev.rayline.ai/v1/messages"
+        );
+        // The saved key reaches only the router host every endpoint names.
+        let home =
+            std::env::temp_dir().join(format!("rayline-hybrid-default-{}", std::process::id()));
+        let dir = home.join(".config").join(crate::CONFIG_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"environments":{"dev":{"router_url":"https://api-dev.rayline.ai","cli_auth_url":"https://dev.example/cli-auth"}}}"#).unwrap();
+        std::fs::write(
+            dir.join("credentials.json"),
+            r#"{"router_keys":{"dev":{"apiKey":"rlk-dev-synthetic"}}}"#,
+        )
+        .unwrap();
+        let found = saved_credentials(config, &home, |_| None).unwrap();
+        assert_eq!(
+            found,
+            vec![(
+                "RAYLINE_ROUTER_API_KEY".to_owned(),
+                "rlk-dev-synthetic".to_owned()
+            )]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        assert!(default_profile("https://r", "http://l", "m", 1000, None).is_err());
     }
 
     #[test]
