@@ -110,10 +110,13 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 | `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs counted local capacity, which requires a profile with a qualified llama.cpp prompt counter ([Advanced](#advanced-a-profile-file)); the default profile refuses it. |
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
-| `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). |
+| `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). It must be 0 or between 1e-6 and 1e6. `start --config` refuses it, because a profile file sets its own prices. |
 | `value_usd` | Your V: what a successful task is worth to you in dollars, from 0.1 to 5 (checked at `start`). A higher V favours more capable, more expensive models. It selects ARC's custom result. |
 
-Unknown keys are refused. A profile pinned to the older `current` or
+Unknown keys are refused. If `settings.json` cannot be read or is not valid
+JSON, or the block is invalid, `start` stops with an error that names the file.
+It never falls back to the default routing. A missing `settings.json` is fine.
+A profile pinned to the older `current` or
 `execution_context_v1` Decisions mode is passed through unchanged, and an
 override block is refused for it.
 

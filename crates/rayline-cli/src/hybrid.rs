@@ -163,7 +163,18 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 Some(path) => fs::canonicalize(path)?,
                 None => installed_binary("rayline-core")?,
             };
-            let settings = crate::status::read_settings(&home);
+            // A missing settings file is fine; an unreadable or malformed one
+            // must not silently drop `local_model` or `hybrid.routing`.
+            let (settings_path, settings) = match crate::status::read_settings_checked(&home)? {
+                Some((path, value)) => (Some(path), Some(value)),
+                None => (None, None),
+            };
+            let settings_error = |error| settings_error(settings_path.as_deref(), error);
+            let origin = if config.is_some() {
+                crate::hybrid_profile::ProfileOrigin::File
+            } else {
+                crate::hybrid_profile::ProfileOrigin::Default
+            };
             let (profile, base_dir) = match config {
                 Some(config) => {
                     if env != "prod" || cell.is_some() || local_context_window.is_some() {
@@ -221,7 +232,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         cell.as_deref(),
                         settings.as_ref(),
                     )
-                    .map_err(io::Error::other)?;
+                    .map_err(settings_error)?;
                     println!(
                         "Default hybrid profile: decisions via {} (model rayline-router), local window {window} tokens",
                         hosted.router_url
@@ -229,18 +240,15 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     (profile, paths.dir.clone())
                 }
             };
-            let composed = crate::hybrid_profile::compose(profile, settings.as_ref(), &base_dir)
-                .map_err(io::Error::other)?;
+            let composed =
+                crate::hybrid_profile::compose(profile, settings.as_ref(), &base_dir, origin)
+                    .map_err(settings_error)?;
             let credentials =
                 crate::hybrid_profile::saved_credentials(&composed.config, &home, |name| {
                     std::env::var(name).ok()
                 })
                 .map_err(io::Error::other)?;
-            serde_json::to_writer_pretty(
-                private_file(&paths.core_config(), true)?,
-                &composed.config,
-            )
-            .map_err(io::Error::other)?;
+            write_private_json(&paths.core_config(), &composed.config, true)?;
             let config = paths.core_config();
             match (&composed.policy, &composed.preset) {
                 (crate::hybrid_profile::PolicySource::LegacyMode(mode), _) => {
@@ -267,7 +275,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             } else {
                 installed_binary(crate::DAEMON_BIN)?
             };
-            let log = private_file(&paths.log(), false)?;
+            let log = private_log(&paths.log())?;
             let mut command = Command::new(rld);
             command
                 .arg("hybrid")
@@ -304,11 +312,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             }
             let mut child = command.spawn()?;
             let startup = async {
-                serde_json::to_writer(
-                    private_file(&paths.supervisor(), true)?,
-                    &json!({"pid":child.id()}),
-                )
-                .map_err(io::Error::other)?;
+                write_private_json(&paths.supervisor(), &json!({"pid":child.id()}), false)?;
                 let started = Instant::now();
                 loop {
                     if let Some(status) = child.try_wait()? {
@@ -722,24 +726,152 @@ fn private_dir(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn private_file(path: &Path, truncate: bool) -> io::Result<fs::File> {
+/// A composition error, naming the settings file when the settings caused it.
+fn settings_error(settings_path: Option<&Path>, error: String) -> io::Error {
+    match settings_path {
+        Some(path) if error.starts_with("settings ") => {
+            io::Error::other(format!("{}: {error}", path.display()))
+        }
+        _ => io::Error::other(error),
+    }
+}
+
+/// Replace `path` atomically with `value` as a 0600 file: a planted symlink
+/// or a loosened file at `path` is replaced, never followed or kept.
+fn write_private_json(path: &Path, value: &Value, pretty: bool) -> io::Result<()> {
+    let contents = if pretty {
+        serde_json::to_vec_pretty(value)
+    } else {
+        serde_json::to_vec(value)
+    }
+    .map_err(io::Error::other)?;
+    crate::claude_app::write_private(path, &contents)
+}
+
+/// Open the append-only runtime log owner-only: never through a symlink, and
+/// narrowed to 0600 even when an older file was looser.
+fn private_log(path: &Path) -> io::Result<fs::File> {
     let mut options = fs::OpenOptions::new();
-    options
-        .create(true)
-        .write(true)
-        .append(!truncate)
-        .truncate(truncate);
+    options.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    options.open(path)
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other(format!(
+                "{} is not a regular file",
+                path.display()
+            )));
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let dir = std::env::temp_dir().join(format!(
+            "rayline-hybrid-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_files_replace_a_planted_symlink_without_writing_through_it() {
+        let dir = temp_dir("symlink");
+        let state = dir.join("state");
+        private_dir(&state).unwrap();
+        let victim = dir.join("victim.json");
+        fs::write(&victim, "keep").unwrap();
+        for target in ["core-config.json", "supervisor.json"] {
+            let path = state.join(target);
+            std::os::unix::fs::symlink(&victim, &path).unwrap();
+            write_private_json(&path, &json!({"ok": true}), true).unwrap();
+            assert!(
+                !fs::symlink_metadata(&path)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+            let written: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            assert_eq!(written, json!({"ok": true}));
+        }
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        // The append-only log refuses a planted symlink outright.
+        std::os::unix::fs::symlink(&victim, state.join("runtime.log")).unwrap();
+        assert!(private_log(&state.join("runtime.log")).is_err());
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_files_end_up_owner_only_whatever_was_there() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_dir("mode");
+        let path = dir.join("core-config.json");
+        fs::write(
+            &path,
+            "{\"stale\": true, \"padding\": \"longer than the new file\"}",
+        )
+        .unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        write_private_json(&path, &json!({"fresh": 1}), false).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"fresh\":1}");
+        let log = dir.join("runtime.log");
+        fs::write(&log, "old\n").unwrap();
+        fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        drop(private_log(&log).unwrap());
+        assert_eq!(
+            fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), "old\n");
+        // No temporary file is left behind.
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_errors_name_the_settings_file() {
+        let path = Path::new("/home/user/.config/rayline/settings.json");
+        let error = settings_error(
+            Some(path),
+            "settings hybrid.routing.value_usd must be a number between 0.1 and 5".to_owned(),
+        );
+        assert_eq!(
+            error.to_string(),
+            "/home/user/.config/rayline/settings.json: settings hybrid.routing.value_usd must be a number between 0.1 and 5"
+        );
+        let other = settings_error(
+            Some(path),
+            "local deployment protocol is missing".to_owned(),
+        );
+        assert_eq!(other.to_string(), "local deployment protocol is missing");
+    }
     #[test]
     fn hybrid_is_explicit_and_requires_core_and_config() {
         // A profile file is optional: the default profile needs only a key and local_model.

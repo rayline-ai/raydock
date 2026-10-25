@@ -98,6 +98,15 @@ pub(crate) struct Composed {
     pub local_model: Option<(String, String, String)>,
 }
 
+/// Which profile [`compose`] is given.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProfileOrigin {
+    /// Built by [`default_profile`]; `local_price` applies.
+    Default,
+    /// A qualified profile file (`--config`), which sets its own prices.
+    File,
+}
+
 /// Compose the core configuration from a profile and the user's settings.
 /// `base_dir` is the profile's directory: relative package and registry paths
 /// are made absolute because the composed file lives in the state directory.
@@ -105,7 +114,13 @@ pub(crate) fn compose(
     mut profile: Value,
     settings: Option<&Value>,
     base_dir: &Path,
+    origin: ProfileOrigin,
 ) -> Result<Composed, String> {
+    if let Some(hybrid) = settings.and_then(|settings| settings.get("hybrid"))
+        && !hybrid.is_object()
+    {
+        return Err("settings hybrid must be an object".to_owned());
+    }
     let root = profile
         .as_object_mut()
         .ok_or("hybrid configuration must be a JSON object")?;
@@ -118,15 +133,19 @@ pub(crate) fn compose(
         }
     }
     let local_model = apply_local_model(root, settings)?;
-    let derived_profile = root.get("derived_actions").is_some();
-    if !derived_profile
-        && settings
-            .and_then(|settings| settings.get("hybrid"))
-            .and_then(|hybrid| hybrid.get("routing"))
-            .and_then(|routing| routing.get("local_price"))
-            .is_some()
-    {
-        return Err("settings hybrid.routing.local_price applies to the default profile; a profile file sets its own prices".to_owned());
+    let priced = settings
+        .and_then(|settings| settings.get("hybrid"))
+        .and_then(|hybrid| hybrid.get("routing"))
+        .and_then(|routing| routing.get("local_price"))
+        .is_some();
+    match origin {
+        ProfileOrigin::File if priced => {
+            return Err("settings hybrid.routing.local_price applies only to the default profile; a profile file (--config) sets its own prices, so remove local_price or start without --config".to_owned());
+        }
+        ProfileOrigin::File => {}
+        ProfileOrigin::Default => {
+            local_price(settings)?;
+        }
     }
     let block = settings
         .and_then(|settings| settings.get("hybrid"))
@@ -622,7 +641,13 @@ mod tests {
 
     #[test]
     fn no_override_sends_the_hybrid_default_preset_explicitly() {
-        let composed = compose(profile(), Some(&settings(None)), Path::new("/profiles")).unwrap();
+        let composed = compose(
+            profile(),
+            Some(&settings(None)),
+            Path::new("/profiles"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
         let decisions = &composed.config["decisions"];
         assert_eq!(decisions["api_mode"], "execution_context_v2");
         assert_eq!(
@@ -638,7 +663,13 @@ mod tests {
     #[test]
     fn override_block_maps_to_policy_schedule_and_value() {
         let block = json!({"policy": "utility", "schedule": {"model": ["cache_boundaries", "user_messages"], "thinking": ["all_turns"]}, "value_usd": 0.1});
-        let composed = compose(profile(), Some(&settings(Some(block))), Path::new("/p")).unwrap();
+        let composed = compose(
+            profile(),
+            Some(&settings(Some(block))),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
         let decisions = &composed.config["decisions"];
         assert_eq!(
             decisions["routing"]["policy"],
@@ -660,7 +691,13 @@ mod tests {
             None,
         )
         .unwrap();
-        let composed = compose(profile, Some(&settings(None)), Path::new("/state")).unwrap();
+        let composed = compose(
+            profile,
+            Some(&settings(None)),
+            Path::new("/state"),
+            ProfileOrigin::Default,
+        )
+        .unwrap();
         let config = &composed.config;
         assert_eq!(
             config["decisions"]["url"],
@@ -716,9 +753,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let config = compose(profile, Some(&settings(None)), Path::new("/state"))
-            .unwrap()
-            .config;
+        let config = compose(
+            profile,
+            Some(&settings(None)),
+            Path::new("/state"),
+            ProfileOrigin::Default,
+        )
+        .unwrap()
+        .config;
         let decisions = &config["decisions"];
         assert_eq!(
             decisions["routing"]["prices"],
@@ -743,9 +785,14 @@ mod tests {
             None,
         )
         .unwrap();
-        let config = compose(profile, Some(&settings(Some(block))), Path::new("/state"))
-            .unwrap()
-            .config;
+        let config = compose(
+            profile,
+            Some(&settings(Some(block))),
+            Path::new("/state"),
+            ProfileOrigin::Default,
+        )
+        .unwrap()
+        .config;
         assert_eq!(config["decisions"]["routing"]["value_usd"], 2.0);
         assert!(config["decisions"]["routing"].get("prices").is_some());
         // local_price is configurable and validated; it is refused for a profile file.
@@ -779,7 +826,85 @@ mod tests {
             )
             .is_err()
         );
-        assert!(compose(profile_value(), Some(&priced), Path::new("/p")).is_err());
+        assert!(
+            compose(
+                profile_value(),
+                Some(&priced),
+                Path::new("/p"),
+                ProfileOrigin::File
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn local_price_is_refused_for_every_profile_file() {
+        // Even a package-less profile with derived actions sets its own prices.
+        let mut derived = profile();
+        derived["derived_actions"] =
+            json!([{"model": "m", "worker": "m", "deployment_id": "local-qwen"}]);
+        for price in [json!(0.05), json!(0), json!(-1), json!("cheap")] {
+            let priced = settings(Some(json!({"local_price": price})));
+            for file in [profile(), derived.clone()] {
+                let error = compose(file, Some(&priced), Path::new("/p"), ProfileOrigin::File)
+                    .expect_err("local_price with a profile file");
+                assert!(
+                    error.contains("local_price applies only to the default profile"),
+                    "{error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_price_is_validated_for_the_default_profile() {
+        let base =
+            || default_profile("https://r.example", "http://l", "q", 16384, None, None).unwrap();
+        for price in [
+            json!(-1),
+            json!(1e7),
+            json!(1e-9),
+            json!("0.1"),
+            json!(null),
+        ] {
+            let priced = settings(Some(json!({"local_price": price})));
+            let error = compose(
+                base(),
+                Some(&priced),
+                Path::new("/state"),
+                ProfileOrigin::Default,
+            )
+            .expect_err("invalid local_price");
+            assert!(
+                error.contains("local_price must be 0 or a price"),
+                "{error}"
+            );
+        }
+        let priced = settings(Some(json!({"local_price": 0.05})));
+        assert!(
+            compose(
+                base(),
+                Some(&priced),
+                Path::new("/state"),
+                ProfileOrigin::Default
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_non_object_hybrid_block_is_refused() {
+        for hybrid in [json!(5), json!("utility"), json!([]), json!(null)] {
+            let mut bad = settings(None);
+            bad["hybrid"] = hybrid.clone();
+            assert!(
+                compose(profile(), Some(&bad), Path::new("/p"), ProfileOrigin::File).is_err(),
+                "{hybrid}"
+            );
+        }
+        let mut bad = settings(None);
+        bad["hybrid"] = json!({"routing": null});
+        assert!(compose(profile(), Some(&bad), Path::new("/p"), ProfileOrigin::File).is_err());
     }
 
     fn profile_value() -> Value {
@@ -795,13 +920,20 @@ mod tests {
             compose(
                 profile(),
                 Some(&settings(Some(block.clone()))),
-                Path::new("/p")
+                Path::new("/p"),
+                ProfileOrigin::File
             )
             .is_err()
         );
         let mut counted = profile();
         counted["deployments"][0]["prompt_counter"] = json!({"model_path": "/m.gguf"});
-        let composed = compose(counted, Some(&settings(Some(block))), Path::new("/p")).unwrap();
+        let composed = compose(
+            counted,
+            Some(&settings(Some(block))),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
         assert_eq!(
             composed.config["decisions"]["routing"]["policy"],
             json!({"preset": PREFER_LOCAL_PRESET, "overrides": {"selection": {"min_p_pass": 0.65}}})
@@ -815,7 +947,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("api_mode");
-        let composed = compose(legacy.clone(), Some(&settings(None)), Path::new("/p")).unwrap();
+        let composed = compose(
+            legacy.clone(),
+            Some(&settings(None)),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
         assert_eq!(
             composed.policy,
             PolicySource::LegacyMode("current".to_owned())
@@ -830,7 +968,8 @@ mod tests {
             compose(
                 legacy,
                 Some(&settings(Some(json!({"value_usd": 1.0})))),
-                Path::new("/p")
+                Path::new("/p"),
+                ProfileOrigin::File
             )
             .is_err()
         );
@@ -875,7 +1014,8 @@ mod tests {
                 compose(
                     profile(),
                     Some(&settings(Some(block.clone()))),
-                    Path::new("/p")
+                    Path::new("/p"),
+                    ProfileOrigin::File
                 )
                 .is_err(),
                 "{block}"
@@ -887,14 +1027,21 @@ mod tests {
     fn legacy_mode_profiles_are_unchanged_and_refuse_overrides() {
         let mut legacy = profile();
         legacy["decisions"]["api_mode"] = json!("current");
-        let composed = compose(legacy.clone(), Some(&settings(None)), Path::new("/p")).unwrap();
+        let composed = compose(
+            legacy.clone(),
+            Some(&settings(None)),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
         assert_eq!(composed.config["decisions"]["routing"], json!({}));
         assert_eq!(composed.config["decisions"]["api_mode"], "current");
         assert!(
             compose(
                 legacy,
                 Some(&settings(Some(json!({"value_usd": 1.0})))),
-                Path::new("/p")
+                Path::new("/p"),
+                ProfileOrigin::File
             )
             .is_err()
         );
@@ -905,7 +1052,13 @@ mod tests {
         let mut pinned = profile();
         pinned["decisions"]["routing"]["policy"] =
             json!({"preset": "arc-policy.package-default.v1"});
-        let composed = compose(pinned.clone(), Some(&settings(None)), Path::new("/p")).unwrap();
+        let composed = compose(
+            pinned.clone(),
+            Some(&settings(None)),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
         assert_eq!(
             composed.preset.as_deref(),
             Some("arc-policy.package-default.v1")
@@ -915,6 +1068,7 @@ mod tests {
             pinned,
             Some(&settings(Some(json!({"policy": "utility"})))),
             Path::new("/p"),
+            ProfileOrigin::File,
         )
         .unwrap();
         assert_eq!(composed.preset.as_deref(), Some(HYBRID_DEFAULT_PRESET));
@@ -922,7 +1076,13 @@ mod tests {
 
     #[test]
     fn local_model_fills_only_the_opted_in_local_deployment() {
-        let composed = compose(profile(), Some(&settings(None)), Path::new("/p")).unwrap();
+        let composed = compose(
+            profile(),
+            Some(&settings(None)),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
         let local = &composed.config["deployments"][0];
         assert_eq!(local["url"], "http://127.0.0.1:11434/v1/chat/completions");
         assert_eq!(local["wire_model"], "qwen3.8:27b");
@@ -932,10 +1092,26 @@ mod tests {
             "https://api-dev.rayline.ai/v1/messages"
         );
         let missing = json!({"local_model": {"mode": "recommended"}});
-        assert!(compose(profile(), Some(&missing), Path::new("/p")).is_err());
+        assert!(
+            compose(
+                profile(),
+                Some(&missing),
+                Path::new("/p"),
+                ProfileOrigin::File
+            )
+            .is_err()
+        );
         let mut cloud_opt_in = profile();
         cloud_opt_in["deployments"][1]["from_local_model"] = json!(true);
-        assert!(compose(cloud_opt_in, Some(&settings(None)), Path::new("/p")).is_err());
+        assert!(
+            compose(
+                cloud_opt_in,
+                Some(&settings(None)),
+                Path::new("/p"),
+                ProfileOrigin::File
+            )
+            .is_err()
+        );
     }
 
     #[test]
