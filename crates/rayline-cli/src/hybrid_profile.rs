@@ -8,7 +8,7 @@
 //! onto `routing.policy` and V:
 //!
 //! ```json
-//! {"hybrid": {"routing": {"policy": "utility",
+//! {"hybrid": {"routing": {"policy": "utility" | "prefer_local", "min_p_pass": 0.65,
 //!                         "schedule": {"model": ["cache_boundaries", "user_messages"]},
 //!                         "value_usd": 0.1}}}
 //! ```
@@ -27,6 +27,7 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 
 pub(crate) const HYBRID_DEFAULT_PRESET: &str = "arc-policy.hybrid-default.v1";
+pub(crate) const PREFER_LOCAL_PRESET: &str = "arc-policy.prefer-local.v1";
 const API_MODE_V2: &str = "execution_context_v2";
 const SCHEDULE_CLASSES: &[&str] = &["cache_boundaries", "user_messages", "all_turns"];
 
@@ -135,9 +136,12 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
     let block = block.and_then(Value::as_object);
     if let Some(block) = block {
         for key in block.keys() {
-            if !matches!(key.as_str(), "policy" | "schedule" | "value_usd") {
+            if !matches!(
+                key.as_str(),
+                "policy" | "schedule" | "value_usd" | "min_p_pass"
+            ) {
                 return Err(format!(
-                    "settings hybrid.routing.{key} is not supported (policy, schedule, value_usd)"
+                    "settings hybrid.routing.{key} is not supported (policy, schedule, value_usd, min_p_pass)"
                 ));
             }
         }
@@ -160,15 +164,11 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
     if let Some(selection) = block.and_then(|block| block.get("policy")) {
         let preset = match selection.as_str() {
             Some("utility") => HYBRID_DEFAULT_PRESET,
-            Some("prefer_local") => {
-                return Err(
-                    "settings hybrid.routing.policy \"prefer_local\" is not yet served by the ARC policy service; use \"utility\" or omit it"
-                        .to_owned(),
-                );
-            }
+            Some("prefer_local") => PREFER_LOCAL_PRESET,
             _ => {
                 return Err(
-                    "settings hybrid.routing.policy must be \"utility\" (or omitted)".to_owned(),
+                    "settings hybrid.routing.policy must be \"utility\" or \"prefer_local\""
+                        .to_owned(),
                 );
             }
         };
@@ -185,6 +185,24 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
             .as_object_mut()
             .ok_or("profile routing.policy.overrides must be an object")?;
         overrides.insert("schedule".to_owned(), schedule.clone());
+    }
+    if let Some(threshold) = block.and_then(|block| block.get("min_p_pass")) {
+        let threshold = threshold
+            .as_f64()
+            .filter(|value| *value > 0.0 && *value < 1.0)
+            .ok_or("settings hybrid.routing.min_p_pass must be a number in (0, 1)")?;
+        if policy.get("preset").and_then(Value::as_str) != Some(PREFER_LOCAL_PRESET) {
+            return Err(
+                "settings hybrid.routing.min_p_pass applies only with policy \"prefer_local\""
+                    .to_owned(),
+            );
+        }
+        let overrides = policy
+            .entry("overrides")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or("profile routing.policy.overrides must be an object")?;
+        overrides.insert("selection".to_owned(), json!({"min_p_pass": threshold}));
     }
     let value = match block.and_then(|block| block.get("value_usd")) {
         None => None,
@@ -454,9 +472,20 @@ mod tests {
     }
 
     #[test]
+    fn prefer_local_maps_to_its_preset_and_threshold() {
+        let block = json!({"policy": "prefer_local", "min_p_pass": 0.65});
+        let composed = compose(profile(), Some(&settings(Some(block))), Path::new("/p")).unwrap();
+        assert_eq!(
+            composed.config["decisions"]["routing"]["policy"],
+            json!({"preset": PREFER_LOCAL_PRESET, "overrides": {"selection": {"min_p_pass": 0.65}}})
+        );
+    }
+
+    #[test]
     fn invalid_or_unserved_overrides_are_refused() {
         for block in [
-            json!({"policy": "prefer_local"}),
+            json!({"min_p_pass": 0.5}),
+            json!({"policy": "prefer_local", "min_p_pass": 1.0}),
             json!({"policy": "fastest"}),
             json!({"schedule": {"model": ["every_5"]}}),
             json!({"schedule": {"model": []}}),

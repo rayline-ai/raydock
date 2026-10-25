@@ -63,8 +63,10 @@ start, a Rayline API key, and a `local_model` pointing at a local Qwen.
                           "value_usd": 0.1}}}
   ```
 
-  `policy: "utility"` is the hybrid default preset. `prefer_local` is refused
-  until the ARC policy service serves it. `schedule` becomes
+  `policy: "utility"` is the hybrid default preset; `"prefer_local"` selects
+  `arc-policy.prefer-local.v1` (local when Stage 1 predicts it passes, else
+  utility), whose threshold `min_p_pass` (in (0, 1)) may be set beside it.
+  `schedule` becomes
   `routing.policy.overrides.schedule`; each dimension (`model`, `thinking`)
   lists switch-point classes from `cache_boundaries`, `user_messages` and
   `all_turns`, and the service refuses a class the package does not admit.
