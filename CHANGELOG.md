@@ -42,9 +42,12 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline
 - The installers (curl, Homebrew, PowerShell) and `rayline update` now also
   install `rayline-core`, the hybrid execution core. If you update from an
   older Rayline and the core is still missing, run `rayline update` again.
-- Rolling back works: `rayline update --version 0.2.12` installs a release
-  whose signed checksums list no core and skips the core. From 0.2.13 on, the
-  core is required, and the update fails closed if it is missing (hardening PR).
+- Rolling back works: `rayline update --version 0.2.12+ee1afb00b6cd` installs
+  a release whose signed checksums list no core, skips the core and removes the
+  installed one. Pass the full version from the release notes; a bare
+  `--version 0.2.12` says so. From 0.2.13 on, the core is required, and the
+  update fails closed if it is missing
+  ([#125](https://github.com/rayline-ai/rayline/pull/125)).
 
 ### Fixed
 
@@ -59,7 +62,7 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline
 - Your saved Rayline key goes only to HTTPS endpoints on the signed-in
   environment's router host.
 - Hybrid decision requests go only to the Rayline router or to loopback
-  (hardening PR).
+  ([#125](https://github.com/rayline-ai/rayline/pull/125)).
 - Tokio is updated to 1.53.3 for RUSTSEC-2026-0386
   ([#121](https://github.com/rayline-ai/rayline/pull/121)).
 
