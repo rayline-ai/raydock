@@ -445,37 +445,54 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
 /// what is left of it) must see the window that handoff can reach.
 ///
 /// A deployment counts only when a `bindings` or `derived_actions` entry
-/// names it, as the core admits targets from actions. A profile with a
-/// `test_alias` keeps `core_window`: its alias source is selection-only and a
-/// binding does not say which model it serves.
+/// names it, as the core admits targets from actions. `core_window` is kept
+/// when the cloud window cannot be established: a profile with a
+/// `test_alias` (its alias source is selection-only and a binding does not say
+/// which model it serves), or a key Go's case-insensitive decoder could read
+/// differently from this exact lookup.
 pub(crate) fn reachable_context_window(config: &Value, core_window: u64) -> u64 {
-    if config
-        .get("test_alias")
-        .is_some_and(|alias| !alias.is_null())
-    {
-        return core_window;
+    reachable_cloud_window(config).map_or(core_window, |window| window.max(core_window))
+}
+
+fn reachable_cloud_window(config: &Value) -> Option<u64> {
+    if go_field(config, "test_alias")?.is_some_and(|alias| !alias.is_null()) {
+        return None;
     }
-    let array = |key: &str| {
-        config
-            .get(key)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-    };
-    let executable: Vec<&str> = array("bindings")
-        .chain(array("derived_actions"))
-        .filter_map(|action| action.get("deployment_id").and_then(Value::as_str))
-        .collect();
-    array("deployments")
-        .filter(|deployment| deployment.get("kind").and_then(Value::as_str) == Some("cloud"))
-        .filter(|deployment| {
-            deployment
-                .get("id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| executable.contains(&id))
+    let list = |name: &str| {
+        go_field(config, name).map(|value| {
+            value
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
         })
-        .filter_map(|deployment| deployment.get("context_window").and_then(Value::as_u64))
-        .fold(core_window, u64::max)
+    };
+    let mut executable = Vec::new();
+    for action in list("bindings")?.iter().chain(list("derived_actions")?) {
+        if let Some(id) = go_field(action, "deployment_id")?.and_then(Value::as_str) {
+            executable.push(id);
+        }
+    }
+    let mut window = 0;
+    for deployment in list("deployments")? {
+        let kind = go_field(deployment, "kind")?.and_then(Value::as_str);
+        let id = go_field(deployment, "id")?.and_then(Value::as_str);
+        let context = go_field(deployment, "context_window")?.and_then(Value::as_u64);
+        if kind == Some("cloud")
+            && id.is_some_and(|id| executable.contains(&id))
+            && let Some(context) = context
+        {
+            window = window.max(context);
+        }
+    }
+    Some(window)
+}
+
+/// `value[name]` as the Go core reads it; None when another key would also
+/// match `name` in Go.
+fn go_field<'v>(value: &'v Value, name: &str) -> Option<Option<&'v Value>> {
+    match value.as_object() {
+        Some(map) => rayline_local_router::decisions_url::exact_field(map, name).ok(),
+        None => Some(None),
+    }
 }
 
 /// The default package-less profile: local Qwen from `local_model`, Opus and
@@ -797,6 +814,15 @@ mod tests {
         aliased["test_alias"] =
             json!({"selected_model": "claude-opus-5.5", "execution_action_id": "local"});
         assert_eq!(reachable_context_window(&aliased, 16384), 16384);
+        // Go reads keys case-insensitively: an alias it would see keeps the
+        // core's window, as does any key Go could read differently.
+        let mut folded = mixed.clone();
+        folded["TEST_ALIAS"] =
+            json!({"selected_model": "claude-opus-5.5", "execution_action_id": "local"});
+        assert_eq!(reachable_context_window(&folded, 16384), 16384);
+        let mut shadowed = mixed.clone();
+        shadowed["derived_actions"][2]["Deployment_ID"] = json!("local");
+        assert_eq!(reachable_context_window(&shadowed, 16384), 16384);
     }
 
     #[test]
