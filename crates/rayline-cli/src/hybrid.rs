@@ -243,6 +243,11 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             let composed =
                 crate::hybrid_profile::compose(profile, settings.as_ref(), &base_dir, origin)
                     .map_err(settings_error)?;
+            // Decisions carry execution context and the router key: only a
+            // configured Rayline router or loopback may receive them.
+            let router_urls = crate::hybrid_profile::configured_router_urls(&home);
+            crate::hybrid_profile::check_decisions_url(&composed.config, &router_urls)
+                .map_err(io::Error::other)?;
             let credentials =
                 crate::hybrid_profile::saved_credentials(&composed.config, &home, |name| {
                     std::env::var(name).ok()
@@ -294,6 +299,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 .stdin(Stdio::null())
                 .stdout(Stdio::from(log.try_clone()?))
                 .stderr(Stdio::from(log));
+            for router_url in &router_urls {
+                command.arg("--router-url").arg(router_url);
+            }
             for (name, key) in &credentials {
                 command.env(name, key);
             }

@@ -39,6 +39,24 @@ A local Decisions
 provider can be selected through the core configuration when its contract is
 supported by the core; Rust performs no policy selection.
 
+**Decisions endpoint allowlist.** Decisions requests carry the session's
+execution context and the router API key, so `decisions.url` must be either
+HTTPS on the exact host and port of a Rayline router (`api.rayline.ai`,
+`api-dev.rayline.ai`, or the `router_url` of an environment configured in
+settings.json), or a loopback address (`127.0.0.0/8`, `::1`, `localhost`, over
+HTTP or HTTPS) for tests and a local Decisions service. Anything else, such as
+a direct `*.modal.run` URL, is refused by `start` with an error that names only
+the host and port. `rld hybrid` repeats the check on the file it gives the core,
+so a hand-edited `core-config.json` cannot widen it, and refuses a
+configuration without `decisions.url`, with duplicate JSON keys, or with a key
+that Go's case-insensitive decoder would also read as `decisions` or `url`
+(such as `Decisions` or `deciſions`). `start` passes `rld` only the
+`https://host:port` origin of each configured router. The URL must be written canonically:
+ASCII only (punycode, not Unicode, for an IDN), no `user:password@`, no
+backslashes or whitespace, and a host and port spelled the way they parse
+(`:443` is accepted, `:0443` or `0x7f.1` are not). Host case is ignored; a
+trailing-dot host (`api.rayline.ai.`) is not the router's host.
+
 Hybrid endpoints are selected by the core configuration. The root `--env` and
 `--auth-token` options are not accepted with `hybrid`; use the configuration and
 `RAYLINE_ROUTER_API_KEY` for a non-production endpoint.
@@ -370,6 +388,20 @@ Missing installed components fail with a repair instruction, without downloading
 during hybrid startup. `rayline update` repairs a missing core even when the
 launcher is already at the requested release, using verified signed artifacts.
 Users upgrading from an older two-binary updater may need to run it a second time.
+
+Releases before 0.2.13 ship no core. A rollback such as
+`rayline update --version 0.2.12+ee1afb00b6cd` decides this from the target's
+signed `SHA256SUMS`: when it lists no `rayline-core` entry and the version is
+older than 0.2.13, the update installs only `rayline` and `rld`, then removes
+the installed `rayline-core` and `rayline-core-LICENSE`, so no later launcher
+(for example one installed by the older two-binary updater) runs a core that
+does not match it; that launcher reports the core missing and `rayline update`
+installs the matching one. A 0.2.13 or later release whose `SHA256SUMS` lacks
+the core fails closed. Releases are published under their full version, build
+label included (shown in the GitHub release notes and by `rayline --version`);
+a bare `--version 0.2.12` that is not found says to use the full form. A build newer than its
+channel's latest release reports that it is up to date and names the
+`rayline update --version <current>` command that repairs a missing core.
 
 Hybrid requires macOS 13 Ventura or later, or Linux. Windows hybrid commands
 fail explicitly because locking, private-state permissions and lifecycle have
