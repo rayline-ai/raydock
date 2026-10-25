@@ -136,6 +136,14 @@ the previous one, including Pi's retained tail. A harness may optionally state
 events itself through the core's `X-Rayline-Event` header or `rayline_event`
 member; no default depends on it.
 
+**Typed signals (optional, no setup).** A client that wants Decisions signals
+(for example `topic.operation`) adds `"routing": {"signals": ["topic.operation"]}`
+to its generation request. The core passes the names to Decisions unchanged,
+never forwards `routing` to the model, and returns the response's `signals`
+block as compact JSON in the `x-vsr-signals` response header, as cloud VSR does.
+Signals change no route. Requests without `routing` are untouched. Serving them
+depends on the Decisions cell (dev cells first).
+
 ## Start and connect
 
 Install or update Rayline using the release installer or Homebrew. The release
