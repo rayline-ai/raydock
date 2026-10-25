@@ -219,6 +219,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         &model,
                         window,
                         cell.as_deref(),
+                        settings.as_ref(),
                     )
                     .map_err(io::Error::other)?;
                     println!(

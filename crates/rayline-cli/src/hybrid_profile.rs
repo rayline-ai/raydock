@@ -30,6 +30,50 @@ pub(crate) const HYBRID_DEFAULT_PRESET: &str = "arc-policy.hybrid-default.v1";
 pub(crate) const PREFER_LOCAL_PRESET: &str = "arc-policy.prefer-local.v1";
 const API_MODE_V2: &str = "execution_context_v2";
 const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
+const LOCAL_REGISTRY_MODEL: &str = "qwen/qwen3.8-27b";
+/// The default V with a zero-priced local model: easy work stays on device,
+/// harder work goes to the cloud (dev cell probe, 2026-10-25).
+const DEFAULT_VALUE_USD: f64 = 0.5;
+const CALLER_PRICES_SCHEMA: &str = "arc-caller-prices.v1";
+
+/// `hybrid.routing.local_price`: USD per million tokens for every leg of the
+/// local model, 0 or within [1e-6, 1e6] so its canonical spelling is plain.
+fn local_price(settings: Option<&Value>) -> Result<f64, String> {
+    let value = settings
+        .and_then(|settings| settings.get("hybrid"))
+        .and_then(|hybrid| hybrid.get("routing"))
+        .and_then(|routing| routing.get("local_price"));
+    match value {
+        None => Ok(0.0),
+        Some(value) => value
+            .as_f64()
+            .filter(|price| *price == 0.0 || (1e-6..=1e6).contains(price))
+            .ok_or_else(|| "settings hybrid.routing.local_price must be 0 or a price in USD per million tokens (1e-6 to 1e6)".to_owned()),
+    }
+}
+
+/// RFC 8785 number spelling for the admitted range (no exponent form).
+fn canonical_number(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{}", value as i64)
+    } else {
+        format!("{value}")
+    }
+}
+
+/// The service's caller price digest: sha256(JCS({schema, exclusive, prices})).
+fn caller_price_sha256(model: &str, price: f64) -> String {
+    use sha2::Digest;
+    let number = canonical_number(price);
+    let canonical = format!(
+        "{{\"exclusive\":false,\"prices\":{{{}:{{\"cache_read\":{number},\"cache_write\":{number},\"input\":{number},\"output\":{number}}}}},\"schema\":\"{CALLER_PRICES_SCHEMA}\"}}",
+        serde_json::to_string(model).expect("model id serializes")
+    );
+    sha2::Sha256::digest(canonical.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 const SCHEDULE_CLASSES: &[&str] = &["cache_boundaries", "user_messages", "all_turns"];
 
 /// Where the applied policy came from, for the start message.
@@ -74,6 +118,16 @@ pub(crate) fn compose(
         }
     }
     let local_model = apply_local_model(root, settings)?;
+    let derived_profile = root.get("derived_actions").is_some();
+    if !derived_profile
+        && settings
+            .and_then(|settings| settings.get("hybrid"))
+            .and_then(|hybrid| hybrid.get("routing"))
+            .and_then(|routing| routing.get("local_price"))
+            .is_some()
+    {
+        return Err("settings hybrid.routing.local_price applies to the default profile; a profile file sets its own prices".to_owned());
+    }
     let block = settings
         .and_then(|settings| settings.get("hybrid"))
         .and_then(|hybrid| hybrid.get("routing"));
@@ -168,10 +222,10 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
         for key in block.keys() {
             if !matches!(
                 key.as_str(),
-                "policy" | "schedule" | "value_usd" | "min_p_pass"
+                "policy" | "schedule" | "value_usd" | "min_p_pass" | "local_price"
             ) {
                 return Err(format!(
-                    "settings hybrid.routing.{key} is not supported (policy, schedule, value_usd, min_p_pass)"
+                    "settings hybrid.routing.{key} is not supported (policy, schedule, value_usd, min_p_pass, local_price)"
                 ));
             }
         }
@@ -363,7 +417,12 @@ pub(crate) fn default_profile(
     model: &str,
     context_window: u64,
     cell: Option<&str>,
+    settings: Option<&Value>,
 ) -> Result<Value, String> {
+    // On-device inference costs the user about nothing per token: price the
+    // local model at `local_price` (default 0, every leg, USD per million
+    // tokens) and leave cloud models at their market prices.
+    let local_price = local_price(settings)?;
     if context_window < 2048 {
         return Err(format!(
             "local context window {context_window} is too small"
@@ -382,8 +441,13 @@ pub(crate) fn default_profile(
                "max_output_tokens": 4096, "context_window": 200000, "input_modalities": ["text"],
                "token_units": "", "auth_env": ROUTER_KEY_ENV})
     };
+    let legs = json!({"input": local_price, "output": local_price, "cache_read": local_price, "cache_write": local_price});
+    let mut prices = Map::new();
+    prices.insert(LOCAL_REGISTRY_MODEL.to_owned(), legs);
     let mut decisions = json!({"api_mode": API_MODE_V2, "url": format!("{router}/v1/routes"),
-                               "auth_env": ROUTER_KEY_ENV, "model": "rayline-router", "result": "top", "routing": {}});
+                               "auth_env": ROUTER_KEY_ENV, "model": "rayline-router", "result": "custom",
+                               "routing": {"value_usd": DEFAULT_VALUE_USD, "prices": prices, "exclusive": false},
+                               "price_sha256": caller_price_sha256(LOCAL_REGISTRY_MODEL, local_price)});
     if let Some(cell) = cell {
         decisions["cell_tag"] = json!(cell);
     }
@@ -393,7 +457,7 @@ pub(crate) fn default_profile(
         "decisions": decisions,
         "deployments": [
             {"id": "local", "kind": "local", "url": local_url, "protocol": "openai.chat.v1", "wire_model": model,
-             "registry_model": "qwen/qwen3.8-27b", "registry_provider": "openai",
+             "registry_model": LOCAL_REGISTRY_MODEL, "registry_provider": "openai",
              "runtime_identity": format!("local_model:{model}"), "max_output_tokens": max_output,
              "context_window": context_window, "input_modalities": ["text"], "token_units": ""},
             cloud("cloud-opus", "anthropic/claude-opus-5.5"),
@@ -593,6 +657,7 @@ mod tests {
             "qwen3.8:27b",
             16384,
             None,
+            None,
         )
         .unwrap();
         let composed = compose(profile, Some(&settings(None)), Path::new("/state")).unwrap();
@@ -637,7 +702,88 @@ mod tests {
             )]
         );
         let _ = std::fs::remove_dir_all(&home);
-        assert!(default_profile("https://r", "http://l", "m", 1000, None).is_err());
+        assert!(default_profile("https://r", "http://l", "m", 1000, None, None).is_err());
+    }
+
+    #[test]
+    fn default_profile_prices_the_local_model_at_its_marginal_cost() {
+        let profile = default_profile(
+            "https://api-dev.rayline.ai",
+            "http://127.0.0.1:8080/v1",
+            "q",
+            16384,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = compose(profile, Some(&settings(None)), Path::new("/state"))
+            .unwrap()
+            .config;
+        let decisions = &config["decisions"];
+        assert_eq!(
+            decisions["routing"]["prices"],
+            json!({"qwen/qwen3.8-27b": {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0}})
+        );
+        assert_eq!(decisions["routing"]["exclusive"], false);
+        assert_eq!(decisions["routing"]["value_usd"], 0.5);
+        assert_eq!(decisions["result"], "custom");
+        // Equal to the dev service's own echo for this price world.
+        assert_eq!(
+            decisions["price_sha256"],
+            "5c2ccbe09f4b5f9938df5ca93282b5a39b3573cae108d5e6abf89de3466d254c"
+        );
+        // A user V override keeps the local price.
+        let block = json!({"value_usd": 2.0});
+        let profile = default_profile(
+            "https://api-dev.rayline.ai",
+            "http://127.0.0.1:8080/v1",
+            "q",
+            16384,
+            None,
+            None,
+        )
+        .unwrap();
+        let config = compose(profile, Some(&settings(Some(block))), Path::new("/state"))
+            .unwrap()
+            .config;
+        assert_eq!(config["decisions"]["routing"]["value_usd"], 2.0);
+        assert!(config["decisions"]["routing"].get("prices").is_some());
+        // local_price is configurable and validated; it is refused for a profile file.
+        let priced = settings(Some(json!({"local_price": 0.05})));
+        let profile = default_profile(
+            "https://r.example",
+            "http://l",
+            "q",
+            16384,
+            None,
+            Some(&priced),
+        )
+        .unwrap();
+        assert_eq!(
+            profile["decisions"]["routing"]["prices"]["qwen/qwen3.8-27b"]["input"],
+            0.05
+        );
+        assert_ne!(
+            profile["decisions"]["price_sha256"],
+            "5c2ccbe09f4b5f9938df5ca93282b5a39b3573cae108d5e6abf89de3466d254c"
+        );
+        let negative = settings(Some(json!({"local_price": -1})));
+        assert!(
+            default_profile(
+                "https://r.example",
+                "http://l",
+                "q",
+                16384,
+                None,
+                Some(&negative)
+            )
+            .is_err()
+        );
+        assert!(compose(profile_value(), Some(&priced), Path::new("/p")).is_err());
+    }
+
+    fn profile_value() -> Value {
+        profile()
     }
 
     #[test]

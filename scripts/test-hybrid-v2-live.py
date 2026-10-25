@@ -70,7 +70,15 @@ def generations(events):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core", type=Path, required=True)
-    parser.add_argument("--profile", type=Path, required=True)
+    parser.add_argument("--profile", type=Path, help="qualified profile; omit to use the no-profile default start")
+    parser.add_argument("--env", default="dev", help="no-profile start: signed-in environment")
+    parser.add_argument("--cell", help="no-profile start: isolated Decisions cell tag")
+    parser.add_argument("--local-url", default="http://127.0.0.1:21815/v1", help="no-profile start: local_model base URL")
+    parser.add_argument("--local-model", default="qwen3.8-27b-local", help="no-profile start: local_model served model")
+    parser.add_argument("--local-context-window", type=int, help="no-profile start: local window when the runtime does not report it")
+    parser.add_argument("--policy", choices=("utility", "prefer_local"), help="settings hybrid.routing.policy")
+    parser.add_argument("--min-p-pass", type=float, help="settings hybrid.routing.min_p_pass")
+    parser.add_argument("--value-usd", type=float, help="settings hybrid.routing.value_usd")
     parser.add_argument("--scenario", choices=("a", "b", "c"), required=True)
     parser.add_argument("--schedule-model", nargs="+", help="settings hybrid.routing.schedule.model (e.g. cache_boundaries user_messages)")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -82,16 +90,37 @@ def main():
     args = parser.parse_args()
     for name in ("RAYLINE_DEV_KEY", "LOCAL_QWEN_KEY"):
         assert os.environ.get(name), f"{name} must be supplied in the environment"
+    # The no-profile default reads the router key from RAYLINE_ROUTER_API_KEY.
+    os.environ.setdefault("RAYLINE_ROUTER_API_KEY", os.environ["RAYLINE_DEV_KEY"])
     args.output_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     output = args.output_dir.resolve()
     state, home, work = output / "state", output / "home", output / "work"
     for path in (home, work):
         path.mkdir(mode=0o700)
-    profile = json.loads(args.profile.read_text())
-    local = next(d for d in profile["deployments"] if d["kind"] == "local")
-    settings = {"local_model": {"mode": "custom", "base_url": local["url"].rsplit("/v1/", 1)[0], "model": local["wire_model"]}}
+    if args.profile:
+        profile = json.loads(args.profile.read_text())
+        local = next(d for d in profile["deployments"] if d["kind"] == "local")
+        settings = {"local_model": {"mode": "custom", "base_url": local["url"].rsplit("/v1/", 1)[0], "model": local["wire_model"]}}
+    else:
+        profile = None
+        settings = {"local_model": {"mode": "custom", "base_url": args.local_url, "model": args.local_model}}
+    # Signed-in environments (router URLs only; never credentials) for --env.
+    real_settings = Path.home() / ".config" / "rayline" / "settings.json"
+    if real_settings.exists():
+        environments = json.loads(real_settings.read_text()).get("environments")
+        if environments:
+            settings["environments"] = environments
+    routing = {}
     if args.schedule_model:
-        settings["hybrid"] = {"routing": {"schedule": {"model": args.schedule_model}}}
+        routing["schedule"] = {"model": args.schedule_model}
+    if args.policy:
+        routing["policy"] = args.policy
+    if args.min_p_pass is not None:
+        routing["min_p_pass"] = args.min_p_pass
+    if args.value_usd is not None:
+        routing["value_usd"] = args.value_usd
+    if routing:
+        settings["hybrid"] = {"routing": routing}
     (home / ".config" / "rayline").mkdir(parents=True, mode=0o700)
     (home / ".config" / "rayline" / "settings.json").write_text(json.dumps(settings))
     pi_settings = {"defaultProvider": "rayline", "defaultModel": "rayline-router"}
@@ -128,14 +157,21 @@ def main():
 
     env = dict(os.environ, HOME=str(home), RLD_BIN=str(args.rld.resolve()), PI_TELEMETRY="0", PI_OFFLINE="1")
     cli = [str(args.rayline.resolve()), "hybrid", "--state-dir", str(state)]
-    report = {"scenario": args.scenario, "profile": args.profile.name, "schedule_model": args.schedule_model,
-              "decisions": {k: profile["decisions"].get(k) for k in ("url", "model", "cell_tag", "result", "routing")},
-              "targets": sorted({d["id"] for d in profile["deployments"]}), "passed": False}
+    report = {"scenario": args.scenario, "profile": args.profile.name if args.profile else "default (no profile file)",
+              "schedule_model": args.schedule_model, "settings_routing": routing, "passed": False}
     started = False
     try:
-        startup = subprocess.run(cli + ["start", "--core", str(args.core.resolve()), "--config", str(args.profile.resolve()), "--port", "0"],
-                                 env=env, capture_output=True, text=True, timeout=180)
-        report["start_output"] = [line for line in startup.stdout.splitlines() if not line.startswith("Gateway credential")]
+        start = cli + ["start", "--core", str(args.core.resolve()), "--port", "0"]
+        if args.profile:
+            start += ["--config", str(args.profile.resolve())]
+        else:
+            start += ["--env", args.env] + (["--cell", args.cell] if args.cell else [])
+            if args.local_context_window:
+                start += ["--local-context-window", str(args.local_context_window)]
+        startup = subprocess.run(start, env=env, capture_output=True, text=True, timeout=180)
+        report["start_output"] = [line for line in startup.stdout.splitlines() if not line.startswith(("Gateway credential", "Logs:"))]
+        report["decisions"] = {k: json.loads((state / "core-config.json").read_text())["decisions"].get(k)
+                               for k in ("url", "model", "cell_tag", "result", "routing")} if (state / "core-config.json").exists() else None
         assert startup.returncode == 0, "hybrid startup failed: " + startup.stderr[-2000:]
         started = True
         log = state / "runtime.log"

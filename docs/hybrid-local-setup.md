@@ -72,6 +72,16 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    `run` also supports `claude`, `codex`, `opencode`, `omp`, `hermes` and
    `openclaw`. Start a fresh harness session after every `start`.
 
+## Pricing defaults
+
+On-device inference costs you about nothing per token. The default profile
+therefore prices the local model at 0 per million tokens on every leg, sends
+those caller prices with `exclusive: false` so cloud models keep their market
+prices, and uses a moderate V of 0.5. Under these defaults easy work stays on
+device and harder work goes to the cloud. Change them in the override block
+with `local_price` (USD per million tokens, applied to every leg of the local
+model) and `value_usd`.
+
 ## Routing policy
 
 With no override, Rayline Local sends the **hybrid default** preset,
@@ -100,6 +110,7 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 | `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs counted local capacity, which requires a profile with a qualified llama.cpp prompt counter ([Advanced](#advanced-a-profile-file)); the default profile refuses it. |
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
+| `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). |
 | `value_usd` | Your V: what a successful task is worth to you in dollars, from 0.1 to 5 (checked at `start`). A higher V favours more capable, more expensive models. It selects ARC's custom result. |
 
 Unknown keys are refused. A profile pinned to the older `current` or
