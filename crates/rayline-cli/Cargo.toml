@@ -34,7 +34,7 @@ rayline-hf = { path = "../rayline-hf" }
 rayline-llama = { path = "../rayline-llama" }
 rayline-local-router = { path = "../rayline-local-router" }
 rayline-metrics = { path = "../rayline-metrics" }
-zstd = "0.13"
+zstd = "0.14"
 toml_edit = "0.25.15"
 
 [target.'cfg(unix)'.dependencies]
