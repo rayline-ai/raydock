@@ -468,6 +468,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
 /// which also starts a scale-to-zero cell; while it answers 502/503/504 the
 /// probe waits and retries within the startup deadline. Without a cell an
 /// empty body is enough: the router authenticates before it validates.
+/// Skipped for a loopback Decisions URL.
 async fn probe_decisions(
     config: &Value,
     credentials: &[(String, String)],
@@ -483,6 +484,16 @@ async fn probe_decisions(
     ) else {
         return Ok(());
     };
+    // A loopback Decisions service is a local fixture or development
+    // service, not a router this check can describe.
+    if reqwest::Url::parse(url).is_ok_and(|url| {
+        matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+        )
+    }) {
+        return Ok(());
+    }
     let saved = credentials
         .iter()
         .find(|(name, _)| name == auth_env)

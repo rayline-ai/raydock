@@ -109,7 +109,7 @@ assert 'RAYLINE_TEST_LOCAL_ALIAS' not in os.environ
 provider = json.loads((pathlib.Path(os.environ['PI_CODING_AGENT_DIR']) / 'models.json').read_text())['providers']['rayline']
 model = provider['models'][0]
 assert model['maxTokens'] == 8192
-assert model['contextWindow'] == 16384
+assert model['contextWindow'] == 1000000  # the harness window; the core's is 16384
 assert model['input'] == ['text']
 assert provider['compat']['sendSessionAffinityHeaders'] is True
 print('qualified Pi profile loaded')
