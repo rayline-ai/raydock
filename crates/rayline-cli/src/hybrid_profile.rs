@@ -532,29 +532,192 @@ pub(crate) fn default_profile(
     }))
 }
 
-/// Reads llama.cpp's per-slot context window from `/props`; None when the
-/// runtime does not report one (it is then the user's to state).
-pub(crate) async fn probe_llamacpp_context(
+/// What the local runtime says it has loaded, read once when hybrid routing
+/// starts: its per-slot window and which model it serves.
+#[derive(Debug, PartialEq)]
+pub(crate) struct LocalRuntime {
+    /// llama.cpp's per-slot context window; None when the runtime does not
+    /// report one (it is then the user's to state).
+    pub window: Option<u64>,
+    pub identity: LocalIdentity,
+}
+
+/// Whether the loaded model is the one the default profile is built for:
+/// its capacity counts use Qwen3.8-27B's own tokenizer and chat template.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LocalIdentity {
+    /// The runtime names Qwen3.8-27B; the string is what it reported.
+    Match(String),
+    /// The runtime names another model; local routing is refused.
+    Mismatch(String),
+    /// The runtime does not say what it serves (not llama.cpp or Ollama).
+    Unknown,
+}
+
+impl LocalIdentity {
+    /// A wrong model never serves a turn: its window and token counts would
+    /// be wrong, and nothing on the chat path would show it.
+    pub(crate) fn refuses_local(&self) -> bool {
+        matches!(self, Self::Mismatch(_))
+    }
+
+    /// What `rayline hybrid start` tells the user, if anything.
+    pub(crate) fn start_message(&self, base_url: &str) -> Option<String> {
+        match self {
+            Self::Match(_) => None,
+            Self::Mismatch(reported) => Some(format!(
+                "Error: the local runtime at {base_url} serves {reported}, not {LOCAL_MODEL_NAME}. Local routing is off for this session: every turn goes to cloud. Serve {LOCAL_MODEL_NAME} (Ollama `qwen3.8:27b`, or a Qwen3.8-27B GGUF in llama.cpp), then run `rayline hybrid start` again."
+            )),
+            Self::Unknown => Some(format!(
+                "Warning: Rayline cannot read which model the runtime at {base_url} serves (llama.cpp and Ollama report it); it assumes {LOCAL_MODEL_NAME}."
+            )),
+        }
+    }
+}
+
+/// Reads what the runtime serves: llama.cpp's `/props` (its loaded file and
+/// window), else Ollama's `/api/show` for the configured model (the GGUF's
+/// `general.*` metadata). A user-chosen name such as a llama.cpp alias or the
+/// request's own model name is not evidence: the runtimes echo it back on
+/// every chat response, so the response cannot confirm the model either.
+pub(crate) async fn read_local_runtime(
     client: &reqwest::Client,
     base_url: &str,
-) -> Option<u64> {
-    let url = format!("{}/props", crate::local_model::normalize_base_url(base_url));
-    let props: Value = client
-        .get(url)
-        .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    props
-        .get("default_generation_settings")
-        .and_then(|settings| settings.get("n_ctx"))
-        .or_else(|| props.get("n_ctx"))
-        .and_then(Value::as_u64)
-        .filter(|window| *window > 0)
+    model: &str,
+) -> LocalRuntime {
+    let base = crate::local_model::normalize_base_url(base_url);
+    async fn answer(request: reqwest::RequestBuilder) -> Option<Value> {
+        request
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()
+    }
+    if let Some(props) = answer(client.get(format!("{base}/props"))).await {
+        let window = props
+            .get("default_generation_settings")
+            .and_then(|settings| settings.get("n_ctx"))
+            .or_else(|| props.get("n_ctx"))
+            .and_then(Value::as_u64)
+            .filter(|window| *window > 0);
+        return LocalRuntime {
+            window,
+            identity: llamacpp_identity(&props),
+        };
+    }
+    let show = answer(
+        client
+            .post(format!("{base}/api/show"))
+            .json(&json!({"model": model})),
+    )
+    .await;
+    LocalRuntime {
+        window: None,
+        identity: show
+            .as_ref()
+            .map_or(LocalIdentity::Unknown, ollama_identity),
+    }
+}
+
+/// The served model's name, normalized: lower case, letters and digits only.
+fn names_local_model(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|char| char.to_ascii_lowercase())
+        .collect();
+    normalized.contains(LOCAL_MODEL_KEY)
+}
+
+/// [`LOCAL_MODEL_NAME`] normalized as [`names_local_model`] reads names.
+const LOCAL_MODEL_KEY: &str = "qwen3827b";
+/// The model the default profile is built for (Hugging Face `Qwen/Qwen3.8-27B`,
+/// 27.8B parameters with its vision encoder; Ollama `qwen3.8:27b`).
+pub(crate) const LOCAL_MODEL_NAME: &str = "Qwen3.8-27B";
+
+/// llama.cpp names its loaded model by file: `/props` `model_path`, whose
+/// file or folder name carries the model's name for every published GGUF
+/// (`Qwen3.8-27B-UD-Q4_K_M.gguf`, `unsloth_Qwen3.8-27B-GGUF_…`). The
+/// `--alias` it may report instead is the user's label, not evidence.
+fn llamacpp_identity(props: &Value) -> LocalIdentity {
+    let Some(path) = props
+        .get("model_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+    else {
+        return LocalIdentity::Unknown;
+    };
+    let path = Path::new(path);
+    let named = [path.file_name(), path.parent().and_then(Path::file_name)]
+        .into_iter()
+        .flatten()
+        .any(|name| names_local_model(&name.to_string_lossy()));
+    let reported = path.to_string_lossy().into_owned();
+    if named {
+        LocalIdentity::Match(reported)
+    } else {
+        LocalIdentity::Mismatch(reported)
+    }
+}
+
+/// Ollama reports the loaded GGUF's own metadata: `general.basename` with
+/// `general.size_label` (`Qwen3.8` + `27B` in `qwen3.8:27b`), or
+/// `general.name`.
+fn ollama_identity(show: &Value) -> LocalIdentity {
+    let Some(info) = show.get("model_info").and_then(Value::as_object) else {
+        return LocalIdentity::Unknown;
+    };
+    let field = |key: &str| info.get(key).and_then(Value::as_str).unwrap_or_default();
+    let basename = format!(
+        "{}-{}",
+        field("general.basename"),
+        field("general.size_label")
+    );
+    let name = field("general.name");
+    if names_local_model(&basename) || names_local_model(name) {
+        return LocalIdentity::Match(basename);
+    }
+    let reported = [name, basename.trim_matches('-')]
+        .into_iter()
+        .find(|value| !value.is_empty())
+        .unwrap_or_default();
+    if reported.is_empty() {
+        LocalIdentity::Unknown
+    } else {
+        LocalIdentity::Mismatch(reported.to_owned())
+    }
+}
+
+/// Removes the local deployment and its action from the default profile:
+/// every turn then goes to cloud. Caller prices keep the local entry, so
+/// their pinned digest is unchanged; a price for an unoffered model selects
+/// nothing.
+pub(crate) fn without_local(profile: &mut Value) {
+    let mut local_ids = Vec::new();
+    if let Some(deployments) = profile.get_mut("deployments").and_then(Value::as_array_mut) {
+        deployments.retain(|deployment| {
+            let local = deployment.get("kind").and_then(Value::as_str) == Some("local");
+            if local && let Some(id) = deployment.get("id").and_then(Value::as_str) {
+                local_ids.push(id.to_owned());
+            }
+            !local
+        });
+    }
+    if let Some(actions) = profile
+        .get_mut("derived_actions")
+        .and_then(Value::as_array_mut)
+    {
+        actions.retain(|action| {
+            action
+                .get("deployment_id")
+                .and_then(Value::as_str)
+                .is_none_or(|id| !local_ids.iter().any(|local| local == id))
+        });
+    }
 }
 
 /// Saved Rayline API keys for credential references whose endpoint is the
@@ -1366,5 +1529,187 @@ mod tests {
         custom["decisions"].as_object_mut().unwrap().remove("url");
         assert!(check_decisions_url(&custom, &routers).is_err());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A stub runtime answering `GET /props` and `POST /api/show` with the
+    /// given bodies (None: 404), for as many requests as arrive.
+    async fn runtime_stub(props: Option<Value>, show: Option<Value>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]);
+                let body = if request.starts_with("GET /props ") {
+                    props.clone()
+                } else if request.starts_with("POST /api/show ") {
+                    show.clone()
+                } else {
+                    None
+                };
+                let (status, body) = match body {
+                    Some(body) => ("200 OK", body.to_string()),
+                    None => ("404 Not Found", String::new()),
+                };
+                let head = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    #[tokio::test]
+    async fn llamacpp_runtime_is_identified_by_its_loaded_file() {
+        let client = reqwest::Client::new();
+        let props = |path: &str| {
+            Some(json!({"default_generation_settings": {"n_ctx": 98304},
+                        "model_alias": "qwen3.8-27b", "model_path": path}))
+        };
+        // Unsloth's file, and llama.cpp's -hf cache name for it.
+        for path in [
+            "/models/Qwen3.8-27B-UD-Q4_K_M.gguf",
+            "/cache/llama.cpp/unsloth_Qwen3.8-27B-GGUF_Qwen3.8-27B-UD-Q4_K_M.gguf",
+            "/models/qwen3.8-27b/model-q4.gguf",
+        ] {
+            let url = runtime_stub(props(path), None).await;
+            let runtime = read_local_runtime(&client, &url, "qwen3.8-27b").await;
+            assert_eq!(runtime.window, Some(98304));
+            assert_eq!(runtime.identity, LocalIdentity::Match(path.to_owned()));
+            assert!(!runtime.identity.refuses_local());
+        }
+        // The alias names Qwen3.8 but the file is Qwen3.6: the alias is the
+        // user's label, so this is a mismatch.
+        let url = runtime_stub(props("/models/Qwen3.6-27B-Q4_K_M.gguf"), None).await;
+        let runtime = read_local_runtime(&client, &url, "qwen3.8-27b").await;
+        assert_eq!(
+            runtime.identity,
+            LocalIdentity::Mismatch("/models/Qwen3.6-27B-Q4_K_M.gguf".to_owned())
+        );
+        assert!(runtime.identity.refuses_local());
+        let message = runtime.identity.start_message(&url).unwrap();
+        assert!(
+            message.contains("Qwen3.6-27B-Q4_K_M.gguf")
+                && message.contains("every turn goes to cloud")
+        );
+        // No path reported: unknown, not a mismatch.
+        let url = runtime_stub(Some(json!({"n_ctx": 4096})), None).await;
+        let runtime = read_local_runtime(&client, &url, "m").await;
+        assert_eq!(
+            runtime,
+            LocalRuntime {
+                window: Some(4096),
+                identity: LocalIdentity::Unknown
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn ollama_runtime_is_identified_by_its_gguf_metadata() {
+        let client = reqwest::Client::new();
+        // `qwen3.8:27b` as the Ollama library publishes it, and unsloth's GGUF.
+        for info in [
+            json!({"general.basename": "Qwen3.8", "general.size_label": "27B", "general.name": "Qwen3.8 27B 0814"}),
+            json!({"general.basename": "Qwen3.8-27B", "general.size_label": "27B", "general.name": "Qwen3.8-27B"}),
+        ] {
+            let url = runtime_stub(None, Some(json!({"model_info": info}))).await;
+            let runtime = read_local_runtime(&client, &url, "qwen3.8:27b").await;
+            assert_eq!(runtime.window, None);
+            assert!(
+                matches!(runtime.identity, LocalIdentity::Match(_)),
+                "{runtime:?}"
+            );
+        }
+        let qwen36 = json!({"model_info": {"general.basename": "Qwen3.6", "general.size_label": "27B", "general.name": "Qwen3.6 27B"}});
+        let url = runtime_stub(None, Some(qwen36)).await;
+        let runtime = read_local_runtime(&client, &url, "qwen3.8:27b").await;
+        assert_eq!(
+            runtime.identity,
+            LocalIdentity::Mismatch("Qwen3.6 27B".to_owned())
+        );
+        // A runtime that reports neither (LM Studio, MLX, vLLM): unknown, and
+        // local routing stays on with a warning.
+        let url = runtime_stub(None, None).await;
+        let runtime = read_local_runtime(&client, &url, "qwen3.8-27b").await;
+        assert_eq!(runtime.identity, LocalIdentity::Unknown);
+        assert!(!runtime.identity.refuses_local());
+        assert!(
+            runtime
+                .identity
+                .start_message(&url)
+                .unwrap()
+                .starts_with("Warning:")
+        );
+    }
+
+    #[test]
+    fn local_model_names_are_matched_exactly_enough() {
+        for name in [
+            "Qwen3.8-27B",
+            "qwen3.8:27b",
+            "Qwen3.8-27B-FP8",
+            "qwen38-27b",
+        ] {
+            assert!(names_local_model(name), "{name}");
+        }
+        for name in [
+            "Qwen3.6-27B",
+            "qwen3.8-270b",
+            "Qwen3.8-2.4T-A95B",
+            "qwen3.5-9b",
+            "",
+        ] {
+            assert!(!names_local_model(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_refused_local_model_leaves_a_cloud_only_profile() {
+        let mut profile = default_profile(
+            "https://api-dev.rayline.ai",
+            "http://127.0.0.1:11434/v1",
+            "llama3",
+            98304,
+            None,
+            None,
+        )
+        .unwrap();
+        let price_sha = profile["decisions"]["price_sha256"].clone();
+        without_local(&mut profile);
+        let composed = compose(
+            profile,
+            Some(&settings(None)),
+            Path::new("/state"),
+            ProfileOrigin::Default,
+        )
+        .unwrap();
+        let config = &composed.config;
+        let kinds: Vec<_> = config["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|deployment| deployment["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["cloud", "cloud"]);
+        let actions: Vec<_> = config["derived_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["deployment_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(actions, ["cloud-opus", "cloud-sonnet"]);
+        // Caller prices and their pinned digest are unchanged.
+        assert_eq!(config["decisions"]["price_sha256"], price_sha);
+        assert!(
+            config["decisions"]["routing"]["prices"]
+                .get(LOCAL_REGISTRY_MODEL)
+                .is_some()
+        );
     }
 }

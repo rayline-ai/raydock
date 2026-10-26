@@ -8,8 +8,8 @@ The release workflow creates platform archives for the Homebrew formula:
 - `rayline-<version>-linux_aarch64.tar.gz`
 
 Each archive contains a single `rayline-<version>-<platform>/` directory with
-`rayline`, `rld`, `rayline-core`, `rayline-core-source.json`, `README.md`, and
-`LICENSE`.
+`rayline`, `rld`, `rayline-core`, `rayline-core-source.json`,
+`rayline-core-LICENSE`, `README.md`, `LICENSE` and `NOTICE`.
 
 Generate the formula from the release `SHA256SUMS` file and use the matching
 archive for each OS/architecture. Do not point Homebrew at bare binary assets;

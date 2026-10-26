@@ -327,6 +327,20 @@ zstd-safe                          7.2.4        MIT OR Apache-2.0
 zstd-sys                           2.0.16+zstd.1.5.7 MIT/Apache-2.0
 
 --------------------------------------------------------------------------------
+Bundled Data
+--------------------------------------------------------------------------------
+
+The rayline-core binary embeds the BPE merges (merges.txt, gzip-compressed,
+uncompressed SHA-256
+a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d) and the
+added-token list of the Qwen3.8-27B tokenizer, to count the local model's
+prompt tokens. Source: https://huggingface.co/Qwen/Qwen3.8-27B at revision
+1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0.
+
+    Copyright 2026 Alibaba Cloud
+    Licensed under the Apache License, Version 2.0 (see rayline-core-LICENSE).
+
+--------------------------------------------------------------------------------
 Design Attributions
 --------------------------------------------------------------------------------
 

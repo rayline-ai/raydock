@@ -142,7 +142,7 @@ jobs:
           cp "target/release/rld${EXE_SUFFIX}" "package/${package_dir}/rld${EXE_SUFFIX}"
           cp "dist/rayline-core-${PLATFORM_TAG}" "package/${package_dir}/rayline-core${EXE_SUFFIX}"
           cp dist/rayline-core-source.json dist/rayline-core-LICENSE "package/${package_dir}/"
-          cp README.md LICENSE "package/${package_dir}/"
+          cp README.md LICENSE NOTICE "package/${package_dir}/"
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             pwsh -NoProfile -Command \

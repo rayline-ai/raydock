@@ -35,6 +35,7 @@ class Rayline < Formula
       bin.install "#{archive_root}/rld"
       bin.install "#{archive_root}/rayline-core"
       pkgshare.install "#{archive_root}/rayline-core-LICENSE"
+      pkgshare.install "#{archive_root}/NOTICE"
     else
       bin.install "rayline"
       bin.install "rld"
