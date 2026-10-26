@@ -717,14 +717,10 @@ fn ollama_identity(show: &Value) -> LocalIdentity {
         field("general.size_label")
     );
     let name = field("general.name");
-    let reported = if name.is_empty() {
-        basename.trim()
-    } else {
-        name
-    };
+    // Each verdict reports the name it was read from.
     let verdicts = [
-        name_identity(&basename, reported),
-        name_identity(name, reported),
+        name_identity(&basename, basename.trim()),
+        name_identity(name, name),
     ];
     if verdicts.contains(&LocalIdentity::Match) {
         LocalIdentity::Match
@@ -1688,6 +1684,14 @@ mod tests {
         assert_eq!(
             runtime.identity,
             LocalIdentity::Mismatch("Qwen3.6 27B".to_owned())
+        );
+        // The error names the field that identified the model.
+        let llama = json!({"model_info": {"general.name": "Model", "general.basename": "Llama-3.3", "general.size_label": "70B"}});
+        let url = runtime_stub(None, Some(llama)).await;
+        let runtime = read_local_runtime(&client, &url, "my-model").await;
+        assert_eq!(
+            runtime.identity,
+            LocalIdentity::Mismatch("Llama-3.3 70B".to_owned())
         );
         // Metadata that names no model family is unknown.
         let unnamed = json!({"model_info": {"general.name": "Model", "general.basename": "Model"}});
