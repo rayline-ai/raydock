@@ -678,8 +678,10 @@ async fn fetch_router_settings(
     Some(body)
 }
 
-/// Probe the configured local endpoint. Legacy custom endpoints are treated as
-/// Anthropic Messages; provider-tagged endpoints may use OpenAI Chat.
+/// Probe the configured local endpoint. An endpoint with a stored protocol is
+/// tested with it; a custom endpoint without one (or `--url`) is tested with
+/// both OpenAI Chat Completions (hybrid routing) and Anthropic Messages
+/// (`--local` Claude Code), and fails only when neither works.
 pub async fn test(request: &LocalTestRequest) -> Result<String, String> {
     let stored = dirs::home_dir().and_then(|home| read_from_home(&home));
     let base_url = match request.base_url.as_deref() {
@@ -724,21 +726,33 @@ pub async fn test(request: &LocalTestRequest) -> Result<String, String> {
         Some("openai_chat") => test_openai_chat(&base_url, &model).await,
         Some("anthropic_messages") => test_anthropic_messages(&base_url, &model).await,
         // A custom endpoint with no stated protocol serves two paths:
-        // `rayline hybrid` sends OpenAI Chat Completions to it (required here),
-        // and `rayline claude --local` sends Anthropic Messages (reported).
+        // `rayline hybrid` sends OpenAI Chat Completions to it, and
+        // `rayline claude --local` sends Anthropic Messages. Both are probed
+        // and reported; the test fails only when neither answers.
         _ => {
-            let chat = test_openai_chat(&base_url, &model).await?;
-            let messages = match test_anthropic_messages(&base_url, &model).await {
-                Ok(_) => "Anthropic Messages (`/v1/messages`, used by `--local` Claude Code): OK"
-                    .to_owned(),
+            let chat = test_openai_chat(&base_url, &model).await;
+            let messages = test_anthropic_messages(&base_url, &model).await;
+            let first_line = |error: &String| error.lines().next().unwrap_or_default().to_owned();
+            let chat_line = match &chat {
+                Ok(ok) => format!("Hybrid routing (Chat Completions): {ok}"),
                 Err(error) => format!(
-                    "Anthropic Messages (`/v1/messages`, used only by `--local` Claude Code) is not available: {}",
-                    error.lines().next().unwrap_or_default()
+                    "Hybrid routing (Chat Completions, `/v1/chat/completions`) cannot use this endpoint: {}",
+                    first_line(error)
                 ),
             };
-            Ok(format!(
-                "{chat} Hybrid routing uses this endpoint.\n{messages}"
-            ))
+            let messages_line = match &messages {
+                Ok(ok) => format!("`--local` Claude Code (Anthropic Messages): {ok}"),
+                Err(error) => format!(
+                    "`--local` Claude Code (Anthropic Messages, `/v1/messages`) cannot use this endpoint: {}",
+                    first_line(error)
+                ),
+            };
+            let report = format!("{chat_line}\n{messages_line}");
+            if chat.is_err() && messages.is_err() {
+                Err(report)
+            } else {
+                Ok(report)
+            }
         }
     }
 }

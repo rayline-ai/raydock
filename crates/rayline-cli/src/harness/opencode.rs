@@ -13,9 +13,10 @@
 //! not exist there. [`launch_args`] adds `--standalone` (a private server that
 //! inherits this environment) to the commands that would attach.
 //!
-//! The model entry carries only keys OpenCode 2 reads: it rejects the legacy
-//! `attachment` and `reasoning` flags, and derives image support from
-//! `modalities.input`.
+//! OpenCode 2 rejects the model entry's legacy `attachment` and `reasoning`
+//! flags (image support comes from `modalities.input`); OpenCode 1 gates
+//! image attachments and reasoning on them, so they are written only for a
+//! known OpenCode 1.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -30,7 +31,7 @@ pub(crate) const PROVIDER_ID: &str = "rayline";
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let model_ref = format!("{PROVIDER_ID}/{ROUTER_MODEL}");
-    let config = json!({
+    let mut config = json!({
         "$schema": "https://opencode.ai/config.json",
         "model": model_ref,
         // The session-title side call otherwise goes to the user's global
@@ -60,6 +61,15 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             }
         }
     });
+    if ctx.harness_major_version.is_some_and(|major| major < 2) {
+        let model = &mut config["provider"][PROVIDER_ID]["models"][ROUTER_MODEL];
+        let images = ctx
+            .input_modalities()
+            .as_array()
+            .is_some_and(|input| input.iter().any(|modality| modality == "image"));
+        model["attachment"] = json!(images);
+        model["reasoning"] = json!(true);
+    }
     Plan {
         files: vec![json_file(CONFIG_FILE, &config, true)],
         env_set: vec![(
@@ -100,6 +110,15 @@ const VALUE_FLAGS: &[&str] = &[
     "--prompt",
     "--session",
     "-s",
+    "--model",
+    "-m",
+    "--agent",
+    "--port",
+    "--hostname",
+    "--file",
+    "-f",
+    "--title",
+    "--format",
 ];
 
 /// The major version `opencode --version` reports (`opencode v2.0.25`), or
@@ -225,6 +244,11 @@ mod tests {
                 &["--prompt", "run tests"],
                 &["--standalone", "--prompt", "run tests"],
             ),
+            (
+                &["-m", "rayline/rayline-router", "run", "hi"],
+                &["-m", "rayline/rayline-router", "run", "--standalone", "hi"],
+            ),
+            (&["--agent", "build"], &["--standalone", "--agent", "build"]),
             // Already picks a server, or a command that never attaches.
             (
                 &["run", "--standalone", "hi"],
@@ -251,6 +275,28 @@ mod tests {
                 strings(&["run", "hi"])
             );
         }
+    }
+
+    #[test]
+    fn opencode_1_keeps_its_attachment_and_reasoning_flags() {
+        let dir = super::super::tests::temp_dir("opencode-1");
+        let ctx = RenderContext {
+            env_name: "dev",
+            key: TEST_KEY,
+            router_url: TEST_URL,
+            config_dir: &dir,
+            conversation_id: super::super::ConversationIdFallback::new("dev", None),
+            allow_empty_signature: false,
+            capabilities: None,
+            harness_major_version: Some(1),
+        };
+        let config: serde_json::Value =
+            serde_json::from_str(&plan(&ctx).files[0].contents).unwrap();
+        let model = &config["provider"]["rayline"]["models"]["rayline-router"];
+        assert_eq!(
+            (&model["attachment"], &model["reasoning"]),
+            (&serde_json::json!(true), &serde_json::json!(true))
+        );
     }
 
     #[test]

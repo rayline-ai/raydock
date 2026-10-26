@@ -166,6 +166,7 @@ mod tests {
             conversation_id: ConversationIdFallback::new("dev", None),
             allow_empty_signature: false,
             capabilities: None,
+            harness_major_version: None,
         };
         let plan = super::plan(&ctx).unwrap();
         // Hermes saves a setting after Rayline read the file.
@@ -225,6 +226,7 @@ fallback_model:
                 conversation_id: ConversationIdFallback::new("dev", None),
                 allow_empty_signature: false,
                 capabilities: None,
+                harness_major_version: None,
             };
             write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
             std::fs::read_to_string(&path).unwrap()
@@ -287,6 +289,7 @@ fallback_providers: []
             conversation_id: ConversationIdFallback::new("dev", None),
             allow_empty_signature: false,
             capabilities: None,
+            harness_major_version: None,
         };
         let error = super::plan(&ctx).unwrap_err();
         assert!(error.contains("fix or remove the file"), "{error}");

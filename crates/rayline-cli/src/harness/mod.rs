@@ -170,7 +170,20 @@ impl Harness {
         })
     }
 
-    pub(crate) fn hybrid_args(self, args: &[OsString]) -> io::Result<Vec<OsString>> {
+    /// The installed harness's major version, where a renderer or the launch
+    /// args depend on it (OpenCode); None otherwise or when unreadable.
+    pub(crate) fn major_version(self, binary: Option<&Path>) -> Option<u64> {
+        match self {
+            Self::OpenCode => opencode::major_version(binary?),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn hybrid_args(
+        self,
+        args: &[OsString],
+        major_version: Option<u64>,
+    ) -> io::Result<Vec<OsString>> {
         if self == Self::OpenClaw {
             let env_container =
                 std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
@@ -181,10 +194,7 @@ impl Harness {
             }
             Ok(openclaw::launch_args(args))
         } else if self == Self::OpenCode {
-            Ok(match find_on_path(self.binary()) {
-                Some(binary) => opencode_args(&binary, args),
-                None => args.to_vec(),
-            })
+            Ok(opencode_args(args, major_version))
         } else {
             Ok(args.to_vec())
         }
@@ -219,6 +229,8 @@ pub(crate) struct RenderContext<'a> {
     /// budget against, the core's output cap, input modalities). `None`: the
     /// hosted router's defaults.
     pub capabilities: Option<&'a rayline_local_router::ModelCapabilities>,
+    /// The installed harness's major version ([`Harness::major_version`]).
+    pub harness_major_version: Option<u64>,
 }
 
 impl RenderContext<'_> {
@@ -355,6 +367,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             std::env::var(pi::ALLOW_EMPTY_SIGNATURE_ENV).ok().as_deref(),
         ),
         capabilities: None,
+        harness_major_version: harness.major_version(Some(&binary)),
     };
     let plan = harness.plan(&ctx)?;
     write_files(&config_dir, &plan.files).map_err(|error| {
@@ -404,7 +417,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             }
             args
         }
-        Harness::OpenCode => opencode_args(&binary, &request.args),
+        Harness::OpenCode => opencode_args(&request.args, ctx.harness_major_version),
         _ => request.args,
     };
     Ok(build_command(&binary, &plan, conv_id.as_deref(), &args))
@@ -412,8 +425,8 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
 
 /// OpenCode's args with `--standalone` where OpenCode 2 would attach to its
 /// background service ([`opencode::launch_args`]).
-fn opencode_args(binary: &Path, args: &[OsString]) -> Vec<OsString> {
-    let launched = opencode::launch_args(args, opencode::major_version(binary));
+fn opencode_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString> {
+    let launched = opencode::launch_args(args, major_version);
     if launched.len() != args.len() {
         eprintln!(
             "  added --standalone so OpenCode uses this config (its background service does not see it)"
@@ -652,7 +665,7 @@ fn yaml_key(key: &str) -> String {
     }
 }
 
-fn find_on_path(binary_name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(binary_name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let names = executable_names(binary_name, cfg!(windows));
     std::env::split_paths(&path).find_map(|dir| find_in_dir(&dir, &names))
@@ -753,6 +766,7 @@ pub(crate) mod tests {
             conversation_id,
             allow_empty_signature: pi::allow_empty_signature("dev", None),
             capabilities: None,
+            harness_major_version: None,
         };
         let plan = harness.plan(&ctx).unwrap();
         write_files(&dir, &plan.files).unwrap();

@@ -668,6 +668,26 @@ pub(crate) fn configured_router_urls(home: &Path) -> Vec<String> {
         .collect()
 }
 
+/// The configured environment whose router serves `url` (same HTTPS host
+/// and port), e.g. to name the right `rayline --env <env> auth login`.
+pub(crate) fn environment_for_url(home: &Path, url: &str) -> Option<String> {
+    let target = https_host(url)?;
+    let mut names = vec![crate::status::PROD_ENV.to_owned()];
+    if let Some(configured) = crate::status::read_settings(home)
+        .as_ref()
+        .and_then(|settings| settings.get("environments"))
+        .and_then(Value::as_object)
+    {
+        names.extend(configured.keys().cloned());
+    }
+    names.into_iter().find(|name| {
+        crate::status::resolve_hosted_environment(name, Some(home))
+            .ok()
+            .and_then(|hosted| https_host(&hosted.router_url))
+            .is_some_and(|authority| authority == target)
+    })
+}
+
 /// Refuse a configuration whose `decisions.url` is not a Rayline router of a
 /// configured environment (HTTPS, exact host and port) or a loopback address.
 /// `rld` repeats this check on the file it hands the core.

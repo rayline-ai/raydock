@@ -566,7 +566,10 @@ fn buffered_response(
         Some((DecisionsFailure::Unavailable, body)) => {
             (StatusCode::SERVICE_UNAVAILABLE, body, true)
         }
-        Some((DecisionsFailure::Auth, body)) => (status, body, false),
+        // Not 5xx: harness SDKs retry those with backoff, which would only
+        // repeat the refused call and hold back the fix. Not 401 either, which
+        // a harness reads as its own (gateway) credential being wrong.
+        Some((DecisionsFailure::Auth, body)) => (StatusCode::FORBIDDEN, body, false),
         None => (status, body, false),
     };
     let mut response = Response::builder().status(status);

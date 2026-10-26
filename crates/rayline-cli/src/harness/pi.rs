@@ -91,6 +91,7 @@ mod tests {
             conversation_id: super::super::ConversationIdFallback::new(env_name, None),
             allow_empty_signature: allow,
             capabilities: None,
+            harness_major_version: None,
         };
         super::super::write_files(dir, &super::plan(&ctx).files).unwrap();
         serde_json::from_str(&std::fs::read_to_string(dir.join("models.json")).unwrap()).unwrap()

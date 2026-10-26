@@ -223,8 +223,8 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         }
                         Some(_) => configured,
                         None => {
-                            println!(
-                                "Local window: {configured} tokens. Load the local model with at least this window (llama.cpp `--ctx-size {configured}`, Ollama `OLLAMA_CONTEXT_LENGTH={configured}`); Rayline cannot read it from this runtime."
+                            eprintln!(
+                                "Warning: Rayline cannot read this runtime's context window, so it assumes {configured} tokens. Load the local model with at least that window (llama.cpp `--ctx-size {configured}`, Ollama `OLLAMA_CONTEXT_LENGTH={configured}`): a runtime loaded with less (Ollama's default is a few thousand tokens) may silently truncate longer prompts. Set a smaller window with --local-context-window if needed."
                             );
                             configured
                         }
@@ -295,7 +295,21 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             }
             // One Decisions call before reporting ready: a refused key or an
             // unreachable router fails here, not on the harness's first turn.
-            probe_decisions(&composed.config, &credentials, &env, startup_timeout_secs).await?;
+            // The environment whose router serves Decisions: a profile file may
+            // name another one than `--env`.
+            let decisions_env = composed
+                .config
+                .pointer("/decisions/url")
+                .and_then(Value::as_str)
+                .and_then(|url| crate::hybrid_profile::environment_for_url(&home, url))
+                .unwrap_or_else(|| env.clone());
+            probe_decisions(
+                &composed.config,
+                &credentials,
+                &decisions_env,
+                startup_timeout_secs,
+            )
+            .await?;
             let rld = if std::env::var_os("RLD_BIN").is_some() {
                 crate::router::resolve_rld_bin(&home)?
             } else {
@@ -323,7 +337,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             for router_url in &router_urls {
                 command.arg("--router-url").arg(router_url);
             }
-            command.arg("--env-name").arg(&env);
+            command.arg("--env-name").arg(&decisions_env);
             for (name, key) in &credentials {
                 command.env(name, key);
             }
@@ -487,10 +501,9 @@ async fn probe_decisions(
     // A loopback Decisions service is a local fixture or development
     // service, not a router this check can describe.
     if reqwest::Url::parse(url).is_ok_and(|url| {
-        matches!(
-            url.host_str(),
-            Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
-        )
+        url.host_str().is_some_and(|host| {
+            rayline_local_router::decisions_url::is_loopback(&host.to_ascii_lowercase())
+        })
     }) {
         return Ok(());
     }
@@ -543,6 +556,11 @@ async fn probe_decisions(
                     "Decisions at {url} refused the Rayline key (HTTP {status}). {fix}, then `rayline hybrid start` again."
                 )));
             }
+            ProbeVerdict::RateLimited => {
+                return Err(io::Error::other(format!(
+                    "Decisions at {url} refused the readiness check with HTTP 429: the Rayline key is rate limited or out of quota; check your account, then retry"
+                )));
+            }
             ProbeVerdict::Rejected(status) => {
                 return Err(io::Error::other(format!(
                     "Decisions at {url} answered HTTP {status} to a readiness check; hybrid routing cannot start"
@@ -577,6 +595,7 @@ async fn probe_decisions(
 enum ProbeVerdict {
     Ready,
     KeyRefused(u16),
+    RateLimited,
     Unavailable,
     Rejected(u16),
 }
@@ -587,10 +606,12 @@ fn probe_verdict(outcome: Result<u16, ()>) -> ProbeVerdict {
         Err(()) => ProbeVerdict::Unavailable,
         Ok(status) if (200..300).contains(&status) => ProbeVerdict::Ready,
         Ok(status @ (401 | 403)) => ProbeVerdict::KeyRefused(status),
-        Ok(429 | 500 | 502 | 503 | 504) => ProbeVerdict::Unavailable,
+        Ok(429) => ProbeVerdict::RateLimited,
+        Ok(500 | 502 | 503 | 504) => ProbeVerdict::Unavailable,
         // Authenticated, then refused the readiness body (an empty one, or a
         // cell that wants an execution context): the key and router work.
-        Ok(400 | 404 | 405 | 409 | 422) => ProbeVerdict::Ready,
+        // A 404/405 means the URL is not a Decisions route: rejected.
+        Ok(400 | 409 | 422) => ProbeVerdict::Ready,
         Ok(status) => ProbeVerdict::Rejected(status),
     }
 }
@@ -765,7 +786,9 @@ fn harness_command(
         _ => {
             let harness = crate::harness::Harness::from_command(name)
                 .ok_or_else(|| io::Error::other(format!("unsupported hybrid harness {name:?}")))?;
-            let args = harness.hybrid_args(args)?;
+            let major_version =
+                harness.major_version(crate::harness::find_on_path(harness.binary()).as_deref());
+            let args = harness.hybrid_args(args, major_version)?;
             let config_dir = paths.dir.join("harness").join(name);
             private_dir(&config_dir)?;
             let ctx = crate::harness::RenderContext {
@@ -779,6 +802,7 @@ fn harness_command(
                 },
                 allow_empty_signature: true,
                 capabilities: Some(capabilities),
+                harness_major_version: major_version,
             };
             let plan = harness.plan(&ctx).map_err(io::Error::other)?;
             crate::harness::write_files(&config_dir, &plan.files)?;
@@ -1231,6 +1255,8 @@ mod tests {
         assert_eq!(probe_verdict(Ok(502)), ProbeVerdict::Unavailable);
         assert_eq!(probe_verdict(Err(())), ProbeVerdict::Unavailable);
         assert_eq!(probe_verdict(Ok(402)), ProbeVerdict::Rejected(402));
+        assert_eq!(probe_verdict(Ok(404)), ProbeVerdict::Rejected(404));
+        assert_eq!(probe_verdict(Ok(429)), ProbeVerdict::RateLimited);
     }
 
     #[test]
