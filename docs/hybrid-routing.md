@@ -85,11 +85,12 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     and Sonnet.
   - `--cell` selects an isolated development cell.
   - This profile has no prompt counter. An execution core with estimated
-    capacity facts (semantic-router#357) estimates every target's prompt size,
-    hands a turn that does not fit the local window to cloud before the local
-    runtime sees it, and refuses a prompt no target can hold. An older core
-    leaves local capacity unknown, and only a llama.cpp context refusal
-    re-consults.
+    local capacity facts (semantic-router#357) conservatively estimates the
+    prompt's size for the local model and hands a turn that does not fit the
+    local window to cloud before the local runtime sees it. A prompt too large
+    for every cloud window is refused by the cloud provider ("prompt is too
+    long"), which the harness's compaction recognises. An older core leaves
+    local capacity unknown, and only a llama.cpp context refusal re-consults.
 - **`--config`:** names a qualified profile instead.
 
 - **Hybrid routing works with no overrides.** For the default profile, a

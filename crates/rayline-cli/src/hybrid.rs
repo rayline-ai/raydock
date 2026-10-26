@@ -686,8 +686,8 @@ fn model_capabilities(state: &Value) -> io::Result<ModelCapabilities> {
 
 /// Context window every harness is told under hybrid routing. The runtime
 /// carries any prompt up to this size: a turn too large for the local model
-/// hands off to a cloud deployment whose own window fits, and the execution
-/// core refuses, naming the limit, a prompt no admitted deployment can take.
+/// hands off to cloud, and a prompt larger than the cloud window is refused
+/// ("prompt is too long") so the harness compacts.
 pub(crate) const HARNESS_CONTEXT_WINDOW: u64 = 1_000_000;
 
 /// The core's capabilities with [`HARNESS_CONTEXT_WINDOW`] as the window.
