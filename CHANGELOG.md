@@ -3,6 +3,36 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline/releases).
 
+## Unreleased
+
+### Fixed
+
+- **`rayline hybrid run opencode` works with OpenCode 2.** Every turn was
+  refused with "output allowance exceeds the admitted deployment limit":
+  every hybrid harness (OpenCode, omp, OpenClaw, Hermes, Claude Code, Codex)
+  now advertises the runtime's admitted output cap and text-only input, as
+  Pi already did (#123). OpenCode 2 launches (`rayline opencode` and
+  `rayline hybrid run opencode`) add `--standalone`, since OpenCode's shared
+  background service never saw Rayline's configuration, and the OpenCode
+  config drops the `attachment` and `reasoning` keys OpenCode 2 rejects.
+  Hybrid refuses OpenCode `-c` / `--session` / `--fork` like other resumes.
+- **Clearer hybrid errors.** `rayline hybrid start` checks Decisions once
+  before reporting ready (a rejected key names the `auth login` command; a
+  starting preview cell is waited for). During a session, a Decisions key
+  refusal names the same command, and a Decisions outage is retried once,
+  then reported as retryable (HTTP 503).
+- **`rayline local test`** checks Chat Completions, the API hybrid routing
+  uses, and reports Anthropic Messages separately.
+
+### Changed
+
+- **Hybrid context.** Harnesses are told the window is 1,000,000 tokens; the
+  default cloud targets (Opus 5.5, Sonnet 5.5) carry their 1M window; the
+  local window defaults to 98,304 tokens (`hybrid.local_context_window`,
+  `--local-context-window`), capped by a llama.cpp runtime's loaded window.
+  Ollama and MLX no longer need `--local-context-window`, but must be loaded
+  with that window. Hermes uses its Responses provider under hybrid.
+
 ## 0.2.13 (2026-10-26)
 
 ### New

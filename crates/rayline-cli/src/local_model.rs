@@ -714,16 +714,32 @@ pub async fn test(request: &LocalTestRequest) -> Result<String, String> {
         .unwrap_or_else(|| "local".to_owned());
 
     let protocol = if request.base_url.is_some() {
-        "anthropic_messages"
+        None
     } else {
         stored
             .as_ref()
             .and_then(|config| config.protocol.as_deref())
-            .unwrap_or("anthropic_messages")
     };
     match protocol {
-        "openai_chat" => test_openai_chat(&base_url, &model).await,
-        _ => test_anthropic_messages(&base_url, &model).await,
+        Some("openai_chat") => test_openai_chat(&base_url, &model).await,
+        Some("anthropic_messages") => test_anthropic_messages(&base_url, &model).await,
+        // A custom endpoint with no stated protocol serves two paths:
+        // `rayline hybrid` sends OpenAI Chat Completions to it (required here),
+        // and `rayline claude --local` sends Anthropic Messages (reported).
+        _ => {
+            let chat = test_openai_chat(&base_url, &model).await?;
+            let messages = match test_anthropic_messages(&base_url, &model).await {
+                Ok(_) => "Anthropic Messages (`/v1/messages`, used by `--local` Claude Code): OK"
+                    .to_owned(),
+                Err(error) => format!(
+                    "Anthropic Messages (`/v1/messages`, used only by `--local` Claude Code) is not available: {}",
+                    error.lines().next().unwrap_or_default()
+                ),
+            };
+            Ok(format!(
+                "{chat} Hybrid routing uses this endpoint.\n{messages}"
+            ))
+        }
     }
 }
 

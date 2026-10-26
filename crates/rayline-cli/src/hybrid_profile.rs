@@ -10,8 +10,13 @@
 //! ```json
 //! {"hybrid": {"routing": {"policy": "utility" | "prefer_local", "min_p_pass": 0.65,
 //!                         "schedule": {"model": ["cache_boundaries", "user_messages"]},
-//!                         "value_usd": 0.1}}}
+//!                         "value_usd": 0.1},
+//!             "local_context_window": 98304}}
 //! ```
+//!
+//! `hybrid.local_context_window` is the local model's window in tokens
+//! ([`DEFAULT_LOCAL_CONTEXT_WINDOW`] when absent). Load the local runtime with
+//! at least that window; a turn whose prompt does not fit hands off to cloud.
 //!
 //! A profile deployment marked `"from_local_model": true` takes its endpoint
 //! and served model from the `local_model` entry (`rayline local custom …`).
@@ -35,6 +40,34 @@ const LOCAL_REGISTRY_MODEL: &str = "qwen/qwen3.8-27b";
 /// harder work goes to the cloud (dev cell probe, 2026-10-25).
 const DEFAULT_VALUE_USD: f64 = 0.5;
 const CALLER_PRICES_SCHEMA: &str = "arc-caller-prices.v1";
+/// The local model's default window: 96k tokens keeps Qwen3.8-27B's KV cache
+/// within a laptop's memory, and a longer turn hands off to cloud.
+pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW: u64 = 98_304;
+/// The bounds of `hybrid.local_context_window` (the cloud targets' window).
+const LOCAL_CONTEXT_WINDOW_RANGE: std::ops::RangeInclusive<u64> = 2048..=1_000_000;
+/// Context window of the default cloud targets, Claude Opus 5.5 and Sonnet
+/// 5.5 (pricing snapshot 2026-10-16, `context_window_tokens`).
+const CLOUD_CONTEXT_WINDOW: u64 = 1_000_000;
+
+/// `hybrid.local_context_window` from settings, or the default.
+pub(crate) fn local_context_window(settings: Option<&Value>) -> Result<u64, String> {
+    let value = settings
+        .and_then(|settings| settings.get("hybrid"))
+        .and_then(|hybrid| hybrid.get("local_context_window"));
+    match value {
+        None => Ok(DEFAULT_LOCAL_CONTEXT_WINDOW),
+        Some(value) => value
+            .as_u64()
+            .filter(|window| LOCAL_CONTEXT_WINDOW_RANGE.contains(window))
+            .ok_or_else(|| {
+                format!(
+                    "settings hybrid.local_context_window must be a whole number of tokens from {} to {}",
+                    LOCAL_CONTEXT_WINDOW_RANGE.start(),
+                    LOCAL_CONTEXT_WINDOW_RANGE.end()
+                )
+            }),
+    }
+}
 
 /// `hybrid.routing.local_price`: USD per million tokens for every leg of the
 /// local model, 0 or within [1e-6, 1e6] so its canonical spelling is plain.
@@ -435,66 +468,6 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
     Some((base_url, field("model")?))
 }
 
-/// The context window a harness should budget against: the largest window of
-/// the composed config's executable cloud deployments, or `core_window` when
-/// that is larger or no cloud deployment is executable (an all-local profile).
-///
-/// The core advertises the smallest window across its deployments. A turn that
-/// overflows the local window is handed off to cloud (capacity handoff), so a
-/// harness that sizes requests from its window (pi 1.1 clamps `max_tokens` to
-/// what is left of it) must see the window that handoff can reach.
-///
-/// A deployment counts only when a `bindings` or `derived_actions` entry
-/// names it, as the core admits targets from actions. `core_window` is kept
-/// when the cloud window cannot be established: a profile with a
-/// `test_alias` (its alias source is selection-only and a binding does not say
-/// which model it serves), or a key Go's case-insensitive decoder could read
-/// differently from this exact lookup.
-pub(crate) fn reachable_context_window(config: &Value, core_window: u64) -> u64 {
-    reachable_cloud_window(config).map_or(core_window, |window| window.max(core_window))
-}
-
-fn reachable_cloud_window(config: &Value) -> Option<u64> {
-    if go_field(config, "test_alias")?.is_some_and(|alias| !alias.is_null()) {
-        return None;
-    }
-    let list = |name: &str| {
-        go_field(config, name).map(|value| {
-            value
-                .and_then(Value::as_array)
-                .map_or(&[][..], Vec::as_slice)
-        })
-    };
-    let mut executable = Vec::new();
-    for action in list("bindings")?.iter().chain(list("derived_actions")?) {
-        if let Some(id) = go_field(action, "deployment_id")?.and_then(Value::as_str) {
-            executable.push(id);
-        }
-    }
-    let mut window = 0;
-    for deployment in list("deployments")? {
-        let kind = go_field(deployment, "kind")?.and_then(Value::as_str);
-        let id = go_field(deployment, "id")?.and_then(Value::as_str);
-        let context = go_field(deployment, "context_window")?.and_then(Value::as_u64);
-        if kind == Some("cloud")
-            && id.is_some_and(|id| executable.contains(&id))
-            && let Some(context) = context
-        {
-            window = window.max(context);
-        }
-    }
-    Some(window)
-}
-
-/// `value[name]` as the Go core reads it; None when another key would also
-/// match `name` in Go.
-fn go_field<'v>(value: &'v Value, name: &str) -> Option<Option<&'v Value>> {
-    match value.as_object() {
-        Some(map) => rayline_local_router::decisions_url::exact_field(map, name).ok(),
-        None => Some(None),
-    }
-}
-
 /// The default package-less profile: local Qwen from `local_model`, Opus and
 /// Sonnet through the signed-in router (exact model pins), decisions from the
 /// router's `rayline-router` model with the hybrid default preset applied by
@@ -526,7 +499,7 @@ pub(crate) fn default_profile(
         json!({"id": id, "kind": "cloud", "cloud_transport": "model_pin", "url": format!("{router}/v1/messages"),
                "protocol": "anthropic.messages.v1", "wire_model": wire, "registry_model": wire,
                "registry_provider": "openrouter", "runtime_identity": "rayline-catalog-model-pin-v1",
-               "max_output_tokens": 4096, "context_window": 200000, "input_modalities": ["text"],
+               "max_output_tokens": 4096, "context_window": CLOUD_CONTEXT_WINDOW, "input_modalities": ["text"],
                "token_units": "", "auth_env": ROUTER_KEY_ENV})
     };
     let legs = json!({"input": local_price, "output": local_price, "cache_read": local_price, "cache_write": local_price});
@@ -773,56 +746,47 @@ mod tests {
     }
 
     #[test]
-    fn reachable_context_window_is_the_cloud_window_when_cloud_is_configured() {
-        let mixed = default_profile(
+    fn local_context_window_defaults_to_96k_and_can_be_raised() {
+        assert_eq!(local_context_window(None).unwrap(), 98_304);
+        assert_eq!(
+            local_context_window(Some(&json!({"hybrid": {}}))).unwrap(),
+            98_304
+        );
+        let raised = json!({"hybrid": {"local_context_window": 131_072}});
+        assert_eq!(local_context_window(Some(&raised)).unwrap(), 131_072);
+        for bad in [json!(1024), json!(2_000_000), json!("96k"), json!(-1)] {
+            let settings = json!({"hybrid": {"local_context_window": bad}});
+            assert!(local_context_window(Some(&settings)).is_err(), "{bad}");
+        }
+        // The cloud targets carry their 1M window.
+        let profile = default_profile(
             "https://api-dev.rayline.ai",
             "http://127.0.0.1:11434/v1",
             "qwen3.8:27b",
-            16384,
+            98_304,
             None,
             None,
         )
         .unwrap();
-        assert_eq!(reachable_context_window(&mixed, 16384), 200_000);
-        // All-local: the core's (local) window stays.
-        let local_only = json!({"deployments": [
-            {"id": "local", "kind": "local", "context_window": 16384},
-            {"id": "local-2", "kind": "local", "context_window": 32768}
-        ]});
-        assert_eq!(reachable_context_window(&local_only, 16384), 16384);
-        // A package profile without inline deployments keeps the core's window.
-        assert_eq!(reachable_context_window(&json!({}), 16384), 16384);
-        // A smaller cloud window never lowers the core's.
-        let small_cloud = json!({
-            "deployments": [{"id": "c", "kind": "cloud", "context_window": 8192}],
-            "bindings": [{"action_id": "a", "worker": "w", "deployment_id": "c"}]
-        });
-        assert_eq!(reachable_context_window(&small_cloud, 16384), 16384);
-        // A cloud deployment no action executes on does not count.
-        let mut unbound = mixed.clone();
-        unbound["derived_actions"] = json!([
-            {"model": "qwen3.8-27b", "worker": "qwen3.8-27b", "deployment_id": "local"}
-        ]);
-        assert_eq!(reachable_context_window(&unbound, 16384), 16384);
-        // Package profiles bind actions to deployments with `bindings`.
-        let mut bound = unbound.clone();
-        bound["bindings"] =
-            json!([{"action_id": "x", "worker": "w", "deployment_id": "cloud-sonnet"}]);
-        assert_eq!(reachable_context_window(&bound, 16384), 200_000);
-        // A test alias's source is selection-only: keep the core's window.
-        let mut aliased = mixed.clone();
-        aliased["test_alias"] =
-            json!({"selected_model": "claude-opus-5.5", "execution_action_id": "local"});
-        assert_eq!(reachable_context_window(&aliased, 16384), 16384);
-        // Go reads keys case-insensitively: an alias it would see keeps the
-        // core's window, as does any key Go could read differently.
-        let mut folded = mixed.clone();
-        folded["TEST_ALIAS"] =
-            json!({"selected_model": "claude-opus-5.5", "execution_action_id": "local"});
-        assert_eq!(reachable_context_window(&folded, 16384), 16384);
-        let mut shadowed = mixed.clone();
-        shadowed["derived_actions"][2]["Deployment_ID"] = json!("local");
-        assert_eq!(reachable_context_window(&shadowed, 16384), 16384);
+        let windows: Vec<_> = profile["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|deployment| {
+                (
+                    deployment["id"].clone(),
+                    deployment["context_window"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            windows,
+            [
+                (json!("local"), json!(98_304)),
+                (json!("cloud-opus"), json!(1_000_000)),
+                (json!("cloud-sonnet"), json!(1_000_000))
+            ]
+        );
     }
 
     #[test]

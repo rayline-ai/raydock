@@ -744,7 +744,9 @@ tail -f ~/.rayline/rld/llama-server.log
 ```
 
 First model load can take a minute or two. If a custom local-model endpoint is
-unreachable, check daemon status and probe the Anthropic Messages endpoint:
+unreachable, check daemon status and probe it (Chat Completions, which hybrid
+routing uses; Anthropic Messages, which `--local` Claude Code uses, is
+reported too):
 
 ```bash
 rayline router status

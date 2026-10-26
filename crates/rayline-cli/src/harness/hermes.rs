@@ -22,9 +22,7 @@ use std::{fs, io};
 
 use serde_json::json;
 
-use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, ConfigFile, Plan, ROUTER_MODEL, RenderContext, to_yaml, yaml_merge,
-};
+use super::{CONV_ID_ENV, ConfigFile, Plan, ROUTER_MODEL, RenderContext, to_yaml, yaml_merge};
 
 pub(crate) const CONFIG_FILE: &str = "config.yaml";
 pub(crate) const MESSAGES_PROVIDER: &str = "rayline-anth";
@@ -44,7 +42,7 @@ const OWNED: &[&[&str]] = &[
 ];
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
-    let models = json!({ ROUTER_MODEL: { "context_length": CONTEXT_WINDOW } });
+    let models = json!({ ROUTER_MODEL: { "context_length": ctx.context_window() } });
     let mut responses = json!({
         "base_url": ctx.v1_base(),
         "api_key": ctx.key,
@@ -65,11 +63,20 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
     if ctx.conversation_id.enabled(false) {
         messages["extra_headers"] = json!({ super::CONV_HEADER: format!("${{{CONV_ID_ENV}}}") });
     }
+    // Under hybrid routing the default is Responses: on Messages Hermes always
+    // asks for its model's full output ceiling (128k for an unknown model; it
+    // has no setting to lower it), which the execution core refuses. On
+    // Responses it sends no output cap and the core applies its own.
+    let default_provider = if ctx.capabilities.is_some() {
+        RESPONSES_PROVIDER
+    } else {
+        MESSAGES_PROVIDER
+    };
     let config = json!({
         "model": {
-            "provider": format!("custom:{MESSAGES_PROVIDER}"),
+            "provider": format!("custom:{default_provider}"),
             "default": ROUTER_MODEL,
-            "context_length": CONTEXT_WINDOW
+            "context_length": ctx.context_window()
         },
         "providers": {
             MESSAGES_PROVIDER: messages,
@@ -158,6 +165,7 @@ mod tests {
             config_dir: &dir,
             conversation_id: ConversationIdFallback::new("dev", None),
             allow_empty_signature: false,
+            capabilities: None,
         };
         let plan = super::plan(&ctx).unwrap();
         // Hermes saves a setting after Rayline read the file.
@@ -216,6 +224,7 @@ fallback_model:
                 config_dir: &dir,
                 conversation_id: ConversationIdFallback::new("dev", None),
                 allow_empty_signature: false,
+                capabilities: None,
             };
             write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
             std::fs::read_to_string(&path).unwrap()
@@ -277,6 +286,7 @@ fallback_providers: []
             config_dir: &dir,
             conversation_id: ConversationIdFallback::new("dev", None),
             allow_empty_signature: false,
+            capabilities: None,
         };
         let error = super::plan(&ctx).unwrap_err();
         assert!(error.contains("fix or remove the file"), "{error}");

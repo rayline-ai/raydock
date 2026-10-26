@@ -75,15 +75,21 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   - Decisions go to the signed-in router (`--env`, default `prod`) with model
     `rayline-router`.
   - `local_model` is the local Chat deployment (`registry_model`
-    `qwen/qwen3.8-27b`). Its context window is read from llama.cpp `/props`, or
-    given with `--local-context-window`.
-  - Claude Opus 5.5 and Sonnet 5.5 are exact model pins through the same router.
+    `qwen/qwen3.8-27b`). Its context window is `--local-context-window`, else
+    settings `hybrid.local_context_window`, else 98304 tokens; a llama.cpp
+    runtime loaded with a smaller window (`/props`) lowers it.
+  - Claude Opus 5.5 and Sonnet 5.5 are exact model pins through the same
+    router, each with its 1,000,000-token window.
   - `derived_actions` let the core derive ARC's actions from its embedded
     registry: Qwen's admitted controls, plus the default-base controls of Opus
     and Sonnet.
   - `--cell` selects an isolated development cell.
-  - This profile has no prompt counter, so local capacity facts are unknown; a
-    runtime context refusal still re-consults.
+  - This profile has no prompt counter. An execution core with estimated
+    capacity facts (semantic-router#357) estimates every target's prompt size,
+    hands a turn that does not fit the local window to cloud before the local
+    runtime sees it, and refuses a prompt no target can hold. An older core
+    leaves local capacity unknown, and only a llama.cpp context refusal
+    re-consults.
 - **`--config`:** names a qualified profile instead.
 
 - **Hybrid routing works with no overrides.** For the default profile, a
@@ -180,18 +186,26 @@ Messages; Codex uses Responses. All launches use
 the virtual model `rayline-router` and the local gateway credential. Protocol
 and model capabilities remain the core's responsibility.
 
-Pi's hybrid model advertises the explicit `max_output_tokens` and
-`input_modalities` returned by the core's authenticated health response. The
-core computes shared limits across usable execution deployments; a source used
-only for an explicit selection alias does not advertise execution capabilities.
-Missing or invalid capabilities prevent startup. Pi's `contextWindow` is the
-largest `context_window` among the started profile's cloud deployments that an
-action executes on (200000 for the default profile's Opus and Sonnet), or the
-core's window when there is none or the profile sets `test_alias`. The core reports the smallest window, which is the local
-model's; a turn that outgrows it is handed off to cloud, and Pi 1.1 and later
-cap `max_tokens` by the window that remains, so a local window would starve
-that handoff. Pi's ordinary hosted launcher
-keeps its existing configuration. The hybrid gateway does not reduce a submitted
+Every harness's hybrid configuration advertises the explicit
+`max_output_tokens` and `input_modalities` returned by the core's authenticated
+health response, and a 1,000,000-token context window:
+
+- Pi, omp and OpenClaw: `maxTokens`, `input`, `contextWindow`.
+- OpenCode: `limit.output`, `modalities.input`, `limit.context`.
+- Hermes: `context_length`. Hermes has no output setting and on Messages asks
+  for its model's full ceiling, so its hybrid default provider is the
+  Responses one (`rayline-resp`), where it sends no output cap.
+- Claude Code: `CLAUDE_CODE_MAX_OUTPUT_TOKENS`.
+- Codex: `model_max_output_tokens` and `model_context_window`.
+
+The core computes shared limits across usable execution deployments; a source
+used only for an explicit selection alias does not advertise execution
+capabilities. Missing or invalid capabilities prevent startup. The core
+reports the smallest window, the local model's; the harness is told 1,000,000
+because a turn that outgrows the local window is handed off to cloud, and
+harnesses such as Pi 1.1 cap `max_tokens` by the window that remains, so the
+local window would starve that handoff. The ordinary hosted launchers keep
+their existing configuration. The hybrid gateway does not reduce a submitted
 output allowance: requests outside admitted limits fail visibly in the core.
 
 For an SDK or another harness, read the gateway address from `ready.json` and
@@ -220,7 +234,7 @@ Every start creates a new execution instance and new gateway/core credentials.
 the gateway; it does not restart automatically or route to a substitute target.
 After stopping or losing an instance, start a fresh harness session so its
 transcript and the core's process-local execution evidence have the same lifetime.
-Claude and Pi resume/continue/fork flags and Codex resume/fork commands are rejected by
+Claude, Pi and OpenCode resume/continue/fork/session flags and Codex resume/fork commands are rejected by
 this launcher. A restarted core rejects historical assistant/tool messages for an
 unknown session or branch; restoring a saved session requires its durable hidden
 instruction ledger, which this version does not persist. Existing harnesses also

@@ -32,10 +32,7 @@ use std::ffi::OsString;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, ConfigFile, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext,
-    json_file,
-};
+use super::{CONV_ID_ENV, ConfigFile, Plan, ROUTER_MODEL, RenderContext, json_file};
 
 pub(crate) const CONFIG_FILE: &str = "openclaw.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -171,9 +168,9 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             "id": ROUTER_MODEL,
             "name": format!("Rayline router ({})", ctx.env_name),
             "reasoning": true,
-            "input": ["text", "image"],
-            "contextWindow": CONTEXT_WINDOW,
-            "maxTokens": MAX_OUTPUT_TOKENS,
+            "input": ctx.input_modalities(),
+            "contextWindow": ctx.context_window(),
+            "maxTokens": ctx.max_output_tokens(),
             "compat": compat
         })
     };

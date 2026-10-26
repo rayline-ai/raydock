@@ -3,13 +3,27 @@
 //! opencode's config substitution; the key is written as a literal `apiKey`.
 //!
 //! opencode sends its session id as `x-session-affinity` on its own, which
-//! the gateway keys the episode on; `opencode -c` / `--session` keeps it.
+//! the gateway keys the episode on. Against the hosted router, `opencode -c` /
+//! `--session` keeps that episode; `rayline hybrid run opencode` refuses them,
+//! since a saved session lacks the execution core's private history.
+//!
+//! OpenCode 2 runs its agent in a shared background service (port 49374) that
+//! the CLI attaches to. The service was started with its own environment, so
+//! it never sees this launch's `OPENCODE_CONFIG` and the Rayline provider does
+//! not exist there. [`launch_args`] adds `--standalone` (a private server that
+//! inherits this environment) to the commands that would attach.
+//!
+//! The model entry carries only keys OpenCode 2 reads: it rejects the legacy
+//! `attachment` and `reasoning` flags, and derives image support from
+//! `modalities.input`.
+
+use std::ffi::OsString;
+use std::path::Path;
+use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext, json_file,
-};
+use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, json_file};
 
 pub(crate) const CONFIG_FILE: &str = "opencode.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -38,11 +52,9 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "models": {
                     ROUTER_MODEL: {
                         "name": "Rayline router",
-                        "limit": { "context": CONTEXT_WINDOW, "output": MAX_OUTPUT_TOKENS },
-                        "modalities": { "input": ["text", "image"], "output": ["text"] },
-                        "reasoning": true,
-                        "tool_call": true,
-                        "attachment": true
+                        "limit": { "context": ctx.context_window(), "output": ctx.max_output_tokens() },
+                        "modalities": { "input": ctx.input_modalities(), "output": ["text"] },
+                        "tool_call": true
                     }
                 }
             }
@@ -56,6 +68,106 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         )],
         env_remove: Vec::new(),
     }
+}
+
+/// Subcommands that attach to OpenCode 2's background service and accept
+/// `--standalone`. The bare command (the TUI, optionally given a directory)
+/// does too.
+const ATTACHING_SUBCOMMANDS: &[&str] = &["run", "mini", "models"];
+/// Every other OpenCode subcommand: left untouched.
+const OTHER_SUBCOMMANDS: &[&str] = &[
+    "upgrade",
+    "update",
+    "uninstall",
+    "acp",
+    "api",
+    "debug",
+    "auth",
+    "mcp",
+    "plugin",
+    "stats",
+    "session",
+    "service",
+    "reload",
+    "pair",
+    "serve",
+    "help",
+];
+/// Root flags that take a value.
+const VALUE_FLAGS: &[&str] = &[
+    "--log-level",
+    "--completions",
+    "--prompt",
+    "--session",
+    "-s",
+];
+
+/// The major version `opencode --version` reports (`opencode v2.0.25`), or
+/// None when it cannot be read.
+pub(crate) fn major_version(binary: &Path) -> Option<u64> {
+    let mut command = Command::new(binary);
+    crate::codex::withhold_router_key(&mut command);
+    let output = command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    parse_major(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_major(text: &str) -> Option<u64> {
+    text.split_whitespace()
+        .map(|token| token.trim_start_matches('v'))
+        .find(|token| token.contains('.'))
+        .and_then(|token| token.split('.').next())
+        .and_then(|major| major.parse().ok())
+}
+
+/// The args OpenCode runs with: `--standalone` added where OpenCode 2 would
+/// otherwise attach to its background service (see the module docs). Left
+/// as given for OpenCode 1 or an unknown version, for any other subcommand,
+/// and when the args already pick a server (`--standalone`, `--server`).
+pub(crate) fn launch_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString> {
+    let mut args = args.to_vec();
+    if major_version.is_none_or(|major| major < 2) {
+        return args;
+    }
+    let before_separator = || args.iter().take_while(|arg| *arg != "--");
+    let picks_server = before_separator().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == "--standalone" || arg == "--server" || arg.starts_with("--server=")
+    });
+    if picks_server {
+        return args;
+    }
+    // The first positional word, skipping root flags and their values.
+    let mut index = 0;
+    let mut command = None;
+    while let Some(arg) = args.get(index).map(|arg| arg.to_string_lossy()) {
+        if arg == "--" {
+            break;
+        }
+        if VALUE_FLAGS.contains(&arg.as_ref()) {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        command = Some((index, arg.into_owned()));
+        break;
+    }
+    match command {
+        Some((index, word)) if ATTACHING_SUBCOMMANDS.contains(&word.as_str()) => {
+            args.insert(index + 1, OsString::from("--standalone"));
+        }
+        Some((_, word)) if OTHER_SUBCOMMANDS.contains(&word.as_str()) => {}
+        // The TUI, with or without a directory argument.
+        _ => args.insert(0, OsString::from("--standalone")),
+    }
+    args
 }
 
 #[cfg(test)]
@@ -84,6 +196,67 @@ mod tests {
         let model = &provider["models"]["rayline-router"];
         assert_eq!(model["limit"]["context"], 200000);
         assert_eq!(model["limit"]["output"], 32000);
+        assert_eq!(
+            model["modalities"]["input"],
+            serde_json::json!(["text", "image"])
+        );
         assert_eq!(model["tool_call"], true);
+        // OpenCode 2 rejects these legacy keys.
+        assert!(model.get("attachment").is_none() && model.get("reasoning").is_none());
+    }
+
+    fn strings(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn opencode_2_runs_standalone() {
+        let cases: &[(&[&str], &[&str])] = &[
+            (&[], &["--standalone"]),
+            (&["."], &["--standalone", "."]),
+            (&["run", "hi"], &["run", "--standalone", "hi"]),
+            (
+                &["--log-level", "info", "run", "hi"],
+                &["--log-level", "info", "run", "--standalone", "hi"],
+            ),
+            (&["models"], &["models", "--standalone"]),
+            (&["mini"], &["mini", "--standalone"]),
+            (
+                &["--prompt", "run tests"],
+                &["--standalone", "--prompt", "run tests"],
+            ),
+            // Already picks a server, or a command that never attaches.
+            (
+                &["run", "--standalone", "hi"],
+                &["run", "--standalone", "hi"],
+            ),
+            (
+                &["run", "--server=http://x", "hi"],
+                &["run", "--server=http://x", "hi"],
+            ),
+            (&["auth", "list"], &["auth", "list"]),
+            (&["service", "stop"], &["service", "stop"]),
+        ];
+        for (given, expected) in cases {
+            assert_eq!(
+                launch_args(&strings(given), Some(2)),
+                strings(expected),
+                "{given:?}"
+            );
+        }
+        // OpenCode 1 has no background service; an unknown version is left alone.
+        for version in [Some(1), None] {
+            assert_eq!(
+                launch_args(&strings(&["run", "hi"]), version),
+                strings(&["run", "hi"])
+            );
+        }
+    }
+
+    #[test]
+    fn parses_the_version_banner() {
+        assert_eq!(parse_major("opencode v2.0.25\n"), Some(2));
+        assert_eq!(parse_major("1.14.3"), Some(1));
+        assert_eq!(parse_major("no version"), None);
     }
 }

@@ -15,9 +15,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{
-    CONTEXT_WINDOW, CONV_ID_ENV, MAX_OUTPUT_TOKENS, Plan, ROUTER_MODEL, RenderContext, yaml_file,
-};
+use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, yaml_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 /// First omp that sends `X-Claude-Code-Session-Id` in `auth: apiKey` mode.
@@ -83,9 +81,9 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                     "id": ROUTER_MODEL,
                     "name": format!("Rayline router ({})", ctx.env_name),
                     "reasoning": true,
-                    "input": ["text", "image"],
-                    "contextWindow": CONTEXT_WINDOW,
-                    "maxTokens": MAX_OUTPUT_TOKENS
+                    "input": ctx.input_modalities(),
+                    "contextWindow": ctx.context_window(),
+                    "maxTokens": ctx.max_output_tokens()
                 }]
             }
         }
