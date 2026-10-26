@@ -238,13 +238,15 @@ pub(crate) fn compose(
     if preset.as_deref() == Some(PREFER_LOCAL_PRESET) {
         // Prefer-local excludes a local target whose capacity is unknown, so
         // without a qualified token counter it would never choose local.
-        let counted = profile
+        let locals: Vec<&Value> = profile
             .get("deployments")
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
             .filter(|deployment| deployment.get("kind").and_then(Value::as_str) == Some("local"))
-            .all(|deployment| {
+            .collect();
+        let counted = !locals.is_empty()
+            && locals.iter().all(|deployment| {
                 deployment
                     .get("prompt_counter")
                     .is_some_and(Value::is_object)
@@ -546,8 +548,8 @@ pub(crate) struct LocalRuntime {
 /// its capacity counts use Qwen3.8-27B's own tokenizer and chat template.
 #[derive(Debug, PartialEq)]
 pub(crate) enum LocalIdentity {
-    /// The runtime names Qwen3.8-27B; the string is what it reported.
-    Match(String),
+    /// The runtime names Qwen3.8-27B.
+    Match,
     /// The runtime names another model; local routing is refused.
     Mismatch(String),
     /// The runtime does not say what it serves (not llama.cpp or Ollama).
@@ -564,7 +566,7 @@ impl LocalIdentity {
     /// What `rayline hybrid start` tells the user, if anything.
     pub(crate) fn start_message(&self, base_url: &str) -> Option<String> {
         match self {
-            Self::Match(_) => None,
+            Self::Match => None,
             Self::Mismatch(reported) => Some(format!(
                 "Error: the local runtime at {base_url} serves {reported}, not {LOCAL_MODEL_NAME}. Local routing is off for this session: every turn goes to cloud. Serve {LOCAL_MODEL_NAME} (Ollama `qwen3.8:27b`, or a Qwen3.8-27B GGUF in llama.cpp), then run `rayline hybrid start` again."
             )),
@@ -623,72 +625,114 @@ pub(crate) async fn read_local_runtime(
     }
 }
 
-/// The served model's name, normalized: lower case, letters and digits only.
-fn names_local_model(name: &str) -> bool {
-    let normalized: String = name
-        .chars()
+/// A reported name, lower case, letters and digits only.
+fn normalized(name: &str) -> String {
+    name.chars()
         .filter(char::is_ascii_alphanumeric)
         .map(|char| char.to_ascii_lowercase())
-        .collect();
-    normalized.contains(LOCAL_MODEL_KEY)
+        .collect()
 }
 
-/// [`LOCAL_MODEL_NAME`] normalized as [`names_local_model`] reads names.
-const LOCAL_MODEL_KEY: &str = "qwen3827b";
+/// [`LOCAL_MODEL_NAME`] as [`normalized`] spells it, and the `28B` a
+/// converter may compute from its 27.8B parameters (no Qwen3.8-28B exists).
+const LOCAL_MODEL_KEYS: &[&str] = &["qwen3827b", "qwen3828b"];
+/// Model families whose name in a file or GGUF identifies *a* model: such a
+/// name without [`LOCAL_MODEL_KEYS`] is another model. A name with none of
+/// them (`model.gguf`, `ggml-model-Q4_K_M.gguf`) identifies nothing.
+const MODEL_FAMILIES: &[&str] = &[
+    "qwen",
+    "llama",
+    "gemma",
+    "mistral",
+    "mixtral",
+    "ministral",
+    "devstral",
+    "codestral",
+    "phi",
+    "deepseek",
+    "glm",
+    "gpt",
+    "granite",
+    "kimi",
+    "minimax",
+    "olmo",
+    "smollm",
+    "falcon",
+    "nemotron",
+    "hermes",
+    "starcoder",
+    "exaone",
+    "internlm",
+    "baichuan",
+];
 /// The model the default profile is built for (Hugging Face `Qwen/Qwen3.8-27B`,
 /// 27.8B parameters with its vision encoder; Ollama `qwen3.8:27b`).
 pub(crate) const LOCAL_MODEL_NAME: &str = "Qwen3.8-27B";
 
+/// What one reported name says: Qwen3.8-27B, another model, or nothing.
+fn name_identity(name: &str, reported: &str) -> LocalIdentity {
+    let name = normalized(name);
+    if LOCAL_MODEL_KEYS.iter().any(|key| name.contains(key)) {
+        LocalIdentity::Match
+    } else if MODEL_FAMILIES.iter().any(|family| name.contains(family)) {
+        LocalIdentity::Mismatch(reported.to_owned())
+    } else {
+        LocalIdentity::Unknown
+    }
+}
+
 /// llama.cpp names its loaded model by file: `/props` `model_path`, whose
-/// file or folder name carries the model's name for every published GGUF
-/// (`Qwen3.8-27B-UD-Q4_K_M.gguf`, `unsloth_Qwen3.8-27B-GGUF_…`). The
-/// `--alias` it may report instead is the user's label, not evidence.
+/// file name carries the model's name for every published GGUF
+/// (`Qwen3.8-27B-UD-Q4_K_M.gguf`, `unsloth_Qwen3.8-27B-GGUF_…`). The file
+/// name decides when it names a model; else its folder's name does. The
+/// `--alias` llama.cpp may report instead is the user's label, not evidence.
 fn llamacpp_identity(props: &Value) -> LocalIdentity {
-    let Some(path) = props
+    let Some(reported) = props
         .get("model_path")
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
     else {
         return LocalIdentity::Unknown;
     };
-    let path = Path::new(path);
-    let named = [path.file_name(), path.parent().and_then(Path::file_name)]
+    let path = Path::new(reported);
+    [path.file_name(), path.parent().and_then(Path::file_name)]
         .into_iter()
         .flatten()
-        .any(|name| names_local_model(&name.to_string_lossy()));
-    let reported = path.to_string_lossy().into_owned();
-    if named {
-        LocalIdentity::Match(reported)
-    } else {
-        LocalIdentity::Mismatch(reported)
-    }
+        .map(|name| name_identity(&name.to_string_lossy(), reported))
+        .find(|identity| *identity != LocalIdentity::Unknown)
+        .unwrap_or(LocalIdentity::Unknown)
 }
 
 /// Ollama reports the loaded GGUF's own metadata: `general.basename` with
 /// `general.size_label` (`Qwen3.8` + `27B` in `qwen3.8:27b`), or
-/// `general.name`.
+/// `general.name`. Either naming Qwen3.8-27B is a match.
 fn ollama_identity(show: &Value) -> LocalIdentity {
     let Some(info) = show.get("model_info").and_then(Value::as_object) else {
         return LocalIdentity::Unknown;
     };
     let field = |key: &str| info.get(key).and_then(Value::as_str).unwrap_or_default();
     let basename = format!(
-        "{}-{}",
+        "{} {}",
         field("general.basename"),
         field("general.size_label")
     );
     let name = field("general.name");
-    if names_local_model(&basename) || names_local_model(name) {
-        return LocalIdentity::Match(basename);
-    }
-    let reported = [name, basename.trim_matches('-')]
-        .into_iter()
-        .find(|value| !value.is_empty())
-        .unwrap_or_default();
-    if reported.is_empty() {
-        LocalIdentity::Unknown
+    let reported = if name.is_empty() {
+        basename.trim()
     } else {
-        LocalIdentity::Mismatch(reported.to_owned())
+        name
+    };
+    let verdicts = [
+        name_identity(&basename, reported),
+        name_identity(name, reported),
+    ];
+    if verdicts.contains(&LocalIdentity::Match) {
+        LocalIdentity::Match
+    } else {
+        verdicts
+            .into_iter()
+            .find(|identity| *identity != LocalIdentity::Unknown)
+            .unwrap_or(LocalIdentity::Unknown)
     }
 }
 
@@ -1581,7 +1625,7 @@ mod tests {
             let url = runtime_stub(props(path), None).await;
             let runtime = read_local_runtime(&client, &url, "qwen3.8-27b").await;
             assert_eq!(runtime.window, Some(98304));
-            assert_eq!(runtime.identity, LocalIdentity::Match(path.to_owned()));
+            assert_eq!(runtime.identity, LocalIdentity::Match, "{path}");
             assert!(!runtime.identity.refuses_local());
         }
         // The alias names Qwen3.8 but the file is Qwen3.6: the alias is the
@@ -1598,7 +1642,20 @@ mod tests {
             message.contains("Qwen3.6-27B-Q4_K_M.gguf")
                 && message.contains("every turn goes to cloud")
         );
-        // No path reported: unknown, not a mismatch.
+        // The file name decides over its folder's name.
+        let url = runtime_stub(props("/models/qwen3.8-27b/Qwen3.6-27B-Q4_K_M.gguf"), None).await;
+        let runtime = read_local_runtime(&client, &url, "qwen3.8-27b").await;
+        assert!(runtime.identity.refuses_local());
+        // A name that identifies no model is unknown, not a mismatch.
+        for path in [
+            "/models/ggml-model-Q4_K_M.gguf",
+            "/hf/snapshots/abc123/model.gguf",
+        ] {
+            let url = runtime_stub(props(path), None).await;
+            let runtime = read_local_runtime(&client, &url, "qwen3.8-27b").await;
+            assert_eq!(runtime.identity, LocalIdentity::Unknown, "{path}");
+        }
+        // No path reported: unknown.
         let url = runtime_stub(Some(json!({"n_ctx": 4096})), None).await;
         let runtime = read_local_runtime(&client, &url, "m").await;
         assert_eq!(
@@ -1617,14 +1674,13 @@ mod tests {
         for info in [
             json!({"general.basename": "Qwen3.8", "general.size_label": "27B", "general.name": "Qwen3.8 27B 0814"}),
             json!({"general.basename": "Qwen3.8-27B", "general.size_label": "27B", "general.name": "Qwen3.8-27B"}),
+            // A local conversion whose size label rounds 27.8B up.
+            json!({"general.basename": "Qwen3.8", "general.size_label": "28B", "general.name": "Model"}),
         ] {
             let url = runtime_stub(None, Some(json!({"model_info": info}))).await;
             let runtime = read_local_runtime(&client, &url, "qwen3.8:27b").await;
             assert_eq!(runtime.window, None);
-            assert!(
-                matches!(runtime.identity, LocalIdentity::Match(_)),
-                "{runtime:?}"
-            );
+            assert!(runtime.identity == LocalIdentity::Match, "{runtime:?}");
         }
         let qwen36 = json!({"model_info": {"general.basename": "Qwen3.6", "general.size_label": "27B", "general.name": "Qwen3.6 27B"}});
         let url = runtime_stub(None, Some(qwen36)).await;
@@ -1633,6 +1689,11 @@ mod tests {
             runtime.identity,
             LocalIdentity::Mismatch("Qwen3.6 27B".to_owned())
         );
+        // Metadata that names no model family is unknown.
+        let unnamed = json!({"model_info": {"general.name": "Model", "general.basename": "Model"}});
+        let url = runtime_stub(None, Some(unnamed)).await;
+        let runtime = read_local_runtime(&client, &url, "my-model").await;
+        assert_eq!(runtime.identity, LocalIdentity::Unknown);
         // A runtime that reports neither (LM Studio, MLX, vLLM): unknown, and
         // local routing stays on with a warning.
         let url = runtime_stub(None, None).await;
@@ -1649,23 +1710,26 @@ mod tests {
     }
 
     #[test]
-    fn local_model_names_are_matched_exactly_enough() {
+    fn reported_names_match_mismatch_or_say_nothing() {
         for name in [
             "Qwen3.8-27B",
             "qwen3.8:27b",
             "Qwen3.8-27B-FP8",
             "qwen38-27b",
         ] {
-            assert!(names_local_model(name), "{name}");
+            assert_eq!(name_identity(name, name), LocalIdentity::Match, "{name}");
         }
         for name in [
             "Qwen3.6-27B",
             "qwen3.8-270b",
             "Qwen3.8-2.4T-A95B",
-            "qwen3.5-9b",
-            "",
+            "Llama-3.3-70B",
+            "gemma-4-31b",
         ] {
-            assert!(!names_local_model(name), "{name}");
+            assert!(name_identity(name, name).refuses_local(), "{name}");
+        }
+        for name in ["model.gguf", "ggml-model-Q4_K_M.gguf", "local", ""] {
+            assert_eq!(name_identity(name, name), LocalIdentity::Unknown, "{name}");
         }
     }
 
@@ -1710,6 +1774,27 @@ mod tests {
             config["decisions"]["routing"]["prices"]
                 .get(LOCAL_REGISTRY_MODEL)
                 .is_some()
+        );
+        // prefer_local still needs a counted local deployment; none is left.
+        let mut cloud_only = default_profile(
+            "https://r.example",
+            "http://127.0.0.1:1/v1",
+            "llama3",
+            98304,
+            None,
+            None,
+        )
+        .unwrap();
+        without_local(&mut cloud_only);
+        let prefer_local = settings(Some(json!({"policy": "prefer_local"})));
+        assert!(
+            compose(
+                cloud_only,
+                Some(&prefer_local),
+                Path::new("/state"),
+                ProfileOrigin::Default
+            )
+            .is_err()
         );
     }
 }

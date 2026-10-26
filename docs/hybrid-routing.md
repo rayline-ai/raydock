@@ -80,13 +80,15 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     runtime loaded with a smaller window (`/props`) lowers it.
   - The local model must be Qwen3.8-27B (Hugging Face `Qwen/Qwen3.8-27B`,
     Ollama `qwen3.8:27b`): its capacity count uses that model's tokenizer and
-    chat template. `start` reads what the runtime has loaded in the same
-    request that reads its window: llama.cpp's `/props` `model_path` (file or
-    folder name), else Ollama's `/api/show` GGUF metadata (`general.basename`
-    and `general.size_label`, or `general.name`). A runtime serving another
-    model is refused for local routing: `start` prints an error and the
-    session runs cloud only. A runtime that reports neither (LM Studio, MLX,
-    vLLM) is assumed to serve Qwen3.8-27B, with a warning. A llama.cpp
+    chat template. `start` reads what the runtime has loaded: llama.cpp's
+    `/props` `model_path` (the same request that reads its window; the file
+    name, else its folder's name), else Ollama's `/api/show` GGUF metadata
+    (`general.basename` and `general.size_label`, or `general.name`). A name
+    that identifies another model is refused for local routing: `start`
+    prints an error and the session runs cloud only. A runtime that reports
+    no model name, or a name that identifies no model (`model.gguf`), is
+    assumed to serve Qwen3.8-27B, with a warning (LM Studio, MLX and vLLM
+    report none). A llama.cpp
     `--alias` or the configured model name is not evidence, since runtimes
     echo it back.
   - Claude Opus 5.5 and Sonnet 5.5 are exact model pins through the same
