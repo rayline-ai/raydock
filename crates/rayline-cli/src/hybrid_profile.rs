@@ -435,6 +435,66 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
     Some((base_url, field("model")?))
 }
 
+/// The context window a harness should budget against: the largest window of
+/// the composed config's executable cloud deployments, or `core_window` when
+/// that is larger or no cloud deployment is executable (an all-local profile).
+///
+/// The core advertises the smallest window across its deployments. A turn that
+/// overflows the local window is handed off to cloud (capacity handoff), so a
+/// harness that sizes requests from its window (pi 1.1 clamps `max_tokens` to
+/// what is left of it) must see the window that handoff can reach.
+///
+/// A deployment counts only when a `bindings` or `derived_actions` entry
+/// names it, as the core admits targets from actions. `core_window` is kept
+/// when the cloud window cannot be established: a profile with a
+/// `test_alias` (its alias source is selection-only and a binding does not say
+/// which model it serves), or a key Go's case-insensitive decoder could read
+/// differently from this exact lookup.
+pub(crate) fn reachable_context_window(config: &Value, core_window: u64) -> u64 {
+    reachable_cloud_window(config).map_or(core_window, |window| window.max(core_window))
+}
+
+fn reachable_cloud_window(config: &Value) -> Option<u64> {
+    if go_field(config, "test_alias")?.is_some_and(|alias| !alias.is_null()) {
+        return None;
+    }
+    let list = |name: &str| {
+        go_field(config, name).map(|value| {
+            value
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
+        })
+    };
+    let mut executable = Vec::new();
+    for action in list("bindings")?.iter().chain(list("derived_actions")?) {
+        if let Some(id) = go_field(action, "deployment_id")?.and_then(Value::as_str) {
+            executable.push(id);
+        }
+    }
+    let mut window = 0;
+    for deployment in list("deployments")? {
+        let kind = go_field(deployment, "kind")?.and_then(Value::as_str);
+        let id = go_field(deployment, "id")?.and_then(Value::as_str);
+        let context = go_field(deployment, "context_window")?.and_then(Value::as_u64);
+        if kind == Some("cloud")
+            && id.is_some_and(|id| executable.contains(&id))
+            && let Some(context) = context
+        {
+            window = window.max(context);
+        }
+    }
+    Some(window)
+}
+
+/// `value[name]` as the Go core reads it; None when another key would also
+/// match `name` in Go.
+fn go_field<'v>(value: &'v Value, name: &str) -> Option<Option<&'v Value>> {
+    match value.as_object() {
+        Some(map) => rayline_local_router::decisions_url::exact_field(map, name).ok(),
+        None => Some(None),
+    }
+}
+
 /// The default package-less profile: local Qwen from `local_model`, Opus and
 /// Sonnet through the signed-in router (exact model pins), decisions from the
 /// router's `rayline-router` model with the hybrid default preset applied by
@@ -611,15 +671,38 @@ pub(crate) fn saved_credentials(
 
 /// The HTTPS origin authority (host and effective port) of an endpoint.
 fn https_host(url: &str) -> Option<String> {
-    let url = reqwest::Url::parse(url).ok()?;
-    if url.scheme() != "https" {
-        return None;
+    rayline_local_router::decisions_url::https_authority(url)
+}
+
+/// Router URLs of every configured Rayline environment: the built-in `prod`
+/// plus each valid `environments` entry in settings.json.
+pub(crate) fn configured_router_urls(home: &Path) -> Vec<String> {
+    let mut names = vec![crate::status::PROD_ENV.to_owned()];
+    if let Some(configured) = crate::status::read_settings(home)
+        .as_ref()
+        .and_then(|settings| settings.get("environments"))
+        .and_then(Value::as_object)
+    {
+        names.extend(configured.keys().cloned());
     }
-    Some(format!(
-        "{}:{}",
-        url.host_str()?.to_ascii_lowercase(),
-        url.port_or_known_default()?
-    ))
+    names
+        .iter()
+        .filter_map(|name| crate::status::resolve_hosted_environment(name, Some(home)).ok())
+        // Only the origin: a router URL's path, query or userinfo never
+        // reaches `rld`'s arguments, and one with credentials is dropped.
+        .filter_map(|hosted| https_host(&hosted.router_url))
+        .map(|authority| format!("https://{authority}"))
+        .collect()
+}
+
+/// Refuse a configuration whose `decisions.url` is not a Rayline router of a
+/// configured environment (HTTPS, exact host and port) or a loopback address.
+/// `rld` repeats this check on the file it hands the core.
+pub(crate) fn check_decisions_url(config: &Value, router_urls: &[String]) -> Result<(), String> {
+    rayline_local_router::decisions_url::check_config(
+        config,
+        router_urls.iter().map(String::as_str),
+    )
 }
 
 #[cfg(test)]
@@ -687,6 +770,59 @@ mod tests {
         assert_eq!(decisions["routing"]["value_usd"], 0.1);
         assert_eq!(decisions["result"], "custom");
         assert_eq!(composed.policy, PolicySource::Settings);
+    }
+
+    #[test]
+    fn reachable_context_window_is_the_cloud_window_when_cloud_is_configured() {
+        let mixed = default_profile(
+            "https://api-dev.rayline.ai",
+            "http://127.0.0.1:11434/v1",
+            "qwen3.8:27b",
+            16384,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reachable_context_window(&mixed, 16384), 200_000);
+        // All-local: the core's (local) window stays.
+        let local_only = json!({"deployments": [
+            {"id": "local", "kind": "local", "context_window": 16384},
+            {"id": "local-2", "kind": "local", "context_window": 32768}
+        ]});
+        assert_eq!(reachable_context_window(&local_only, 16384), 16384);
+        // A package profile without inline deployments keeps the core's window.
+        assert_eq!(reachable_context_window(&json!({}), 16384), 16384);
+        // A smaller cloud window never lowers the core's.
+        let small_cloud = json!({
+            "deployments": [{"id": "c", "kind": "cloud", "context_window": 8192}],
+            "bindings": [{"action_id": "a", "worker": "w", "deployment_id": "c"}]
+        });
+        assert_eq!(reachable_context_window(&small_cloud, 16384), 16384);
+        // A cloud deployment no action executes on does not count.
+        let mut unbound = mixed.clone();
+        unbound["derived_actions"] = json!([
+            {"model": "qwen3.8-27b", "worker": "qwen3.8-27b", "deployment_id": "local"}
+        ]);
+        assert_eq!(reachable_context_window(&unbound, 16384), 16384);
+        // Package profiles bind actions to deployments with `bindings`.
+        let mut bound = unbound.clone();
+        bound["bindings"] =
+            json!([{"action_id": "x", "worker": "w", "deployment_id": "cloud-sonnet"}]);
+        assert_eq!(reachable_context_window(&bound, 16384), 200_000);
+        // A test alias's source is selection-only: keep the core's window.
+        let mut aliased = mixed.clone();
+        aliased["test_alias"] =
+            json!({"selected_model": "claude-opus-5.5", "execution_action_id": "local"});
+        assert_eq!(reachable_context_window(&aliased, 16384), 16384);
+        // Go reads keys case-insensitively: an alias it would see keeps the
+        // core's window, as does any key Go could read differently.
+        let mut folded = mixed.clone();
+        folded["TEST_ALIAS"] =
+            json!({"selected_model": "claude-opus-5.5", "execution_action_id": "local"});
+        assert_eq!(reachable_context_window(&folded, 16384), 16384);
+        let mut shadowed = mixed.clone();
+        shadowed["derived_actions"][2]["Deployment_ID"] = json!("local");
+        assert_eq!(reachable_context_window(&shadowed, 16384), 16384);
     }
 
     #[test]
@@ -1198,6 +1334,53 @@ mod tests {
         let mut port = profile();
         port["deployments"][1]["url"] = json!("https://api-dev.rayline.ai:8443/v1/messages");
         assert!(saved_credentials(&port, &home, unset).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn decisions_go_only_to_a_configured_router_or_loopback() {
+        let home =
+            std::env::temp_dir().join(format!("rayline-hybrid-decisions-{}", std::process::id()));
+        let config_dir = home.join(".config").join(crate::CONFIG_DIR);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"environments":{"stage":{"router_url":"https://router.stage.example:8443","cli_auth_url":"https://stage.example/cli-auth"}}}"#,
+        )
+        .unwrap();
+        let routers = configured_router_urls(&home);
+        assert_eq!(
+            routers,
+            vec![
+                "https://api.rayline.ai:443".to_owned(),
+                "https://router.stage.example:8443".to_owned()
+            ]
+        );
+        // The default profile is built on the selected environment's router.
+        for router in [
+            "https://api.rayline.ai",
+            "https://router.stage.example:8443",
+        ] {
+            let profile =
+                default_profile(router, "http://127.0.0.1:1", "q", 16384, None, None).unwrap();
+            check_decisions_url(&profile, &routers).unwrap();
+        }
+        // A profile file is held to the same allowlist.
+        let mut custom = profile();
+        check_decisions_url(&custom, &routers).unwrap();
+        custom["decisions"]["url"] = json!("http://127.0.0.1:9/decisions");
+        check_decisions_url(&custom, &routers).unwrap();
+        for url in [
+            json!("https://rayline--decisions.modal.run/v1/routes"),
+            json!("https://router.stage.example/v1/routes"),
+            json!("https://user@api.rayline.ai/v1/routes"),
+            json!(42),
+        ] {
+            custom["decisions"]["url"] = url.clone();
+            assert!(check_decisions_url(&custom, &routers).is_err(), "{url}");
+        }
+        custom["decisions"].as_object_mut().unwrap().remove("url");
+        assert!(check_decisions_url(&custom, &routers).is_err());
         let _ = std::fs::remove_dir_all(&home);
     }
 }

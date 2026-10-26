@@ -164,6 +164,8 @@ mod tests {
 
     #[test]
     fn hybrid_model_advertises_only_qualified_capabilities() {
+        // `rayline hybrid run` passes the window capacity handoff can reach
+        // (the cloud window), not the core's smallest one.
         let dir = super::super::tests::temp_dir("pi-hybrid-capabilities");
         let ctx = super::super::RenderContext {
             env_name: "hybrid",
@@ -177,7 +179,7 @@ mod tests {
             allow_empty_signature: true,
         };
         let capabilities = rayline_local_router::ModelCapabilities {
-            context_window: 16384,
+            context_window: 200_000,
             max_output_tokens: 2048,
             input_modalities: vec!["text".into()],
         };
@@ -186,7 +188,7 @@ mod tests {
         let models: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("models.json")).unwrap()).unwrap();
         let model = &models["providers"]["rayline"]["models"][0];
-        assert_eq!(model["contextWindow"], 16384);
+        assert_eq!(model["contextWindow"], 200_000);
         assert_eq!(model["maxTokens"], 2048);
         assert_eq!(model["input"], serde_json::json!(["text"]));
         assert_eq!(

@@ -36,6 +36,23 @@ impl Runtime {
         deadline: u64,
         capabilities: Option<Value>,
     ) -> Self {
+        Self::start_with_decisions(
+            version,
+            delay,
+            deadline,
+            capabilities,
+            "http://127.0.0.1:9/decisions",
+            "",
+        )
+    }
+    fn start_with_decisions(
+        version: u32,
+        delay: u64,
+        deadline: u64,
+        capabilities: Option<Value>,
+        decisions_url: &str,
+        raw_members: &str,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "rayline-hybrid-{}-{:x}",
             std::process::id(),
@@ -47,11 +64,18 @@ impl Runtime {
         fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
         let mut config = json!({"events":dir.join("events.jsonl"),
             "cancelled":dir.join("cancelled"), "contract_version":version,
-            "handshake_delay":delay});
+            "handshake_delay":delay, "decisions": {"url": decisions_url}});
         if let Some(capabilities) = capabilities {
             config["capabilities"] = capabilities;
         }
-        fs::write(dir.join("config.json"), config.to_string()).unwrap();
+        // Extra members as raw JSON text, for keys serde_json cannot build.
+        let mut text = config.to_string();
+        if !raw_members.is_empty() {
+            text.pop();
+            text.push_str(raw_members);
+            text.push('}');
+        }
+        fs::write(dir.join("config.json"), text).unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_rld"))
             .arg("hybrid")
             .arg("--core")
@@ -219,6 +243,40 @@ async fn incompatible_core_never_becomes_ready_and_is_reaped() {
     runtime.core_exited().await;
     assert!(!runtime.dir.join("ready.json").exists());
     assert!(!runtime.dir.join("token").exists());
+}
+
+#[tokio::test]
+async fn non_router_decisions_url_never_starts_the_core() {
+    // A hand-edited core configuration cannot send decisions (and the router
+    // key) to a non-router host: rld refuses before spawning the core.
+    for url in [
+        "https://rayline--decisions.modal.run/v1/routes",
+        "https://api.rayline.ai:8443/v1/routes",
+        "https://evil.test@api.rayline.ai/v1/routes",
+        "http://api.rayline.ai/v1/routes",
+    ] {
+        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, "");
+        assert!(!runtime.exited().await.success(), "{url}");
+        assert!(!runtime.dir.join("config.pid").exists(), "{url}");
+        assert!(!runtime.dir.join("ready.json").exists());
+        assert!(!runtime.dir.join("token").exists());
+    }
+    // A key Go folds onto `decisions`, or a duplicate key Go would merge,
+    // cannot replace the checked URL.
+    for (url, raw) in [
+        (
+            "https://api.rayline.ai/v1/routes",
+            r#","deci\u017fions":{"url":"https://evil.test/v1/routes"}"#,
+        ),
+        (
+            "https://evil.test/v1/routes",
+            r#","decisions":{"url":"https://api.rayline.ai/v1/routes"}"#,
+        ),
+    ] {
+        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, raw);
+        assert!(!runtime.exited().await.success(), "{raw}");
+        assert!(!runtime.dir.join("config.pid").exists(), "{raw}");
+    }
 }
 
 #[tokio::test]
