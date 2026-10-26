@@ -3,7 +3,7 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline/releases).
 
-## 0.2.13 (unreleased)
+## 0.2.13 (2026-10-26)
 
 ### New
 
@@ -70,7 +70,9 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline
 
 Hybrid issues are tracked in [#123](https://github.com/rayline-ai/rayline/issues/123).
 
-- Only Pi receives the local model's limits in `rayline hybrid run`. Other
+- In `rayline hybrid run`, Pi gets the local model's output and input limits,
+  and the largest cloud context window (200,000 tokens with the default
+  profile), so turns that outgrow the local model hand off to cloud. Other
   harnesses keep their usual limits and may send requests the core rejects.
 - Ctrl-C during `rayline hybrid start` can leave the runtime running. Run
   `rayline hybrid stop` once it is ready; if it never gets ready, stop the
