@@ -483,10 +483,12 @@ async fn probe_decisions(
     ) else {
         return Ok(());
     };
-    let key = credentials
+    let saved = credentials
         .iter()
         .find(|(name, _)| name == auth_env)
-        .map(|(_, key)| key.clone())
+        .map(|(_, key)| key.clone());
+    let from_environment = saved.is_none();
+    let key = saved
         .or_else(|| std::env::var(auth_env).ok().filter(|key| !key.is_empty()))
         .ok_or_else(|| {
             io::Error::other(format!(
@@ -521,8 +523,13 @@ async fn probe_decisions(
         match probe_verdict(outcome.as_ref().copied().map_err(|_| ())) {
             ProbeVerdict::Ready => return Ok(()),
             ProbeVerdict::KeyRefused(status) => {
+                let fix = if from_environment {
+                    format!("Check or unset {auth_env}, which overrides the saved key")
+                } else {
+                    format!("Run `rayline --env {env} auth login`")
+                };
                 return Err(io::Error::other(format!(
-                    "Decisions at {url} refused the Rayline key (HTTP {status}). Run `rayline --env {env} auth login`, then `rayline hybrid start` again."
+                    "Decisions at {url} refused the Rayline key (HTTP {status}). {fix}, then `rayline hybrid start` again."
                 )));
             }
             ProbeVerdict::Rejected(status) => {
