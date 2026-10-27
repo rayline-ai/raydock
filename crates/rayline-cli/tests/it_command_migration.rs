@@ -164,3 +164,117 @@ fn failed_migration_preserves_legacy_payload_and_explains_repair() {
     );
     assert!(install.binary("raydock").is_dir());
 }
+
+#[test]
+fn installer_hard_link_migrates_to_a_forwarding_alias() {
+    let install = Installation::new();
+    place_payload(&install.binary("raydock"));
+    fs::hard_link(install.binary("raydock"), install.binary("rayline"))
+        .expect("installer hard link");
+    let result = install.run("rayline", &["--version"]);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("Rayline Local is now"));
+    let direct = install.run("raydock", &["--version"]);
+    let alias = install.run("rayline", &["--version"]);
+    assert_eq!(direct.stdout, alias.stdout);
+    assert_eq!(direct.stderr, alias.stderr);
+    assert_eq!(direct.status.code(), alias.status.code());
+}
+
+#[test]
+fn installed_alias_inherits_stdin_and_propagates_exit_status() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let install = Installation::new();
+    place_payload(&install.binary("rayline"));
+    assert!(install.run("rayline", &["--version"]).status.success());
+    // Exercise the installed alias against a real child that consumes stdin.
+    let source = install.0.join("stdin_probe.rs");
+    fs::write(
+        &source,
+        r#"
+        use std::io::{Read, Write};
+        fn main() {
+            let mut bytes = Vec::new();
+            std::io::stdin().read_to_end(&mut bytes).unwrap();
+            std::io::stdout().write_all(&bytes).unwrap();
+            eprintln!("child stderr");
+            std::process::exit(37);
+        }
+    "#,
+    )
+    .expect("stdin probe source");
+    let build = Command::new("rustc")
+        .args(["--edition=2021", "--crate-name", "stdin_probe"])
+        .arg(&source)
+        .arg("-o")
+        .arg(install.binary("raydock"))
+        .output()
+        .expect("compile stdin probe");
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let mut child = Command::new(install.binary("rayline"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("run alias");
+    let input = "stdin with spaces, λ, and a second line\nnext line\n";
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .expect("write stdin");
+    let result = child.wait_with_output().expect("wait for alias");
+    assert_eq!(result.stdout, input.as_bytes());
+    assert_eq!(
+        String::from_utf8_lossy(&result.stderr).trim(),
+        "child stderr"
+    );
+    assert_eq!(result.status.code(), Some(37));
+}
+
+#[cfg(unix)]
+#[test]
+fn concurrent_first_invocations_converge_on_the_same_command() {
+    use std::process::Stdio;
+
+    let install = Installation::new();
+    place_payload(&install.binary("rayline"));
+    let children: Vec<_> = (0..16)
+        .map(|_| {
+            Command::new(install.binary("rayline"))
+                .arg("--version")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start concurrent command")
+        })
+        .collect();
+    let results: Vec<_> = children
+        .into_iter()
+        .map(|child| child.wait_with_output().expect("wait for command"))
+        .collect();
+    let expected = install.run("raydock", &["--version"]);
+    for result in results {
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, expected.stdout);
+    }
+    assert_eq!(
+        fs::read_link(install.binary("rayline")).unwrap(),
+        Path::new("raydock")
+    );
+}

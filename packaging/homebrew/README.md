@@ -1,6 +1,14 @@
 # Homebrew Packaging
 
-The release workflow creates platform archives for the Homebrew formula:
+Production Homebrew publishing is owned by `atlasfutures/memex-desktop`:
+its `backend/workshop-cli/homebrew/raydock.rb.template` installs the flat
+`homebrew/` archives produced by that repo's release workflow.
+
+This directory's template is for the manual fallback workflow in this repo,
+whose archives have the layout below. Do not render it against production's
+flat archives or substitute one archive layout for the other.
+
+The fallback workflow creates platform archives:
 
 - `rayline-<version>-macosx_11_0_arm64.tar.gz`
 - `rayline-<version>-macosx_10_12_x86_64.tar.gz`

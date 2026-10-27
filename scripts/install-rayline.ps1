@@ -11,6 +11,27 @@ function Fail($Message) {
     exit 1
 }
 
+function Remove-RetiredBackup($Path) {
+    try {
+        Remove-Item -LiteralPath $Path -Force
+    } catch {
+        if ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) { return }
+        $Code = $_.Exception.HResult -band 0xffff
+        if ($Code -in @(5, 32, 33)) {
+            Write-Warning "Retained old executable ${Path}: $($_.Exception.Message). Close older Raydock sessions; a later run will retry cleanup."
+        } else { throw }
+    }
+}
+
+function Remove-RetiredBackups($Directory) {
+    # These names are assigned only after a replacement succeeds. Never sweep
+    # .tmp files: another installer/updater may still need them for rollback.
+    $Pattern = '^\.(raydock\.exe|rayline\.exe|rld\.exe|rayline-core\.exe|rayline-core-LICENSE)\.old-[0-9]+-[0-9a-f]+$'
+    Get-ChildItem -LiteralPath $Directory -File -Force | Where-Object { $_.Name -match $Pattern } | ForEach-Object {
+        Remove-RetiredBackup $_.FullName
+    }
+}
+
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 switch ($arch) {
     "X64" { $Platform = "windows_x86_64" }
@@ -65,15 +86,33 @@ try {
     }
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    Remove-RetiredBackups $InstallDir
     Copy-Item -Force $LicensePath (Join-Path $InstallDir "rayline-core-LICENSE")
     Copy-Item -Force $RaylinePath (Join-Path $InstallDir "raydock.exe")
     $alias = Join-Path $InstallDir 'rayline.exe'
+    $AliasBackup = $null
+    $AliasNonce = [Guid]::NewGuid().ToString('N')
     if (Test-Path -LiteralPath $alias) {
-        Move-Item -LiteralPath $alias -Destination "$alias.old-$([Guid]::NewGuid().ToString('N'))"
+        $AliasBackup = Join-Path $InstallDir ".rayline.exe.tmp-$PID-$AliasNonce"
+        Move-Item -LiteralPath $alias -Destination $AliasBackup
     }
     # Hard links need no administrator or Developer Mode privileges. The new
     # launcher turns this initial alias into a forwarding EXE on first use.
-    New-Item -ItemType HardLink -Path $alias -Target (Join-Path $InstallDir 'raydock.exe') | Out-Null
+    try {
+        New-Item -ItemType HardLink -Path $alias -Target (Join-Path $InstallDir 'raydock.exe') | Out-Null
+    } catch {
+        $InstallError = $_
+        if ($AliasBackup) {
+            try { Move-Item -LiteralPath $AliasBackup -Destination $alias }
+            catch { throw "Failed to install alias: $InstallError. Restore also failed: $_. Original preserved at $AliasBackup" }
+        }
+        throw $InstallError
+    }
+    if ($AliasBackup) {
+        $Retired = Join-Path $InstallDir ".rayline.exe.old-$PID-$AliasNonce"
+        Move-Item -LiteralPath $AliasBackup -Destination $Retired
+        Remove-RetiredBackup $Retired
+    }
     Copy-Item -Force $DaemonPath (Join-Path $InstallDir "rld.exe")
     Copy-Item -Force $CorePath (Join-Path $InstallDir "rayline-core.exe")
 

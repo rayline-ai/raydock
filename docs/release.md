@@ -4,6 +4,13 @@ Raydock releases are binary-first. The Rust workspace is not published to
 crates.io yet; all crates are marked `publish = false` until the package split
 is intentionally reviewed.
 
+## Command compatibility
+
+`raydock` is the primary command. `rayline` remains a supported alias with no
+scheduled removal; this migration does not add an expiry. Any future removal
+requires a separate announced breaking change. Updater asset names, config
+paths, credentials, and environment variables remain unchanged.
+
 ## Release Tags
 
 Prod releases are cut by the Rayline release pipeline, which builds a pinned
@@ -148,6 +155,7 @@ core and hybrid execution require macOS 13+, despite those historical names;
 existing Rust deployment targets are unchanged. Linux hybrid is supported.
 Windows core cross-compiles, but Windows hybrid lifecycle is not qualified and
 the CLI refuses hybrid commands there. A successful cross-build is not runtime
-acceptance. The Homebrew formula template remains authoritative in
-`packaging/homebrew/raydock.rb.template`, with `__RELEASE_BASE_URL__` supplied by
-the publishing pipeline.
+acceptance. Production Homebrew publishing uses the template and flat archives from
+`atlasfutures/memex-desktop`. `packaging/homebrew/raydock.rb.template` applies
+only to this repo's manual fallback archives; see the packaging README for the
+different layouts.

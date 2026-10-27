@@ -58,7 +58,8 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/rayline-ai/rayline/main/scripts/install-rayline.ps1 | iex
 ```
 
-The installers place `raydock` and `rld` in `~/.rayline/bin` by default and
+The installers place `raydock`, its `rayline` alias, `rld`, and `rayline-core`
+in `~/.rayline/bin` by default and
 verify every downloaded binary against the release `SHA256SUMS` file.
 
 ## Quick Start
@@ -172,7 +173,7 @@ You can also send your own Anthropic API traffic through Rayline — from a scri
 or your own agent — using the official Anthropic SDKs. Examples come in Python
 and TypeScript, grouped by routing path:
 
-- **Cloud router** — point the SDK at `https://api.rayline.ai` with a router key:
+- **Rayline Platform** — point the SDK at `https://api.rayline.ai` with a router key:
   [examples/cloud/python](examples/cloud/python) ·
   [examples/cloud/typescript](examples/cloud/typescript)
 - **Local routing** — start the router with `raydock router start`, then send the
@@ -184,20 +185,21 @@ and TypeScript, grouped by routing path:
   `raydock router start --mode codex` and point Codex at
   `http://127.0.0.1:20811/v1`, run `raydock codex ...` to have Raydock pass the
   provider overrides automatically, or `raydock codex app` to launch the Codex
-  desktop app routed through Raydock. The default no-config path uses
-  Rayline Platform's hosted router at `api.rayline.ai`; `--subscription` selects
+  desktop app routed through Raydock. `raydock codex` without a config uses
+  Rayline Platform's hosted router at `api.rayline.ai`; its `--subscription` flag selects
   ChatGPT subscription auth, and explicit configs can select local/API-key
   endpoints. Raydock supports Codex's Responses create
   stream, model catalog, compaction, memory-summary, images, and search provider
   calls, with native passthrough when the selected route is an `openai_responses`
-  endpoint.
+  endpoint. In contrast, `raydock router start --mode codex` without a config
+  defaults to subscription auth.
 
 ## Supported Clients
 
 - Claude Code, Anthropic's CLI coding agent.
 - Codex CLI and Codex app via OpenAI Responses-compatible local routing.
-
-More clients may be supported over time.
+- Claude Desktop via the `claude-desktop` profile and local router.
+- OpenCode, Pi, Oh My Pi, Hermes Agent, and OpenClaw via their launcher commands.
 
 ## Build
 

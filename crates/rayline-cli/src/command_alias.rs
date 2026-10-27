@@ -16,7 +16,26 @@ pub(crate) fn primary_path(path: &Path) -> PathBuf {
 /// payload finishes the migration before dispatching any user command. Managed
 /// installs must be migrated by their package manager, never modified in place.
 pub(crate) fn migrate_legacy_payload() -> Result<Option<PathBuf>, UpdateError> {
-    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
+    let running = std::env::current_exe()?;
+    // Linux marks an unlinked running executable with this suffix. Another
+    // first invocation may already have installed the alias while we started.
+    // Accept only the completed migration layout, never an arbitrary sibling.
+    #[cfg(target_os = "linux")]
+    if running.file_name().and_then(|name| name.to_str()) == Some("rayline (deleted)") {
+        let primary = primary_path(&running);
+        let alias = running.with_file_name("rayline");
+        if std::fs::canonicalize(&alias)? != primary {
+            return Err(UpdateError::Install(
+                "Concurrent Raydock migration did not leave a valid rayline alias. Re-run the Raydock installer.".to_owned(),
+            ));
+        }
+        return Ok(Some(primary));
+    }
+    let executable = std::fs::canonicalize(running)?;
+    #[cfg(windows)]
+    if !update::is_app_bundle_managed(&executable) && !update::is_homebrew_managed(&executable) {
+        update::cleanup_retired_backups(&executable)?;
+    }
     if executable.file_name().and_then(|name| name.to_str())
         != Some(if cfg!(windows) {
             "rayline.exe"
@@ -40,7 +59,7 @@ pub(crate) fn migrate_legacy_payload() -> Result<Option<PathBuf>, UpdateError> {
                 executable.display()
             ))
         })?;
-    eprintln!("Rayline Local is now Raydock. Use `raydock`; `rayline` remains an alias.");
+    eprintln!("Use `raydock`; `rayline` remains an alias.");
     Ok(Some(primary))
 }
 
