@@ -30,6 +30,11 @@ use tokio::task::JoinSet;
 
 const CONTRACT_VERSION: u32 = 1;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// The execution core's own request body limit.
+const MAX_REQUEST_BYTES: usize = 64 << 20;
+/// Wait before the one retry of a turn whose Decisions call found the routing
+/// service unavailable (a scale-to-zero cell answers 502 while it starts).
+const DECISIONS_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -55,6 +60,10 @@ pub struct Args {
     /// Decisions requests, in addition to the built-in routers and loopback.
     #[arg(long = "router-url")]
     router_urls: Vec<String>,
+    /// Rayline environment whose router key Decisions uses; named in the
+    /// sign-in hint when Decisions refuses that key.
+    #[arg(long)]
+    env_name: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -86,6 +95,8 @@ struct Gateway {
     instance_id: String,
     capabilities: ModelCapabilities,
     shutdown: mpsc::Sender<()>,
+    /// The command that renews the router key Decisions uses.
+    login_command: String,
 }
 
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
@@ -156,6 +167,7 @@ pub async fn run(args: Args) -> Result<()> {
             instance_id: instance_id.clone(),
             capabilities: capabilities.clone(),
             shutdown: shutdown_tx,
+            login_command: login_command(args.env_name.as_deref()),
         });
         let ready = Ready {
             contract_version: CONTRACT_VERSION,
@@ -387,6 +399,48 @@ fn model_capabilities(health: &serde_json::Value) -> Result<ModelCapabilities> {
 
 async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response<Body>> {
     let (parts, body) = request.into_parts();
+    // Buffered (within the core's own limit) so a turn can be sent again.
+    let body = match http_body_util::Limited::new(body, MAX_REQUEST_BYTES)
+        .collect()
+        .await
+    {
+        Ok(collected) => collected.to_bytes(),
+        Err(error) if error.is::<http_body_util::LengthLimitError>() => {
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds the execution core's 64 MiB limit",
+            ));
+        }
+        Err(error) => bail!("read request body: {error}"),
+    };
+    let mut retried = false;
+    loop {
+        let upstream = send_to_core(state, &parts, body.clone()).await?;
+        if upstream.status() != StatusCode::BAD_GATEWAY {
+            return stream_response(upstream);
+        }
+        // A refused decision arrives before any output, as one small JSON error.
+        let status = upstream.status();
+        let headers = upstream.headers().clone();
+        let error_body = upstream.bytes().await?;
+        let failure = decisions_failure(&error_body);
+        if failure == Some(DecisionsFailure::Unavailable) && !retried {
+            // Nothing ran: the core decides before it dispatches, and treats an
+            // identical resend like the harness's own retry.
+            retried = true;
+            tracing::info!("Decisions unavailable; retrying the turn once");
+            tokio::time::sleep(DECISIONS_RETRY_DELAY).await;
+            continue;
+        }
+        return buffered_response(state, status, &headers, error_body, failure);
+    }
+}
+
+async fn send_to_core(
+    state: &Gateway,
+    parts: &hyper::http::request::Parts,
+    body: Bytes,
+) -> reqwest::Result<reqwest::Response> {
     let path = parts
         .uri
         .path_and_query()
@@ -394,10 +448,13 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         .unwrap_or("/");
     let mut outgoing = state
         .client
-        .request(parts.method, format!("{}{path}", state.core_url));
+        .request(parts.method.clone(), format!("{}{path}", state.core_url));
     for (name, value) in &parts.headers {
         if !hop_header(name.as_str())
-            && !matches!(name.as_str(), "authorization" | "x-api-key" | "host")
+            && !matches!(
+                name.as_str(),
+                "authorization" | "x-api-key" | "host" | "content-length"
+            )
         {
             outgoing = outgoing.header(name, value);
         }
@@ -440,11 +497,14 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
                 .unwrap_or_else(|| hyper::header::HeaderValue::from_static("main")),
         );
     }
-    let upstream = outgoing
+    outgoing
         .bearer_auth(&state.core_token)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .body(body)
         .send()
-        .await?;
+        .await
+}
+
+fn stream_response(upstream: reqwest::Response) -> Result<Response<Body>> {
     let mut response = Response::builder().status(upstream.status());
     for (name, value) in upstream.headers() {
         if !hop_header(name.as_str()) {
@@ -457,6 +517,90 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         .map_ok(Frame::data)
         .map_err(io::Error::other);
     Ok(response.body(BodyExt::boxed(StreamBody::new(stream)))?)
+}
+
+/// Why the core could not get a decision, from its error message.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecisionsFailure {
+    /// Decisions refused the router key.
+    Auth,
+    /// Decisions was unreachable or answered 502/503/504 (e.g. a cold cell).
+    Unavailable,
+}
+
+/// Classify the core's `decision_failed` error, in either wire format
+/// (`error.message`). The messages are the core's own (`Decide`).
+fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let message = value.pointer("/error/message")?.as_str()?;
+    if message == "Decisions request failed" {
+        return Some(DecisionsFailure::Unavailable);
+    }
+    let status = message.strip_prefix("Decisions request refused (HTTP ")?;
+    match status.get(..3)? {
+        "401" | "403" => Some(DecisionsFailure::Auth),
+        "502" | "503" | "504" => Some(DecisionsFailure::Unavailable),
+        _ => None,
+    }
+}
+
+fn login_command(env_name: Option<&str>) -> String {
+    match env_name {
+        Some(env) if !env.is_empty() => format!("rayline --env {env} auth login"),
+        _ => "rayline auth login".to_owned(),
+    }
+}
+
+/// The core's error response, with a Decisions failure explained: what to
+/// run for a refused key, and that an unavailable service is retryable.
+fn buffered_response(
+    state: &Gateway,
+    status: StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: Bytes,
+    failure: Option<DecisionsFailure>,
+) -> Result<Response<Body>> {
+    let (status, body, retry_after) = match failure.and_then(|failure| {
+        explain_decisions_failure(&body, failure, &state.login_command).map(|body| (failure, body))
+    }) {
+        Some((DecisionsFailure::Unavailable, body)) => {
+            (StatusCode::SERVICE_UNAVAILABLE, body, true)
+        }
+        // Not 5xx: harness SDKs retry those with backoff, which would only
+        // repeat the refused call and hold back the fix. Not 401 either, which
+        // a harness reads as its own (gateway) credential being wrong.
+        Some((DecisionsFailure::Auth, body)) => (StatusCode::FORBIDDEN, body, false),
+        None => (status, body, false),
+    };
+    let mut response = Response::builder().status(status);
+    for (name, value) in headers {
+        if !hop_header(name.as_str()) && name.as_str() != "content-length" {
+            response = response.header(name, value);
+        }
+    }
+    if retry_after {
+        response = response.header("retry-after", "30");
+    }
+    Ok(response.body(Full::new(body).map_err(|never| match never {}).boxed())?)
+}
+
+fn explain_decisions_failure(
+    body: &[u8],
+    failure: DecisionsFailure,
+    login_command: &str,
+) -> Option<Bytes> {
+    let mut value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let message = value.pointer("/error/message")?.as_str()?.to_owned();
+    let explained = match failure {
+        DecisionsFailure::Auth => format!(
+            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `rayline hybrid stop` and `rayline hybrid start` so the runtime uses the new key."
+        ),
+        DecisionsFailure::Unavailable => format!(
+            "{message}: the Rayline routing service is unavailable or still starting (a development cell scales to zero and takes about a minute to start). This is retryable: send the turn again shortly."
+        ),
+    };
+    *value.pointer_mut("/error/message")? = serde_json::Value::String(explained);
+    Some(Bytes::from(value.to_string()))
 }
 
 fn hop_header(name: &str) -> bool {
@@ -586,4 +730,93 @@ async fn stop_child(child: &mut Child) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn anthropic(message: &str) -> Vec<u8> {
+        json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}})
+            .to_string()
+            .into_bytes()
+    }
+
+    fn openai(message: &str) -> Vec<u8> {
+        json!({"error": {"type": "invalid_request_error", "code": "decision_failed", "message": message}})
+            .to_string()
+            .into_bytes()
+    }
+
+    #[test]
+    fn classifies_the_cores_decisions_failures() {
+        for encode in [anthropic, openai] {
+            assert_eq!(
+                decisions_failure(&encode("Decisions request refused (HTTP 401)")),
+                Some(DecisionsFailure::Auth)
+            );
+            assert_eq!(
+                decisions_failure(&encode(
+                    "Decisions request refused (HTTP 403, code policy_x)"
+                )),
+                Some(DecisionsFailure::Auth)
+            );
+            for message in [
+                "Decisions request refused (HTTP 502)",
+                "Decisions request refused (HTTP 503)",
+                "Decisions request failed",
+            ] {
+                assert_eq!(
+                    decisions_failure(&encode(message)),
+                    Some(DecisionsFailure::Unavailable),
+                    "{message}"
+                );
+            }
+            for message in [
+                "Decisions request refused (HTTP 400)",
+                "selected endpoint request failed",
+            ] {
+                assert_eq!(decisions_failure(&encode(message)), None, "{message}");
+            }
+        }
+        assert_eq!(decisions_failure(b"not json"), None);
+    }
+
+    #[test]
+    fn auth_failure_names_the_login_command() {
+        let explained = explain_decisions_failure(
+            &anthropic("Decisions request refused (HTTP 401)"),
+            DecisionsFailure::Auth,
+            &login_command(Some("dev")),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&explained).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("Decisions request refused (HTTP 401): "),
+            "{message}"
+        );
+        assert!(
+            message.contains("`rayline --env dev auth login`"),
+            "{message}"
+        );
+        // The wire shape is kept.
+        assert_eq!(value["type"], "error");
+        assert_eq!(value["error"]["type"], "invalid_request_error");
+        assert_eq!(login_command(None), "rayline auth login");
+    }
+
+    #[test]
+    fn unavailable_failure_says_retryable() {
+        let explained = explain_decisions_failure(
+            &openai("Decisions request refused (HTTP 502)"),
+            DecisionsFailure::Unavailable,
+            "rayline auth login",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&explained).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("retryable"), "{message}");
+        assert_eq!(value["error"]["code"], "decision_failed");
+    }
 }

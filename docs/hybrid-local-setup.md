@@ -63,14 +63,34 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    - Claude Opus 5.5 and Sonnet 5.5, through the same router, are the cloud
      targets.
 
-   The local context window is read from llama.cpp's `/props`. Ollama and MLX
-   do not report it, so add `--local-context-window <tokens>`, for example
-   `--local-context-window 16384`. Once production serves v2, plain
-   `rayline hybrid start` uses the production router.
+   The local model's context window defaults to 98,304 tokens. Load your
+   runtime with at least that window:
+   - llama.cpp: `llama-server --ctx-size 98304 ...` (Rayline reads the loaded
+     window from `/props` and uses the smaller of the two);
+   - Ollama: `OLLAMA_CONTEXT_LENGTH=98304 ollama serve`, or `num_ctx` in the
+     model's Modelfile. Ollama's default is much smaller and it silently
+     truncates a longer prompt, so set it;
+   - MLX (`mlx_lm.server`): check that your build's KV-cache limit, if you set
+     one, is at least 98,304 tokens.
+
+   Raise or lower it with `"hybrid": {"local_context_window": 131072}` in
+   `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
+   `start`. A turn whose prompt does not fit the local window goes to a cloud
+   model; harnesses are told the window is 1,000,000 tokens. Once production
+   serves v2, plain `rayline hybrid start` uses the production router.
+
+   `start` checks Decisions once before it reports ready: a rejected key
+   fails with the `rayline --env dev auth login` command to run, and a
+   preview cell that is still starting is waited for.
 
    `start` prints the profile, the routing policy and the local model it bound.
    `run` also supports `claude`, `codex`, `opencode`, `omp`, `hermes` and
-   `openclaw`. Start a fresh harness session after every `start`.
+   `openclaw`. Start a fresh harness session after every `start`. With
+   OpenCode 2, `run` adds `--standalone` so the session uses Rayline's
+   configuration rather than OpenCode's shared background service.
+
+   `rayline local test` checks the endpoint with an OpenAI Chat Completions
+   request, the API hybrid routing uses.
 
 ## Pricing defaults
 

@@ -15,7 +15,10 @@
 //! last-written key.
 //!
 //! Every config uses Anthropic Messages, model `rayline-router`,
-//! `contextWindow` 200000 / `maxTokens` 32000.
+//! `contextWindow` 200000 / `maxTokens` 32000 against the hosted router. Under
+//! `rayline hybrid run` every renderer advertises the hybrid runtime's admitted
+//! limits instead ([`RenderContext::capabilities`]): a harness that asks for
+//! more output than the execution core admits has every turn refused.
 //!
 //! Episode keying: the router keys a routing episode on each harness's own
 //! session id where it reads them: opencode and
@@ -167,19 +170,20 @@ impl Harness {
         })
     }
 
-    pub(crate) fn hybrid_plan(
-        self,
-        ctx: &RenderContext<'_>,
-        capabilities: &rayline_local_router::ModelCapabilities,
-    ) -> Result<Plan, String> {
-        if self == Self::Pi {
-            Ok(pi::plan_with_capabilities(ctx, Some(capabilities)))
-        } else {
-            self.plan(ctx)
+    /// The installed harness's major version, where a renderer or the launch
+    /// args depend on it (OpenCode); None otherwise or when unreadable.
+    pub(crate) fn major_version(self, binary: Option<&Path>) -> Option<u64> {
+        match self {
+            Self::OpenCode => opencode::major_version(binary?),
+            _ => None,
         }
     }
 
-    pub(crate) fn hybrid_args(self, args: &[OsString]) -> io::Result<Vec<OsString>> {
+    pub(crate) fn hybrid_args(
+        self,
+        args: &[OsString],
+        major_version: Option<u64>,
+    ) -> io::Result<Vec<OsString>> {
         if self == Self::OpenClaw {
             let env_container =
                 std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
@@ -189,6 +193,8 @@ impl Harness {
                 ));
             }
             Ok(openclaw::launch_args(args))
+        } else if self == Self::OpenCode {
+            Ok(opencode_args(args, major_version))
         } else {
             Ok(args.to_vec())
         }
@@ -219,9 +225,35 @@ pub(crate) struct RenderContext<'a> {
     /// pi only: whether to set `compat.allowEmptySignature`
     /// ([`pi::allow_empty_signature`]).
     pub allow_empty_signature: bool,
+    /// The limits `rayline hybrid run` admits (context window the harness may
+    /// budget against, the core's output cap, input modalities). `None`: the
+    /// hosted router's defaults.
+    pub capabilities: Option<&'a rayline_local_router::ModelCapabilities>,
+    /// The installed harness's major version ([`Harness::major_version`]).
+    pub harness_major_version: Option<u64>,
 }
 
 impl RenderContext<'_> {
+    /// Context window to advertise for the router model.
+    pub fn context_window(&self) -> u64 {
+        self.capabilities
+            .map_or(CONTEXT_WINDOW, |caps| caps.context_window)
+    }
+
+    /// Output cap to advertise for the router model.
+    pub fn max_output_tokens(&self) -> u64 {
+        self.capabilities
+            .map_or(MAX_OUTPUT_TOKENS, |caps| caps.max_output_tokens)
+    }
+
+    /// Input modalities to advertise for the router model.
+    pub fn input_modalities(&self) -> Value {
+        match self.capabilities {
+            Some(caps) => serde_json::json!(caps.input_modalities),
+            None => serde_json::json!(["text", "image"]),
+        }
+    }
+
     /// Base URL for clients that append `/v1/messages` themselves.
     pub fn messages_base(&self) -> String {
         self.router_url.to_owned()
@@ -334,6 +366,8 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             &env_name,
             std::env::var(pi::ALLOW_EMPTY_SIGNATURE_ENV).ok().as_deref(),
         ),
+        capabilities: None,
+        harness_major_version: harness.major_version(Some(&binary)),
     };
     let plan = harness.plan(&ctx)?;
     write_files(&config_dir, &plan.files).map_err(|error| {
@@ -383,9 +417,22 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             }
             args
         }
+        Harness::OpenCode => opencode_args(&request.args, ctx.harness_major_version),
         _ => request.args,
     };
     Ok(build_command(&binary, &plan, conv_id.as_deref(), &args))
+}
+
+/// OpenCode's args with `--standalone` where OpenCode 2 would attach to its
+/// background service ([`opencode::launch_args`]).
+fn opencode_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString> {
+    let launched = opencode::launch_args(args, major_version);
+    if launched.len() != args.len() {
+        eprintln!(
+            "  added --standalone so OpenCode uses this config (its background service does not see it)"
+        );
+    }
+    launched
 }
 
 fn explicit_router_key() -> Option<String> {
@@ -618,7 +665,7 @@ fn yaml_key(key: &str) -> String {
     }
 }
 
-fn find_on_path(binary_name: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(binary_name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let names = executable_names(binary_name, cfg!(windows));
     std::env::split_paths(&path).find_map(|dir| find_in_dir(&dir, &names))
@@ -718,6 +765,8 @@ pub(crate) mod tests {
             config_dir: &dir,
             conversation_id,
             allow_empty_signature: pi::allow_empty_signature("dev", None),
+            capabilities: None,
+            harness_major_version: None,
         };
         let plan = harness.plan(&ctx).unwrap();
         write_files(&dir, &plan.files).unwrap();

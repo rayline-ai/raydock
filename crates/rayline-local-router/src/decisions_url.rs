@@ -243,7 +243,8 @@ fn split_authority(authority: &str) -> (&str, Option<&str>) {
     (host, rest.strip_prefix(':'))
 }
 
-fn is_loopback(host: &str) -> bool {
+/// Whether a lowercase URL host is a loopback name or address.
+pub fn is_loopback(host: &str) -> bool {
     if host == "localhost" {
         return true;
     }

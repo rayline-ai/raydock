@@ -38,9 +38,10 @@ enum Action {
         /// Signed-in environment whose router makes the decisions (default: prod).
         #[arg(long, default_value = "prod")]
         env: String,
-        /// Local runtime context window in tokens, when it cannot be read from
-        /// the runtime (llama.cpp reports it; Ollama and MLX do not).
-        #[arg(long)]
+        /// Local model context window in tokens (default: settings
+        /// `hybrid.local_context_window`, else 98304). A turn whose prompt does
+        /// not fit hands off to cloud. llama.cpp's loaded window caps it.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(2048..=1_000_000))]
         local_context_window: Option<u64>,
         /// Isolated Decisions cell tag (development only).
         #[arg(long)]
@@ -203,13 +204,30 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                                 "hybrid routing needs your local model: run `rayline local custom --url <URL> --model <NAME>` first",
                             ),
                         )?;
-                    let window = match local_context_window {
+                    let configured = match local_context_window {
                         Some(window) => window,
-                        None => crate::hybrid_profile::probe_llamacpp_context(&client, &base_url)
-                            .await
-                            .ok_or_else(|| io::Error::other(
-                                "cannot read the local runtime's context window; pass --local-context-window <tokens>",
-                            ))?,
+                        None => crate::hybrid_profile::local_context_window(settings.as_ref())
+                            .map_err(settings_error)?,
+                    };
+                    let window = match crate::hybrid_profile::probe_llamacpp_context(
+                        &client, &base_url,
+                    )
+                    .await
+                    {
+                        // The runtime cannot hold more than it was loaded with.
+                        Some(loaded) if loaded < configured => {
+                            eprintln!(
+                                "Note: the local runtime is loaded with a {loaded}-token window, below the configured {configured}; using {loaded}. Restart llama.cpp with `--ctx-size {configured}` to keep longer turns local."
+                            );
+                            loaded
+                        }
+                        Some(_) => configured,
+                        None => {
+                            eprintln!(
+                                "Warning: Rayline cannot read this runtime's context window, so it assumes {configured} tokens. Load the local model with at least that window (llama.cpp `--ctx-size {configured}`, Ollama `OLLAMA_CONTEXT_LENGTH={configured}`): a runtime loaded with less (Ollama's default is a few thousand tokens) may silently truncate longer prompts. Set a smaller window with --local-context-window if needed."
+                            );
+                            configured
+                        }
                     };
                     if env == crate::status::PROD_ENV {
                         eprintln!(
@@ -275,6 +293,23 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             for (name, _) in &credentials {
                 println!("Using the saved Rayline key for {name}");
             }
+            // One Decisions call before reporting ready: a refused key or an
+            // unreachable router fails here, not on the harness's first turn.
+            // The environment whose router serves Decisions: a profile file may
+            // name another one than `--env`.
+            let decisions_env = composed
+                .config
+                .pointer("/decisions/url")
+                .and_then(Value::as_str)
+                .and_then(|url| crate::hybrid_profile::environment_for_url(&home, url))
+                .unwrap_or_else(|| env.clone());
+            probe_decisions(
+                &composed.config,
+                &credentials,
+                &decisions_env,
+                startup_timeout_secs,
+            )
+            .await?;
             let rld = if std::env::var_os("RLD_BIN").is_some() {
                 crate::router::resolve_rld_bin(&home)?
             } else {
@@ -302,6 +337,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             for router_url in &router_urls {
                 command.arg("--router-url").arg(router_url);
             }
+            command.arg("--env-name").arg(&decisions_env);
             for (name, key) in &credentials {
                 command.env(name, key);
             }
@@ -422,7 +458,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 &args,
                 url(&state)?,
                 &token,
-                &harness_capabilities(&paths, model_capabilities(&state)?)?,
+                &harness_capabilities(model_capabilities(&state)?),
             )?;
             for name in credential_env_names(&state)? {
                 // A harness may use the same variable name for its local gateway
@@ -439,6 +475,145 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Send one Decisions request with the key the core will use and classify
+/// the answer. A development cell (`cell_tag`) gets a real routing request,
+/// which also starts a scale-to-zero cell; while it answers 502/503/504 the
+/// probe waits and retries within the startup deadline. Without a cell an
+/// empty body is enough: the router authenticates before it validates.
+/// Skipped for a loopback Decisions URL.
+async fn probe_decisions(
+    config: &Value,
+    credentials: &[(String, String)],
+    env: &str,
+    startup_timeout_secs: u64,
+) -> io::Result<()> {
+    let Some(decisions) = config.get("decisions") else {
+        return Ok(());
+    };
+    let (Some(url), Some(auth_env)) = (
+        decisions.get("url").and_then(Value::as_str),
+        decisions.get("auth_env").and_then(Value::as_str),
+    ) else {
+        return Ok(());
+    };
+    // A loopback Decisions service is a local fixture or development
+    // service, not a router this check can describe.
+    if reqwest::Url::parse(url).is_ok_and(|url| {
+        url.host_str().is_some_and(|host| {
+            rayline_local_router::decisions_url::is_loopback(&host.to_ascii_lowercase())
+        })
+    }) {
+        return Ok(());
+    }
+    let saved = credentials
+        .iter()
+        .find(|(name, _)| name == auth_env)
+        .map(|(_, key)| key.clone());
+    let from_environment = saved.is_none();
+    let key = saved
+        .or_else(|| std::env::var(auth_env).ok().filter(|key| !key.is_empty()))
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "no Rayline key for Decisions ({auth_env}); run `rayline --env {env} auth login`"
+            ))
+        })?;
+    let cell = decisions.get("cell_tag").and_then(Value::as_str);
+    let body = match cell {
+        Some(_) => json!({
+            "model": decisions.get("model").and_then(Value::as_str).unwrap_or("rayline-router"),
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "rayline hybrid start: readiness check"}]
+        }),
+        None => json!({}),
+    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(io::Error::other)?;
+    let deadline = Instant::now() + Duration::from_secs(startup_timeout_secs);
+    let mut announced = false;
+    loop {
+        let mut request = client.post(url).bearer_auth(&key).json(&body);
+        if let Some(cell) = cell {
+            request = request.header("X-Rayline-Cell", cell);
+        }
+        let outcome = match request.send().await {
+            Ok(response) => Ok(response.status().as_u16()),
+            Err(error) => Err(error),
+        };
+        match probe_verdict(outcome.as_ref().copied().map_err(|_| ())) {
+            ProbeVerdict::Ready => return Ok(()),
+            ProbeVerdict::KeyRefused(status) => {
+                let fix = if from_environment {
+                    format!("Check or unset {auth_env}, which overrides the saved key")
+                } else {
+                    format!("Run `rayline --env {env} auth login`")
+                };
+                return Err(io::Error::other(format!(
+                    "Decisions at {url} refused the Rayline key (HTTP {status}). {fix}, then `rayline hybrid start` again."
+                )));
+            }
+            ProbeVerdict::RateLimited => {
+                return Err(io::Error::other(format!(
+                    "Decisions at {url} refused the readiness check with HTTP 429: the Rayline key is rate limited or out of quota; check your account, then retry"
+                )));
+            }
+            ProbeVerdict::Rejected(status) => {
+                return Err(io::Error::other(format!(
+                    "Decisions at {url} answered HTTP {status} to a readiness check; hybrid routing cannot start"
+                )));
+            }
+            ProbeVerdict::Unavailable => {
+                if Instant::now() >= deadline {
+                    let detail = match &outcome {
+                        Ok(status) => format!("HTTP {status}"),
+                        Err(error) => error.to_string(),
+                    };
+                    return Err(io::Error::other(format!(
+                        "Decisions at {url} is unreachable or not ready ({detail}); check your network and `rayline --env {env} status`, then retry"
+                    )));
+                }
+                if !announced {
+                    announced = true;
+                    match cell {
+                        Some(cell) => println!(
+                            "Waiting for Decisions cell {cell} to start (it scales to zero)..."
+                        ),
+                        None => println!("Waiting for Decisions at {url}..."),
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ProbeVerdict {
+    Ready,
+    KeyRefused(u16),
+    RateLimited,
+    Unavailable,
+    Rejected(u16),
+}
+
+/// `Err(())`: no HTTP answer (connect error or timeout).
+fn probe_verdict(outcome: Result<u16, ()>) -> ProbeVerdict {
+    match outcome {
+        Err(()) => ProbeVerdict::Unavailable,
+        Ok(status) if (200..300).contains(&status) => ProbeVerdict::Ready,
+        Ok(status @ (401 | 403)) => ProbeVerdict::KeyRefused(status),
+        Ok(429) => ProbeVerdict::RateLimited,
+        Ok(500 | 502 | 503 | 504) => ProbeVerdict::Unavailable,
+        // Authenticated, then refused the readiness body (an empty one, or a
+        // cell that wants an execution context): the key and router work.
+        // A 404/405 means the URL is not a Decisions route: rejected.
+        Ok(400 | 409 | 422) => ProbeVerdict::Ready,
+        Ok(status) => ProbeVerdict::Rejected(status),
+    }
 }
 
 fn installed_binary(name: &str) -> io::Result<PathBuf> {
@@ -509,22 +684,17 @@ fn model_capabilities(state: &Value) -> io::Result<ModelCapabilities> {
     Ok(capabilities)
 }
 
-/// The core's capabilities with the context window a harness should budget
-/// against ([`crate::hybrid_profile::reachable_context_window`]), read from
-/// the config this instance was started with. `start` refuses to rewrite it
-/// while an instance runs. Output and modality limits stay the core's.
-fn harness_capabilities(
-    paths: &Paths,
-    mut capabilities: ModelCapabilities,
-) -> io::Result<ModelCapabilities> {
-    let config: Value = match fs::read(paths.core_config()) {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(io::Error::other)?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(capabilities),
-        Err(error) => return Err(error),
-    };
-    capabilities.context_window =
-        crate::hybrid_profile::reachable_context_window(&config, capabilities.context_window);
-    Ok(capabilities)
+/// Context window every harness is told under hybrid routing. The runtime
+/// carries any prompt up to this size: a turn too large for the local model
+/// hands off to cloud, and a prompt larger than the cloud window is refused
+/// ("prompt is too long") so the harness compacts.
+pub(crate) const HARNESS_CONTEXT_WINDOW: u64 = 1_000_000;
+
+/// The core's capabilities with [`HARNESS_CONTEXT_WINDOW`] as the window.
+/// Output and modality limits stay the core's admitted ones.
+fn harness_capabilities(mut capabilities: ModelCapabilities) -> ModelCapabilities {
+    capabilities.context_window = HARNESS_CONTEXT_WINDOW;
+    capabilities
 }
 
 fn url(state: &Value) -> io::Result<&str> {
@@ -576,6 +746,12 @@ fn harness_command(
                 .env("ANTHROPIC_BASE_URL", endpoint)
                 .env("ANTHROPIC_AUTH_TOKEN", token)
                 .env_remove("ANTHROPIC_API_KEY")
+                // Claude Code otherwise asks for its own output default
+                // (32k), which the core refuses.
+                .env(
+                    "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+                    capabilities.max_output_tokens.to_string(),
+                )
                 .args(["--model", "rayline-router"]);
             let recovery = crate::claude::refusal_recovery_values(
                 crate::claude::RoutingMode::Override,
@@ -601,6 +777,8 @@ fn harness_command(
                 "model_providers.rayline-hybrid.wire_api=\"responses\"".to_owned(),
                 "model_providers.rayline-hybrid.env_key=\"RAYLINE_HYBRID_GATEWAY_TOKEN\""
                     .to_owned(),
+                format!("model_context_window={}", capabilities.context_window),
+                format!("model_max_output_tokens={}", capabilities.max_output_tokens),
             ] {
                 command.arg("-c").arg(setting);
             }
@@ -608,7 +786,9 @@ fn harness_command(
         _ => {
             let harness = crate::harness::Harness::from_command(name)
                 .ok_or_else(|| io::Error::other(format!("unsupported hybrid harness {name:?}")))?;
-            let args = harness.hybrid_args(args)?;
+            let major_version =
+                harness.major_version(crate::harness::find_on_path(harness.binary()).as_deref());
+            let args = harness.hybrid_args(args, major_version)?;
             let config_dir = paths.dir.join("harness").join(name);
             private_dir(&config_dir)?;
             let ctx = crate::harness::RenderContext {
@@ -621,10 +801,10 @@ fn harness_command(
                     env_needs_it: false,
                 },
                 allow_empty_signature: true,
+                capabilities: Some(capabilities),
+                harness_major_version: major_version,
             };
-            let plan = harness
-                .hybrid_plan(&ctx, capabilities)
-                .map_err(io::Error::other)?;
+            let plan = harness.plan(&ctx).map_err(io::Error::other)?;
             crate::harness::write_files(&config_dir, &plan.files)?;
             // Used only by harnesses which cannot transmit native session identity.
             let conversation_id = format!("hybrid-{:032x}", rand::random::<u128>());
@@ -673,6 +853,7 @@ fn require_fresh_session(harness: &str, args: &[OsString]) -> io::Result<()> {
                         | "-r"
                         | "-c"
                 ),
+                "opencode" => matches!(flag, "--continue" | "--session" | "--fork" | "-c" | "-s"),
                 _ => false,
             }
         });
@@ -960,57 +1141,122 @@ mod tests {
         }
     }
 
-    fn pi_models_for(profile: &Value) -> Value {
-        let paths = Paths {
-            dir: temp_dir("pi-window"),
-        };
-        write_private_json(&paths.core_config(), profile, true).unwrap();
+    /// Every hybrid harness advertises the 1M harness window, the core's
+    /// output cap and text-only input, never the hosted 32k output / image
+    /// defaults the core refuses (#123).
+    #[test]
+    fn every_harness_advertises_the_admitted_limits() {
         let core = ModelCapabilities {
-            context_window: 16384,
+            context_window: 98_304,
             max_output_tokens: 4096,
             input_modalities: vec!["text".into()],
         };
-        let capabilities = harness_capabilities(&paths, core).unwrap();
-        harness_command(
+        let capabilities = harness_capabilities(core);
+        assert_eq!(capabilities.context_window, 1_000_000);
+        let paths = Paths {
+            dir: temp_dir("limits"),
+        };
+        let read = |relative: &str| fs::read_to_string(paths.dir.join(relative)).unwrap();
+        for name in ["pi", "opencode", "omp", "hermes", "openclaw"] {
+            harness_command(
+                &paths,
+                name,
+                &[],
+                "http://127.0.0.1:20815",
+                "local-token",
+                &capabilities,
+            )
+            .unwrap();
+        }
+        let json = |relative: &str| -> Value { serde_json::from_str(&read(relative)).unwrap() };
+        let pi = &json("harness/pi/models.json")["providers"]["rayline"]["models"][0];
+        assert_eq!(
+            (&pi["contextWindow"], &pi["maxTokens"], &pi["input"]),
+            (&json!(1_000_000), &json!(4096), &json!(["text"]))
+        );
+        let opencode = &json("harness/opencode/opencode.json")["provider"]["rayline"]["models"]["rayline-router"];
+        assert_eq!(
+            opencode["limit"],
+            json!({"context": 1_000_000, "output": 4096})
+        );
+        assert_eq!(opencode["modalities"]["input"], json!(["text"]));
+        let openclaw = json("harness/openclaw/openclaw.json");
+        for provider in openclaw["models"]["providers"]
+            .as_object()
+            .unwrap()
+            .values()
+        {
+            let model = &provider["models"][0];
+            assert_eq!(
+                (
+                    &model["contextWindow"],
+                    &model["maxTokens"],
+                    &model["input"]
+                ),
+                (&json!(1_000_000), &json!(4096), &json!(["text"]))
+            );
+        }
+        let omp = read("harness/omp/models.yml");
+        for line in [
+            "contextWindow: 1000000",
+            "maxTokens: 4096",
+            "input: [\"text\"]",
+        ] {
+            assert!(omp.contains(line), "{omp}");
+        }
+        let hermes = read("harness/hermes/config.yaml");
+        assert!(hermes.contains("context_length: 1000000"), "{hermes}");
+        assert!(
+            hermes.contains("provider: \"custom:rayline-resp\""),
+            "{hermes}"
+        );
+        let claude = harness_command(
             &paths,
-            "pi",
+            "claude",
             &[],
             "http://127.0.0.1:20815",
             "local-token",
             &capabilities,
         )
         .unwrap();
-        let models: Value =
-            serde_json::from_slice(&fs::read(paths.dir.join("harness/pi/models.json")).unwrap())
-                .unwrap();
-        let _ = fs::remove_dir_all(&paths.dir);
-        models["providers"]["rayline"]["models"][0].clone()
-    }
-
-    #[test]
-    fn pi_gets_the_cloud_window_when_handoff_can_reach_cloud() {
-        let profile = crate::hybrid_profile::default_profile(
-            "https://api-dev.rayline.ai",
-            "http://127.0.0.1:11434/v1",
-            "qwen3.8:27b",
-            16384,
-            None,
-            None,
+        assert!(
+            claude
+                .get_envs()
+                .any(|(key, value)| key == "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
+                    && value == Some(std::ffi::OsStr::new("4096")))
+        );
+        let codex = harness_command(
+            &paths,
+            "codex",
+            &[],
+            "http://127.0.0.1:20815",
+            "local-token",
+            &capabilities,
         )
         .unwrap();
-        let model = pi_models_for(&profile);
-        assert_eq!(model["contextWindow"], 200_000);
-        // Output and modality limits stay the core's common envelope.
-        assert_eq!(model["maxTokens"], 4096);
-        assert_eq!(model["input"], json!(["text"]));
+        let args: Vec<_> = codex.get_args().map(|arg| arg.to_string_lossy()).collect();
+        assert!(
+            args.iter().any(|arg| arg == "model_max_output_tokens=4096"),
+            "{args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "model_context_window=1000000"),
+            "{args:?}"
+        );
+        let _ = fs::remove_dir_all(&paths.dir);
     }
 
     #[test]
-    fn pi_keeps_the_local_window_without_a_cloud_deployment() {
-        let profile = json!({"deployments": [
-            {"id": "local", "kind": "local", "context_window": 16384, "max_output_tokens": 4096}
-        ]});
-        assert_eq!(pi_models_for(&profile)["contextWindow"], 16384);
+    fn decisions_probe_verdicts() {
+        assert_eq!(probe_verdict(Ok(200)), ProbeVerdict::Ready);
+        assert_eq!(probe_verdict(Ok(400)), ProbeVerdict::Ready);
+        assert_eq!(probe_verdict(Ok(401)), ProbeVerdict::KeyRefused(401));
+        assert_eq!(probe_verdict(Ok(403)), ProbeVerdict::KeyRefused(403));
+        assert_eq!(probe_verdict(Ok(502)), ProbeVerdict::Unavailable);
+        assert_eq!(probe_verdict(Err(())), ProbeVerdict::Unavailable);
+        assert_eq!(probe_verdict(Ok(402)), ProbeVerdict::Rejected(402));
+        assert_eq!(probe_verdict(Ok(404)), ProbeVerdict::Rejected(404));
+        assert_eq!(probe_verdict(Ok(429)), ProbeVerdict::RateLimited);
     }
 
     #[test]
@@ -1023,6 +1269,11 @@ mod tests {
             ("codex", "fork"),
             ("pi", "--fork"),
             ("pi", "--session=saved"),
+            ("opencode", "-c"),
+            ("opencode", "--continue"),
+            ("opencode", "-s"),
+            ("opencode", "--session=ses_1"),
+            ("opencode", "--fork"),
         ] {
             assert!(require_fresh_session(harness, &[OsString::from(arg)]).is_err());
         }
