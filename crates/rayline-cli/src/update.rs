@@ -142,7 +142,7 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
             // than failing the check.
             return Ok(UpdateResult {
                 message: format!(
-                    "{}Execution core is missing; repair it with `rayline update --version {}`.\n",
+                    "{}Execution core is missing; repair it with `raydock update --version {}`.\n",
                     decision.message, current.normalized
                 ),
                 ..decision
@@ -150,7 +150,7 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
         }
         decision = UpdateResult {
             message: format!(
-                "Execution core is missing; reinstall the complete {} release with `rayline update`.\n",
+                "Execution core is missing; reinstall the complete {} release with `raydock update`.\n",
                 current.public
             ),
             exit_code: 1,
@@ -215,12 +215,13 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                 }
                 replace_binary(&artifacts.launcher, &install_path)?;
                 replace_binary(&artifacts.daemon, &daemon_install_path)?;
+                crate::command_alias::install_alias(&install_path)?;
                 if artifacts.core.is_none() {
                     // Rollback to a pre-core release: remove the newer core
                     // and its license so no later launcher (for example one
                     // installed by the older two-binary updater) runs a core
                     // that does not match it; it then reports the core as
-                    // missing and `rayline update` installs the matching one.
+                    // missing and `raydock update` installs the matching one.
                     remove_stale_core(&[&core_install_path, &license_install_path]);
                 }
                 cleanup_legacy_uv_install(crate::UV_TOOL_NAME, &install_path);
@@ -251,7 +252,7 @@ fn bare_version_hint(target: &Version, error: UpdateError) -> UpdateError {
             if !target.normalized.contains('+') && message.ends_with("HTTP 404") =>
         {
             UpdateError::Network(format!(
-                "release {} was not found. Releases are published under their full version including the build label; run `rayline update --version {}+<build>` with the full version from the release notes (`rayline --version` prints it for an installed release).",
+                "release {} was not found. Releases are published under their full version including the build label; run `raydock update --version {}+<build>` with the full version from the release notes (`raydock --version` prints it for an installed release).",
                 target.public, target.public
             ))
         }
@@ -554,7 +555,7 @@ async fn download_and_verify(
 ) -> Result<UpdateArtifacts, UpdateError> {
     let version = target.normalized.as_str();
     fs::create_dir_all(dest_dir).map_err(UpdateError::from)?;
-    let launcher_name = format!("{}-{platform_tag}", crate::CLI_BIN);
+    let launcher_name = format!("{}-{platform_tag}", crate::CLI_ASSET);
     let daemon_name = format!("{}-{platform_tag}", crate::DAEMON_BIN);
     let launcher_path = dest_dir.join(&launcher_name);
     let daemon_path = dest_dir.join(&daemon_name);
@@ -584,7 +585,7 @@ async fn download_and_verify(
     let with_core = release_ships_core(&sums, platform_tag, target)?;
 
     download_to(
-        &artifact_url_for(version, platform_tag, crate::CLI_BIN),
+        &artifact_url_for(version, platform_tag, crate::CLI_ASSET),
         &launcher_path,
     )
     .await?;
@@ -708,6 +709,7 @@ fn install_path() -> io::Result<PathBuf> {
         .map(PathBuf::from)
         .map_or_else(std::env::current_exe, Ok)
         .map(resolve_install_path)
+        .map(|path| crate::command_alias::primary_path(&path))
 }
 
 /// `current_exe()` may return the invoking symlink rather than its target on
@@ -721,7 +723,7 @@ fn resolve_install_path(path: PathBuf) -> PathBuf {
     fs::canonicalize(&path).unwrap_or(path)
 }
 
-fn is_homebrew_managed(install_path: &Path) -> bool {
+pub(crate) fn is_homebrew_managed(install_path: &Path) -> bool {
     let Some(prefix) = homebrew_prefix() else {
         return false;
     };
@@ -733,7 +735,7 @@ fn is_homebrew_managed(install_path: &Path) -> bool {
 /// action). The app owns updates in that case; self-replacing would break the
 /// notarization seal. Canonicalize first so symlink paths resolve to the real
 /// bundle path before matching.
-fn is_app_bundle_managed(install_path: &Path) -> bool {
+pub(crate) fn is_app_bundle_managed(install_path: &Path) -> bool {
     let resolved =
         std::fs::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
     resolved.to_string_lossy().contains(".app/Contents/")
@@ -824,7 +826,7 @@ fn replace_file(
 /// a sidecar path first, then move the update into place, restoring the
 /// original if the second move fails.
 #[cfg(not(windows))]
-fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
+pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     fs::rename(staged, install_path).map_err(|error| {
         UpdateError::Install(format!(
             "failed to replace {}: {error}",
@@ -834,7 +836,7 @@ fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError
 }
 
 #[cfg(windows)]
-fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
+pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     if !install_path.exists() {
         return fs::rename(staged, install_path).map_err(|error| {
             UpdateError::Install(format!(
@@ -870,7 +872,7 @@ fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError
     }
 }
 
-fn staged_install_path(install_path: &Path) -> Result<PathBuf, UpdateError> {
+pub(crate) fn staged_install_path(install_path: &Path) -> Result<PathBuf, UpdateError> {
     let parent = install_path.parent().ok_or_else(|| {
         UpdateError::Install(format!(
             "install path has no parent directory: {}",

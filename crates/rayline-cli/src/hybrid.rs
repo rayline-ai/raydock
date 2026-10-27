@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 #[derive(Parser)]
 #[command(
-    name = "rayline hybrid",
+    name = "raydock hybrid",
     about = "Run ARC hybrid routing with externally managed inference"
 )]
 struct Cli {
@@ -30,7 +30,7 @@ enum Action {
         /// Override the execution core installed beside rayline.
         #[arg(long)]
         core: Option<PathBuf>,
-        /// Optional qualified execution-core profile. Without it, Rayline Local
+        /// Optional qualified execution-core profile. Without it, Raydock
         /// builds the default profile from your signed-in environment and
         /// `local_model`. Either way it applies `hybrid.routing` overrides.
         #[arg(long)]
@@ -89,7 +89,7 @@ impl Paths {
 
 pub async fn run(args: Vec<OsString>) -> ExitCode {
     let cli =
-        match Cli::try_parse_from(std::iter::once(OsString::from("rayline hybrid")).chain(args)) {
+        match Cli::try_parse_from(std::iter::once(OsString::from("raydock hybrid")).chain(args)) {
             Ok(cli) => cli,
             Err(error) => {
                 let code = error.exit_code();
@@ -201,7 +201,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     let (base_url, model) =
                         crate::hybrid_profile::custom_local_model(settings.as_ref()).ok_or_else(
                             || io::Error::other(
-                                "hybrid routing needs your local model: run `rayline local custom --url <URL> --model <NAME>` first",
+                                "hybrid routing needs your local model: run `raydock local custom --url <URL> --model <NAME>` first",
                             ),
                         )?;
                     let configured = match local_context_window {
@@ -237,7 +237,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                             "Note: hybrid routing v2 is in preview on the development router; the production router accepts it after the catalog migration. Use --env dev for the preview."
                         );
                     }
-                    // `rayline auth login` is enough: mint the router key on first use.
+                    // `raydock auth login` is enough: mint the router key on first use.
                     if std::env::var_os("RAYLINE_ROUTER_API_KEY")
                         .is_none_or(|value| value.is_empty())
                     {
@@ -291,7 +291,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 (source, Some(preset)) => println!(
                     "Routing policy: {preset} ({})",
                     match source {
-                        crate::hybrid_profile::PolicySource::Default => "Rayline Local default",
+                        crate::hybrid_profile::PolicySource::Default => "Raydock default",
                         crate::hybrid_profile::PolicySource::Settings => "settings hybrid.routing",
                         _ => "profile",
                     }
@@ -527,7 +527,7 @@ async fn probe_decisions(
         .or_else(|| std::env::var(auth_env).ok().filter(|key| !key.is_empty()))
         .ok_or_else(|| {
             io::Error::other(format!(
-                "no Rayline key for Decisions ({auth_env}); run `rayline --env {env} auth login`"
+                "no Rayline key for Decisions ({auth_env}); run `raydock --env {env} auth login`"
             ))
         })?;
     let cell = decisions.get("cell_tag").and_then(Value::as_str);
@@ -535,7 +535,7 @@ async fn probe_decisions(
         Some(_) => json!({
             "model": decisions.get("model").and_then(Value::as_str).unwrap_or("rayline-router"),
             "max_tokens": 1,
-            "messages": [{"role": "user", "content": "rayline hybrid start: readiness check"}]
+            "messages": [{"role": "user", "content": "raydock hybrid start: readiness check"}]
         }),
         None => json!({}),
     };
@@ -561,10 +561,10 @@ async fn probe_decisions(
                 let fix = if from_environment {
                     format!("Check or unset {auth_env}, which overrides the saved key")
                 } else {
-                    format!("Run `rayline --env {env} auth login`")
+                    format!("Run `raydock --env {env} auth login`")
                 };
                 return Err(io::Error::other(format!(
-                    "Decisions at {url} refused the Rayline key (HTTP {status}). {fix}, then `rayline hybrid start` again."
+                    "Decisions at {url} refused the Rayline key (HTTP {status}). {fix}, then `raydock hybrid start` again."
                 )));
             }
             ProbeVerdict::RateLimited => {
@@ -584,7 +584,7 @@ async fn probe_decisions(
                         Err(error) => error.to_string(),
                     };
                     return Err(io::Error::other(format!(
-                        "Decisions at {url} is unreachable or not ready ({detail}); check your network and `rayline --env {env} status`, then retry"
+                        "Decisions at {url} is unreachable or not ready ({detail}); check your network and `raydock --env {env} status`, then retry"
                     )));
                 }
                 if !announced {
@@ -633,7 +633,7 @@ fn installed_binary(name: &str) -> io::Result<PathBuf> {
         .parent()
         .ok_or_else(|| io::Error::other("rayline executable has no parent directory"))?;
     fs::canonicalize(directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
-        .map_err(|error| io::Error::new(error.kind(), format!("installed {name} is unavailable; run `rayline update` or reinstall the complete Rayline release: {error}")))
+        .map_err(|error| io::Error::new(error.kind(), format!("installed {name} is unavailable; run `raydock update` or reinstall the complete Rayline release: {error}")))
 }
 
 fn ready(paths: &Paths) -> io::Result<Value> {
@@ -899,7 +899,7 @@ fn stopped(paths: &Paths) -> io::Result<bool> {
 fn clear_stopped_state(paths: &Paths) -> io::Result<()> {
     if !stopped(paths)? {
         return Err(io::Error::other(
-            "hybrid supervisor is running; use `rayline hybrid status` or `rayline hybrid stop` first",
+            "hybrid supervisor is running; use `raydock hybrid status` or `raydock hybrid stop` first",
         ));
     }
     for path in [paths.ready(), paths.token(), paths.supervisor()] {

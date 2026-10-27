@@ -41,7 +41,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core", type=Path, required=True, help="rayline-core built from the v2 Go core")
     parser.add_argument("--registry", type=Path, required=True, help="public compiled thinking registry")
-    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/rayline")
+    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
     parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     args = parser.parse_args()
     registry_bytes = args.registry.read_bytes()

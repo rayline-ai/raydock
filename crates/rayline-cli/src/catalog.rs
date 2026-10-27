@@ -201,10 +201,12 @@ fn parse_curated(body: &Value) -> Vec<CatalogModel> {
     let mut models = entries
         .iter()
         .filter(|entry| {
+            // Catalog curation tags are a stable wire contract, independent of
+            // the public executable name.
             entry
                 .get("curated")
                 .and_then(Value::as_array)
-                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some(crate::CLI_BIN)))
+                .is_some_and(|tags| tags.iter().any(|tag| tag.as_str() == Some("rayline")))
                 && entry.get("shardedFilenames").is_none()
         })
         .filter_map(parse_model)
@@ -1275,7 +1277,7 @@ fn should_auto_select(
 }
 
 /// `<cli> local use <number|model-id>`: resolve by 1-based selection number
-/// (from `rayline local models`) or model id, download if missing, then select.
+/// (from `raydock local models`) or model id, download if missing, then select.
 pub async fn use_command(env_name: Option<&str>, selection: &str) -> Result<String, String> {
     let (home, models) = fetch_for_command(env_name).await?;
     let hardware = detect_hardware();
@@ -1437,7 +1439,7 @@ mod tests {
             "maxContextWindow": 1024,
             "qualityScore": 1,
             "description": "test model",
-            "curated": [crate::CLI_BIN],
+            "curated": ["rayline"],
         })
     }
 

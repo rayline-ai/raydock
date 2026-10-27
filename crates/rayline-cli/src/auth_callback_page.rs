@@ -1,4 +1,4 @@
-//! The HTML served by the loopback listener that catches the `rayline auth
+//! The HTML served by the loopback listener that catches the `raydock auth
 //! login` OAuth redirect.
 //!
 //! This is the only Rayline surface rendered by the CLI itself rather than by
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn success_page_carries_the_brand_shell() {
         let html = success_html();
-        assert!(html.contains("<title>Logged in — Rayline</title>"));
+        assert!(html.contains("<title>Logged in — Raydock</title>"));
         assert!(html.contains("You can close this tab and return to the terminal."));
         assert!(html.contains("aria-label=\"Rayline\""));
         assert!(html.contains("--ember:#ea5e2a"));

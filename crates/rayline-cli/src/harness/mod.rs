@@ -1,8 +1,8 @@
-//! `rayline opencode|pi|omp|hermes|openclaw`: launch a third-party coding harness
+//! `raydock opencode|pi|omp|hermes|openclaw`: launch a third-party coding harness
 //! against the hosted Rayline router.
 //!
 //! Each launcher resolves the environment's router URL and `rlk-` key the same
-//! way `rayline claude` does, writes a Rayline-owned config under
+//! way `raydock claude` does, writes a Rayline-owned config under
 //! `~/.config/rayline/harness/<name>/<env>/`, points the harness at it through
 //! the harness's own config env var, and execs the harness with the remaining
 //! args. The key lives only in that config (0600, in a 0700 dir), never in the
@@ -16,7 +16,7 @@
 //!
 //! Every config uses Anthropic Messages, model `rayline-router`,
 //! `contextWindow` 200000 / `maxTokens` 32000 against the hosted router. Under
-//! `rayline hybrid run` every renderer advertises the hybrid runtime's admitted
+//! `raydock hybrid run` every renderer advertises the hybrid runtime's admitted
 //! limits instead ([`RenderContext::capabilities`]): a harness that asks for
 //! more output than the execution core admits has every turn refused.
 //!
@@ -225,7 +225,7 @@ pub(crate) struct RenderContext<'a> {
     /// pi only: whether to set `compat.allowEmptySignature`
     /// ([`pi::allow_empty_signature`]).
     pub allow_empty_signature: bool,
-    /// The limits `rayline hybrid run` admits (context window the harness may
+    /// The limits `raydock hybrid run` admits (context window the harness may
     /// budget against, the core's output cap, input modalities). `None`: the
     /// hosted router's defaults.
     pub capabilities: Option<&'a rayline_local_router::ModelCapabilities>,
@@ -328,14 +328,14 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    // Same env -> router URL resolution as `rayline claude`: `--env` (default
+    // Same env -> router URL resolution as `raydock claude`: `--env` (default
     // prod), then settings.json `environments.<env>.router_url`.
     let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(&home));
     let hosted = crate::status::resolve_hosted_environment(&env_name, Some(&home))
         .map_err(|error| error.to_string())?;
     let router_url = normalize_router_url(&hosted.router_url);
     // An explicit RAYLINE_ROUTER_API_KEY wins, as on the codex path; otherwise
-    // the stored `rlk-` key, minted (and signed in) on demand like `rayline claude`.
+    // the stored `rlk-` key, minted (and signed in) on demand like `raydock claude`.
     let key = match explicit_router_key() {
         Some(key) => key,
         None => crate::claude::ensure_router_key(
@@ -710,7 +710,7 @@ fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
     use std::os::unix::process::CommandExt as _;
 
     let error = command.exec();
-    eprintln!("rayline: failed to exec {}: {error}", harness.binary());
+    eprintln!("raydock: failed to exec {}: {error}", harness.binary());
     ExitCode::from(127)
 }
 
@@ -719,7 +719,7 @@ fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
     match command.status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => {
-            eprintln!("rayline: failed to run {}: {error}", harness.binary());
+            eprintln!("raydock: failed to run {}: {error}", harness.binary());
             ExitCode::from(127)
         }
     }

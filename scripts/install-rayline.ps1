@@ -66,15 +66,22 @@ try {
 
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
     Copy-Item -Force $LicensePath (Join-Path $InstallDir "rayline-core-LICENSE")
-    Copy-Item -Force $RaylinePath (Join-Path $InstallDir "rayline.exe")
+    Copy-Item -Force $RaylinePath (Join-Path $InstallDir "raydock.exe")
+    $alias = Join-Path $InstallDir 'rayline.exe'
+    if (Test-Path -LiteralPath $alias) {
+        Move-Item -LiteralPath $alias -Destination "$alias.old-$([Guid]::NewGuid().ToString('N'))"
+    }
+    # Hard links need no administrator or Developer Mode privileges. The new
+    # launcher turns this initial alias into a forwarding EXE on first use.
+    New-Item -ItemType HardLink -Path $alias -Target (Join-Path $InstallDir 'raydock.exe') | Out-Null
     Copy-Item -Force $DaemonPath (Join-Path $InstallDir "rld.exe")
     Copy-Item -Force $CorePath (Join-Path $InstallDir "rayline-core.exe")
 
-    Write-Host "Installed Rayline Local to $InstallDir"
+    Write-Host "Installed Raydock to $InstallDir"
     $PathEntries = $env:PATH -split [System.IO.Path]::PathSeparator
     if ($PathEntries -notcontains $InstallDir) {
         Write-Host ""
-        Write-Host "Add Rayline to your PATH:"
+        Write-Host "Add Raydock to your PATH:"
         Write-Host "  `$env:PATH = `"$InstallDir;$env:PATH`""
     }
 } finally {

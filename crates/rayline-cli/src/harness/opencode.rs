@@ -4,7 +4,7 @@
 //!
 //! opencode sends its session id as `x-session-affinity` on its own, which
 //! the gateway keys the episode on. Against the hosted router, `opencode -c` /
-//! `--session` keeps that episode; `rayline hybrid run opencode` refuses them,
+//! `--session` keeps that episode; `raydock hybrid run opencode` refuses them,
 //! since a saved session lacks the execution core's private history.
 //!
 //! OpenCode 2 runs its agent in a shared background service (port 49374) that

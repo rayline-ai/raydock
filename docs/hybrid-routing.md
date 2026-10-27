@@ -1,12 +1,12 @@
 # ARC hybrid execution
 
-`rayline hybrid` runs a standalone Go execution core behind an authenticated
+`raydock hybrid` runs a standalone Go execution core behind an authenticated
 loopback gateway managed by `rld`. The core owns ARC decisions, wire-format
 conversion, thinking controls, private append, and execution context. The Rust
 gateway streams the original request and response bytes without entering the
 static router or adapter.
 
-This is an explicit mode. `rayline claude --local` continues to mean auth-free
+This is an explicit mode. `raydock claude --local` continues to mean auth-free
 local static routing.
 
 ## Bring your own inference server
@@ -27,7 +27,7 @@ core validates the policy-package and thinking-registry hashes at startup.
 For hosted Decisions and Rayline cloud inference, the core reads the Rayline
 API key from the environment variable each endpoint names (normally
 `RAYLINE_ROUTER_API_KEY`). An explicit launch-environment value always wins.
-Otherwise `start` supplies the key saved by `rayline auth login` only for an
+Otherwise `start` supplies the key saved by `raydock auth login` only for an
 HTTPS endpoint on the same host as that signed-in environment's router (for
 example the dev key for `https://api-dev.rayline.ai`); it never offers a saved
 key to another host and prints only the variable name.
@@ -61,7 +61,7 @@ Hybrid endpoints are selected by the core configuration. The root `--env` and
 `--auth-token` options are not accepted with `hybrid`; use the configuration and
 `RAYLINE_ROUTER_API_KEY` for a non-production endpoint.
 
-## Rayline Local defaults
+## Raydock defaults
 
 `start` composes the core configuration from a profile and the user's
 `~/.config/rayline/settings.json`, and writes the result to `core-config.json`
@@ -110,7 +110,7 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   `derived_actions` profile, or a profile that sets `decisions.api_mode:
   "execution_context_v2"`, the core uses that mode
   and sends `routing.policy: {"preset": "arc-policy.hybrid-default.v1"}`
-  explicitly. Rayline Local never relies on an absent policy, which the
+  explicitly. Raydock never relies on an absent policy, which the
   Decisions API reads as today's package default.
 - **One optional override block,** `hybrid.routing` (every key optional):
 
@@ -131,7 +131,7 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   result. Unknown keys are refused.
 - **Local model.** A profile deployment marked `"from_local_model": true`
   takes its endpoint and served model from `local_model`
-  (`rayline local custom --url http://127.0.0.1:11434/v1 --model qwen3.8:27b`); its protocol
+  (`raydock local custom --url http://127.0.0.1:11434/v1 --model qwen3.8:27b`); its protocol
   path is appended. Its runtime identity and thinking-control qualification
   still come from the profile, and a configured llama.cpp prompt counter
   verifies the served model at startup. Without a custom `local_model`, such a
@@ -145,7 +145,7 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
 `start` prints the applied preset and its source, the local model and any saved
 key it used.
 
-**Events come from the wire.** Harnesses run unmodified; Rayline Local adds
+**Events come from the wire.** Harnesses run unmodified; Raydock adds
 nothing to them. The Go core infers each request's event from what the harness
 already sends (`basis: marker_inferred`): `task_start` before any assistant
 message, `tool_result` versus `user_message` from the trailing turn (injected
@@ -171,14 +171,14 @@ includes its matching execution core. Select your qualified policy and endpoint
 configuration explicitly:
 
 ```bash
-rayline hybrid start --config /absolute/path/to/hybrid.json
-rayline hybrid status
-rayline hybrid run claude -- -p "Explain this repository"
-rayline hybrid run codex -- exec "Explain this repository"
-rayline hybrid stop
+raydock hybrid start --config /absolute/path/to/hybrid.json
+raydock hybrid status
+raydock hybrid run claude -- -p "Explain this repository"
+raydock hybrid run codex -- exec "Explain this repository"
+raydock hybrid stop
 ```
 
-For source development, build `rayline` and `rld` with
+For source development, build `raydock` and `rld` with
 `cargo build --locked -p rayline-cli -p rayline-daemon`, set `RLD_BIN` to the built
 daemon, and pass `start --core /absolute/path/to/rayline-core` to select a core
 built from the matching VSR source. Startup never downloads an executable.
@@ -422,28 +422,28 @@ also remain separate work.
 
 ## Installed execution core
 
-Releases include `rayline-core` beside `rayline` and `rld`. `rayline hybrid start
+Releases include `rayline-core` beside `raydock` and `rld`. `raydock hybrid start
 --config <path>` discovers those companion binaries beside the resolved launcher,
 including when the launcher is reached through a symlink. `--core <path>` remains
 an explicit development override; `RLD_BIN` remains an explicit daemon override.
 Missing installed components fail with a repair instruction, without downloading
-during hybrid startup. `rayline update` repairs a missing core even when the
+during hybrid startup. `raydock update` repairs a missing core even when the
 launcher is already at the requested release, using verified signed artifacts.
 Users upgrading from an older two-binary updater may need to run it a second time.
 
 Releases before 0.2.13 ship no core. A rollback such as
-`rayline update --version 0.2.12+ee1afb00b6cd` decides this from the target's
+`raydock update --version 0.2.12+ee1afb00b6cd` decides this from the target's
 signed `SHA256SUMS`: when it lists no `rayline-core` entry and the version is
-older than 0.2.13, the update installs only `rayline` and `rld`, then removes
+older than 0.2.13, the update installs only `raydock` and `rld`, then removes
 the installed `rayline-core` and `rayline-core-LICENSE`, so no later launcher
 (for example one installed by the older two-binary updater) runs a core that
-does not match it; that launcher reports the core missing and `rayline update`
+does not match it; that launcher reports the core missing and `raydock update`
 installs the matching one. A 0.2.13 or later release whose `SHA256SUMS` lacks
 the core fails closed. Releases are published under their full version, build
-label included (shown in the GitHub release notes and by `rayline --version`);
+label included (shown in the GitHub release notes and by `raydock --version`);
 a bare `--version 0.2.12` that is not found says to use the full form. A build newer than its
 channel's latest release reports that it is up to date and names the
-`rayline update --version <current>` command that repairs a missing core.
+`raydock update --version <current>` command that repairs a missing core.
 
 Hybrid requires macOS 13 Ventura or later, or Linux. Windows hybrid commands
 fail explicitly because locking, private-state permissions and lifecycle have

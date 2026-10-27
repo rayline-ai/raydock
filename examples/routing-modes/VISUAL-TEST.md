@@ -18,13 +18,13 @@ hang, and a per-mode loop lets you recover and continue.
 
 | # | Requirement | Check | If missing |
 |---|---|---|---|
-| 1 | `rayline`/`rld` built from the branch under test, installed, **all stale `rld` killed** | `rayline --version`; `pgrep -fl "rld serve\|rld proxy"` → none | rebuild + install (Apple Silicon: `codesign --force --sign -` after copying); `pkill -9 -f "rld serve\|rld proxy"` |
-| 2 | Signed in to rayline | `rayline auth status` (or `rayline local show` works) | `rayline auth login` |
+| 1 | `raydock`/`rld` built from the branch under test, installed, **all stale `rld` killed** | `raydock --version`; `pgrep -fl "rld serve\|rld proxy"` → none | rebuild + install (Apple Silicon: `codesign --force --sign -` after copying); `pkill -9 -f "rld serve\|rld proxy"` |
+| 2 | Signed in to rayline | `raydock auth status` (or `raydock local show` works) | `raydock auth login` |
 | 3 | `ANTHROPIC_API_KEY` exported | `[ -n "$ANTHROPIC_API_KEY" ]` | Rc-K/Rl-K/L-K subagent leg will **FAIL** — mark those rows accordingly, don't hide it |
-| 3b | `RAYLINE_ROUTER_API_KEY` is an **`rlk-`** key, for the Router column | `case $RAYLINE_ROUTER_API_KEY in rlk-*) ;; *) echo wrong;; esac` | cloud subagent legs 401 (unset) or **403** (session token) — see README ⁷. `rayline auth token` returns an `rls_` session token and is **not** usable here |
+| 3b | `RAYLINE_ROUTER_API_KEY` is an **`rlk-`** key, for the Router column | `case $RAYLINE_ROUTER_API_KEY in rlk-*) ;; *) echo wrong;; esac` | cloud subagent legs 401 (unset) or **403** (session token) — see README ⁷. `raydock auth token` returns an `rls_` session token and is **not** usable here |
 | 4 | `claude` (Claude Code) on PATH + Claude **subscription** logged in | `command -v claude` | passthrough modes (S-Rc/S-Rcl/S-Rl/S-L main) can't run |
 | 5 | ollama up with both models | `curl -s localhost:11434/api/tags` shows `qwen3.5:9b` + `qwen2.5-coder:7b` | `ollama pull qwen3.5:9b && ollama pull qwen2.5-coder:7b` |
-| 6 | local model configured + ON | `rayline local show` → "Custom endpoint … qwen2.5-coder:7b" + "account: ON" | `rayline local custom --url http://127.0.0.1:11434 --model qwen2.5-coder:7b`; the script runs `rayline local on` |
+| 6 | local model configured + ON | `raydock local show` → "Custom endpoint … qwen2.5-coder:7b" + "account: ON" | `raydock local custom --url http://127.0.0.1:11434 --model qwen2.5-coder:7b`; the script runs `raydock local on` |
 | 7 | `python3` available | `python3 --version` | install python3 |
 | 8 | ports 20809–20813 free | script handles via killing `rld` | — |
 
@@ -46,7 +46,7 @@ Then, **for each MODE in this order** — `Rc-Rc Rc-K Rc-L Rcl-Rcl Rl-Rl Rl-K Rc
 S-Rcl S-L L-Rc L-Rl L-K L-L Rl-L S-Rl` (skip `Rcl-K Rcl-L L-Rcl`, see §5) — do exactly this:
 
 ```bash
-# a) clean slate so `rayline top` reflects only this mode (each run restarts rld)
+# a) clean slate so `raydock top` reflects only this mode (each run restarts rld)
 pkill -9 -f "rld serve|rld proxy"; sleep 1
 # b) run the mode's demo headless, with a ~100s timeout (local-main modes are slow —
 #    a pinned-window 9B took ~6 min to reach the spawn; raise the bound for L-* modes)
@@ -117,10 +117,10 @@ With the window pinned the local main **does** drive Claude Code's Task tool and
 spawns subagents — verify both the **main** route to ollama and the `task=subagent`
 lines. Spawning is still **flaky** (~1 in 4 attempts the main narrates the answer and
 stops), so a single no-spawn run is not a failure; re-run before scoring. For the
-**Router** entry point, `rayline router start` does **not** inject any credential —
+**Router** entry point, `raydock router start` does **not** inject any credential —
 export an **`rlk-` router key** as `RAYLINE_ROUTER_API_KEY` first, or cloud subagent
 legs fail while the local main still prints a plausible answer and exits 0. A session
-token (`rayline auth token`, `rls_…`) is the wrong credential: it clears the 401 and
+token (`raydock auth token`, `rls_…`) is the wrong credential: it clears the 401 and
 returns 403 from the model data plane. See README ⁷.
 
 ---

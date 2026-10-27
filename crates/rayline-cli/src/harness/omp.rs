@@ -2,7 +2,7 @@
 //! `config.yml`. A named profile (`OMP_PROFILE`/`PI_PROFILE`) makes omp ignore
 //! that override, so both are removed. omp also reads Claude Code's config from
 //! `CLAUDE_CONFIG_DIR` (MCP servers, skills); in testing, a
-//! `CLAUDE_CONFIG_DIR` inherited from `rayline claude` pulling another config
+//! `CLAUDE_CONFIG_DIR` inherited from `raydock claude` pulling another config
 //! into omp, so it is removed too. Header values name env vars; `apiKey` is the
 //! literal key.
 //!

@@ -140,3 +140,7 @@ jobs:
       - name: Build release binaries
         shell: bash
         run: cargo build --release -p rayline-cli -p rayline-daemon --locked
+
+      - name: Test installed command migration
+        shell: bash
+        run: cargo test -p rayline-cli --locked --test it_command_migration -- --test-threads=1

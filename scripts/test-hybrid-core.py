@@ -33,7 +33,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core", type=Path, required=True)
     parser.add_argument("--registry", type=Path, required=True)
-    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/rayline")
+    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
     parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     parser.add_argument("--claude", action="store_true", help="also run the installed Claude Code harness")
     parser.add_argument("--pi", action="store_true", help="also run the installed Pi harness")

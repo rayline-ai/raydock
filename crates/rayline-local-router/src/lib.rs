@@ -4492,7 +4492,7 @@ fn responses_translation_refusal(
                     "code": "unsupported_tool",
                     "param": "tools",
                     "message": format!(
-                        "Rayline Local cannot keep the allowed_callers restriction of the \
+                        "Raydock cannot keep the allowed_callers restriction of the \
                          function(s) {}: translated, the model could call them directly. Allow \
                          direct calls (\"direct\" in allowed_callers), or route to an endpoint \
                          that serves the Responses API natively.",
@@ -4514,7 +4514,7 @@ fn responses_translation_refusal(
                     "code": "unsupported_web_search",
                     "param": "tools",
                     "message": format!(
-                        "Rayline Local cannot translate this web_search to Anthropic: {reason}"
+                        "Raydock cannot translate this web_search to Anthropic: {reason}"
                     ),
                 }}),
             ),
@@ -4558,7 +4558,7 @@ fn unsupported_tool_response(kinds: &[String], target: HostedToolTarget) -> Resp
             "code": "unsupported_tool",
             "param": "tools",
             "message": format!(
-                "Rayline Local cannot translate the tool type(s) {names} for this route: {reason}. \
+                "Raydock cannot translate the tool type(s) {names} for this route: {reason}. \
                  Remove them from the request, or route to an endpoint that serves the Responses API natively."
             ),
         }}),

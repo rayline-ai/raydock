@@ -43,7 +43,7 @@ binary assets against `SHA256SUMS`.
 
 ## Self-Update Mirror
 
-The built-in `rayline update` command reads from `https://get.rayline.ai` by
+The built-in `raydock update` command reads from `https://get.rayline.ai` by
 default. After the GitHub Release is created, mirror the bare binary assets and
 **both** signature files to:
 
@@ -56,7 +56,7 @@ https://get.rayline.ai/cli/v<version>/SHA256SUMS
 https://get.rayline.ai/cli/v<version>/SHA256SUMS.minisig
 ```
 
-`SHA256SUMS.minisig` is **required**: `rayline update` verifies it against the
+`SHA256SUMS.minisig` is **required**: `raydock update` verifies it against the
 pinned public key before trusting any checksum, and fails closed if it is
 missing or invalid.
 
@@ -149,5 +149,5 @@ existing Rust deployment targets are unchanged. Linux hybrid is supported.
 Windows core cross-compiles, but Windows hybrid lifecycle is not qualified and
 the CLI refuses hybrid commands there. A successful cross-build is not runtime
 acceptance. The Homebrew formula template remains authoritative in
-`packaging/homebrew/rayline.rb.template`, with `__RELEASE_BASE_URL__` supplied by
+`packaging/homebrew/raydock.rb.template`, with `__RELEASE_BASE_URL__` supplied by
 the publishing pipeline.

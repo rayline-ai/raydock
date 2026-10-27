@@ -32,7 +32,7 @@ pub(crate) const ALLOW_EMPTY_SIGNATURE_ENV: &str = "RAYLINE_PI_ALLOW_EMPTY_SIGNA
 /// TODO: add "prod" once the prod router drops unsigned reasoning.
 const UNSIGNED_REASONING_ENVS: &[&str] = &["dev"];
 
-/// Whether `rayline pi` sets `compat.allowEmptySignature` for `env_name`:
+/// Whether `raydock pi` sets `compat.allowEmptySignature` for `env_name`:
 /// [`ALLOW_EMPTY_SIGNATURE_ENV`] if set to `1`/`0`, else the env default.
 pub(crate) fn allow_empty_signature(env_name: &str, override_value: Option<&str>) -> bool {
     super::parse_switch(override_value).unwrap_or(UNSIGNED_REASONING_ENVS.contains(&env_name))

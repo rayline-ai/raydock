@@ -38,7 +38,7 @@ pub fn default_config_path_for_env(home: &Path, env_name: &str) -> PathBuf {
         .join(format!("router.{env_name}.json"))
 }
 
-/// Default content: reproduce today's `rayline claude` — route everything to the
+/// Default content: reproduce today's `raydock claude` — route everything to the
 /// hosted cloud router at `router_url`. Users edit this to send subagents/main to
 /// local or custom endpoints.
 pub fn default_config_json(router_url: &str) -> Value {
@@ -140,7 +140,7 @@ fn config_value_uses_local_decider(cfg: &Value) -> bool {
 
 /// Whether any route targets the hosted cloud router — prod (`api.rayline.ai`)
 /// **or** dev (`api-dev.rayline.ai`) — so its `rlk-` key should be resolved from
-/// `rayline auth login`.
+/// `raydock auth login`.
 ///
 /// Both hosts, deliberately. This used to match prod only, which made a
 /// dev-targeted config fail three ways at once: no `rlk-` key was injected (the
@@ -166,7 +166,7 @@ pub fn config_uses_cloud_router(path: &Path) -> bool {
 
 /// Whether any route targets a hosted Rayline Cloud Router endpoint — prod
 /// (`api.rayline.ai`) **or** dev (`api-dev.rayline.ai`) — so its `rlk-` key
-/// should be provisioned from `rayline auth login`.
+/// should be provisioned from `raydock auth login`.
 ///
 /// The Codex-side spelling of [`config_uses_cloud_router`], kept as its own name
 /// because `codex.rs` guards its native rewrite on this question. The two were
@@ -310,7 +310,7 @@ fn config_value_may_local(cfg: &Value) -> Option<MayLocal> {
     let raw_base = endpoint_base_url_for_model(cfg, &model)?;
     // The custom-mode adapter appends `/v1/messages` to the upstream base
     // (`rayline-adapter` `format!("{}/v1/messages", target)`), so the upstream must
-    // be the server *root*. Normalize exactly like `rayline local custom` does —
+    // be the server *root*. Normalize exactly like `raydock local custom` does —
     // strip a trailing `/v1` — so an `openai_chat` endpoint's `…/v1` base_url does
     // not become `…/v1/v1/messages`.
     let upstream_url = crate::local_model::normalize_base_url(&raw_base);
@@ -1275,7 +1275,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// `rayline codex --config <file>` where the file declares only `routes.main`
+    /// `raydock codex --config <file>` where the file declares only `routes.main`
     /// (a single-model setup): the sentinel `--model` pins to that main and NO
     /// `subagent` route is invented. The local router then inherits main for
     /// subagent turns, so one route entry drives the whole session.

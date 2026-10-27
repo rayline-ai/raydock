@@ -161,7 +161,7 @@ def main():
     parser.add_argument("--proof", choices=("routing", "transport"), required=True,
                         help="routing requires applied V/prices and local/cloud outcomes; transport explicitly makes no such claim")
     parser.add_argument("--price-profile-content-hash", help="expected saved profile table hash (sha256:<hex>), distinct from decisions.price_sha256")
-    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/rayline")
+    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
     parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     parser.add_argument("--task-timeout-secs", type=int, default=300)
     parser.add_argument("--max-generations-per-task", type=int, default=4)

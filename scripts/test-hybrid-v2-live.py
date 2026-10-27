@@ -82,7 +82,7 @@ def main():
     parser.add_argument("--scenario", choices=("a", "b", "c"), required=True)
     parser.add_argument("--schedule-model", nargs="+", help="settings hybrid.routing.schedule.model (e.g. cache_boundaries user_messages)")
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/rayline")
+    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
     parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     parser.add_argument("--no-warmup", action="store_true", help="scenario b: send only the scheduler prompt (task start is the boundary)")
     parser.add_argument("--max-generations", type=int, default=12)

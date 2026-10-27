@@ -339,7 +339,7 @@ impl ProfileStore {
             }) || (state["phase"] == "active" && config["deploymentMode"] != "3p")
             {
                 return Err(invalid(
-                    "Desktop selection changed or setup was interrupted. Run `rayline claude-desktop off` to recover; if it reports a selection conflict, select Rayline ARC in Desktop before retrying off",
+                    "Desktop selection changed or setup was interrupted. Run `raydock claude-desktop off` to recover; if it reports a selection conflict, select Rayline ARC in Desktop before retrying off",
                 ));
             }
             self.require_profile(&state["previous"]["appliedId"])?;
@@ -399,7 +399,7 @@ impl ProfileStore {
             state["previous"] = json!({"appliedId": meta["appliedId"], "hybridPointer": meta["hybridPointer"], "mode": config["deploymentMode"]});
         } else if meta["appliedId"] != id {
             return Err(invalid(
-                "Desktop selection changed or setup was interrupted; run `rayline claude-desktop off` before retrying",
+                "Desktop selection changed or setup was interrupted; run `raydock claude-desktop off` before retrying",
             ));
         }
         state["phase"] = json!("prepared");
@@ -649,7 +649,7 @@ mod macos {
         let changed = !store.matches(desired)?;
         if changed {
             eprintln!(
-                "Selecting Rayline ARC for the whole Claude Desktop app; Chat and Cowork are off in this profile. Your previous selection is saved for `rayline claude-desktop off`."
+                "Selecting Rayline ARC for the whole Claude Desktop app; Chat and Cowork are off in this profile. Your previous selection is saved for `raydock claude-desktop off`."
             );
             quit()?;
             if let Err(error) = store.activate(desired) {
@@ -671,7 +671,7 @@ mod macos {
             }
             return Err(error);
         }
-        Ok("Selected the Rayline ARC profile and asked macOS to open Claude Desktop.\nOpen Code and select arc-sage or arc-swift. If prompted, continue with the configured gateway.\nUse `rayline claude-desktop off` to restore your previous profile.\n".to_owned())
+        Ok("Selected the Rayline ARC profile and asked macOS to open Claude Desktop.\nOpen Code and select arc-sage or arc-swift. If prompted, continue with the configured gateway.\nUse `raydock claude-desktop off` to restore your previous profile.\n".to_owned())
     }
 
     pub(super) fn restore(home: &Path) -> io::Result<bool> {

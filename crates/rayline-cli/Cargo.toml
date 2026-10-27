@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Rayline public Rust CLI launcher"
+description = "Raydock on-device CLI for Rayline"
 homepage.workspace = true
 repository.workspace = true
 publish.workspace = true
@@ -14,7 +14,7 @@ publish.workspace = true
 workspace = true
 
 [[bin]]
-name = "rayline"
+name = "raydock"
 path = "src/main.rs"
 
 [dependencies]

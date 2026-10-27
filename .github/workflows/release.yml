@@ -120,6 +120,10 @@ jobs:
           set -euo pipefail
           cargo build --release -p rayline-cli -p rayline-daemon --locked
 
+      - name: Test installed command migration
+        shell: bash
+        run: cargo test -p rayline-cli --locked --test it_command_migration -- --test-threads=1
+
       - name: Package release assets
         shell: bash
         env:
@@ -133,23 +137,26 @@ jobs:
 
           rayline_asset="rayline-${PLATFORM_TAG}"
           daemon_asset="rld-${PLATFORM_TAG}"
-          cp "target/release/rayline${EXE_SUFFIX}" "dist/${rayline_asset}"
+          cp "target/release/raydock${EXE_SUFFIX}" "dist/${rayline_asset}"
           cp "target/release/rld${EXE_SUFFIX}" "dist/${daemon_asset}"
 
           package_dir="rayline-${VERSION}-${PLATFORM_TAG}"
           mkdir -p "package/${package_dir}"
-          cp "target/release/rayline${EXE_SUFFIX}" "package/${package_dir}/rayline${EXE_SUFFIX}"
+          cp "target/release/raydock${EXE_SUFFIX}" "package/${package_dir}/raydock${EXE_SUFFIX}"
           cp "target/release/rld${EXE_SUFFIX}" "package/${package_dir}/rld${EXE_SUFFIX}"
           cp "dist/rayline-core-${PLATFORM_TAG}" "package/${package_dir}/rayline-core${EXE_SUFFIX}"
           cp dist/rayline-core-source.json dist/rayline-core-LICENSE "package/${package_dir}/"
           cp README.md LICENSE NOTICE "package/${package_dir}/"
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp "package/${package_dir}/raydock.exe" "package/${package_dir}/rayline.exe"
+            "package/${package_dir}/rayline.exe" --version
             pwsh -NoProfile -Command \
               "Compress-Archive -Path 'package/${package_dir}/*' -DestinationPath 'dist/${package_dir}.${ARCHIVE_EXT}' -Force"
           else
+            ln -s raydock "package/${package_dir}/rayline"
             chmod 0755 "dist/${rayline_asset}" "dist/${daemon_asset}" "dist/rayline-core-${PLATFORM_TAG}"
-            chmod 0755 "package/${package_dir}/rayline" "package/${package_dir}/rld" "package/${package_dir}/rayline-core"
+            chmod 0755 "package/${package_dir}/raydock" "package/${package_dir}/rld" "package/${package_dir}/rayline-core"
             tar -C package -czf "dist/${package_dir}.${ARCHIVE_EXT}" "${package_dir}"
           fi
 

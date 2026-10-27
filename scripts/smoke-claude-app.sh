@@ -5,7 +5,7 @@
 # ARC model, then stops the router. Never prints the key.
 set -euo pipefail
 REPO=${REPO:-$(cd "$(dirname "$0")/.." && pwd)}
-RAYLINE=${RAYLINE:-$REPO/target/debug/rayline}
+RAYLINE=${RAYLINE:-$REPO/target/debug/raydock}
 export RLD_BIN=${RLD_BIN:-$REPO/target/debug/rld}
 CLAUDE=${CLAUDE:-$(command -v claude)}
 # Desktop's hidden model ids and the ARC tier each must route to.

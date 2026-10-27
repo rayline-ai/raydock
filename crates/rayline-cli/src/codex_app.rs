@@ -1,6 +1,6 @@
-//! `rayline codex app` — launch the Codex **desktop app** routed through Rayline.
+//! `raydock codex app` — launch the Codex **desktop app** routed through Rayline.
 //!
-//! Mirrors `rayline codex` (same `--config`/`--auth`/`--model` flags, same
+//! Mirrors `raydock codex` (same `--config`/`--auth`/`--model` flags, same
 //! router-daemon path) but targets the desktop app instead of the CLI. The
 //! desktop app-server differs from the CLI in two ways that shape this module:
 //!
@@ -43,7 +43,7 @@ pub struct AppRunRequest {
 
 pub async fn run(mut request: AppRunRequest) -> ExitCode {
     // Default (no `--config`, auto auth) to Rc-Rc — route everything to the hosted
-    // cloud RCR, mirroring `rayline claude` and `rayline codex`. Shared resolver
+    // cloud RCR, mirroring `raydock claude` and `raydock codex`. Shared resolver
     // so the default is defined once.
     match crate::codex::resolve_codex_config_path_from_home(
         request.config_path.take(),
@@ -56,7 +56,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
             return ExitCode::from(1);
         }
     }
-    // 1. Start/ensure the Rayline router — identical path to `rayline codex`.
+    // 1. Start/ensure the Rayline router — identical path to `raydock codex`.
     let router_api_key_override = crate::codex::resolve_cloud_router_key(
         request.config_path.as_deref(),
         request.env_name.as_deref(),
@@ -140,7 +140,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
         // failure (matching the Codex CLI path), not silent success.
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => {
-            eprintln!("rayline: failed to launch codex app: {error}");
+            eprintln!("raydock: failed to launch codex app: {error}");
             ExitCode::from(127)
         }
     }
@@ -721,7 +721,7 @@ mod tests {
     fn config_unchanged_when_settings_present_whatever_the_app_layout() {
         // Same settings, but the app moved [tools] above our table, added its own
         // root key and re-serialised our table (order, spacing): still "unchanged".
-        let existing = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nwire_api=\"responses\"\nname = \"Rayline Local\"\nbase_url =   \"http://127.0.0.1:20811/v1\"\n\n[desktop]\nx = 1\n";
+        let existing = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nwire_api=\"responses\"\nname = \"Raydock\"\nbase_url =   \"http://127.0.0.1:20811/v1\"\n\n[desktop]\nx = 1\n";
         assert!(!generated_config_differs(
             existing,
             &snippet("rayline-local", false)
@@ -894,7 +894,7 @@ mod tests {
     // keys and tables of its own and has moved [tools] above our table.
     fn app_shaped_config(rayline_model: &str) -> String {
         format!(
-            "model = \"{rayline_model}\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+            "model = \"{rayline_model}\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
         )
     }
 
@@ -958,7 +958,7 @@ mod tests {
         // An earlier release composed a fresh block over a suffix that still held
         // the previous table — invalid TOML the app refuses to load.
         let existing = format!(
-            "{}\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nx = 1\n",
+            "{}\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nx = 1\n",
             snippet("rayline-local", false)
         );
         let generated = snippet("rayline-local", false);

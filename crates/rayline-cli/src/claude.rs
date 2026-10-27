@@ -163,7 +163,7 @@ fn default_model_for_routing_mode(mode: RoutingMode) -> &'static str {
 /// - `config_present`: a `--config` file is in play. When true, the config is the
 ///   sole driver of may-local (a `local_models` route → the Rcl-Rcl/S-Rcl arm), so the
 ///   implicit path is suppressed — e.g. a cloud-only `Rc-Rc` (`--local-model=off`)
-///   stays pure cloud even with `rayline local on` + a local model configured.
+///   stays pure cloud even with `raydock local on` + a local model configured.
 /// - Env (`Override`) mode is cloud-only by contract (sets `ANTHROPIC_BASE_URL`
 ///   directly, can't reach local), so it never engages.
 /// - `--isolated` opts out; an isolated local session must be requested with `--local`.
@@ -550,7 +550,7 @@ async fn run_command_from_home(
         .unwrap_or(false);
     // `--config` whose routes stay entirely on the hosted cloud router: no on-device
     // router, but the proxy still gets the config (subagent allowlist) and the scope
-    // is derived from `routes.main`. Behaves like a cloud `rayline claude` with the
+    // is derived from `routes.main`. Behaves like a cloud `raydock claude` with the
     // config's per-type subagent allowlist applied.
     let config_cloud_only = effective_config.is_some()
         && request.routing_mode != RoutingMode::Override
@@ -655,7 +655,7 @@ async fn run_command_from_home(
                 RunError::Router(format!("failed to prepare config for the router: {error}"))
             })?,
         );
-        // Reuse `rayline auth login` for a hosted cloud-router endpoint — inject the
+        // Reuse `raydock auth login` for a hosted cloud-router endpoint — inject the
         // stored key so its `api_key_env` resolves with no manual env var. Best
         // effort: the daemon surfaces a clear error only if a cloud route is hit.
         if crate::router_config::config_uses_cloud_router(&path) {
@@ -691,7 +691,7 @@ async fn run_command_from_home(
         // can 307-redirect to it (may-local). Mirrors the proven account-toggle
         // may-local path (`defaults()` keeps the hosted decision plane + cloud
         // `router_url`; `from_local_model`-style Custom fields point the adapter at
-        // the upstream), sourced from `local_models` instead of `rayline local on`.
+        // the upstream), sourced from `local_models` instead of `raydock local on`.
         eprintln!(
             "Routing via config: {} (may-local → {})",
             effective_config
@@ -707,7 +707,7 @@ async fn run_command_from_home(
         start_request.router_url = router_url.to_owned();
         start_request.router_url_explicit = true;
         start_request.injector_port = injector_port;
-        // Cloud-router endpoint: inject the stored `rayline auth login` key so the
+        // Cloud-router endpoint: inject the stored `raydock auth login` key so the
         // embedded proxy authenticates to the RCR without a manual env var.
         start_request.router_api_key_override = ensure_router_key(
             &env_name,
@@ -796,7 +796,7 @@ async fn run_command_from_home(
         .map(|start_request| start_request.injector_port);
 
     // Correct the parse-time routing mode now that local engagement is known.
-    // The parser resolves bare cloud `rayline claude` to route-all `Proxy`, but
+    // The parser resolves bare cloud `raydock claude` to route-all `Proxy`, but
     // when account-local routing engages without an explicit `--route` the scope
     // must fall back to the hybrid subagents-only default (main agent on cloud
     // Claude, subagents on-device) — the same default as explicit `--local`.
@@ -1072,7 +1072,7 @@ fn router_url_for_run(
 ///
 /// Shared by the Claude run path and the Codex run/app paths (see
 /// [`crate::codex::resolve_cloud_router_key`]) so a config whose route targets a
-/// `rayline-cloud` endpoint authenticates from a plain `rayline auth login` with
+/// `rayline-cloud` endpoint authenticates from a plain `raydock auth login` with
 /// no manual `RAYLINE_ROUTER_API_KEY`.
 pub(crate) async fn ensure_router_key(
     env_name: &str,
@@ -3347,7 +3347,7 @@ mod implicit_local_routing_tests {
             true,
             true
         ));
-        // And plain `rayline claude` (no config) still honors the toggle.
+        // And plain `raydock claude` (no config) still honors the toggle.
         assert!(implicit_local_engages(
             RoutingMode::Proxy,
             false,

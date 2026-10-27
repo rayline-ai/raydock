@@ -1,3 +1,4 @@
+mod command_alias;
 use std::env;
 use std::ffi::OsString;
 use std::io::IsTerminal as _;
@@ -23,9 +24,11 @@ pub mod router_config;
 pub mod status;
 pub mod update;
 
-pub const CLI_BIN: &str = "rayline";
+pub const CLI_BIN: &str = "raydock";
+/// Immutable download identifier; existing updaters verify these filenames.
+pub const CLI_ASSET: &str = "rayline";
 pub const DAEMON_BIN: &str = "rld";
-pub const DISPLAY_NAME: &str = "Rayline";
+pub const DISPLAY_NAME: &str = "Raydock";
 pub const CONFIG_DIR: &str = "rayline";
 pub const DOT_CONFIG_DIR: &str = ".rayline";
 pub const ROUTER_STATE_DIR: &str = ".rayline/rld";
@@ -48,7 +51,7 @@ pub const MINISIGN_PUBLIC_KEYS: &[&str] = &[
 ];
 
 const ROOT_HELP: &str = "\
-Usage: rayline [OPTIONS] COMMAND [ARGS]...
+Usage: raydock [OPTIONS] COMMAND [ARGS]...
 
 Options:
   --version    Show version
@@ -69,17 +72,17 @@ Commands:
   hybrid     Start the ARC execution core or connect a harness to it
   top        Show live router request metrics
   local      Configure local model routing
-  update     Check for or install a rayline launcher update
+  update     Check for or install a Raydock launcher update
 ";
 
 const STATUS_HELP: &str = "\
-Usage: rayline status
+Usage: raydock status
 
 Show current CLI auth status.
 ";
 
 const AUTH_HELP: &str = "\
-Usage: rayline auth COMMAND
+Usage: raydock auth COMMAND
 
 Commands:
   login    Sign in to Rayline
@@ -89,7 +92,7 @@ Commands:
 ";
 
 const AUTH_LOGIN_HELP: &str = "\
-Usage: rayline auth login [OPTIONS]
+Usage: raydock auth login [OPTIONS]
 
 Options:
   -b, --no-browser     Use device-code login instead of a local callback
@@ -98,26 +101,26 @@ Options:
 ";
 
 const AUTH_LOGOUT_HELP: &str = "\
-Usage: rayline auth logout
+Usage: raydock auth logout
 
 Revoke the stored Rayline session and remove the stored router key.
 ";
 
 const AUTH_STATUS_HELP: &str = "\
-Usage: rayline auth status
+Usage: raydock auth status
 
 Show current auth status.
 ";
 
 const AUTH_TOKEN_HELP: &str = "\
-Usage: rayline auth token
+Usage: raydock auth token
 
 Print a valid account bearer token for scripts and integrations.
 ";
 
 const CLAUDE_HELP: &str = "\
-Usage: rayline claude [OPTIONS] [--] [CLAUDE_ARGS]...
-       rayline claude run [OPTIONS] [--] [CLAUDE_ARGS]...
+Usage: raydock claude [OPTIONS] [--] [CLAUDE_ARGS]...
+       raydock claude run [OPTIONS] [--] [CLAUDE_ARGS]...
 
 Run Claude Code through Rayline hosted routing. Use --local for the
 local static router path.
@@ -151,13 +154,13 @@ Options:
 ";
 
 const CLAUDE_APP_HELP: &str = "\
-Usage: rayline claude-desktop [COMMAND] [OPTIONS]
+Usage: raydock claude-desktop [COMMAND] [OPTIONS]
 
 Run Claude Code inside the Claude desktop app on ARC. The import adds two
 models to Desktop's picker: arc-sage (default) and arc-swift (cheaper). ARC is
 not a Claude model, and Rayline is not affiliated with Anthropic. Starts a dedicated
 local router (its own ports and state in ~/.rayline/claude-desktop, separate
-from `rayline claude` and `rayline codex`), selects a recoverable Rayline ARC
+from `raydock claude` and `raydock codex`), selects a recoverable Rayline ARC
 profile, and opens Claude Desktop. A running Desktop is gracefully restarted
 when its configuration changes. --manual prints import instructions instead.
 Your Rayline key stays in the router; Desktop gets a gateway
@@ -165,7 +168,7 @@ token that only unlocks this local router. macOS only (the router also runs on
 Linux, for testing).
 
 Third-party mode applies to the whole Desktop app and switches away from your
-claude.ai subscription; `rayline claude-desktop off` restores the previous mode.
+claude.ai subscription; `raydock claude-desktop off` restores the previous mode.
 
 Commands:
   start              Configure and launch Desktop with ARC (default)
@@ -188,9 +191,9 @@ Options:
 ";
 
 const CODEX_HELP: &str = "\
-Usage: rayline codex [OPTIONS] [--] [CODEX_ARGS]...
-       rayline codex app [OPTIONS] [WORKSPACE]
-       rayline codex configure [OPTIONS]
+Usage: raydock codex [OPTIONS] [--] [CODEX_ARGS]...
+       raydock codex app [OPTIONS] [WORKSPACE]
+       raydock codex configure [OPTIONS]
 
 Start Rayline's local OpenAI Responses router and run Codex CLI against it.
 
@@ -201,7 +204,7 @@ Options:
   --auth <mode>           Codex auth source: auto|subscription|none.
                           auto with no --config defaults to Rc-Rc (route
                           everything to the hosted cloud router, like
-                          `rayline claude`); with --config it follows the
+                          `raydock claude`); with --config it follows the
                           config. subscription uses your ChatGPT subscription;
                           none runs local.
   --subscription          Alias for --auth subscription
@@ -209,7 +212,7 @@ Options:
 ";
 
 const CODEX_APP_HELP: &str = "\
-Usage: rayline codex app [OPTIONS] [WORKSPACE]
+Usage: raydock codex app [OPTIONS] [WORKSPACE]
 
 Start Rayline's local router and launch the Codex desktop app against it.
 
@@ -231,7 +234,7 @@ Options:
 ";
 
 const CODEX_CONFIGURE_HELP: &str = "\
-Usage: rayline codex configure [OPTIONS]
+Usage: raydock codex configure [OPTIONS]
 
 Write a Codex profile at $CODEX_HOME/rayline.config.toml (or ~/.codex).
 
@@ -247,7 +250,7 @@ Options:
 ";
 
 const ROUTER_HELP: &str = "\
-Usage: rayline router COMMAND
+Usage: raydock router COMMAND
 
 Commands:
   start    Start router processes
@@ -258,12 +261,12 @@ Commands:
 ";
 
 const ROUTER_START_HELP: &str = "\
-Usage: rayline router start [--mode <anthropic|codex>] [--route <all|subagents>] [--config <path>]
+Usage: raydock router start [--mode <anthropic|codex>] [--route <all|subagents>] [--config <path>]
 
 Start the local router + transparent proxy daemon and exit, leaving it running.
 Point an Anthropic SDK client at the proxy on http://127.0.0.1:20810 (and trust
 the proxy CA cert) to route requests through it. The on-device model comes from
-your `rayline local` configuration.
+your `raydock local` configuration.
 
 Options:
   --mode <anthropic|codex>  Inbound API surface (default: anthropic). `codex`
@@ -283,20 +286,20 @@ Options:
 ";
 
 const ROUTER_STATUS_HELP: &str = "\
-Usage: rayline router status
+Usage: raydock router status
 
 Show local router process status.
 ";
 
 const ROUTER_LOGS_HELP: &str = "\
-Usage: rayline router logs [--lines <count>]
+Usage: raydock router logs [--lines <count>]
 
 Print local router logs.
 ";
 
 const ROUTER_TOP_HELP: &str = "\
-Usage: rayline top [--json] [--all]
-       rayline router top [--json] [--all]
+Usage: raydock top [--json] [--all]
+       raydock router top [--json] [--all]
 
 Show live LLM request metrics.
 
@@ -306,13 +309,13 @@ Options:
 ";
 
 const ROUTER_STOP_HELP: &str = "\
-Usage: rayline router stop
+Usage: raydock router stop
 
 Stop local router processes.
 ";
 
 const LOCAL_HELP: &str = "\
-Usage: rayline local COMMAND
+Usage: raydock local COMMAND
 
 Configure local model routing for this machine.
 
@@ -327,85 +330,85 @@ Commands:
   clear     Remove the local model configuration
   on        Turn local routing on for your account
   off       Turn local routing off for your account
-  onboard   Set up or re-pick a local model for `rayline claude --local`
+  onboard   Set up or re-pick a local model for `raydock claude --local`
   subagents Discover your subagents and map each to local or cloud
 ";
 
 const LOCAL_MODELS_HELP: &str = "\
-Usage: rayline local models [--json]
+Usage: raydock local models [--json]
 
 List provider and recommended local models.
 ";
 
 const LOCAL_DOWNLOAD_HELP: &str = "\
-Usage: rayline local download <model-id> [--json]
+Usage: raydock local download <model-id> [--json]
 
 Download a recommended model into the local cache without selecting it.
 ";
 
 const LOCAL_USE_HELP: &str = "\
-Usage: rayline local use <number|model-id>
+Usage: raydock local use <number|model-id>
 
 Select a provider model or recommended built-in model.
-Numbers come from `rayline local models`.
+Numbers come from `raydock local models`.
 ";
 
 const LOCAL_REMOVE_HELP: &str = "\
-Usage: rayline local remove <model-id>
+Usage: raydock local remove <model-id>
 
 Delete a downloaded model's file from the local cache.
 ";
 
 const LOCAL_CUSTOM_HELP: &str = "\
-Usage: rayline local custom [--url <URL>] [--model <NAME>]
+Usage: raydock local custom [--url <URL>] [--model <NAME>]
 
 Use a custom local inference endpoint.
 ";
 
 const LOCAL_SHOW_HELP: &str = "\
-Usage: rayline local show
+Usage: raydock local show
 
 Show the configured local model mode and account routing state.
 ";
 
 const LOCAL_TEST_HELP: &str = "\
-Usage: rayline local test [--url <URL>] [--model <NAME>]
+Usage: raydock local test [--url <URL>] [--model <NAME>]
 
 Probe a custom endpoint for protocol compatibility.
 ";
 
 const LOCAL_CLEAR_HELP: &str = "\
-Usage: rayline local clear
+Usage: raydock local clear
 
 Remove the local model configuration.
 ";
 
 const LOCAL_ON_HELP: &str = "\
-Usage: rayline local on
+Usage: raydock local on
 
 Turn local routing on for your account.
 ";
 
 const LOCAL_OFF_HELP: &str = "\
-Usage: rayline local off
+Usage: raydock local off
 
 Turn local routing off for your account.
 ";
 
 const LOCAL_ONBOARD_HELP: &str = "\
-Usage: rayline local onboard [--reset]
+Usage: raydock local onboard [--reset]
 
-Set up (or re-pick) a local model for `rayline claude --local`.
+Set up (or re-pick) a local model for `raydock claude --local`.
 
 Options:
   --reset    Clear the current local model first, then run the wizard
 ";
 
 const LOCAL_SUBAGENTS_HELP: &str = "\
-Usage: rayline local subagents [--json] [--all]
+Usage: raydock local subagents [--json] [--all]
 
 Scan your Claude Code history for the subagents you use and map each to a
-routing target (local or cloud) for `rayline claude --local`. Read-only agents
+routing target (local or cloud) for `raydock claude --local`. Read-only agents
 are pre-selected for local. The mapping is saved to settings.json and applied
 on the next `--local` launch.
 
@@ -423,24 +426,32 @@ Options:
 ";
 
 const UPDATE_HELP: &str = "\
-Usage: rayline update [OPTIONS]
+Usage: raydock update [OPTIONS]
 
 Options:
   --check              Check for an update without installing
   --version <version>  Install or check a specific version
   --channel <channel>  Use prod, dev, main, or local
   --force              Install even when already current
-  --dry-run            Download and verify without replacing rayline
+  --dry-run            Download and verify without replacing Raydock
 ";
 
 pub async fn run() -> ExitCode {
+    match command_alias::migrate_legacy_payload() {
+        Ok(Some(primary)) => return command_alias::forward(&primary),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("Raydock command migration failed: {error}");
+            return ExitCode::FAILURE;
+        }
+    }
     let original_argv = env::args_os().collect::<Vec<_>>();
     run_argv(&original_argv).await
 }
 
 pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
     if root_version_requested(original_argv) {
-        println!("rayline {RAYLINE_VERSION}");
+        println!("raydock {RAYLINE_VERSION}");
         return ExitCode::SUCCESS;
     }
 
@@ -451,7 +462,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
 
     match rayline_dispatch_for_argv(original_argv) {
         RaylineDispatch::Version => {
-            println!("rayline {RAYLINE_VERSION}");
+            println!("raydock {RAYLINE_VERSION}");
             ExitCode::SUCCESS
         }
         RaylineDispatch::Status(request) => match status::render_status(&request) {
@@ -487,7 +498,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                     ExitCode::SUCCESS
                 }
                 Ok(status::AuthTokenOutcome::NotLoggedIn) => {
-                    eprintln!("Error: Not logged in to {env_name}. Run: rayline auth login");
+                    eprintln!("Error: Not logged in to {env_name}. Run: raydock auth login");
                     ExitCode::from(1)
                 }
                 Err(error) => {
@@ -926,7 +937,7 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
     RaylineDispatch::Unavailable
 }
 
-/// `rayline [--env E] <harness> [--env E] [--auth-token T] [--] [ARGS]...`.
+/// `raydock [--env E] <harness> [--env E] [--auth-token T] [--] [ARGS]...`.
 /// Rayline options are read only before the first other arg; everything from
 /// there (or after `--`) passes through to the harness, including `--help`.
 fn parse_harness_request<'a, I>(
@@ -2278,7 +2289,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     use std::os::unix::process::CommandExt;
 
     let error = command.exec();
-    eprintln!("rayline: failed to exec claude: {error}");
+    eprintln!("raydock: failed to exec claude: {error}");
     ExitCode::from(127)
 }
 
@@ -2287,7 +2298,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     match command.status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => {
-            eprintln!("rayline: failed to run claude: {error}");
+            eprintln!("raydock: failed to run claude: {error}");
             ExitCode::from(127)
         }
     }
@@ -2295,7 +2306,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 
 fn unavailable(original_argv: &[OsString]) -> ExitCode {
     let command = first_command(original_argv).unwrap_or("command");
-    eprintln!("rayline: `{command}` is not available in this public Rayline build");
+    eprintln!("raydock: `{command}` is not available in this public Rayline build");
     ExitCode::from(127)
 }
 
@@ -2717,25 +2728,25 @@ mod tests {
     fn public_help_surface_is_native() {
         for (args, needle) in [
             (&["rayline", "--help"][..], "Commands:"),
-            (&["rayline", "update", "--help"][..], "rayline update"),
+            (&["rayline", "update", "--help"][..], "raydock update"),
             (
                 &["rayline", "router", "status", "--help"][..],
-                "rayline router status",
+                "raydock router status",
             ),
             (
                 &["rayline", "router", "logs", "--help"][..],
-                "rayline router logs",
+                "raydock router logs",
             ),
             (
                 &["rayline", "router", "top", "--help"][..],
-                "rayline router top",
+                "raydock router top",
             ),
-            (&["rayline", "top", "--help"][..], "rayline top"),
+            (&["rayline", "top", "--help"][..], "raydock top"),
             (
                 &["rayline", "router", "stop", "--help"][..],
-                "rayline router stop",
+                "raydock router stop",
             ),
-            (&["rayline", "local", "--help"][..], "rayline local"),
+            (&["rayline", "local", "--help"][..], "raydock local"),
         ] {
             let help = rayline_help_for_argv(&argv(args)).expect("native help");
             assert!(help.contains(needle), "{args:?} should mention {needle:?}");
@@ -3234,7 +3245,7 @@ mod tests {
 
     #[test]
     fn claude_without_app_still_runs_claude_code() {
-        // `rayline claude app` stays Claude Code's: `app` is a prompt word.
+        // `raydock claude app` stays Claude Code's: `app` is a prompt word.
         match rayline_dispatch_for_argv(&argv(&["rayline", "claude", "app"])) {
             RaylineDispatch::ClaudeRun(request) => {
                 assert_eq!(request.args, argv(&["app"]));
