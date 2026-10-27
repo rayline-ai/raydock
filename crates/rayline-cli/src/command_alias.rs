@@ -18,10 +18,14 @@ pub(crate) fn primary_path(path: &Path) -> PathBuf {
 pub(crate) fn migrate_legacy_payload() -> Result<Option<PathBuf>, UpdateError> {
     let running = std::env::current_exe()?;
     // Linux marks an unlinked running executable with this suffix. Another
-    // first invocation may already have installed the alias while we started.
-    // Accept only the completed migration layout, never an arbitrary sibling.
+    // first invocation may replace either the legacy payload or the primary
+    // while our forwarded process starts. Accept only the completed migration
+    // layout, never an arbitrary sibling.
     #[cfg(target_os = "linux")]
-    if running.file_name().and_then(|name| name.to_str()) == Some("rayline (deleted)") {
+    if matches!(
+        running.file_name().and_then(|name| name.to_str()),
+        Some("rayline (deleted)" | "raydock (deleted)")
+    ) {
         let primary = primary_path(&running);
         let alias = running.with_file_name("rayline");
         if std::fs::canonicalize(&alias)? != primary {
