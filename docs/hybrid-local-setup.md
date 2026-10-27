@@ -45,8 +45,10 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    rayline local custom --url http://127.0.0.1:8080/v1 --model qwen3.8-27b
    ```
 
-   This is the local endpoint hybrid routing uses. ARC treats it as Qwen 3.8
-   27B, its local model.
+   This is the local endpoint hybrid routing uses. It must serve Qwen3.8-27B
+   (Hugging Face `Qwen/Qwen3.8-27B`; Ollama `qwen3.8:27b`), ARC's local model.
+   `rayline hybrid start` checks the loaded model on llama.cpp and Ollama, and
+   runs the session cloud only if it is another model.
 
 3. **Start and connect a harness.**
 

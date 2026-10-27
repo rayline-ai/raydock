@@ -7,6 +7,12 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline
 
 ### Fixed
 
+- **Hybrid routing checks the local model is Qwen3.8-27B.** `rayline hybrid
+  start` reads what the runtime has loaded (llama.cpp `/props`, Ollama
+  `/api/show`); another model is refused for local routing and the session
+  runs cloud only, with an error naming what was found. Runtimes that do not
+  report it get a warning. Release archives now include `NOTICE`, which
+  attributes the embedded Qwen3.8-27B tokenizer data (Apache-2.0).
 - **`rayline hybrid run opencode` works with OpenCode 2.** Every turn was
   refused with "output allowance exceeds the admitted deployment limit":
   every hybrid harness (OpenCode, omp, OpenClaw, Hermes, Claude Code, Codex)

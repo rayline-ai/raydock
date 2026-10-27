@@ -209,11 +209,14 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         None => crate::hybrid_profile::local_context_window(settings.as_ref())
                             .map_err(settings_error)?,
                     };
-                    let window = match crate::hybrid_profile::probe_llamacpp_context(
-                        &client, &base_url,
-                    )
-                    .await
-                    {
+                    let runtime =
+                        crate::hybrid_profile::read_local_runtime(&client, &base_url, &model).await;
+                    if let Some(message) = runtime.identity.start_message(&base_url) {
+                        eprintln!("{message}");
+                    }
+                    let local_refused = runtime.identity.refuses_local();
+                    let window = match runtime.window {
+                        _ if local_refused => configured,
                         // The runtime cannot hold more than it was loaded with.
                         Some(loaded) if loaded < configured => {
                             eprintln!(
@@ -242,7 +245,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                             .await
                             .map_err(|error| io::Error::other(error.to_string()))?;
                     }
-                    let profile = crate::hybrid_profile::default_profile(
+                    let mut profile = crate::hybrid_profile::default_profile(
                         &hosted.router_url,
                         &base_url,
                         &model,
@@ -251,10 +254,18 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         settings.as_ref(),
                     )
                     .map_err(settings_error)?;
-                    println!(
-                        "Default hybrid profile: decisions via {} (model rayline-router), local window {window} tokens",
-                        hosted.router_url
-                    );
+                    if local_refused {
+                        crate::hybrid_profile::without_local(&mut profile);
+                        println!(
+                            "Default hybrid profile: decisions via {} (model rayline-router), cloud only",
+                            hosted.router_url
+                        );
+                    } else {
+                        println!(
+                            "Default hybrid profile: decisions via {} (model rayline-router), local window {window} tokens",
+                            hosted.router_url
+                        );
+                    }
                     (profile, paths.dir.clone())
                 }
             };
