@@ -166,7 +166,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let model = |compat: serde_json::Value| {
         json!({
             "id": ROUTER_MODEL,
-            "name": format!("Rayline router ({})", ctx.env_name),
+            "name": format!("Raydock router ({})", ctx.env_name),
             "reasoning": true,
             "input": ctx.input_modalities(),
             "contextWindow": ctx.context_window(),

@@ -62,7 +62,7 @@ Commands:
   status     Show current CLI auth status
   claude     Run Claude Code through Rayline routing
   claude-desktop  Run Claude Desktop's Code sessions on ARC (local router)
-  codex      Run Codex CLI through Rayline local Responses routing
+  codex      Run Codex CLI through Raydock Responses routing
   opencode   Run opencode against the Rayline router
   pi         Run pi against the Rayline router
   omp        Run oh-my-pi (omp) against the Rayline router
@@ -195,7 +195,7 @@ Usage: raydock codex [OPTIONS] [--] [CODEX_ARGS]...
        raydock codex app [OPTIONS] [WORKSPACE]
        raydock codex configure [OPTIONS]
 
-Start Rayline's local OpenAI Responses router and run Codex CLI against it.
+Start Raydock's local OpenAI Responses router and run Codex CLI against it.
 
 Options:
   --model <model>         Real model to request (e.g. gpt-5.6-luna). Omit to let the
@@ -214,7 +214,7 @@ Options:
 const CODEX_APP_HELP: &str = "\
 Usage: raydock codex app [OPTIONS] [WORKSPACE]
 
-Start Rayline's local router and launch the Codex desktop app against it.
+Start Raydock's local router and launch the Codex desktop app against it.
 
 Unlike the CLI, the desktop app-server ignores -c overrides and is
 single-instance, so this writes the Rayline provider into an isolated
@@ -2306,7 +2306,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 
 fn unavailable(original_argv: &[OsString]) -> ExitCode {
     let command = first_command(original_argv).unwrap_or("command");
-    eprintln!("raydock: `{command}` is not available in this public Rayline build");
+    eprintln!("raydock: `{command}` is not available in this public Raydock build");
     ExitCode::from(127)
 }
 

@@ -79,7 +79,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "headers": ctx.conversation_headers(CONV_ID_ENV),
                 "models": [{
                     "id": ROUTER_MODEL,
-                    "name": format!("Rayline router ({})", ctx.env_name),
+                    "name": format!("Raydock router ({})", ctx.env_name),
                     "reasoning": true,
                     "input": ctx.input_modalities(),
                     "contextWindow": ctx.context_window(),
@@ -136,7 +136,7 @@ mod tests {
         id: \"rayline-router\"
         input: [\"text\", \"image\"]
         maxTokens: 32000
-        name: \"Rayline router (dev)\"
+        name: \"Raydock router (dev)\"
         reasoning: true
 "
         );

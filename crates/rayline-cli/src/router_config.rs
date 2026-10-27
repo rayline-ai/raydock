@@ -164,7 +164,7 @@ pub fn config_uses_cloud_router(path: &Path) -> bool {
         .any(|endpoint| cloud_ids.contains(&endpoint))
 }
 
-/// Whether any route targets a hosted Rayline Cloud Router endpoint — prod
+/// Whether any route targets a hosted Rayline Platform router endpoint — prod
 /// (`api.rayline.ai`) **or** dev (`api-dev.rayline.ai`) — so its `rlk-` key
 /// should be provisioned from `raydock auth login`.
 ///
@@ -681,7 +681,7 @@ fn ensure_rcr_base_url_has_v1(endpoint: &mut serde_json::Map<String, Value>) -> 
     true
 }
 
-/// Whether a `base_url` host is the hosted Rayline Cloud Router (prod or dev).
+/// Whether a `base_url` host is the hosted Rayline Platform router (prod or dev).
 pub(crate) fn endpoint_base_url_is_hosted_rcr(base_url: Option<&str>) -> bool {
     matches!(
         base_url.and_then(host_of).as_deref(),

@@ -3,7 +3,7 @@
 
 Runs the real Rayline CLI, rld, Go core (execution_context_v2), stock installed
 Pi, the live dev Decisions cell and real local/cloud inference. Nothing is
-aliased or forced. Rayline Local composes the profile (hybrid default preset,
+aliased or forced. Raydock composes the profile (hybrid default preset,
 optional settings schedule, `local_model`). Oracles run in this parent process
 on files the agent cannot edit; receipts come from the core's structured log.
 

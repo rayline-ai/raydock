@@ -1,6 +1,6 @@
 # Release Process
 
-Rayline Local releases are binary-first. The Rust workspace is not published to
+Raydock releases are binary-first. The Rust workspace is not published to
 crates.io yet; all crates are marked `publish = false` until the package split
 is intentionally reviewed.
 
@@ -105,8 +105,8 @@ After the release workflow completes, validate at least one installer path:
 
 ```bash
 scripts/install-rayline.sh --version 0.2.0 --install-dir /tmp/rayline-bin
-/tmp/rayline-bin/rayline --version
-/tmp/rayline-bin/rayline update --check
+/tmp/rayline-bin/raydock --version
+/tmp/rayline-bin/raydock update --check
 ```
 
 For installer validation against a staged asset directory:
@@ -121,7 +121,7 @@ base at a local or staged mirror:
 
 ```bash
 RAYLINE_UPDATE_BASE_URL=file:///tmp/rayline-release \
-  /tmp/rayline-bin/rayline update --dry-run --version 0.2.0
+  /tmp/rayline-bin/raydock update --dry-run --version 0.2.0
 ```
 
 ## Execution core build

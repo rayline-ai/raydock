@@ -123,7 +123,7 @@ jobs:
             allow_failure: false
           - platform: windows-x64
             os: windows-latest
-            allow_failure: true
+            allow_failure: false
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd

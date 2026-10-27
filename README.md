@@ -64,7 +64,7 @@ verify every downloaded binary against the release `SHA256SUMS` file.
 ## Quick Start
 
 Start a Claude Code session with the auth-free local router. Your conversation
-works exactly as it normally does — Rayline just routes background subagent work
+works exactly as it normally does — Raydock routes background subagent work
 to your on-device model:
 
 ```bash
@@ -85,23 +85,26 @@ raydock router logs --lines 120
 raydock router stop
 ```
 
-Run Codex CLI through Rayline's local OpenAI Responses-compatible router. With
-no `--config`, Rayline reuses Codex's existing ChatGPT/Codex subscription login
-and forwards through the ChatGPT Codex backend:
+Run Codex CLI through Raydock's local OpenAI Responses-compatible router. By
+default, main-agent and subagent requests go to Rayline Platform's hosted router,
+authenticated with your `raydock auth login` session:
 
 ```bash
 raydock codex -- exec "summarize this repo"
 ```
 
-Launch the Codex **desktop app** through Rayline in one step — it accepts the
-same flags as `raydock codex`, starts the router, and points the app at Rayline:
+Pass `--subscription` to use your existing ChatGPT/Codex login instead. An
+explicit `--config` can select local models, cloud APIs, or subscription routes.
+
+Launch the Codex **desktop app** through Raydock in one step — it accepts the
+same flags as `raydock codex`, starts the router, and points the app at Raydock:
 
 ```bash
-raydock codex app                 # opens the desktop app routed through Rayline
+raydock codex app                 # opens the desktop app routed through Raydock
 raydock codex app ~/projects/app  # optionally open a workspace
 ```
 
-Rayline sets the app up on an isolated Codex home so it doesn't disturb your
+Raydock sets the app up on an isolated Codex home so it doesn't disturb your
 normal Codex configuration. Because the desktop app is single-instance, if it is
 already running with a different configuration, `raydock codex app` prompts
 before restarting it.
@@ -179,13 +182,12 @@ and TypeScript, grouped by routing path:
   [examples/local/typescript](examples/local/typescript)
 - **Codex / OpenAI Responses** — start the router with
   `raydock router start --mode codex` and point Codex at
-  `http://127.0.0.1:20811/v1`, run `raydock codex ...` to have Rayline pass the
+  `http://127.0.0.1:20811/v1`, run `raydock codex ...` to have Raydock pass the
   provider overrides automatically, or `raydock codex app` to launch the Codex
-  desktop app routed through Rayline. The default no-config path reuses
-  Codex's ChatGPT subscription auth; explicit configs can route selected
-  requests to local/API-key endpoints or to the hosted **cloud router (RCR)** at
-  `api.rayline.ai` (the `R*` modes), which serves Codex natively over
-  `/v1/responses` and picks a GPT model. Rayline supports Codex's Responses create
+  desktop app routed through Raydock. The default no-config path uses
+  Rayline Platform's hosted router at `api.rayline.ai`; `--subscription` selects
+  ChatGPT subscription auth, and explicit configs can select local/API-key
+  endpoints. Raydock supports Codex's Responses create
   stream, model catalog, compaction, memory-summary, images, and search provider
   calls, with native passthrough when the selected route is an `openai_responses`
   endpoint.

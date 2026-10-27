@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible Rayline Local bug.
+description: Report a reproducible Raydock bug.
 title: "[bug]: "
 labels: ["bug"]
 body:
@@ -107,7 +107,7 @@ body:
     id: logs
     attributes:
       label: Logs or diagnostics
-      description: Paste sanitized output from `rayline router status`, `rayline router logs --lines 120`, the failing command, or relevant `~/.rayline/rld/*.log` snippets.
+      description: Paste sanitized output from `raydock router status`, `raydock router logs --lines 120`, the failing command, or relevant `~/.rayline/rld/*.log` snippets.
       render: text
   - type: textarea
     id: config

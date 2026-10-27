@@ -1,7 +1,7 @@
 # Acceptance Testing
 
 This guide is for maintainers and coding agents who need to validate the real
-Claude Code path through Rayline Local end to end — exercising it the way a user
+Claude Code path through Raydock end to end — exercising it the way a user
 would, against the local router and managed llama.cpp runtime. It complements the
 automated gate (`fmt` / `clippy` / `test`); run these manual steps on a real
 machine with a TTY after that gate is green.
@@ -14,7 +14,7 @@ Prerequisites:
 
 ## Install Matching Binaries
 
-From a Rayline Local source checkout:
+From a Raydock source checkout:
 
 ```bash
 cargo install --path crates/rayline-daemon --locked --root ~/.rayline --force
@@ -62,14 +62,14 @@ JSON
 
 ## Clear Stale Test State
 
-Stop any previous isolated Claude Code daemon and Rayline Local router:
+Stop any previous isolated Claude Code daemon and Raydock router:
 
 ```bash
 CLAUDE_CONFIG_DIR="$HOME/.rayline/cc" claude daemon stop --any || true
 raydock router stop || true
 ```
 
-## Run Claude Through Rayline Local
+## Run Claude Through Raydock
 
 Run interactively. On the first `--isolated` run the profile is logged out, so a
 browser sign-in opens automatically — complete it and the session continues.
@@ -264,7 +264,7 @@ raydock claude --local -p 'hello'
 
 A broader sweep of the CLI surface, beyond the routing path above. The routing
 steps (3–5) reuse the same setup as
-[Run Claude Through Rayline Local](#run-claude-through-rayline-local); verify
+[Run Claude Through Raydock](#run-claude-through-raydock); verify
 routing there rather than duplicating those assertions here.
 
 1. **Version and help:**
@@ -374,7 +374,7 @@ alone does not prove the app consumed the profile.
 
 ## Troubleshooting
 
-If Claude reports a non-Rayline Local daemon conflict, stop only the isolated
+If Claude reports a non-Raydock daemon conflict, stop only the isolated
 daemon and retry:
 
 ```bash

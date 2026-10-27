@@ -1,4 +1,4 @@
-Rayline Local
+Raydock
 Copyright 2026 Atlas Futures, Inc.
 
 This product includes software developed by Atlas Futures, Inc.
@@ -14,7 +14,7 @@ Third-Party Attributions
 --------------------------------------------------------------------------------
 
 This NOTICE file lists attribution notices for third-party components that are
-bundled or statically linked into distributed Rayline Local binaries.
+bundled or statically linked into distributed Raydock binaries.
 
 The dependency list below was generated from the current locked Rust workspace
 with:

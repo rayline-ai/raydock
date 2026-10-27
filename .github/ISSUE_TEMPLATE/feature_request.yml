@@ -1,12 +1,12 @@
 name: Feature request
-description: Suggest a Rayline Local improvement.
+description: Suggest a Raydock improvement.
 title: "[feature]: "
 labels: ["enhancement"]
 body:
   - type: markdown
     attributes:
       value: |
-        Rayline Local is not accepting external pull requests yet. Use this form to describe the problem and shape the proposal before implementation work starts.
+        Raydock is not accepting external pull requests yet. Use this form to describe the problem and shape the proposal before implementation work starts.
   - type: dropdown
     id: area
     attributes:
@@ -38,7 +38,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: What change would you like Rayline Local to make?
+      description: What change would you like Raydock to make?
     validations:
       required: true
   - type: textarea
@@ -68,5 +68,5 @@ body:
       options:
         - label: I searched existing issues before filing.
           required: true
-        - label: I understand Rayline Local is not accepting external pull requests yet.
+        - label: I understand Raydock is not accepting external pull requests yet.
           required: true

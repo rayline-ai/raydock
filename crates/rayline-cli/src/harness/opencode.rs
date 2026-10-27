@@ -41,7 +41,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "small_model": model_ref,
         "provider": {
             PROVIDER_ID: {
-                "name": format!("Rayline ({})", ctx.env_name),
+                "name": format!("Raydock ({})", ctx.env_name),
                 // opencode's default for custom providers (chat completions)
                 // 404s at the router, so use Messages.
                 "npm": "@ai-sdk/anthropic",
@@ -52,7 +52,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 },
                 "models": {
                     ROUTER_MODEL: {
-                        "name": "Rayline router",
+                        "name": "Raydock router",
                         "limit": { "context": ctx.context_window(), "output": ctx.max_output_tokens() },
                         "modalities": { "input": ctx.input_modalities(), "output": ["text"] },
                         "tool_call": true

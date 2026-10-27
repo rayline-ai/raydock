@@ -14,7 +14,7 @@ Rayline releases with minisign signature verification.
 - ⏳ **REMAINING (human):** back up the secret key to 1Password — a `0600` copy was left at
   `~/rayline-prod-minisign.key`; stash it, then shred the file. Without a backup, the only copy
   is the (unreadable) GitHub secret, and recovery means rotating to a new key.
-- ⏳ **REMAINING:** verify the first signed release end-to-end (a real tag → CI signs → `rayline update` accepts).
+- ⏳ **REMAINING:** verify the first signed release end-to-end (a real tag → CI signs → `raydock update` accepts).
 
 The sections below are the original setup guide / rotation reference.
 
@@ -76,7 +76,7 @@ RAYLINE_PUBKEY="${RAYLINE_MINISIGN_PUBKEY:-<your-prod-key>}"
 ```
 
 Commit both changes and ship. The new key takes effect for all subsequent
-`rayline update` calls and fresh installs.
+`raydock update` calls and fresh installs.
 
 ---
 
@@ -119,7 +119,7 @@ Signature and comment signature verified
 - The `sign` CI job is gated on the `release` GitHub environment (required
   reviewers). No automated process can sign without a human approving the run.
 - `verify_signature` in `update.rs` is fail-closed: a missing or invalid
-  `.minisig` causes `rayline update` to abort before any binary is installed.
+  `.minisig` causes `raydock update` to abort before any binary is installed.
 - The installer (`install-rayline.sh`) follows the same pattern: when
   `minisign` is present, it verifies and aborts on failure; when absent, it
   prints a TOFU notice and proceeds over HTTPS.

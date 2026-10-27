@@ -52,7 +52,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
     ) {
         Ok(path) => request.config_path = path,
         Err(error) => {
-            eprintln!("Error: failed to prepare the default Rayline codex config: {error}");
+            eprintln!("Error: failed to prepare the default Raydock Codex config: {error}");
             return ExitCode::from(1);
         }
     }
@@ -73,11 +73,11 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
         router_api_key_override,
     };
     if let Err(error) = crate::router::start_from_cli(&start_request).await {
-        eprintln!("Error: failed to start Rayline Codex router: {error}");
+        eprintln!("Error: failed to start Raydock Codex router: {error}");
         return ExitCode::from(1);
     }
     eprintln!(
-        "Rayline Codex router ready at http://127.0.0.1:{}/v1",
+        "Raydock Codex router ready at http://127.0.0.1:{}/v1",
         crate::router::DEFAULT_LOCAL_ROUTER_PORT
     );
 
@@ -96,7 +96,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
         == EffectiveCodexAuthMode::Subscription;
     // Present the Rayline provider to the desktop app as OpenAI-authed whenever we
     // can. That is what makes Codex use the provider's /models and show the clean
-    // "Rayline Auto" entry in the picker instead of "Custom" + its built-in GPT
+    // "Raydock Auto" entry in the picker instead of "Custom" + its built-in GPT
     // presets. This is presentation only — it does NOT change where the prompt
     // goes: the router config decides that. Under the Rc-Rc default the request
     // routes to the hosted RCR with your `rlk-` key (the endpoint is not
@@ -116,7 +116,7 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
         ReconcileOutcome::AlreadyCurrent => {
             // Config already matches; don't rewrite. Still launch so `codex app`
             // focuses the window / opens the requested workspace.
-            eprintln!("The Codex app is already using Rayline. Bringing it to the front.");
+            eprintln!("The Codex app is already using Raydock. Bringing it to the front.");
         }
         ReconcileOutcome::Cancelled => {
             eprintln!("Leaving the Codex app as it is.");
@@ -468,7 +468,7 @@ fn reconcile_running_app(home: &Path, config: &str) -> ReconcileOutcome {
         return ReconcileOutcome::AlreadyCurrent;
     }
     if same_home {
-        eprintln!("The Codex app is running with an out-of-date Rayline configuration.");
+        eprintln!("The Codex app is running with an out-of-date Raydock configuration.");
     } else {
         eprintln!("The Codex app is already running with a different configuration.");
     }
@@ -615,7 +615,7 @@ fn confirm_restart() -> bool {
         eprintln!("Not an interactive terminal; leaving the running Codex app as-is.");
         return false;
     }
-    eprint!("Would you like to restart it to use Rayline? [y/N] ");
+    eprint!("Would you like to restart it to use Raydock? [y/N] ");
     if io::stderr().flush().is_err() {
         return false;
     }

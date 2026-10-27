@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Demo a routing mode: run `rayline <client> --config <MODE>.json` and watch routing.
+# Demo a routing mode: run `raydock <client> --config <MODE>.json` and watch routing.
 #
 #   interactive (TTY)        -> records an asciinema cast in a split-pane tmux
 #                               session: left pane = the client run, right pane =
-#                               `rayline top` (live routing metrics).
-#   headless (no TTY, or     -> runs the same command, then prints `rayline top
+#                               `raydock top` (live routing metrics).
+#   headless (no TTY, or     -> runs the same command, then prints `raydock top
 #   DEMO_HEADLESS=1)            --all` as a plain-text transcript (no asciinema /
 #                               tmux, which need a real terminal). For CI / scripted
 #                               verification.
@@ -25,17 +25,17 @@
 #   CODEX_AUTH     codex auth source: auto (default) | subscription | none. `auto`
 #                  uses `--auth subscription` for S-* (subscription-main) modes and
 #                  no client auth otherwise. Ignored when CLIENT=claude.
-#   RAYLINE_BIN    rayline binary to use (default: rayline from PATH)
+#   RAYLINE_BIN    Raydock binary to use (default: raydock from PATH)
 #   DEMO_HEADLESS  set to 1 to force the text path even on a TTY
 #   WINDOW_SIZE    asciinema --window-size COLSxROWS (default: 220x50)
 #
-# Claude is forced through `--via proxy` so `rayline top` has metrics to display;
+# Claude is forced through `--via proxy` so `raydock top` has metrics to display;
 # Codex is pointed at Rayline directly (no proxy) and routes are visible the same way.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="${1:-Rc-Rc}"
-RAYLINE_BIN="${RAYLINE_BIN:-rayline}"
+RAYLINE_BIN="${RAYLINE_BIN:-raydock}"
 WINDOW_SIZE="${WINDOW_SIZE:-220x50}"
 CLIENT="${CLIENT:-claude}"
 CFG="$HERE/$MODE.json"
@@ -99,7 +99,7 @@ else
 fi
 
 # Headless: no TTY (CI / scripted) or DEMO_HEADLESS=1. asciinema/tmux need a real
-# terminal, so run the command and print `rayline top` as text instead.
+# terminal, so run the command and print `raydock top` as text instead.
 if [ "${DEMO_HEADLESS:-}" = 1 ] || [ ! -t 1 ]; then
   echo "=== $MODE: $INVOCATION  (headless, client=$CLIENT) ==="
   echo "--- prompt: $PROMPT"
@@ -130,7 +130,7 @@ for r in reversed(rows[:24]):
 fi
 
 # Interactive: record an asciinema cast driving a tmux split. The tmux driver runs
-# *inside* the recording. It builds the split, starts `rayline top` on the right,
+# *inside* the recording. It builds the split, starts `raydock top` on the right,
 # drives the command on the left from a background scheduler, then kills the server
 # so the foreground attach (and the recording) ends.
 for tool in asciinema tmux; do
@@ -147,13 +147,13 @@ tm new-session -d -s demo -x ${WINDOW_SIZE%x*} -y ${WINDOW_SIZE#*x} -c "$HERE"
 tm set -t demo status off
 tm split-window -h -t demo:0 -c "$HERE"
 tm select-pane -t demo:0.0
-tm send-keys -t demo:0.1 "clear; echo '>>> rayline top  (live routing metrics)'; sleep 1; '$RAYLINE_BIN' top --all" Enter
+tm send-keys -t demo:0.1 "clear; echo '>>> raydock top  (live routing metrics)'; sleep 1; '$RAYLINE_BIN' top --all" Enter
 tm send-keys -t demo:0.0 "clear; echo '=== $MODE (client=$CLIENT): $INVOCATION ==='; echo" Enter
 (
   sleep 3
   tm send-keys -t demo:0.0 "$LEFT_CMD" Enter
   sleep 45
-  tm send-keys -t demo:0.0 "echo; echo '=== demo complete: $MODE routed, observed in rayline top ==='" Enter
+  tm send-keys -t demo:0.0 "echo; echo '=== demo complete: $MODE routed, observed in raydock top ==='" Enter
   sleep 5
   tm kill-server
 ) &

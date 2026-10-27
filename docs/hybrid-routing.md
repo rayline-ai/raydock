@@ -24,7 +24,7 @@ must name the selected worker rather than submit a second routing request. The
 configuration contains credential environment-variable names, never keys. The
 core validates the policy-package and thinking-registry hashes at startup.
 
-For hosted Decisions and Rayline cloud inference, the core reads the Rayline
+For hosted Decisions and Rayline Platform inference, the core reads the Rayline
 API key from the environment variable each endpoint names (normally
 `RAYLINE_ROUTER_API_KEY`). An explicit launch-environment value always wins.
 Otherwise `start` supplies the key saved by `raydock auth login` only for an

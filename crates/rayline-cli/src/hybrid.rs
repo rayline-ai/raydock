@@ -227,7 +227,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         Some(_) => configured,
                         None => {
                             eprintln!(
-                                "Warning: Rayline cannot read this runtime's context window, so it assumes {configured} tokens. Load the local model with at least that window (llama.cpp `--ctx-size {configured}`, Ollama `OLLAMA_CONTEXT_LENGTH={configured}`): a runtime loaded with less (Ollama's default is a few thousand tokens) may silently truncate longer prompts. Set a smaller window with --local-context-window if needed."
+                                "Warning: Raydock cannot read this runtime's context window, so it assumes {configured} tokens. Load the local model with at least that window (llama.cpp `--ctx-size {configured}`, Ollama `OLLAMA_CONTEXT_LENGTH={configured}`): a runtime loaded with less (Ollama's default is a few thousand tokens) may silently truncate longer prompts. Set a smaller window with --local-context-window if needed."
                             );
                             configured
                         }
@@ -633,7 +633,7 @@ fn installed_binary(name: &str) -> io::Result<PathBuf> {
         .parent()
         .ok_or_else(|| io::Error::other("rayline executable has no parent directory"))?;
     fs::canonicalize(directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
-        .map_err(|error| io::Error::new(error.kind(), format!("installed {name} is unavailable; run `raydock update` or reinstall the complete Rayline release: {error}")))
+        .map_err(|error| io::Error::new(error.kind(), format!("installed {name} is unavailable; run `raydock update` or reinstall the complete Raydock release: {error}")))
 }
 
 fn ready(paths: &Paths) -> io::Result<Value> {
@@ -783,7 +783,7 @@ fn harness_command(
             for setting in [
                 "model_provider=\"rayline-hybrid\"".to_owned(),
                 "model=\"rayline-router\"".to_owned(),
-                "model_providers.rayline-hybrid.name=\"Rayline Hybrid\"".to_owned(),
+                "model_providers.rayline-hybrid.name=\"Raydock Hybrid\"".to_owned(),
                 format!("model_providers.rayline-hybrid.base_url=\"{endpoint}/v1\""),
                 "model_providers.rayline-hybrid.wire_api=\"responses\"".to_owned(),
                 "model_providers.rayline-hybrid.env_key=\"RAYLINE_HYBRID_GATEWAY_TOKEN\""

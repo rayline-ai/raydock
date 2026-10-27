@@ -546,8 +546,8 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
 
 fn login_command(env_name: Option<&str>) -> String {
     match env_name {
-        Some(env) if !env.is_empty() => format!("rayline --env {env} auth login"),
-        _ => "rayline auth login".to_owned(),
+        Some(env) if !env.is_empty() => format!("raydock --env {env} auth login"),
+        _ => "raydock auth login".to_owned(),
     }
 }
 
@@ -593,7 +593,7 @@ fn explain_decisions_failure(
     let message = value.pointer("/error/message")?.as_str()?.to_owned();
     let explained = match failure {
         DecisionsFailure::Auth => format!(
-            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `rayline hybrid stop` and `rayline hybrid start` so the runtime uses the new key."
+            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `raydock hybrid stop` and `raydock hybrid start` so the runtime uses the new key."
         ),
         DecisionsFailure::Unavailable => format!(
             "{message}: the Rayline routing service is unavailable or still starting (a development cell scales to zero and takes about a minute to start). This is retryable: send the turn again shortly."
@@ -797,13 +797,13 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("`rayline --env dev auth login`"),
+            message.contains("`raydock --env dev auth login`"),
             "{message}"
         );
         // The wire shape is kept.
         assert_eq!(value["type"], "error");
         assert_eq!(value["error"]["type"], "invalid_request_error");
-        assert_eq!(login_command(None), "rayline auth login");
+        assert_eq!(login_command(None), "raydock auth login");
     }
 
     #[test]
@@ -811,7 +811,7 @@ mod tests {
         let explained = explain_decisions_failure(
             &openai("Decisions request refused (HTTP 502)"),
             DecisionsFailure::Unavailable,
-            "rayline auth login",
+            "raydock auth login",
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&explained).unwrap();

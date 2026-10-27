@@ -149,8 +149,13 @@ jobs:
           cp README.md LICENSE NOTICE "package/${package_dir}/"
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            cp "package/${package_dir}/raydock.exe" "package/${package_dir}/rayline.exe"
-            "package/${package_dir}/rayline.exe" --version
+            # Migration may leave its running EXE in a locked backup. Build the
+            # native alias outside the archive and copy only the final launcher.
+            alias_dir="$(mktemp -d)"
+            trap 'rm -rf "$alias_dir"' EXIT
+            cp "target/release/raydock.exe" "${alias_dir}/rayline.exe"
+            "${alias_dir}/rayline.exe" --version
+            cp "${alias_dir}/rayline.exe" "package/${package_dir}/rayline.exe"
             pwsh -NoProfile -Command \
               "Compress-Archive -Path 'package/${package_dir}/*' -DestinationPath 'dist/${package_dir}.${ARCHIVE_EXT}' -Force"
           else
@@ -208,7 +213,7 @@ jobs:
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file"
           # Sign SHA256SUMS (covers the binaries/archives).
           minisign -S -s "$key_file" -m dist/SHA256SUMS
-          # Generate and sign the channel version pointer so `rayline update`
+          # Generate and sign the channel version pointer so `raydock update`
           # verifies the version it is told to install before trusting it
           # (defeats downgrade attacks). Signed separately from SHA256SUMS; the
           # signature is over the version bytes, so the same latest.txt /
@@ -256,10 +261,10 @@ jobs:
           version="${RELEASE_TAG#v}"
 
           cat > release-notes.md <<EOF
-          Rayline ${version}
+          Raydock ${version}
 
           Assets:
-          - \`rayline-<platform>\`, \`rld-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts.
+          - \`rayline-<platform>\`, \`rld-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`raydock update\` and the install scripts. Asset names remain stable for existing updaters.
           - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain all three binaries, source provenance and license/readme files.
           - \`SHA256SUMS\` covers every uploaded binary, archive and provenance file.
           - \`SHA256SUMS.minisig\` is the minisign signature over \`SHA256SUMS\`.
@@ -272,7 +277,7 @@ jobs:
             echo "::error::Release $RELEASE_TAG already exists; refusing to replace its assets with this build." >&2
             exit 1
           fi
-          args=(release create "$RELEASE_TAG" dist/* --title "Rayline ${version}" --notes-file release-notes.md)
+          args=(release create "$RELEASE_TAG" dist/* --title "Raydock ${version}" --notes-file release-notes.md)
           if [[ "$version" == *"-"* ]]; then
             args+=(--prerelease)
           fi

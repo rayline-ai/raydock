@@ -5,7 +5,7 @@ contact_links:
     about: Report vulnerabilities privately through GitHub Private Vulnerability Reporting.
   - name: Contribution policy
     url: https://github.com/rayline-ai/rayline/blob/main/CONTRIBUTING.md
-    about: Rayline Local is not accepting external pull requests yet; read the current contribution policy before starting implementation work.
+    about: Raydock is not accepting external pull requests yet; read the current contribution policy before starting implementation work.
   - name: Getting started documentation
     url: https://github.com/rayline-ai/rayline/blob/main/docs/getting-started.md
     about: Start here for setup, routing, and configuration before filing a bug.

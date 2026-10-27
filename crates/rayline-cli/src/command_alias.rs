@@ -32,8 +32,14 @@ pub(crate) fn migrate_legacy_payload() -> Result<Option<PathBuf>, UpdateError> {
         ));
     }
     let primary = primary_path(&executable);
-    update::replace_binary(&executable, &primary)?;
-    install_alias(&primary)?;
+    update::replace_binary(&executable, &primary)
+        .and_then(|()| install_alias(&primary))
+        .map_err(|error| {
+            UpdateError::Install(format!(
+                "{error}. Re-run the Raydock installer with write access to the directory containing {}, or install into a user-writable directory and update PATH.",
+                executable.display()
+            ))
+        })?;
     eprintln!("Rayline Local is now Raydock. Use `raydock`; `rayline` remains an alias.");
     Ok(Some(primary))
 }

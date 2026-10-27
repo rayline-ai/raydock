@@ -61,6 +61,8 @@ fn old_updater_landing_migrates_and_alias_preserves_output_arguments_and_status(
         vec!["--version"],
         vec!["--help"],
         vec!["unknown-command", "two words", "λ"],
+        vec![r#"two words "quoted" λ \tail\"#],
+        vec![""],
         vec!["local", "--help"],
     ] {
         let direct = install.run("raydock", &args);
@@ -111,4 +113,54 @@ fn legacy_named_payload_in_app_bundle_requires_managed_upgrade() {
         !bin.join(format!("raydock{}", std::env::consts::EXE_SUFFIX))
             .exists()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn app_bundle_alias_keeps_existing_command_and_login_service_paths_working() {
+    let install = Installation::new();
+    let bin = install.0.join("Rayline.app/Contents/Resources/bin");
+    fs::create_dir_all(&bin).expect("bundle layout");
+    place_payload(&bin.join("raydock"));
+    std::os::unix::fs::symlink("raydock", bin.join("rayline")).expect("bundle alias");
+    // An existing installation or login service may still invoke either link.
+    std::os::unix::fs::symlink(bin.join("rayline"), install.binary("rayline"))
+        .expect("existing command link");
+    for executable in [bin.join("rayline"), install.binary("rayline")] {
+        let result = Command::new(executable)
+            .arg("--version")
+            .output()
+            .expect("run bundled alias");
+        assert!(result.status.success());
+        assert!(String::from_utf8_lossy(&result.stdout).starts_with("raydock "));
+        assert!(result.stderr.is_empty(), "managed aliases must not migrate");
+    }
+    assert_eq!(
+        fs::read_link(bin.join("rayline")).unwrap(),
+        Path::new("raydock")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_migration_preserves_legacy_payload_and_explains_repair() {
+    let install = Installation::new();
+    let legacy = install.binary("rayline");
+    place_payload(&legacy);
+    // A conflicting destination must fail visibly rather than run the command
+    // under an installation layout the updater cannot maintain.
+    fs::create_dir(install.binary("raydock")).expect("conflicting directory");
+    let result = install.run("rayline", &["--version"]);
+    assert!(!result.status.success());
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        error.contains("Raydock command migration failed"),
+        "{error}"
+    );
+    assert!(error.contains("Re-run the Raydock installer"), "{error}");
+    assert_eq!(
+        fs::read(&legacy).unwrap(),
+        fs::read(env!("CARGO_BIN_EXE_raydock")).unwrap()
+    );
+    assert!(install.binary("raydock").is_dir());
 }

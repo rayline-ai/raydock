@@ -909,7 +909,7 @@ fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
         for model in &endpoint.models {
             // Internal sentinels (`rayline-router`/`rayline-subagent`/`rayline-codex`)
             // are valid wire values but not picker entries — the one picker sentinel
-            // (`rayline-local` → "Rayline Auto") is added above. An endpoint that
+            // (`rayline-local` → "Raydock Auto") is added above. An endpoint that
             // declares a sentinel as its `models` (e.g. `rayline-cloud`) would
             // otherwise pollute the catalog with a duplicate/garbled entry.
             if is_internal_sentinel_model(model) {
@@ -944,7 +944,7 @@ fn endpoint_hidden_from_catalog(endpoint: &EndpointConfig) -> bool {
 }
 
 /// Builds the picker label for an endpoint model. Requests routed to a real
-/// provider endpoint are prefixed `Rayline <provider> <model>` so they are
+/// provider endpoint are prefixed `Raydock <provider> <model>` so they are
 /// visibly distinct; `client_bearer` subscription passthrough keeps its plain
 /// Codex name.
 fn catalog_display_name(endpoint: &EndpointConfig, model: &str) -> String {
@@ -952,7 +952,7 @@ fn catalog_display_name(endpoint: &EndpointConfig, model: &str) -> String {
         return pretty_model(model);
     }
     format!(
-        "Rayline {} {}",
+        "Raydock {} {}",
         pretty_provider(endpoint),
         pretty_model(model)
     )
@@ -1200,7 +1200,7 @@ fn model_response(state: &AppState, path: &str) -> Response<BoxBody> {
 /// picker; the internal sentinels keep their raw id.
 fn sentinel_display_name(id: &str) -> String {
     if id == CATALOG_SENTINEL_MODEL {
-        "Rayline Auto".to_owned()
+        "Raydock Auto".to_owned()
     } else {
         id.to_owned()
     }
@@ -10069,7 +10069,7 @@ mod tests {
             || id == "rayline-codex"));
         assert_eq!(
             catalog_display(&RouterConfig::default(), CATALOG_SENTINEL_MODEL).as_deref(),
-            Some("Rayline Auto")
+            Some("Raydock Auto")
         );
     }
 
@@ -10077,8 +10077,8 @@ mod tests {
     fn catalog_hides_internal_sentinels_declared_as_endpoint_models() {
         // A `rayline-cloud` endpoint declares the `rayline-router` sentinel as its
         // model (Rc-Rc configs do). It is an internal wire marker, not a picker entry,
-        // so the catalog must offer only `rayline-local` ("Rayline Auto") — never a
-        // garbled "Rayline rayline-cloud rayline-router" row.
+        // so the catalog must offer only `rayline-local` ("Raydock Auto") — never a
+        // garbled "Raydock rayline-cloud rayline-router" row.
         let config = RouterConfig {
             endpoints: vec![endpoint(
                 "rayline-cloud",
@@ -10113,15 +10113,15 @@ mod tests {
         };
         assert_eq!(
             catalog_display(&config, "claude-sonnet-4-6").as_deref(),
-            Some("Rayline Anthropic Sonnet 4.6")
+            Some("Raydock Anthropic Sonnet 4.6")
         );
         assert_eq!(
             catalog_display(&config, "anthropic/claude-sonnet-4.6").as_deref(),
-            Some("Rayline OpenRouter Sonnet 4.6")
+            Some("Raydock OpenRouter Sonnet 4.6")
         );
         assert_eq!(
             catalog_display(&config, "qwen3.6-35b").as_deref(),
-            Some("Rayline Local Qwen")
+            Some("Raydock Local Qwen")
         );
     }
 
@@ -10225,7 +10225,7 @@ mod tests {
     fn codex_model_entries_sort_after_native_models() {
         // Native Codex models carry small ascending priorities; ours must be
         // larger so the picker clusters them at the bottom, not interleaved.
-        let value = codex_model_json(CATALOG_SENTINEL_MODEL, "Rayline Auto");
+        let value = codex_model_json(CATALOG_SENTINEL_MODEL, "Raydock Auto");
         assert_eq!(value["priority"], json!(RAYLINE_MODEL_PRIORITY));
         // Larger than the observed native ceiling (codex-auto-review == 43).
         const _: () = assert!(RAYLINE_MODEL_PRIORITY > 100);

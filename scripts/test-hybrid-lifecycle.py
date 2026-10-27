@@ -163,7 +163,7 @@ print(json.dumps(sys.argv[1:]))
             bad["contract_version"] = 99
             config.write_text(json.dumps(bad))
             cli("start", "--core", str(core), "--config", str(config), "--port", "0", success=False)
-            # The core receives Rayline Local's composed configuration.
+            # The core receives Raydock's composed configuration.
             wait_dead(int((state / "core-config.pid").read_text()))
             assert not (state / "ready.json").exists()
             assert not (state / "gateway-token").exists()
