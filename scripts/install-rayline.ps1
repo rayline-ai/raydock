@@ -11,24 +11,27 @@ function Fail($Message) {
     exit 1
 }
 
-function Remove-RetiredBackup($Path) {
+function Remove-RetiredBackup {
+    param([string]$Path)
     try {
         Remove-Item -LiteralPath $Path -Force
     } catch {
         if ($_.Exception -is [System.Management.Automation.ItemNotFoundException]) { return }
-        $Code = $_.Exception.HResult -band 0xffff
-        if ($Code -in @(5, 32, 33)) {
-            Write-Warning "Retained old executable ${Path}: $($_.Exception.Message). Close older Raydock sessions; a later run will retry cleanup."
-        } else { throw }
+        Write-Warning "Retained update backup ${Path}: $($_.Exception.Message). A later update or installer will retry cleanup."
     }
 }
 
-function Remove-RetiredBackups($Directory) {
-    # These names are assigned only after a replacement succeeds. Never sweep
-    # .tmp files: another installer/updater may still need them for rollback.
-    $Pattern = '^\.(raydock\.exe|rayline\.exe|rld\.exe|rayline-core\.exe|rayline-core-LICENSE)\.old-[0-9]+-[0-9a-f]+$'
-    Get-ChildItem -LiteralPath $Directory -File -Force | Where-Object { $_.Name -match $Pattern } | ForEach-Object {
-        Remove-RetiredBackup $_.FullName
+function Remove-RetiredBackups {
+    param([string]$Directory)
+    # Only new dot .old names certify a committed replacement. Historical
+    # non-dot .old and all .tmp files can still be needed for recovery.
+    $pattern = '^\.(raydock\.exe|rayline\.exe|rld\.exe|rayline-core\.exe|rayline-core-LICENSE)\.old-[0-9]+-[0-9a-f]+$'
+    try {
+        Get-ChildItem -LiteralPath $Directory -File -Force | Where-Object { $_.Name -match $pattern } | ForEach-Object {
+            Remove-RetiredBackup -Path $_.FullName
+        }
+    } catch {
+        Write-Warning "Could not finish backup cleanup in ${Directory}: $($_.Exception.Message). Continuing installation; a later update or installer will retry."
     }
 }
 
@@ -110,8 +113,10 @@ try {
     }
     if ($AliasBackup) {
         $Retired = Join-Path $InstallDir ".rayline.exe.old-$PID-$AliasNonce"
-        Move-Item -LiteralPath $AliasBackup -Destination $Retired
-        Remove-RetiredBackup $Retired
+        try { Move-Item -LiteralPath $AliasBackup -Destination $Retired }
+        catch { Write-Warning "Installed alias; retained previous file at ${AliasBackup}: $($_.Exception.Message). Remove it manually after older sessions and installers exit." }
+        # The previous image can still be running. A later installer or update
+        # deletes committed .old backups; this invocation only marks them.
     }
     Copy-Item -Force $DaemonPath (Join-Path $InstallDir "rld.exe")
     Copy-Item -Force $CorePath (Join-Path $InstallDir "rayline-core.exe")

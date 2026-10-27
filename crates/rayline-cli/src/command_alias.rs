@@ -36,10 +36,6 @@ pub(crate) fn migrate_legacy_payload() -> Result<Option<PathBuf>, UpdateError> {
         return Ok(Some(primary));
     }
     let executable = std::fs::canonicalize(running)?;
-    #[cfg(windows)]
-    if !update::is_app_bundle_managed(&executable) && !update::is_homebrew_managed(&executable) {
-        update::cleanup_retired_backups(&executable)?;
-    }
     if executable.file_name().and_then(|name| name.to_str())
         != Some(if cfg!(windows) {
             "rayline.exe"

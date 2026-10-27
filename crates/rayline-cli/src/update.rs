@@ -116,11 +116,6 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
             stderr: false,
         });
     }
-    #[cfg(windows)]
-    if !request.check_only && !request.dry_run {
-        cleanup_retired_backups(&install_path)?;
-    }
-
     let platform_tag = detect_platform_tag()?;
     let current = Version::parse(crate::RAYLINE_VERSION)
         .map_err(|_| UpdateError::InvalidVersion(crate::RAYLINE_VERSION.to_owned()))?;
@@ -213,6 +208,12 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                 let core_install_path = daemon_install_path
                     .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
                 let license_install_path = core_install_path.with_file_name(CORE_LICENSE_NAME);
+                #[cfg(windows)]
+                if let Err(error) = cleanup_retired_backups(&install_path) {
+                    eprintln!(
+                        "Could not finish old update backup cleanup: {error}. Continuing installation; a later update will retry."
+                    );
+                }
                 if let Some(core) = &artifacts.core {
                     replace_file(&core.license, &license_install_path, false)?;
                     replace_binary(&core.binary, &core_install_path)?;
@@ -860,17 +861,8 @@ pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), 
 
     match fs::rename(staged, install_path) {
         Ok(()) => {
-            // Only a committed replacement makes its backup disposable. Never
-            // sweep .tmp files: another process may still need one to roll back.
-            let retired = sidecar_install_path(install_path, "old")?;
-            fs::rename(&backup, &retired).map_err(|error| {
-                UpdateError::Install(format!(
-                    "updated {}, but could not mark backup {} for cleanup: {error}",
-                    install_path.display(),
-                    backup.display()
-                ))
-            })?;
-            remove_retired_backup(&retired)
+            retire_replaced_backup(&backup, install_path);
+            Ok(())
         }
         Err(error) => {
             // Restore the original so a failed update never leaves a hole.
@@ -886,6 +878,22 @@ pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), 
                 install_path.display()
             )))
         }
+    }
+}
+
+/// Mark a committed replacement's old file for a later update to delete. The
+/// running image is normally still locked now; retirement is only housekeeping
+/// and must not stop installation of the remaining companion binaries.
+#[cfg(any(windows, test))]
+fn retire_replaced_backup(backup: &Path, install_path: &Path) {
+    let result = sidecar_install_path(install_path, "old")
+        .and_then(|retired| fs::rename(backup, retired).map_err(UpdateError::from));
+    if let Err(error) = result {
+        eprintln!(
+            "Updated {}; retained previous file at {} because it could not be marked for cleanup: {error}. Remove it manually after older sessions and installers exit.",
+            install_path.display(),
+            backup.display()
+        );
     }
 }
 
@@ -916,11 +924,11 @@ fn sidecar_install_path(install_path: &Path, kind: &str) -> Result<PathBuf, Upda
     Ok(parent.join(staged_name))
 }
 
-/// Delete only backups marked disposable after a successful Windows swap.
+/// Before an actual update, delete backups from previous successful Windows swaps.
 /// Historical .tmp files also name active staging and rollback files, so those
 /// require manual cleanup after all installers and Raydock sessions have exited.
 #[cfg(any(windows, test))]
-pub(crate) fn cleanup_retired_backups(install_path: &Path) -> Result<(), UpdateError> {
+fn cleanup_retired_backups(install_path: &Path) -> Result<(), UpdateError> {
     let parent = install_path.parent().ok_or_else(|| {
         UpdateError::Install(format!(
             "install path has no parent: {}",
@@ -979,7 +987,7 @@ fn remove_retired_backup(path: &Path) -> Result<(), UpdateError> {
                 || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))) =>
         {
             eprintln!(
-                "Retained old executable {}: {error}. Close older Raydock sessions; a later run will retry cleanup.",
+                "Retained old executable {}: {error}. Close older Raydock sessions; a later update or installer will retry cleanup.",
                 path.display()
             );
             Ok(())
@@ -1316,6 +1324,20 @@ mod tests {
         for name in retired.iter().chain(retained.iter()) {
             fs::write(root.join(name), b"payload")?;
         }
+        let installed = root.join("raydock.exe");
+        let backup = staged_install_path(&installed)?;
+        fs::write(&backup, b"previous executable")?;
+        retire_replaced_backup(&backup, &installed);
+        assert!(!backup.exists());
+        let entries = fs::read_dir(&root)?.collect::<io::Result<Vec<_>>>()?;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.file_name().to_str().is_some_and(is_retired_backup))
+                .count(),
+            retired.len() + 1,
+            "retirement must keep the old file until a later sweep"
+        );
         let directory = root.join(".rld.exe.old-123-789");
         fs::create_dir(&directory)?;
         cleanup_retired_backups(&root.join("raydock.exe"))?;
@@ -1325,6 +1347,7 @@ mod tests {
         for name in retained {
             assert_eq!(fs::read(root.join(name))?, b"payload", "retained {name}");
         }
+        assert_eq!(fs::read_dir(&root)?.count(), retained.len() + 1);
         assert!(directory.is_dir());
         fs::remove_dir_all(root)?;
         Ok(())
@@ -1353,14 +1376,43 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_failed_swap_restores_without_retiring_backup() -> Result<(), UpdateError> {
+    fn windows_swap_defers_cleanup_and_preserves_failed_swap() -> Result<(), UpdateError> {
         let root = temp_update_dir()?;
         let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
         fs::write(&installed, b"original")?;
+        fs::write(&staged, b"new")?;
+        move_into_place(&staged, &installed)?;
+        assert_eq!(fs::read_dir(&root)?.count(), 2);
+        assert_eq!(fs::read(&installed)?, b"new");
         assert!(move_into_place(&root.join("missing-staged.exe"), &installed).is_err());
         cleanup_retired_backups(&installed)?;
-        assert_eq!(fs::read(&installed)?, b"original");
+        assert_eq!(fs::read(&installed)?, b"new");
         assert_eq!(fs::read_dir(&root)?.count(), 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retirement_failure_preserves_committed_install_and_backup() -> Result<(), UpdateError>
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let backup = staged_install_path(&installed)?;
+        fs::write(&installed, b"committed")?;
+        fs::write(&backup, b"previous")?;
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&backup)?;
+        retire_replaced_backup(&backup, &installed);
+        assert!(backup.exists());
+        assert_eq!(fs::read(&installed)?, b"committed");
+        drop(locked);
+        assert_eq!(fs::read(&backup)?, b"previous");
         fs::remove_dir_all(root)?;
         Ok(())
     }
