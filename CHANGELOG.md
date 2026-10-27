@@ -3,7 +3,7 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline/releases).
 
-## Unreleased
+## 0.2.14 (2026-10-27)
 
 ### Fixed
 
