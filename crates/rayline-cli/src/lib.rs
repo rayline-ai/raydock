@@ -228,8 +228,9 @@ Options:
                           auto with no --config defaults to Rc-Rc (route
                           everything to the hosted cloud router on ARC:
                           arc-sage-1.0 main, arc-swift-1.0 subagents, via
-                          ~/.config/rayline/router.json; set its route models
-                          to rayline-router for the Legacy Rules Router);
+                          ~/.config/rayline/router.json; --model
+                          rayline-router, or rayline-router as its route
+                          models, selects the Legacy Rules Router);
                           with --config it follows the config. subscription
                           uses your ChatGPT subscription; none runs local.
   --subscription          Alias for --auth subscription

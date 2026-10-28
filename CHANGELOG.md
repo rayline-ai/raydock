@@ -19,8 +19,9 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `CLAUDE_CODE_SUBAGENT_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, OpenCode's
   `small_model`, omp's `smol` role, Codex's `subagent` route). The Legacy Rules
   Router stays available by explicit choice: `--model rayline-router`, the
-  harness's own model flag or picker (every generated config lists it), or a
-  route model in `router.json`. Choices you made are kept: an explicit model,
+  harness's own model flag or picker (every generated config lists it;
+  `raydock codex --model rayline-router` too), or a route model in
+  `router.json`. Choices you made are kept: an explicit model,
   your own Claude Code model variables, `--config` routes, and the model pi
   and omp saved (Hermes and OpenClaw configs are rewritten each launch, as
   before, so pick Legacy there per run). Generated defaults that were never edited (the 0.2.x

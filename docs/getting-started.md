@@ -63,7 +63,8 @@ authenticated with your `raydock auth login` session key, on ARC: the main agent
 on `arc-sage-1.0` and subagents on `arc-swift-1.0`. This mirrors the default
 `raydock claude`, which likewise routes everything to the cloud router on ARC; a
 `--config` overrides selected routes to local/API-key/subscription endpoints. For
-the Legacy Rules Router, set the route models in the generated
+the Legacy Rules Router, pass `--model rayline-router` (the generated config pins
+it with a `model_routes` entry), or set the route models in the generated
 `~/.config/rayline/router.json` to `rayline-router`.
 
 To use your ChatGPT/Codex subscription for the main agent instead, pass
@@ -255,7 +256,7 @@ harness gives them their own model setting:
 | Launcher | Main agent | Subagents / background | Legacy Rules Router |
 |---|---|---|---|
 | `raydock claude` (hosted) | `arc-sage-1.0` | `arc-swift-1.0` (`CLAUDE_CODE_SUBAGENT_MODEL`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` with `--route all`) | `--model rayline-router`; with `--route subagents`, `CLAUDE_CODE_SUBAGENT_MODEL=rayline-router` |
-| `raydock codex` (default Rc-Rc) | `arc-sage-1.0` | `arc-swift-1.0` | set the route models in `router.json` to `rayline-router` |
+| `raydock codex` (default Rc-Rc) | `arc-sage-1.0` | `arc-swift-1.0` | `--model rayline-router`, or set the route models in `router.json` to `rayline-router` |
 | `raydock opencode` | `arc-sage-1.0` | `small_model`: `arc-swift-1.0` | `-m rayline/rayline-router` |
 | `raydock pi` | `arc-sage-1.0` | — | `--model rayline/rayline-router`, or pi's model picker |
 | `raydock omp` | `arc-sage-1.0` (`default`, `slow`, `plan`) | `smol`: `arc-swift-1.0` | pick `rayline/rayline-router` for a role |
@@ -524,7 +525,8 @@ The same applies to the hosted cloud router: a config needs only its `main`
 entry, and subagents then follow that model. The generated default
 `~/.config/rayline/router.json` routes `main` to `arc-sage-1.0` and `subagent` to
 `arc-swift-1.0`, and also lists `rayline-router` (the Legacy Rules Router) for a
-route that names it. With a non-prod
+route that names it; its `model_routes` entry sends an explicit `--model
+rayline-router` to Legacy. With a non-prod
 `--env <name>` and no `--config`, `raydock codex` generates and reads
 `~/.config/rayline/router.<name>.json` instead, pointed at that environment's
 router, so a non-prod key never reaches the prod router. The file is created

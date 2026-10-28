@@ -9028,6 +9028,33 @@ mod tests {
     }
 
     #[test]
+    fn codex_explicit_legacy_model_route_beats_the_virtual_marker() {
+        // The shape `raydock codex` generates: ARC by default, with a
+        // `model_routes` entry pinning an explicit `rayline-router` to Legacy.
+        let config = serde_json::from_str::<RouterConfig>(
+            r#"{"endpoints":[{"id":"rayline-cloud","protocol":"openai_responses",
+                "base_url":"https://api.rayline.ai/v1",
+                "models":["arc-sage-1.0","arc-swift-1.0","rayline-router"]}],
+               "routes":{"main":{"endpoint":"rayline-cloud","model":"arc-sage-1.0"},
+                 "subagent":{"endpoint":"rayline-cloud","model":"arc-swift-1.0"},
+                 "model_routes":{
+                   "rayline-router":{"endpoint":"rayline-cloud","model":"rayline-router"},
+                   "rayline-local":{"endpoint":"rayline-cloud","model":"arc-sage-1.0"}}}}"#,
+        )
+        .unwrap();
+        let state = state(config);
+        let headers = HeaderMap::new();
+        for (requested, selected) in [
+            ("rayline-router", "rayline-router"),
+            ("rayline-local", "arc-sage-1.0"),
+        ] {
+            let body = json!({"model": requested, "input": []});
+            let decision = select_route(&state, &headers, &body, ApiSurface::Codex);
+            assert_eq!(decision.selected_model, selected, "{requested}");
+        }
+    }
+
+    #[test]
     fn codex_sentinel_subagent_role_signal_comes_from_selected_route_model() {
         // The role advertised to the RCR (`x-rayline-subagent`) must be derived
         // from the SELECTED route model, not the requested one. Codex sends the

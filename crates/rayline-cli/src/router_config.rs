@@ -61,7 +61,17 @@ pub fn default_config_json(router_url: &str) -> Value {
             "main": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
             "subagent": { "endpoint": "rayline-cloud", "model": crate::ARC_SWIFT_MODEL },
             "default": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
-            "subagents": {}
+            "subagents": {},
+            // The local router reads a requested `rayline-router` as "route by
+            // `routes.main`" (its virtual marker), so without this an explicit
+            // `raydock codex --model rayline-router` would run on ARC Sage.
+            // This pins that request to the Legacy Rules Router.
+            "model_routes": {
+                crate::LEGACY_ROUTER_MODEL: {
+                    "endpoint": "rayline-cloud",
+                    "model": crate::LEGACY_ROUTER_MODEL
+                }
+            }
         }
     })
 }
@@ -1072,6 +1082,22 @@ mod tests {
             cfg["endpoints"][0]["models"],
             json!(["arc-sage-1.0", "arc-swift-1.0", "rayline-router"])
         );
+    }
+
+    #[test]
+    fn default_codex_config_pins_an_explicit_legacy_model() {
+        // `raydock codex --model rayline-router` must reach Legacy, while the
+        // Codex sentinel (no --model) follows routes.main (ARC Sage).
+        let home = tmp_home();
+        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+        let routes = &cfg["routes"]["model_routes"];
+        assert_eq!(routes["rayline-router"]["model"], "rayline-router");
+        assert_eq!(routes["rayline-router"]["endpoint"], "rayline-cloud");
+        assert_eq!(routes["rayline-local"]["model"], "arc-sage-1.0");
+        assert_eq!(cfg["routes"]["subagent"]["model"], "arc-swift-1.0");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
