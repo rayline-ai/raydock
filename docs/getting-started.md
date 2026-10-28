@@ -259,17 +259,19 @@ harness gives them their own model setting:
 | `raydock opencode` | `arc-sage-1.0` | `small_model`: `arc-swift-1.0` | `-m rayline/rayline-router` |
 | `raydock pi` | `arc-sage-1.0` | — | `--model rayline/rayline-router`, or pi's model picker |
 | `raydock omp` | `arc-sage-1.0` (`default`, `slow`, `plan`) | `smol`: `arc-swift-1.0` | pick `rayline/rayline-router` for a role |
-| `raydock hermes` | `arc-sage-1.0` | — | `--model rayline-router` |
-| `raydock openclaw` | `arc-sage-1.0` | — | select `rayline/rayline-router` |
+| `raydock hermes` | `arc-sage-1.0` | — | `--model rayline-router` (per run) |
+| `raydock openclaw` | `arc-sage-1.0` | — | switch the session's model to `rayline/rayline-router` (per run) |
 
 Each generated harness config lists all three models, so the harness's own
 picker offers ARC Sage, ARC Swift and the Legacy Rules Router. A model you set
 yourself is kept: `--model` or `ANTHROPIC_MODEL` for Claude Code (subagents then
 inherit it, as before), your own `CLAUDE_CODE_SUBAGENT_MODEL` or
-`ANTHROPIC_DEFAULT_HAIKU_MODEL`, a `--config` route, and settings the harness
+`ANTHROPIC_DEFAULT_HAIKU_MODEL`, a `--config` route, and the model pi and omp
 saved. The pi `settings.json` and omp `config.yml` that Raydock seeds only once
 are moved to ARC only while they still read exactly as an 0.2.x release wrote
-them, which means no model was ever picked there.
+them, which means no model was ever picked there. Raydock rewrites its model
+keys in the Hermes and OpenClaw configs on every launch (as before), so pick
+Legacy there per run.
 
 The local and hybrid paths (`--local`, a local-plane `--config`, account-local
 and may-local routing, `raydock hybrid run`) are unchanged: they keep the local
