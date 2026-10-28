@@ -48,6 +48,11 @@ const LOCAL_CONTEXT_WINDOW_RANGE: std::ops::RangeInclusive<u64> = 2048..=1_000_0
 /// Context window of the default cloud targets, Claude Opus 5.5 and Sonnet
 /// 5.5 (pricing snapshot 2026-10-16, `context_window_tokens`).
 const CLOUD_CONTEXT_WINDOW: u64 = 1_000_000;
+/// Output ceiling of every hybrid deployment: the harness default
+/// (`harness::MAX_OUTPUT_TOKENS`). The core admits the smallest deployment
+/// cap for the whole session, and a 4096 cap cut long local turns short
+/// before any edit landed (Mac hybrid test, 2026-10-27).
+const MAX_OUTPUT_TOKENS: u64 = crate::harness::MAX_OUTPUT_TOKENS;
 
 /// `hybrid.local_context_window` from settings, or the default.
 pub(crate) fn local_context_window(settings: Option<&Value>) -> Result<u64, String> {
@@ -496,12 +501,12 @@ pub(crate) fn default_profile(
         "{}/v1/chat/completions",
         crate::local_model::normalize_base_url(base_url)
     );
-    let max_output = (context_window / 4).clamp(1024, 4096);
+    let max_output = (context_window / 4).clamp(1024, MAX_OUTPUT_TOKENS);
     let cloud = |id: &str, wire: &str| {
         json!({"id": id, "kind": "cloud", "cloud_transport": "model_pin", "url": format!("{router}/v1/messages"),
                "protocol": "anthropic.messages.v1", "wire_model": wire, "registry_model": wire,
                "registry_provider": "openrouter", "runtime_identity": "rayline-catalog-model-pin-v1",
-               "max_output_tokens": 4096, "context_window": CLOUD_CONTEXT_WINDOW, "input_modalities": ["text"],
+               "max_output_tokens": MAX_OUTPUT_TOKENS, "context_window": CLOUD_CONTEXT_WINDOW, "input_modalities": ["text"],
                "token_units": "", "auth_env": ROUTER_KEY_ENV})
     };
     let legs = json!({"input": local_price, "output": local_price, "cache_read": local_price, "cache_write": local_price});
@@ -1046,6 +1051,9 @@ mod tests {
         assert_eq!(local["wire_model"], "qwen3.8:27b");
         assert_eq!(local["context_window"], 16384);
         assert_eq!(local["max_output_tokens"], 4096);
+        for cloud in &config["deployments"].as_array().unwrap()[1..] {
+            assert_eq!(cloud["max_output_tokens"], 32_000);
+        }
         assert_eq!(config["derived_actions"].as_array().unwrap().len(), 3);
         assert_eq!(
             config["deployments"][1]["url"],
@@ -1072,6 +1080,22 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
         assert!(default_profile("https://r", "http://l", "m", 1000, None, None).is_err());
+    }
+
+    /// The core admits the smallest deployment cap, so a long local turn
+    /// gets a quarter of the local window up to the harness default.
+    #[test]
+    fn default_profile_output_cap_scales_with_the_local_window() {
+        let local_cap = |window| {
+            let profile =
+                default_profile("https://r", "http://l", "m", window, None, None).unwrap();
+            profile["deployments"][0]["max_output_tokens"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(local_cap(2048), 1024);
+        assert_eq!(local_cap(DEFAULT_LOCAL_CONTEXT_WINDOW), 24_576);
+        assert_eq!(local_cap(1_000_000), 32_000);
     }
 
     #[test]

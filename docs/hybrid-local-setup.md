@@ -149,6 +149,12 @@ core counts the exact prompt the local model would receive with the runtime's
 own tokenizer. The count covers tools, history and private instructions. The
 core adds the output limit, then tells ARC whether the request fits.
 
+The default profile sets the local output limit to a quarter of the local
+window, at most 32,000 tokens (24,576 at the default 96k window), and the cloud
+targets' limit to 32,000. The core admits the smallest limit for the session,
+so a long local answer has room to finish, and a prompt larger than about
+three quarters of the local window goes to cloud.
+
 When the conversation grows past the local window, for example during a long
 tool loop with no compaction, ARC hands the turn to a cloud target. The receipt
 reads `decided_by: capacity_handoff`, and the local target is listed as
