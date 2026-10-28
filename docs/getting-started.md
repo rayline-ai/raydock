@@ -63,8 +63,8 @@ authenticated with your `raydock auth login` session key, on ARC: the main agent
 on `arc-sage-1.0` and subagents on `arc-swift-1.0`. This mirrors the default
 `raydock claude`, which likewise routes everything to the cloud router on ARC; a
 `--config` overrides selected routes to local/API-key/subscription endpoints. For
-the Legacy Rules Router, pass `--model rayline-router` (the generated config pins
-it with a `model_routes` entry), or set the route models in the generated
+the Legacy Rules Router, pass `--model rayline-router` (with a hosted `routes.main`,
+Raydock pins it to Legacy when it prepares the config for Codex), or set the route models in the generated
 `~/.config/rayline/router.json` to `rayline-router`.
 
 To use your ChatGPT/Codex subscription for the main agent instead, pass
@@ -525,8 +525,7 @@ The same applies to the hosted cloud router: a config needs only its `main`
 entry, and subagents then follow that model. The generated default
 `~/.config/rayline/router.json` routes `main` to `arc-sage-1.0` and `subagent` to
 `arc-swift-1.0`, and also lists `rayline-router` (the Legacy Rules Router) for a
-route that names it; its `model_routes` entry sends an explicit `--model
-rayline-router` to Legacy. With a non-prod
+route that names it. With a non-prod
 `--env <name>` and no `--config`, `raydock codex` generates and reads
 `~/.config/rayline/router.<name>.json` instead, pointed at that environment's
 router, so a non-prod key never reaches the prod router. The file is created

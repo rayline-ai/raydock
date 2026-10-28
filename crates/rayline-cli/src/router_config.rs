@@ -61,17 +61,7 @@ pub fn default_config_json(router_url: &str) -> Value {
             "main": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
             "subagent": { "endpoint": "rayline-cloud", "model": crate::ARC_SWIFT_MODEL },
             "default": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
-            "subagents": {},
-            // The local router reads a requested `rayline-router` as "route by
-            // `routes.main`" (its virtual marker), so without this an explicit
-            // `raydock codex --model rayline-router` would run on ARC Sage.
-            // This pins that request to the Legacy Rules Router.
-            "model_routes": {
-                crate::LEGACY_ROUTER_MODEL: {
-                    "endpoint": "rayline-cloud",
-                    "model": crate::LEGACY_ROUTER_MODEL
-                }
-            }
+            "subagents": {}
         }
     })
 }
@@ -617,7 +607,8 @@ pub fn materialize_codex_subscription_for_local_router(
 pub fn materialize_codex_config_for_local_router(path: &Path, home: &Path) -> io::Result<PathBuf> {
     let raw = std::fs::read(path)?;
     let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
-    let mut changed = ensure_codex_config_model_routes(&mut cfg);
+    let mut changed = ensure_codex_legacy_model_route(&mut cfg);
+    changed |= ensure_codex_config_model_routes(&mut cfg);
     // A may-local `rayline-cloud` route may declare only `local_models` and omit
     // `model` (accepted by config_may_local); fill the RCR sentinel so the local
     // router's non-empty-model check doesn't reject it at startup.
@@ -687,6 +678,44 @@ fn ensure_codex_config_model_routes(cfg: &mut Value) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Pin an explicit Codex `--model rayline-router` to the Legacy Rules Router
+/// when `routes.main` is a hosted RCR. The local router reads a requested
+/// `rayline-router` as its virtual marker ("route by `routes.main`"), so with
+/// an ARC main (the generated default) that explicit choice would run on ARC.
+/// Codex's own "no model" sentinel is `rayline-local`, so on the Codex surface
+/// `rayline-router` is only ever the user's pick. Claude Code launches send
+/// `rayline-router` as the marker itself, which is why this is added here, in
+/// the Codex materialization, and never to the shared config. A main on a
+/// local or custom endpoint keeps the marker meaning, and an existing
+/// `model_routes` entry is left as is.
+fn ensure_codex_legacy_model_route(cfg: &mut Value) -> bool {
+    let Some(main_endpoint) = cfg
+        .get("routes")
+        .and_then(|routes| routes.get("main"))
+        .and_then(route_endpoint)
+    else {
+        return false;
+    };
+    if !hosted_rcr_endpoint_ids(cfg).contains(&main_endpoint) {
+        return false;
+    }
+    let Some(routes) = cfg.get_mut("routes").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let model_routes = routes.entry("model_routes").or_insert_with(|| json!({}));
+    let Some(model_routes) = model_routes.as_object_mut() else {
+        return false;
+    };
+    if model_routes.contains_key(crate::LEGACY_ROUTER_MODEL) {
+        return false;
+    }
+    model_routes.insert(
+        crate::LEGACY_ROUTER_MODEL.to_owned(),
+        json!({ "endpoint": main_endpoint, "model": crate::LEGACY_ROUTER_MODEL }),
+    );
+    true
 }
 
 /// `x-rayline-client` value the edge stamps on Codex requests forwarded to the
@@ -1097,7 +1126,36 @@ mod tests {
         assert_eq!(routes["rayline-router"]["endpoint"], "rayline-cloud");
         assert_eq!(routes["rayline-local"]["model"], "arc-sage-1.0");
         assert_eq!(cfg["routes"]["subagent"]["model"], "arc-swift-1.0");
+        // The shared file carries no pin: Claude Code sends `rayline-router`
+        // as its "follow routes.main" marker.
+        let shared: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(shared["routes"].get("model_routes").is_none());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn codex_legacy_pin_only_for_a_hosted_main() {
+        // A local main keeps the marker meaning for `rayline-router`.
+        let mut local = json!({
+            "endpoints": [
+                { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] },
+                { "id": "ollama", "protocol": "openai_chat",
+                  "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen"] }
+            ],
+            "routes": { "main": { "endpoint": "ollama", "model": "qwen" } }
+        });
+        assert!(!ensure_codex_legacy_model_route(&mut local));
+        assert!(local["routes"].get("model_routes").is_none());
+        // A user's own entry wins.
+        let mut own = default_config_json(crate::ROUTER_PROD_URL);
+        own["routes"]["model_routes"] = json!({
+            "rayline-router": { "endpoint": "rayline-cloud", "model": "arc-swift-1.0" } });
+        assert!(!ensure_codex_legacy_model_route(&mut own));
+        assert_eq!(
+            own["routes"]["model_routes"]["rayline-router"]["model"],
+            "arc-swift-1.0"
+        );
     }
 
     #[test]
