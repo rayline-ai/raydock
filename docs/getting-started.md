@@ -264,8 +264,11 @@ harness gives them their own model setting:
 
 Each generated harness config lists all three models, so the harness's own
 picker offers ARC Sage, ARC Swift and the Legacy Rules Router. A model you set
-yourself is kept: `--model` or `ANTHROPIC_MODEL` for Claude Code (subagents then
-inherit it, as before), your own `CLAUDE_CODE_SUBAGENT_MODEL` or
+yourself is kept: `--model` (before or after `--`) or `ANTHROPIC_MODEL` for
+Claude Code (subagents then inherit it, as before), a cloud-only `--config`'s
+`routes.main` and `routes.subagent` models (with `--route all`; without a
+`routes.subagent`, subagents follow `routes.main`), a `--router-config-path`
+subagent allowlist (Raydock then sets no subagent model), your own `CLAUDE_CODE_SUBAGENT_MODEL` or
 `ANTHROPIC_DEFAULT_HAIKU_MODEL`, a `--config` route, and the model pi and omp
 saved. The pi `settings.json` and omp `config.yml` that Raydock seeds only once
 are moved to ARC only while they still read exactly as an 0.2.x release wrote

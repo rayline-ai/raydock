@@ -245,10 +245,21 @@ fn hosted_rcr_endpoint_ids(cfg: &Value) -> Vec<String> {
 /// explicit main model, which `raydock claude` launches with instead of its
 /// default.
 pub fn config_main_model(path: &Path) -> Option<String> {
+    config_route_model(path, "main")
+}
+
+/// The model `routes.subagent` names, if any (non-empty): a cloud-only
+/// config's subagent model, which `raydock claude` gives Claude Code's
+/// subagents.
+pub fn config_subagent_model(path: &Path) -> Option<String> {
+    config_route_model(path, "subagent")
+}
+
+fn config_route_model(path: &Path, route: &str) -> Option<String> {
     let raw = std::fs::read(path).ok()?;
     let cfg: Value = serde_json::from_slice(&raw).ok()?;
     cfg.get("routes")?
-        .get("main")?
+        .get(route)?
         .get("model")?
         .as_str()
         .map(str::trim)

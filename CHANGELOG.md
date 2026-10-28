@@ -27,7 +27,8 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `router.json`, pi `settings.json` and omp `config.yml`) move to ARC once.
   Local and hybrid sessions are unchanged.
 - A cloud-only `raydock claude --config` launches the main agent with the model
-  its `routes.main` names.
+  its `routes.main` names and, with `--route all`, subagents with its
+  `routes.subagent` model.
 - Under `--route subagents`, a request naming an ARC model (`arc-*`) always
   goes to the router, like `rayline-router`: Anthropic serves neither.
 
