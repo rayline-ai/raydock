@@ -11,7 +11,7 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 ## Requirements
 
 - macOS 13 or later, or Linux, with a Rayline release installed. The release
-  includes `rayline`, `rld` and `rayline-core`.
+  includes `raydock`, `rld` and `rayline-core`.
 - A local inference server with your Qwen model: llama.cpp, Ollama or MLX.
   Rayline does not start, download or stop it.
 - Nothing else. A profile file is optional (see [Advanced: a profile file](#advanced-a-profile-file)).
@@ -30,8 +30,8 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 1. **Sign in.**
 
    ```bash
-   rayline --env dev auth login        # preview
-   rayline auth login                  # once production serves v2
+   raydock --env dev auth login        # preview
+   raydock auth login                  # once production serves v2
    ```
 
    `start` mints your Rayline API key on first use if none is saved. That key
@@ -42,21 +42,21 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 2. **Point Rayline at your local model.**
 
    ```bash
-   rayline local custom --url http://127.0.0.1:8080/v1 --model qwen3.8-27b
+   raydock local custom --url http://127.0.0.1:8080/v1 --model qwen3.8-27b
    ```
 
    This is the local endpoint hybrid routing uses. It must serve Qwen3.8-27B
    (Hugging Face `Qwen/Qwen3.8-27B`; Ollama `qwen3.8:27b`), ARC's local model.
-   `rayline hybrid start` checks the loaded model on llama.cpp and Ollama, and
+   `raydock hybrid start` checks the loaded model on llama.cpp and Ollama, and
    runs the session cloud only if it is another model.
 
 3. **Start and connect a harness.**
 
    ```bash
-   rayline hybrid start --env dev --cell pf-5505cbf8-v2   # preview
-   rayline hybrid run pi -- "Fix the failing test in parser.py"
-   rayline hybrid status
-   rayline hybrid stop
+   raydock hybrid start --env dev --cell pf-5505cbf8-v2   # preview
+   raydock hybrid run pi -- "Fix the failing test in parser.py"
+   raydock hybrid status
+   raydock hybrid stop
    ```
 
    With no profile file, `start` builds the default profile:
@@ -79,10 +79,10 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
    `start`. A turn whose prompt does not fit the local window goes to a cloud
    model; harnesses are told the window is 1,000,000 tokens. Once production
-   serves v2, plain `rayline hybrid start` uses the production router.
+   serves v2, plain `raydock hybrid start` uses the production router.
 
    `start` checks Decisions once before it reports ready: a rejected key
-   fails with the `rayline --env dev auth login` command to run, and a
+   fails with the `raydock --env dev auth login` command to run, and a
    preview cell that is still starting is waited for.
 
    `start` prints the profile, the routing policy and the local model it bound.
@@ -91,7 +91,7 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    OpenCode 2, `run` adds `--standalone` so the session uses Rayline's
    configuration rather than OpenCode's shared background service.
 
-   `rayline local test` checks the endpoint with an OpenAI Chat Completions
+   `raydock local test` checks the endpoint with an OpenAI Chat Completions
    request, the API hybrid routing uses.
 
 ## Pricing defaults
@@ -106,7 +106,7 @@ model) and `value_usd`.
 
 ## Routing policy
 
-With no override, Rayline Local sends the **hybrid default** preset,
+With no override, Raydock sends the **hybrid default** preset,
 `arc-policy.hybrid-default.v1`, on every decision. Under this preset:
 
 - **The model** may change at cache boundaries: task start, a subagent start, a
@@ -193,7 +193,7 @@ No harness extension or patch is needed.
 
 ## Advanced: a profile file
 
-`rayline hybrid start --config /absolute/path/to/hybrid.json` uses a qualified
+`raydock hybrid start --config /absolute/path/to/hybrid.json` uses a qualified
 execution-core profile instead of the default. The `hybrid.routing` overrides
 still apply. Use one to:
 
@@ -206,7 +206,7 @@ The fields are described in [ARC hybrid execution](hybrid-routing.md).
 
 ## Troubleshooting
 
-- `rayline hybrid status` shows readiness, process identity and the advertised
+- `raydock hybrid status` shows readiness, process identity and the advertised
   model capabilities.
 - Refusals come back as errors in the harness:
   - `policy_preset_not_admitted`: the cell does not serve that preset.

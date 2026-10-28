@@ -1,8 +1,15 @@
 # Release Process
 
-Rayline Local releases are binary-first. The Rust workspace is not published to
+Raydock releases are binary-first. The Rust workspace is not published to
 crates.io yet; all crates are marked `publish = false` until the package split
 is intentionally reviewed.
+
+## Command compatibility
+
+`raydock` is the primary command. `rayline` remains a supported alias with no
+scheduled removal; this migration does not add an expiry. Any future removal
+requires a separate announced breaking change. Updater asset names, config
+paths, credentials, and environment variables remain unchanged.
 
 ## Release Tags
 
@@ -43,7 +50,7 @@ binary assets against `SHA256SUMS`.
 
 ## Self-Update Mirror
 
-The built-in `rayline update` command reads from `https://get.rayline.ai` by
+The built-in `raydock update` command reads from `https://get.rayline.ai` by
 default. After the GitHub Release is created, mirror the bare binary assets and
 **both** signature files to:
 
@@ -56,7 +63,7 @@ https://get.rayline.ai/cli/v<version>/SHA256SUMS
 https://get.rayline.ai/cli/v<version>/SHA256SUMS.minisig
 ```
 
-`SHA256SUMS.minisig` is **required**: `rayline update` verifies it against the
+`SHA256SUMS.minisig` is **required**: `raydock update` verifies it against the
 pinned public key before trusting any checksum, and fails closed if it is
 missing or invalid.
 
@@ -105,8 +112,8 @@ After the release workflow completes, validate at least one installer path:
 
 ```bash
 scripts/install-rayline.sh --version 0.2.0 --install-dir /tmp/rayline-bin
-/tmp/rayline-bin/rayline --version
-/tmp/rayline-bin/rayline update --check
+/tmp/rayline-bin/raydock --version
+/tmp/rayline-bin/raydock update --check
 ```
 
 For installer validation against a staged asset directory:
@@ -121,7 +128,7 @@ base at a local or staged mirror:
 
 ```bash
 RAYLINE_UPDATE_BASE_URL=file:///tmp/rayline-release \
-  /tmp/rayline-bin/rayline update --dry-run --version 0.2.0
+  /tmp/rayline-bin/raydock update --dry-run --version 0.2.0
 ```
 
 ## Execution core build
@@ -148,6 +155,7 @@ core and hybrid execution require macOS 13+, despite those historical names;
 existing Rust deployment targets are unchanged. Linux hybrid is supported.
 Windows core cross-compiles, but Windows hybrid lifecycle is not qualified and
 the CLI refuses hybrid commands there. A successful cross-build is not runtime
-acceptance. The Homebrew formula template remains authoritative in
-`packaging/homebrew/rayline.rb.template`, with `__RELEASE_BASE_URL__` supplied by
-the publishing pipeline.
+acceptance. Production Homebrew publishing uses the template and flat archives from
+`atlasfutures/memex-desktop`. `packaging/homebrew/raydock.rb.template` applies
+only to this repo's manual fallback archives; see the packaging README for the
+different layouts.

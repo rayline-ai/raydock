@@ -1,5 +1,5 @@
-//! `rayline claude-desktop` — run Claude Code inside the **Claude desktop app**
-//! against ARC through Rayline Local.
+//! `raydock claude-desktop` — run Claude Code inside the **Claude desktop app**
+//! against ARC through Raydock.
 //!
 //! Claude Desktop's Code sessions ignore `ANTHROPIC_BASE_URL`; the only way to
 //! point them at a gateway is the app's third-party inference ("3P") mode,
@@ -14,7 +14,7 @@
 //! 2. 3P mode applies to the whole app (it switches away from the claude.ai
 //!    subscription), so the router runs as its **own** instance — its own state
 //!    directory, ports, pid file and LaunchAgent — and never touches the shared
-//!    `rayline claude` / `rayline codex` router or any Claude Code CLI config.
+//!    `raydock claude` / `raydock codex` router or any Claude Code CLI config.
 //! 3. The Rayline `rlk-` key stays inside the router process. Desktop receives a
 //!    loopback URL and a per-instance gateway token (which only unlocks this
 //!    router). The default command installs a recoverable local Desktop profile
@@ -681,7 +681,7 @@ pub fn validate_desktop_config(
         (Some(_), None) => (
             false,
             "inferenceGatewayApiKey is set, but this router has no token yet; run \
-             `rayline claude-desktop` and re-import",
+             `raydock claude-desktop` and re-import",
         ),
     };
     check(key_ok, key_message.to_owned());
@@ -759,7 +759,7 @@ fn render_findings(source: &Path, findings: &[Finding]) -> (bool, String) {
         out.push('\n');
     }
     if !ok {
-        out.push_str("Re-import the file `rayline claude-desktop` prints, then Apply Changes.\n");
+        out.push_str("Re-import the file `raydock claude-desktop` prints, then Apply Changes.\n");
     }
     (ok, out)
 }
@@ -774,7 +774,7 @@ fn xml_escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// LaunchAgent that runs `rayline [--env <env>] claude-desktop serve` at login. The
+/// LaunchAgent that runs `raydock [--env <env>] claude-desktop serve` at login. The
 /// plist carries no secret: `serve` reads the key from Rayline's credentials.
 /// `RLD_BIN` pins the `rld` this command resolved, because launchd's PATH is
 /// not the user's shell PATH.
@@ -1063,7 +1063,7 @@ fn unguarded_error(paths: &AppPaths, rld_bin: &Path) -> String {
     format!(
         "the router on {} did not come up enforcing its gateway token, so any local \
          process could spend your Rayline key; it was stopped. {} may be older than this \
-         CLI: update Rayline and run `rayline claude-desktop` again. See {}",
+         CLI: update Rayline and run `raydock claude-desktop` again. See {}",
         gateway_url(PORTS),
         rld_bin.display(),
         paths.log_file.display()
@@ -1093,7 +1093,7 @@ Rayline ARC gateway for Claude Desktop is running.
 
 Before you continue: third-party mode applies to the whole Claude Desktop app.
 It switches away from your claude.ai subscription, and Chat and Cowork are
-off while it is active. Run `rayline claude-desktop off` to see how to switch back.
+off while it is active. Run `raydock claude-desktop off` to see how to switch back.
 
 Connect Claude Desktop (once):
   1. Open Claude Desktop. From the menu bar choose Help > Troubleshooting >
@@ -1104,8 +1104,8 @@ Connect Claude Desktop (once):
   5. On the sign-in screen, choose to continue with the configured gateway.
   6. Open Code and pick arc-sage, or arc-swift for the cheaper tier.
 
-Check the setup with `rayline claude-desktop validate`. Keep the router running
-across logins with `rayline claude-desktop install-service`.
+Check the setup with `raydock claude-desktop validate`. Keep the router running
+across logins with `raydock claude-desktop install-service`.
 Anthropic does not support routing Claude Code to non-Claude models through a
 gateway, so a Desktop update can change this behaviour.
 ",
@@ -1423,7 +1423,7 @@ fn serve(request: &AppRequest) -> Result<String, String> {
     let key = crate::status::load_claude_key_from_home(&resolved.env, &resolved.home).ok_or_else(
         || {
             format!(
-                "no Rayline key for '{}'; run `rayline auth login` (the login service \
+                "no Rayline key for '{}'; run `raydock auth login` (the login service \
                  never prompts)",
                 resolved.env
             )
@@ -1518,7 +1518,7 @@ fn validate(request: &AppRequest) -> Result<String, String> {
         None => applied_desktop_config_path(&home).map_err(|error| {
             format!(
                 "could not read Claude Desktop's applied third-party configuration \
-                 ({error}). Import the file from `rayline claude-desktop` first.\n"
+                 ({error}). Import the file from `raydock claude-desktop` first.\n"
             )
         })?,
     };

@@ -29,7 +29,7 @@ fn local_main_spawns_subagent_end_to_end() {
         return;
     }
 
-    let rayline = env!("CARGO_BIN_EXE_rayline");
+    let rayline = env!("CARGO_BIN_EXE_raydock");
     let config = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../examples/routing-modes/L-L.json"
@@ -44,7 +44,7 @@ fn local_main_spawns_subagent_end_to_end() {
             "claude", "--config", config, "--via", "proxy", "--", "-p", prompt,
         ])
         .output()
-        .expect("spawn `rayline claude --config`");
+        .expect("spawn `raydock claude --config`");
 
     // The subagent leg is observable in router metrics as a request carrying an
     // `agent_type`. With a tool-capable local main this is present; today it is
@@ -52,9 +52,9 @@ fn local_main_spawns_subagent_end_to_end() {
     let top = Command::new(rayline)
         .args(["top", "--json", "--all"])
         .output()
-        .expect("spawn `rayline top --json`");
+        .expect("spawn `raydock top --json`");
     let snapshot: serde_json::Value =
-        serde_json::from_slice(&top.stdout).expect("parse `rayline top --json` output");
+        serde_json::from_slice(&top.stdout).expect("parse `raydock top --json` output");
 
     let spawned_subagent = ["active", "recent"]
         .iter()

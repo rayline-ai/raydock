@@ -22,7 +22,7 @@
 //!   `--session-id <id>` in the args the conversation id is stable
 //!   (`oc-` + 32 hex of sha256(id)), so relaunching that session keeps its
 //!   episode; otherwise each launch is its own episode.
-//! - The `rayline-resp` provider (model `rayline-resp/rayline-router`) speaks
+//! - The `rayline-resp` provider (e.g. `rayline-resp/arc-sage-1.0`) speaks
 //!   Responses, where `compat.supportsPromptCacheKey` sends the session as
 //!   `prompt_cache_key`; without it OpenClaw sends no key on a custom
 //!   endpoint. It takes the per-launch header only where the env needs it.
@@ -32,7 +32,7 @@ use std::ffi::OsString;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use super::{CONV_ID_ENV, ConfigFile, Plan, ROUTER_MODEL, RenderContext, json_file};
+use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, json_file, model_display_name};
 
 pub(crate) const CONFIG_FILE: &str = "openclaw.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -163,16 +163,23 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     // No native session id on Messages (see the module docs).
     let messages_headers = ctx.conversation_headers_for(&conv_ref, false);
     let responses_headers = ctx.conversation_headers(&conv_ref);
-    let model = |compat: serde_json::Value| {
-        json!({
-            "id": ROUTER_MODEL,
-            "name": format!("Rayline router ({})", ctx.env_name),
-            "reasoning": true,
-            "input": ctx.input_modalities(),
-            "contextWindow": ctx.context_window(),
-            "maxTokens": ctx.max_output_tokens(),
-            "compat": compat
-        })
+    let launch = ctx.models();
+    let models = |compat: serde_json::Value| {
+        launch
+            .offered
+            .iter()
+            .map(|model| {
+                json!({
+                    "id": model,
+                    "name": format!("{} ({})", model_display_name(launch, model), ctx.env_name),
+                    "reasoning": true,
+                    "input": ctx.input_modalities(),
+                    "contextWindow": ctx.context_window(),
+                    "maxTokens": ctx.max_output_tokens(),
+                    "compat": compat
+                })
+            })
+            .collect::<Vec<_>>()
     };
     let config = json!({
         "secrets": {
@@ -187,7 +194,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "memory": { "search": { "provider": "none" } },
         "agents": {
             "defaults": {
-                "model": { "primary": format!("{PROVIDER_ID}/{ROUTER_MODEL}") },
+                "model": { "primary": format!("{PROVIDER_ID}/{}", launch.main) },
                 "heartbeat": { "every": "0m" },
                 "compaction": { "memoryFlush": { "enabled": false } }
             }
@@ -200,14 +207,14 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                     "apiKey": api_key,
                     "api": "anthropic-messages",
                     "headers": messages_headers,
-                    "models": [model(json!({}))]
+                    "models": models(json!({}))
                 },
                 RESPONSES_PROVIDER_ID: {
                     "baseUrl": ctx.v1_base(),
                     "apiKey": api_key,
                     "api": "openai-responses",
                     "headers": responses_headers,
-                    "models": [model(json!({ "supportsPromptCacheKey": true }))]
+                    "models": models(json!({ "supportsPromptCacheKey": true }))
                 }
             }
         }
@@ -220,6 +227,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 contents: ctx.key.to_owned(),
                 overwrite: true,
                 merged_from: None,
+                replaces_seed: None,
             },
         ],
         env_set: vec![(
@@ -248,7 +256,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
         assert_eq!(config["memory"]["search"]["provider"], "none");
         let defaults = &config["agents"]["defaults"];
-        assert_eq!(defaults["model"]["primary"], "rayline/rayline-router");
+        assert_eq!(defaults["model"]["primary"], "rayline/arc-sage-1.0");
         assert_eq!(defaults["heartbeat"]["every"], "0m");
         assert_eq!(defaults["compaction"]["memoryFlush"]["enabled"], false);
         let provider = &config["models"]["providers"]["rayline"];
@@ -283,7 +291,14 @@ mod tests {
         assert_eq!(responses["api"], "openai-responses");
         assert_eq!(responses["apiKey"], key_ref);
         assert_eq!(responses["headers"], serde_json::json!({}));
-        assert_eq!(responses["models"][0]["id"], "rayline-router");
+        let ids: Vec<_> = responses["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        // Legacy stays selectable (`rayline/rayline-router`).
+        assert_eq!(ids, ["arc-sage-1.0", "arc-swift-1.0", "rayline-router"]);
         assert_eq!(
             responses["models"][0]["compat"]["supportsPromptCacheKey"],
             true

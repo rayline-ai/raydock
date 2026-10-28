@@ -281,7 +281,7 @@ fn chat_translation_refusal(body: &Value) -> Option<Response<BoxBody>> {
         return Some(chat_invalid_request(
             "unsupported_parameter",
             "functions",
-            "Rayline Local cannot translate the deprecated functions / function_call fields \
+            "Raydock cannot translate the deprecated functions / function_call fields \
              (or role \"function\" messages) on this route. Declare them as tools and use \
              tool_choice and tool messages instead."
                 .to_owned(),
@@ -297,7 +297,7 @@ fn chat_translation_refusal(body: &Value) -> Option<Response<BoxBody>> {
         return Some(chat_invalid_request(
             "unsupported_parameter",
             "web_search_options",
-            "Rayline Local cannot run Chat Completions web search on this route: it translates \
+            "Raydock cannot run Chat Completions web search on this route: it translates \
              Chat Completions to Anthropic Messages without web search. Remove \
              web_search_options, or route to an endpoint that speaks Chat Completions natively."
                 .to_owned(),
@@ -311,7 +311,7 @@ fn chat_translation_refusal(body: &Value) -> Option<Response<BoxBody>> {
         return Some(chat_invalid_request(
             "unsupported_tool_type",
             "messages",
-            "Rayline Local cannot replay an assistant tool call that is not a named function \
+            "Raydock cannot replay an assistant tool call that is not a named function \
              call (a custom tool call, for example) on this route: it translates Chat \
              Completions to Anthropic Messages, which supports only function tools."
                 .to_owned(),
@@ -485,7 +485,7 @@ fn untranslatable_chat_tools_response(body: &Value) -> Option<Response<BoxBody>>
         "unsupported_tool_type",
         "tools",
         format!(
-            "Rayline Local cannot send tool type(s) {} on this route: it translates Chat Completions to \
+            "Raydock cannot send tool type(s) {} on this route: it translates Chat Completions to \
              Anthropic Messages, which supports only function tools. Declare them as function tools, or \
              route to an endpoint that speaks Chat Completions natively.",
             kinds.join(", ")

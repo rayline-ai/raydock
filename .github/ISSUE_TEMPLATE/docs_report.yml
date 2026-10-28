@@ -1,5 +1,5 @@
 name: Documentation issue
-description: Report missing, stale, or confusing Rayline Local documentation.
+description: Report missing, stale, or confusing Raydock documentation.
 title: "[docs]: "
 labels: ["documentation"]
 body:

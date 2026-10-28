@@ -1,12 +1,12 @@
-# Contributing to Rayline Local
+# Contributing to Raydock
 
-Thanks for your interest in Rayline Local, the local-router project in the
+Thanks for your interest in Raydock, the local-router project in the
 broader Rayline ecosystem. This document explains how to engage with the project
 during its current phase.
 
 ## External Pull Requests Are Not Accepted Yet
 
-Rayline Local is in a locked-down, pre-public-contribution phase. We are not
+Raydock is in a locked-down, pre-public-contribution phase. We are not
 accepting external pull requests at this time. PRs opened from outside the
 maintainer team will be closed without review. This is a temporary policy while
 the project's governance, security, and release infrastructure are established.
@@ -19,7 +19,7 @@ reproducible reports are the most useful thing you can contribute right now.
 When filing an issue, please:
 
 - use the provided issue forms;
-- include your OS, Rayline Local version, the exact command you ran, and a
+- include your OS, Raydock version, the exact command you ran, and a
   minimal reproduction;
 - describe expected vs. actual behavior;
 - never include secrets, API keys, tokens, private prompts, customer data, or

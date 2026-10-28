@@ -16,8 +16,8 @@
 //!
 //! This is **config only**. Whether local routing actually engages is gated by
 //! the server-side `enable_local_router` toggle (flipped from the menu bar, or
-//! a forthcoming `rayline local on`); a configured endpoint here is necessary but
-//! not sufficient. `rayline claude` engagement and the server read live in a later
+//! a forthcoming `raydock local on`); a configured endpoint here is necessary but
+//! not sufficient. `raydock claude` engagement and the server read live in a later
 //! phase and are intentionally not handled here.
 
 use std::io;
@@ -87,7 +87,7 @@ pub struct LocalModelConfig {
 }
 
 impl LocalModelConfig {
-    /// Whether this config can actually drive `rayline claude` local routing.
+    /// Whether this config can actually drive `raydock claude` local routing.
     /// Recommended needs an explicit verified pick (repo/file + revision/SHA) —
     /// there is deliberately NO bundled-default fallback. A pickless config
     /// (e.g. legacy `mode: "auto"`) is resolved at engagement time: the best
@@ -641,7 +641,7 @@ async fn set_router_enabled_in_home(
 
 /// Fetch the caller's router settings once. `None` on any network/auth failure
 /// or error payload. Mirrors the consolidated fetch in `claude.rs`; kept local
-/// to the `rayline local` surface so `show`/`on`/`off` need no cross-module plumbing.
+/// to the `raydock local` surface so `show`/`on`/`off` need no cross-module plumbing.
 async fn fetch_router_settings(
     hosted: &crate::status::HostedEnvironment,
     auth_token: Option<&str>,
@@ -726,8 +726,8 @@ pub async fn test(request: &LocalTestRequest) -> Result<String, String> {
         Some("openai_chat") => test_openai_chat(&base_url, &model).await,
         Some("anthropic_messages") => test_anthropic_messages(&base_url, &model).await,
         // A custom endpoint with no stated protocol serves two paths:
-        // `rayline hybrid` sends OpenAI Chat Completions to it, and
-        // `rayline claude --local` sends Anthropic Messages. Both are probed
+        // `raydock hybrid` sends OpenAI Chat Completions to it, and
+        // `raydock claude --local` sends Anthropic Messages. Both are probed
         // and reported; the test fails only when neither answers.
         _ => {
             let chat = test_openai_chat(&base_url, &model).await;

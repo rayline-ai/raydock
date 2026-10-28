@@ -116,7 +116,6 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
             stderr: false,
         });
     }
-
     let platform_tag = detect_platform_tag()?;
     let current = Version::parse(crate::RAYLINE_VERSION)
         .map_err(|_| UpdateError::InvalidVersion(crate::RAYLINE_VERSION.to_owned()))?;
@@ -142,7 +141,7 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
             // than failing the check.
             return Ok(UpdateResult {
                 message: format!(
-                    "{}Execution core is missing; repair it with `rayline update --version {}`.\n",
+                    "{}Execution core is missing; repair it with `raydock update --version {}`.\n",
                     decision.message, current.normalized
                 ),
                 ..decision
@@ -150,7 +149,7 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
         }
         decision = UpdateResult {
             message: format!(
-                "Execution core is missing; reinstall the complete {} release with `rayline update`.\n",
+                "Execution core is missing; reinstall the complete {} release with `raydock update`.\n",
                 current.public
             ),
             exit_code: 1,
@@ -209,18 +208,25 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                 let core_install_path = daemon_install_path
                     .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
                 let license_install_path = core_install_path.with_file_name(CORE_LICENSE_NAME);
+                #[cfg(windows)]
+                if let Err(error) = cleanup_retired_backups(&install_path) {
+                    eprintln!(
+                        "Could not finish old update backup cleanup: {error}. Continuing installation; a later update will retry."
+                    );
+                }
                 if let Some(core) = &artifacts.core {
                     replace_file(&core.license, &license_install_path, false)?;
                     replace_binary(&core.binary, &core_install_path)?;
                 }
                 replace_binary(&artifacts.launcher, &install_path)?;
                 replace_binary(&artifacts.daemon, &daemon_install_path)?;
+                crate::command_alias::install_alias(&install_path)?;
                 if artifacts.core.is_none() {
                     // Rollback to a pre-core release: remove the newer core
                     // and its license so no later launcher (for example one
                     // installed by the older two-binary updater) runs a core
                     // that does not match it; it then reports the core as
-                    // missing and `rayline update` installs the matching one.
+                    // missing and `raydock update` installs the matching one.
                     remove_stale_core(&[&core_install_path, &license_install_path]);
                 }
                 cleanup_legacy_uv_install(crate::UV_TOOL_NAME, &install_path);
@@ -251,7 +257,7 @@ fn bare_version_hint(target: &Version, error: UpdateError) -> UpdateError {
             if !target.normalized.contains('+') && message.ends_with("HTTP 404") =>
         {
             UpdateError::Network(format!(
-                "release {} was not found. Releases are published under their full version including the build label; run `rayline update --version {}+<build>` with the full version from the release notes (`rayline --version` prints it for an installed release).",
+                "release {} was not found. Releases are published under their full version including the build label; run `raydock update --version {}+<build>` with the full version from the release notes (`raydock --version` prints it for an installed release).",
                 target.public, target.public
             ))
         }
@@ -554,7 +560,7 @@ async fn download_and_verify(
 ) -> Result<UpdateArtifacts, UpdateError> {
     let version = target.normalized.as_str();
     fs::create_dir_all(dest_dir).map_err(UpdateError::from)?;
-    let launcher_name = format!("{}-{platform_tag}", crate::CLI_BIN);
+    let launcher_name = format!("{}-{platform_tag}", crate::CLI_ASSET);
     let daemon_name = format!("{}-{platform_tag}", crate::DAEMON_BIN);
     let launcher_path = dest_dir.join(&launcher_name);
     let daemon_path = dest_dir.join(&daemon_name);
@@ -584,7 +590,7 @@ async fn download_and_verify(
     let with_core = release_ships_core(&sums, platform_tag, target)?;
 
     download_to(
-        &artifact_url_for(version, platform_tag, crate::CLI_BIN),
+        &artifact_url_for(version, platform_tag, crate::CLI_ASSET),
         &launcher_path,
     )
     .await?;
@@ -708,6 +714,7 @@ fn install_path() -> io::Result<PathBuf> {
         .map(PathBuf::from)
         .map_or_else(std::env::current_exe, Ok)
         .map(resolve_install_path)
+        .map(|path| crate::command_alias::primary_path(&path))
 }
 
 /// `current_exe()` may return the invoking symlink rather than its target on
@@ -721,7 +728,7 @@ fn resolve_install_path(path: PathBuf) -> PathBuf {
     fs::canonicalize(&path).unwrap_or(path)
 }
 
-fn is_homebrew_managed(install_path: &Path) -> bool {
+pub(crate) fn is_homebrew_managed(install_path: &Path) -> bool {
     let Some(prefix) = homebrew_prefix() else {
         return false;
     };
@@ -733,7 +740,7 @@ fn is_homebrew_managed(install_path: &Path) -> bool {
 /// action). The app owns updates in that case; self-replacing would break the
 /// notarization seal. Canonicalize first so symlink paths resolve to the real
 /// bundle path before matching.
-fn is_app_bundle_managed(install_path: &Path) -> bool {
+pub(crate) fn is_app_bundle_managed(install_path: &Path) -> bool {
     let resolved =
         std::fs::canonicalize(install_path).unwrap_or_else(|_| install_path.to_path_buf());
     resolved.to_string_lossy().contains(".app/Contents/")
@@ -824,7 +831,7 @@ fn replace_file(
 /// a sidecar path first, then move the update into place, restoring the
 /// original if the second move fails.
 #[cfg(not(windows))]
-fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
+pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     fs::rename(staged, install_path).map_err(|error| {
         UpdateError::Install(format!(
             "failed to replace {}: {error}",
@@ -834,7 +841,7 @@ fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError
 }
 
 #[cfg(windows)]
-fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
+pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     if !install_path.exists() {
         return fs::rename(staged, install_path).map_err(|error| {
             UpdateError::Install(format!(
@@ -854,14 +861,18 @@ fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError
 
     match fs::rename(staged, install_path) {
         Ok(()) => {
-            // Best-effort: the old binary stays locked while it is the running
-            // process, so removal may fail here and succeed on a later update.
-            let _ = fs::remove_file(&backup);
+            retire_replaced_backup(&backup, install_path);
             Ok(())
         }
         Err(error) => {
             // Restore the original so a failed update never leaves a hole.
-            let _ = fs::rename(&backup, install_path);
+            fs::rename(&backup, install_path).map_err(|restore_error| {
+                UpdateError::Install(format!(
+                    "failed to replace {}: {error}; restore also failed: {restore_error}. Original preserved at {}",
+                    install_path.display(),
+                    backup.display()
+                ))
+            })?;
             Err(UpdateError::Install(format!(
                 "failed to replace {}: {error}",
                 install_path.display()
@@ -870,7 +881,27 @@ fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError
     }
 }
 
-fn staged_install_path(install_path: &Path) -> Result<PathBuf, UpdateError> {
+/// Mark a committed replacement's old file for a later update to delete. The
+/// running image is normally still locked now; retirement is only housekeeping
+/// and must not stop installation of the remaining companion binaries.
+#[cfg(any(windows, test))]
+fn retire_replaced_backup(backup: &Path, install_path: &Path) {
+    let result = sidecar_install_path(install_path, "old")
+        .and_then(|retired| fs::rename(backup, retired).map_err(UpdateError::from));
+    if let Err(error) = result {
+        eprintln!(
+            "Updated {}; retained previous file at {} because it could not be marked for cleanup: {error}. Remove it manually after older sessions and installers exit.",
+            install_path.display(),
+            backup.display()
+        );
+    }
+}
+
+pub(crate) fn staged_install_path(install_path: &Path) -> Result<PathBuf, UpdateError> {
+    sidecar_install_path(install_path, "tmp")
+}
+
+fn sidecar_install_path(install_path: &Path, kind: &str) -> Result<PathBuf, UpdateError> {
     let parent = install_path.parent().ok_or_else(|| {
         UpdateError::Install(format!(
             "install path has no parent directory: {}",
@@ -889,8 +920,83 @@ fn staged_install_path(install_path: &Path) -> Result<PathBuf, UpdateError> {
         .as_nanos();
     let mut staged_name = OsString::from(".");
     staged_name.push(file_name);
-    staged_name.push(format!(".tmp-{}-{unique}", std::process::id()));
+    staged_name.push(format!(".{kind}-{}-{unique}", std::process::id()));
     Ok(parent.join(staged_name))
+}
+
+/// Before an actual update, delete backups from previous successful Windows swaps.
+/// Historical .tmp files also name active staging and rollback files, so those
+/// require manual cleanup after all installers and Raydock sessions have exited.
+#[cfg(any(windows, test))]
+fn cleanup_retired_backups(install_path: &Path) -> Result<(), UpdateError> {
+    let parent = install_path.parent().ok_or_else(|| {
+        UpdateError::Install(format!(
+            "install path has no parent: {}",
+            install_path.display()
+        ))
+    })?;
+    for entry in fs::read_dir(parent).map_err(|error| {
+        UpdateError::Install(format!(
+            "cannot inspect update backups in {}: {error}",
+            parent.display()
+        ))
+    })? {
+        let entry = entry?;
+        if entry.file_name().to_str().is_some_and(is_retired_backup) {
+            match entry.file_type() {
+                Ok(kind) if kind.is_file() => remove_retired_backup(&entry.path())?,
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn is_retired_backup(name: &str) -> bool {
+    [
+        "raydock.exe",
+        "rayline.exe",
+        "rld.exe",
+        "rayline-core.exe",
+        CORE_LICENSE_NAME,
+    ]
+    .iter()
+    .any(|binary| {
+        name.strip_prefix(&format!(".{binary}.old-"))
+            .and_then(|suffix| suffix.split_once('-'))
+            .is_some_and(|(pid, nonce)| {
+                !pid.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && !nonce.is_empty()
+                    && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+            })
+    })
+}
+
+#[cfg(any(windows, test))]
+fn remove_retired_backup(path: &Path) -> Result<(), UpdateError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        // Another cleanup may have removed the same committed backup.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))) =>
+        {
+            eprintln!(
+                "Retained old executable {}: {error}. Close older Raydock sessions; a later update or installer will retry cleanup.",
+                path.display()
+            );
+            Ok(())
+        }
+        Err(error) => Err(UpdateError::Install(format!(
+            "cannot remove retired update backup {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn cleanup_legacy_uv_install(tool_name: &str, install_path: &Path) {
@@ -1195,6 +1301,121 @@ impl From<io::Error> for UpdateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_removes_only_committed_windows_backups() -> Result<(), UpdateError> {
+        let root = temp_update_dir()?;
+        let retired = [
+            ".raydock.exe.old-123-456",
+            ".rayline.exe.old-123-abcdef",
+            ".rld.exe.old-123-456",
+            ".rayline-core.exe.old-123-456",
+            ".rayline-core-LICENSE.old-123-456",
+        ];
+        let retained = [
+            "raydock.exe",
+            ".raydock.exe.tmp-123-456",
+            ".rayline.exe.tmp-123-456",
+            ".raydock.exe.old-manual-backup",
+            ".unrelated.exe.old-123-456",
+            "rayline.exe.old-0123456789abcdef0123456789abcdef",
+            "rayline.exe.old-incomplete",
+        ];
+        for name in retired.iter().chain(retained.iter()) {
+            fs::write(root.join(name), b"payload")?;
+        }
+        let installed = root.join("raydock.exe");
+        let backup = staged_install_path(&installed)?;
+        fs::write(&backup, b"previous executable")?;
+        retire_replaced_backup(&backup, &installed);
+        assert!(!backup.exists());
+        let entries = fs::read_dir(&root)?.collect::<io::Result<Vec<_>>>()?;
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.file_name().to_str().is_some_and(is_retired_backup))
+                .count(),
+            retired.len() + 1,
+            "retirement must keep the old file until a later sweep"
+        );
+        let directory = root.join(".rld.exe.old-123-789");
+        fs::create_dir(&directory)?;
+        cleanup_retired_backups(&root.join("raydock.exe"))?;
+        for name in retired {
+            assert!(!root.join(name).exists(), "retired file {name}");
+        }
+        for name in retained {
+            assert_eq!(fs::read(root.join(name))?, b"payload", "retained {name}");
+        }
+        assert_eq!(fs::read_dir(&root)?.count(), retained.len() + 1);
+        assert!(directory.is_dir());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cleanup_retries_locked_retired_backup() -> Result<(), UpdateError> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = temp_update_dir()?;
+        let backup = root.join(".raydock.exe.old-123-456");
+        fs::write(&backup, b"old executable")?;
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&backup)?;
+        cleanup_retired_backups(&root.join("raydock.exe"))?;
+        assert!(backup.exists());
+        drop(locked);
+        cleanup_retired_backups(&root.join("raydock.exe"))?;
+        assert!(!backup.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_swap_defers_cleanup_and_preserves_failed_swap() -> Result<(), UpdateError> {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
+        fs::write(&installed, b"original")?;
+        fs::write(&staged, b"new")?;
+        move_into_place(&staged, &installed)?;
+        assert_eq!(fs::read_dir(&root)?.count(), 2);
+        assert_eq!(fs::read(&installed)?, b"new");
+        assert!(move_into_place(&root.join("missing-staged.exe"), &installed).is_err());
+        cleanup_retired_backups(&installed)?;
+        assert_eq!(fs::read(&installed)?, b"new");
+        assert_eq!(fs::read_dir(&root)?.count(), 1);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retirement_failure_preserves_committed_install_and_backup() -> Result<(), UpdateError>
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let backup = staged_install_path(&installed)?;
+        fs::write(&installed, b"committed")?;
+        fs::write(&backup, b"previous")?;
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&backup)?;
+        retire_replaced_backup(&backup, &installed);
+        assert!(backup.exists());
+        assert_eq!(fs::read(&installed)?, b"committed");
+        drop(locked);
+        assert_eq!(fs::read(&backup)?, b"previous");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn core_license_installs_as_verified_nonexecutable_data() -> Result<(), UpdateError> {

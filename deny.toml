@@ -1,4 +1,4 @@
-# cargo-deny policy for the Rayline Local Rust workspace.
+# cargo-deny policy for the Raydock Rust workspace.
 #
 # Keep this policy scoped to the committed workspace lockfile so OSS release
 # dependency review stays repeatable.

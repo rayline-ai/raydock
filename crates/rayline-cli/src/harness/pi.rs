@@ -20,7 +20,7 @@
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, json_file};
+use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, json_file, model_display_name};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 /// Runtime override for [`allow_empty_signature`]: `1` or `0`.
@@ -32,7 +32,7 @@ pub(crate) const ALLOW_EMPTY_SIGNATURE_ENV: &str = "RAYLINE_PI_ALLOW_EMPTY_SIGNA
 /// TODO: add "prod" once the prod router drops unsigned reasoning.
 const UNSIGNED_REASONING_ENVS: &[&str] = &["dev"];
 
-/// Whether `rayline pi` sets `compat.allowEmptySignature` for `env_name`:
+/// Whether `raydock pi` sets `compat.allowEmptySignature` for `env_name`:
 /// [`ALLOW_EMPTY_SIGNATURE_ENV`] if set to `1`/`0`, else the env default.
 pub(crate) fn allow_empty_signature(env_name: &str, override_value: Option<&str>) -> bool {
     super::parse_switch(override_value).unwrap_or(UNSIGNED_REASONING_ENVS.contains(&env_name))
@@ -43,6 +43,21 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     if ctx.allow_empty_signature {
         compat["allowEmptySignature"] = json!(true);
     }
+    let launch = ctx.models();
+    let entries: Vec<_> = launch
+        .offered
+        .iter()
+        .map(|model| {
+            json!({
+                "id": model,
+                "name": format!("{} ({})", model_display_name(launch, model), ctx.env_name),
+                "reasoning": true,
+                "input": ctx.input_modalities(),
+                "contextWindow": ctx.context_window(),
+                "maxTokens": ctx.max_output_tokens()
+            })
+        })
+        .collect();
     let models = json!({
         "providers": {
             PROVIDER_ID: {
@@ -51,27 +66,26 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "apiKey": ctx.key,
                 "headers": ctx.conversation_headers(&format!("${CONV_ID_ENV}")),
                 "compat": compat,
-                "models": [{
-                    "id": ROUTER_MODEL,
-                    "name": format!("Rayline router ({})", ctx.env_name),
-                    "reasoning": true,
-                    "input": ctx.input_modalities(),
-                    "contextWindow": ctx.context_window(),
-                    "maxTokens": ctx.max_output_tokens()
-                }]
+                "models": entries
             }
         }
     });
     // pi writes settings.json itself (model picks, theme), so only seed it.
-    let settings = json!({
-        "defaultProvider": PROVIDER_ID,
-        "defaultModel": ROUTER_MODEL
-    });
+    let settings = |model: &str| {
+        json!({
+            "defaultProvider": PROVIDER_ID,
+            "defaultModel": model
+        })
+    };
+    let mut settings_file = json_file("settings.json", &settings(launch.main), false);
+    // The seed 0.2.x wrote (Legacy as the default); still exactly that means
+    // the user never picked a model, so it moves to the new default.
+    if launch.main != ROUTER_MODEL {
+        settings_file.replaces_seed =
+            Some(json_file("settings.json", &settings(ROUTER_MODEL), false).contents);
+    }
     Plan {
-        files: vec![
-            json_file("models.json", &models, true),
-            json_file("settings.json", &settings, false),
-        ],
+        files: vec![json_file("models.json", &models, true), settings_file],
         env_set: vec![("PI_CODING_AGENT_DIR", ctx.config_dir.as_os_str().to_owned())],
         env_remove: Vec::new(),
     }
@@ -146,12 +160,44 @@ mod tests {
         assert_eq!(provider["compat"]["sendSessionAffinityHeaders"], true);
         assert_eq!(provider["compat"]["allowEmptySignature"], true);
         assert_eq!(provider["headers"], serde_json::json!({}));
+        let ids: Vec<_> = provider["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        // ARC first; Legacy stays selectable in pi's model picker.
+        assert_eq!(ids, ["arc-sage-1.0", "arc-swift-1.0", "rayline-router"]);
         let model = &provider["models"][0];
-        assert_eq!(model["id"], "rayline-router");
         assert_eq!(model["contextWindow"], 200000);
         assert_eq!(model["maxTokens"], 32000);
         let settings = read("settings.json");
         assert_eq!(settings["defaultProvider"], "rayline");
-        assert_eq!(settings["defaultModel"], "rayline-router");
+        assert_eq!(settings["defaultModel"], "arc-sage-1.0");
+    }
+
+    #[test]
+    fn untouched_legacy_seed_moves_to_arc_and_a_saved_pick_is_kept() {
+        let dir = super::super::tests::temp_dir("pi-seed");
+        let ctx = super::super::tests::render_context(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        // The exact seed 0.2.x wrote: no model was ever picked.
+        let written = super::super::json_file(
+            "settings.json",
+            &serde_json::json!({"defaultProvider": "rayline", "defaultModel": "rayline-router"}),
+            false,
+        )
+        .contents;
+        std::fs::write(&settings, &written).unwrap();
+        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+        let upgraded: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(upgraded["defaultModel"], "arc-sage-1.0");
+        // A pick pi saved (Legacy, with pi's own settings): kept.
+        let picked = "{\n  \"defaultProvider\": \"rayline\",\n  \"defaultModel\": \"rayline-router\",\n  \"theme\": \"dark\"\n}\n";
+        std::fs::write(&settings, picked).unwrap();
+        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), picked);
     }
 }

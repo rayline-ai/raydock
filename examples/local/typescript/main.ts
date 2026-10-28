@@ -6,7 +6,7 @@
  * default local config maps the model name "rayline-local" to your on-device
  * endpoint, so requesting that model lands the call on your local model.
  *
- * Start the router with `rayline router start` (no Claude session needed). It
+ * Start the router with `raydock router start` (no Claude session needed). It
  * defaults to routing every request through the router, so a plain call
  * requesting model "rayline-local" reaches the on-device model.
  *
@@ -19,10 +19,10 @@
  *   2. Node 18+ (uses the built-in fetch + undici dispatcher).
  *   3. A running router with a local model loaded (give it a minute to load on
  *      first use):
- *          rayline router start
+ *          raydock router start
  *      Confirm it is up:
  *          curl -s http://127.0.0.1:20810/healthz   # expect "local_available": true
- *      Stop it later with: rayline router stop
+ *      Stop it later with: raydock router stop
  *   4. Because Rayline intercepts TLS, set CA_PATH to the proxy CA path for your
  *      OS:
  *          macOS:   ~/Library/Application Support/rayline/proxy-ca.pem

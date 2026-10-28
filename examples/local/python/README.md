@@ -1,23 +1,23 @@
 # Local routing — Python
 
 Route an [`anthropic`](https://pypi.org/project/anthropic/) SDK call to your
-**on-device model** through Rayline, mirroring what `rayline claude --local`
+**on-device model** through Rayline, mirroring what `raydock claude --local`
 does. Traffic flows through Rayline's local proxy on `127.0.0.1:20810` to the
 on-device router (`rld`), which routes by your config — no special headers.
 
 The default local config maps the model name **`rayline-local`** to your
 on-device endpoint, so the example just requests that model. Start the router
-with `rayline router start` (no Claude session needed); it routes every request
+with `raydock router start` (no Claude session needed); it routes every request
 through the router by default, so requesting `rayline-local` reaches the on-device
 model.
 
-**Flow.** `rayline router start` (optionally `--config <mode>.json`) → your Python
+**Flow.** `raydock router start` (optionally `--config <mode>.json`) → your Python
 client → the local proxy on `127.0.0.1:20810` → the router → the endpoint the
 config picks (**local**, **cloud RCR**, or **Anthropic**). With no `--config` the
 router uses Rayline's built-in local config (what this example assumes); pass
 `--config` to drive any routing mode instead. All the modes — and which entry
 points support each — are explained in the
-[routing-modes table](https://github.com/rayline-ai/rayline/blob/main/examples/routing-modes/README.md#modes).
+[routing-modes table](https://github.com/rayline-ai/raydock/blob/main/examples/routing-modes/README.md#modes).
 
 > **Caveats**
 > - The model-name routes (`rayline-local`, `rayline-subagent`) come from
@@ -40,17 +40,17 @@ pip install -r requirements.txt
 
    ```bash
    # Option 1 — Rayline downloads and runs the model (bundled llama.cpp):
-   rayline local models             # list the catalog, copy a <model-id>
-   rayline local use <model-id>
+   raydock local models             # list the catalog, copy a <model-id>
+   raydock local use <model-id>
 
    # Option 2 — you run the model yourself (Ollama / LM Studio / etc.):
-   rayline local custom --url http://127.0.0.1:11434 --model <model-id>
+   raydock local custom --url http://127.0.0.1:11434 --model <model-id>
    ```
 
 2. Start the router (give the on-device model a minute to load on first use):
 
    ```bash
-   rayline router start
+   raydock router start
    ```
 
    Confirm it's ready:
@@ -59,7 +59,7 @@ pip install -r requirements.txt
    curl -s http://127.0.0.1:20810/healthz   # expect "local_available": true
    ```
 
-   Stop it later with `rayline router stop`.
+   Stop it later with `raydock router stop`.
 
 3. Set `CA_CERT` in [`main.py`](main.py) to Rayline's proxy CA path for your OS.
    The client must trust this cert because Rayline intercepts TLS:

@@ -1,5 +1,5 @@
-class Rayline < Formula
-  desc "Open-source local router for coding agents"
+class Raydock < Formula
+  desc "Raydock on-device CLI for local models and cloud services"
   homepage "https://rayline.ai"
   license "Apache-2.0"
   version "__VERSION__"
@@ -31,21 +31,22 @@ class Rayline < Formula
   def install
     archive_root = Dir["rayline-*"].find { |path| File.directory?(path) }
     if archive_root
-      bin.install "#{archive_root}/rayline"
+      bin.install "#{archive_root}/raydock"
       bin.install "#{archive_root}/rld"
       bin.install "#{archive_root}/rayline-core"
       pkgshare.install "#{archive_root}/rayline-core-LICENSE"
       pkgshare.install "#{archive_root}/NOTICE"
     else
-      bin.install "rayline"
+      bin.install "raydock"
       bin.install "rld"
       bin.install "rayline-core"
       pkgshare.install "rayline-core-LICENSE"
     end
+    bin.install_symlink "raydock" => "rayline"
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/rayline --version")
+    assert_match "raydock #{version}", shell_output("#{bin}/raydock --version")
     assert_path_exists bin/"rayline-core"
     assert_path_exists pkgshare/"rayline-core-LICENSE"
   end

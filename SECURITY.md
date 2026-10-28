@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Rayline Local, the local-router project in the broader Rayline ecosystem, is
+Raydock, the local-router project in the broader Rayline ecosystem, is
 under active pre-release development. Only the latest release and `main` are
 supported; security fixes are applied there.
 
@@ -34,7 +34,7 @@ you informed as we work on a fix and coordinate disclosure.
 
 ## Local TLS Interception
 
-Rayline Local can install a local certificate authority and intercept TLS
+Raydock can install a local certificate authority and intercept TLS
 traffic on your own machine to route requests. This is core to how proxy-mode
 routing works and is documented in the [README](README.md#disclaimers).
 

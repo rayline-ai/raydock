@@ -2,8 +2,7 @@
 //!
 //! Routing is config-file driven: an explicit `--router-config-path` wins, else the
 //! default file at [`default_config_path`] (auto-created on first cloud launch with
-//! content that reproduces today's behavior — everything through the hosted cloud
-//! router). The on-device router is engaged only when the effective config routes
+//! everything through the hosted cloud router on ARC). The on-device router is engaged only when the effective config routes
 //! something *away* from the hosted cloud router (see [`config_needs_local_router`]);
 //! a pure default stays on today's hosted path with no local process.
 //!
@@ -38,9 +37,11 @@ pub fn default_config_path_for_env(home: &Path, env_name: &str) -> PathBuf {
         .join(format!("router.{env_name}.json"))
 }
 
-/// Default content: reproduce today's `rayline claude` — route everything to the
-/// hosted cloud router at `router_url`. Users edit this to send subagents/main to
-/// local or custom endpoints.
+/// Default content: route everything to the hosted cloud router at
+/// `router_url` on ARC — the main agent on ARC Sage, subagents on ARC Swift.
+/// The endpoint also lists the Legacy Rules Router, which a route selects by
+/// naming `rayline-router`. Users edit this to send subagents/main to local or
+/// custom endpoints.
 pub fn default_config_json(router_url: &str) -> Value {
     json!({
         "endpoints": [
@@ -49,12 +50,39 @@ pub fn default_config_json(router_url: &str) -> Value {
                 "protocol": "anthropic_messages",
                 "base_url": router_url,
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": ["rayline-router"]
+                "models": [
+                    crate::ARC_SAGE_MODEL,
+                    crate::ARC_SWIFT_MODEL,
+                    crate::LEGACY_ROUTER_MODEL
+                ]
             }
         ],
         "routes": {
-            "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
-            "default": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+            "main": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
+            "subagent": { "endpoint": "rayline-cloud", "model": crate::ARC_SWIFT_MODEL },
+            "default": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
+            "subagents": {}
+        }
+    })
+}
+
+/// The default this launcher generated before ARC became the default (0.2.x):
+/// everything on the Legacy Rules Router. A file that still holds exactly this
+/// was never edited, so it carries no choice of the user's.
+fn legacy_default_config_json(router_url: &str) -> Value {
+    json!({
+        "endpoints": [
+            {
+                "id": "rayline-cloud",
+                "protocol": "anthropic_messages",
+                "base_url": router_url,
+                "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                "models": [crate::LEGACY_ROUTER_MODEL]
+            }
+        ],
+        "routes": {
+            "main": { "endpoint": "rayline-cloud", "model": crate::LEGACY_ROUTER_MODEL },
+            "default": { "endpoint": "rayline-cloud", "model": crate::LEGACY_ROUTER_MODEL },
             "subagents": {}
         }
     })
@@ -63,15 +91,37 @@ pub fn default_config_json(router_url: &str) -> Value {
 /// Create the default config for `env_name` if absent, pointing its cloud
 /// endpoint at `router_url` (the environment's resolved router). Idempotent;
 /// never overwrites user edits.
+///
+/// A file that is exactly the generated Legacy default (see
+/// [`legacy_default_config_json`]) is the old default, not a choice, so it is
+/// replaced with the ARC default. Any other content, including a file that
+/// names `rayline-router` alongside any edit, is the user's and is kept.
 pub fn ensure_default_config(home: &Path, env_name: &str, router_url: &str) -> io::Result<PathBuf> {
     let path = default_config_path_for_env(home, env_name);
-    if !path.exists() {
+    let write_default = match std::fs::read(&path) {
+        Ok(raw) => serde_json::from_slice::<Value>(&raw)
+            .is_ok_and(|existing| existing == legacy_default_config_json(router_url)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error),
+    };
+    if write_default {
+        let upgrading = path.exists();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let body = serde_json::to_vec_pretty(&default_config_json(router_url))
             .map_err(io::Error::other)?;
         std::fs::write(&path, body)?;
+        if upgrading {
+            eprintln!(
+                "Updated the generated router config {} to ARC ({} main, {} subagents). \
+                 To keep the Legacy Rules Router, set its route models to {}.",
+                path.display(),
+                crate::ARC_SAGE_MODEL,
+                crate::ARC_SWIFT_MODEL,
+                crate::LEGACY_ROUTER_MODEL
+            );
+        }
     }
     Ok(path)
 }
@@ -140,7 +190,7 @@ fn config_value_uses_local_decider(cfg: &Value) -> bool {
 
 /// Whether any route targets the hosted cloud router — prod (`api.rayline.ai`)
 /// **or** dev (`api-dev.rayline.ai`) — so its `rlk-` key should be resolved from
-/// `rayline auth login`.
+/// `raydock auth login`.
 ///
 /// Both hosts, deliberately. This used to match prod only, which made a
 /// dev-targeted config fail three ways at once: no `rlk-` key was injected (the
@@ -164,9 +214,9 @@ pub fn config_uses_cloud_router(path: &Path) -> bool {
         .any(|endpoint| cloud_ids.contains(&endpoint))
 }
 
-/// Whether any route targets a hosted Rayline Cloud Router endpoint — prod
+/// Whether any route targets a hosted Rayline Platform router endpoint — prod
 /// (`api.rayline.ai`) **or** dev (`api-dev.rayline.ai`) — so its `rlk-` key
-/// should be provisioned from `rayline auth login`.
+/// should be provisioned from `raydock auth login`.
 ///
 /// The Codex-side spelling of [`config_uses_cloud_router`], kept as its own name
 /// because `codex.rs` guards its native rewrite on this question. The two were
@@ -189,6 +239,32 @@ fn hosted_rcr_endpoint_ids(cfg: &Value) -> Vec<String> {
             endpoint_base_url_is_hosted_rcr(base_url).then(|| id.to_owned())
         })
         .collect()
+}
+
+/// The model `routes.main` names, if any (non-empty). A cloud-only config's
+/// explicit main model, which `raydock claude` launches with instead of its
+/// default.
+pub fn config_main_model(path: &Path) -> Option<String> {
+    config_route_model(path, "main")
+}
+
+/// The model `routes.subagent` names, if any (non-empty): a cloud-only
+/// config's subagent model, which `raydock claude` gives Claude Code's
+/// subagents.
+pub fn config_subagent_model(path: &Path) -> Option<String> {
+    config_route_model(path, "subagent")
+}
+
+fn config_route_model(path: &Path, route: &str) -> Option<String> {
+    let raw = std::fs::read(path).ok()?;
+    let cfg: Value = serde_json::from_slice(&raw).ok()?;
+    cfg.get("routes")?
+        .get(route)?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Whether any route targets the bundled `"local"` endpoint (needs a configured
@@ -310,7 +386,7 @@ fn config_value_may_local(cfg: &Value) -> Option<MayLocal> {
     let raw_base = endpoint_base_url_for_model(cfg, &model)?;
     // The custom-mode adapter appends `/v1/messages` to the upstream base
     // (`rayline-adapter` `format!("{}/v1/messages", target)`), so the upstream must
-    // be the server *root*. Normalize exactly like `rayline local custom` does —
+    // be the server *root*. Normalize exactly like `raydock local custom` does —
     // strip a trailing `/v1` — so an `openai_chat` endpoint's `…/v1` base_url does
     // not become `…/v1/v1/messages`.
     let upstream_url = crate::local_model::normalize_base_url(&raw_base);
@@ -531,7 +607,8 @@ pub fn materialize_codex_subscription_for_local_router(
 pub fn materialize_codex_config_for_local_router(path: &Path, home: &Path) -> io::Result<PathBuf> {
     let raw = std::fs::read(path)?;
     let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
-    let mut changed = ensure_codex_config_model_routes(&mut cfg);
+    let mut changed = ensure_codex_legacy_model_route(&mut cfg);
+    changed |= ensure_codex_config_model_routes(&mut cfg);
     // A may-local `rayline-cloud` route may declare only `local_models` and omit
     // `model` (accepted by config_may_local); fill the RCR sentinel so the local
     // router's non-empty-model check doesn't reject it at startup.
@@ -601,6 +678,44 @@ fn ensure_codex_config_model_routes(cfg: &mut Value) -> bool {
         changed = true;
     }
     changed
+}
+
+/// Pin an explicit Codex `--model rayline-router` to the Legacy Rules Router
+/// when `routes.main` is a hosted RCR. The local router reads a requested
+/// `rayline-router` as its virtual marker ("route by `routes.main`"), so with
+/// an ARC main (the generated default) that explicit choice would run on ARC.
+/// Codex's own "no model" sentinel is `rayline-local`, so on the Codex surface
+/// `rayline-router` is only ever the user's pick. Claude Code launches send
+/// `rayline-router` as the marker itself, which is why this is added here, in
+/// the Codex materialization, and never to the shared config. A main on a
+/// local or custom endpoint keeps the marker meaning, and an existing
+/// `model_routes` entry is left as is.
+fn ensure_codex_legacy_model_route(cfg: &mut Value) -> bool {
+    let Some(main_endpoint) = cfg
+        .get("routes")
+        .and_then(|routes| routes.get("main"))
+        .and_then(route_endpoint)
+    else {
+        return false;
+    };
+    if !hosted_rcr_endpoint_ids(cfg).contains(&main_endpoint) {
+        return false;
+    }
+    let Some(routes) = cfg.get_mut("routes").and_then(Value::as_object_mut) else {
+        return false;
+    };
+    let model_routes = routes.entry("model_routes").or_insert_with(|| json!({}));
+    let Some(model_routes) = model_routes.as_object_mut() else {
+        return false;
+    };
+    if model_routes.contains_key(crate::LEGACY_ROUTER_MODEL) {
+        return false;
+    }
+    model_routes.insert(
+        crate::LEGACY_ROUTER_MODEL.to_owned(),
+        json!({ "endpoint": main_endpoint, "model": crate::LEGACY_ROUTER_MODEL }),
+    );
+    true
 }
 
 /// `x-rayline-client` value the edge stamps on Codex requests forwarded to the
@@ -681,7 +796,7 @@ fn ensure_rcr_base_url_has_v1(endpoint: &mut serde_json::Map<String, Value>) -> 
     true
 }
 
-/// Whether a `base_url` host is the hosted Rayline Cloud Router (prod or dev).
+/// Whether a `base_url` host is the hosted Rayline Platform router (prod or dev).
 pub(crate) fn endpoint_base_url_is_hosted_rcr(base_url: Option<&str>) -> bool {
     matches!(
         base_url.and_then(host_of).as_deref(),
@@ -978,10 +1093,95 @@ mod tests {
         let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
         assert!(path.exists());
         assert_eq!(path, default_config_path(&home));
-        // The default file reproduces today's behavior → no local router.
+        // The default file is all hosted cloud → no local router.
         assert!(!config_needs_local_router(&path));
         assert!(config_uses_cloud_router(&path));
         assert!(!config_uses_local_endpoint(&path));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_config_routes_main_to_sage_and_subagents_to_swift() {
+        let cfg = default_config_json(crate::ROUTER_PROD_URL);
+        assert_eq!(cfg["routes"]["main"]["model"], "arc-sage-1.0");
+        assert_eq!(cfg["routes"]["subagent"]["model"], "arc-swift-1.0");
+        assert_eq!(cfg["routes"]["default"]["model"], "arc-sage-1.0");
+        // Legacy stays selectable on the same endpoint.
+        assert_eq!(
+            cfg["endpoints"][0]["models"],
+            json!(["arc-sage-1.0", "arc-swift-1.0", "rayline-router"])
+        );
+    }
+
+    #[test]
+    fn default_codex_config_pins_an_explicit_legacy_model() {
+        // `raydock codex --model rayline-router` must reach Legacy, while the
+        // Codex sentinel (no --model) follows routes.main (ARC Sage).
+        let home = tmp_home();
+        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
+        let cfg: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+        let routes = &cfg["routes"]["model_routes"];
+        assert_eq!(routes["rayline-router"]["model"], "rayline-router");
+        assert_eq!(routes["rayline-router"]["endpoint"], "rayline-cloud");
+        assert_eq!(routes["rayline-local"]["model"], "arc-sage-1.0");
+        assert_eq!(cfg["routes"]["subagent"]["model"], "arc-swift-1.0");
+        // The shared file carries no pin: Claude Code sends `rayline-router`
+        // as its "follow routes.main" marker.
+        let shared: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(shared["routes"].get("model_routes").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn codex_legacy_pin_only_for_a_hosted_main() {
+        // A local main keeps the marker meaning for `rayline-router`.
+        let mut local = json!({
+            "endpoints": [
+                { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] },
+                { "id": "ollama", "protocol": "openai_chat",
+                  "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen"] }
+            ],
+            "routes": { "main": { "endpoint": "ollama", "model": "qwen" } }
+        });
+        assert!(!ensure_codex_legacy_model_route(&mut local));
+        assert!(local["routes"].get("model_routes").is_none());
+        // A user's own entry wins.
+        let mut own = default_config_json(crate::ROUTER_PROD_URL);
+        own["routes"]["model_routes"] = json!({
+            "rayline-router": { "endpoint": "rayline-cloud", "model": "arc-swift-1.0" } });
+        assert!(!ensure_codex_legacy_model_route(&mut own));
+        assert_eq!(
+            own["routes"]["model_routes"]["rayline-router"]["model"],
+            "arc-swift-1.0"
+        );
+    }
+
+    #[test]
+    fn ensure_default_config_upgrades_only_the_untouched_legacy_default() {
+        let home = tmp_home();
+        let path = default_config_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The file 0.2.x generated, never edited: it is the old default.
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy_default_config_json(crate::ROUTER_PROD_URL)).unwrap(),
+        )
+        .unwrap();
+        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        let upgraded: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded, default_config_json(crate::ROUTER_PROD_URL));
+
+        // An explicit Legacy choice (any edit to the generated file) is kept.
+        let mut chosen = legacy_default_config_json(crate::ROUTER_PROD_URL);
+        chosen["routes"]["subagents"] = json!({ "Explore": {
+            "endpoint": "rayline-cloud", "model": "rayline-router" } });
+        let chosen_body = serde_json::to_vec_pretty(&chosen).unwrap();
+        std::fs::write(&path, &chosen_body).unwrap();
+        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), chosen_body);
+        assert_eq!(config_main_model(&path).as_deref(), Some("rayline-router"));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1275,7 +1475,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// `rayline codex --config <file>` where the file declares only `routes.main`
+    /// `raydock codex --config <file>` where the file declares only `routes.main`
     /// (a single-model setup): the sentinel `--model` pins to that main and NO
     /// `subagent` route is invented. The local router then inherits main for
     /// subagent turns, so one route entry drives the whole session.

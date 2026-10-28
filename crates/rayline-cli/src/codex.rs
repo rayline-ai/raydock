@@ -93,7 +93,7 @@ pub struct RunRequest {
     pub env_name: Option<String>,
     /// Account bearer (`--auth-token`) used to mint/read the `rlk-` router key,
     /// mirroring the Claude path. `None` falls back to stored credentials or the
-    /// interactive `rayline auth login` prompt.
+    /// interactive `raydock auth login` prompt.
     pub auth_token: Option<String>,
 }
 
@@ -106,8 +106,8 @@ pub struct ConfigureRequest {
 }
 
 /// Provision the hosted-RCR router key (`rlk-`) when a `--config` routes a leg to
-/// the cloud router, so `rayline codex --config <cloud>` (Rc-Rc/Rc-K/Rl-K/…)
-/// authenticates from a plain `rayline auth login` — no manual
+/// the cloud router, so `raydock codex --config <cloud>` (Rc-Rc/Rc-K/Rl-K/…)
+/// authenticates from a plain `raydock auth login` — no manual
 /// `RAYLINE_ROUTER_API_KEY`. Mirrors the Claude path
 /// ([`crate::claude::ensure_router_key`]).
 ///
@@ -123,7 +123,7 @@ pub struct ConfigureRequest {
 /// routes to no cloud endpoint (subscription `A*` / local `L*` modes), or
 /// provisioning fails (e.g. not logged in and non-interactive) — the daemon then
 /// surfaces a clear error only if a cloud route is actually hit. When interactive
-/// and logged out, `ensure_router_key` drives the same `rayline auth login`
+/// and logged out, `ensure_router_key` drives the same `raydock auth login`
 /// prompt Claude uses.
 pub(crate) async fn resolve_cloud_router_key(
     config_path: Option<&Path>,
@@ -148,11 +148,11 @@ pub(crate) async fn resolve_cloud_router_key(
         .ok()
 }
 
-/// Resolve the config that drives a `rayline codex` / `rayline codex app` run.
+/// Resolve the config that drives a `raydock codex` / `raydock codex app` run.
 ///
 /// A user-supplied `--config` is used verbatim. Otherwise the **default** is Rc-Rc
 /// — route main + subagents to the hosted cloud RCR (native OpenAI Responses),
-/// mirroring `rayline claude`'s route-all cloud default. We reuse the shared
+/// mirroring `raydock claude`'s route-all cloud default. We reuse the shared
 /// default config (`router_config::default_config_json`, materialized via
 /// `ensure_default_config`) and drive it through the ordinary `--config` codex
 /// path, so cloud-key provisioning ([`resolve_cloud_router_key`]) and the native
@@ -161,7 +161,7 @@ pub(crate) async fn resolve_cloud_router_key(
 ///
 /// The default config follows `--env`: its cloud endpoint is the selected
 /// environment's router (the same `resolve_env` + `resolve_hosted_environment`
-/// resolution `rayline claude` uses), and each environment has its own file, so
+/// resolution `raydock claude` uses), and each environment has its own file, so
 /// the router URL always matches the environment whose `rlk-` key
 /// [`resolve_cloud_router_key`] provisions. An unknown environment, or one whose
 /// router is not a hosted Rayline router, is an error rather than a silent
@@ -265,7 +265,7 @@ pub async fn run(mut request: RunRequest) -> ExitCode {
         .arg("-c")
         .arg(format!("model={}", toml_string(model)))
         .arg("-c")
-        .arg("model_providers.rayline.name=\"Rayline Local\"")
+        .arg("model_providers.rayline.name=\"Raydock\"")
         .arg("-c")
         .arg(format!(
             "model_providers.rayline.base_url={}",
@@ -301,7 +301,7 @@ pub async fn run(mut request: RunRequest) -> ExitCode {
 /// spawns (`$CODEX_HOME/shell_snapshots`), so a key it inherited would be
 /// written to disk in plain text. The launcher reads an explicit
 /// `RAYLINE_ROUTER_API_KEY` before this, when it starts the router. The
-/// harness launchers' old `RAYLINE_KEY` goes too, for a `rayline codex` started
+/// harness launchers' old `RAYLINE_KEY` goes too, for a `raydock codex` started
 /// from a shell that still exports it.
 pub(crate) fn withhold_router_key(command: &mut Command) {
     command.env_remove("RAYLINE_ROUTER_API_KEY");
@@ -333,8 +333,8 @@ pub fn default_rayline_base_url() -> String {
 /// Rayline local router.
 ///
 /// This is the single source of truth for the Codex-side provider config,
-/// shared by `rayline codex configure` (writes it as `$CODEX_HOME/
-/// rayline.config.toml`) and `rayline codex app` (writes it as the default
+/// shared by `raydock codex configure` (writes it as `$CODEX_HOME/
+/// rayline.config.toml`) and `raydock codex app` (writes it as the default
 /// `config.toml` inside an isolated `CODEX_HOME`, since the desktop app-server
 /// ignores `-c` overrides and only reads persistent config).
 pub fn rayline_provider_config_toml(
@@ -351,7 +351,7 @@ pub fn rayline_provider_config_toml(
     };
     format!(
         "model = {}\nmodel_provider = \"rayline\"\n{}\
-\n[model_providers.rayline]\nname = \"Rayline Local\"\nbase_url = {}\nwire_api = \"responses\"\n{}{}",
+\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = {}\nwire_api = \"responses\"\n{}{}",
         toml_string(model),
         if subscription_auth {
             "forced_login_method = \"chatgpt\"\n"
@@ -388,7 +388,7 @@ pub fn configure(request: &ConfigureRequest) -> io::Result<String> {
     let contents = rayline_provider_config_toml(model, &base_url, subscription_auth);
     fs::write(&profile_path, contents)?;
     Ok(format!(
-        "Wrote Codex Rayline profile: {}\nStart Rayline with `rayline router start --mode codex --auth {}`, then use Codex profile `rayline`.\nBase URL: {base_url}\n",
+        "Wrote Codex Rayline profile: {}\nStart Rayline with `raydock router start --mode codex --auth {}`, then use Codex profile `rayline`.\nBase URL: {base_url}\n",
         profile_path.display(),
         if subscription_auth {
             "subscription"
@@ -412,11 +412,11 @@ pub fn write_subscription_router_config(home: &Path, subagents_local: bool) -> i
     Ok(path)
 }
 
-/// The zero-config `rayline codex --auth subscription` router config.
+/// The zero-config `raydock codex --auth subscription` router config.
 ///
 /// `main` always routes to the ChatGPT subscription. When `subagents_local` is
 /// true (a usable on-device model is available), `subagent` routes to the local
-/// adapter — the hybrid default that mirrors `rayline claude`'s "main on cloud,
+/// adapter — the hybrid default that mirrors `raydock claude`'s "main on cloud,
 /// subagents on-device" shape. When false (no local model), subagents stay on
 /// the subscription, preserving the zero-setup all-subscription behavior.
 ///
@@ -487,7 +487,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     use std::os::unix::process::CommandExt;
 
     let error = command.exec();
-    eprintln!("rayline: failed to exec codex: {error}");
+    eprintln!("raydock: failed to exec codex: {error}");
     ExitCode::from(127)
 }
 
@@ -530,7 +530,7 @@ mod tests {
     // Router-key provisioning is gated on the config routing a leg to the hosted
     // RCR. The negative cases must resolve to `None` *without* touching
     // credentials or the network, so subscription (`A*`) and local (`L*`) Codex
-    // runs never trigger a `rayline auth login` prompt.
+    // runs never trigger a `raydock auth login` prompt.
     #[tokio::test]
     async fn cloud_router_key_none_without_config() {
         assert!(
@@ -588,7 +588,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // Default `rayline codex` / `codex app` (no `--config`, auto auth) → Rc-Rc:
+    // Default `raydock codex` / `codex app` (no `--config`, auto auth) → Rc-Rc:
     // synthesize the shared default config (route everything to the hosted RCR).
     #[test]
     fn default_auto_no_config_resolves_to_rrc() {
@@ -969,7 +969,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     match command.status() {
         Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
         Err(error) => {
-            eprintln!("rayline: failed to run codex: {error}");
+            eprintln!("raydock: failed to run codex: {error}");
             ExitCode::from(127)
         }
     }

@@ -1,7 +1,7 @@
-//! Rayline Local's hybrid defaults, applied to a qualified execution-core
+//! Raydock's hybrid defaults, applied to a qualified execution-core
 //! profile before `rld` starts the Go core.
 //!
-//! With no override, Rayline Local sends the hybrid default policy explicitly
+//! With no override, Raydock sends the hybrid default policy explicitly
 //! (`routing.policy: {"preset": "arc-policy.hybrid-default.v1"}`) through the
 //! core's `execution_context_v2` Decisions contract; it never relies on an
 //! absent policy. The optional `hybrid.routing` block in settings.json maps
@@ -19,7 +19,7 @@
 //! at least that window; a turn whose prompt does not fit hands off to cloud.
 //!
 //! A profile deployment marked `"from_local_model": true` takes its endpoint
-//! and served model from the `local_model` entry (`rayline local custom …`).
+//! and served model from the `local_model` entry (`raydock local custom …`).
 //! Its runtime identity, protocol and thinking-control qualification still come
 //! from the profile; a configured prompt counter verifies the served model.
 //!
@@ -117,7 +117,7 @@ const SCHEDULE_CLASSES: &[&str] = &["cache_boundaries", "user_messages", "all_tu
 /// Where the applied policy came from, for the start message.
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum PolicySource {
-    /// Rayline Local's default: no override block and no profile policy.
+    /// Raydock's default: no override block and no profile policy.
     Default,
     /// The user's `hybrid.routing` block.
     Settings,
@@ -433,7 +433,7 @@ fn apply_local_model(
             return Err("from_local_model applies only to a local deployment".to_owned());
         }
         let (base_url, model) = custom_local_model(settings).ok_or(
-            "this profile takes its local endpoint from local_model; run `rayline local custom --url <URL> --model <NAME>` first",
+            "this profile takes its local endpoint from local_model; run `raydock local custom --url <URL> --model <NAME>` first",
         )?;
         let path = match deployment.get("protocol").and_then(Value::as_str) {
             Some("openai.chat.v1") => "/v1/chat/completions",
@@ -568,12 +568,12 @@ impl LocalIdentity {
         matches!(self, Self::Mismatch(_))
     }
 
-    /// What `rayline hybrid start` tells the user, if anything.
+    /// What `raydock hybrid start` tells the user, if anything.
     pub(crate) fn start_message(&self, base_url: &str) -> Option<String> {
         match self {
             Self::Match => None,
             Self::Mismatch(reported) => Some(format!(
-                "Error: the local runtime at {base_url} serves {reported}, not {LOCAL_MODEL_NAME}. Local routing is off for this session: every turn goes to cloud. Serve {LOCAL_MODEL_NAME} (Ollama `qwen3.8:27b`, or a Qwen3.8-27B GGUF in llama.cpp), then run `rayline hybrid start` again."
+                "Error: the local runtime at {base_url} serves {reported}, not {LOCAL_MODEL_NAME}. Local routing is off for this session: every turn goes to cloud. Serve {LOCAL_MODEL_NAME} (Ollama `qwen3.8:27b`, or a Qwen3.8-27B GGUF in llama.cpp), then run `raydock hybrid start` again."
             )),
             Self::Unknown => Some(format!(
                 "Warning: Rayline cannot read which model the runtime at {base_url} serves (llama.cpp and Ollama report it); it assumes {LOCAL_MODEL_NAME}."
@@ -877,7 +877,7 @@ pub(crate) fn configured_router_urls(home: &Path) -> Vec<String> {
 }
 
 /// The configured environment whose router serves `url` (same HTTPS host
-/// and port), e.g. to name the right `rayline --env <env> auth login`.
+/// and port), e.g. to name the right `raydock --env <env> auth login`.
 pub(crate) fn environment_for_url(home: &Path, url: &str) -> Option<String> {
     let target = https_host(url)?;
     let mut names = vec![crate::status::PROD_ENV.to_owned()];

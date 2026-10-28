@@ -24,14 +24,14 @@ def main():
             path.mkdir()
         # A controlled command path makes the unsigned staging scenario explicit,
         # independent of whether the developer has minisign installed globally.
-        for name in ("sh", "cat", "curl", "awk", "uname", "mktemp", "rm", "shasum", "install", "mkdir"):
+        for name in ("sh", "cat", "curl", "awk", "uname", "mktemp", "rm", "shasum", "install", "mkdir", "ln"):
             executable = shutil.which(name)
             assert executable, f"required test command: {name}"
             (commands / name).symlink_to(executable)
         system, arch = os.uname().sysname, os.uname().machine
         platform = {("Darwin", "arm64"): "macosx_11_0_arm64", ("Darwin", "x86_64"): "macosx_10_12_x86_64",
                     ("Linux", "x86_64"): "linux_x86_64", ("Linux", "aarch64"): "linux_aarch64"}[(system, arch)]
-        files = {"rayline": ROOT / "target/debug/rayline", "rld": ROOT / "target/debug/rld",
+        files = {"rayline": ROOT / "target/debug/raydock", "rld": ROOT / "target/debug/rld",
                  "rayline-core": ROOT / "crates/rayline-daemon/tests/fixtures/execution-contract.py"}
         expected = {}
         for name, source in files.items():
@@ -50,6 +50,9 @@ def main():
             assert (result.returncode == 0) == success, result.stdout + result.stderr
 
         install(True)
+        assert (installed / "rayline").is_symlink()
+        assert (installed / "rayline").resolve() == (installed / "raydock").resolve()
+        assert (installed / "raydock").read_bytes() == expected["rayline"]
         for name, data in expected.items():
             assert (installed / name).read_bytes() == data
         assert (installed / "rayline-core-LICENSE").read_bytes() == license_data
@@ -78,7 +81,7 @@ def main():
         install(False)
         for name, data in expected.items():
             assert (installed / name).read_bytes() == data
-    print("Release installation passed: three binaries, missing-core repair detection, tamper and missing-checksum refusal.")
+    print("Release installation passed: Raydock plus alias, daemon/core, missing-core repair detection, tamper and missing-checksum refusal.")
 
 
 if __name__ == "__main__":

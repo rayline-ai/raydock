@@ -2,7 +2,7 @@
 //! `config.yml`. A named profile (`OMP_PROFILE`/`PI_PROFILE`) makes omp ignore
 //! that override, so both are removed. omp also reads Claude Code's config from
 //! `CLAUDE_CONFIG_DIR` (MCP servers, skills); in testing, a
-//! `CLAUDE_CONFIG_DIR` inherited from `rayline claude` pulling another config
+//! `CLAUDE_CONFIG_DIR` inherited from `raydock claude` pulling another config
 //! into omp, so it is removed too. Header values name env vars; `apiKey` is the
 //! literal key.
 //!
@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, yaml_file};
+use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, model_display_name, yaml_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 /// First omp that sends `X-Claude-Code-Session-Id` in `auth: apiKey` mode.
@@ -67,6 +67,21 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
 }
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
+    let launch = ctx.models();
+    let entries: Vec<_> = launch
+        .offered
+        .iter()
+        .map(|model| {
+            json!({
+                "id": model,
+                "name": format!("{} ({})", model_display_name(launch, model), ctx.env_name),
+                "reasoning": true,
+                "input": ctx.input_modalities(),
+                "contextWindow": ctx.context_window(),
+                "maxTokens": ctx.max_output_tokens()
+            })
+        })
+        .collect();
     let models = json!({
         "providers": {
             PROVIDER_ID: {
@@ -77,32 +92,32 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 // billing system block). apiKey mode is the honest request shape.
                 "auth": "apiKey",
                 "headers": ctx.conversation_headers(CONV_ID_ENV),
-                "models": [{
-                    "id": ROUTER_MODEL,
-                    "name": format!("Rayline router ({})", ctx.env_name),
-                    "reasoning": true,
-                    "input": ctx.input_modalities(),
-                    "contextWindow": ctx.context_window(),
-                    "maxTokens": ctx.max_output_tokens()
-                }]
+                "models": entries
             }
         }
     });
-    let model_ref = format!("{PROVIDER_ID}/{ROUTER_MODEL}");
-    // omp writes its settings to config.yml, so only seed it.
-    let config = json!({
-        "modelRoles": {
-            "default": model_ref,
-            "smol": model_ref,
-            "slow": model_ref,
-            "plan": model_ref
-        }
-    });
+    // omp writes its settings to config.yml, so only seed it. `smol` is its
+    // small/fast role (side calls, quick subagent work): ARC Swift.
+    let config = |main: &str, smol: &str| {
+        let main = format!("{PROVIDER_ID}/{main}");
+        json!({
+            "modelRoles": {
+                "default": main,
+                "smol": format!("{PROVIDER_ID}/{smol}"),
+                "slow": main,
+                "plan": main
+            }
+        })
+    };
+    let mut config_file = yaml_file("config.yml", &config(launch.main, launch.background), false);
+    // The seed 0.2.x wrote (Legacy in every role); still exactly that means the
+    // user never changed a role, so it moves to the new defaults.
+    if launch.main != ROUTER_MODEL {
+        config_file.replaces_seed =
+            Some(yaml_file("config.yml", &config(ROUTER_MODEL, ROUTER_MODEL), false).contents);
+    }
     Plan {
-        files: vec![
-            yaml_file("models.yml", &models, true),
-            yaml_file("config.yml", &config, false),
-        ],
+        files: vec![yaml_file("models.yml", &models, true), config_file],
         env_set: vec![("PI_CODING_AGENT_DIR", ctx.config_dir.as_os_str().to_owned())],
         env_remove: vec!["CLAUDE_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"],
     }
@@ -133,18 +148,61 @@ mod tests {
     headers: {}
     models:
       - contextWindow: 200000
+        id: \"arc-sage-1.0\"
+        input: [\"text\", \"image\"]
+        maxTokens: 32000
+        name: \"ARC Sage (dev)\"
+        reasoning: true
+      - contextWindow: 200000
+        id: \"arc-swift-1.0\"
+        input: [\"text\", \"image\"]
+        maxTokens: 32000
+        name: \"ARC Swift (dev)\"
+        reasoning: true
+      - contextWindow: 200000
         id: \"rayline-router\"
         input: [\"text\", \"image\"]
         maxTokens: 32000
-        name: \"Rayline router (dev)\"
+        name: \"Legacy Rules Router (dev)\"
         reasoning: true
 "
         );
         let config = std::fs::read_to_string(dir.join("config.yml")).unwrap();
         assert!(config.starts_with("modelRoles:\n"));
-        for role in ["default", "smol", "slow", "plan"] {
-            assert!(config.contains(&format!("  {role}: \"rayline/rayline-router\"\n")));
+        for role in ["default", "slow", "plan"] {
+            assert!(config.contains(&format!("  {role}: \"rayline/arc-sage-1.0\"\n")));
         }
+        assert!(config.contains("  smol: \"rayline/arc-swift-1.0\"\n"));
+    }
+
+    const LEGACY_SEED: &str = "modelRoles:
+  default: \"rayline/rayline-router\"
+  plan: \"rayline/rayline-router\"
+  slow: \"rayline/rayline-router\"
+  smol: \"rayline/rayline-router\"
+";
+
+    #[test]
+    fn untouched_legacy_seed_moves_to_arc_and_an_edited_one_is_kept() {
+        let dir = super::super::tests::temp_dir("omp-seed");
+        let ctx = super::super::tests::render_context(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The exact seed 0.2.x wrote: no role was ever chosen.
+        std::fs::write(dir.join("config.yml"), LEGACY_SEED).unwrap();
+        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+        let config = std::fs::read_to_string(dir.join("config.yml")).unwrap();
+        assert!(
+            config.contains("  default: \"rayline/arc-sage-1.0\"\n"),
+            "{config}"
+        );
+        // Legacy chosen for one role (any edit): the file is kept as is.
+        let chosen = LEGACY_SEED.replace("  smol: \"rayline/rayline-router\"\n", "");
+        std::fs::write(dir.join("config.yml"), &chosen).unwrap();
+        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("config.yml")).unwrap(),
+            chosen
+        );
     }
 
     #[test]

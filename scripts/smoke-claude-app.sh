@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Wire smoke for `rayline claude-desktop` in a throwaway HOME.
+# Wire smoke for `raydock claude-desktop` in a throwaway HOME.
 # Starts the Desktop router, runs one headless Claude Code turn with the exact
 # model id Desktop sends, asserts the reply, the alias route and the upstream
 # ARC model, then stops the router. Never prints the key.
 set -euo pipefail
 REPO=${REPO:-$(cd "$(dirname "$0")/.." && pwd)}
-RAYLINE=${RAYLINE:-$REPO/target/debug/rayline}
+RAYLINE=${RAYLINE:-$REPO/target/debug/raydock}
 export RLD_BIN=${RLD_BIN:-$REPO/target/debug/rld}
 CLAUDE=${CLAUDE:-$(command -v claude)}
 # Desktop's hidden model ids and the ARC tier each must route to.
@@ -39,7 +39,7 @@ PY
 # HOME must never load, reuse or unload the user's real login service.
 run() { env -i PATH="$PATH" HOME="$H" RLD_BIN="$RLD_BIN" TERM=dumb RAYLINE_CLAUDE_DESKTOP_NO_LAUNCHD=1 "$@"; }
 
-echo "== rayline claude-desktop (start)"
+echo "== raydock claude-desktop (start)"
 run "$RAYLINE" claude-desktop --manual $START_FLAGS </dev/null | tee "$OUT/start.txt"
 echo "== validate the generated import file"
 run "$RAYLINE" claude-desktop validate --desktop-config "$H/.rayline/claude-desktop/claude-desktop-import.json"

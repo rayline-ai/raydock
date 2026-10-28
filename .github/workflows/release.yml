@@ -120,6 +120,10 @@ jobs:
           set -euo pipefail
           cargo build --release -p rayline-cli -p rayline-daemon --locked
 
+      - name: Test installed command migration
+        shell: bash
+        run: cargo test -p rayline-cli --locked --test it_command_migration -- --test-threads=1
+
       - name: Package release assets
         shell: bash
         env:
@@ -133,23 +137,31 @@ jobs:
 
           rayline_asset="rayline-${PLATFORM_TAG}"
           daemon_asset="rld-${PLATFORM_TAG}"
-          cp "target/release/rayline${EXE_SUFFIX}" "dist/${rayline_asset}"
+          cp "target/release/raydock${EXE_SUFFIX}" "dist/${rayline_asset}"
           cp "target/release/rld${EXE_SUFFIX}" "dist/${daemon_asset}"
 
           package_dir="rayline-${VERSION}-${PLATFORM_TAG}"
           mkdir -p "package/${package_dir}"
-          cp "target/release/rayline${EXE_SUFFIX}" "package/${package_dir}/rayline${EXE_SUFFIX}"
+          cp "target/release/raydock${EXE_SUFFIX}" "package/${package_dir}/raydock${EXE_SUFFIX}"
           cp "target/release/rld${EXE_SUFFIX}" "package/${package_dir}/rld${EXE_SUFFIX}"
           cp "dist/rayline-core-${PLATFORM_TAG}" "package/${package_dir}/rayline-core${EXE_SUFFIX}"
           cp dist/rayline-core-source.json dist/rayline-core-LICENSE "package/${package_dir}/"
           cp README.md LICENSE NOTICE "package/${package_dir}/"
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # Migration may leave its running EXE in a locked backup. Build the
+            # native alias outside the archive and copy only the final launcher.
+            alias_dir="$(mktemp -d)"
+            trap 'rm -rf "$alias_dir"' EXIT
+            cp "target/release/raydock.exe" "${alias_dir}/rayline.exe"
+            "${alias_dir}/rayline.exe" --version
+            cp "${alias_dir}/rayline.exe" "package/${package_dir}/rayline.exe"
             pwsh -NoProfile -Command \
               "Compress-Archive -Path 'package/${package_dir}/*' -DestinationPath 'dist/${package_dir}.${ARCHIVE_EXT}' -Force"
           else
+            ln -s raydock "package/${package_dir}/rayline"
             chmod 0755 "dist/${rayline_asset}" "dist/${daemon_asset}" "dist/rayline-core-${PLATFORM_TAG}"
-            chmod 0755 "package/${package_dir}/rayline" "package/${package_dir}/rld" "package/${package_dir}/rayline-core"
+            chmod 0755 "package/${package_dir}/raydock" "package/${package_dir}/rld" "package/${package_dir}/rayline-core"
             tar -C package -czf "dist/${package_dir}.${ARCHIVE_EXT}" "${package_dir}"
           fi
 
@@ -201,7 +213,7 @@ jobs:
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key_file"
           # Sign SHA256SUMS (covers the binaries/archives).
           minisign -S -s "$key_file" -m dist/SHA256SUMS
-          # Generate and sign the channel version pointer so `rayline update`
+          # Generate and sign the channel version pointer so `raydock update`
           # verifies the version it is told to install before trusting it
           # (defeats downgrade attacks). Signed separately from SHA256SUMS; the
           # signature is over the version bytes, so the same latest.txt /
@@ -249,10 +261,10 @@ jobs:
           version="${RELEASE_TAG#v}"
 
           cat > release-notes.md <<EOF
-          Rayline ${version}
+          Raydock ${version}
 
           Assets:
-          - \`rayline-<platform>\`, \`rld-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts.
+          - \`rayline-<platform>\`, \`rld-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`raydock update\` and the install scripts. Asset names remain stable for existing updaters.
           - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain all three binaries, source provenance and license/readme files.
           - \`SHA256SUMS\` covers every uploaded binary, archive and provenance file.
           - \`SHA256SUMS.minisig\` is the minisign signature over \`SHA256SUMS\`.
@@ -265,7 +277,7 @@ jobs:
             echo "::error::Release $RELEASE_TAG already exists; refusing to replace its assets with this build." >&2
             exit 1
           fi
-          args=(release create "$RELEASE_TAG" dist/* --title "Rayline ${version}" --notes-file release-notes.md)
+          args=(release create "$RELEASE_TAG" dist/* --title "Raydock ${version}" --notes-file release-notes.md)
           if [[ "$version" == *"-"* ]]; then
             args+=(--prerelease)
           fi

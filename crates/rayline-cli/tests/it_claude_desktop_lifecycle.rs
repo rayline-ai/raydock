@@ -25,7 +25,7 @@ impl Home {
         Self(path)
     }
     fn run(&self, action: &str) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_rayline"))
+        Command::new(env!("CARGO_BIN_EXE_raydock"))
             .env_clear()
             .env("HOME", &self.0)
             .env("PATH", "/usr/bin:/bin")

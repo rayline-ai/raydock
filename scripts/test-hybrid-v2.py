@@ -2,7 +2,7 @@
 """Joined v2 smoke: real Rayline CLI + rld + Go core + stock installed Pi, with HTTP fixtures.
 
 Exercises the seams the hybrid v2 spec adds, end to end, with an unmodified harness:
-  * `rayline hybrid start` composes Rayline Local's defaults into the core config
+  * `raydock hybrid start` composes Raydock's defaults into the core config
     (decisions.api_mode execution_context_v2, explicit routing.policy preset, and an
     optional settings `hybrid.routing` schedule override);
   * the core infers events from stock Pi's own requests (`basis: marker_inferred`):
@@ -41,7 +41,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core", type=Path, required=True, help="rayline-core built from the v2 Go core")
     parser.add_argument("--registry", type=Path, required=True, help="public compiled thinking registry")
-    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/rayline")
+    parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
     parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     args = parser.parse_args()
     registry_bytes = args.registry.read_bytes()
@@ -161,7 +161,7 @@ def main():
         state = root / "state"
         package = root / "synthetic-package.json"
         package.write_bytes(package_bytes)
-        # v2 profile with no policy: Rayline Local must supply the preset.
+        # v2 profile with no policy: Raydock must supply the preset.
         config = {"contract_version": 1, "package_path": package.name, "package_sha256": package_sha,
             "registry_path": str(args.registry.resolve()), "registry_sha256": registry_sha,
             "allow_experimental_controls": True,
@@ -244,7 +244,7 @@ def main():
     assert compacted["history"] == [{"message": 1, "action_id": local["action_id"]}], compacted["history"]
     assert [target["placement"] for target in second["targets"]] in (["local", "cloud"], ["cloud", "local"])
     assert all(target["capacity"] is None for target in second["targets"])
-    print("Joined v2 smoke passed: Rayline Local composed the hybrid preset and schedule override; the core inferred "
+    print("Joined v2 smoke passed: Raydock composed the hybrid preset and schedule override; the core inferred "
           "stock Pi's events from its own requests, ran Pi's session-less summary call as a stateless side call, and "
           "recognised Pi's auto-compaction with its retained tail. Decisions and model responses were synthetic fixtures.")
 

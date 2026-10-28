@@ -2454,11 +2454,23 @@ fn claude_project_slug(path: &Path) -> String {
         .collect()
 }
 
+/// A model only the router serves: the virtual model, or an ARC tier
+/// (`arc-sage-1.0`, `arc-swift`, `rayline/arc-sage`, ...). Under selective
+/// routing such a request goes to the router whatever its headers say:
+/// Anthropic serves none of these ids, so passing one through can only fail.
+/// `raydock claude --route subagents` names ARC Swift for subagents, and a
+/// subagent's token count or a turn without the agent-id header must still
+/// reach the router.
 fn is_virtual_model(model: Option<&str>) -> bool {
     model.is_some_and(|model| {
         let normalized = normalize_model_name(model);
-        normalized == VIRTUAL_MODEL
+        normalized == VIRTUAL_MODEL || is_arc_model(&normalized)
     })
+}
+
+fn is_arc_model(model: &str) -> bool {
+    let bare = model.strip_prefix("rayline/").unwrap_or(model);
+    bare.starts_with("arc-")
 }
 
 fn is_virtual_model_lookup(path: &str) -> bool {
@@ -3190,6 +3202,48 @@ mod tests {
         let body: Value = serde_json::from_slice(&prepared.body).unwrap();
         assert_eq!(body["model"], "rayline-router");
         assert_eq!(body["messages"], json!([]));
+    }
+
+    #[test]
+    fn selective_mode_routes_arc_models_without_an_agent_header() {
+        for model in [
+            "arc-swift-1.0",
+            "arc-sage-1.0[1m]",
+            "arc-sage",
+            "rayline/arc-swift",
+        ] {
+            for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+                let prepared = prepare_anthropic_route_with_subagent_filter(
+                    &Method::POST,
+                    path,
+                    &HeaderMap::new(),
+                    Bytes::from(json!({"model": model, "messages": []}).to_string()),
+                    ProxyRoutingMode::SelectiveSubagents,
+                    &[],
+                    None,
+                    true,
+                );
+                assert_eq!(
+                    prepared.decision.target,
+                    RouteTarget::Router,
+                    "{model} {path}"
+                );
+                assert_eq!(prepared.decision.reason, "selective_virtual_model");
+                assert!(!prepared.body_was_rewritten, "{model}");
+            }
+        }
+        // A Claude id with no agent header is the main agent's: Anthropic.
+        let prepared = prepare_anthropic_route_with_subagent_filter(
+            &Method::POST,
+            "/v1/messages",
+            &HeaderMap::new(),
+            Bytes::from(json!({"model": "claude-sonnet-5", "messages": []}).to_string()),
+            ProxyRoutingMode::SelectiveSubagents,
+            &[],
+            None,
+            true,
+        );
+        assert_eq!(prepared.decision.reason, "selective_main_passthrough");
     }
 
     #[test]

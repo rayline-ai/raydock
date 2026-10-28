@@ -1,7 +1,7 @@
 # Acceptance Testing
 
 This guide is for maintainers and coding agents who need to validate the real
-Claude Code path through Rayline Local end to end — exercising it the way a user
+Claude Code path through Raydock end to end — exercising it the way a user
 would, against the local router and managed llama.cpp runtime. It complements the
 automated gate (`fmt` / `clippy` / `test`); run these manual steps on a real
 machine with a TTY after that gate is green.
@@ -14,28 +14,28 @@ Prerequisites:
 
 ## Install Matching Binaries
 
-From a Rayline Local source checkout:
+From a Raydock source checkout:
 
 ```bash
 cargo install --path crates/rayline-daemon --locked --root ~/.rayline --force
 cargo install --path crates/rayline-cli --locked --root ~/.rayline --force
 export PATH="$HOME/.rayline/bin:$PATH"
 
-rayline --version
+raydock --version
 rld --version
 ```
 
 The two versions should match. If you are testing an already installed release,
-skip this step and use the installed `rayline`.
+skip this step and use the installed `raydock`.
 
 ## Select a Local Model
 
 Use a managed recommended model:
 
 ```bash
-rayline local models
-rayline local use qwen3.6-35b-a3b-q4km
-rayline local show
+raydock local models
+raydock local use qwen3.6-35b-a3b-q4km
+raydock local show
 ```
 
 First use may download the model. First launch may take a few minutes while
@@ -62,14 +62,14 @@ JSON
 
 ## Clear Stale Test State
 
-Stop any previous isolated Claude Code daemon and Rayline Local router:
+Stop any previous isolated Claude Code daemon and Raydock router:
 
 ```bash
 CLAUDE_CONFIG_DIR="$HOME/.rayline/cc" claude daemon stop --any || true
-rayline router stop || true
+raydock router stop || true
 ```
 
-## Run Claude Through Rayline Local
+## Run Claude Through Raydock
 
 Run interactively. On the first `--isolated` run the profile is logged out, so a
 browser sign-in opens automatically — complete it and the session continues.
@@ -77,12 +77,12 @@ browser sign-in opens automatically — complete it and the session continues.
 
 <a href="https://get.rayline.ai/media/rayline-login-demo.mp4">
   <img src="https://get.rayline.ai/media/rayline-login-demo.gif"
-       alt="rayline claude --local --isolated: browser sign-in, then an Explore subagent routed to the on-device model"
+       alt="raydock claude --local --isolated: browser sign-in, then an Explore subagent routed to the on-device model"
        width="100%">
 </a>
 
 ```bash
-rayline claude \
+raydock claude \
   --local \
   --isolated \
   --route subagents \
@@ -104,8 +104,8 @@ RAYLINE_EXPLORE_ACCEPTANCE_OK
 Check the router:
 
 ```bash
-rayline router status
-rayline router top --json \
+raydock router status
+raydock router top --json \
   | jq '.active[]?, .recent[]? | select(((.agent_type // "") | ascii_downcase) == "explore" and .target == "local")'
 ```
 
@@ -139,20 +139,20 @@ the automated gate (`fmt` / `clippy` / `test`) is green.
 
 ```bash
 # Confirm the binary is fresh (should match current branch build)
-rayline --version
+raydock --version
 ```
 
 ### Step 2: First-run onboarding (interactive wizard)
 
 ```bash
 # Reset to a clean slate
-rayline local clear
+raydock local clear
 # Also remove the "onboarding" marker so the first-run wizard re-triggers.
 # (portable; macOS has no `sponge`)
 tmp=$(mktemp) && jq 'del(.onboarding)' ~/.config/rayline/settings.json > "$tmp" && mv "$tmp" ~/.config/rayline/settings.json
 
-rayline claude --local
-# (Tip: `rayline local onboard` re-runs the wizard directly, no settings edit needed.)
+raydock claude --local
+# (Tip: `raydock local onboard` re-runs the wizard directly, no settings edit needed.)
 ```
 
 **Expected:**
@@ -161,25 +161,25 @@ rayline claude --local
 - `cat ~/.config/rayline/settings.json | jq .local_model` shows a `local_model` block (endpoint, model_id)
 - `cat ~/.config/rayline/settings.json | jq .onboarding` shows `schema: 1`, `outcome: "local-model"`, a `completed_at` timestamp, and `cli_version`
 - After the wizard, Claude routes only `Explore`/`codebase-*` subagents locally; main thread and other agents stay cloud
-- Verify: `rayline router top` shows `policy=subagent:Explore target=local` rows; main rows stay `target=cloud`
+- Verify: `raydock router top` shows `policy=subagent:Explore target=local` rows; main rows stay `target=cloud`
 - Or: `grep 'policy=subagent:Explore' ~/.rayline/rld/rl-rld.log`
 
 ### Step 3: Re-run + `--reset`
 
 ```bash
-rayline local onboard            # wizard re-runs; keeps local_model unless changed
-rayline local onboard --reset    # clears local_model first, then wizard
+raydock local onboard            # wizard re-runs; keeps local_model unless changed
+raydock local onboard --reset    # clears local_model first, then wizard
 ```
 
 **Expected:**
-- After `rayline local onboard`: `.onboarding.completed_at` in settings.json is updated to a newer timestamp
-- After `rayline local onboard --reset`: `.local_model` is cleared before the wizard starts, then re-filled on `[Y]`
+- After `raydock local onboard`: `.onboarding.completed_at` in settings.json is updated to a newer timestamp
+- After `raydock local onboard --reset`: `.local_model` is cleared before the wizard starts, then re-filled on `[Y]`
 
 ### Step 4: Non-interactive fallback
 
 ```bash
-rayline local clear
-echo "" | rayline claude --local -p 'hello'
+raydock local clear
+echo "" | raydock claude --local -p 'hello'
 ```
 
 **Expected:**
@@ -191,9 +191,9 @@ echo "" | rayline claude --local -p 'hello'
 ### Step 5: Skipped → re-prompt
 
 ```bash
-rayline local clear
-rayline claude --local        # when prompted, choose [s] (skip) → outcome "skipped"
-rayline claude --local        # MUST re-prompt even though a skip marker was recorded
+raydock local clear
+raydock claude --local        # when prompted, choose [s] (skip) → outcome "skipped"
+raydock claude --local        # MUST re-prompt even though a skip marker was recorded
 ```
 
 **Expected:**
@@ -203,16 +203,16 @@ rayline claude --local        # MUST re-prompt even though a skip marker was rec
 ### Step 6: `--route all` widens past the allowlist
 
 ```bash
-rayline local clear
-rayline local use <some-model>   # configure a model without going through onboarding
-rayline claude --local --route all
+raydock local clear
+raydock local use <some-model>   # configure a model without going through onboarding
+raydock claude --local --route all
 ```
 
 **Expected:**
 - All subagents (not just the read-only allowlist) route locally
 - Main thread stays cloud
 - The materialized `local-default-routes.json` (written at launch under `~/.rayline/rld/`) is NOT applied — `--route all` (Proxy mode) bypasses it
-- Verify via `rayline router top`: subagent rows show `target=local`, main rows show `target=cloud`
+- Verify via `raydock router top`: subagent rows show `target=local`, main rows show `target=cloud`
 
 ### Step 7: Local provider endpoint
 
@@ -221,22 +221,22 @@ With Ollama running and at least one model installed:
 ```bash
 ollama serve
 ollama list
-rayline claude --local --local-provider ollama --model <ollama-tag> -p 'Use the Explore subagent to list the top-level files in this repo.'
+raydock claude --local --local-provider ollama --model <ollama-tag> -p 'Use the Explore subagent to list the top-level files in this repo.'
 ```
 
 **Expected:**
-- `rayline local show` reports `Local model: Ollama`, the provider URL, the selected model, and `Protocol: openai_chat`
+- `raydock local show` reports `Local model: Ollama`, the provider URL, the selected model, and `Protocol: openai_chat`
 - `cat ~/.config/rayline/settings.json | jq .local_model` includes `"mode": "custom"`, `"provider": "ollama"`, `"protocol": "openai_chat"`, root `"base_url": "http://localhost:11434"`, and the selected model
 - `~/.rayline/rld/provider-routes.json` contains an `openai_chat` endpoint named `ollama` plus `routes.subagents`, `routes.subagent`, and `routes.model_routes` entries pointing to that endpoint
 - `~/.rayline/rld/rl-rld.log` shows custom upstream mode and does **not** show GGUF download or bundled `llama-server spawned`
-- `rayline router top` shows Explore/subagent rows targeting the provider endpoint; main rows stay cloud
+- `raydock router top` shows Explore/subagent rows targeting the provider endpoint; main rows stay cloud
 
 Stopped-provider failure:
 
 ```bash
-rayline router stop
+raydock router stop
 # stop ollama / LM Studio
-rayline claude --local --local-provider ollama --model <ollama-tag> -p 'hello'
+raydock claude --local --local-provider ollama --model <ollama-tag> -p 'hello'
 ```
 
 **Expected:**
@@ -248,15 +248,15 @@ Auto-discovery picker:
 
 ```bash
 ollama serve
-rayline local models
-rayline local use <provider-row-number>
-rayline claude --local -p 'hello'
+raydock local models
+raydock local use <provider-row-number>
+raydock claude --local -p 'hello'
 ```
 
 **Expected:**
-- `rayline local models` lists detected provider models before built-in models
+- `raydock local models` lists detected provider models before built-in models
 - Selecting a provider row configures it immediately (no GGUF download)
-- A later bare `rayline claude --local` reuses the persisted provider config and regenerates provider routes
+- A later bare `raydock claude --local` reuses the persisted provider config and regenerates provider routes
 
 ---
 
@@ -264,36 +264,36 @@ rayline claude --local -p 'hello'
 
 A broader sweep of the CLI surface, beyond the routing path above. The routing
 steps (3–5) reuse the same setup as
-[Run Claude Through Rayline Local](#run-claude-through-rayline-local); verify
+[Run Claude Through Raydock](#run-claude-through-raydock); verify
 routing there rather than duplicating those assertions here.
 
 1. **Version and help:**
 
    ```bash
-   rayline --version
-   rayline --help
-   rayline claude --help
-   rayline update --help
+   raydock --version
+   raydock --help
+   raydock claude --help
+   raydock update --help
    ```
 
    Confirm the CLI exposes `claude`, `router`, `local`, and `update`, and that
-   `rayline claude --help` describes local routing and includes `--local`,
+   `raydock claude --help` describes local routing and includes `--local`,
    `--isolated`, `--via`, `--route`, and `--router-config-path`.
 
 2. **Update check:**
 
    ```bash
-   rayline update --check
+   raydock update --check
    ```
 
    Confirm the command reports either `Already on latest` (exit code 0) or
    `Update available` (exit code 1). For install-path validation without
-   replacing the binary, run `rayline update --dry-run --version <version>`.
+   replacing the binary, run `raydock update --dry-run --version <version>`.
 
 3. **Isolated launch:**
 
    ```bash
-   rayline claude \
+   raydock claude \
      --local \
      --isolated \
      --router-config-path ~/.config/rayline/local-router.json
@@ -315,9 +315,9 @@ routing there rather than duplicating those assertions here.
 6. **Log inspection:**
 
    ```bash
-   rayline router status
-   rayline router logs --lines 120
-   rayline router top
+   raydock router status
+   raydock router logs --lines 120
+   raydock router top
    tail -n 120 ~/.rayline/rld/rl-rld.log
    tail -n 120 ~/.rayline/rld/cc/rl-rld-proxy.log
    ```
@@ -334,7 +334,7 @@ routing there rather than duplicating those assertions here.
 
 ---
 
-## `rayline claude-desktop` (Claude Desktop) Acceptance
+## `raydock claude-desktop` (Claude Desktop) Acceptance
 
 Wire smoke, in a throwaway HOME (two hosted ARC turns, a few cents): it starts
 the Desktop router, validates the generated import file, runs one headless
@@ -356,12 +356,12 @@ real login service. It copies only the prod `router_keys.prod.apiKey` from
 or the gateway token.
 
 Desktop UI checklist (per Desktop release, on a macOS user without other
-Desktop state): run `rayline claude-desktop`; confirm **Rayline ARC** is selected
+Desktop state): run `raydock claude-desktop`; confirm **Rayline ARC** is selected
 and Desktop opens in third-party mode without importing a file. If prompted,
 continue with the gateway; open **Code**, pick **arc-sage**, send
-"Reply with exactly PONG"; confirm `rayline claude-desktop status` counts the
+"Reply with exactly PONG"; confirm `raydock claude-desktop status` counts the
 request. Repeat the command and confirm it reuses the profile without restarting
-Desktop. Run `rayline claude-desktop off` and confirm the prior profile and mode
+Desktop. Run `raydock claude-desktop off` and confirm the prior profile and mode
 return, while unrelated Desktop preferences remain intact. Also check
 `--manual` still prints import instructions without touching Desktop.
 
@@ -374,7 +374,7 @@ alone does not prove the app consumed the profile.
 
 ## Troubleshooting
 
-If Claude reports a non-Rayline Local daemon conflict, stop only the isolated
+If Claude reports a non-Raydock daemon conflict, stop only the isolated
 daemon and retry:
 
 ```bash

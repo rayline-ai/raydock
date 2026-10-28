@@ -82,7 +82,7 @@ pub struct RouterStartRequest {
     /// upstream). Used when the static config routes only to named endpoints.
     pub no_local_model: bool,
     /// Override for the router API key the daemon endpoints read from
-    /// `RAYLINE_ROUTER_API_KEY` (e.g. the `rayline auth login` key for a hosted
+    /// `RAYLINE_ROUTER_API_KEY` (e.g. the `raydock auth login` key for a hosted
     /// cloud-router endpoint). When `None`, the normal resolution applies.
     pub router_api_key_override: Option<String>,
     /// Codex may-local (Rcl-Rcl/Rcl-K): the local router advertises
@@ -153,7 +153,7 @@ pub struct RouterStartCliRequest {
     /// headless/agent use. When set, the daemon runs config-driven (decision plane
     /// local, scope from `routes.main`).
     pub config_path: Option<PathBuf>,
-    /// Codex provider auth behavior. `Auto` mirrors `rayline codex`: subscription
+    /// Codex provider auth behavior. `Auto` mirrors `raydock codex`: subscription
     /// passthrough when no config is supplied, no client auth for explicit configs.
     pub codex_auth_mode: crate::codex::CodexAuthMode,
     pub root_env_explicit: bool,
@@ -940,7 +940,7 @@ fn draw_top(
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
     let mut y = 0;
-    y = draw_title(stdout, y, width, "Rayline Local Router")?;
+    y = draw_title(stdout, y, width, "Raydock Router")?;
     y = draw_top_summary(stdout, y, width, snapshot, paused, sort, show_all)?;
     if let Some(error) = last_error {
         y = draw_colored_line(
@@ -1613,7 +1613,7 @@ pub async fn start_from_home(home: &Path, request: &RouterStartRequest) -> io::R
 
 /// Start the local router daemon (router + embedded proxy) without launching
 /// Claude Code, then return a status string. This mirrors the local startup that
-/// `rayline claude --local` performs, but leaves the daemon running so other
+/// `raydock claude --local` performs, but leaves the daemon running so other
 /// clients (e.g. the Anthropic SDK pointed at the proxy on 127.0.0.1:20810) can
 /// use it. The model comes from the stored `local_model` config, exactly like
 /// `start`.
@@ -1731,7 +1731,7 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
     }
 
     if codex_subscription_auth {
-        // Default `rayline codex` (no `--config`): mirror `rayline claude`'s
+        // Default `raydock codex` (no `--config`): mirror `raydock claude`'s
         // graceful hybrid — main on the ChatGPT subscription, subagents on the
         // on-device model when one is usable. Codex surfaces every subagent as a
         // single generic `collab_spawn`, so this is a `routes.subagent → local`
@@ -1768,7 +1768,7 @@ pub async fn start_from_cli(request: &RouterStartCliRequest) -> io::Result<Strin
                 }
                 Err(error) => {
                     eprintln!(
-                        "rayline codex: on-device subagent routing unavailable ({error}); \
+                        "raydock codex: on-device subagent routing unavailable ({error}); \
                          running subagents on your subscription. Set up a local model with \
                          `{} local onboard` to offload them on-device.",
                         cli_name()
@@ -2369,7 +2369,7 @@ fn spawn_router(
     }
     let chosen_metrics_port = choose_serve_metrics_port(&data_ports);
     let mut requested_meta = router_meta(home, request, Some(bin_path), router_api_key);
-    // Record the port this daemon is told to bind, so `rayline top` and a
+    // Record the port this daemon is told to bind, so `raydock top` and a
     // forwarding proxy find it when it is not the default. With no usable
     // port, serve is given its preferred one, which is a data port; serve
     // refuses to bind metrics there and runs without them, and no port is
@@ -2839,7 +2839,7 @@ fn router_meta(
 ///
 /// Forwarding is chosen only when a serve daemon is actually live. Stale serve
 /// meta left behind by a crashed daemon must not pin a cloud-only proxy to a
-/// dead endpoint — that would leave `rayline top` with no metrics. The empty
+/// dead endpoint — that would leave `raydock top` with no metrics. The empty
 /// fast-path skips the liveness probe entirely for the common cloud-only launch
 /// where no serve daemon has ever published meta.
 async fn serve_metrics_forward_url(home: &Path, client: &reqwest::Client) -> Option<String> {
@@ -2887,7 +2887,7 @@ fn serve_metrics_url(serve_running: bool, serve_meta: &BTreeMap<String, String>)
 /// Once the proxy is healthy, make the advertised `metrics_port` reflect what the
 /// daemon actually bound. The daemon self-hosts metrics best-effort: on a port
 /// collision it runs without metrics rather than failing the proxy. Leaving
-/// `metrics_port` in the proxy meta then points `rayline top` (and future
+/// `metrics_port` in the proxy meta then points `raydock top` (and future
 /// launches' port discovery) at an endpoint the proxy never owned, so drop it
 /// when the self-hosted server is not answering. Metrics stays best-effort —
 /// this only edits meta and never restarts the proxy.
@@ -2958,7 +2958,7 @@ fn proxy_meta(
         meta.insert("metrics_url".to_owned(), metrics_url.to_owned());
     }
     // Only recorded when the proxy self-hosts metrics (i.e. it is not forwarding
-    // to a serve daemon), so `rayline top` only ever discovers a port the proxy
+    // to a serve daemon), so `raydock top` only ever discovers a port the proxy
     // actually owns.
     if let Some(metrics_port) = self_hosted_metrics_port {
         meta.insert("metrics_port".to_owned(), metrics_port.to_string());
@@ -3079,7 +3079,7 @@ fn effective_start_request(
 }
 
 fn resolve_router_api_key(home: &Path, request: &RouterStartRequest) -> io::Result<Option<String>> {
-    // An explicit override (e.g. the `rayline auth login` session key injected
+    // An explicit override (e.g. the `raydock auth login` session key injected
     // for a config whose `rayline-cloud` endpoint reads `RAYLINE_ROUTER_API_KEY`)
     // is honored regardless of `enable_proxy`. The isolated local-plane path
     // starts the router with `enable_proxy = false`, so gating on it here would
@@ -3327,7 +3327,7 @@ mod tests {
 
     #[test]
     fn serve_metrics_port_moves_off_a_held_port() {
-        // #82: a running `rayline claude` proxy holds the default port.
+        // #82: a running `raydock claude` proxy holds the default port.
         let held = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .expect("bind a test port");
         let held_port = held.local_addr().expect("local addr").port();
@@ -3524,7 +3524,7 @@ mod tests {
     fn serve_metrics_url_none_when_serve_not_running() {
         // Regression: a crashed serve daemon can leave stale meta behind. The
         // proxy must not forward metrics to that dead endpoint — it should
-        // self-host instead so `rayline top` still works.
+        // self-host instead so `raydock top` still works.
         let stale = meta_with_metrics_port(20813);
 
         assert_eq!(serve_metrics_url(false, &stale), None);
@@ -4476,7 +4476,7 @@ mod tests {
     fn router_api_key_override_survives_disabled_proxy() {
         // Regression: the isolated local-plane path starts the router with
         // enable_proxy = false. An explicit `router_api_key_override` (the
-        // `rayline auth login` session key injected for a config whose
+        // `raydock auth login` session key injected for a config whose
         // `rayline-cloud` endpoint reads RAYLINE_ROUTER_API_KEY, e.g. Rc-K/Rl-K)
         // must still be resolved — not dropped by the proxy gate — so the cloud
         // main leg authenticates instead of 502-ing.
@@ -5131,7 +5131,7 @@ fn metrics_port_from_env(value: Option<&str>, default_port: u16) -> u16 {
 
 /// Metrics-control port for a `serve` daemon: the configured port
 /// (`RAYLINE_METRICS_PORT`, else the default) when it is free, else a free
-/// ephemeral port. Another rld, such as a running `rayline claude` proxy, may
+/// ephemeral port. Another rld, such as a running `raydock claude` proxy, may
 /// already hold the default, and a second launcher must still start (#82).
 /// `data_ports` are the ports this serve binds for routing; metrics never takes
 /// one, or serve's own router bind would fail.
@@ -5183,7 +5183,7 @@ fn ephemeral_local_port() -> Option<u16> {
         .ok()
 }
 
-/// Ordered, de-duplicated list of metrics-control ports `rayline top` should try,
+/// Ordered, de-duplicated list of metrics-control ports `raydock top` should try,
 /// most-authoritative first: the local-router `serve` daemon, then the
 /// non-isolated proxy's self-hosted server, then the isolated proxy's, with the
 /// default metrics port as a final fallback. The proxy only records its
@@ -5357,7 +5357,7 @@ pub(crate) fn terminate_process(pid: i32) -> io::Result<()> {
     // process tree (`/T /F`) — the same call `force_stop_process_group` makes —
     // which also reaps child processes (e.g. llama-server). Returning an Err here
     // (as the old graceful attempt did) made the callers' escalation unreachable,
-    // breaking `rayline router stop` and the daemon-restart in `rayline claude`.
+    // breaking `raydock router stop` and the daemon-restart in `raydock claude`.
     let status = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())

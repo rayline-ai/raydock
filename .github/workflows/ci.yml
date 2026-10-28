@@ -123,7 +123,7 @@ jobs:
             allow_failure: false
           - platform: windows-x64
             os: windows-latest
-            allow_failure: true
+            allow_failure: false
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
@@ -140,3 +140,26 @@ jobs:
       - name: Build release binaries
         shell: bash
         run: cargo build --release -p rayline-cli -p rayline-daemon --locked
+
+      - name: Test installed command migration
+        shell: bash
+        run: cargo test -p rayline-cli --locked --test it_command_migration -- --test-threads=1
+
+      - name: Test Windows update backup lifecycle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo test -p rayline-cli --locked --lib update::tests::windows_ -- --test-threads=1
+
+      - name: Parse Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PWD 'scripts/install-rayline.ps1'), [ref]$tokens, [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_ }
+            exit 1
+          }

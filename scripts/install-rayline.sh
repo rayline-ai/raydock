@@ -1,13 +1,13 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="rayline-ai/rayline"
+REPO="rayline-ai/raydock"
 VERSION="latest"
 INSTALL_DIR="${RAYLINE_INSTALL_DIR:-$HOME/.rayline/bin}"
 
 usage() {
   cat <<'EOF'
-Install Rayline Local.
+Install Raydock.
 
 Usage:
   install-rayline.sh [--version <version>] [--install-dir <path>]
@@ -15,7 +15,7 @@ Usage:
 Options:
   --version      Release version to install, for example 0.2.0 or v0.2.0.
                  Defaults to the latest GitHub release.
-  --install-dir  Directory for rayline, rld and rayline-core.
+  --install-dir  Directory for raydock, its rayline alias, rld and rayline-core.
                  Defaults to ~/.rayline/bin.
 
 Environment:
@@ -152,15 +152,16 @@ done
 
 mkdir -p "$INSTALL_DIR"
 install -m 0644 "$tmp_dir/rayline-core-LICENSE" "$INSTALL_DIR/rayline-core-LICENSE"
-install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/rayline"
+install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/raydock"
+ln -sfn raydock "$INSTALL_DIR/rayline"
 install -m 0755 "$tmp_dir/$daemon_asset" "$INSTALL_DIR/rld"
 install -m 0755 "$tmp_dir/$core_asset" "$INSTALL_DIR/rayline-core"
 
-echo "Installed Rayline Local to $INSTALL_DIR"
-if ! command -v rayline >/dev/null 2>&1; then
+echo "Installed Raydock to $INSTALL_DIR"
+if ! command -v raydock >/dev/null 2>&1; then
   cat <<EOF
 
-Add Rayline to your PATH:
+Add Raydock to your PATH:
   export PATH="$INSTALL_DIR:\$PATH"
 EOF
 fi
