@@ -2,8 +2,7 @@
 //!
 //! Routing is config-file driven: an explicit `--router-config-path` wins, else the
 //! default file at [`default_config_path`] (auto-created on first cloud launch with
-//! content that reproduces today's behavior — everything through the hosted cloud
-//! router). The on-device router is engaged only when the effective config routes
+//! everything through the hosted cloud router on ARC). The on-device router is engaged only when the effective config routes
 //! something *away* from the hosted cloud router (see [`config_needs_local_router`]);
 //! a pure default stays on today's hosted path with no local process.
 //!
@@ -38,9 +37,11 @@ pub fn default_config_path_for_env(home: &Path, env_name: &str) -> PathBuf {
         .join(format!("router.{env_name}.json"))
 }
 
-/// Default content: reproduce today's `raydock claude` — route everything to the
-/// hosted cloud router at `router_url`. Users edit this to send subagents/main to
-/// local or custom endpoints.
+/// Default content: route everything to the hosted cloud router at
+/// `router_url` on ARC — the main agent on ARC Sage, subagents on ARC Swift.
+/// The endpoint also lists the Legacy Rules Router, which a route selects by
+/// naming `rayline-router`. Users edit this to send subagents/main to local or
+/// custom endpoints.
 pub fn default_config_json(router_url: &str) -> Value {
     json!({
         "endpoints": [
@@ -49,12 +50,39 @@ pub fn default_config_json(router_url: &str) -> Value {
                 "protocol": "anthropic_messages",
                 "base_url": router_url,
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": ["rayline-router"]
+                "models": [
+                    crate::ARC_SAGE_MODEL,
+                    crate::ARC_SWIFT_MODEL,
+                    crate::LEGACY_ROUTER_MODEL
+                ]
             }
         ],
         "routes": {
-            "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
-            "default": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+            "main": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
+            "subagent": { "endpoint": "rayline-cloud", "model": crate::ARC_SWIFT_MODEL },
+            "default": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
+            "subagents": {}
+        }
+    })
+}
+
+/// The default this launcher generated before ARC became the default (0.2.x):
+/// everything on the Legacy Rules Router. A file that still holds exactly this
+/// was never edited, so it carries no choice of the user's.
+fn legacy_default_config_json(router_url: &str) -> Value {
+    json!({
+        "endpoints": [
+            {
+                "id": "rayline-cloud",
+                "protocol": "anthropic_messages",
+                "base_url": router_url,
+                "api_key_env": "RAYLINE_ROUTER_API_KEY",
+                "models": [crate::LEGACY_ROUTER_MODEL]
+            }
+        ],
+        "routes": {
+            "main": { "endpoint": "rayline-cloud", "model": crate::LEGACY_ROUTER_MODEL },
+            "default": { "endpoint": "rayline-cloud", "model": crate::LEGACY_ROUTER_MODEL },
             "subagents": {}
         }
     })
@@ -63,15 +91,37 @@ pub fn default_config_json(router_url: &str) -> Value {
 /// Create the default config for `env_name` if absent, pointing its cloud
 /// endpoint at `router_url` (the environment's resolved router). Idempotent;
 /// never overwrites user edits.
+///
+/// A file that is exactly the generated Legacy default (see
+/// [`legacy_default_config_json`]) is the old default, not a choice, so it is
+/// replaced with the ARC default. Any other content, including a file that
+/// names `rayline-router` alongside any edit, is the user's and is kept.
 pub fn ensure_default_config(home: &Path, env_name: &str, router_url: &str) -> io::Result<PathBuf> {
     let path = default_config_path_for_env(home, env_name);
-    if !path.exists() {
+    let write_default = match std::fs::read(&path) {
+        Ok(raw) => serde_json::from_slice::<Value>(&raw)
+            .is_ok_and(|existing| existing == legacy_default_config_json(router_url)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error),
+    };
+    if write_default {
+        let upgrading = path.exists();
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let body = serde_json::to_vec_pretty(&default_config_json(router_url))
             .map_err(io::Error::other)?;
         std::fs::write(&path, body)?;
+        if upgrading {
+            eprintln!(
+                "Updated the generated router config {} to ARC ({} main, {} subagents). \
+                 To keep the Legacy Rules Router, set its route models to {}.",
+                path.display(),
+                crate::ARC_SAGE_MODEL,
+                crate::ARC_SWIFT_MODEL,
+                crate::LEGACY_ROUTER_MODEL
+            );
+        }
     }
     Ok(path)
 }
@@ -189,6 +239,21 @@ fn hosted_rcr_endpoint_ids(cfg: &Value) -> Vec<String> {
             endpoint_base_url_is_hosted_rcr(base_url).then(|| id.to_owned())
         })
         .collect()
+}
+
+/// The model `routes.main` names, if any (non-empty). A cloud-only config's
+/// explicit main model, which `raydock claude` launches with instead of its
+/// default.
+pub fn config_main_model(path: &Path) -> Option<String> {
+    let raw = std::fs::read(path).ok()?;
+    let cfg: Value = serde_json::from_slice(&raw).ok()?;
+    cfg.get("routes")?
+        .get("main")?
+        .get("model")?
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Whether any route targets the bundled `"local"` endpoint (needs a configured
@@ -978,10 +1043,50 @@ mod tests {
         let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
         assert!(path.exists());
         assert_eq!(path, default_config_path(&home));
-        // The default file reproduces today's behavior → no local router.
+        // The default file is all hosted cloud → no local router.
         assert!(!config_needs_local_router(&path));
         assert!(config_uses_cloud_router(&path));
         assert!(!config_uses_local_endpoint(&path));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn default_config_routes_main_to_sage_and_subagents_to_swift() {
+        let cfg = default_config_json(crate::ROUTER_PROD_URL);
+        assert_eq!(cfg["routes"]["main"]["model"], "arc-sage-1.0");
+        assert_eq!(cfg["routes"]["subagent"]["model"], "arc-swift-1.0");
+        assert_eq!(cfg["routes"]["default"]["model"], "arc-sage-1.0");
+        // Legacy stays selectable on the same endpoint.
+        assert_eq!(
+            cfg["endpoints"][0]["models"],
+            json!(["arc-sage-1.0", "arc-swift-1.0", "rayline-router"])
+        );
+    }
+
+    #[test]
+    fn ensure_default_config_upgrades_only_the_untouched_legacy_default() {
+        let home = tmp_home();
+        let path = default_config_path(&home);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // The file 0.2.x generated, never edited: it is the old default.
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&legacy_default_config_json(crate::ROUTER_PROD_URL)).unwrap(),
+        )
+        .unwrap();
+        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        let upgraded: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(upgraded, default_config_json(crate::ROUTER_PROD_URL));
+
+        // An explicit Legacy choice (any edit to the generated file) is kept.
+        let mut chosen = legacy_default_config_json(crate::ROUTER_PROD_URL);
+        chosen["routes"]["subagents"] = json!({ "Explore": {
+            "endpoint": "rayline-cloud", "model": "rayline-router" } });
+        let chosen_body = serde_json::to_vec_pretty(&chosen).unwrap();
+        std::fs::write(&path, &chosen_body).unwrap();
+        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), chosen_body);
+        assert_eq!(config_main_model(&path).as_deref(), Some("rayline-router"));
         let _ = std::fs::remove_dir_all(&home);
     }
 

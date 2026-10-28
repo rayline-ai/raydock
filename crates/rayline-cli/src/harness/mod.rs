@@ -14,11 +14,16 @@
 //! one env with different explicit `RAYLINE_ROUTER_API_KEY` values share the
 //! last-written key.
 //!
-//! Every config uses Anthropic Messages, model `rayline-router`,
-//! `contextWindow` 200000 / `maxTokens` 32000 against the hosted router. Under
-//! `raydock hybrid run` every renderer advertises the hybrid runtime's admitted
-//! limits instead ([`RenderContext::capabilities`]): a harness that asks for
-//! more output than the execution core admits has every turn refused.
+//! Every config uses Anthropic Messages, `contextWindow` 200000 / `maxTokens`
+//! 32000 against the hosted router. The main agent defaults to ARC Sage
+//! (`arc-sage-1.0`) and, where the harness has a separate small/background
+//! model role, that role to ARC Swift (`arc-swift-1.0`); each provider also
+//! lists the Legacy Rules Router (`rayline-router`), which the harness's own
+//! model picker or flag selects ([`LaunchModels`]). Under `raydock hybrid run`
+//! every renderer keeps `rayline-router` (the execution core's virtual model)
+//! and advertises the hybrid runtime's admitted limits instead
+//! ([`RenderContext::capabilities`]): a harness that asks for more output than
+//! the execution core admits has every turn refused.
 //!
 //! Episode keying: the router keys a routing episode on each harness's own
 //! session id where it reads them: opencode and
@@ -61,8 +66,46 @@ const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 pub const CONV_ID_ENV: &str = "RAYLINE_CONV_ID";
 /// Header the gateway reads as the conversation (episode) key.
 pub const CONV_HEADER: &str = "x-conversation-id";
-/// The virtual model every launcher selects.
-pub const ROUTER_MODEL: &str = "rayline-router";
+/// The Legacy Rules Router on the hosted router, and the execution core's
+/// virtual model under `raydock hybrid run`.
+pub const ROUTER_MODEL: &str = crate::LEGACY_ROUTER_MODEL;
+
+/// The models a rendered config selects and offers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct LaunchModels {
+    /// The main agent's default.
+    pub main: &'static str,
+    /// The default for a harness's small/background or subagent model role.
+    pub background: &'static str,
+    /// Every model the provider entry lists, default first.
+    pub offered: &'static [&'static str],
+}
+
+/// A hosted launch: ARC by default, Legacy by explicit choice.
+pub(crate) const HOSTED_MODELS: LaunchModels = LaunchModels {
+    main: crate::ARC_SAGE_MODEL,
+    background: crate::ARC_SWIFT_MODEL,
+    offered: &[crate::ARC_SAGE_MODEL, crate::ARC_SWIFT_MODEL, ROUTER_MODEL],
+};
+
+/// `raydock hybrid run`: the execution core serves one virtual model.
+pub(crate) const HYBRID_MODELS: LaunchModels = LaunchModels {
+    main: ROUTER_MODEL,
+    background: ROUTER_MODEL,
+    offered: &[ROUTER_MODEL],
+};
+
+/// Display name for a model a provider entry lists.
+pub(crate) fn model_display_name(models: LaunchModels, model: &str) -> &'static str {
+    match model {
+        crate::ARC_SAGE_MODEL => "ARC Sage",
+        crate::ARC_SWIFT_MODEL => "ARC Swift",
+        // Under hybrid it is the execution core's only model, not Legacy.
+        ROUTER_MODEL if models == HYBRID_MODELS => "Raydock router",
+        ROUTER_MODEL => "Legacy Rules Router",
+        _ => "Raydock",
+    }
+}
 pub const CONTEXT_WINDOW: u64 = 200_000;
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// Runtime override for [`ConversationIdFallback`]: `1` or `0`.
@@ -234,6 +277,17 @@ pub(crate) struct RenderContext<'a> {
 }
 
 impl RenderContext<'_> {
+    /// The models this launch selects and offers: [`HYBRID_MODELS`] under
+    /// `raydock hybrid run` (which sets [`Self::capabilities`]), else
+    /// [`HOSTED_MODELS`].
+    pub fn models(&self) -> LaunchModels {
+        if self.capabilities.is_some() {
+            HYBRID_MODELS
+        } else {
+            HOSTED_MODELS
+        }
+    }
+
     /// Context window to advertise for the router model.
     pub fn context_window(&self) -> u64 {
         self.capabilities
@@ -296,6 +350,11 @@ pub(crate) struct ConfigFile {
     /// reads exactly this when it is replaced (the harness saved a setting
     /// meanwhile), the write is refused rather than losing that edit.
     pub merged_from: Option<String>,
+    /// For a create-once file (`overwrite: false`): the seed an earlier
+    /// release wrote with a default that has since changed. A file that still
+    /// reads exactly this was never edited, so it holds no choice and is
+    /// replaced with `contents`; any other text is kept.
+    pub replaces_seed: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -471,7 +530,13 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
     for file in files {
         let path = dir.join(file.name);
         if !file.overwrite && path.exists() {
-            continue;
+            let untouched_old_seed = file
+                .replaces_seed
+                .as_ref()
+                .is_some_and(|seed| fs::read_to_string(&path).ok().as_ref() == Some(seed));
+            if !untouched_old_seed {
+                continue;
+            }
         }
         let tmp = dir.join(format!(".{}.tmp-{}", file.name, std::process::id()));
         write_private(&tmp, &file.contents)?;
@@ -570,6 +635,7 @@ pub(crate) fn json_file(name: &'static str, value: &Value, overwrite: bool) -> C
         contents,
         overwrite,
         merged_from: None,
+        replaces_seed: None,
     }
 }
 
@@ -579,6 +645,7 @@ pub(crate) fn yaml_file(name: &'static str, value: &Value, overwrite: bool) -> C
         contents: to_yaml(value),
         overwrite,
         merged_from: None,
+        replaces_seed: None,
     }
 }
 
@@ -745,6 +812,20 @@ pub(crate) mod tests {
         dir
     }
 
+    /// A hosted dev context writing into `dir`.
+    pub(crate) fn render_context(dir: &Path) -> RenderContext<'_> {
+        RenderContext {
+            env_name: "dev",
+            key: TEST_KEY,
+            router_url: TEST_URL,
+            config_dir: dir,
+            conversation_id: ConversationIdFallback::new("dev", None),
+            allow_empty_signature: false,
+            capabilities: None,
+            harness_major_version: None,
+        }
+    }
+
     /// Render `harness` for dev with no override into a temp dir and return
     /// (dir, plan).
     pub(crate) fn render(harness: Harness) -> (PathBuf, Plan) {
@@ -836,12 +917,14 @@ pub(crate) mod tests {
                     contents: text.to_owned(),
                     overwrite: true,
                     merged_from: None,
+                    replaces_seed: None,
                 },
                 ConfigFile {
                     name: "default.json",
                     contents: text.to_owned(),
                     overwrite: false,
                     merged_from: None,
+                    replaces_seed: None,
                 },
             ]
         };
@@ -1056,6 +1139,7 @@ pub(crate) mod tests {
             contents: "new".to_owned(),
             overwrite: true,
             merged_from: None,
+            replaces_seed: None,
         }];
         write_files(&dir, &files).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");

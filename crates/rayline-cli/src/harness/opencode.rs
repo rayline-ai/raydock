@@ -24,21 +24,39 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, json_file};
+use super::{CONV_ID_ENV, Plan, RenderContext, json_file, model_display_name};
 
 pub(crate) const CONFIG_FILE: &str = "opencode.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
-    let model_ref = format!("{PROVIDER_ID}/{ROUTER_MODEL}");
-    let mut config = json!({
+    let models = ctx.models();
+    let mut entries = serde_json::Map::new();
+    for model in models.offered {
+        let mut entry = json!({
+            "name": model_display_name(models, model),
+            "limit": { "context": ctx.context_window(), "output": ctx.max_output_tokens() },
+            "modalities": { "input": ctx.input_modalities(), "output": ["text"] },
+            "tool_call": true
+        });
+        if ctx.harness_major_version.is_some_and(|major| major < 2) {
+            let images = ctx
+                .input_modalities()
+                .as_array()
+                .is_some_and(|input| input.iter().any(|modality| modality == "image"));
+            entry["attachment"] = json!(images);
+            entry["reasoning"] = json!(true);
+        }
+        entries.insert((*model).to_owned(), entry);
+    }
+    let config = json!({
         "$schema": "https://opencode.ai/config.json",
-        "model": model_ref,
+        "model": format!("{PROVIDER_ID}/{}", models.main),
         // The session-title side call otherwise goes to the user's global
         // `small_model` (another provider) or a guessed small model. Keep it on
-        // Rayline. The router treats it as a one-turn side call off the
-        // session's episode.
-        "small_model": model_ref,
+        // Rayline (ARC Swift on the hosted router). The router treats it as a
+        // one-turn side call off the session's episode.
+        "small_model": format!("{PROVIDER_ID}/{}", models.background),
         "provider": {
             PROVIDER_ID: {
                 "name": format!("Raydock ({})", ctx.env_name),
@@ -50,26 +68,10 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                     "apiKey": ctx.key,
                     "headers": ctx.conversation_headers(&format!("{{env:{CONV_ID_ENV}}}")),
                 },
-                "models": {
-                    ROUTER_MODEL: {
-                        "name": "Raydock router",
-                        "limit": { "context": ctx.context_window(), "output": ctx.max_output_tokens() },
-                        "modalities": { "input": ctx.input_modalities(), "output": ["text"] },
-                        "tool_call": true
-                    }
-                }
+                "models": entries
             }
         }
     });
-    if ctx.harness_major_version.is_some_and(|major| major < 2) {
-        let model = &mut config["provider"][PROVIDER_ID]["models"][ROUTER_MODEL];
-        let images = ctx
-            .input_modalities()
-            .as_array()
-            .is_some_and(|input| input.iter().any(|modality| modality == "image"));
-        model["attachment"] = json!(images);
-        model["reasoning"] = json!(true);
-    }
     Plan {
         files: vec![json_file(CONFIG_FILE, &config, true)],
         env_set: vec![(
@@ -205,14 +207,25 @@ mod tests {
         );
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
-        assert_eq!(config["model"], "rayline/rayline-router");
-        assert_eq!(config["small_model"], "rayline/rayline-router");
+        // ARC by default: Sage for the main agent, Swift for side calls.
+        assert_eq!(config["model"], "rayline/arc-sage-1.0");
+        assert_eq!(config["small_model"], "rayline/arc-swift-1.0");
         let provider = &config["provider"]["rayline"];
         assert_eq!(provider["npm"], "@ai-sdk/anthropic");
         assert_eq!(provider["options"]["baseURL"], format!("{TEST_URL}/v1"));
         assert_eq!(provider["options"]["apiKey"], TEST_KEY);
         assert_eq!(provider["options"]["headers"], serde_json::json!({}));
-        let model = &provider["models"]["rayline-router"];
+        // Legacy stays selectable (`-m rayline/rayline-router`).
+        let ids: Vec<_> = provider["models"].as_object().unwrap().keys().collect();
+        assert_eq!(ids.len(), 3);
+        for id in ["arc-sage-1.0", "arc-swift-1.0", "rayline-router"] {
+            assert!(provider["models"].get(id).is_some(), "{id}");
+        }
+        assert_eq!(
+            provider["models"]["rayline-router"]["name"],
+            "Legacy Rules Router"
+        );
+        let model = &provider["models"]["arc-sage-1.0"];
         assert_eq!(model["limit"]["context"], 200000);
         assert_eq!(model["limit"]["output"], 32000);
         assert_eq!(
@@ -292,11 +305,16 @@ mod tests {
         };
         let config: serde_json::Value =
             serde_json::from_str(&plan(&ctx).files[0].contents).unwrap();
-        let model = &config["provider"]["rayline"]["models"]["rayline-router"];
-        assert_eq!(
-            (&model["attachment"], &model["reasoning"]),
-            (&serde_json::json!(true), &serde_json::json!(true))
-        );
+        for model in config["provider"]["rayline"]["models"]
+            .as_object()
+            .unwrap()
+            .values()
+        {
+            assert_eq!(
+                (&model["attachment"], &model["reasoning"]),
+                (&serde_json::json!(true), &serde_json::json!(true))
+            );
+        }
     }
 
     #[test]

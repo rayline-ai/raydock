@@ -34,6 +34,16 @@ pub const DOT_CONFIG_DIR: &str = ".rayline";
 pub const ROUTER_STATE_DIR: &str = ".rayline/rld";
 pub const ROUTER_FILE_PREFIX: &str = "rl-rld";
 pub const ROUTER_PROD_URL: &str = "https://api.rayline.ai";
+/// The model a hosted harness launch gives its main agent when the user picks
+/// none: ARC Sage, by its canonical public id (not the bare `arc-sage` alias,
+/// which tracks the newest ARC line).
+pub const ARC_SAGE_MODEL: &str = "arc-sage-1.0";
+/// The model a hosted harness launch gives subagents and background tasks,
+/// where the harness tells them apart from the main agent: ARC Swift.
+pub const ARC_SWIFT_MODEL: &str = "arc-swift-1.0";
+/// The Legacy Rules Router. No longer the launch default, but every launcher
+/// still offers it and an explicit choice of it is kept.
+pub const LEGACY_ROUTER_MODEL: &str = "rayline-router";
 pub const UPDATE_BASE_URL: &str = "https://get.rayline.ai";
 pub const INSTALLER_URL: &str = "https://get.rayline.ai/install.sh";
 pub const UV_TOOL_NAME: &str = "rayline-cli";
@@ -60,14 +70,20 @@ Options:
 Commands:
   auth       Sign in to hosted Rayline
   status     Show current CLI auth status
-  claude     Run Claude Code through Rayline routing
+  claude     Run Claude Code on ARC (Sage main agent, Swift subagents)
   claude-desktop  Run Claude Desktop's Code sessions on ARC (local router)
   codex      Run Codex CLI through Raydock Responses routing
-  opencode   Run opencode against the Rayline router
-  pi         Run pi against the Rayline router
-  omp        Run oh-my-pi (omp) against the Rayline router
-  hermes     Run Hermes Agent against the Rayline router
-  openclaw   Run OpenClaw against the Rayline router
+  opencode   Run opencode on ARC through the Rayline router
+  pi         Run pi on ARC through the Rayline router
+  omp        Run oh-my-pi (omp) on ARC through the Rayline router
+  hermes     Run Hermes Agent on ARC through the Rayline router
+  openclaw   Run OpenClaw on ARC through the Rayline router
+
+Harness launches default to ARC: arc-sage-1.0 for the main agent and
+arc-swift-1.0 for subagents and background tasks where the harness has a
+separate role for them. The Legacy Rules Router stays available as
+rayline-router: pick it with the harness's own model flag or picker (for
+example `raydock opencode -m rayline/rayline-router`).
   router     Start, inspect, or stop the local Rayline router runtime
   hybrid     Start the ARC execution core or connect a harness to it
   top        Show live router request metrics
@@ -125,8 +141,15 @@ Usage: raydock claude [OPTIONS] [--] [CLAUDE_ARGS]...
 Run Claude Code through Rayline hosted routing. Use --local for the
 local static router path.
 
+Hosted routing defaults to ARC: the main agent on arc-sage-1.0, subagents
+and background tasks on arc-swift-1.0 (CLAUDE_CODE_SUBAGENT_MODEL and
+ANTHROPIC_DEFAULT_HAIKU_MODEL, unless you set them). For the Legacy Rules
+Router, pass --model rayline-router (and, with --route subagents, set
+CLAUDE_CODE_SUBAGENT_MODEL=rayline-router).
+
 Options:
-  -m, --model <model>               Route through a specific model
+  -m, --model <model>               Main-agent model (default: arc-sage-1.0;
+                                    rayline-router for the Legacy Rules Router)
   --auto-compact-window <tokens>    Override Claude auto-compact threshold
   --local                           Use local static routing without hosted auth
                                     (no login; forces the proxy)
@@ -203,10 +226,12 @@ Options:
   --config <path>         Rayline router config (endpoints + routes)
   --auth <mode>           Codex auth source: auto|subscription|none.
                           auto with no --config defaults to Rc-Rc (route
-                          everything to the hosted cloud router, like
-                          `raydock claude`); with --config it follows the
-                          config. subscription uses your ChatGPT subscription;
-                          none runs local.
+                          everything to the hosted cloud router on ARC:
+                          arc-sage-1.0 main, arc-swift-1.0 subagents, via
+                          ~/.config/rayline/router.json; set its route models
+                          to rayline-router for the Legacy Rules Router);
+                          with --config it follows the config. subscription
+                          uses your ChatGPT subscription; none runs local.
   --subscription          Alias for --auth subscription
   --help                  Show this message and exit
 ";
@@ -227,7 +252,8 @@ Options:
   --config <path>         Rayline router config (endpoints + routes)
   --auth <mode>           Codex auth source: auto|subscription|none.
                           auto with no --config defaults to Rc-Rc (route
-                          everything to the hosted cloud router). subscription
+                          everything to the hosted cloud router on ARC, as
+                          for `raydock codex`). subscription
                           uses your ChatGPT subscription; none runs local.
   --subscription          Alias for --auth subscription
   --help                  Show this message and exit

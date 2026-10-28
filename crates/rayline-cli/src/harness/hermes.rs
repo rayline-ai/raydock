@@ -22,7 +22,7 @@ use std::{fs, io};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, ConfigFile, Plan, ROUTER_MODEL, RenderContext, to_yaml, yaml_merge};
+use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, to_yaml, yaml_merge};
 
 pub(crate) const CONFIG_FILE: &str = "config.yaml";
 pub(crate) const MESSAGES_PROVIDER: &str = "rayline-anth";
@@ -42,7 +42,17 @@ const OWNED: &[&[&str]] = &[
 ];
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
-    let models = json!({ ROUTER_MODEL: { "context_length": ctx.context_window() } });
+    let launch = ctx.models();
+    let models: serde_json::Map<_, _> = launch
+        .offered
+        .iter()
+        .map(|model| {
+            (
+                (*model).to_owned(),
+                json!({ "context_length": ctx.context_window() }),
+            )
+        })
+        .collect();
     let mut responses = json!({
         "base_url": ctx.v1_base(),
         "api_key": ctx.key,
@@ -75,7 +85,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
     let config = json!({
         "model": {
             "provider": format!("custom:{default_provider}"),
-            "default": ROUTER_MODEL,
+            "default": launch.main,
             "context_length": ctx.context_window()
         },
         "providers": {
@@ -104,6 +114,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
             contents,
             overwrite: true,
             merged_from,
+            replaces_seed: None,
         }],
         env_set: vec![("HERMES_HOME", ctx.config_dir.as_os_str().to_owned())],
         env_remove: Vec::new(),
@@ -235,7 +246,7 @@ fallback_model:
         assert_eq!(
             first,
             "model:
-  default: \"rayline-router\"
+  default: \"arc-sage-1.0\"
   provider: \"custom:rayline-anth\"
   reasoning_effort: high
   context_length: 200000
@@ -247,6 +258,10 @@ providers:
     extra_headers:
       x-conversation-id: \"${RAYLINE_CONV_ID}\"
     models:
+      arc-sage-1.0:
+        context_length: 200000
+      arc-swift-1.0:
+        context_length: 200000
       rayline-router:
         context_length: 200000
   mine:
@@ -256,6 +271,10 @@ providers:
     api_mode: \"codex_responses\"
     base_url: \"https://api-dev.rayline.ai/v1\"
     models:
+      arc-sage-1.0:
+        context_length: 200000
+      arc-swift-1.0:
+        context_length: 200000
       rayline-router:
         context_length: 200000
 agent:
@@ -308,7 +327,7 @@ fallback_providers: []
             "fallback_providers: []
 model:
   context_length: 200000
-  default: \"rayline-router\"
+  default: \"arc-sage-1.0\"
   provider: \"custom:rayline-anth\"
 providers:
   rayline-anth:
@@ -318,6 +337,10 @@ providers:
     extra_headers:
       x-conversation-id: \"${RAYLINE_CONV_ID}\"
     models:
+      arc-sage-1.0:
+        context_length: 200000
+      arc-swift-1.0:
+        context_length: 200000
       rayline-router:
         context_length: 200000
   rayline-resp:
@@ -325,6 +348,10 @@ providers:
     api_mode: \"codex_responses\"
     base_url: \"https://api-dev.rayline.ai/v1\"
     models:
+      arc-sage-1.0:
+        context_length: 200000
+      arc-swift-1.0:
+        context_length: 200000
       rayline-router:
         context_length: 200000
 "

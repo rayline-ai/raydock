@@ -12,7 +12,16 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_CLAUDE_SETTINGS_SUFFIX: &str = ".claude/settings.json";
-const DEFAULT_MODEL: &str = "rayline-router";
+/// Claude Code's main-agent model when a hosted route-all launch names none.
+const DEFAULT_MODEL: &str = crate::ARC_SAGE_MODEL;
+/// The local static router's virtual model: "let `routes.main` decide". The
+/// default on the local and may-local planes, which stay as they were.
+const LOCAL_PLANE_DEFAULT_MODEL: &str = crate::LEGACY_ROUTER_MODEL;
+/// Claude Code's model for every subagent (`CLAUDE_CODE_SUBAGENT_MODEL`).
+const SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
+/// Claude Code's model for its `haiku` alias, which its background tasks
+/// (titles, summaries) and the built-in Explore agent use.
+const HAIKU_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
 const DEFAULT_PROXY_SUBAGENTS_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_ROUTER_KEY_NAME: &str = "rayline-cli";
 /// Claude Code's `--model` / `ANTHROPIC_MODEL` aliases (each may also carry a
@@ -146,11 +155,59 @@ fn isolated_needs_claude_login(mode: RoutingMode) -> bool {
     mode != RoutingMode::Override
 }
 
-fn default_model_for_routing_mode(mode: RoutingMode) -> &'static str {
+/// The main-agent model when neither `--model` nor `ANTHROPIC_MODEL` names
+/// one. A hosted launch defaults to ARC Sage; a launch whose router runs on
+/// this machine (`--local`, a local-plane `--config`, account-local or
+/// may-local routing) keeps the router's virtual model.
+fn default_model_for_routing_mode(mode: RoutingMode, local_router: bool) -> &'static str {
     match mode {
         RoutingMode::ProxySubagents => DEFAULT_PROXY_SUBAGENTS_MODEL,
+        RoutingMode::Override | RoutingMode::Proxy if local_router => LOCAL_PLANE_DEFAULT_MODEL,
         RoutingMode::Override | RoutingMode::Proxy => DEFAULT_MODEL,
     }
+}
+
+/// The ARC Swift defaults for the turns the router serves besides the main
+/// agent's, as `(env var, value)`: the child runs with each `Some`, and a
+/// reused Claude Code daemon must already hold it.
+///
+/// They apply only to a hosted launch with no routing config (`arc_hosted`),
+/// and only to what the user left unset: an inherited non-empty value is the
+/// user's choice and is kept (`CLAUDE_CODE_SUBAGENT_MODEL=rayline-router`
+/// keeps subagents on the Legacy Rules Router).
+///
+/// - Subagents: every proxy or env mode routes them, so they get ARC Swift.
+///   In route-all modes only when the main model is the ARC default too: an
+///   explicit `--model` (or `ANTHROPIC_MODEL`) leaves subagents to inherit it,
+///   as before.
+/// - The `haiku` alias (background tasks, Explore): route-all modes only.
+///   Under `--route subagents` the main agent's own background turns go
+///   straight to Anthropic, which does not serve an ARC id.
+fn arc_subagent_env_switches(
+    routing_mode: RoutingMode,
+    arc_hosted: bool,
+    main_model_is_default: bool,
+    inherited: impl Fn(&str) -> Option<OsString>,
+) -> Vec<(&'static str, Option<String>)> {
+    let user = |key: &str| {
+        inherited(key)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_string_lossy().into_owned())
+    };
+    let route_all = routing_mode != RoutingMode::ProxySubagents;
+    let subagents = arc_hosted && (!route_all || main_model_is_default);
+    let haiku = arc_hosted && route_all && main_model_is_default;
+    let swift = || Some(crate::ARC_SWIFT_MODEL.to_owned());
+    vec![
+        (
+            SUBAGENT_MODEL_ENV,
+            user(SUBAGENT_MODEL_ENV).or_else(|| subagents.then(swift).flatten()),
+        ),
+        (
+            HAIKU_MODEL_ENV,
+            user(HAIKU_MODEL_ENV).or_else(|| haiku.then(swift).flatten()),
+        ),
+    ]
 }
 
 /// Whether *implicit* account-local routing (the hosted `enable_local_router`
@@ -834,11 +891,26 @@ async fn run_command_from_home(
     };
 
     let inherited_anthropic_model = env::var_os("ANTHROPIC_MODEL").is_some();
+    // A cloud-only `--config` names the main agent's model in `routes.main`;
+    // that explicit choice (ARC or Legacy) wins over the launch default.
+    let config_main_model = if config_cloud_only {
+        effective_config
+            .as_deref()
+            .and_then(crate::router_config::config_main_model)
+    } else {
+        None
+    };
+    let main_model_is_default =
+        request.model.is_none() && !inherited_anthropic_model && config_main_model.is_none();
     let model = request
         .model
         .clone()
         .or_else(|| env::var("ANTHROPIC_MODEL").ok())
-        .unwrap_or_else(|| default_model_for_routing_mode(request.routing_mode).to_owned());
+        .or(config_main_model)
+        .unwrap_or_else(|| {
+            default_model_for_routing_mode(request.routing_mode, local_start_request.is_some())
+                .to_owned()
+        });
     let set_model_env = should_set_model_env(
         request.routing_mode,
         request.model.is_some(),
@@ -884,7 +956,16 @@ async fn run_command_from_home(
         None
     };
     let mut inspect_dir = claude_config_dir(home, isolated);
-    let refusal_recovery = launch_env_switches(request.routing_mode, |key| env::var_os(key));
+    let mut refusal_recovery = launch_env_switches(request.routing_mode, |key| env::var_os(key));
+    // ARC Swift for subagents and background turns: hosted routing with no
+    // routing config only (a config's own routes, and the local planes, decide
+    // for themselves).
+    refusal_recovery.extend(arc_subagent_env_switches(
+        request.routing_mode,
+        local_start_request.is_none() && effective_config.is_none(),
+        main_model_is_default,
+        |key| env::var_os(key),
+    ));
     let mut daemon_request = RequestSpec {
         env_name: &env_name,
         routing_mode: request.routing_mode,
@@ -3390,6 +3471,89 @@ mod implicit_local_routing_tests {
         assert_eq!(
             effective_routing_mode(RoutingMode::ProxySubagents, true, false),
             RoutingMode::ProxySubagents
+        );
+    }
+}
+
+#[cfg(test)]
+mod arc_default_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_route_all_defaults_to_arc_sage() {
+        for mode in [RoutingMode::Override, RoutingMode::Proxy] {
+            assert_eq!(default_model_for_routing_mode(mode, false), "arc-sage-1.0");
+            // The local planes keep the local router's virtual model.
+            assert_eq!(default_model_for_routing_mode(mode, true), "rayline-router");
+        }
+        // `--route subagents`: the main agent stays on Claude.
+        for local in [false, true] {
+            assert_eq!(
+                default_model_for_routing_mode(RoutingMode::ProxySubagents, local),
+                DEFAULT_PROXY_SUBAGENTS_MODEL
+            );
+        }
+    }
+
+    fn switches(
+        mode: RoutingMode,
+        arc_hosted: bool,
+        main_default: bool,
+        inherited: &[(&str, &str)],
+    ) -> Vec<(&'static str, Option<String>)> {
+        arc_subagent_env_switches(mode, arc_hosted, main_default, |key| {
+            inherited
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| OsString::from(value))
+        })
+    }
+
+    fn swift() -> Option<String> {
+        Some("arc-swift-1.0".to_owned())
+    }
+
+    #[test]
+    fn hosted_default_puts_subagents_and_background_on_arc_swift() {
+        for mode in [RoutingMode::Override, RoutingMode::Proxy] {
+            assert_eq!(
+                switches(mode, true, true, &[]),
+                vec![(SUBAGENT_MODEL_ENV, swift()), (HAIKU_MODEL_ENV, swift())]
+            );
+        }
+        // Under `--route subagents` the main agent's background turns go to
+        // Anthropic, so only subagents move to ARC.
+        assert_eq!(
+            switches(RoutingMode::ProxySubagents, true, false, &[]),
+            vec![(SUBAGENT_MODEL_ENV, swift()), (HAIKU_MODEL_ENV, None)]
+        );
+    }
+
+    #[test]
+    fn explicit_choices_and_local_planes_are_left_alone() {
+        // An explicit main model (e.g. `--model rayline-router`): subagents
+        // inherit it as before.
+        assert_eq!(
+            switches(RoutingMode::Proxy, true, false, &[]),
+            vec![(SUBAGENT_MODEL_ENV, None), (HAIKU_MODEL_ENV, None)]
+        );
+        // Local planes and routing configs decide for themselves.
+        assert_eq!(
+            switches(RoutingMode::Proxy, false, true, &[]),
+            vec![(SUBAGENT_MODEL_ENV, None), (HAIKU_MODEL_ENV, None)]
+        );
+        // A user's own value (here: Legacy for subagents) wins.
+        assert_eq!(
+            switches(
+                RoutingMode::ProxySubagents,
+                true,
+                false,
+                &[(SUBAGENT_MODEL_ENV, "rayline-router")]
+            ),
+            vec![
+                (SUBAGENT_MODEL_ENV, Some("rayline-router".to_owned())),
+                (HAIKU_MODEL_ENV, None)
+            ]
         );
     }
 }
