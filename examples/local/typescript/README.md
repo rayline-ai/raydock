@@ -18,7 +18,7 @@ endpoint the config picks (**local**, **cloud RCR**, or **Anthropic**). With no
 `--config` the router uses Rayline's built-in local config (what this example
 assumes); pass `--config` to drive any routing mode instead. All the modes — and
 which entry points support each — are explained in the
-[routing-modes table](https://github.com/rayline-ai/rayline/blob/main/examples/routing-modes/README.md#modes).
+[routing-modes table](https://github.com/rayline-ai/raydock/blob/main/examples/routing-modes/README.md#modes).
 
 > **Caveats**
 > - The model-name routes (`rayline-local`, `rayline-subagent`) come from

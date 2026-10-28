@@ -1,7 +1,32 @@
 # Changelog
 
 User-facing changes in each Rayline release. Install commands and signed
-assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline/releases).
+assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
+
+## 0.3.0 (unreleased)
+
+### Changed
+
+- **Rayline Local is now Raydock.** Use `raydock` for new commands; `rayline`
+  remains a supported alias. Configuration, credentials, environment variables
+  and update channels keep their paths and names. The source repository is now
+  [rayline-ai/raydock](https://github.com/rayline-ai/raydock).
+- **Harness launches run on ARC by default** instead of the Legacy Rules
+  Router. Hosted `raydock claude`, `raydock codex` (default Rc-Rc) and the
+  `opencode`, `pi`, `omp`, `hermes` and `openclaw` launchers give the main agent
+  `arc-sage-1.0`, and subagents and background tasks `arc-swift-1.0` where the
+  harness has a separate setting for them (Claude Code's
+  `CLAUDE_CODE_SUBAGENT_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, OpenCode's
+  `small_model`, omp's `smol` role, Codex's `subagent` route). The Legacy Rules
+  Router stays available by explicit choice: `--model rayline-router`, the
+  harness's own model flag or picker (every generated config lists it), or a
+  route model in `router.json`. Choices you made are kept: an explicit model,
+  your own Claude Code model variables, `--config` routes, and harness
+  settings you saved. Generated defaults that were never edited (the 0.2.x
+  `router.json`, pi `settings.json` and omp `config.yml`) move to ARC once.
+  Local and hybrid sessions are unchanged.
+- A cloud-only `raydock claude --config` launches the main agent with the model
+  its `routes.main` names.
 
 ## 0.2.14 (2026-10-27)
 
@@ -47,8 +72,8 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline
   your machine or to a cloud model through the Rayline router, and your coding
   harness runs unmodified. Preview: development router only, until production
   support lands. macOS 13+ or Linux
-  ([#120](https://github.com/rayline-ai/rayline/pull/120),
-  [#122](https://github.com/rayline-ai/rayline/pull/122)). Setup, with the
+  ([#120](https://github.com/rayline-ai/raydock/pull/120),
+  [#122](https://github.com/rayline-ai/raydock/pull/122)). Setup, with the
   development environment configured in `~/.config/rayline/settings.json`:
   1. `rayline --env dev auth login`
   2. `rayline local custom --url http://127.0.0.1:8080/v1 --model qwen3.8-27b`
@@ -71,7 +96,7 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline
   command (macOS).** It selects a **Rayline ARC** profile and opens the app.
   This switches the whole app off your subscription, with Chat and Cowork off,
   until you run `rayline claude-desktop off`
-  ([#121](https://github.com/rayline-ai/rayline/pull/121)).
+  ([#121](https://github.com/rayline-ai/raydock/pull/121)).
 
 ### Changed
 
@@ -83,14 +108,14 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline
   installed one. Pass the full version from the release notes; a bare
   `--version 0.2.12` says so. From 0.2.13 on, the core is required, and the
   update fails closed if it is missing
-  ([#125](https://github.com/rayline-ai/rayline/pull/125)).
+  ([#125](https://github.com/rayline-ai/raydock/pull/125)).
 
 ### Fixed
 
 - Claude Code in proxy mode keeps the full conversation history. Rayline turns
   off Claude Code's message threads by default (your own setting is kept) and
   refuses router-bound thread continuations locally, so Claude Code resends the
-  full history ([#119](https://github.com/rayline-ai/rayline/pull/119)).
+  full history ([#119](https://github.com/rayline-ai/raydock/pull/119)).
 
 ### Security
 
@@ -98,13 +123,13 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/rayline
 - Your saved Rayline key goes only to HTTPS endpoints on the signed-in
   environment's router host.
 - Hybrid decision requests go only to the Rayline router or to loopback
-  ([#125](https://github.com/rayline-ai/rayline/pull/125)).
+  ([#125](https://github.com/rayline-ai/raydock/pull/125)).
 - Tokio is updated to 1.53.3 for RUSTSEC-2026-0386
-  ([#121](https://github.com/rayline-ai/rayline/pull/121)).
+  ([#121](https://github.com/rayline-ai/raydock/pull/121)).
 
 ### Known issues
 
-Hybrid issues are tracked in [#123](https://github.com/rayline-ai/rayline/issues/123).
+Hybrid issues are tracked in [#123](https://github.com/rayline-ai/raydock/issues/123).
 
 - In `rayline hybrid run`, Pi gets the local model's output and input limits,
   and the largest cloud context window (200,000 tokens with the default
@@ -123,4 +148,4 @@ Hybrid issues are tracked in [#123](https://github.com/rayline-ai/rayline/issues
   `arc-sage-1.0` and `arc-swift-1.0`.
 
 Release notes for 0.2.12 and earlier are on
-[GitHub Releases](https://github.com/rayline-ai/rayline/releases).
+[GitHub Releases](https://github.com/rayline-ai/raydock/releases).

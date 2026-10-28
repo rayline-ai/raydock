@@ -44,18 +44,18 @@ single session.
 ## Install
 
 Release assets are published on
-[GitHub Releases](https://github.com/rayline-ai/rayline/releases).
+[GitHub Releases](https://github.com/rayline-ai/raydock/releases).
 
 macOS and Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rayline-ai/rayline/main/scripts/install-rayline.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/rayline-ai/rayline/main/scripts/install-rayline.ps1 | iex
+irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1 | iex
 ```
 
 The installers place `raydock`, its `rayline` alias, `rld`, and `rayline-core`
@@ -87,7 +87,8 @@ raydock router stop
 ```
 
 Run Codex CLI through Raydock's local OpenAI Responses-compatible router. By
-default, main-agent and subagent requests go to Rayline Platform's hosted router,
+default, main-agent and subagent requests go to Rayline Platform's hosted router
+on ARC (`arc-sage-1.0` for the main agent, `arc-swift-1.0` for subagents),
 authenticated with your `raydock auth login` session:
 
 ```bash
@@ -193,6 +194,17 @@ and TypeScript, grouped by routing path:
   calls, with native passthrough when the selected route is an `openai_responses`
   endpoint. In contrast, `raydock router start --mode codex` without a config
   defaults to subscription auth.
+
+## Default Model: ARC
+
+Hosted launches (`raydock claude`, `raydock codex`, and the `opencode`, `pi`,
+`omp`, `hermes` and `openclaw` launchers) run on ARC by default: the main agent
+on `arc-sage-1.0`, and subagents and background tasks on `arc-swift-1.0` where
+the harness gives them their own model setting. The Legacy Rules Router stays
+available as `rayline-router` — for example `raydock claude --model
+rayline-router` or `raydock opencode -m rayline/rayline-router` — and a model
+you chose yourself is kept. Local and hybrid sessions are unchanged. See
+[Which model runs](docs/getting-started.md#which-model-runs-arc-by-default).
 
 ## Supported Clients
 

@@ -14,13 +14,13 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.14"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["Atlas Futures, Inc."]
 homepage = "https://rayline.ai"
-repository = "https://github.com/rayline-ai/rayline"
+repository = "https://github.com/rayline-ai/raydock"
 publish = false
 
 [workspace.lints.rust]

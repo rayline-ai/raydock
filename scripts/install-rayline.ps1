@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$Repo = "rayline-ai/rayline"
+$Repo = "rayline-ai/raydock"
 
 function Fail($Message) {
     Write-Error $Message

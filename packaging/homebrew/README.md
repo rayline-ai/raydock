@@ -31,7 +31,7 @@ brew upgrade raydock
 ```
 
 Set `__RELEASE_BASE_URL__` to
-`https://github.com/rayline-ai/rayline/releases/download/v<version>` for public
+`https://github.com/rayline-ai/raydock/releases/download/v<version>` for public
 GitHub releases, or the verified mirror archive directory when rendering a
 mirrored formula. Hybrid requires macOS 13+ or Linux; archive platform names
 remain stable for existing update clients.

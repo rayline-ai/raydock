@@ -1,11 +1,11 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
-    url: https://github.com/rayline-ai/rayline/security/advisories/new
+    url: https://github.com/rayline-ai/raydock/security/advisories/new
     about: Report vulnerabilities privately through GitHub Private Vulnerability Reporting.
   - name: Contribution policy
-    url: https://github.com/rayline-ai/rayline/blob/main/CONTRIBUTING.md
+    url: https://github.com/rayline-ai/raydock/blob/main/CONTRIBUTING.md
     about: Raydock is not accepting external pull requests yet; read the current contribution policy before starting implementation work.
   - name: Getting started documentation
-    url: https://github.com/rayline-ai/rayline/blob/main/docs/getting-started.md
+    url: https://github.com/rayline-ai/raydock/blob/main/docs/getting-started.md
     about: Start here for setup, routing, and configuration before filing a bug.
