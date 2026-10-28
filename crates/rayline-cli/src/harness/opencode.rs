@@ -60,8 +60,8 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "provider": {
             PROVIDER_ID: {
                 "name": format!("Raydock ({})", ctx.env_name),
-                // opencode's default for custom providers (chat completions)
-                // 404s at the router, so use Messages.
+                // Messages rather than opencode's default for custom providers
+                // (chat completions): the launcher's chosen protocol.
                 "npm": "@ai-sdk/anthropic",
                 "options": {
                     "baseURL": ctx.v1_base(),
@@ -298,7 +298,7 @@ mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id: super::super::ConversationIdFallback::new("dev", None),
+            conversation_id: super::super::ConversationIdFallback::new(None),
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: Some(1),

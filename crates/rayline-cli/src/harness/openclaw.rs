@@ -3,34 +3,37 @@
 //! key is a file SecretRef to `<dir>/router-key` instead, so OpenClaw never
 //! caches its value (#83) and the key stays out of its environment.
 //!
-//! `api` must be explicit: OpenClaw's default is chat completions, which 404s
-//! at the gateway. Memory search is off because its default embeddings
-//! provider sends side calls to OpenAI; heartbeat and the compaction memory
-//! flush are off so no background turns hit the router.
+//! The default `rayline` provider speaks OpenAI Chat Completions, OpenClaw's
+//! own default protocol, which the hosted router and the local gateway
+//! (`/v1/chat/completions`, #106) both accept. Memory search is off because
+//! its default embeddings provider sends side calls to OpenAI; heartbeat and
+//! the compaction memory flush are off so no background turns hit the router.
 //!
-//! Episode keying (OpenClaw 2026.9.6; `compat` is a model field there, the
-//! provider schema has none):
-//! - Messages sends no session id, so the `rayline` provider always carries
-//!   the per-launch `x-conversation-id` (unless
-//!   `RAYLINE_HARNESS_CONV_ID_FALLBACK=0`). A custom `anthropic-messages`
-//!   provider runs on OpenClaw's own fetch transport (strategy
-//!   `boundary-aware:anthropic-messages`, `createAnthropicMessagesTransportStreamFn`
-//!   / `createAnthropicTransportClient` in `dist/worker/worker.mjs`), which
-//!   adds no `x-session-affinity`; only the Anthropic SDK path
-//!   (`@openclaw/ai/dist/anthropic-DZQ_7gD1.mjs:309`) honours
-//!   `compat.sendSessionAffinityHeaders`, so that flag is not set. With
-//!   `--session-id <id>` in the args the conversation id is stable
-//!   (`oc-` + 32 hex of sha256(id)), so relaunching that session keeps its
-//!   episode; otherwise each launch is its own episode.
+//! Episode keying (OpenClaw 2026.9.6 and 2026.10.8; `compat` is a model field,
+//! the provider schema has none):
+//! - On Chat Completions, `compat.sendSessionAffinityHeaders` makes OpenClaw
+//!   send its persisted session id as `x-session-affinity` (with `session_id`
+//!   and `x-client-request-id` carrying the same value), which the gateway
+//!   keys the episode on; `--session-id <id>` in a later launch resumes that
+//!   session and so keeps its episode. A custom `anthropic-messages` provider
+//!   could not do this: it runs on OpenClaw's own fetch transport, which adds
+//!   no session header, so the launcher had to send a per-launch
+//!   `x-conversation-id` instead.
 //! - The `rayline-resp` provider (e.g. `rayline-resp/arc-sage-1.0`) speaks
 //!   Responses, where `compat.supportsPromptCacheKey` sends the session as
 //!   `prompt_cache_key`; without it OpenClaw sends no key on a custom
-//!   endpoint. It takes the per-launch header only where the env needs it.
+//!   endpoint. ARC is not served on Responses yet, so Chat Completions stays
+//!   the default.
+//! - Both providers take the per-launch `x-conversation-id` only when
+//!   `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` forces it
+//!   ([`super::ConversationIdFallback`]).
+//!
+//! OpenAI-style hosted tools (`web_search`) are not carried on a Chat
+//! Completions upstream; ordinary function tools are.
 
 use std::ffi::OsString;
 
 use serde_json::json;
-use sha2::{Digest, Sha256};
 
 use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, json_file, model_display_name};
 
@@ -41,50 +44,6 @@ pub(crate) const RESPONSES_PROVIDER_ID: &str = "rayline-resp";
 pub(crate) const KEY_FILE: &str = "router-key";
 /// The `secrets.providers` entry that reads [`KEY_FILE`].
 pub(crate) const SECRET_PROVIDER: &str = "rayline";
-
-/// The value of `--session-id <v>` / `--session-id=<v>` in OpenClaw's args
-/// (the last one wins; trimmed, as OpenClaw does; a blank value counts as none).
-pub(crate) fn session_id_arg(args: &[OsString]) -> Option<String> {
-    option_value(args, "--session-id")
-}
-
-/// The `--agent` value in OpenClaw's args, if any.
-pub(crate) fn agent_arg(args: &[OsString]) -> Option<String> {
-    option_value(args, "--agent")
-}
-
-/// The last `<name> <v>` / `<name>=<v>` value before `--`, trimmed.
-fn option_value(args: &[OsString], name: &str) -> Option<String> {
-    let mut found = None;
-    let mut args = args.iter().map(|arg| arg.to_string_lossy());
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            break;
-        }
-        if arg == name {
-            found = args.next().map(|value| value.trim().to_owned());
-        } else if let Some(value) = arg
-            .strip_prefix(name)
-            .and_then(|rest| rest.strip_prefix('='))
-        {
-            found = Some(value.trim().to_owned());
-        }
-    }
-    found.filter(|value| !value.is_empty())
-}
-
-/// The conversation id for a launch that names a session: OpenClaw scopes a
-/// `--session-id` to the `--agent` when one is given (agent ids are
-/// case-insensitive), so the id does too.
-pub(crate) fn session_conversation_id(args: &[OsString]) -> Option<String> {
-    let session = session_id_arg(args)?;
-    Some(match agent_arg(args) {
-        Some(agent) => {
-            stable_conversation_id(&format!("agent:{}:{session}", agent.to_ascii_lowercase()))
-        }
-        None => stable_conversation_id(&session),
-    })
-}
 
 /// OpenClaw root options that take a value; they may precede the command.
 const ROOT_VALUE_OPTIONS: &[&str] = &["--profile", "--log-level", "--container"];
@@ -144,13 +103,6 @@ fn command_index(args: &[OsString]) -> Option<usize> {
     None
 }
 
-/// `oc-` + the first 32 hex characters of sha256(session id).
-pub(crate) fn stable_conversation_id(session_id: &str) -> String {
-    let digest = Sha256::digest(session_id.as_bytes());
-    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("oc-{}", &hex[..32])
-}
-
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     // A SecretRef, not a string: OpenClaw resolves a string `apiKey` (or a
     // `${VAR}` in one) while loading the config and then writes the resolved
@@ -160,9 +112,8 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     // id must be `value`. OpenClaw refuses a file other users can read.
     let api_key = json!({ "source": "file", "provider": SECRET_PROVIDER, "id": "value" });
     let conv_ref = format!("${{{CONV_ID_ENV}}}");
-    // No native session id on Messages (see the module docs).
-    let messages_headers = ctx.conversation_headers_for(&conv_ref, false);
-    let responses_headers = ctx.conversation_headers(&conv_ref);
+    // Both wires carry OpenClaw's session id (see the module docs).
+    let headers = ctx.conversation_headers(&conv_ref);
     let launch = ctx.models();
     let models = |compat: serde_json::Value| {
         launch
@@ -203,17 +154,17 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             "mode": "merge",
             "providers": {
                 PROVIDER_ID: {
-                    "baseUrl": ctx.messages_base(),
+                    "baseUrl": ctx.v1_base(),
                     "apiKey": api_key,
-                    "api": "anthropic-messages",
-                    "headers": messages_headers,
-                    "models": models(json!({}))
+                    "api": "openai-completions",
+                    "headers": headers,
+                    "models": models(json!({ "sendSessionAffinityHeaders": true }))
                 },
                 RESPONSES_PROVIDER_ID: {
                     "baseUrl": ctx.v1_base(),
                     "apiKey": api_key,
                     "api": "openai-responses",
-                    "headers": responses_headers,
+                    "headers": headers,
                     "models": models(json!({ "supportsPromptCacheKey": true }))
                 }
             }
@@ -245,7 +196,7 @@ mod tests {
     use super::{CONFIG_FILE, KEY_FILE};
 
     #[test]
-    fn renders_explicit_api_and_disables_side_calls() {
+    fn renders_chat_completions_with_session_affinity_and_disables_side_calls() {
         let (dir, plan) = render(Harness::OpenClaw);
         let path = dir.join(CONFIG_FILE);
         assert_eq!(
@@ -261,8 +212,8 @@ mod tests {
         assert_eq!(defaults["compaction"]["memoryFlush"]["enabled"], false);
         let provider = &config["models"]["providers"]["rayline"];
         assert_eq!(config["models"]["mode"], "merge");
-        assert_eq!(provider["baseUrl"], TEST_URL);
-        assert_eq!(provider["api"], "anthropic-messages");
+        assert_eq!(provider["baseUrl"], format!("{TEST_URL}/v1"));
+        assert_eq!(provider["api"], "openai-completions");
         let key_ref = serde_json::json!({ "source": "file", "provider": "rayline", "id": "value" });
         assert_eq!(provider["apiKey"], key_ref);
         assert_eq!(
@@ -277,15 +228,18 @@ mod tests {
             std::fs::read_to_string(dir.join(KEY_FILE)).unwrap(),
             TEST_KEY
         );
-        // dev: Messages still carries the per-launch id, Responses does not.
-        assert_eq!(
-            provider["headers"],
-            serde_json::json!({ "x-conversation-id": "${RAYLINE_CONV_ID}" })
-        );
+        // OpenClaw keys the episode itself on both wires: no per-launch id.
+        assert_eq!(provider["headers"], serde_json::json!({}));
         let model = &provider["models"][0];
+        assert_eq!(model["id"], "arc-sage-1.0");
         assert_eq!(model["contextWindow"], 200000);
         assert_eq!(model["maxTokens"], 32000);
-        assert_eq!(model["compat"], serde_json::json!({}));
+        for model in provider["models"].as_array().unwrap() {
+            assert_eq!(
+                model["compat"],
+                serde_json::json!({ "sendSessionAffinityHeaders": true })
+            );
+        }
         let responses = &config["models"]["providers"]["rayline-resp"];
         assert_eq!(responses["baseUrl"], format!("{TEST_URL}/v1"));
         assert_eq!(responses["api"], "openai-responses");
@@ -306,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_header_follows_the_override() {
+    fn conversation_header_follows_the_override() {
         use super::super::ConversationIdFallback;
         use super::super::tests::render_with;
         let headers = |fallback| {
@@ -322,40 +276,18 @@ mod tests {
         };
         let header = serde_json::json!({ "x-conversation-id": "${RAYLINE_CONV_ID}" });
         let none = serde_json::json!({});
+        // The router keys on OpenClaw's session id; the header is opt-in.
         assert_eq!(
-            headers(ConversationIdFallback::new("prod", None)),
-            (header.clone(), header.clone())
-        );
-        assert_eq!(
-            headers(ConversationIdFallback::new("dev", Some("0"))),
+            headers(ConversationIdFallback::new(None)),
             (none.clone(), none.clone())
         );
         assert_eq!(
-            headers(ConversationIdFallback::new("prod", Some("0"))),
+            headers(ConversationIdFallback::new(Some("1"))),
+            (header.clone(), header)
+        );
+        assert_eq!(
+            headers(ConversationIdFallback::new(Some("0"))),
             (none.clone(), none)
-        );
-    }
-
-    #[test]
-    fn session_id_arg_forms() {
-        use super::session_id_arg;
-        let args = |list: &[&str]| -> Vec<std::ffi::OsString> {
-            list.iter().map(std::ffi::OsString::from).collect()
-        };
-        assert_eq!(
-            session_id_arg(&args(&["agent", "--session-id", "abc", "-m", "hi"])),
-            Some("abc".into())
-        );
-        assert_eq!(
-            session_id_arg(&args(&["agent", "--session-id=abc"])),
-            Some("abc".into())
-        );
-        assert_eq!(session_id_arg(&args(&["agent", "-m", "hi"])), None);
-        assert_eq!(session_id_arg(&args(&["agent", "--session-id"])), None);
-        assert_eq!(session_id_arg(&args(&["agent", "--session-id="])), None);
-        assert_eq!(
-            session_id_arg(&args(&["agent", "--", "--session-id", "x"])),
-            None
         );
     }
 
@@ -408,51 +340,5 @@ mod tests {
         ] {
             assert_eq!(launch_args(&args(unchanged)), args(unchanged));
         }
-    }
-
-    #[test]
-    fn stable_id_is_scoped_to_the_agent_and_trimmed() {
-        use super::super::conversation_id_for;
-        let args = |list: &[&str]| -> Vec<std::ffi::OsString> {
-            list.iter().map(std::ffi::OsString::from).collect()
-        };
-        let id = |list: &[&str]| conversation_id_for(Harness::OpenClaw, &args(list));
-        let alpha = id(&["agent", "--agent", "alpha", "--session-id", "1234"]);
-        assert_ne!(
-            alpha,
-            id(&["agent", "--agent", "beta", "--session-id", "1234"])
-        );
-        assert_eq!(
-            alpha,
-            id(&["agent", "--agent=alpha", "--session-id", " 1234 "])
-        );
-        // OpenClaw agent ids are case-insensitive.
-        assert_eq!(
-            alpha,
-            id(&["agent", "--agent", " Alpha", "--session-id", "1234"])
-        );
-        assert_eq!(
-            id(&["agent", "--session-id", " 1234"]),
-            id(&["agent", "--session-id", "1234"])
-        );
-    }
-
-    #[test]
-    fn session_id_gives_a_stable_conversation_id() {
-        use super::super::conversation_id_for;
-        use super::stable_conversation_id;
-        let id = stable_conversation_id("session-1");
-        // `printf session-1 | shasum -a 256 | cut -c1-32`
-        assert_eq!(id, "oc-84097828fc31a8c8d29210df48901a85");
-        assert_ne!(id, stable_conversation_id("session-2"));
-        let args: Vec<std::ffi::OsString> = ["agent", "--session-id", "session-1"]
-            .iter()
-            .map(std::ffi::OsString::from)
-            .collect();
-        assert_eq!(conversation_id_for(Harness::OpenClaw, &args), id);
-        assert_eq!(conversation_id_for(Harness::OpenClaw, &args), id);
-        // No session id: a fresh UUID per launch. Other harnesses ignore it.
-        assert_eq!(conversation_id_for(Harness::OpenClaw, &[]).len(), 36);
-        assert_eq!(conversation_id_for(Harness::Pi, &args).len(), 36);
     }
 }

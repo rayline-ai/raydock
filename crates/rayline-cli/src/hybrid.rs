@@ -807,10 +807,7 @@ fn harness_command(
                 key: token,
                 router_url: endpoint,
                 config_dir: &config_dir,
-                conversation_id: crate::harness::ConversationIdFallback {
-                    forced: None,
-                    env_needs_it: false,
-                },
+                conversation_id: crate::harness::ConversationIdFallback { forced: None },
                 allow_empty_signature: true,
                 capabilities: Some(capabilities),
                 harness_major_version: major_version,

@@ -32,6 +32,26 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `routes.subagent` model.
 - Under `--route subagents`, a request naming an ARC model (`arc-*`) always
   goes to the router, like `rayline-router`: Anthropic serves neither.
+- **`raydock openclaw` speaks Chat Completions and keys its own episode.**
+  The generated `rayline` provider is now `openai-completions` (OpenClaw's
+  default protocol) with `compat.sendSessionAffinityHeaders`, so OpenClaw
+  sends its session id as
+  `x-session-affinity` and a `--session-id` resume keeps its routing episode.
+  The launcher no longer sends a per-launch `x-conversation-id` for OpenClaw;
+  `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` still forces it. OpenAI-style hosted
+  tools (`web_search`) are not carried on Chat Completions; function tools
+  are.
+- **Harness launchers rely on the router's session keying.**
+  `raydock opencode|pi|omp|hermes|openclaw` no longer send a per-launch
+  `x-conversation-id` unless `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` forces it.
+  The router keys episodes on each harness's own session id on dev and prod
+  (prod since 2026-10-23), so `--resume` / `-c` in a new launch keeps the
+  episode. Hermes on Messages sends no session id, and the router now derives
+  its episode from the conversation instead; with the per-launch id, a
+  `delegate_task` subagent's turns and the title side call were all keyed
+  into the parent's episode. Under `raydock hybrid run` the Hermes Messages
+  provider keeps the per-launch id, since the execution core refuses a request
+  with no identity.
 
 ## 0.2.14 (2026-10-27)
 
