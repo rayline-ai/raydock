@@ -271,7 +271,7 @@ async fn quiesce_waits_for_an_in_flight_refresh_to_persist_and_refuses_new_ones(
     tokio::pin!(quiesce);
     assert!(futures::poll!(&mut quiesce).is_pending());
     token.resume();
-    quiesce.await;
+    assert!(quiesce.await.is_empty());
     assert!(
         std::fs::read_to_string(temp.path().join("profile/.credentials.json"))
             .expect("saved")
@@ -337,6 +337,34 @@ async fn persistence_failure_keeps_rotated_grant_and_retries_save_not_oauth() {
     std::fs::write(profile.join(".credentials.json"), original).expect("restore source");
     tokio::time::sleep(Duration::from_millis(2)).await;
     pool.refresh_all_usage().await;
+    assert_eq!(token.count.load(Ordering::SeqCst), 1);
+    assert!(
+        std::fs::read_to_string(profile.join(".credentials.json"))
+            .expect("saved")
+            .contains("rotated-refresh")
+    );
+}
+
+#[tokio::test]
+async fn quiesce_saves_a_pending_rotated_grant_and_reports_what_it_could_not() {
+    let temp = tempfile::tempdir().expect("temp");
+    let profile = temp.path().join("profile");
+    credentials(&profile);
+    let original = std::fs::read(profile.join(".credentials.json")).expect("original");
+    let usage = endpoint(false, USAGE, false).await;
+    let token = endpoint(true, GRANT, true).await;
+    let pool = runtime(temp.path(), &usage, &token, false).await;
+    let p = pool.clone();
+    let refresh = tokio::spawn(async move { p.force_refresh("a").await });
+    token.wait().await;
+    std::fs::remove_file(profile.join(".credentials.json")).expect("remove");
+    std::fs::create_dir(profile.join(".credentials.json")).expect("obstruct save");
+    token.resume();
+    refresh.await.expect("task").expect("pending grant");
+    std::fs::remove_dir(profile.join(".credentials.json")).expect("remove obstruction");
+    std::fs::write(profile.join(".credentials.json"), original).expect("restore source");
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    assert!(pool.quiesce_credentials().await.is_empty());
     assert_eq!(token.count.load(Ordering::SeqCst), 1);
     assert!(
         std::fs::read_to_string(profile.join(".credentials.json"))

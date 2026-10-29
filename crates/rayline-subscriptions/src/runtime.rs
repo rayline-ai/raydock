@@ -561,17 +561,28 @@ impl SubscriptionPoolRuntime {
         }
     }
 
-    /// For orderly shutdown: waits for every in-flight OAuth refresh to finish
-    /// (each persists its rotated grant before releasing the gate) and refuses
-    /// new ones. Recoveries run on their own tasks, so without this, dropping
-    /// the Tokio runtime could cancel a refresh after the provider already
-    /// rotated the grant, leaving the stored login unusable.
-    pub async fn quiesce_credentials(&self) {
+    /// For orderly shutdown: waits for every in-flight OAuth refresh to finish,
+    /// makes one more attempt to save a rotated grant whose save failed
+    /// earlier, then refuses new refreshes. Recoveries run on their own
+    /// tasks, so without this, dropping the Tokio runtime could cancel a
+    /// refresh after the provider already rotated the grant, leaving the
+    /// stored login unusable. Returns the accounts whose rotated grant is
+    /// still only in memory.
+    pub async fn quiesce_credentials(&self) -> Vec<String> {
+        let mut unsaved = Vec::new();
         for account in &self.accounts {
+            if account.persistence_pending.load(Ordering::SeqCst) {
+                // Retries the save, not OAuth (see recover).
+                let _ = account.recover(false, None).await;
+            }
             // Err only when already closed, which is what we want anyway.
             let _permit = account.refresh_gate.acquire().await;
             account.refresh_gate.close();
+            if account.persistence_pending.load(Ordering::SeqCst) {
+                unsaved.push(account.id.clone());
+            }
         }
+        unsaved
     }
 
     /// Waits for a complete recovery snapshot write (for orderly shutdown).
