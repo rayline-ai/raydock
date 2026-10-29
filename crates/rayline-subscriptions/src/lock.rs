@@ -144,7 +144,7 @@ fn held_message(path: &Path, holder_pid: Option<u32>) -> String {
 
 fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
     if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        validate_trusted_ancestors(parent)?;
+        validate_trusted_ancestors(parent, Missing::Allowed)?;
     }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -161,9 +161,10 @@ fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
         })?;
     // Components missing at the first check were unverified: another user
     // could have created one (in a sticky shared directory) before we did.
-    // With every component now present, check the whole path again.
+    // Every component must now exist and be trusted; one missing here was
+    // moved away, which only its foreign owner could do.
     if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        validate_trusted_ancestors(parent)?;
+        validate_trusted_ancestors(parent, Missing::Refused)?;
     }
     let metadata = fs::symlink_metadata(dir).map_err(|source| PoolLockError::StateDir {
         path: dir.to_owned(),
@@ -199,7 +200,15 @@ fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
 /// symlink must be owned by us or root (its holder is a directory already
 /// checked). Missing components below are created by us, privately; `..`
 /// among them is refused because it would step back into unchecked ground.
-fn validate_trusted_ancestors(parent: &Path) -> Result<(), PoolLockError> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Missing {
+    /// Before creation: the rest of the path will be created by us.
+    Allowed,
+    /// After creation: a missing component means the path was tampered with.
+    Refused,
+}
+
+fn validate_trusted_ancestors(parent: &Path, missing: Missing) -> Result<(), PoolLockError> {
     #[cfg(unix)]
     {
         use std::collections::VecDeque;
@@ -248,7 +257,7 @@ fn validate_trusted_ancestors(parent: &Path) -> Result<(), PoolLockError> {
             let metadata = match fs::symlink_metadata(&next) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if pending.iter().any(Option::is_none) {
+                    if missing == Missing::Refused || pending.iter().any(Option::is_none) {
                         return Err(PoolLockError::UnsafeStateDir(parent.to_owned()));
                     }
                     break;
@@ -276,7 +285,7 @@ fn validate_trusted_ancestors(parent: &Path) -> Result<(), PoolLockError> {
         }
     }
     #[cfg(not(unix))]
-    let _ = parent;
+    let _ = (parent, missing);
     Ok(())
 }
 
@@ -431,6 +440,19 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn the_post_create_check_refuses_a_missing_ancestor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = temp.path().canonicalize().expect("physical temp");
+        // Moved away after creation: only its (foreign) owner could do that.
+        assert!(matches!(
+            validate_trusted_ancestors(&temp.join("moved"), Missing::Refused),
+            Err(PoolLockError::UnsafeStateDir(_))
+        ));
+        validate_trusted_ancestors(&temp.join("moved"), Missing::Allowed).expect("not yet created");
+        validate_trusted_ancestors(&temp, Missing::Refused).expect("present");
+    }
+
     #[test]
     fn refuses_parent_steps_below_a_missing_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
