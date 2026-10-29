@@ -36,6 +36,10 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(50);
 /// hold the drain to its limit; the remainder is kept for credential work.
 const DRAIN_GRACE: Duration = Duration::from_secs(30);
 
+/// Hard end of shutdown, after which the recovery-state flush is abandoned
+/// and the lock released, still inside the launchd job's 60s ExitTimeOut.
+const FLUSH_DEADLINE: Duration = Duration::from_secs(56);
+
 /// Exit status when another process already owns the pool. launchd retries
 /// after its throttle interval, so a supervisor never starts a second owner.
 pub const EXIT_POOL_OWNED: i32 = 75;
@@ -201,8 +205,12 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
         }
     }
     info!("flushing recovery state");
-    if let Err(error) = runtime.flush_recovery_state().await {
-        warn!("recovery state flush failed: {error}");
+    match tokio::time::timeout_at(started + FLUSH_DEADLINE, runtime.flush_recovery_state()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => warn!("recovery state flush failed: {error}"),
+        Err(_) => {
+            warn!("recovery state flush still running at the shutdown deadline; abandoning it")
+        }
     }
     drop(lock);
     Ok(())

@@ -17,5 +17,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(csub::app::run(&csub::app::CSUB, std::env::args_os()))
+    let code = runtime.block_on(csub::app::run(&csub::app::CSUB, std::env::args_os()));
+    // Don't let an abandoned blocking write (see serve) hold the exit past
+    // launchd's ExitTimeOut; the process ends right after.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    code
 }

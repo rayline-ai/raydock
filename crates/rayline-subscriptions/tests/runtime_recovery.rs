@@ -279,8 +279,16 @@ async fn quiesce_waits_for_an_in_flight_refresh_to_persist_and_refuses_new_ones(
     let quiesce = pool.quiesce_credentials();
     tokio::pin!(quiesce);
     assert!(futures::poll!(&mut quiesce).is_pending());
+    // A request still open after the drain queues a refresh behind it.
+    let p = pool.clone();
+    let late = tokio::spawn(async move { p.force_refresh("a").await });
+    tokio::task::yield_now().await;
     token.resume();
     assert!(quiesce.await.is_empty());
+    assert!(
+        late.await.expect("late task").is_err(),
+        "no OAuth after quiesce"
+    );
     assert!(
         std::fs::read_to_string(temp.path().join("profile/.credentials.json"))
             .expect("saved")
