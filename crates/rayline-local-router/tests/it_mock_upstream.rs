@@ -1611,6 +1611,204 @@ async fn refused_hosted_tool_request_is_not_left_active_in_metrics() {
     let _ = std::fs::remove_file(config);
 }
 
+/// A complete (non-streaming) Anthropic message with a single text block and
+/// authoritative token counts, as an `anthropic_messages` upstream returns for
+/// `stream: false`.
+fn anthropic_json_message(text: &str) -> Value {
+    json!({
+        "id": "msg_mock", "type": "message", "role": "assistant", "model": "x",
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": "end_turn", "stop_sequence": null,
+        "usage": {"input_tokens": 42, "output_tokens": 17, "cache_read_input_tokens": 5}
+    })
+}
+
+/// Send one `/v1/responses` turn with the given `stream` flag through a router
+/// that owns its metrics sink and routes everything to an `anthropic_messages`
+/// upstream answering `upstream` (one raw HTTP response). Returns the metrics
+/// snapshot taken after the client has read the whole answer.
+async fn responses_turn_metrics(
+    name: &str,
+    upstream: String,
+    want_stream: bool,
+) -> rayline_metrics::MetricsSnapshot {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = listener.local_addr().unwrap().port();
+    tokio::spawn(serve_once(listener, upstream));
+
+    let config = write_config(
+        name,
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{up_port}"),
+                           "models": ["claude-mock"]}],
+            "routes": {"main": {"endpoint": "up", "model": "claude-mock"},
+                       "default": {"endpoint": "up", "model": "claude-mock"},
+                       "model_routes": {
+                           "rayline-local": {"endpoint": "up", "model": "claude-mock"}
+                       }}
+        }),
+    );
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        metrics: Some(metrics.clone()),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({"model": "rayline-local", "input": "hi", "stream": want_stream}))
+        .send()
+        .await
+        .expect("router request");
+    let status = resp.status();
+    // Drain the answer so a streamed body cannot be mistaken for an open row.
+    let body = resp.text().await.expect("response body");
+    assert_eq!(status, 200, "unexpected status {status}: {body}");
+    assert!(
+        body.contains("\"usage\""),
+        "translated answer should carry usage: {body}"
+    );
+    let _ = std::fs::remove_file(config);
+    metrics.snapshot()
+}
+
+/// The row a `/v1/responses` turn leaves behind once the Anthropic upstream has
+/// answered and the translation has been handed to the client: in `recent`, not
+/// `active`, with the upstream's token counts (whole prompt, output, cached
+/// part) and the selected model.
+fn assert_row_closed(
+    snapshot: &rayline_metrics::MetricsSnapshot,
+    input_tokens: u64,
+    output_tokens: u64,
+    prompt_cache_tokens: Option<u64>,
+) {
+    assert!(
+        snapshot.active.is_empty(),
+        "row still active: {:?}",
+        snapshot.active
+    );
+    assert_eq!(snapshot.totals.active_requests, 0);
+    assert_eq!(snapshot.totals.completed_requests, 1);
+    assert_eq!(snapshot.totals.errored_requests, 0);
+    assert_eq!(snapshot.recent.len(), 1, "exactly one closed row expected");
+    let row = &snapshot.recent[0];
+    assert_eq!(row.state, "completed");
+    assert_eq!(row.status_code, Some(200));
+    assert_eq!(row.endpoint_id.as_deref(), Some("up"));
+    assert_eq!(row.selected_model.as_deref(), Some("claude-mock"));
+    assert_eq!(row.input_tokens, Some(input_tokens));
+    assert_eq!(row.output_tokens, Some(output_tokens));
+    assert_eq!(row.prompt_cache_tokens, prompt_cache_tokens);
+    assert_eq!(
+        (snapshot.totals.input_tokens, snapshot.totals.output_tokens),
+        (input_tokens, output_tokens)
+    );
+    assert!(
+        row.first_token_at_unix_ms.is_some(),
+        "FirstToken not recorded"
+    );
+}
+
+/// Codex compaction and some tool turns send `stream: false`; an Anthropic
+/// upstream answers with a JSON message. The translation is synchronous, so the
+/// metrics row must be closed before the answer is returned, or `raydock top`
+/// shows the turn as active forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_anthropic_json_answer_non_streaming_closes_metrics_row() {
+    let snapshot = responses_turn_metrics(
+        "responses-json-nonstream-metrics",
+        http_json(&anthropic_json_message("done")),
+        false,
+    )
+    .await;
+    assert_row_closed(&snapshot, 47, 17, Some(5));
+}
+
+/// `stream: true` from the client with a JSON (non-streaming) upstream answer
+/// is replayed as one synthetic SSE body; that row must close too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_anthropic_json_answer_streaming_client_closes_metrics_row() {
+    let snapshot = responses_turn_metrics(
+        "responses-json-stream-metrics",
+        http_json(&anthropic_json_message("done")),
+        true,
+    )
+    .await;
+    assert_row_closed(&snapshot, 47, 17, Some(5));
+}
+
+/// `stream: false` from the client with an SSE upstream answer is buffered into
+/// one JSON body; the counts come from `message_start` / `message_delta`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_anthropic_sse_answer_non_streaming_client_closes_metrics_row() {
+    let snapshot = responses_turn_metrics(
+        "responses-sse-nonstream-metrics",
+        anthropic_sse("done"),
+        false,
+    )
+    .await;
+    assert_row_closed(&snapshot, 1, 1, None);
+}
+
+/// A buffered SSE answer that reports an `error` event, or stops before
+/// `message_stop`, is not a completion: the client still gets the text that
+/// arrived (unchanged), but the row is closed as an error, so the completed
+/// totals do not count a failed turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_anthropic_failed_sse_answer_non_streaming_client_closes_row_as_error() {
+    let error_event = http_sse(concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n",
+    ));
+    let cut_off = http_sse(concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"par\"}}\n\n",
+    ));
+    for (name, upstream, error) in [
+        ("responses-sse-error-metrics", error_event, "Overloaded"),
+        (
+            "responses-sse-cutoff-metrics",
+            cut_off,
+            "ended before the response completed",
+        ),
+    ] {
+        let snapshot = responses_turn_metrics(name, upstream, false).await;
+        assert!(snapshot.active.is_empty(), "{name}: {:?}", snapshot.active);
+        assert_eq!(snapshot.totals.errored_requests, 1, "{name}");
+        assert_eq!(snapshot.recent.len(), 1, "{name}");
+        let row = &snapshot.recent[0];
+        assert_eq!(row.state, "error", "{name}: {row:?}");
+        assert_eq!(row.status_code, Some(502), "{name}");
+        assert!(
+            row.error.as_deref().is_some_and(|e| e.contains(error)),
+            "{name}: {row:?}"
+        );
+    }
+}
+
 /// Codex declares `{type: "web_search", external_web_access: false}` on every
 /// turn and sets it to true only for live search. The default must keep
 /// working through a Responses → Anthropic route: the offline declaration is
