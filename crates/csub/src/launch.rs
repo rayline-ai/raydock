@@ -45,6 +45,10 @@ fn claude_config_dir() -> Option<PathBuf> {
 enum Tier {
     /// Managed policy outranks our `--settings`, so it may not set the URL.
     Managed,
+    /// Claude Code's global config (`.claude.json`): its env block is
+    /// applied, and its rank against `--settings` is not established, so it
+    /// may not set the URL either.
+    GlobalConfig,
     /// User, project and local settings; our `--settings` overrides them in
     /// the foreground session.
     Overridable,
@@ -110,6 +114,23 @@ fn settings_files(roots: &[PathBuf]) -> Vec<(PathBuf, Tier)> {
     }
     if let Some(config_dir) = claude_config_dir() {
         files.push((config_dir.join("settings.json"), Tier::Overridable));
+        // Claude Code prefers a legacy `.config.json` here when present;
+        // both are checked rather than mirroring that choice.
+        files.push((config_dir.join(".config.json"), Tier::GlobalConfig));
+    }
+    let suffix = if std::env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").is_some() {
+        "-custom-oauth"
+    } else {
+        ""
+    };
+    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+    {
+        files.push((
+            dir.join(format!(".claude{suffix}.json")),
+            Tier::GlobalConfig,
+        ));
     }
     for root in roots {
         files.push((root.join(".claude/settings.json"), Tier::Overridable));
@@ -201,11 +222,24 @@ fn check_settings_env(files: &[(PathBuf, Tier)], background: bool) -> anyhow::Re
         let Some(settings) = read_settings(path)? else {
             continue;
         };
+        // A policy helper's settings outrank ours and cannot be inspected
+        // before launch.
+        if *tier == Tier::Managed {
+            for key in ["policyHelper", "policyHelpers"] {
+                if settings.get(key).is_some() {
+                    bail!(
+                        "{} sets {key}, whose managed settings csub cannot check; launch without the pool",
+                        path.display()
+                    );
+                }
+            }
+        }
         let Some(env) = settings.get("env").and_then(|env| env.as_object()) else {
             continue;
         };
         for name in env.keys() {
-            let redirects = name == "ANTHROPIC_BASE_URL" && (*tier == Tier::Managed || background);
+            let redirects =
+                name == "ANTHROPIC_BASE_URL" && (*tier != Tier::Overridable || background);
             if redirects || WITHHELD_ENV.contains(&name.as_str()) {
                 bail!(
                     "{} sets {name} in its env block, which would take Claude Code off the subscription pool; remove it or launch without the pool",
@@ -419,6 +453,31 @@ mod tests {
         assert!(check_settings_env(&files, false).is_err());
         std::fs::write(&user, "\u{feff} \n").expect("settings");
         check_settings_env(&files, false).expect("blank settings");
+    }
+
+    #[test]
+    fn global_config_and_policy_helpers_are_checked() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let global = temp.path().join(".claude.json");
+        let files = vec![(global.clone(), Tier::GlobalConfig)];
+        std::fs::write(&global, r#"{"numStartups":3}"#).expect("global");
+        check_settings_env(&files, false).expect("no env block");
+        std::fs::write(&global, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#).expect("global");
+        assert!(check_settings_env(&files, false).is_err());
+        std::fs::write(&global, r#"{"env":{"ANTHROPIC_BASE_URL":"http://x"}}"#).expect("global");
+        assert!(check_settings_env(&files, false).is_err());
+
+        let managed = temp.path().join("managed-settings.json");
+        std::fs::write(
+            &managed,
+            r#"{"policyHelpers":{"default":{"env":{"ANTHROPIC_BASE_URL":"http://x"}}}}"#,
+        )
+        .expect("managed");
+        let error = check_settings_env(&[(managed.clone(), Tier::Managed)], false)
+            .expect_err("policy helper");
+        assert!(error.to_string().contains("policyHelpers"), "{error}");
+        // Only managed sources run policy helpers.
+        check_settings_env(&[(managed, Tier::Overridable)], false).expect("user tier");
     }
 
     #[test]
