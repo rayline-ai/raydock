@@ -484,10 +484,13 @@ fn response_head(
         .status(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY));
     for (name, value) in headers {
         let name = name.as_str();
+        // Upstream CORS grants must never reach a client of a loopback
+        // gateway that holds pooled credentials.
         if matches!(
             name,
             "connection" | "keep-alive" | "transfer-encoding" | "content-length"
-        ) {
+        ) || name.starts_with("access-control-")
+        {
             continue;
         }
         if let (Ok(name), Ok(value)) = (

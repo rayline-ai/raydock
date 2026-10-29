@@ -169,6 +169,13 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
     Ok(())
 }
 
+fn is_browser_request<B>(request: &Request<B>) -> bool {
+    request.method() == Method::OPTIONS
+        || ["origin", "sec-fetch-site", "sec-fetch-mode"]
+            .iter()
+            .any(|name| request.headers().contains_key(*name))
+}
+
 async fn route(
     request: Request<Incoming>,
     port: u16,
@@ -181,6 +188,16 @@ async fn route(
         return json_response(
             StatusCode::MISDIRECTED_REQUEST,
             json!({"ok": false, "error": "csub only serves 127.0.0.1, localhost or [::1]"}),
+        );
+    }
+    // Claude Code and the csub CLI never send browser headers. Anything with
+    // an Origin (or a CORS preflight) is a web page; refusing it outright
+    // keeps a site the user visits from spending pool quota through
+    // fetch(..., {mode: "no-cors"}).
+    if is_browser_request(&request) {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({"ok": false, "error": "csub does not serve browser requests"}),
         );
     }
     let path = request.uri().path();
@@ -298,5 +315,30 @@ mod tests {
         assert!(!is_loopback_host(&host("attacker.example:20816"), 20816));
         assert!(!is_loopback_host(&host("127.0.0.1:80"), 20816));
         assert!(!is_loopback_host(&hyper::HeaderMap::new(), 20816));
+    }
+
+    #[test]
+    fn refuses_browser_requests() {
+        let request = |method: Method, header: Option<(&str, &str)>| {
+            let mut builder = Request::builder().method(method).uri("/v1/messages");
+            if let Some((name, value)) = header {
+                builder = builder.header(name, value);
+            }
+            builder.body(()).expect("request")
+        };
+        assert!(!is_browser_request(&request(Method::POST, None)));
+        assert!(is_browser_request(&request(Method::OPTIONS, None)));
+        assert!(is_browser_request(&request(
+            Method::POST,
+            Some(("origin", "https://attacker.example"))
+        )));
+        assert!(is_browser_request(&request(
+            Method::POST,
+            Some(("origin", "null"))
+        )));
+        assert!(is_browser_request(&request(
+            Method::GET,
+            Some(("sec-fetch-mode", "no-cors"))
+        )));
     }
 }
