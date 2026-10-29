@@ -248,23 +248,25 @@ async fn refuses_requests_that_could_escape_pool_routing() {
             .expect("gateway response");
         assert_eq!(response.status(), 400, "{path} {body}");
     }
-    // HTTP clients normalize dot segments, so send this one raw.
-    let mut stream = tokio::net::TcpStream::connect(gateway)
-        .await
-        .expect("connect");
-    let body = r#"{"model":"claude-sonnet-5-5"}"#;
-    let request = format!(
-        "POST /l/launch-1/v1/x/../messages HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
-        .await
-        .expect("write");
-    let mut response = String::new();
-    tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut response)
-        .await
-        .expect("read");
-    assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+    // HTTP clients normalize these paths, so send them raw.
+    for path in ["/l/launch-1/v1/x/../messages", "/l/launch-1/v1\\messages"] {
+        let mut stream = tokio::net::TcpStream::connect(gateway)
+            .await
+            .expect("connect");
+        let body = r#"{"model":"claude-sonnet-5-5"}"#;
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+            .await
+            .expect("write");
+        let mut response = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut response)
+            .await
+            .expect("read");
+        assert!(response.starts_with("HTTP/1.1 400"), "{path}: {response}");
+    }
     let seen = seen.lock().expect("seen");
     assert!(seen.messages.is_empty() && seen.passthrough.is_empty());
 }

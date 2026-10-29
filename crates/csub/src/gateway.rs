@@ -109,12 +109,14 @@ impl Gateway {
                 ));
             }
         };
-        // Dot segments would be normalized by the HTTP client after routing
-        // was decided on the raw path; refuse them instead of guessing.
+        // Dot segments, percent escapes and backslashes would be normalized by
+        // the HTTP client after routing was decided on the raw path; refuse
+        // them instead of guessing.
         let path = api_path.split('?').next().unwrap_or(api_path);
-        if path
-            .split('/')
-            .any(|segment| segment == "." || segment == ".." || segment.contains('%'))
+        if path.contains(['%', '\\'])
+            || path
+                .split('/')
+                .any(|segment| segment == "." || segment == "..")
         {
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,

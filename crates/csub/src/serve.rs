@@ -152,12 +152,14 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
     drop(listener);
     // In-flight requests may be mid-refresh; let them finish before the lock
     // is released so a successor never races a rotating grant.
-    info!("csub shutting down; draining connections");
-    if tokio::time::timeout(SHUTDOWN_GRACE, graceful.shutdown())
-        .await
-        .is_err()
-    {
-        warn!("connections still open after {SHUTDOWN_GRACE:?}; stopping anyway");
+    info!("csub shutting down; draining connections (signal again to stop now)");
+    tokio::select! {
+        result = tokio::time::timeout(SHUTDOWN_GRACE, graceful.shutdown()) => {
+            if result.is_err() {
+                warn!("connections still open after {SHUTDOWN_GRACE:?}; stopping anyway");
+            }
+        }
+        () = shutdown_signal() => warn!("second signal; stopping without draining"),
     }
     info!("flushing recovery state");
     if let Err(error) = runtime.flush_recovery_state().await {
