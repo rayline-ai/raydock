@@ -183,8 +183,13 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
         info!("waiting for in-flight credential refreshes");
         tokio::select! {
             result = tokio::time::timeout_at(deadline, runtime.quiesce_credentials()) => {
-                if result.is_err() {
-                    warn!("credential refresh still running at the shutdown deadline; stopping anyway");
+                match result {
+                    Err(_) => warn!("credential refresh still running at the shutdown deadline; stopping anyway"),
+                    Ok(unsaved) if !unsaved.is_empty() => warn!(
+                        "rotated grants for {} could not be saved; those accounts may need `claude /login` again",
+                        unsaved.join(", ")
+                    ),
+                    Ok(_) => {}
                 }
             }
             () = signals.recv() => warn!("second signal; not waiting for credential refreshes"),
