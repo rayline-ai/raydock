@@ -159,6 +159,12 @@ fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
             path: dir.to_owned(),
             source,
         })?;
+    // Components missing at the first check were unverified: another user
+    // could have created one (in a sticky shared directory) before we did.
+    // With every component now present, check the whole path again.
+    if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        validate_trusted_ancestors(parent)?;
+    }
     let metadata = fs::symlink_metadata(dir).map_err(|source| PoolLockError::StateDir {
         path: dir.to_owned(),
         source,
