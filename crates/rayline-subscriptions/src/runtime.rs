@@ -103,6 +103,9 @@ impl SubscriptionPoolRuntime {
         let refresh_client =
             OAuthRefreshClient::new(http.clone(), &options.token_url, &options.oauth_client_id)?;
         let refresh_margin_ms = duration_ms(options.refresh_margin);
+        if !is_credential_safe_base_url(&options.anthropic_base_url) {
+            return Err(SubscriptionRuntimeError::InsecureBaseUrl);
+        }
         let usage_url = format!(
             "{}{}",
             options.anthropic_base_url.trim_end_matches('/'),
@@ -1956,6 +1959,8 @@ pub enum SubscriptionRuntimeError {
     HomeUnavailable(PathBuf),
     #[error("subscription runtime is read-only")]
     ReadOnly,
+    #[error("Anthropic base URL must use https unless it is a loopback address")]
+    InsecureBaseUrl,
     #[error("subscription recovery state failed: {0}")]
     RecoveryState(String),
     #[error("subscription account recovery is temporarily backed off")]
@@ -1994,6 +1999,26 @@ fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
         source = error.source();
     }
     output
+}
+
+/// Bearer tokens are sent to the base URL, so it must be https. Plain http is
+/// accepted only for loopback hosts (local gateways and test fixtures).
+pub fn is_credential_safe_base_url(base_url: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => true,
+        "http" => url.host_str().is_some_and(|host| {
+            host.eq_ignore_ascii_case("localhost")
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -2076,5 +2101,17 @@ mod tests {
         }))
         .expect("legacy status");
         assert_eq!(legacy.schema, 0);
+    }
+
+    #[test]
+    fn only_https_or_loopback_base_urls_carry_credentials() {
+        assert!(is_credential_safe_base_url("https://api.anthropic.com"));
+        assert!(is_credential_safe_base_url("http://127.0.0.1:20816"));
+        assert!(is_credential_safe_base_url("http://localhost:9"));
+        assert!(is_credential_safe_base_url("http://[::1]:9"));
+        assert!(!is_credential_safe_base_url("http://api.anthropic.com"));
+        assert!(!is_credential_safe_base_url("http://10.0.0.5"));
+        assert!(!is_credential_safe_base_url("ftp://127.0.0.1"));
+        assert!(!is_credential_safe_base_url("not a url"));
     }
 }
