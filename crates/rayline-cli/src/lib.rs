@@ -88,6 +88,7 @@ example `raydock opencode -m rayline/rayline-router`).
   hybrid     Start the ARC execution core or connect a harness to it
   top        Show live router request metrics
   local      Configure local model routing
+  subscriptions  Pool several Claude subscriptions (csub)
   update     Check for or install a Raydock launcher update
 ";
 
@@ -163,6 +164,9 @@ Options:
   --via <proxy|env>                 How Claude Code connects to the router
                                     (default: proxy; env is lightweight,
                                     cloud-only, no background process)
+  --subscription-pool[=<pool>]      Run on the csub subscription pool gateway
+                                    instead of the router (default pool:
+                                    default; needs `csub service install`)
   --local-injector-port <port>      Local injector port
   --statusline/--no-statusline      Show proxy picked model in status line
   --diagnose                        Print routing diagnostics before exec
@@ -772,6 +776,33 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        RaylineDispatch::Subscriptions(args) => {
+            let argv = std::iter::once(OsString::from(CSUB_FRONTEND.name)).chain(args);
+            csub::app::run(&CSUB_FRONTEND, argv).await
+        }
+        RaylineDispatch::SubscriptionClaude { pool, args } => {
+            let port = match env::var("CSUB_PORT") {
+                Err(_) => csub::serve::DEFAULT_PORT,
+                Ok(value) => match value.parse() {
+                    Ok(port) => port,
+                    Err(_) => {
+                        eprintln!("raydock claude: CSUB_PORT={value:?} is not a port number");
+                        return ExitCode::from(2);
+                    }
+                },
+            };
+            match csub::launch::claude(&CSUB_FRONTEND, &pool, port, args).await {
+                Ok(code) => code,
+                Err(error) => {
+                    eprintln!("raydock claude --subscription-pool: {error:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        RaylineDispatch::SubscriptionClaudeUsage(message) => {
+            eprintln!("raydock claude: {message}");
+            ExitCode::from(2)
+        }
         RaylineDispatch::Unavailable => unavailable(original_argv),
     }
 }
@@ -849,6 +880,15 @@ pub enum RaylineDispatch {
         all: bool,
     },
     Update(update::UpdateRequest),
+    /// `subscriptions ...`: the csub command line, unchanged.
+    Subscriptions(Vec<OsString>),
+    /// `claude --subscription-pool[=<pool>] ...`: Claude Code on the csub
+    /// gateway; the remaining arguments go to `claude` unchanged.
+    SubscriptionClaude {
+        pool: String,
+        args: Vec<OsString>,
+    },
+    SubscriptionClaudeUsage(String),
     Unavailable,
 }
 
@@ -928,6 +968,22 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
                 parse_claude_app_request(args, root_env, root_auth_token, root_env_explicit)
                     .map(RaylineDispatch::ClaudeApp)
                     .unwrap_or(RaylineDispatch::Unavailable)
+            }
+            "subscriptions" if !root_env_explicit && root_auth_token.is_none() => {
+                RaylineDispatch::Subscriptions(args.cloned().collect())
+            }
+            "claude" if !root_env_explicit && root_auth_token.is_none() => {
+                let rest = args.cloned().collect::<Vec<_>>();
+                match parse_subscription_claude(&rest) {
+                    Some(dispatch) => dispatch,
+                    None => parse_claude_dispatch(
+                        rest.iter().peekable(),
+                        root_env,
+                        root_auth_token,
+                        root_env_explicit,
+                    )
+                    .unwrap_or(RaylineDispatch::Unavailable),
+                }
             }
             "claude" => parse_claude_dispatch(args, root_env, root_auth_token, root_env_explicit)
                 .unwrap_or(RaylineDispatch::Unavailable),
@@ -1540,6 +1596,85 @@ fn is_claude_management_subcommand(arg: &str) -> bool {
         arg,
         "login" | "logout" | "key" | "setup" | "hooks" | "telemetry"
     )
+}
+
+/// `raydock subscriptions` mounts the csub command line.
+const CSUB_FRONTEND: csub::app::Frontend = csub::app::Frontend {
+    name: "raydock subscriptions",
+    command_prefix: &["subscriptions"],
+};
+
+/// Rayline routing flags that make no sense on the subscription gateway.
+const ROUTER_ONLY_CLAUDE_FLAGS: &[&str] = &[
+    "--auto-compact-window",
+    "--config",
+    "--diagnose",
+    "--env",
+    "--isolated",
+    "--local",
+    "--local-injector-port",
+    "--local-provider",
+    "--local-router",
+    "--no-proxy",
+    "--no-statusline",
+    "--no-telemetry",
+    "--route",
+    "--router-config-path",
+    "--routing-mode",
+    "--statusline",
+    "--upstream-ca-path",
+    "--via",
+];
+
+/// `None` when the arguments before `--` carry no `--subscription-pool`.
+/// Combined with a router flag it is a usage error (`Unavailable`).
+fn parse_subscription_claude(args: &[OsString]) -> Option<RaylineDispatch> {
+    let mut pool = None;
+    let mut rest = Vec::with_capacity(args.len());
+    // `raydock claude run ...` is an alias of `raydock claude ...`.
+    let args = match args.first().and_then(|arg| arg.to_str()) {
+        Some("run") => &args[1..],
+        _ => args,
+    };
+    let mut after_separator = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let Some(text) = arg.to_str() else {
+            rest.push(arg.clone());
+            continue;
+        };
+        if text == "--" {
+            // Like the router path, `--` only ends Raydock's options; Claude
+            // Code receives what follows it as its own arguments.
+            after_separator.extend(iter.by_ref().cloned());
+            break;
+        }
+        if text == "--subscription-pool" {
+            pool = Some("default".to_owned());
+        } else if let Some(value) = text.strip_prefix("--subscription-pool=") {
+            pool = Some(value.to_owned());
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let pool = pool?;
+    let router_flag = rest
+        .iter()
+        .filter_map(|arg| arg.to_str())
+        .map(|arg| arg.split_once('=').map_or(arg, |(flag, _)| flag))
+        .find(|flag| ROUTER_ONLY_CLAUDE_FLAGS.contains(flag));
+    if pool.is_empty() {
+        return Some(RaylineDispatch::SubscriptionClaudeUsage(
+            "--subscription-pool= needs a pool name".to_owned(),
+        ));
+    }
+    if let Some(flag) = router_flag {
+        return Some(RaylineDispatch::SubscriptionClaudeUsage(format!(
+            "{flag} routes through the Rayline router and cannot be combined with --subscription-pool; put Claude Code's own arguments after --"
+        )));
+    }
+    rest.extend(after_separator);
+    Some(RaylineDispatch::SubscriptionClaude { pool, args: rest })
 }
 
 fn parse_claude_dispatch<'a, I>(
@@ -2469,6 +2604,69 @@ mod tests {
     }
 
     use crate::claude::RoutingMode;
+
+    #[test]
+    fn subscription_pool_launches_claude_on_the_csub_gateway() {
+        let RaylineDispatch::SubscriptionClaude { pool, args } =
+            rayline_dispatch_for_argv(&argv(&[
+                "raydock",
+                "claude",
+                "--subscription-pool",
+                "--model",
+                "opus",
+                "-p",
+                "hi",
+            ]))
+        else {
+            panic!("expected SubscriptionClaude");
+        };
+        assert_eq!(pool, "default");
+        assert_eq!(args, argv(&["--model", "opus", "-p", "hi"]));
+
+        let RaylineDispatch::SubscriptionClaude { pool, args } =
+            rayline_dispatch_for_argv(&argv(&[
+                "raydock",
+                "claude",
+                "run",
+                "--subscription-pool=work",
+                "--",
+                "-p",
+                "--local",
+            ]))
+        else {
+            panic!("expected SubscriptionClaude");
+        };
+        assert_eq!(pool, "work");
+        assert_eq!(args, argv(&["-p", "--local"]));
+    }
+
+    #[test]
+    fn subscription_pool_refuses_router_flags() {
+        for flag in ["--local", "--via=env", "--route", "--isolated"] {
+            assert!(
+                matches!(
+                    rayline_dispatch_for_argv(&argv(&[
+                        "raydock",
+                        "claude",
+                        "--subscription-pool",
+                        flag
+                    ])),
+                    RaylineDispatch::SubscriptionClaudeUsage(_)
+                ),
+                "{flag}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscriptions_forwards_to_the_csub_command_line() {
+        let RaylineDispatch::Subscriptions(args) =
+            rayline_dispatch_for_argv(&argv(&["raydock", "subscriptions", "status", "--json"]))
+        else {
+            panic!("expected Subscriptions");
+        };
+        assert_eq!(args, argv(&["status", "--json"]));
+    }
 
     fn claude_run(args: &[&str]) -> crate::claude::RunRequest {
         let RaylineDispatch::ClaudeRun(request) = rayline_dispatch_for_argv(&argv(args)) else {
