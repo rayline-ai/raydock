@@ -723,7 +723,11 @@ fn write_file_atomic(
             source,
         })?;
         set_private_file_permissions(path)?;
-        sync_directory(parent)
+        // The replacement is committed once renamed; the caller must record
+        // it as saved. A failed directory sync only weakens crash durability,
+        // so it is not reported as a failed save.
+        let _ = sync_directory(parent);
+        Ok(())
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&temp_path);
