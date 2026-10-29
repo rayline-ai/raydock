@@ -5,14 +5,28 @@
 use std::ffi::OsString;
 use std::path::Path;
 
-/// `--bg`/`--background` or `claude agents` hand work to the supervisor; a
-/// foreground session never touches it. Matched on any argument, since
-/// options may precede the `agents` subcommand: a false positive only adds a
-/// check, a false negative would skip it.
+/// `--bg`/`--background`/`--routine`, `claude agents` and the background
+/// session verbs (Claude Code's own set: `attach`, `logs`, `stop`, `kill`,
+/// `respawn`, `rm`) go through the supervisor; a foreground session never
+/// touches it. Matched on any argument, since options may precede a
+/// subcommand: a false positive only adds a check, a false negative would
+/// skip it.
 pub fn starts_background_session(args: &[OsString]) -> bool {
-    args.iter()
-        .filter_map(|arg| arg.to_str())
-        .any(|arg| matches!(arg, "agents" | "--bg" | "--background"))
+    args.iter().filter_map(|arg| arg.to_str()).any(|arg| {
+        matches!(
+            arg,
+            "agents"
+                | "--bg"
+                | "--background"
+                | "--routine"
+                | "attach"
+                | "logs"
+                | "stop"
+                | "kill"
+                | "respawn"
+                | "rm"
+        ) || arg.starts_with("--routine=")
+    })
 }
 
 /// Refuses when a live supervisor for `config_dir` is not on the csub gateway
@@ -24,15 +38,31 @@ pub fn check(config_dir: &Path, port: u16) -> Result<(), String> {
     let Some(pid) = running_supervisor(config_dir) else {
         return Ok(());
     };
-    verdict(pid, read_base_url(pid), port)
+    verdict(pid, read_env(pid), port)
 }
 
-fn verdict(pid: u32, base_url: Option<Option<String>>, port: u16) -> Result<(), String> {
+/// The supervisor keeps its own environment, so it must carry the gateway URL
+/// and none of the variables a pool launch withholds (a provider switch or
+/// `ANTHROPIC_UNIX_SOCKET` would route around the URL).
+fn verdict(pid: u32, env: Option<Vec<(String, String)>>, port: u16) -> Result<(), String> {
     let gateway = format!("http://127.0.0.1:{port}/l/");
-    let why = match base_url {
-        Some(Some(url)) if url.starts_with(&gateway) => return Ok(()),
-        Some(_) => "that is not on the subscription pool",
-        None => "whose environment cannot be inspected",
+    let why = match env {
+        None => "whose environment cannot be inspected".to_owned(),
+        Some(env) => {
+            let base_url = env
+                .iter()
+                .rev()
+                .find(|(name, _)| name == "ANTHROPIC_BASE_URL")
+                .map(|(_, value)| value.as_str());
+            let withheld = env
+                .iter()
+                .find(|(name, _)| crate::launch::WITHHELD_ENV.contains(&name.as_str()));
+            match (base_url, withheld) {
+                (Some(url), None) if url.starts_with(&gateway) => return Ok(()),
+                (_, Some((name, _))) => format!("whose environment sets {name}"),
+                _ => "that is not on the subscription pool".to_owned(),
+            }
+        }
     };
     Err(format!(
         "a Claude Code background supervisor (pid {pid}) {why} is running; background sessions from this launch would reuse it. Stop it with `claude daemon stop --any` and launch again."
@@ -81,17 +111,21 @@ fn pid_is_alive(pid: u32) -> bool {
     }
 }
 
-/// `None` when the environment cannot be read; `Some(None)` when it has no
-/// `ANTHROPIC_BASE_URL`.
-fn read_base_url(pid: u32) -> Option<Option<String>> {
+/// The process environment as `NAME=value` pairs; `None` when it cannot be
+/// read. Values are only compared, never logged.
+fn read_env(pid: u32) -> Option<Vec<(String, String)>> {
+    let pair = |entry: &str| {
+        entry
+            .split_once('=')
+            .map(|(name, value)| (name.to_owned(), value.trim().to_owned()))
+    };
     #[cfg(target_os = "linux")]
     {
         let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
         Some(
             raw.split(|byte| *byte == 0)
-                .filter_map(|entry| entry.strip_prefix(b"ANTHROPIC_BASE_URL="))
-                .map(|value| String::from_utf8_lossy(value).into_owned())
-                .next_back(),
+                .filter_map(|entry| pair(&String::from_utf8_lossy(entry)))
+                .collect(),
         )
     }
     #[cfg(target_os = "macos")]
@@ -107,16 +141,13 @@ fn read_base_url(pid: u32) -> Option<Option<String>> {
         if line.trim().is_empty() {
             return None;
         }
-        Some(
-            line.split(' ')
-                .filter_map(|token| token.strip_prefix("ANTHROPIC_BASE_URL="))
-                .map(|value| value.trim().to_owned())
-                .next_back(),
-        )
+        // ps does not delimit variables; space-separated `NAME=` tokens are
+        // the best split (a stray match only refuses).
+        Some(line.split(' ').filter_map(pair).collect())
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = pid;
+        let _ = (pid, pair);
         None
     }
 }
@@ -138,6 +169,9 @@ mod tests {
             "--background"
         ])));
         assert!(starts_background_session(&args(&["agents"])));
+        assert!(starts_background_session(&args(&["respawn", "--all"])));
+        assert!(starts_background_session(&args(&["attach", "abc"])));
+        assert!(starts_background_session(&args(&["--routine=nightly"])));
         assert!(starts_background_session(&args(&[
             "--model", "opus", "agents"
         ])));
@@ -157,13 +191,33 @@ mod tests {
 
     #[test]
     fn reuses_only_a_supervisor_on_the_csub_gateway() {
-        let url = |value: &str| Some(Some(value.to_owned()));
+        let env = |pairs: &[(&str, &str)]| {
+            Some(
+                pairs
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let url = |value: &str| env(&[("HOME", "/h"), ("ANTHROPIC_BASE_URL", value)]);
         assert!(verdict(7, url("http://127.0.0.1:20816/l/abc"), 20816).is_ok());
         assert!(verdict(7, url("http://127.0.0.1:20817/l/abc"), 20816).is_err());
         assert!(verdict(7, url("https://gateway.example"), 20816).is_err());
-        let error = verdict(7, Some(None), 20816).expect_err("plain supervisor");
+        let error = verdict(7, env(&[("HOME", "/h")]), 20816).expect_err("plain supervisor");
         assert!(error.contains("claude daemon stop --any"), "{error}");
         assert!(verdict(7, None, 20816).is_err());
+        // On the gateway URL, but a withheld variable routes around it.
+        let error = verdict(
+            7,
+            env(&[
+                ("ANTHROPIC_BASE_URL", "http://127.0.0.1:20816/l/abc"),
+                ("ANTHROPIC_UNIX_SOCKET", "/tmp/s"),
+            ]),
+            20816,
+        )
+        .expect_err("withheld variable");
+        assert!(error.contains("ANTHROPIC_UNIX_SOCKET"), "{error}");
+        assert!(!error.contains("/tmp/s"), "{error}");
     }
 
     #[test]

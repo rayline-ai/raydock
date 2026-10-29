@@ -6,6 +6,7 @@ use std::process::{Command, ExitCode};
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
+use rayline_subscriptions::CredentialStore;
 
 use crate::app::Frontend;
 use crate::gateway::LAUNCH_PREFIX;
@@ -14,7 +15,7 @@ use crate::gateway::LAUNCH_PREFIX;
 /// OAuth login (so its requests would no longer be pool-placed), provider
 /// credentials it has no use for on the pool, and Rayline router keys it must
 /// never see. Names checked against Claude Code 2.1.312.
-const WITHHELD_ENV: &[&str] = &[
+pub(crate) const WITHHELD_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_UNIX_SOCKET",
@@ -264,6 +265,35 @@ fn refuse_settings_flags(args: &[OsString]) -> anyhow::Result<()> {
                 "{flag} cannot be combined with the subscription pool, which passes its own --settings to pin the gateway URL"
             );
         }
+        // Moves the session to another directory after these checks ran on
+        // this one; launch from that directory instead.
+        if flag == "--deep-link-cwd-b64" {
+            bail!(
+                "{flag} cannot be combined with the subscription pool; launch from the target directory instead"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A stored Cloud gateway sign-in (`enterpriseGateway` in the profile's
+/// credentials) makes Claude Code send inference to that gateway, whatever
+/// `ANTHROPIC_BASE_URL` says.
+async fn refuse_gateway_sign_in() -> anyhow::Result<()> {
+    let Some(config_dir) = claude_config_dir().filter(|dir| dir.is_dir()) else {
+        return Ok(());
+    };
+    let shown = config_dir.display().to_string();
+    let signed_in = tokio::task::spawn_blocking(move || {
+        CredentialStore::new(&config_dir)?.source_has_top_level_key("enterpriseGateway")
+    })
+    .await
+    .context("check the Claude Code sign-in")?
+    .map_err(|error| anyhow!("cannot check the Claude Code sign-in in {shown}: {error}"))?;
+    if signed_in {
+        bail!(
+            "the Claude Code profile in {shown} is signed in to a Cloud gateway, which takes precedence over the subscription pool; run `claude auth logout` or launch without the pool"
+        );
     }
     Ok(())
 }
@@ -282,6 +312,7 @@ pub async fn claude(
     let mut files = settings_files(&project_roots(&cwd));
     files.extend(mdm_policies().into_iter().map(|path| (path, Tier::Managed)));
     check_settings_env(&files, background)?;
+    refuse_gateway_sign_in().await?;
     if background {
         if let Some(config_dir) = claude_config_dir() {
             crate::supervisor::check(&config_dir, port).map_err(|message| anyhow!(message))?;
@@ -555,6 +586,8 @@ mod tests {
         assert!(refuse_settings_flags(&args(&["--settings=x.json"])).is_err());
         assert!(refuse_settings_flags(&args(&["--managed-settings", "{}"])).is_err());
         assert!(refuse_settings_flags(&args(&["--project-config-root=/other"])).is_err());
+        assert!(refuse_settings_flags(&args(&["--deep-link-cwd-b64", "L3Q="])).is_err());
+        assert!(refuse_settings_flags(&args(&["--deep-link-cwd-b64=L3Q="])).is_err());
         assert!(
             refuse_settings_flags(&args(&["--system-prompt", "--", "--settings", "{}"])).is_err()
         );

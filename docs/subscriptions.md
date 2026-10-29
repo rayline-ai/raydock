@@ -32,17 +32,21 @@ This runs `claude` with
 `ANTHROPIC_BASE_URL=http://127.0.0.1:20816/l/<launch-id>`. No CA, `HTTPS_PROXY`
 or Rayline router is involved, so router flags (`--local`, `--via`, `--route`,
 `--isolated`, …) are rejected alongside it. All other arguments go to `claude`
-unchanged, except `--settings`, `--managed-settings` and `--project-config-root`,
-which are refused: the launcher passes its own `--settings` so the gateway URL
-wins over user and project settings.
+unchanged, except `--settings`, `--managed-settings`, `--project-config-root`
+and `--deep-link-cwd-b64`, which are refused: the launcher passes its own
+`--settings` so the gateway URL wins over user and project settings, and checks
+settings for the directory it starts in. A profile signed in to a Cloud
+gateway (`claude auth logout` clears it) is refused too, since that sign-in
+outranks `ANTHROPIC_BASE_URL`.
 
 The launch is refused when a settings `env` block (managed, user, project,
 local, or the global `~/.claude.json`) sets an API key, a cloud provider switch
 (Bedrock, Vertex, Foundry, …) or a provider credential; when managed settings
 (or, for `--bg`, any settings) set `ANTHROPIC_BASE_URL`; or when managed
 settings use a `policyHelper`. The same variables are removed from the inherited
-environment. A `--bg` launch (via raydock or `csub claude`) is also refused while Claude
-Code's background supervisor runs off the pool; stop it with
+environment. A `--bg`, `agents` or background-session (`attach`, `respawn`, …) launch is
+also refused while Claude Code's background supervisor runs off the pool (or
+carries a withheld variable); stop it with
 `claude daemon stop --any` first.
 
 A request moves to another account only when Anthropic rejects it before
