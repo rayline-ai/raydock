@@ -131,24 +131,33 @@ impl CredentialStore {
         transaction.save_if_unchanged(document)
     }
 
+    /// Claude Code saves its own logins without Rayline's lock, so no store
+    /// offers a true compare-and-swap. The check is therefore repeated as late
+    /// as the store allows: after serializing, and for files again after the
+    /// replacement is staged and immediately before the rename. A login saved
+    /// earlier than that is never overwritten; the remaining window is the
+    /// rename (or Keychain update) syscall itself.
     fn save_unlocked(&self, document: &mut CredentialDocument) -> Result<(), CredentialError> {
         validate_config_directory(&self.config_dir)?;
-        let current = Zeroizing::new(self.read_origin(&document.origin)?);
-        let actual_version = credential_fingerprint(&current);
-        if actual_version != document.version {
-            return Err(CredentialError::ConcurrentUpdate {
-                config_dir: self.config_dir.clone(),
-            });
-        }
-
         let serialized = Zeroizing::new(
             serde_json::to_vec(&document.value).map_err(CredentialError::Serialize)?,
         );
         if serialized.len() as u64 > MAX_CREDENTIAL_BYTES {
             return Err(CredentialError::CredentialPayloadTooLarge);
         }
+        let still_current = || -> Result<(), CredentialError> {
+            let current = Zeroizing::new(self.read_origin(&document.origin)?);
+            if credential_fingerprint(&current) == document.version {
+                Ok(())
+            } else {
+                Err(CredentialError::ConcurrentUpdate {
+                    config_dir: self.config_dir.clone(),
+                })
+            }
+        };
+        still_current()?;
         match &document.origin {
-            CredentialOrigin::File(path) => write_file_atomic(path, &serialized)?,
+            CredentialOrigin::File(path) => write_file_atomic(path, &serialized, still_current)?,
             #[cfg(target_os = "macos")]
             CredentialOrigin::Keychain { service, account } => {
                 keychain::write_password(service, account, &serialized)
@@ -662,7 +671,14 @@ fn keychain_service_for_dir(config_dir: &Path) -> String {
     format!("{CLAUDE_KEYCHAIN_SERVICE_PREFIX}{}", &digest[..8])
 }
 
-fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
+/// Stages `bytes` beside `path`, runs `before_replace` as the last check, then
+/// renames over `path` and syncs the directory so a reported save survives a
+/// crash (a lost rename would resurrect an already-rotated refresh grant).
+fn write_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+    before_replace: impl FnOnce() -> Result<(), CredentialError>,
+) -> Result<(), CredentialError> {
     let parent = path
         .parent()
         .ok_or_else(|| CredentialError::UnsafeCredentialFile(path.to_owned()))?;
@@ -694,6 +710,7 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
                 path: temp_path.clone(),
                 source,
             })?;
+        before_replace()?;
         #[cfg(windows)]
         if path.exists() {
             fs::remove_file(path).map_err(|source| CredentialError::Write {
@@ -705,12 +722,28 @@ fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), CredentialError> {
             path: path.to_owned(),
             source,
         })?;
-        set_private_file_permissions(path)
+        set_private_file_permissions(path)?;
+        sync_directory(parent)
     })();
     if write_result.is_err() {
         let _ = fs::remove_file(&temp_path);
     }
     write_result
+}
+
+fn sync_directory(directory: &Path) -> Result<(), CredentialError> {
+    #[cfg(unix)]
+    {
+        File::open(directory)
+            .and_then(|handle| handle.sync_all())
+            .map_err(|source| CredentialError::Write {
+                path: directory.to_owned(),
+                source,
+            })?;
+    }
+    #[cfg(not(unix))]
+    let _ = directory;
+    Ok(())
 }
 
 fn set_private_file_permissions(path: &Path) -> Result<(), CredentialError> {
@@ -1018,6 +1051,31 @@ mod tests {
             store.save_if_unchanged(&mut document),
             Err(CredentialError::ConcurrentUpdate { .. })
         ));
+    }
+
+    #[test]
+    fn a_login_saved_while_the_replacement_is_staged_is_kept() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(CREDENTIAL_FILE_NAME);
+        let external = credential_json("access-external", "refresh-external", 3000);
+        let result = write_file_atomic(&path, b"{\"ours\":true}", || {
+            // Claude Code saves a fresh login after our check, mid-write.
+            fs::write(&path, &external).expect("external save");
+            Err(CredentialError::ConcurrentUpdate {
+                config_dir: dir.path().to_owned(),
+            })
+        });
+        assert!(matches!(
+            result,
+            Err(CredentialError::ConcurrentUpdate { .. })
+        ));
+        assert_eq!(fs::read(&path).expect("read"), external);
+        let leftovers = fs::read_dir(dir.path())
+            .expect("list")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0, "staged file is removed");
     }
 
     #[cfg(unix)]

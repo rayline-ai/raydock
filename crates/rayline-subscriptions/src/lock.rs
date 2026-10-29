@@ -186,46 +186,61 @@ fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
 }
 
 /// Another user able to rename an entry anywhere above the state directory
-/// could swap it under a running owner, so every existing ancestor (resolved
-/// through symlinks) must be ours or root's and not writable by others unless
-/// it is sticky. Missing components below them are created by us, privately.
+/// could swap it under a running owner, so every existing ancestor must be
+/// ours or root's and not writable by others unless it is sticky. That holds
+/// for the directories the path resolves to and, because a symlink is only as
+/// fixed as the directory holding it, for every directory that holds a
+/// symlink along the path as written (whose own owner must be trusted too).
+/// Missing components below them are created by us, privately.
 fn validate_trusted_ancestors(parent: &Path) -> Result<(), PoolLockError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        let mut existing = parent;
-        let resolved = loop {
-            match fs::canonicalize(existing) {
-                Ok(resolved) => break resolved,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    match existing
-                        .parent()
-                        .filter(|next| !next.as_os_str().is_empty())
-                    {
-                        Some(next) => existing = next,
-                        None => return Ok(()),
-                    }
-                }
-                Err(source) => {
-                    return Err(PoolLockError::StateDir {
-                        path: existing.to_owned(),
-                        source,
-                    });
-                }
-            }
-        };
         // SAFETY: geteuid has no arguments or memory safety preconditions.
         let euid = unsafe { libc::geteuid() };
-        for ancestor in resolved.ancestors() {
-            let metadata = fs::metadata(ancestor).map_err(|source| PoolLockError::StateDir {
-                path: ancestor.to_owned(),
-                source,
-            })?;
+        let state_error = |path: &Path, source| PoolLockError::StateDir {
+            path: path.to_owned(),
+            source,
+        };
+        let trusted = |metadata: &fs::Metadata| {
             let owner_trusted = metadata.uid() == euid || metadata.uid() == 0;
             let shared_writable = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
-            if !owner_trusted || shared_writable {
-                return Err(PoolLockError::UnsafeStateDir(ancestor.to_owned()));
+            owner_trusted && !shared_writable
+        };
+        let check_resolved = |path: &Path| -> Result<(), PoolLockError> {
+            let resolved = fs::canonicalize(path).map_err(|source| state_error(path, source))?;
+            for ancestor in resolved.ancestors() {
+                let metadata =
+                    fs::metadata(ancestor).map_err(|source| state_error(ancestor, source))?;
+                if !trusted(&metadata) {
+                    return Err(PoolLockError::UnsafeStateDir(ancestor.to_owned()));
+                }
             }
+            Ok(())
+        };
+
+        let mut prefix = std::path::PathBuf::new();
+        let mut deepest_existing = None;
+        for component in parent.components() {
+            prefix.push(component);
+            let metadata = match fs::symlink_metadata(&prefix) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(source) => return Err(state_error(&prefix, source)),
+            };
+            if metadata.file_type().is_symlink() {
+                let owner_trusted = metadata.uid() == euid || metadata.uid() == 0;
+                if !owner_trusted {
+                    return Err(PoolLockError::UnsafeStateDir(prefix.clone()));
+                }
+                if let Some(holder) = prefix.parent() {
+                    check_resolved(holder)?;
+                }
+            }
+            deepest_existing = Some(prefix.clone());
+        }
+        if let Some(existing) = deepest_existing {
+            check_resolved(&existing)?;
         }
     }
     #[cfg(not(unix))]
@@ -340,6 +355,28 @@ mod tests {
             PoolLock::try_acquire(temp.path(), "default"),
             Err(PoolLockError::Open { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_symlink_held_by_a_shared_writable_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let trusted = temp.path().join("trusted");
+        fs::create_dir(&trusted).expect("trusted dir");
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).expect("shared dir");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
+        // The link resolves somewhere trusted, but anyone could re-point it.
+        std::os::unix::fs::symlink(&trusted, shared.join("link")).expect("symlink");
+        assert!(matches!(
+            PoolLock::try_acquire(&shared.join("link/state"), "default"),
+            Err(PoolLockError::UnsafeStateDir(_))
+        ));
+        // A link held by a private directory is fine.
+        std::os::unix::fs::symlink(&trusted, temp.path().join("private-link")).expect("symlink");
+        PoolLock::try_acquire(&temp.path().join("private-link/state"), "default")
+            .expect("link in a private directory");
     }
 
     #[cfg(unix)]
