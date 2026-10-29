@@ -571,6 +571,9 @@ impl SubscriptionPoolRuntime {
     pub async fn quiesce_credentials(&self) -> Vec<String> {
         let mut unsaved = Vec::new();
         for account in &self.accounts {
+            account.oauth_closed.store(true, Ordering::SeqCst);
+        }
+        for account in &self.accounts {
             // Err only when already closed, which is what we want anyway.
             let permit = account.refresh_gate.acquire().await;
             if permit.is_ok() {
@@ -1027,6 +1030,10 @@ struct AccountWorker {
     credential: Mutex<Option<CredentialDocument>>,
     rejected_refresh_grant: Mutex<Option<SecretString>>,
     refresh_gate: Arc<Semaphore>,
+    /// Set for every account before shutdown waits on any gate, so a request
+    /// still open cannot start an OAuth refresh on an account quiesce has not
+    /// reached yet.
+    oauth_closed: AtomicBool,
     state: RwLock<RoutingState>,
     generation: AtomicU64,
     durable_recovery_revision: AtomicU64,
@@ -1070,6 +1077,7 @@ impl AccountWorker {
             store,
             credential: Mutex::new(None),
             refresh_gate: Arc::new(Semaphore::new(1)),
+            oauth_closed: AtomicBool::new(false),
             rejected_refresh_grant: Mutex::new(None),
             generation: AtomicU64::new(0),
             persistence_pending: AtomicBool::new(false),
@@ -1223,6 +1231,9 @@ impl AccountWorker {
             .acquire_owned()
             .await
             .map_err(|_| SubscriptionRuntimeError::RuntimeClosed)?;
+        if self.oauth_closed.load(Ordering::SeqCst) {
+            return Err(SubscriptionRuntimeError::RuntimeClosed);
+        }
         let health = self.state().credential_health;
         let valid = self.credential_valid();
         let current = self.current_access_token().ok();
