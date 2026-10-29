@@ -30,7 +30,11 @@ pub const DEFAULT_PORT: u16 = 20816;
 /// Longest wait on shutdown, for in-flight requests and credential refreshes
 /// together. The launchd job's ExitTimeOut (60s) is longer, so launchd never
 /// kills a daemon that is draining or finishing a refresh.
-pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(45);
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(50);
+
+/// The share of `SHUTDOWN_GRACE` that draining may use. A long stream can
+/// hold the drain to its limit; the remainder is kept for credential work.
+const DRAIN_GRACE: Duration = Duration::from_secs(30);
 
 /// Exit status when another process already owns the pool. launchd retries
 /// after its throttle interval, so a supervisor never starts a second owner.
@@ -163,13 +167,14 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
     }
     // One deadline covers draining and waiting for refreshes, so the whole
     // shutdown stays inside launchd's ExitTimeOut.
-    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    let started = tokio::time::Instant::now();
+    let deadline = started + SHUTDOWN_GRACE;
     info!("csub shutting down; draining connections (signal again to stop now)");
     let mut forced = false;
     tokio::select! {
-        result = tokio::time::timeout_at(deadline, graceful.shutdown()) => {
+        result = tokio::time::timeout_at(started + DRAIN_GRACE, graceful.shutdown()) => {
             if result.is_err() {
-                warn!("connections still open after {SHUTDOWN_GRACE:?}; stopping anyway");
+                warn!("connections still open after {DRAIN_GRACE:?}; stopping anyway");
             }
         }
         () = signals.recv() => {
