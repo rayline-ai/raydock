@@ -6,13 +6,13 @@ use std::ffi::OsString;
 use std::path::Path;
 
 /// `--bg`/`--background` or `claude agents` hand work to the supervisor; a
-/// foreground session never touches it.
+/// foreground session never touches it. Matched on any argument, since
+/// options may precede the `agents` subcommand: a false positive only adds a
+/// check, a false negative would skip it.
 pub fn starts_background_session(args: &[OsString]) -> bool {
-    args.first().and_then(|arg| arg.to_str()) == Some("agents")
-        || args
-            .iter()
-            .filter_map(|arg| arg.to_str())
-            .any(|arg| arg == "--bg" || arg == "--background")
+    args.iter()
+        .filter_map(|arg| arg.to_str())
+        .any(|arg| matches!(arg, "agents" | "--bg" | "--background"))
 }
 
 /// Refuses when a live supervisor for `config_dir` is not on the csub gateway
@@ -134,7 +134,10 @@ mod tests {
             "--background"
         ])));
         assert!(starts_background_session(&args(&["agents"])));
-        assert!(!starts_background_session(&args(&["-p", "agents"])));
+        assert!(starts_background_session(&args(&[
+            "--model", "opus", "agents"
+        ])));
+        assert!(!starts_background_session(&args(&["-p", "hello"])));
         assert!(!starts_background_session(&args(&[])));
     }
 

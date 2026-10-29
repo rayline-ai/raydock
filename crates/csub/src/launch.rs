@@ -41,38 +41,138 @@ fn claude_config_dir() -> Option<PathBuf> {
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
 }
 
-fn settings_files(cwd: &Path) -> Vec<(PathBuf, bool)> {
-    let mut files = vec![(
-        PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.json"),
-        true,
-    )];
-    if let Some(config_dir) = claude_config_dir() {
-        files.push((config_dir.join("settings.json"), false));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tier {
+    /// Managed policy outranks our `--settings`, so it may not set the URL.
+    Managed,
+    /// User, project and local settings; our `--settings` overrides them in
+    /// the foreground session.
+    Overridable,
+}
+
+/// Project roots Claude Code reads `.claude/settings*.json` from: the working
+/// directory, its git top level, and, in a linked worktree, the main checkout
+/// (whose local settings Claude Code also applies).
+fn project_roots(cwd: &Path) -> Vec<PathBuf> {
+    let mut roots = vec![cwd.to_owned()];
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--git-common-dir",
+        ])
+        .output();
+    if let Some(output) = output.ok().filter(|output| output.status.success()) {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut lines = text.lines();
+        if let Some(top) = lines.next() {
+            roots.push(PathBuf::from(top));
+        }
+        if let Some(main) = lines.next().and_then(|common| Path::new(common).parent()) {
+            roots.push(main.to_owned());
+        }
     }
-    for directory in cwd.ancestors() {
-        files.push((directory.join(".claude/settings.json"), false));
-        files.push((directory.join(".claude/settings.local.json"), false));
+    roots.dedup();
+    roots
+}
+
+#[cfg(target_os = "macos")]
+const MANAGED_DIR: &str = "/Library/Application Support/ClaudeCode";
+#[cfg(not(target_os = "macos"))]
+const MANAGED_DIR: &str = "/etc/claude-code";
+
+fn settings_files(roots: &[PathBuf]) -> Vec<(PathBuf, Tier)> {
+    let managed = Path::new(MANAGED_DIR);
+    let mut files = vec![(managed.join("managed-settings.json"), Tier::Managed)];
+    if let Ok(entries) = std::fs::read_dir(managed.join("managed-settings.d")) {
+        let mut drop_ins = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect::<Vec<_>>();
+        drop_ins.sort();
+        files.extend(drop_ins.into_iter().map(|path| (path, Tier::Managed)));
+    }
+    if let Some(config_dir) = claude_config_dir() {
+        files.push((config_dir.join("settings.json"), Tier::Overridable));
+    }
+    for root in roots {
+        files.push((root.join(".claude/settings.json"), Tier::Overridable));
+        files.push((root.join(".claude/settings.local.json"), Tier::Overridable));
     }
     files
 }
 
-/// Refuses a launch whose settings would re-introduce a withheld variable or,
-/// from managed policy, override the gateway URL. Names only, never values.
-fn check_settings_env(files: &[(PathBuf, bool)]) -> anyhow::Result<()> {
-    for (path, managed) in files {
-        let managed = *managed;
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let Ok(settings) = serde_json::from_str::<serde_json::Value>(&text) else {
+/// MDM-delivered managed policy (macOS configuration profiles).
+fn mdm_policies() -> Vec<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut paths = vec![PathBuf::from(
+            "/Library/Managed Preferences/com.anthropic.claudecode.plist",
+        )];
+        if let Ok(user) = std::env::var("USER") {
+            paths.push(
+                Path::new("/Library/Managed Preferences")
+                    .join(user)
+                    .join("com.anthropic.claudecode.plist"),
+            );
+        }
+        paths.retain(|path| path.exists());
+        paths
+    }
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
+}
+
+fn read_settings(path: &Path) -> anyhow::Result<Option<serde_json::Value>> {
+    let text = if path.extension().is_some_and(|ext| ext == "plist") {
+        let output = Command::new("/usr/bin/plutil")
+            .args(["-convert", "json", "-o", "-"])
+            .arg(path)
+            .output()
+            .with_context(|| format!("read {}", path.display()))?;
+        if !output.status.success() {
+            bail!("{} cannot be read as a property list", path.display());
+        }
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    } else {
+        match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(anyhow!(error).context(format!("read {}", path.display())));
+            }
+        }
+    };
+    // Claude Code accepts a leading byte-order mark; an unreadable file is
+    // refused rather than skipped, since it cannot be shown to be harmless.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(text).map(Some).map_err(|_| {
+        anyhow!(
+            "{} is not valid JSON; csub cannot check its env block",
+            path.display()
+        )
+    })
+}
+
+/// Refuses a launch whose settings would re-introduce a withheld variable or
+/// move Claude Code off the gateway: managed policy outranks our
+/// `--settings`, and background sessions may not receive it at all. Names
+/// only, never values.
+fn check_settings_env(files: &[(PathBuf, Tier)], background: bool) -> anyhow::Result<()> {
+    for (path, tier) in files {
+        let Some(settings) = read_settings(path)? else {
             continue;
         };
         let Some(env) = settings.get("env").and_then(|env| env.as_object()) else {
             continue;
         };
         for name in env.keys() {
-            let overrides_url = managed && name == "ANTHROPIC_BASE_URL";
-            if overrides_url || WITHHELD_ENV.contains(&name.as_str()) {
+            let redirects = name == "ANTHROPIC_BASE_URL" && (*tier == Tier::Managed || background);
+            if redirects || WITHHELD_ENV.contains(&name.as_str()) {
                 bail!(
                     "{} sets {name} in its env block, which would take Claude Code off the subscription pool; remove it or launch without the pool",
                     path.display()
@@ -83,15 +183,14 @@ fn check_settings_env(files: &[(PathBuf, bool)]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn refuse_own_settings_flag(args: &[OsString]) -> anyhow::Result<()> {
-    for arg in args {
-        let Some(arg) = arg.to_str() else { continue };
-        if arg == "--" {
-            break;
-        }
-        if arg == "--settings" || arg.starts_with("--settings=") {
+/// Flags that would replace or outrank the `--settings` the launcher adds.
+/// Checked across every argument: an option value may itself be `--`.
+fn refuse_settings_flags(args: &[OsString]) -> anyhow::Result<()> {
+    for arg in args.iter().filter_map(|arg| arg.to_str()) {
+        let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+        if flag == "--settings" || flag == "--managed-settings" {
             bail!(
-                "--settings cannot be combined with the subscription pool, which passes its own --settings to pin the gateway URL"
+                "{flag} cannot be combined with the subscription pool, which passes its own --settings to pin the gateway URL"
             );
         }
     }
@@ -106,10 +205,13 @@ pub async fn claude(
     port: u16,
     args: Vec<OsString>,
 ) -> anyhow::Result<ExitCode> {
-    refuse_own_settings_flag(&args)?;
+    refuse_settings_flags(&args)?;
+    let background = crate::supervisor::starts_background_session(&args);
     let cwd = std::env::current_dir().context("read the current directory")?;
-    check_settings_env(&settings_files(&cwd))?;
-    if crate::supervisor::starts_background_session(&args) {
+    let mut files = settings_files(&project_roots(&cwd));
+    files.extend(mdm_policies().into_iter().map(|path| (path, Tier::Managed)));
+    check_settings_env(&files, background)?;
+    if background {
         if let Some(config_dir) = claude_config_dir() {
             crate::supervisor::check(&config_dir, port).map_err(|message| anyhow!(message))?;
         }
@@ -245,38 +347,107 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let user = temp.path().join("settings.json");
         let managed = temp.path().join("managed-settings.json");
-        let files = [(managed.clone(), true), (user.clone(), false)];
-        check_settings_env(&files).expect("no settings files");
-        // A user/project gateway URL is overridden by our --settings.
+        let files = [
+            (managed.clone(), Tier::Managed),
+            (user.clone(), Tier::Overridable),
+        ];
+        check_settings_env(&files, false).expect("no settings files");
+        // A user/project gateway URL is overridden by our --settings in the
+        // foreground, but a background session may not receive it.
         std::fs::write(
             &user,
             r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example","OTHER":"1"}}"#,
         )
         .expect("settings");
-        check_settings_env(&files).expect("base URL is pinned by --settings");
+        check_settings_env(&files, false).expect("base URL is pinned by --settings");
+        assert!(check_settings_env(&files, true).is_err());
         // Managed policy outranks --settings.
         std::fs::write(&managed, r#"{"env":{"ANTHROPIC_BASE_URL":"https://gw"}}"#)
             .expect("managed");
-        assert!(check_settings_env(&files).is_err());
+        assert!(check_settings_env(&files, false).is_err());
         std::fs::remove_file(&managed).expect("rm");
-        std::fs::write(&user, r#"{"env":{"ANTHROPIC_API_KEY":"sk-test"}}"#).expect("settings");
-        let error = check_settings_env(&files).expect_err("api key");
+        // A byte-order mark does not hide a withheld variable.
+        std::fs::write(
+            &user,
+            "\u{feff}{\"env\":{\"ANTHROPIC_API_KEY\":\"sk-test\"}}",
+        )
+        .expect("settings");
+        let error = check_settings_env(&files, false).expect_err("api key");
         assert!(error.to_string().contains("ANTHROPIC_API_KEY"), "{error}");
         assert!(!error.to_string().contains("sk-test"), "{error}");
+        // Unparseable settings are refused, not skipped.
+        std::fs::write(&user, "{not json").expect("settings");
+        assert!(check_settings_env(&files, false).is_err());
     }
 
     #[test]
-    fn project_settings_are_found_up_the_tree() {
-        let files = settings_files(Path::new("/a/b"));
-        assert!(files.contains(&(PathBuf::from("/a/b/.claude/settings.json"), false)));
-        assert!(files.contains(&(PathBuf::from("/a/.claude/settings.local.json"), false)));
+    fn project_settings_come_from_the_given_roots_only() {
+        let files = settings_files(&[PathBuf::from("/a/b"), PathBuf::from("/main")]);
+        assert!(files.contains(&(
+            PathBuf::from("/a/b/.claude/settings.json"),
+            Tier::Overridable
+        )));
+        assert!(files.contains(&(
+            PathBuf::from("/main/.claude/settings.local.json"),
+            Tier::Overridable
+        )));
+        assert!(!files.iter().any(|(path, _)| path.starts_with("/a/.claude")));
     }
 
     #[test]
-    fn a_user_settings_flag_is_refused() {
-        assert!(refuse_own_settings_flag(&[OsString::from("--settings=x.json")]).is_err());
-        assert!(refuse_own_settings_flag(&[OsString::from("--settings")]).is_err());
-        refuse_own_settings_flag(&[OsString::from("--model")]).expect("other flags");
+    fn a_linked_worktree_includes_its_main_checkout() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let main = temp.path().join("main");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .expect("git");
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", main.to_str().expect("utf8")]);
+        git(&[
+            "-C",
+            main.to_str().expect("utf8"),
+            "-c",
+            "user.email=t@example.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let linked = temp.path().join("linked");
+        git(&[
+            "-C",
+            main.to_str().expect("utf8"),
+            "worktree",
+            "add",
+            "-q",
+            linked.to_str().expect("utf8"),
+        ]);
+        let roots = project_roots(&linked);
+        let main = main.canonicalize().expect("main");
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.canonicalize().ok() == Some(main.clone())),
+            "{roots:?}"
+        );
+    }
+
+    #[test]
+    fn settings_flags_are_refused_anywhere() {
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(refuse_settings_flags(&args(&["--settings=x.json"])).is_err());
+        assert!(refuse_settings_flags(&args(&["--managed-settings", "{}"])).is_err());
+        assert!(
+            refuse_settings_flags(&args(&["--system-prompt", "--", "--settings", "{}"])).is_err()
+        );
+        refuse_settings_flags(&args(&["--model", "opus"])).expect("other flags");
     }
 
     #[tokio::test]
