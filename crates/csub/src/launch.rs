@@ -36,9 +36,13 @@ const WITHHELD_ENV: &[&str] = &[
 /// environment. The gateway URL is also passed with `--settings`, which wins
 /// over user and project settings but not over managed policy.
 fn claude_config_dir() -> Option<PathBuf> {
-    std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
+    config_dir_override(std::env::var_os("CLAUDE_CONFIG_DIR"))
         .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+}
+
+/// Claude Code tests `CLAUDE_CONFIG_DIR` for truthiness: empty means unset.
+fn config_dir_override(value: Option<OsString>) -> Option<PathBuf> {
+    value.filter(|dir| !dir.is_empty()).map(PathBuf::from)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,9 +126,8 @@ fn settings_files(roots: &[PathBuf]) -> Vec<(PathBuf, Tier)> {
         } else {
             ""
         };
-    if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
+    if let Some(dir) =
+        config_dir_override(std::env::var_os("CLAUDE_CONFIG_DIR")).or_else(dirs::home_dir)
     {
         files.push((dir.join(format!(".claude{suffix}.json")), Tier::Overridable));
     }
@@ -384,6 +387,16 @@ fn new_launch_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_config_dir_is_unset() {
+        assert_eq!(config_dir_override(None), None);
+        assert_eq!(config_dir_override(Some(OsString::new())), None);
+        assert_eq!(
+            config_dir_override(Some(OsString::from("/c"))),
+            Some(PathBuf::from("/c"))
+        );
+    }
 
     #[test]
     fn launch_ids_are_valid_gateway_path_segments() {
