@@ -17,8 +17,6 @@ use time::format_description::well_known::Rfc3339;
 
 use self::forecast::{DepletionForecast, depletion_forecast};
 
-const DEFAULT_SUBSCRIPTION_METRICS_PORT: u16 = 20816;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SubscriptionCommand {
     Add {
@@ -285,7 +283,7 @@ async fn status(
     let status = status_snapshot(
         pool_id,
         pool,
-        subscription_metrics_port(),
+        daemon_port(),
         live_only,
         SubscriptionRuntimeOptions {
             poll_usage_read_only: poll_usage,
@@ -1107,13 +1105,14 @@ fn status_paint(text: &str, ansi: &str, color: bool) -> String {
     }
 }
 
-/// The daemon port the client commands talk to: `CSUB_PORT`, as `csub serve`
-/// reads it, then the legacy Rayline variable, then the default.
-fn subscription_metrics_port() -> u16 {
+/// The port of the running daemon, which serves the status and reload API on
+/// its one listener: `CSUB_PORT`, as `csub serve` reads it, then the legacy
+/// Rayline variable, then the serve default.
+fn daemon_port() -> u16 {
     ["CSUB_PORT", "RAYLINE_SUBSCRIPTION_METRICS_PORT"]
         .iter()
         .find_map(|name| std::env::var(name).ok()?.parse::<u16>().ok())
-        .unwrap_or(DEFAULT_SUBSCRIPTION_METRICS_PORT)
+        .unwrap_or(crate::serve::DEFAULT_PORT)
 }
 
 async fn live_pool_status_at(pool_id: &str, port: u16) -> Option<PoolRuntimeStatus> {
@@ -1137,13 +1136,7 @@ async fn live_pool_status_at(pool_id: &str, port: u16) -> Option<PoolRuntimeStat
 /// profile the user signed in to again is adopted without restarting Claude
 /// Code. Credential work stays in the daemon; this command only reports it.
 async fn reload(pool_id: &str, config_path: Option<&Path>) -> Result<String, String> {
-    reload_at(
-        pool_id,
-        config_path,
-        subscription_metrics_port(),
-        RELOAD_TIMEOUT,
-    )
-    .await
+    reload_at(pool_id, config_path, daemon_port(), RELOAD_TIMEOUT).await
 }
 
 async fn reload_at(
