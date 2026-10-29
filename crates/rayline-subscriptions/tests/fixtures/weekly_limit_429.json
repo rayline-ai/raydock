@@ -1,0 +1,26 @@
+{
+  "status": 429,
+  "headers": {
+    "content-type": "application/json",
+    "x-should-retry": "true",
+    "anthropic-ratelimit-unified-status": "rejected",
+    "anthropic-ratelimit-unified-5h-status": "allowed",
+    "anthropic-ratelimit-unified-5h-utilization": "0.0",
+    "anthropic-ratelimit-unified-7d-status": "rejected",
+    "anthropic-ratelimit-unified-7d-utilization": "1.0",
+    "anthropic-ratelimit-unified-7d-surpassed-threshold": "1.0",
+    "anthropic-ratelimit-unified-representative-claim": "seven_day",
+    "anthropic-ratelimit-unified-reset": "1893459600",
+    "retry-after": "3600",
+    "anthropic-ratelimit-unified-overage-status": "rejected",
+    "anthropic-ratelimit-unified-overage-disabled-reason": "out_of_credits"
+  },
+  "body": {
+    "type": "error",
+    "error": {
+      "type": "rate_limit_error",
+      "message": "This request would exceed your account's rate limit. Please try again later."
+    },
+    "request_id": "<redacted>"
+  }
+}
