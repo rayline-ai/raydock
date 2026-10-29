@@ -31,6 +31,9 @@ pub(crate) const WITHHELD_ENV: &[&str] = &[
     "AWS_BEARER_TOKEN_BEDROCK",
     "RAYLINE_ROUTER_API_KEY",
     "RAYLINE_KEY",
+    // Points Claude Code's secure storage (and so a stored Cloud gateway
+    // sign-in) at another profile than the one checked here.
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
 ];
 
 /// Settings files whose `env` block Claude Code applies over the process
@@ -265,9 +268,12 @@ fn refuse_settings_flags(args: &[OsString]) -> anyhow::Result<()> {
                 "{flag} cannot be combined with the subscription pool, which passes its own --settings to pin the gateway URL"
             );
         }
-        // Moves the session to another directory after these checks ran on
-        // this one; launch from that directory instead.
-        if flag == "--deep-link-cwd-b64" {
+        // Move the session to another directory after these checks ran on
+        // this one; launch from that directory instead. `--tmux` needs
+        // `--worktree`; `-w` may be bundled with other short flags.
+        let short_worktree =
+            !arg.starts_with("--") && arg.starts_with('-') && flag[1..].contains('w');
+        if short_worktree || matches!(flag, "--deep-link-cwd-b64" | "--worktree" | "--tmux") {
             bail!(
                 "{flag} cannot be combined with the subscription pool; launch from the target directory instead"
             );
@@ -588,6 +594,10 @@ mod tests {
         assert!(refuse_settings_flags(&args(&["--project-config-root=/other"])).is_err());
         assert!(refuse_settings_flags(&args(&["--deep-link-cwd-b64", "L3Q="])).is_err());
         assert!(refuse_settings_flags(&args(&["--deep-link-cwd-b64=L3Q="])).is_err());
+        for flag in ["-w", "-w=x", "-pw", "--worktree", "--worktree=x", "--tmux"] {
+            assert!(refuse_settings_flags(&args(&[flag])).is_err(), "{flag}");
+        }
+        refuse_settings_flags(&args(&["-p", "--model", "opus", "write it"])).expect("plain");
         assert!(
             refuse_settings_flags(&args(&["--system-prompt", "--", "--settings", "{}"])).is_err()
         );

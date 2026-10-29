@@ -32,8 +32,8 @@ This runs `claude` with
 `ANTHROPIC_BASE_URL=http://127.0.0.1:20816/l/<launch-id>`. No CA, `HTTPS_PROXY`
 or Rayline router is involved, so router flags (`--local`, `--via`, `--route`,
 `--isolated`, …) are rejected alongside it. All other arguments go to `claude`
-unchanged, except `--settings`, `--managed-settings`, `--project-config-root`
-and `--deep-link-cwd-b64`, which are refused: the launcher passes its own
+unchanged, except `--settings`, `--managed-settings`, `--project-config-root`,
+`--deep-link-cwd-b64` and `-w`/`--worktree`/`--tmux`, which are refused: the launcher passes its own
 `--settings` so the gateway URL wins over user and project settings, and checks
 settings for the directory it starts in. A profile signed in to a Cloud
 gateway (`claude auth logout` clears it) is refused too, since that sign-in
