@@ -256,6 +256,32 @@ async fn cancelled_refresh_retains_owned_transaction_and_single_account_singlefl
 }
 
 #[tokio::test]
+async fn quiesce_waits_for_an_in_flight_refresh_to_persist_and_refuses_new_ones() {
+    let temp = tempfile::tempdir().expect("temp");
+    credentials(&temp.path().join("profile"));
+    let usage = endpoint(false, USAGE, false).await;
+    let token = endpoint(true, GRANT, true).await;
+    let pool = runtime(temp.path(), &usage, &token, false).await;
+    let p = pool.clone();
+    let refresh = tokio::spawn(async move { p.force_refresh("a").await });
+    token.wait().await;
+    // The requester goes away mid-refresh, as on shutdown.
+    refresh.abort();
+    let quiesce = pool.quiesce_credentials();
+    tokio::pin!(quiesce);
+    assert!(futures::poll!(&mut quiesce).is_pending());
+    token.resume();
+    quiesce.await;
+    assert!(
+        std::fs::read_to_string(temp.path().join("profile/.credentials.json"))
+            .expect("saved")
+            .contains("rotated-refresh")
+    );
+    assert!(pool.force_refresh("a").await.is_err());
+    assert_eq!(token.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn peer_runtime_adopts_cross_process_owner_grant_without_second_refresh() {
     let temp = tempfile::tempdir().expect("temp");
     credentials(&temp.path().join("profile"));
