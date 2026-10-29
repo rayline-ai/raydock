@@ -119,7 +119,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(run(cli.command))
+    let code = runtime.block_on(run(cli.command));
+    // Don't let an abandoned blocking write (see serve) hold the exit past
+    // launchd's ExitTimeOut; the process ends right after.
+    runtime.shutdown_timeout(std::time::Duration::from_secs(2));
+    code
 }
 
 async fn run(command: Command) -> ExitCode {
