@@ -475,6 +475,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "csub"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "dirs",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rand 0.9.4",
+ "rayline-subscriptions",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
