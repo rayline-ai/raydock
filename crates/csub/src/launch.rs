@@ -289,11 +289,10 @@ fn refuse_resume_into_hook_worktree(
     files: &[(PathBuf, Tier)],
     args: &[OsString],
 ) -> anyhow::Result<()> {
-    let resumes = args.iter().filter_map(|arg| arg.to_str()).any(|arg| {
-        let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
-        matches!(flag, "--resume" | "--continue" | "--from-pr")
-            || (!arg.starts_with("--") && arg.starts_with('-') && flag[1..].contains(['r', 'c']))
-    });
+    let parsed = crate::claude_args::parse(args);
+    let resumes = ["--resume", "--continue", "--from-pr", "-r", "-c"]
+        .iter()
+        .any(|flag| parsed.has(flag));
     if !resumes {
         return Ok(());
     }
@@ -315,27 +314,23 @@ fn refuse_resume_into_hook_worktree(
     Ok(())
 }
 
-/// Flags that would replace or outrank the `--settings` the launcher adds.
-/// Checked across every argument: an option value may itself be `--`.
+/// Flags that would replace or outrank the `--settings` the launcher adds,
+/// or move the session after these checks. Errors name the flag only.
 fn refuse_settings_flags(args: &[OsString]) -> anyhow::Result<()> {
-    for arg in args.iter().filter_map(|arg| arg.to_str()) {
-        let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
-        // --project-config-root (hidden) reads project settings from a
-        // directory the checks above never see.
-        if matches!(
-            flag,
-            "--settings" | "--managed-settings" | "--project-config-root"
-        ) {
+    let parsed = crate::claude_args::parse(args);
+    // --project-config-root (hidden) reads project settings from a directory
+    // the checks above never see.
+    for flag in ["--settings", "--managed-settings", "--project-config-root"] {
+        if parsed.has(flag) {
             bail!(
                 "{flag} cannot be combined with the subscription pool, which passes its own --settings to pin the gateway URL"
             );
         }
-        // Move the session to another directory after these checks ran on
-        // this one; launch from that directory instead. `--tmux` needs
-        // `--worktree`; `-w` may be bundled with other short flags.
-        let short_worktree =
-            !arg.starts_with("--") && arg.starts_with('-') && flag[1..].contains('w');
-        if short_worktree || matches!(flag, "--deep-link-cwd-b64" | "--worktree" | "--tmux") {
+    }
+    // Move the session to another directory after these checks ran on this
+    // one; launch from that directory instead. `--tmux` needs `--worktree`.
+    for flag in ["--deep-link-cwd-b64", "--worktree", "-w", "--tmux"] {
+        if parsed.has(flag) {
             bail!(
                 "{flag} cannot be combined with the subscription pool; launch from the target directory instead"
             );
@@ -347,17 +342,38 @@ fn refuse_settings_flags(args: &[OsString]) -> anyhow::Result<()> {
 /// A stored Cloud gateway sign-in (`enterpriseGateway` in the profile's
 /// credentials) makes Claude Code send inference to that gateway, whatever
 /// `ANTHROPIC_BASE_URL` says.
+/// Only a positive finding refuses: a source that cannot be read (a locked
+/// keychain over SSH, loose permissions) is reported and the launch goes on.
 async fn refuse_gateway_sign_in() -> anyhow::Result<()> {
-    let Some(config_dir) = claude_config_dir().filter(|dir| dir.is_dir()) else {
+    let Some(config_dir) = claude_config_dir() else {
         return Ok(());
     };
     let shown = config_dir.display().to_string();
-    let signed_in = tokio::task::spawn_blocking(move || {
-        CredentialStore::new(&config_dir)?.source_has_top_level_key("enterpriseGateway")
+    let checked = tokio::task::spawn_blocking(move || {
+        // The keychain item outlives a deleted profile directory, and the
+        // store is keyed on the directory; Claude Code creates it on start.
+        if !config_dir.is_dir() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                builder.mode(0o700);
+            }
+            builder.create(&config_dir).ok()?;
+        }
+        CredentialStore::new(&config_dir)
+            .and_then(|store| store.source_has_top_level_key("enterpriseGateway"))
+            .ok()
     })
     .await
-    .context("check the Claude Code sign-in")?
-    .map_err(|error| anyhow!("cannot check the Claude Code sign-in in {shown}: {error}"))?;
+    .context("check the Claude Code sign-in")?;
+    let Some(signed_in) = checked else {
+        eprintln!(
+            "warning: could not read the Claude Code credentials in {shown} to check for a Cloud gateway sign-in; continuing"
+        );
+        return Ok(());
+    };
     if signed_in {
         bail!(
             "the Claude Code profile in {shown} is signed in to a Cloud gateway, which takes precedence over the subscription pool; run `claude auth logout` or launch without the pool"
@@ -573,6 +589,8 @@ mod tests {
         refuse_resume_into_hook_worktree(&files, &args(&["--continue"])).expect("no hook");
         std::fs::write(&settings, r#"{"hooks":{"WorktreeCreate":[]}}"#).expect("settings");
         refuse_resume_into_hook_worktree(&files, &args(&["-p", "hi"])).expect("not resuming");
+        refuse_resume_into_hook_worktree(&files, &args(&["-p", "explain -crash"]))
+            .expect("prompt text");
         for flag in ["--continue", "--resume=abc", "-r", "-c", "--from-pr"] {
             assert!(
                 refuse_resume_into_hook_worktree(&files, &args(&[flag])).is_err(),
@@ -685,9 +703,14 @@ mod tests {
         assert!(refuse_settings_flags(&args(&["--deep-link-cwd-b64", "L3Q="])).is_err());
         assert!(refuse_settings_flags(&args(&["--deep-link-cwd-b64=L3Q="])).is_err());
         for flag in ["-w", "-w=x", "-pw", "--worktree", "--worktree=x", "--tmux"] {
-            assert!(refuse_settings_flags(&args(&[flag])).is_err(), "{flag}");
+            let error = refuse_settings_flags(&args(&[flag])).expect_err(flag);
+            // Names the flag, never echoes the argument.
+            assert!(!error.to_string().contains("=x"), "{error}");
         }
         refuse_settings_flags(&args(&["-p", "--model", "opus", "write it"])).expect("plain");
+        // Prompt text and option values are not flags.
+        refuse_settings_flags(&args(&["-p", "--name", "-w", "review -w usage"])).expect("values");
+        refuse_settings_flags(&args(&["--append-system-prompt", "--settings"])).expect("value");
         assert!(
             refuse_settings_flags(&args(&["--system-prompt", "--", "--settings", "{}"])).is_err()
         );

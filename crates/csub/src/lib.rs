@@ -5,6 +5,7 @@
 //! daemon, its launchd service, and the `csub claude` launcher.
 
 pub mod app;
+mod claude_args;
 pub mod cli;
 pub mod gateway;
 pub mod launch;

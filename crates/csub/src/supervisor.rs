@@ -12,21 +12,16 @@ use std::path::Path;
 /// subcommand: a false positive only adds a check, a false negative would
 /// skip it.
 pub fn starts_background_session(args: &[OsString]) -> bool {
-    args.iter().filter_map(|arg| arg.to_str()).any(|arg| {
-        matches!(
-            arg,
-            "agents"
-                | "--bg"
-                | "--background"
-                | "--routine"
-                | "attach"
-                | "logs"
-                | "stop"
-                | "kill"
-                | "respawn"
-                | "rm"
-        ) || arg.starts_with("--routine=")
-    })
+    let parsed = crate::claude_args::parse(args);
+    ["--bg", "--background", "--routine"]
+        .iter()
+        .any(|flag| parsed.has(flag))
+        || parsed.first_positional.as_deref().is_some_and(|word| {
+            matches!(
+                word,
+                "agents" | "attach" | "logs" | "stop" | "kill" | "respawn" | "rm"
+            )
+        })
 }
 
 /// Refuses when a live supervisor for `config_dir` is not on the csub gateway
@@ -172,6 +167,10 @@ mod tests {
         assert!(starts_background_session(&args(&["respawn", "--all"])));
         assert!(starts_background_session(&args(&["attach", "abc"])));
         assert!(starts_background_session(&args(&["--routine=nightly"])));
+        assert!(starts_background_session(&args(&["-p", "logs"])));
+        // Only the subcommand position counts, not option values or prompts.
+        assert!(!starts_background_session(&args(&["--name", "logs"])));
+        assert!(!starts_background_session(&args(&["fix it", "logs"])));
         assert!(starts_background_session(&args(&[
             "--model", "opus", "agents"
         ])));
