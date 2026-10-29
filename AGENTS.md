@@ -35,6 +35,8 @@ handlers. Prefer focused modules over growing the existing large CLI/proxy files
 - Use `--router-config-path` when `routes.subagents` is meant to constrain the
   transparent proxy allowlist. Do not rely on `RAYLINE_ROUTER_CONFIG` alone for
   that allowlist.
+- `--subscription-pool` runs Claude Code on the csub gateway via
+  `ANTHROPIC_BASE_URL`; it must not be combined with router flags.
 - `raydock top` should work for proxy-mode launches when metrics can bind.
   Metrics bind failures are best-effort and must not break proxy data flow.
 
