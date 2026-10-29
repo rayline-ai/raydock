@@ -27,8 +27,9 @@ use crate::gateway::{Body, Gateway, LAUNCH_PREFIX, json_response};
 
 pub const DEFAULT_PORT: u16 = 20816;
 
-/// Longest wait for in-flight requests on shutdown. The launchd job's
-/// ExitTimeOut is longer, so launchd never kills a draining daemon.
+/// Longest wait on shutdown, for in-flight requests and credential refreshes
+/// together. The launchd job's ExitTimeOut (60s) is longer, so launchd never
+/// kills a daemon that is draining or finishing a refresh.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(45);
 
 /// Exit status when another process already owns the pool. launchd retries
@@ -155,29 +156,39 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
     drop(listener);
     // In-flight requests may be mid-refresh; let them finish before the lock
     // is released so a successor never races a rotating grant.
+    // Background usage polls run on their own task; stop scheduling them
+    // before draining so no new OAuth refresh starts during shutdown.
+    if let Some(monitor) = monitor {
+        monitor.abort();
+    }
+    // One deadline covers draining and waiting for refreshes, so the whole
+    // shutdown stays inside launchd's ExitTimeOut.
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
     info!("csub shutting down; draining connections (signal again to stop now)");
+    let mut forced = false;
     tokio::select! {
-        result = tokio::time::timeout(SHUTDOWN_GRACE, graceful.shutdown()) => {
+        result = tokio::time::timeout_at(deadline, graceful.shutdown()) => {
             if result.is_err() {
                 warn!("connections still open after {SHUTDOWN_GRACE:?}; stopping anyway");
             }
         }
-        () = signals.recv() => warn!("second signal; stopping without draining"),
-    }
-    // Background usage polls and recoveries run on their own tasks; stop
-    // scheduling them and let any refresh in flight persist its rotated grant
-    // before the lock is released.
-    if let Some(monitor) = monitor {
-        monitor.abort();
-    }
-    info!("waiting for in-flight credential refreshes");
-    tokio::select! {
-        result = tokio::time::timeout(SHUTDOWN_GRACE, runtime.quiesce_credentials()) => {
-            if result.is_err() {
-                warn!("credential refresh still running after {SHUTDOWN_GRACE:?}; stopping anyway");
-            }
+        () = signals.recv() => {
+            warn!("second signal; stopping without draining");
+            forced = true;
         }
-        () = signals.recv() => warn!("second signal; not waiting for credential refreshes"),
+    }
+    // Recoveries run on their own tasks; let any refresh in flight persist its
+    // rotated grant before the lock is released.
+    if !forced {
+        info!("waiting for in-flight credential refreshes");
+        tokio::select! {
+            result = tokio::time::timeout_at(deadline, runtime.quiesce_credentials()) => {
+                if result.is_err() {
+                    warn!("credential refresh still running at the shutdown deadline; stopping anyway");
+                }
+            }
+            () = signals.recv() => warn!("second signal; not waiting for credential refreshes"),
+        }
     }
     info!("flushing recovery state");
     if let Err(error) = runtime.flush_recovery_state().await {
@@ -189,7 +200,10 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
 
 fn is_browser_request<B>(request: &Request<B>) -> bool {
     request.method() == Method::OPTIONS
-        || ["origin", "sec-fetch-site", "sec-fetch-mode"]
+        // Not Sec-Fetch-Mode: Node's fetch (undici) sends it on every request,
+        // so Node-based Claude Code would be refused. Browsers pair it with
+        // Sec-Fetch-Site, which is checked.
+        || ["origin", "sec-fetch-site"]
             .iter()
             .any(|name| request.headers().contains_key(*name))
 }
@@ -371,7 +385,12 @@ mod tests {
         )));
         assert!(is_browser_request(&request(
             Method::GET,
-            Some(("sec-fetch-mode", "no-cors"))
+            Some(("sec-fetch-site", "cross-site"))
+        )));
+        // Node's fetch (npm Claude Code) sends this on every request.
+        assert!(!is_browser_request(&request(
+            Method::POST,
+            Some(("sec-fetch-mode", "cors"))
         )));
     }
 }
