@@ -141,8 +141,9 @@ mod tests {
     use super::super::tests::{env_value, render};
     use super::CONFIG_FILE;
 
+    /// Both providers treat the per-launch id the same way: only when forced.
     #[test]
-    fn messages_provider_carries_the_conversation_id() {
+    fn neither_provider_carries_the_conversation_id_unless_forced() {
         use super::super::ConversationIdFallback;
         use super::super::tests::render_with;
         let headers = |fallback| {

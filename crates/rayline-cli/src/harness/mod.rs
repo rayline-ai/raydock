@@ -43,8 +43,9 @@
 //! parent's episode where the harness attaches the header to every request of
 //! the process. The native compat flags and config keys stay on either way;
 //! the gateway ranks `x-conversation-id` first when both arrive. The override
-//! applies to `raydock hybrid run` too, and either path exports
-//! [`CONV_ID_ENV`] only when a rendered config references it
+//! applies to `raydock hybrid run` too, so forcing it there accepts the same
+//! episode collapse rather than silently doing nothing on that path; either
+//! path exports [`CONV_ID_ENV`] only when a rendered config references it
 //! ([`conversation_id_for`]).
 
 mod hermes;
