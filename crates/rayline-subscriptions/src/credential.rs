@@ -93,6 +93,46 @@ impl CredentialStore {
         transaction.load()
     }
 
+    /// Whether any credential source Claude Code may read for this config dir
+    /// (keychain items, then the file) holds a non-null top-level `key`.
+    /// Unlike `load`, a source without a Claude.ai login is still read; no
+    /// value leaves this function. Read-only: no lock, no permission change.
+    pub fn source_has_top_level_key(&self, key: &str) -> Result<bool, CredentialError> {
+        validate_config_directory(&self.config_dir)?;
+        let has_key = |bytes: Vec<u8>| -> Result<bool, CredentialError> {
+            let bytes = Zeroizing::new(bytes);
+            if bytes.len() as u64 > MAX_CREDENTIAL_BYTES {
+                return Err(CredentialError::CredentialPayloadTooLarge);
+            }
+            let value: Value =
+                serde_json::from_slice(&bytes).map_err(CredentialError::InvalidJson)?;
+            Ok(value.get(key).is_some_and(|value| !value.is_null()))
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let account =
+                std::env::var("USER").map_err(|_| CredentialError::UsernameUnavailable)?;
+            let mut services = vec![keychain_service_for_dir(&self.config_dir)];
+            if self.allow_legacy_keychain {
+                services.push(CLAUDE_LEGACY_KEYCHAIN_SERVICE.to_owned());
+            }
+            for service in services {
+                if let Some(bytes) = keychain::read_password(&service, &account)
+                    .map_err(CredentialError::KeychainRead)?
+                {
+                    if has_key(bytes)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        let path = self.config_dir.join(CREDENTIAL_FILE_NAME);
+        if fs::symlink_metadata(&path).is_ok() {
+            return has_key(read_credential_file(&path, false)?);
+        }
+        Ok(false)
+    }
+
     /// Inspect the source without creating a lockfile or changing permissions.
     /// Like all source I/O, this must run outside an async executor.
     pub(crate) fn load_read_only(&self) -> Result<CredentialDocument, CredentialError> {
@@ -1007,6 +1047,29 @@ mod tests {
         let path = dir.join(CREDENTIAL_FILE_NAME);
         fs::write(&path, bytes).expect("write credential");
         set_private_file_permissions(&path).expect("permissions");
+    }
+
+    #[test]
+    fn reports_a_top_level_key_without_requiring_a_claude_login() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CredentialStore::new(dir.path()).expect("store");
+        assert!(
+            !store
+                .source_has_top_level_key("enterpriseGateway")
+                .expect("no source")
+        );
+        write_test_credential(dir.path(), &credential_json("access-a", "refresh-a", 1000));
+        assert!(
+            !store
+                .source_has_top_level_key("enterpriseGateway")
+                .expect("absent")
+        );
+        write_test_credential(dir.path(), br#"{"enterpriseGateway":{"url":"https://gw"}}"#);
+        assert!(
+            store
+                .source_has_top_level_key("enterpriseGateway")
+                .expect("present")
+        );
     }
 
     #[test]
