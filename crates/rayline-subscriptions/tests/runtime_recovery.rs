@@ -196,18 +196,39 @@ async fn runtime_with_backoff(
     persisted: bool,
     recovery_backoff: Duration,
 ) -> Arc<SubscriptionPoolRuntime> {
+    runtime_with_accounts(
+        root,
+        usage,
+        token,
+        persisted,
+        recovery_backoff,
+        &[("a", "profile")],
+    )
+    .await
+}
+async fn runtime_with_accounts(
+    root: &Path,
+    usage: &Endpoint,
+    token: &Endpoint,
+    persisted: bool,
+    recovery_backoff: Duration,
+    accounts: &[(&str, &str)],
+) -> Arc<SubscriptionPoolRuntime> {
     let root = std::fs::canonicalize(root).expect("physical temp root");
     std::fs::create_dir_all(root.join("control")).expect("control");
     SubscriptionPoolRuntime::start(
         "pool",
         SubscriptionPoolConfig {
             control_config_dir: root.join("control"),
-            accounts: vec![SubscriptionAccountConfig {
-                id: "a".into(),
-                credential_source: CredentialSourceConfig {
-                    claude_config_dir: root.join("profile"),
-                },
-            }],
+            accounts: accounts
+                .iter()
+                .map(|(id, profile)| SubscriptionAccountConfig {
+                    id: (*id).into(),
+                    credential_source: CredentialSourceConfig {
+                        claude_config_dir: root.join(profile),
+                    },
+                })
+                .collect(),
             policy: Default::default(),
         },
         SubscriptionRuntimeOptions {
@@ -262,6 +283,39 @@ async fn cancelled_refresh_retains_owned_transaction_and_single_account_singlefl
             .expect("saved")
             .contains("rotated-refresh")
     );
+}
+
+#[tokio::test]
+async fn quiesce_stops_oauth_on_accounts_it_has_not_reached_yet() {
+    let temp = tempfile::tempdir().expect("temp");
+    credentials(&temp.path().join("profile"));
+    credentials(&temp.path().join("profile-b"));
+    let usage = endpoint(false, USAGE, false).await;
+    let token = endpoint(true, GRANT, true).await;
+    let pool = runtime_with_accounts(
+        temp.path(),
+        &usage,
+        &token,
+        false,
+        Duration::from_millis(1),
+        &[("a", "profile"), ("b", "profile-b")],
+    )
+    .await;
+    let p = pool.clone();
+    let refresh = tokio::spawn(async move { p.force_refresh("a").await });
+    token.wait().await;
+    // Quiesce now waits on account a; b's gate is still open.
+    let quiesce = pool.quiesce_credentials();
+    tokio::pin!(quiesce);
+    assert!(futures::poll!(&mut quiesce).is_pending());
+    let late = tokio::time::timeout(Duration::from_secs(5), pool.force_refresh("b"))
+        .await
+        .expect("refused without waiting on OAuth");
+    assert!(late.is_err(), "no OAuth on b once quiesce has begun");
+    token.resume();
+    refresh.await.expect("task").expect("a's refresh completes");
+    assert!(quiesce.await.is_empty());
+    assert_eq!(token.count.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
