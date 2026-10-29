@@ -5,6 +5,10 @@
 //! runs a refreshing [`crate::SubscriptionPoolRuntime`] must hold the pool's
 //! [`PoolLock`] for as long as the runtime lives. Read-only status polls do not
 //! refresh and need no lock.
+//!
+//! The lock is an advisory `flock` on a named file: anything that deletes the
+//! lock file or its directory while an owner runs lets a second owner in, so
+//! cleanup must check [`recorded_holder_pid`] and the lock before removing it.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -55,6 +59,11 @@ impl PoolLock {
             }
             Err(source) => return Err(PoolLockError::Lock { path, source }),
         }
+        // A file unlinked or replaced between open and lock is not the pool's
+        // lock any more; owning it would not exclude the next owner.
+        if !still_names_open_file(&file, &path) {
+            return Err(PoolLockError::Replaced(path));
+        }
         let pid = std::process::id();
         file.set_len(0)
             .and_then(|()| file.seek(SeekFrom::Start(0)))
@@ -76,7 +85,14 @@ impl PoolLock {
 /// value is possible after a crash, so callers must only use it for messages.
 pub fn recorded_holder_pid(state_dir: &Path, pool_id: &str) -> Option<u32> {
     let path = PoolLock::path_for(state_dir, pool_id).ok()?;
-    let mut file = open_lock_file(&path).ok()?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(&path).ok()?;
     read_holder_pid(&mut file)
 }
 
@@ -100,6 +116,8 @@ pub enum PoolLockError {
     },
     #[error("subscription pool lock {0:?} is not a regular file owned by this user")]
     UnsafeLockFile(PathBuf),
+    #[error("subscription pool lock {0:?} was replaced while it was being taken")]
+    Replaced(PathBuf),
     #[error("{}", held_message(path, *holder_pid))]
     Held {
         path: PathBuf,
@@ -120,6 +138,9 @@ fn held_message(path: &Path, holder_pid: Option<u32>) -> String {
 }
 
 fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
+    if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        validate_trusted_parent(parent)?;
+    }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -157,6 +178,53 @@ fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
         }
     }
     Ok(())
+}
+
+/// Another user able to rename entries in the parent could swap the state
+/// directory under a running owner, so the parent must be ours (or root's) and
+/// not writable by others unless it is sticky. A parent that does not exist
+/// yet is created by us with private permissions.
+fn validate_trusted_parent(parent: &Path) -> Result<(), PoolLockError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let metadata = match fs::metadata(parent) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(PoolLockError::StateDir {
+                    path: parent.to_owned(),
+                    source,
+                });
+            }
+        };
+        // SAFETY: geteuid has no arguments or memory safety preconditions.
+        let euid = unsafe { libc::geteuid() };
+        let owner_trusted = metadata.uid() == euid || metadata.uid() == 0;
+        let shared_writable = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
+        if !owner_trusted || shared_writable {
+            return Err(PoolLockError::UnsafeStateDir(parent.to_owned()));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
+}
+
+fn still_names_open_file(file: &File, path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (Ok(open), Ok(named)) = (file.metadata(), fs::symlink_metadata(path)) else {
+            return false;
+        };
+        open.dev() == named.dev() && open.ino() == named.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (file, path);
+        true
+    }
 }
 
 fn open_lock_file(path: &Path) -> Result<File, PoolLockError> {
@@ -251,6 +319,29 @@ mod tests {
             PoolLock::try_acquire(temp.path(), "default"),
             Err(PoolLockError::Open { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refuses_a_state_dir_under_a_shared_writable_parent() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let temp = tempfile::tempdir().expect("tempdir");
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).expect("shared dir");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(matches!(
+            PoolLock::try_acquire(&shared.join("state"), "default"),
+            Err(PoolLockError::UnsafeStateDir(_))
+        ));
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).expect("sticky");
+        PoolLock::try_acquire(&shared.join("state"), "default").expect("sticky parent is safe");
+    }
+
+    #[test]
+    fn reading_the_holder_pid_does_not_create_the_lock() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(recorded_holder_pid(temp.path(), "default"), None);
+        assert!(!temp.path().join("pool-default.lock").exists());
     }
 
     #[cfg(unix)]
