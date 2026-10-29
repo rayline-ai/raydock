@@ -1566,6 +1566,69 @@ async fn inbound_chat_completions_translate_to_anthropic_and_back() {
     let _ = std::fs::remove_file(config);
 }
 
+/// Same upstream shape as the Chat Completions case below, through
+/// `/v1/responses`: `response.completed` must report the whole prompt and the
+/// cache-read count under `input_tokens_details.cached_tokens`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_responses_stream_reports_prompt_and_cached_tokens() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PONG\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":8686,\"output_tokens\":17,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":5508}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    tokio::spawn(serve_once(upstream, http_sse(sse)));
+    let config = write_config(
+        "responses-inbound-usage",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .json(&json!({"model": "m", "stream": true,
+                      "input": [{"type": "message", "role": "user", "content": [
+                          {"type": "input_text", "text": "ping"}]}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let events = collect_sse(response).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| event["type"] == "response.output_text.delta" && event["delta"] == "PONG"),
+        "{events:?}"
+    );
+    let completed = events
+        .iter()
+        .find(|event| event["type"] == "response.completed")
+        .expect("response.completed");
+    assert_eq!(
+        completed["response"]["usage"],
+        json!({"input_tokens": 14194, "input_tokens_details": {"cached_tokens": 5508},
+               "output_tokens": 17, "output_tokens_details": {"reasoning_tokens": 0},
+               "total_tokens": 14211})
+    );
+    let _ = std::fs::remove_file(config);
+}
+
 /// The Rayline router streams a placeholder `message_start` (`input_tokens`
 /// 0, cache fields `null`) and reports the real counts only in the final
 /// `message_delta`. A Chat client reading the usage chunk must see the whole
