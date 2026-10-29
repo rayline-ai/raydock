@@ -96,6 +96,30 @@ const VALUE_OPTIONS: &[&str] = &[
     "--workload",
 ];
 
+/// Variadic options (Claude Code's own pre-parse set, plus Commander's
+/// `<value...>` options): without `=value` they take every following
+/// argument up to the next one starting with `-`, so they never hide a flag.
+const VARIADIC_OPTIONS: &[&str] = &[
+    "--add-dir",
+    "--allow-tools",
+    "--allowed-tools",
+    "--allowedTools",
+    "--betas",
+    "--channels",
+    "--dangerously-load-development-channels",
+    "--disallow-tools",
+    "--disallowed-tools",
+    "--disallowedTools",
+    "--env",
+    "--file",
+    "--header",
+    "--mcp-config",
+    "--sparse",
+    "--tag",
+    "--tools",
+    "--with",
+];
+
 /// Long options with an optional value: without `=value`, they take the next
 /// argument when it does not start with `-`, as Commander does.
 const OPTIONAL_VALUE_OPTIONS: &[&str] = &[
@@ -112,8 +136,8 @@ const OPTIONAL_VALUE_OPTIONS: &[&str] = &[
     "--worktree",
 ];
 
-/// Short options with a required value: last in a cluster, they take the
-/// next argument. Optional-value ones (`-d`, `-r`, `-w`) take the rest of
+/// Short options with a required value (all subcommand options in 2.1.312;
+/// none is a boolean): last in a cluster, they take the next argument. Optional-value ones (`-d`, `-r`, `-w`) take the rest of
 /// their cluster, or, last in it, the next argument unless it starts with
 /// `-`; either way the rest of the cluster is a value.
 const SHORT_REQUIRED: &[char] = &['e', 'H', 'j', 'm', 'n', 's', 't'];
@@ -150,7 +174,9 @@ pub(crate) fn parse(args: &[OsString]) -> ClaudeArgs {
                 .map_or((long, false), |(name, _)| (name, true));
             let name = format!("--{name}");
             if !inline_value {
-                if VALUE_OPTIONS.contains(&name.as_str()) {
+                if VARIADIC_OPTIONS.contains(&name.as_str()) {
+                    while args.next_if(|next| !next.starts_with('-')).is_some() {}
+                } else if VALUE_OPTIONS.contains(&name.as_str()) {
                     args.next();
                 } else if OPTIONAL_VALUE_OPTIONS.contains(&name.as_str()) {
                     args.next_if(|next| !next.starts_with('-'));
@@ -220,6 +246,14 @@ mod tests {
         let parsed = parse_strs(&["--resume", "-w"]);
         assert!(parsed.has("-w"));
         let parsed = parse_strs(&["--autocompact", "auto", "logs"]);
+        assert_eq!(parsed.first_positional.as_deref(), Some("logs"));
+        // Variadic options take values up to the next option.
+        let parsed = parse_strs(&["--add-dir", "/a", "/b", "--model", "opus", "respawn"]);
+        assert_eq!(parsed.first_positional.as_deref(), Some("respawn"));
+        let parsed = parse_strs(&["--allowed-tools", "Bash", "Edit", "-w"]);
+        assert!(parsed.has("-w"));
+        assert_eq!(parsed.first_positional, None);
+        let parsed = parse_strs(&["--tools=Bash", "logs"]);
         assert_eq!(parsed.first_positional.as_deref(), Some("logs"));
         let parsed = parse_strs(&["--", "-w"]);
         assert!(parsed.options.is_empty());
