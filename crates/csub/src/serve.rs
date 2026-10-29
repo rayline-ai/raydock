@@ -209,7 +209,12 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("recovery state flush failed: {error}"),
         Err(_) => {
-            warn!("recovery state flush still running at the shutdown deadline; abandoning it")
+            warn!("recovery state flush still running at the shutdown deadline; abandoning it");
+            drop(lock);
+            // Dropping the Tokio runtime would wait for the blocking write
+            // past launchd's ExitTimeOut, whichever front end built it (csub
+            // or raydock). The lock is released; end the process now.
+            std::process::exit(0);
         }
     }
     drop(lock);
