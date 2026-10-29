@@ -786,14 +786,8 @@ pub(crate) fn anthropic_message_to_chat(
     if !tool_calls.is_empty() {
         assistant["tool_calls"] = Value::Array(tool_calls);
     }
-    let input = message
-        .pointer("/usage/input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = message
-        .pointer("/usage/output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let mut usage = AnthropicUsage::default();
+    usage.merge(message.get("usage"));
     json!({
         "id": id,
         "object": "chat.completion",
@@ -804,8 +798,87 @@ pub(crate) fn anthropic_message_to_chat(
             "message": assistant,
             "finish_reason": finish_reason(message.get("stop_reason").and_then(Value::as_str)),
         }],
-        "usage": {"prompt_tokens": input, "completion_tokens": output, "total_tokens": input + output},
+        "usage": usage.to_chat(),
     })
+}
+
+/// Token counts from Anthropic `usage` objects, merged as they arrive.
+///
+/// Which event carries the real counts depends on the upstream. Anthropic
+/// puts the prompt counts in `message_start` and repeats them, cumulative, in
+/// the final `message_delta`. The Rayline router (and other gateways that
+/// translate from another provider) sends a `message_start` placeholder
+/// (`input_tokens: 0`, cache fields `null`) and only the final `message_delta`
+/// carries the real counts. Every usage object seen is merged, a nonzero
+/// number overwriting the previous value, so the last event that reports a
+/// count wins and a placeholder (`null` or `0`) never erases a real one. The
+/// counts are cumulative, so a real count never drops to zero later.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnthropicUsage {
+    input_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl AnthropicUsage {
+    /// Overlay the nonzero numeric fields of an Anthropic `usage` object.
+    fn merge(&mut self, usage: Option<&Value>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        let slots = [
+            ("input_tokens", &mut self.input_tokens),
+            (
+                "cache_creation_input_tokens",
+                &mut self.cache_creation_input_tokens,
+            ),
+            ("cache_read_input_tokens", &mut self.cache_read_input_tokens),
+            ("output_tokens", &mut self.output_tokens),
+        ];
+        for (key, slot) in slots {
+            if let Some(count) = usage.get(key).and_then(Value::as_u64)
+                && count > 0
+            {
+                *slot = count;
+            }
+        }
+    }
+
+    /// The counts in OpenAI's shape. Anthropic's `input_tokens` excludes
+    /// cached tokens; OpenAI's `prompt_tokens` is the whole prompt, with the
+    /// cached part repeated under `prompt_tokens_details.cached_tokens`, which
+    /// is where Chat clients read their cache-read count.
+    fn to_chat(self) -> Value {
+        let prompt_tokens = self
+            .input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens);
+        json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": self.output_tokens,
+            "total_tokens": prompt_tokens.saturating_add(self.output_tokens),
+            "prompt_tokens_details": {"cached_tokens": self.cache_read_input_tokens},
+        })
+    }
+
+    /// The inverse of [`Self::to_chat`], for replaying a `chat.completion`.
+    fn from_chat(usage: Option<&Value>) -> Self {
+        let field = |pointer: &str| {
+            usage
+                .and_then(|usage| usage.pointer(pointer))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+        };
+        let prompt_tokens = field("/prompt_tokens");
+        let cache_read_input_tokens = field("/prompt_tokens_details/cached_tokens");
+        Self {
+            input_tokens: prompt_tokens.saturating_sub(cache_read_input_tokens),
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens,
+            output_tokens: field("/completion_tokens"),
+        }
+    }
 }
 
 async fn anthropic_response_to_chat(
@@ -960,8 +1033,7 @@ pub(crate) struct AnthropicToChatTranslator {
     /// arguments were emitted for it).
     tool_index: HashMap<usize, (usize, bool)>,
     stop_reason: Option<String>,
-    input_tokens: u64,
-    output_tokens: u64,
+    usage: AnthropicUsage,
     started: bool,
     finished: bool,
 }
@@ -983,8 +1055,7 @@ impl AnthropicToChatTranslator {
             buffer: String::new(),
             tool_index: HashMap::new(),
             stop_reason: None,
-            input_tokens: 0,
-            output_tokens: 0,
+            usage: AnthropicUsage::default(),
             started: false,
             finished: false,
         }
@@ -1058,10 +1129,7 @@ impl AnthropicToChatTranslator {
     fn process(&mut self, event: &str, value: &Value, out: &mut String) {
         match event {
             "message_start" => {
-                self.input_tokens = value
-                    .pointer("/message/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                self.usage.merge(value.pointer("/message/usage"));
                 self.ensure_started(out);
             }
             "content_block_start" => {
@@ -1142,12 +1210,7 @@ impl AnthropicToChatTranslator {
                 if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
                     self.stop_reason = Some(reason.to_owned());
                 }
-                if let Some(output) = value
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    self.output_tokens = output;
-                }
+                self.usage.merge(value.get("usage"));
             }
             "message_stop" => out.push_str(&self.finish()),
             "error" => {
@@ -1183,11 +1246,7 @@ impl AnthropicToChatTranslator {
                 "created": self.created,
                 "model": self.model,
                 "choices": [],
-                "usage": {
-                    "prompt_tokens": self.input_tokens,
-                    "completion_tokens": self.output_tokens,
-                    "total_tokens": self.input_tokens + self.output_tokens,
-                },
+                "usage": self.usage.to_chat(),
             });
             out.push_str(&format!("data: {data}\n\n"));
         }
@@ -1219,14 +1278,7 @@ impl AnthropicToChatTranslator {
             Some("length") => Some("max_tokens".to_owned()),
             _ => None,
         };
-        self.input_tokens = completion
-            .pointer("/usage/prompt_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        self.output_tokens = completion
-            .pointer("/usage/completion_tokens")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
+        self.usage = AnthropicUsage::from_chat(completion.get("usage"));
         out.push_str(&self.finish());
         out
     }
@@ -1523,7 +1575,8 @@ mod tests {
             "content": [{"type": "text", "text": "Reading."},
                         {"type": "tool_use", "id": "call_9", "name": upstream, "input": {"path": "a"}}],
             "stop_reason": "tool_use",
-            "usage": {"input_tokens": 10, "output_tokens": 4}
+            "usage": {"input_tokens": 10, "cache_creation_input_tokens": 20,
+                      "cache_read_input_tokens": 30, "output_tokens": 4}
         });
         let completion = anthropic_message_to_chat(&message, "chatcmpl_x", "arc-sage", &rewrites);
         let choice = &completion["choices"][0];
@@ -1537,7 +1590,11 @@ mod tests {
             choice["message"]["tool_calls"][0]["function"]["arguments"],
             "{\"path\":\"a\"}"
         );
-        assert_eq!(completion["usage"]["total_tokens"], 14);
+        assert_eq!(
+            completion["usage"],
+            json!({"prompt_tokens": 60, "completion_tokens": 4, "total_tokens": 64,
+                   "prompt_tokens_details": {"cached_tokens": 30}})
+        );
         assert_eq!(completion["object"], "chat.completion");
     }
 
@@ -1693,10 +1750,14 @@ mod tests {
             ToolNameRewrites::default(),
         );
         let mut upstream = String::new();
+        // The Rayline router's shape: `message_start` is a placeholder and the
+        // final `message_delta` carries every count.
         push_sse(
             &mut upstream,
             "message_start",
-            json!({"type":"message_start","message":{"usage":{"input_tokens":7}}}),
+            json!({"type":"message_start","message":{"usage":{"input_tokens":0,
+                   "cache_creation_input_tokens":null,"cache_read_input_tokens":null,
+                   "output_tokens":0}}}),
         );
         push_sse(
             &mut upstream,
@@ -1721,7 +1782,9 @@ mod tests {
         push_sse(
             &mut upstream,
             "message_delta",
-            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":3}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},
+                   "usage":{"input_tokens":7,"cache_creation_input_tokens":null,
+                            "cache_read_input_tokens":5,"output_tokens":3}}),
         );
         push_sse(
             &mut upstream,
@@ -1763,6 +1826,144 @@ mod tests {
             .iter()
             .find(|c| c.get("usage").is_some())
             .expect("usage chunk");
-        assert_eq!(usage["usage"]["total_tokens"], 10);
+        assert_eq!(
+            usage["usage"],
+            json!({"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15,
+                   "prompt_tokens_details": {"cached_tokens": 5}})
+        );
+    }
+
+    /// Anthropic reports the prompt counts in `message_start` and a
+    /// `message_delta` that may carry only `output_tokens`; the Rayline router
+    /// reports a placeholder start and everything in the delta. Both shapes
+    /// must produce the same Chat usage, and a count already seen survives a
+    /// later event that omits it.
+    #[test]
+    fn stream_usage_merges_message_start_and_message_delta() {
+        fn usage_after(start: Value, delta: Value) -> Value {
+            let mut translator = AnthropicToChatTranslator::new(
+                "chatcmpl_x".to_owned(),
+                "arc-swift".to_owned(),
+                true,
+                ToolNameRewrites::default(),
+            );
+            let mut upstream = String::new();
+            push_sse(
+                &mut upstream,
+                "message_start",
+                json!({"type":"message_start","message":{"usage":start}}),
+            );
+            push_sse(
+                &mut upstream,
+                "message_delta",
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":delta}),
+            );
+            push_sse(
+                &mut upstream,
+                "message_stop",
+                json!({"type":"message_stop"}),
+            );
+            let out = translator.push_bytes(upstream.as_bytes());
+            out.split("\n\n")
+                .filter_map(|event| event.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .find_map(|chunk| chunk.get("usage").cloned())
+                .expect("usage chunk")
+        }
+        let expected = json!({"prompt_tokens": 60, "completion_tokens": 4, "total_tokens": 64,
+                              "prompt_tokens_details": {"cached_tokens": 30}});
+        // Anthropic: counts up front, the delta adds output.
+        assert_eq!(
+            usage_after(
+                json!({"input_tokens": 10, "cache_creation_input_tokens": 20,
+                       "cache_read_input_tokens": 30, "output_tokens": 1}),
+                json!({"output_tokens": 4}),
+            ),
+            expected
+        );
+        // Gateway: a placeholder start, every count in the delta.
+        assert_eq!(
+            usage_after(
+                json!({"input_tokens": 0, "cache_creation_input_tokens": null,
+                       "cache_read_input_tokens": null, "output_tokens": 0}),
+                json!({"input_tokens": 10, "cache_creation_input_tokens": 20,
+                       "cache_read_input_tokens": 30, "output_tokens": 4}),
+            ),
+            expected
+        );
+        // A placeholder after the real counts (zeros, then a delta that
+        // omits the prompt fields) leaves them intact; later deltas replace
+        // the cumulative output count rather than summing it.
+        let mut translator = AnthropicToChatTranslator::new(
+            "chatcmpl_x".to_owned(),
+            "arc-swift".to_owned(),
+            true,
+            ToolNameRewrites::default(),
+        );
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"input_tokens":10,
+                   "cache_creation_input_tokens":20,"cache_read_input_tokens":30,
+                   "output_tokens":1}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_delta",
+            json!({"type":"message_delta","delta":{},"usage":{"input_tokens":0,
+                   "cache_creation_input_tokens":0,"cache_read_input_tokens":0,
+                   "output_tokens":2}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                   "usage":{"output_tokens":4}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_stop",
+            json!({"type":"message_stop"}),
+        );
+        let out = translator.push_bytes(upstream.as_bytes());
+        let usage = out
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .find_map(|chunk| chunk.get("usage").cloned())
+            .expect("usage chunk");
+        assert_eq!(usage, expected);
+        // No usage anywhere still yields a well-formed block.
+        assert_eq!(
+            usage_after(json!(null), json!(null)),
+            json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+                   "prompt_tokens_details": {"cached_tokens": 0}})
+        );
+    }
+
+    /// A one-piece upstream answer replayed as chunks keeps its cache count.
+    #[test]
+    fn replayed_completion_keeps_cached_tokens() {
+        let mut translator = AnthropicToChatTranslator::new(
+            "chatcmpl_x".to_owned(),
+            "arc-swift".to_owned(),
+            true,
+            ToolNameRewrites::default(),
+        );
+        let completion = json!({
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "Hi"},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 2, "total_tokens": 42,
+                      "prompt_tokens_details": {"cached_tokens": 30}}
+        });
+        let out = translator.replay_completion(&completion);
+        let usage = out
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .find_map(|chunk| chunk.get("usage").cloned())
+            .expect("usage chunk");
+        assert_eq!(usage, completion["usage"]);
     }
 }

@@ -1566,6 +1566,70 @@ async fn inbound_chat_completions_translate_to_anthropic_and_back() {
     let _ = std::fs::remove_file(config);
 }
 
+/// The Rayline router streams a placeholder `message_start` (`input_tokens`
+/// 0, cache fields `null`) and reports the real counts only in the final
+/// `message_delta`. A Chat client reading the usage chunk must see the whole
+/// prompt and the cache-read count, not zeros (rayline-ai/rayline#134).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_completions_stream_reports_prompt_and_cached_tokens() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let sse = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":null}}}\n\n",
+        "event: content_block_start\n",
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PONG\"}}\n\n",
+        "event: content_block_stop\n",
+        "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":8686,\"output_tokens\":17,\"cache_creation_input_tokens\":null,\"cache_read_input_tokens\":5508}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    let (tx, _rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(upstream, http_sse(sse), tx));
+    let config = write_config(
+        "chat-inbound-usage",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "anthropic_messages",
+                           "base_url": format!("http://127.0.0.1:{upstream_port}"),
+                           "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&json!({"model": "m", "stream": true,
+                      "stream_options": {"include_usage": true},
+                      "messages": [{"role": "user", "content": "ping"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let chunks = collect_sse(response).await;
+    assert!(
+        chunks
+            .iter()
+            .any(|chunk| chunk["choices"][0]["delta"]["content"] == "PONG"),
+        "{chunks:?}"
+    );
+    let usage = chunks
+        .iter()
+        .find_map(|chunk| chunk.get("usage"))
+        .expect("usage chunk");
+    assert_eq!(
+        usage,
+        &json!({"prompt_tokens": 14194, "completion_tokens": 17, "total_tokens": 14211,
+                "prompt_tokens_details": {"cached_tokens": 5508}})
+    );
+    let _ = std::fs::remove_file(config);
+}
+
 /// On an OpenAI Chat route the request passes through with the routed model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn inbound_chat_completions_pass_through_to_openai_chat() {
