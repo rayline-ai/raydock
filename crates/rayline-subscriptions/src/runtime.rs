@@ -571,12 +571,11 @@ impl SubscriptionPoolRuntime {
     pub async fn quiesce_credentials(&self) -> Vec<String> {
         let mut unsaved = Vec::new();
         for account in &self.accounts {
-            if account.persistence_pending.load(Ordering::SeqCst) {
-                // Retries the save, not OAuth (see recover).
-                let _ = account.recover(false, None).await;
-            }
             // Err only when already closed, which is what we want anyway.
-            let _permit = account.refresh_gate.acquire().await;
+            let permit = account.refresh_gate.acquire().await;
+            if permit.is_ok() {
+                account.persist_pending_grant().await;
+            }
             account.refresh_gate.close();
             if account.persistence_pending.load(Ordering::SeqCst) {
                 unsaved.push(account.id.clone());
@@ -1177,6 +1176,42 @@ impl AccountWorker {
         tokio::spawn(async move { worker.recover(true, Some(rejected)).await })
             .await
             .map_err(SubscriptionRuntimeError::BackgroundTask)?
+    }
+
+    /// Shutdown's last attempt to save a rotated grant held only in memory.
+    /// Save-only: ignores the recovery backoff and never calls OAuth, so it
+    /// cannot itself rotate a grant that a deadline might then drop. The
+    /// caller holds `refresh_gate`.
+    async fn persist_pending_grant(&self) {
+        if !self.persistence_pending.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(document) = self
+            .credential
+            .lock()
+            .expect("credential lock poisoned")
+            .clone()
+        else {
+            return;
+        };
+        let store = self.store.clone();
+        let saved = tokio::task::spawn_blocking(move || {
+            let tx = store.begin_refresh(Duration::from_secs(5))?;
+            let mut document = document;
+            let _ = tx.rebase_if_same_auth(&mut document);
+            tx.save_if_unchanged(&mut document).map(|()| document)
+        })
+        .await;
+        match saved {
+            Ok(Ok(document)) => {
+                self.persistence_pending.store(false, Ordering::SeqCst);
+                let _ = self.activate_credential(document);
+            }
+            Ok(Err(error)) => {
+                self.set_last_error(format!("credential persistence pending: {error}"))
+            }
+            Err(error) => self.set_last_error(format!("credential persistence pending: {error}")),
+        }
     }
 
     async fn recover(
