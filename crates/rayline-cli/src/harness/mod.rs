@@ -42,7 +42,10 @@
 //! launch starts a new one. That also collapses a subagent's turns into its
 //! parent's episode where the harness attaches the header to every request of
 //! the process. The native compat flags and config keys stay on either way;
-//! the gateway ranks `x-conversation-id` first when both arrive.
+//! the gateway ranks `x-conversation-id` first when both arrive. The override
+//! applies to `raydock hybrid run` too, and either path exports
+//! [`CONV_ID_ENV`] only when a rendered config references it
+//! ([`conversation_id_for`]).
 
 mod hermes;
 mod omp;
@@ -447,12 +450,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    // Set the id only when a rendered config references it.
-    let conv_id = plan
-        .files
-        .iter()
-        .any(|file| file.contents.contains(CONV_ID_ENV))
-        .then(new_conversation_id);
+    let conv_id = conversation_id_for(&plan, new_conversation_id);
     let episode = match &conv_id {
         Some(id) => format!("conversation {id}"),
         None => "episode keyed on the harness session".to_owned(),
@@ -607,6 +605,17 @@ pub(crate) fn build_command(
         None => command.env_remove(CONV_ID_ENV),
     };
     command
+}
+
+/// The per-launch id to export, minted by `mint` only when a rendered config
+/// actually references [`CONV_ID_ENV`]. A harness that keys the episode on its
+/// own session id references nothing, and then exporting an id would leave an
+/// unused variable in the environment every tool subprocess inherits.
+pub(crate) fn conversation_id_for(plan: &Plan, mint: impl FnOnce() -> String) -> Option<String> {
+    plan.files
+        .iter()
+        .any(|file| file.contents.contains(CONV_ID_ENV))
+        .then(mint)
 }
 
 /// A random (v4) UUID. One per launch; see [`ConversationIdFallback`].
