@@ -11,6 +11,9 @@ repo-specific.
 - `rayline-injector`: process/environment injection.
 - `rayline-adapter`: adapter protocol translation.
 - `rayline-local-router`: static routing policy and endpoint selection.
+- `rayline-subscriptions`: Claude subscription pool core (registry, credentials,
+  OAuth refresh, usage, placement, pool lock). No dependencies on other
+  Rayline crates; keep it that way so `csub` and `rld` can share it.
 - `rayline-hf`, `rayline-llama`, `rayline-metrics`: model/cache/runtime support.
 
 Keep protocol and routing logic in shared crates. Do not duplicate it in CLI
