@@ -25,24 +25,24 @@
 //! output than the execution core admits has every turn refused.
 //!
 //! Episode keying: the router keys a routing episode on each harness's own
-//! session id where it reads them: opencode and
-//! Hermes (on Responses) send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
-//! mode from omp 18.1.10), and pi (on Messages) and OpenClaw (on Chat
-//! Completions) send `x-session-affinity` once their config sets
-//! `compat.sendSessionAffinityHeaders`. On Responses, pi's and OpenClaw's
-//! `prompt_cache_key` keys the session. A harness session is one episode, so
-//! `--resume` / `-c` / `--session-id` in a later launch keeps the episode.
+//! session id where it reads them ([`SESSION_AFFINITY_HEADER`]). opencode
+//! sends it on its own; omp sends `X-Claude-Code-Session-Id` (apiKey mode from
+//! omp 18.1.10); pi (on Messages) and OpenClaw (on Chat Completions) send it
+//! once their config sets `compat.sendSessionAffinityHeaders`; Hermes (on both
+//! its wires) once its provider entry names the header in
+//! `session_affinity_header` (from Hermes v2026.9.21). On Responses, pi's and
+//! OpenClaw's `prompt_cache_key` keys the session instead. A harness session
+//! is one episode, so `--resume` / `-c` / `--session-id` in a later launch
+//! keeps the episode.
 //!
 //! The per-launch conversation id ([`ConversationIdFallback`]) is off by
-//! default: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on for every wire,
+//! default on every wire: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on,
 //! and then each launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as
 //! `x-conversation-id`, so one launch is one episode and a resume in a new
-//! launch starts a new one. The native compat flags stay on either way; the
-//! gateway ranks `x-conversation-id` first when both arrive. A wire with no
-//! native id (Hermes on Messages) sends nothing, and the router derives the
-//! episode from the opening messages, which also keeps a subagent's turns
-//! apart from its parent's. Under `raydock hybrid run` the execution core
-//! refuses a request with no identity, so that wire keeps the header there.
+//! launch starts a new one. That also collapses a subagent's turns into its
+//! parent's episode where the harness attaches the header to every request of
+//! the process. The native compat flags and config keys stay on either way;
+//! the gateway ranks `x-conversation-id` first when both arrive.
 
 mod hermes;
 mod omp;
@@ -72,6 +72,11 @@ const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 pub const CONV_ID_ENV: &str = "RAYLINE_CONV_ID";
 /// Header the gateway reads as the conversation (episode) key.
 pub const CONV_HEADER: &str = "x-conversation-id";
+/// Header a harness's own session id rides on, which the gateway keys the
+/// episode on when no [`CONV_HEADER`] arrives. Most harnesses send it under
+/// this name on their own; Hermes needs the name written into its config
+/// ([`hermes::SESSION_AFFINITY_KEY`]).
+pub const SESSION_AFFINITY_HEADER: &str = "x-session-affinity";
 /// The Legacy Rules Router on the hosted router, and the execution core's
 /// virtual model under `raydock hybrid run`.
 pub const ROUTER_MODEL: &str = crate::LEGACY_ROUTER_MODEL;
