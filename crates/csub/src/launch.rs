@@ -55,24 +55,29 @@ enum Tier {
 /// (whose local settings Claude Code also applies).
 fn project_roots(cwd: &Path) -> Vec<PathBuf> {
     let mut roots = vec![cwd.to_owned()];
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args([
-            "rev-parse",
-            "--path-format=absolute",
-            "--show-toplevel",
-            "--git-common-dir",
-        ])
-        .output();
-    if let Some(output) = output.ok().filter(|output| output.status.success()) {
+    // One value per call, so a path containing a newline stays intact.
+    let rev_parse = |flag: &str| -> Option<PathBuf> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["rev-parse", "--path-format=absolute", flag])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
         let text = String::from_utf8_lossy(&output.stdout);
-        let mut lines = text.lines();
-        if let Some(top) = lines.next() {
-            roots.push(PathBuf::from(top));
-        }
-        if let Some(main) = lines.next().and_then(|common| Path::new(common).parent()) {
-            roots.push(main.to_owned());
+        let text = text.strip_suffix('\n').unwrap_or(&text);
+        (!text.is_empty()).then(|| PathBuf::from(text))
+    };
+    if let Some(top) = rev_parse("--show-toplevel") {
+        roots.push(top);
+    }
+    // Only a standard `<checkout>/.git` names a main checkout; a bare or
+    // separate git dir has no project settings beside it.
+    if let Some(common) = rev_parse("--git-common-dir") {
+        if common.file_name().is_some_and(|name| name == ".git") {
+            if let Some(main) = common.parent() {
+                roots.push(main.to_owned());
+            }
         }
     }
     roots.dedup();
@@ -90,6 +95,13 @@ fn settings_files(roots: &[PathBuf]) -> Vec<(PathBuf, Tier)> {
     if let Ok(entries) = std::fs::read_dir(managed.join("managed-settings.d")) {
         let mut drop_ins = entries
             .filter_map(Result::ok)
+            // Claude Code's filter: visible `*.json` files or symlinks.
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .is_ok_and(|kind| kind.is_file() || kind.is_symlink())
+                    && !entry.file_name().to_string_lossy().starts_with('.')
+            })
             .map(|entry| entry.path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
             .collect::<Vec<_>>();
@@ -113,7 +125,8 @@ fn mdm_policies() -> Vec<PathBuf> {
         let mut paths = vec![PathBuf::from(
             "/Library/Managed Preferences/com.anthropic.claudecode.plist",
         )];
-        if let Ok(user) = std::env::var("USER") {
+        // Claude Code uses the OS account name, not $USER.
+        if let Some(user) = account_name() {
             paths.push(
                 Path::new("/Library/Managed Preferences")
                     .join(user)
@@ -125,6 +138,23 @@ fn mdm_policies() -> Vec<PathBuf> {
     }
     #[cfg(not(target_os = "macos"))]
     Vec::new()
+}
+
+#[cfg(target_os = "macos")]
+fn account_name() -> Option<String> {
+    // SAFETY: getuid has no preconditions. getpwuid returns null or a pointer
+    // to static storage that stays valid until the next getpw* call; the name
+    // is copied out before returning and nothing else here calls getpw*.
+    unsafe {
+        let entry = libc::getpwuid(libc::getuid());
+        if entry.is_null() || (*entry).pw_name.is_null() {
+            return None;
+        }
+        std::ffi::CStr::from_ptr((*entry).pw_name)
+            .to_str()
+            .ok()
+            .map(str::to_owned)
+    }
 }
 
 fn read_settings(path: &Path) -> anyhow::Result<Option<serde_json::Value>> {
@@ -150,6 +180,10 @@ fn read_settings(path: &Path) -> anyhow::Result<Option<serde_json::Value>> {
     // Claude Code accepts a leading byte-order mark; an unreadable file is
     // refused rather than skipped, since it cannot be shown to be harmless.
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    // Claude Code reads a blank file as `{}`.
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
     serde_json::from_str(text).map(Some).map_err(|_| {
         anyhow!(
             "{} is not valid JSON; csub cannot check its env block",
@@ -375,9 +409,11 @@ mod tests {
         let error = check_settings_env(&files, false).expect_err("api key");
         assert!(error.to_string().contains("ANTHROPIC_API_KEY"), "{error}");
         assert!(!error.to_string().contains("sk-test"), "{error}");
-        // Unparseable settings are refused, not skipped.
+        // Unparseable settings are refused, not skipped; blank ones are `{}`.
         std::fs::write(&user, "{not json").expect("settings");
         assert!(check_settings_env(&files, false).is_err());
+        std::fs::write(&user, "\u{feff} \n").expect("settings");
+        check_settings_env(&files, false).expect("blank settings");
     }
 
     #[test]
