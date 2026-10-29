@@ -30,11 +30,14 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+mod anthropic_usage;
 mod capabilities;
 mod chat_inbound;
 pub mod decisions_url;
 pub use capabilities::ModelCapabilities;
 pub mod inbound_guard;
+
+use anthropic_usage::AnthropicUsage;
 pub use inbound_guard::InboundGuard;
 
 pub const DEFAULT_PORT: u16 = 20811;
@@ -4924,7 +4927,7 @@ fn anthropic_stream_to_responses(
                         record_remote_token_usage(
                             metrics.as_ref(),
                             Some(&request_id),
-                            Some(translator.input_tokens),
+                            Some(translator.input_tokens()),
                             Some(translator.output_tokens_estimate()),
                             Some(selected_model.clone()),
                         );
@@ -4959,7 +4962,7 @@ fn anthropic_stream_to_responses(
                 metrics.record(MetricsUpdate::RequestCompleted {
                     request_id: request_id.clone(),
                     status_code: Some(StatusCode::OK.as_u16()),
-                    input_tokens: Some(translator.input_tokens),
+                    input_tokens: Some(translator.input_tokens()),
                     output_tokens: Some(translator.output_tokens_estimate()),
                     selected_model: Some(selected_model),
                 });
@@ -5002,8 +5005,10 @@ struct AnthropicToResponsesTranslator {
     text: String,
     tools: HashMap<usize, AnthropicToolBlock>,
     tool_names: ToolNameRewrites,
-    input_tokens: u64,
-    output_tokens: Option<u64>,
+    /// The request's own estimate, reported until the upstream says better.
+    estimated_input_tokens: u64,
+    /// Counts merged from every upstream `usage` object seen.
+    usage: AnthropicUsage,
     running_output_chars: usize,
     completed: bool,
     saw_content: bool,
@@ -5032,8 +5037,8 @@ impl AnthropicToResponsesTranslator {
             text: String::new(),
             tools: HashMap::new(),
             tool_names,
-            input_tokens: estimated_input_tokens,
-            output_tokens: None,
+            estimated_input_tokens,
+            usage: AnthropicUsage::default(),
             running_output_chars: 0,
             completed: false,
             saw_content: false,
@@ -5093,12 +5098,7 @@ impl AnthropicToResponsesTranslator {
         };
         match event {
             "message_start" => {
-                if let Some(input) = value
-                    .pointer("/message/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    self.input_tokens = input;
-                }
+                self.usage.merge(value.pointer("/message/usage"));
             }
             "content_block_start" => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -5212,12 +5212,7 @@ impl AnthropicToResponsesTranslator {
                 }
             }
             "message_delta" => {
-                if let Some(output) = value
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    self.output_tokens = Some(output);
-                }
+                self.usage.merge(value.get("usage"));
             }
             "message_stop" => {
                 out.push_str(&self.finish());
@@ -5262,7 +5257,6 @@ impl AnthropicToResponsesTranslator {
                 json!({"type": "response.output_item.done", "output_index": index, "item": item}),
             );
         }
-        let output_tokens = self.output_tokens_estimate();
         let output: Vec<Value> = self.output.iter().flatten().cloned().collect();
         let response = json!({
             "id": self.response_id,
@@ -5270,13 +5264,7 @@ impl AnthropicToResponsesTranslator {
             "status": "completed",
             "model": self.selected_model,
             "output": output,
-            "usage": {
-                "input_tokens": self.input_tokens,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens": output_tokens,
-                "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": self.input_tokens + output_tokens,
-            }
+            "usage": self.usage_or_estimates().to_responses(),
         });
         self.emit(
             &mut out,
@@ -5310,9 +5298,30 @@ impl AnthropicToResponsesTranslator {
         index
     }
 
+    /// The whole prompt as the upstream reported it, or the request's own
+    /// estimate before any event carried a count.
+    fn input_tokens(&self) -> u64 {
+        if self.usage.has_prompt_tokens() {
+            self.usage.prompt_tokens()
+        } else {
+            self.estimated_input_tokens
+        }
+    }
+
     fn output_tokens_estimate(&self) -> u64 {
-        self.output_tokens
-            .unwrap_or_else(|| (self.running_output_chars as u64 / 4).max(1))
+        self.usage
+            .output_tokens_or(|| (self.running_output_chars as u64 / 4).max(1))
+    }
+
+    /// The merged counts, with the estimates standing in for anything the
+    /// upstream never reported.
+    fn usage_or_estimates(&self) -> AnthropicUsage {
+        let mut usage = self.usage;
+        if !usage.has_prompt_tokens() {
+            usage.input_tokens = self.estimated_input_tokens;
+        }
+        usage.output_tokens = Some(self.output_tokens_estimate());
+        usage
     }
 }
 
@@ -5349,12 +5358,7 @@ fn synthetic_responses_sse(
         tool_names.clone(),
     );
     let mut events = translator.start();
-    if let Some(usage) = anthropic_message.get("usage") {
-        if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
-            translator.input_tokens = input;
-        }
-        translator.output_tokens = usage.get("output_tokens").and_then(Value::as_u64);
-    }
+    translator.usage.merge(anthropic_message.get("usage"));
     for (index, block) in anthropic_message
         .get("content")
         .and_then(Value::as_array)
@@ -5431,14 +5435,12 @@ fn synthetic_responses_json(
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    let input_tokens = anthropic_message
-        .pointer("/usage/input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(estimated_input_tokens);
-    let output_tokens = anthropic_message
-        .pointer("/usage/output_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| (output_text.len() as u64 / 4).max(1));
+    let mut usage = AnthropicUsage::default();
+    usage.merge(anthropic_message.get("usage"));
+    if !usage.has_prompt_tokens() {
+        usage.input_tokens = estimated_input_tokens;
+    }
+    usage.output_tokens = Some(usage.output_tokens_or(|| (output_text.len() as u64 / 4).max(1)));
     let mut response = json_response(
         StatusCode::OK,
         json!({
@@ -5449,13 +5451,7 @@ fn synthetic_responses_json(
             "model": decision.requested_model,
             "output": output,
             "output_text": output_text,
-            "usage": {
-                "input_tokens": input_tokens,
-                "input_tokens_details": {"cached_tokens": 0},
-                "output_tokens": output_tokens,
-                "output_tokens_details": {"reasoning_tokens": 0},
-                "total_tokens": input_tokens + output_tokens,
-            },
+            "usage": usage.to_responses(),
         }),
     );
     response.headers_mut().insert(
@@ -5527,8 +5523,7 @@ fn synthetic_response_items(
 
 fn anthropic_sse_text_to_message(sse_text: &str, estimated_input_tokens: u64) -> Value {
     let mut text = String::new();
-    let mut input_tokens = estimated_input_tokens;
-    let mut output_tokens = None;
+    let mut usage = AnthropicUsage::default();
     let mut buffer = sse_text.to_owned();
     while let Some(event) = drain_sse_event(&mut buffer) {
         let Some((_event, data)) = parse_sse_event(&event) else {
@@ -5538,14 +5533,7 @@ fn anthropic_sse_text_to_message(sse_text: &str, estimated_input_tokens: u64) ->
             continue;
         };
         match value.get("type").and_then(Value::as_str) {
-            Some("message_start") => {
-                if let Some(input) = value
-                    .pointer("/message/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    input_tokens = input;
-                }
-            }
+            Some("message_start") => usage.merge(value.pointer("/message/usage")),
             Some("content_block_delta") => {
                 if value.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
                     && let Some(delta) = value.pointer("/delta/text").and_then(Value::as_str)
@@ -5553,18 +5541,21 @@ fn anthropic_sse_text_to_message(sse_text: &str, estimated_input_tokens: u64) ->
                     text.push_str(delta);
                 }
             }
-            Some("message_delta") => {
-                output_tokens = value
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64);
-            }
+            Some("message_delta") => usage.merge(value.get("usage")),
             _ => {}
         }
     }
-    let output_tokens = output_tokens.unwrap_or_else(|| (text.len() as u64 / 4).max(1));
+    if !usage.has_prompt_tokens() {
+        usage.input_tokens = estimated_input_tokens;
+    }
     json!({
         "content": [{"type": "text", "text": text}],
-        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+        "usage": {
+            "input_tokens": usage.input_tokens,
+            "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": usage.cache_read_input_tokens,
+            "output_tokens": usage.output_tokens_or(|| (text.len() as u64 / 4).max(1)),
+        },
     })
 }
 
@@ -8827,6 +8818,101 @@ mod tests {
         assert!(emitted.contains("\"type\":\"compaction\""));
         assert!(emitted.contains("\"encrypted_content\":\"summary\""));
         assert!(!emitted.contains("response.output_text.delta"));
+    }
+
+    /// The Rayline router streams a placeholder `message_start` (`input_tokens`
+    /// 0, cache fields `null`) and reports the real counts only in the final
+    /// `message_delta`. `response.completed` must carry the whole prompt and
+    /// the cache-read count, not the request's estimate and zero.
+    #[test]
+    fn anthropic_stream_translator_reports_prompt_and_cached_tokens() {
+        let mut translator = AnthropicToResponsesTranslator::new(
+            "resp_test".to_owned(),
+            "arc-swift".to_owned(),
+            3,
+            SyntheticOutputKind::Message,
+            ToolNameRewrites::default(),
+        );
+        // Until the upstream reports a count, metrics see the estimate.
+        assert_eq!(translator.input_tokens(), 3);
+        let mut upstream = String::new();
+        push_sse(
+            &mut upstream,
+            "message_start",
+            json!({"type":"message_start","message":{"usage":{"input_tokens":0,
+                   "cache_creation_input_tokens":null,"cache_read_input_tokens":null,
+                   "output_tokens":0}}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        );
+        push_sse(
+            &mut upstream,
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"PONG"}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+                   "usage":{"input_tokens":3,"cache_creation_input_tokens":null,
+                            "cache_read_input_tokens":3360,"output_tokens":16}}),
+        );
+        push_sse(
+            &mut upstream,
+            "message_stop",
+            json!({"type":"message_stop"}),
+        );
+        let emitted = format!(
+            "{}{}",
+            translator.start(),
+            translator.push_bytes(upstream.as_bytes())
+        );
+        let completed = emitted
+            .split("\n\n")
+            .filter_map(|raw| raw.lines().find_map(|line| line.strip_prefix("data: ")))
+            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+            .find(|event| event["type"] == "response.completed")
+            .expect("response.completed");
+        assert_eq!(
+            completed["response"]["usage"],
+            json!({"input_tokens": 3363, "input_tokens_details": {"cached_tokens": 3360},
+                   "output_tokens": 16, "output_tokens_details": {"reasoning_tokens": 0},
+                   "total_tokens": 3379})
+        );
+        assert_eq!(translator.input_tokens(), 3363);
+    }
+
+    /// A non-streaming request whose upstream answered in SSE keeps the
+    /// prompt and cache counts the final `message_delta` carried.
+    #[test]
+    fn sse_text_to_message_keeps_delta_prompt_and_cache_counts() {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":null}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PONG\"}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":3,\"cache_read_input_tokens\":3360,\"output_tokens\":16}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let message = anthropic_sse_text_to_message(sse, 99);
+        assert_eq!(message["content"][0]["text"], "PONG");
+        assert_eq!(
+            message["usage"],
+            json!({"input_tokens": 3, "cache_creation_input_tokens": 0,
+                   "cache_read_input_tokens": 3360, "output_tokens": 16})
+        );
+        // No counts at all: the estimate stands in for the prompt.
+        let message = anthropic_sse_text_to_message(
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+            99,
+        );
+        assert_eq!(message["usage"]["input_tokens"], 99);
+        assert_eq!(message["usage"]["output_tokens"], 1);
     }
 
     #[test]
