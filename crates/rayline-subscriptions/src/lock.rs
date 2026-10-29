@@ -47,6 +47,11 @@ impl PoolLock {
     /// when another process owns the pool.
     pub fn try_acquire(state_dir: &Path, pool_id: &str) -> Result<Self, PoolLockError> {
         let path = Self::path_for(state_dir, pool_id)?;
+        // A relative directory would depend on the working directory, whose
+        // own ancestors are never checked.
+        if !state_dir.is_absolute() {
+            return Err(PoolLockError::UnsafeStateDir(state_dir.to_owned()));
+        }
         create_private_dir(state_dir)?;
         let mut file = open_lock_file(&path)?;
         match file.try_lock_exclusive() {
@@ -364,6 +369,14 @@ mod tests {
         ));
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).expect("sticky");
         PoolLock::try_acquire(&shared.join("state"), "default").expect("sticky parent is safe");
+    }
+
+    #[test]
+    fn refuses_a_relative_state_dir() {
+        assert!(matches!(
+            PoolLock::try_acquire(Path::new("relative/state"), "default"),
+            Err(PoolLockError::UnsafeStateDir(_))
+        ));
     }
 
     #[test]
