@@ -91,16 +91,23 @@ fn project_roots(cwd: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    // NUL-separated, so a path containing a newline stays intact.
-    let worktrees = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .output()
-        .ok()
-        .filter(|output| output.status.success());
-    if let Some(output) = worktrees {
-        for field in output.stdout.split(|byte| *byte == 0) {
+    // NUL-separated where git supports it (2.36+), so a path containing a
+    // newline stays intact; older git gets the line format.
+    let list = |extra: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["worktree", "list", "--porcelain"])
+            .args(extra)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+    };
+    let fields = list(&["-z"])
+        .map(|output| (output.stdout, 0))
+        .or_else(|| list(&[]).map(|output| (output.stdout, b'\n')));
+    if let Some((stdout, separator)) = fields {
+        for field in stdout.split(|byte| *byte == separator) {
             if let Some(path) = field.strip_prefix(b"worktree ") {
                 roots.push(PathBuf::from(String::from_utf8_lossy(path).into_owned()));
             }
@@ -275,6 +282,39 @@ fn check_settings_env(files: &[(PathBuf, Tier)], background: bool) -> anyhow::Re
     Ok(())
 }
 
+/// A resumed session re-enters the worktree it was started in. One made by a
+/// `WorktreeCreate` hook is not registered with git, so `project_roots`
+/// cannot find it; refuse resuming while such a hook is configured.
+fn refuse_resume_into_hook_worktree(
+    files: &[(PathBuf, Tier)],
+    args: &[OsString],
+) -> anyhow::Result<()> {
+    let resumes = args.iter().filter_map(|arg| arg.to_str()).any(|arg| {
+        let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
+        matches!(flag, "--resume" | "--continue" | "--from-pr")
+            || (!arg.starts_with("--") && arg.starts_with('-') && flag[1..].contains(['r', 'c']))
+    });
+    if !resumes {
+        return Ok(());
+    }
+    for (path, _) in files {
+        let Some(settings) = read_settings(path)? else {
+            continue;
+        };
+        if settings
+            .get("hooks")
+            .and_then(|hooks| hooks.get("WorktreeCreate"))
+            .is_some_and(|hook| !hook.is_null())
+        {
+            bail!(
+                "{} configures a WorktreeCreate hook, and a resumed session may re-enter a worktree it made whose settings csub cannot check; start a new session or launch without the pool",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Flags that would replace or outrank the `--settings` the launcher adds.
 /// Checked across every argument: an option value may itself be `--`.
 fn refuse_settings_flags(args: &[OsString]) -> anyhow::Result<()> {
@@ -340,6 +380,7 @@ pub async fn claude(
     let mut files = settings_files(&project_roots(&cwd));
     files.extend(mdm_policies().into_iter().map(|path| (path, Tier::Managed)));
     check_settings_env(&files, background)?;
+    refuse_resume_into_hook_worktree(&files, &args)?;
     refuse_gateway_sign_in().await?;
     if background {
         if let Some(config_dir) = claude_config_dir() {
@@ -520,6 +561,24 @@ mod tests {
         assert!(check_settings_env(&files, false).is_err());
         std::fs::write(&user, "\u{feff} \n").expect("settings");
         check_settings_env(&files, false).expect("blank settings");
+    }
+
+    #[test]
+    fn resuming_is_refused_only_with_a_worktree_create_hook() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let settings = temp.path().join("settings.json");
+        let files = vec![(settings.clone(), Tier::Overridable)];
+        let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
+        std::fs::write(&settings, r#"{"hooks":{"Stop":[]}}"#).expect("settings");
+        refuse_resume_into_hook_worktree(&files, &args(&["--continue"])).expect("no hook");
+        std::fs::write(&settings, r#"{"hooks":{"WorktreeCreate":[]}}"#).expect("settings");
+        refuse_resume_into_hook_worktree(&files, &args(&["-p", "hi"])).expect("not resuming");
+        for flag in ["--continue", "--resume=abc", "-r", "-c", "--from-pr"] {
+            assert!(
+                refuse_resume_into_hook_worktree(&files, &args(&[flag])).is_err(),
+                "{flag}"
+            );
+        }
     }
 
     #[test]
