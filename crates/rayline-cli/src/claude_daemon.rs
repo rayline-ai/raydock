@@ -89,40 +89,6 @@ impl LaunchPreflight<'_> {
     }
 }
 
-/// Background sessions (`--bg`, agent view) run under Claude Code's
-/// supervisor daemon, which keeps the environment it started with. A
-/// subscription-pool launch can only reuse one that already talks to a csub
-/// gateway on `port`; any other would send background work elsewhere.
-pub fn check_subscription_pool_daemon(config_dir: &Path, port: u16) -> Result<(), String> {
-    if crate::claude::claude_agent_view_disabled() {
-        return Ok(());
-    }
-    let Some(state) = inspect_running_daemon(config_dir) else {
-        return Ok(());
-    };
-    subscription_pool_daemon_verdict(&state, port)
-}
-
-fn subscription_pool_daemon_verdict(state: &DaemonState, port: u16) -> Result<(), String> {
-    let gateway = format!("http://127.0.0.1:{port}/l/");
-    let on_pool = state
-        .env_vars
-        .get("ANTHROPIC_BASE_URL")
-        .is_some_and(|url| url.starts_with(&gateway));
-    if on_pool {
-        return Ok(());
-    }
-    let why = if state.env_unreadable {
-        "whose environment cannot be inspected"
-    } else {
-        "that is not on the subscription pool"
-    };
-    Err(format!(
-        "a Claude Code background supervisor (pid {}) {why} is running; background sessions from this launch would reuse it. Stop it with `{STOP_COMMAND}` and launch again.",
-        state.pid
-    ))
-}
-
 fn proceed_preflight(config_dir: &Path, state: Option<&DaemonState>) -> ProceedPreflight {
     let preserve_spawned_by_pid = state
         .and_then(|state| state.spawned_by_pid)
@@ -798,31 +764,6 @@ mod tests {
             spawned_by_pid: None,
             started_at_ms: None,
         }
-    }
-
-    #[test]
-    fn subscription_pool_reuses_only_a_supervisor_on_the_csub_gateway() {
-        let base_url = |url: &str| {
-            state(BTreeMap::from([(
-                "ANTHROPIC_BASE_URL".to_owned(),
-                url.to_owned(),
-            )]))
-        };
-        assert!(
-            subscription_pool_daemon_verdict(&base_url("http://127.0.0.1:20816/l/abc"), 20816)
-                .is_ok()
-        );
-        assert!(
-            subscription_pool_daemon_verdict(&base_url("http://127.0.0.1:20817/l/abc"), 20816)
-                .is_err()
-        );
-        assert!(
-            subscription_pool_daemon_verdict(&base_url("https://gateway.example"), 20816).is_err()
-        );
-        let error = subscription_pool_daemon_verdict(&state(BTreeMap::new()), 20816)
-            .expect_err("plain supervisor");
-        assert!(error.contains(STOP_COMMAND), "{error}");
-        assert!(subscription_pool_daemon_verdict(&unreadable_state(None, None), 20816).is_err());
     }
 
     fn unreadable_state(spawned_by_pid: Option<u32>, started_at_ms: Option<i64>) -> DaemonState {

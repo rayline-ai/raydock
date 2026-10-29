@@ -35,15 +35,18 @@ const WITHHELD_ENV: &[&str] = &[
 /// Settings files whose `env` block Claude Code applies over the process
 /// environment. The gateway URL is also passed with `--settings`, which wins
 /// over user and project settings but not over managed policy.
+fn claude_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")))
+}
+
 fn settings_files(cwd: &Path) -> Vec<(PathBuf, bool)> {
     let mut files = vec![(
         PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.json"),
         true,
     )];
-    let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".claude")));
-    if let Some(config_dir) = config_dir {
+    if let Some(config_dir) = claude_config_dir() {
         files.push((config_dir.join("settings.json"), false));
     }
     for directory in cwd.ancestors() {
@@ -106,6 +109,11 @@ pub async fn claude(
     refuse_own_settings_flag(&args)?;
     let cwd = std::env::current_dir().context("read the current directory")?;
     check_settings_env(&settings_files(&cwd))?;
+    if crate::supervisor::starts_background_session(&args) {
+        if let Some(config_dir) = claude_config_dir() {
+            crate::supervisor::check(&config_dir, port).map_err(|message| anyhow!(message))?;
+        }
+    }
     ensure_daemon(frontend, pool, port).await?;
     let base_url = format!("http://127.0.0.1:{port}{LAUNCH_PREFIX}{}", new_launch_id());
     let settings = serde_json::json!({"env": {"ANTHROPIC_BASE_URL": base_url}}).to_string();

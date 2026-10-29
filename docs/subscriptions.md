@@ -38,7 +38,7 @@ gateway URL wins over user and project settings.
 The launch is refused when a settings `env` block sets an API key, a cloud
 provider switch (Bedrock, Vertex, Foundry, …) or a provider credential, or
 when managed settings set `ANTHROPIC_BASE_URL`. The same variables are removed
-from the inherited environment. A `--bg` launch is also refused while Claude
+from the inherited environment. A `--bg` launch (via raydock or `csub claude`) is also refused while Claude
 Code's background supervisor runs off the pool; stop it with
 `claude daemon stop --any` first.
 

@@ -10,3 +10,4 @@ pub mod gateway;
 pub mod launch;
 pub mod serve;
 pub mod service;
+pub mod supervisor;
