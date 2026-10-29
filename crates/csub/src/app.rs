@@ -159,7 +159,7 @@ where
 async fn run_command(frontend: &Frontend, command: Command) -> ExitCode {
     let registry_command = match command {
         Command::Claude { pool, port, args } => {
-            return match crate::launch::claude(&pool, port, args).await {
+            return match crate::launch::claude(frontend, &pool, port, args).await {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("csub claude: {error:#}");

@@ -777,19 +777,21 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::Subscriptions(args) => {
-            const FRONTEND: csub::app::Frontend = csub::app::Frontend {
-                name: "raydock subscriptions",
-                command_prefix: &["subscriptions"],
-            };
-            let argv = std::iter::once(OsString::from(FRONTEND.name)).chain(args);
-            csub::app::run(&FRONTEND, argv).await
+            let argv = std::iter::once(OsString::from(CSUB_FRONTEND.name)).chain(args);
+            csub::app::run(&CSUB_FRONTEND, argv).await
         }
         RaylineDispatch::SubscriptionClaude { pool, args } => {
-            let port = env::var("CSUB_PORT")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(csub::serve::DEFAULT_PORT);
-            match csub::launch::claude(&pool, port, args).await {
+            let port = match env::var("CSUB_PORT") {
+                Err(_) => csub::serve::DEFAULT_PORT,
+                Ok(value) => match value.parse() {
+                    Ok(port) => port,
+                    Err(_) => {
+                        eprintln!("raydock claude: CSUB_PORT={value:?} is not a port number");
+                        return ExitCode::from(2);
+                    }
+                },
+            };
+            match csub::launch::claude(&CSUB_FRONTEND, &pool, port, args).await {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("raydock claude --subscription-pool: {error:#}");
@@ -1595,6 +1597,12 @@ fn is_claude_management_subcommand(arg: &str) -> bool {
         "login" | "logout" | "key" | "setup" | "hooks" | "telemetry"
     )
 }
+
+/// `raydock subscriptions` mounts the csub command line.
+const CSUB_FRONTEND: csub::app::Frontend = csub::app::Frontend {
+    name: "raydock subscriptions",
+    command_prefix: &["subscriptions"],
+};
 
 /// Rayline routing flags that make no sense on the subscription gateway.
 const ROUTER_ONLY_CLAUDE_FLAGS: &[&str] = &[

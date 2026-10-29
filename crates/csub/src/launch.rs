@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, anyhow, bail};
 
+use crate::app::Frontend;
 use crate::gateway::LAUNCH_PREFIX;
 
 /// Env vars that would take Claude Code off its subscription OAuth login (so
@@ -15,6 +16,7 @@ const WITHHELD_ENV: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_VERTEX",
     "RAYLINE_ROUTER_API_KEY",
     "RAYLINE_KEY",
@@ -22,8 +24,13 @@ const WITHHELD_ENV: &[&str] = &[
 
 /// Checks that a csub daemon for `pool` answers on `port`, then replaces this
 /// process with `claude` (spawns and waits where exec is unavailable).
-pub async fn claude(pool: &str, port: u16, args: Vec<OsString>) -> anyhow::Result<ExitCode> {
-    ensure_daemon(pool, port).await?;
+pub async fn claude(
+    frontend: &Frontend,
+    pool: &str,
+    port: u16,
+    args: Vec<OsString>,
+) -> anyhow::Result<ExitCode> {
+    ensure_daemon(frontend, pool, port).await?;
     let base_url = format!("http://127.0.0.1:{port}{LAUNCH_PREFIX}{}", new_launch_id());
     let binary = std::env::var_os("CSUB_CLAUDE_BIN").unwrap_or_else(|| OsString::from("claude"));
     let mut command = Command::new(&binary);
@@ -55,10 +62,13 @@ pub async fn claude(pool: &str, port: u16, args: Vec<OsString>) -> anyhow::Resul
     }
 }
 
-async fn ensure_daemon(pool: &str, port: u16) -> anyhow::Result<()> {
-    let hint = "start it with `csub service install` (or run `csub serve`)";
+async fn ensure_daemon(frontend: &Frontend, pool: &str, port: u16) -> anyhow::Result<()> {
+    let name = frontend.name;
+    let hint = format!("start it with `{name} service install` (or run `{name} serve`)");
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
+        // Loopback only: an inherited HTTP(S)_PROXY must not carry this.
+        .no_proxy()
         .build()
         .context("build HTTP client")?
         .get(format!("http://127.0.0.1:{port}/healthz"))
@@ -146,7 +156,7 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
         let port = listener.local_addr().expect("addr").port();
         drop(listener);
-        let error = claude("default", port, Vec::new())
+        let error = claude(&crate::app::CSUB, "default", port, Vec::new())
             .await
             .expect_err("no daemon");
         assert!(
