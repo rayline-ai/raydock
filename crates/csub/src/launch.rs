@@ -45,12 +45,9 @@ fn claude_config_dir() -> Option<PathBuf> {
 enum Tier {
     /// Managed policy outranks our `--settings`, so it may not set the URL.
     Managed,
-    /// Claude Code's global config (`.claude.json`): its env block is
-    /// applied, and its rank against `--settings` is not established, so it
-    /// may not set the URL either.
-    GlobalConfig,
-    /// User, project and local settings; our `--settings` overrides them in
-    /// the foreground session.
+    /// User, project and local settings, and the global config's env block
+    /// (applied first); our `--settings` overrides them in the foreground
+    /// session.
     Overridable,
 }
 
@@ -116,21 +113,20 @@ fn settings_files(roots: &[PathBuf]) -> Vec<(PathBuf, Tier)> {
         files.push((config_dir.join("settings.json"), Tier::Overridable));
         // Claude Code prefers a legacy `.config.json` here when present;
         // both are checked rather than mirroring that choice.
-        files.push((config_dir.join(".config.json"), Tier::GlobalConfig));
+        files.push((config_dir.join(".config.json"), Tier::Overridable));
     }
-    let suffix = if std::env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").is_some() {
-        "-custom-oauth"
-    } else {
-        ""
-    };
+    // Claude Code tests the value's truthiness: empty means unset.
+    let suffix =
+        if std::env::var_os("CLAUDE_CODE_CUSTOM_OAUTH_URL").is_some_and(|url| !url.is_empty()) {
+            "-custom-oauth"
+        } else {
+            ""
+        };
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
     {
-        files.push((
-            dir.join(format!(".claude{suffix}.json")),
-            Tier::GlobalConfig,
-        ));
+        files.push((dir.join(format!(".claude{suffix}.json")), Tier::Overridable));
     }
     for root in roots {
         files.push((root.join(".claude/settings.json"), Tier::Overridable));
@@ -238,8 +234,7 @@ fn check_settings_env(files: &[(PathBuf, Tier)], background: bool) -> anyhow::Re
             continue;
         };
         for name in env.keys() {
-            let redirects =
-                name == "ANTHROPIC_BASE_URL" && (*tier != Tier::Overridable || background);
+            let redirects = name == "ANTHROPIC_BASE_URL" && (*tier == Tier::Managed || background);
             if redirects || WITHHELD_ENV.contains(&name.as_str()) {
                 bail!(
                     "{} sets {name} in its env block, which would take Claude Code off the subscription pool; remove it or launch without the pool",
@@ -459,13 +454,15 @@ mod tests {
     fn global_config_and_policy_helpers_are_checked() {
         let temp = tempfile::tempdir().expect("tempdir");
         let global = temp.path().join(".claude.json");
-        let files = vec![(global.clone(), Tier::GlobalConfig)];
+        let files = vec![(global.clone(), Tier::Overridable)];
         std::fs::write(&global, r#"{"numStartups":3}"#).expect("global");
         check_settings_env(&files, false).expect("no env block");
         std::fs::write(&global, r#"{"env":{"CLAUDE_CODE_USE_BEDROCK":"1"}}"#).expect("global");
         assert!(check_settings_env(&files, false).is_err());
+        // Our --settings outranks its URL in the foreground only.
         std::fs::write(&global, r#"{"env":{"ANTHROPIC_BASE_URL":"http://x"}}"#).expect("global");
-        assert!(check_settings_env(&files, false).is_err());
+        check_settings_env(&files, false).expect("foreground");
+        assert!(check_settings_env(&files, true).is_err());
 
         let managed = temp.path().join("managed-settings.json");
         std::fs::write(
