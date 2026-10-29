@@ -61,7 +61,9 @@ enum Tier {
 
 /// Project roots Claude Code reads `.claude/settings*.json` from: the working
 /// directory, its git top level, and, in a linked worktree, the main checkout
-/// (whose local settings Claude Code also applies).
+/// (whose local settings Claude Code also applies). Every other worktree of
+/// the repository is included too: `--resume`/`--continue` re-enter the
+/// worktree a session was started in, after these checks.
 fn project_roots(cwd: &Path) -> Vec<PathBuf> {
     let mut roots = vec![cwd.to_owned()];
     // One value per call, so a path containing a newline stays intact.
@@ -89,8 +91,28 @@ fn project_roots(cwd: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    roots.dedup();
-    roots
+    // NUL-separated, so a path containing a newline stays intact.
+    let worktrees = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    if let Some(output) = worktrees {
+        for field in output.stdout.split(|byte| *byte == 0) {
+            if let Some(path) = field.strip_prefix(b"worktree ") {
+                roots.push(PathBuf::from(String::from_utf8_lossy(path).into_owned()));
+            }
+        }
+    }
+    let mut unique = Vec::with_capacity(roots.len());
+    for root in roots {
+        if !unique.contains(&root) {
+            unique.push(root);
+        }
+    }
+    unique
 }
 
 #[cfg(target_os = "macos")]
@@ -582,6 +604,15 @@ mod tests {
             roots
                 .iter()
                 .any(|root| root.canonicalize().ok() == Some(main.clone())),
+            "{roots:?}"
+        );
+        // From the main checkout, a resumed session may re-enter the linked one.
+        let linked = linked.canonicalize().expect("linked");
+        let roots = project_roots(&main);
+        assert!(
+            roots
+                .iter()
+                .any(|root| root.canonicalize().ok() == Some(linked.clone())),
             "{roots:?}"
         );
     }
