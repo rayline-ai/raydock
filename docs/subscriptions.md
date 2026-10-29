@@ -37,7 +37,9 @@ unchanged, except `--settings`, `--managed-settings`, `--project-config-root`,
 `--settings` so the gateway URL wins over user and project settings, and checks
 settings for the directory it starts in. A profile signed in to a Cloud
 gateway (`claude auth logout` clears it) is refused too, since that sign-in
-outranks `ANTHROPIC_BASE_URL`.
+outranks `ANTHROPIC_BASE_URL`. Settings in every worktree of the repository are checked, since
+`--resume`/`--continue` can re-enter one; resuming is refused while a
+`WorktreeCreate` hook is configured, whose worktrees git does not list.
 
 The launch is refused when a settings `env` block (managed, user, project,
 local, or the global `~/.claude.json`) sets an API key, a cloud provider switch
