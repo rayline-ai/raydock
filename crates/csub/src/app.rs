@@ -118,17 +118,31 @@ struct PoolArgs {
     config: Option<PathBuf>,
 }
 
-/// Parses `argv` (program name first) and runs the command. `name` is the
-/// command shown in help and errors, e.g. `csub` or `rayline subscriptions`.
-pub async fn run<I, T>(name: &'static str, argv: I) -> ExitCode
+/// How a front end mounts this command line.
+pub struct Frontend {
+    /// Shown in help and errors, e.g. `csub` or `raydock subscriptions`.
+    pub name: &'static str,
+    /// Arguments that reach this command line from the running binary, used
+    /// when a launchd job must re-run it (`[]` for csub, `["subscriptions"]`
+    /// for raydock).
+    pub command_prefix: &'static [&'static str],
+}
+
+pub const CSUB: Frontend = Frontend {
+    name: "csub",
+    command_prefix: &[],
+};
+
+/// Parses `argv` (program name first) and runs the command.
+pub async fn run<I, T>(frontend: &Frontend, argv: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
     use clap::{CommandFactory as _, FromArgMatches as _};
     let parsed = Cli::command()
-        .name(name)
-        .bin_name(name)
+        .name(frontend.name)
+        .bin_name(frontend.name)
         .try_get_matches_from(argv)
         .and_then(|matches| Cli::from_arg_matches(&matches));
     let cli = match parsed {
@@ -139,10 +153,10 @@ where
             return ExitCode::from(error.exit_code().clamp(0, 255) as u8);
         }
     };
-    run_command(cli.command).await
+    run_command(frontend, cli.command).await
 }
 
-async fn run_command(command: Command) -> ExitCode {
+async fn run_command(frontend: &Frontend, command: Command) -> ExitCode {
     let registry_command = match command {
         Command::Claude { pool, port, args } => {
             return match crate::launch::claude(&pool, port, args).await {
@@ -185,6 +199,11 @@ async fn run_command(command: Command) -> ExitCode {
                     pool_id: pool.pool,
                     config_path: pool.config,
                     port,
+                    command_prefix: frontend
+                        .command_prefix
+                        .iter()
+                        .map(|argument| (*argument).to_owned())
+                        .collect(),
                 }),
                 ServiceAction::Uninstall => crate::service::uninstall(),
                 ServiceAction::Status => crate::service::status(),

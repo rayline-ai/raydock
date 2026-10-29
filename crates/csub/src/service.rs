@@ -16,6 +16,9 @@ pub struct ServiceOptions {
     pub pool_id: String,
     pub config_path: Option<PathBuf>,
     pub port: u16,
+    /// Arguments between the binary and `serve`, e.g. `["subscriptions"]`
+    /// when the job runs `raydock subscriptions serve`.
+    pub command_prefix: Vec<String>,
 }
 
 pub fn plist_path(home: &Path) -> PathBuf {
@@ -29,14 +32,15 @@ pub fn log_path(home: &Path) -> PathBuf {
 
 /// Renders the LaunchAgent for `binary` (an absolute path).
 pub fn render_plist(binary: &Path, home: &Path, options: &ServiceOptions) -> String {
-    let mut arguments = vec![
-        binary.display().to_string(),
+    let mut arguments = vec![binary.display().to_string()];
+    arguments.extend(options.command_prefix.iter().cloned());
+    arguments.extend([
         "serve".to_owned(),
         "--pool".to_owned(),
         options.pool_id.clone(),
         "--port".to_owned(),
         options.port.to_string(),
-    ];
+    ]);
     if let Some(config) = &options.config_path {
         arguments.push("--config".to_owned());
         arguments.push(config.display().to_string());
@@ -120,6 +124,7 @@ pub fn install(options: &ServiceOptions) -> Result<String, anyhow::Error> {
             })
             .transpose()?,
         port: options.port,
+        command_prefix: options.command_prefix.clone(),
     };
     let binary = std::env::current_exe()
         .context("locate the csub binary")?
@@ -199,6 +204,7 @@ mod tests {
                 pool_id: "default".to_owned(),
                 config_path: Some(PathBuf::from("/Users/someone/a&b.json")),
                 port: 20816,
+                command_prefix: Vec::new(),
             },
         );
         assert!(plist.contains("<string>/opt/csub/bin/csub</string>\n    <string>serve</string>"));
@@ -206,5 +212,22 @@ mod tests {
         assert!(plist.contains("<string>/Users/someone/a&amp;b.json</string>"));
         assert!(plist.contains("<key>KeepAlive</key><true/>"));
         assert!(plist.contains("/Users/someone/Library/Logs/csub.log"));
+    }
+
+    #[test]
+    fn plist_reenters_a_mounted_command_line() {
+        let plist = render_plist(
+            Path::new("/usr/local/bin/raydock"),
+            Path::new("/Users/someone"),
+            &ServiceOptions {
+                pool_id: "default".to_owned(),
+                config_path: None,
+                port: 20816,
+                command_prefix: vec!["subscriptions".to_owned()],
+            },
+        );
+        assert!(plist.contains(
+            "<string>/usr/local/bin/raydock</string>\n    <string>subscriptions</string>\n    <string>serve</string>"
+        ));
     }
 }

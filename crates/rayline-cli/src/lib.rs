@@ -777,11 +777,19 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             }
         },
         RaylineDispatch::Subscriptions(args) => {
-            let argv = std::iter::once(OsString::from("raydock subscriptions")).chain(args);
-            csub::app::run("raydock subscriptions", argv).await
+            const FRONTEND: csub::app::Frontend = csub::app::Frontend {
+                name: "raydock subscriptions",
+                command_prefix: &["subscriptions"],
+            };
+            let argv = std::iter::once(OsString::from(FRONTEND.name)).chain(args);
+            csub::app::run(&FRONTEND, argv).await
         }
         RaylineDispatch::SubscriptionClaude { pool, args } => {
-            match csub::launch::claude(&pool, csub::serve::DEFAULT_PORT, args).await {
+            let port = env::var("CSUB_PORT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(csub::serve::DEFAULT_PORT);
+            match csub::launch::claude(&pool, port, args).await {
                 Ok(code) => code,
                 Err(error) => {
                     eprintln!("raydock claude --subscription-pool: {error:#}");
@@ -1615,6 +1623,12 @@ const ROUTER_ONLY_CLAUDE_FLAGS: &[&str] = &[
 fn parse_subscription_claude(args: &[OsString]) -> Option<RaylineDispatch> {
     let mut pool = None;
     let mut rest = Vec::with_capacity(args.len());
+    // `raydock claude run ...` is an alias of `raydock claude ...`.
+    let args = match args.first().and_then(|arg| arg.to_str()) {
+        Some("run") => &args[1..],
+        _ => args,
+    };
+    let mut after_separator = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         let Some(text) = arg.to_str() else {
@@ -1622,8 +1636,9 @@ fn parse_subscription_claude(args: &[OsString]) -> Option<RaylineDispatch> {
             continue;
         };
         if text == "--" {
-            rest.push(arg.clone());
-            rest.extend(iter.by_ref().cloned());
+            // Like the router path, `--` only ends Raydock's options; Claude
+            // Code receives what follows it as its own arguments.
+            after_separator.extend(iter.by_ref().cloned());
             break;
         }
         if text == "--subscription-pool" {
@@ -1637,7 +1652,6 @@ fn parse_subscription_claude(args: &[OsString]) -> Option<RaylineDispatch> {
     let pool = pool?;
     let router_flag = rest
         .iter()
-        .take_while(|arg| arg.to_str() != Some("--"))
         .filter_map(|arg| arg.to_str())
         .map(|arg| arg.split_once('=').map_or(arg, |(flag, _)| flag))
         .find(|flag| ROUTER_ONLY_CLAUDE_FLAGS.contains(flag));
@@ -1651,6 +1665,7 @@ fn parse_subscription_claude(args: &[OsString]) -> Option<RaylineDispatch> {
             "{flag} routes through the Rayline router and cannot be combined with --subscription-pool; put Claude Code's own arguments after --"
         )));
     }
+    rest.extend(after_separator);
     Some(RaylineDispatch::SubscriptionClaude { pool, args: rest })
 }
 
@@ -2604,15 +2619,17 @@ mod tests {
             rayline_dispatch_for_argv(&argv(&[
                 "raydock",
                 "claude",
+                "run",
                 "--subscription-pool=work",
                 "--",
+                "-p",
                 "--local",
             ]))
         else {
             panic!("expected SubscriptionClaude");
         };
         assert_eq!(pool, "work");
-        assert_eq!(args, argv(&["--", "--local"]));
+        assert_eq!(args, argv(&["-p", "--local"]));
     }
 
     #[test]

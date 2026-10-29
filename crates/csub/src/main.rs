@@ -17,5 +17,5 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    runtime.block_on(csub::app::run("csub", std::env::args_os()))
+    runtime.block_on(csub::app::run(&csub::app::CSUB, std::env::args_os()))
 }
