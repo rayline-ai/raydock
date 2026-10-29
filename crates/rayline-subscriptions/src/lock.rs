@@ -139,7 +139,7 @@ fn held_message(path: &Path, holder_pid: Option<u32>) -> String {
 
 fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
     if let Some(parent) = dir.parent().filter(|parent| !parent.as_os_str().is_empty()) {
-        validate_trusted_parent(parent)?;
+        validate_trusted_ancestors(parent)?;
     }
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -180,30 +180,47 @@ fn create_private_dir(dir: &Path) -> Result<(), PoolLockError> {
     Ok(())
 }
 
-/// Another user able to rename entries in the parent could swap the state
-/// directory under a running owner, so the parent must be ours (or root's) and
-/// not writable by others unless it is sticky. A parent that does not exist
-/// yet is created by us with private permissions.
-fn validate_trusted_parent(parent: &Path) -> Result<(), PoolLockError> {
+/// Another user able to rename an entry anywhere above the state directory
+/// could swap it under a running owner, so every existing ancestor (resolved
+/// through symlinks) must be ours or root's and not writable by others unless
+/// it is sticky. Missing components below them are created by us, privately.
+fn validate_trusted_ancestors(parent: &Path) -> Result<(), PoolLockError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
-        let metadata = match fs::metadata(parent) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(source) => {
-                return Err(PoolLockError::StateDir {
-                    path: parent.to_owned(),
-                    source,
-                });
+        let mut existing = parent;
+        let resolved = loop {
+            match fs::canonicalize(existing) {
+                Ok(resolved) => break resolved,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    match existing
+                        .parent()
+                        .filter(|next| !next.as_os_str().is_empty())
+                    {
+                        Some(next) => existing = next,
+                        None => return Ok(()),
+                    }
+                }
+                Err(source) => {
+                    return Err(PoolLockError::StateDir {
+                        path: existing.to_owned(),
+                        source,
+                    });
+                }
             }
         };
         // SAFETY: geteuid has no arguments or memory safety preconditions.
         let euid = unsafe { libc::geteuid() };
-        let owner_trusted = metadata.uid() == euid || metadata.uid() == 0;
-        let shared_writable = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
-        if !owner_trusted || shared_writable {
-            return Err(PoolLockError::UnsafeStateDir(parent.to_owned()));
+        for ancestor in resolved.ancestors() {
+            let metadata = fs::metadata(ancestor).map_err(|source| PoolLockError::StateDir {
+                path: ancestor.to_owned(),
+                source,
+            })?;
+            let owner_trusted = metadata.uid() == euid || metadata.uid() == 0;
+            let shared_writable = metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0;
+            if !owner_trusted || shared_writable {
+                return Err(PoolLockError::UnsafeStateDir(ancestor.to_owned()));
+            }
         }
     }
     #[cfg(not(unix))]
@@ -330,6 +347,19 @@ mod tests {
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
         assert!(matches!(
             PoolLock::try_acquire(&shared.join("state"), "default"),
+            Err(PoolLockError::UnsafeStateDir(_))
+        ));
+        // Also when the unsafe directory is a grandparent and the parent is
+        // still missing, or is private but movable through the grandparent.
+        assert!(matches!(
+            PoolLock::try_acquire(&shared.join("missing/state"), "default"),
+            Err(PoolLockError::UnsafeStateDir(_))
+        ));
+        let private = shared.join("private");
+        fs::create_dir(&private).expect("private dir");
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).expect("chmod");
+        assert!(matches!(
+            PoolLock::try_acquire(&private.join("state"), "default"),
             Err(PoolLockError::UnsafeStateDir(_))
         ));
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).expect("sticky");
