@@ -277,12 +277,11 @@ mod tests {
         let first = PoolLock::try_acquire(&state, "default").expect("first owner");
         assert_eq!(first.path(), state.join("pool-default.lock"));
 
-        match PoolLock::try_acquire(&state, "default") {
-            Err(PoolLockError::Held { holder_pid, .. }) => {
-                assert_eq!(holder_pid, Some(std::process::id()));
-            }
-            other => panic!("expected Held, got {other:?}"),
-        }
+        let second = PoolLock::try_acquire(&state, "default");
+        assert!(matches!(
+            second,
+            Err(PoolLockError::Held { holder_pid: Some(pid), .. }) if pid == std::process::id()
+        ));
         assert_eq!(
             recorded_holder_pid(&state, "default"),
             Some(std::process::id())
