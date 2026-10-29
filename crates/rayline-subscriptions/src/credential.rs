@@ -56,6 +56,10 @@ impl Eq for SecretString {}
 #[derive(Clone, Debug)]
 pub struct CredentialStore {
     config_dir: PathBuf,
+    /// The path as given: Claude Code hashes it unresolved for the keychain
+    /// service name, so a symlinked path names a different item.
+    #[cfg(target_os = "macos")]
+    requested_dir: PathBuf,
     #[cfg(target_os = "macos")]
     allow_legacy_keychain: bool,
 }
@@ -79,6 +83,8 @@ impl CredentialStore {
             .is_some_and(|default| default == config_dir);
         Ok(Self {
             config_dir,
+            #[cfg(target_os = "macos")]
+            requested_dir: requested,
             #[cfg(target_os = "macos")]
             allow_legacy_keychain,
         })
@@ -112,7 +118,13 @@ impl CredentialStore {
         {
             let account =
                 std::env::var("USER").map_err(|_| CredentialError::UsernameUnavailable)?;
-            let mut services = vec![keychain_service_for_dir(&self.config_dir)];
+            // Both the resolved and the given path's item: whichever one
+            // Claude Code computes, it is checked.
+            let mut services = vec![
+                keychain_service_for_dir(&self.config_dir),
+                keychain_service_for_dir(&self.requested_dir),
+            ];
+            services.dedup();
             if self.allow_legacy_keychain {
                 services.push(CLAUDE_LEGACY_KEYCHAIN_SERVICE.to_owned());
             }
