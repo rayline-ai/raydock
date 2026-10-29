@@ -222,7 +222,12 @@ fn check_settings_env(files: &[(PathBuf, Tier)], background: bool) -> anyhow::Re
 fn refuse_settings_flags(args: &[OsString]) -> anyhow::Result<()> {
     for arg in args.iter().filter_map(|arg| arg.to_str()) {
         let flag = arg.split_once('=').map_or(arg, |(flag, _)| flag);
-        if flag == "--settings" || flag == "--managed-settings" {
+        // --project-config-root (hidden) reads project settings from a
+        // directory the checks above never see.
+        if matches!(
+            flag,
+            "--settings" | "--managed-settings" | "--project-config-root"
+        ) {
             bail!(
                 "{flag} cannot be combined with the subscription pool, which passes its own --settings to pin the gateway URL"
             );
@@ -480,6 +485,7 @@ mod tests {
         let args = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
         assert!(refuse_settings_flags(&args(&["--settings=x.json"])).is_err());
         assert!(refuse_settings_flags(&args(&["--managed-settings", "{}"])).is_err());
+        assert!(refuse_settings_flags(&args(&["--project-config-root=/other"])).is_err());
         assert!(
             refuse_settings_flags(&args(&["--system-prompt", "--", "--settings", "{}"])).is_err()
         );

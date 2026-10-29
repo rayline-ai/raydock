@@ -39,13 +39,17 @@ fn verdict(pid: u32, base_url: Option<Option<String>>, port: u16) -> Result<(), 
     ))
 }
 
+/// Claude Code's own truthy set: anything else leaves agent view on, so the
+/// check must still run.
 fn agent_view_disabled() -> bool {
-    std::env::var("CLAUDE_CODE_DISABLE_AGENT_VIEW").is_ok_and(|value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no"
-        )
-    })
+    std::env::var("CLAUDE_CODE_DISABLE_AGENT_VIEW").is_ok_and(|value| is_truthy(&value))
+}
+
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn running_supervisor(config_dir: &Path) -> Option<u32> {
@@ -139,6 +143,16 @@ mod tests {
         ])));
         assert!(!starts_background_session(&args(&["-p", "hello"])));
         assert!(!starts_background_session(&args(&[])));
+    }
+
+    #[test]
+    fn only_claude_codes_truthy_values_disable_agent_view() {
+        for value in ["1", "true", "YES", " on "] {
+            assert!(is_truthy(value), "{value}");
+        }
+        for value in ["", "0", "off", "maybe", "false"] {
+            assert!(!is_truthy(value), "{value}");
+        }
     }
 
     #[test]
