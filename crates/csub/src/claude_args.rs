@@ -23,6 +23,7 @@ const VALUE_OPTIONS: &[&str] = &[
     "--append-system-prompt",
     "--append-system-prompt-file",
     "--attach-serve",
+    "--autocompact",
     "--betas",
     "--channels",
     "--client-data-url",
@@ -37,6 +38,7 @@ const VALUE_OPTIONS: &[&str] = &[
     "--disallow-tools",
     "--effort",
     "--env",
+    "--environment",
     "--fallback-model",
     "--fast-mode",
     "--file",
@@ -55,6 +57,7 @@ const VALUE_OPTIONS: &[&str] = &[
     "--messaging-socket-path",
     "--model",
     "--name",
+    "--on-branch",
     "--output-format",
     "--parent-session-id",
     "--permission-mode",
@@ -64,14 +67,17 @@ const VALUE_OPTIONS: &[&str] = &[
     "--plugin-dir",
     "--plugin-dir-no-mcp",
     "--plugin-url",
+    "--pool",
     "--prefill",
     "--prefill-b64",
     "--proactivity",
     "--project-config-root",
+    "--ref",
     "--remote-control-session-name-prefix",
     "--resume-drops-turn",
     "--resume-session-at",
     "--rewind-files",
+    "--runner-declares",
     "--sdk-url",
     "--session-id",
     "--setting-sources",
@@ -90,9 +96,26 @@ const VALUE_OPTIONS: &[&str] = &[
     "--workload",
 ];
 
+/// Long options with an optional value: without `=value`, they take the next
+/// argument when it does not start with `-`, as Commander does.
+const OPTIONAL_VALUE_OPTIONS: &[&str] = &[
+    "--cloud",
+    "--debug",
+    "--from-pr",
+    "--project",
+    "--prompt-suggestions",
+    "--rc",
+    "--remote",
+    "--remote-control",
+    "--resume",
+    "--teleport",
+    "--worktree",
+];
+
 /// Short options with a required value: last in a cluster, they take the
 /// next argument. Optional-value ones (`-d`, `-r`, `-w`) take the rest of
-/// their cluster; either way the rest of the cluster is a value.
+/// their cluster, or, last in it, the next argument unless it starts with
+/// `-`; either way the rest of the cluster is a value.
 const SHORT_REQUIRED: &[char] = &['e', 'H', 'j', 'm', 'n', 's', 't'];
 const SHORT_OPTIONAL: &[char] = &['d', 'r', 'w'];
 
@@ -113,7 +136,7 @@ impl ClaudeArgs {
 
 pub(crate) fn parse(args: &[OsString]) -> ClaudeArgs {
     let mut parsed = ClaudeArgs::default();
-    let mut args = args.iter().map(|arg| arg.to_string_lossy());
+    let mut args = args.iter().map(|arg| arg.to_string_lossy()).peekable();
     while let Some(arg) = args.next() {
         if arg == "--" {
             if parsed.first_positional.is_none() {
@@ -126,8 +149,12 @@ pub(crate) fn parse(args: &[OsString]) -> ClaudeArgs {
                 .split_once('=')
                 .map_or((long, false), |(name, _)| (name, true));
             let name = format!("--{name}");
-            if !inline_value && VALUE_OPTIONS.contains(&name.as_str()) {
-                args.next();
+            if !inline_value {
+                if VALUE_OPTIONS.contains(&name.as_str()) {
+                    args.next();
+                } else if OPTIONAL_VALUE_OPTIONS.contains(&name.as_str()) {
+                    args.next_if(|next| !next.starts_with('-'));
+                }
             }
             parsed.options.push(name);
         } else if arg.len() > 1 && arg.starts_with('-') {
@@ -135,6 +162,9 @@ pub(crate) fn parse(args: &[OsString]) -> ClaudeArgs {
             while let Some(short) = cluster.next() {
                 parsed.options.push(format!("-{short}"));
                 if SHORT_OPTIONAL.contains(&short) {
+                    if cluster.as_str().is_empty() {
+                        args.next_if(|next| !next.starts_with('-'));
+                    }
                     break;
                 }
                 if SHORT_REQUIRED.contains(&short) {
@@ -163,7 +193,8 @@ mod tests {
     fn clusters_split_until_a_value_taking_flag() {
         let parsed = parse_strs(&["-pw", "-cr", "abc"]);
         assert_eq!(parsed.options, ["-p", "-w", "-c", "-r"]);
-        assert_eq!(parsed.first_positional.as_deref(), Some("abc"));
+        // `-r` ends its cluster, so `abc` is its value.
+        assert_eq!(parsed.first_positional, None);
         // `-n` takes the next argument, so `-w` there is a value.
         assert!(!parse_strs(&["-n", "-w"]).has("-w"));
         // `-r` takes the rest of its cluster.
@@ -181,6 +212,15 @@ mod tests {
             parsed.first_positional.as_deref(),
             Some("do the --worktree thing")
         );
+        // Optional values: the next word is the value unless it is an option.
+        let parsed = parse_strs(&["--debug", "api", "logs"]);
+        assert_eq!(parsed.first_positional.as_deref(), Some("logs"));
+        let parsed = parse_strs(&["-d", "api", "respawn"]);
+        assert_eq!(parsed.first_positional.as_deref(), Some("respawn"));
+        let parsed = parse_strs(&["--resume", "-w"]);
+        assert!(parsed.has("-w"));
+        let parsed = parse_strs(&["--autocompact", "auto", "logs"]);
+        assert_eq!(parsed.first_positional.as_deref(), Some("logs"));
         let parsed = parse_strs(&["--", "-w"]);
         assert!(parsed.options.is_empty());
         assert_eq!(parsed.first_positional.as_deref(), Some("-w"));
