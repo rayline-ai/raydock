@@ -188,12 +188,18 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
     }
     // Recoveries run on their own tasks; let any refresh in flight persist its
     // rotated grant before the lock is released.
+    // Set when a wait is cut short, so a blocking credential or snapshot
+    // write may still be running.
+    let mut abandoned = forced;
     if !forced {
         info!("waiting for in-flight credential refreshes");
         tokio::select! {
             result = tokio::time::timeout_at(deadline, runtime.quiesce_credentials()) => {
                 match result {
-                    Err(_) => warn!("credential refresh still running at the shutdown deadline; stopping anyway"),
+                    Err(_) => {
+                        warn!("credential refresh still running at the shutdown deadline; stopping anyway");
+                        abandoned = true;
+                    }
                     Ok(unsaved) if !unsaved.is_empty() => warn!(
                         "rotated grants for {} could not be saved; those accounts may need `claude /login` again",
                         unsaved.join(", ")
@@ -201,7 +207,10 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
                     Ok(_) => {}
                 }
             }
-            () = signals.recv() => warn!("second signal; not waiting for credential refreshes"),
+            () = signals.recv() => {
+                warn!("second signal; not waiting for credential refreshes");
+                abandoned = true;
+            }
         }
     }
     info!("flushing recovery state");
@@ -210,12 +219,15 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
         Ok(Err(error)) => warn!("recovery state flush failed: {error}"),
         Err(_) => {
             warn!("recovery state flush still running at the shutdown deadline; abandoning it");
-            drop(lock);
-            // Dropping the Tokio runtime would wait for the blocking write
-            // past launchd's ExitTimeOut, whichever front end built it (csub
-            // or raydock). The lock is released; end the process now.
-            std::process::exit(0);
+            abandoned = true;
         }
+    }
+    if abandoned {
+        // Dropping the Tokio runtime would wait for that write past launchd's
+        // ExitTimeOut, whichever front end built it (csub or raydock). Exit
+        // with the lock still held, so no successor can start before this
+        // process is gone; the OS releases it on exit.
+        std::process::exit(0);
     }
     drop(lock);
     Ok(())
