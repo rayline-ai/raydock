@@ -791,6 +791,17 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                     }
                 },
             };
+            let config_dir = env::var_os("CLAUDE_CONFIG_DIR")
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|home| home.join(".claude")));
+            if let Some(config_dir) = config_dir.filter(|_| starts_background_session(&args)) {
+                if let Err(message) =
+                    claude_daemon::check_subscription_pool_daemon(&config_dir, port)
+                {
+                    eprintln!("raydock claude --subscription-pool: {message}");
+                    return ExitCode::FAILURE;
+                }
+            }
             match csub::launch::claude(&CSUB_FRONTEND, &pool, port, args).await {
                 Ok(code) => code,
                 Err(error) => {
@@ -1596,6 +1607,16 @@ fn is_claude_management_subcommand(arg: &str) -> bool {
         arg,
         "login" | "logout" | "key" | "setup" | "hooks" | "telemetry"
     )
+}
+
+/// `--bg`/`--background` or `claude agents` hand work to Claude Code's
+/// background supervisor; a foreground session never touches it.
+fn starts_background_session(args: &[OsString]) -> bool {
+    args.first().and_then(|arg| arg.to_str()) == Some("agents")
+        || args
+            .iter()
+            .filter_map(|arg| arg.to_str())
+            .any(|arg| arg == "--bg" || arg == "--background")
 }
 
 /// `raydock subscriptions` mounts the csub command line.
@@ -2656,6 +2677,19 @@ mod tests {
                 "{flag}"
             );
         }
+    }
+
+    #[test]
+    fn only_background_launches_check_the_supervisor() {
+        assert!(starts_background_session(&argv(&["--bg", "fix it"])));
+        assert!(starts_background_session(&argv(&[
+            "-p",
+            "x",
+            "--background"
+        ])));
+        assert!(starts_background_session(&argv(&["agents"])));
+        assert!(!starts_background_session(&argv(&["-p", "agents"])));
+        assert!(!starts_background_session(&argv(&[])));
     }
 
     #[test]

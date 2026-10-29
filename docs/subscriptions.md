@@ -32,7 +32,15 @@ This runs `claude` with
 `ANTHROPIC_BASE_URL=http://127.0.0.1:20816/l/<launch-id>`. No CA, `HTTPS_PROXY`
 or Rayline router is involved, so router flags (`--local`, `--via`, `--route`,
 `--isolated`, …) are rejected alongside it. All other arguments go to `claude`
-unchanged.
+unchanged, except `--settings`: the launcher passes its own `--settings` so the
+gateway URL wins over user and project settings.
+
+The launch is refused when a settings `env` block sets an API key, a cloud
+provider switch (Bedrock, Vertex, Foundry, …) or a provider credential, or
+when managed settings set `ANTHROPIC_BASE_URL`. The same variables are removed
+from the inherited environment. A `--bg` launch is also refused while Claude
+Code's background supervisor runs off the pool; stop it with
+`claude daemon stop --any` first.
 
 A request moves to another account only when Anthropic rejects it before
 streaming starts, for quota, entitlement or credentials. Generic rate limits,
