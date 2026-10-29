@@ -286,7 +286,15 @@ subscription` keeps your ChatGPT subscription for the main agent.
 ## OpenClaw
 
 `raydock openclaw` runs OpenClaw against the Rayline router with a generated
-config. It gives the router key to OpenClaw as a file SecretRef that reads an
+config. The default `rayline` provider speaks OpenAI Chat Completions (OpenClaw's
+own default protocol) with `compat.sendSessionAffinityHeaders`, so OpenClaw sends
+its session id as `x-session-affinity` and the router keeps one routing episode
+per OpenClaw session, including a `--session-id` resume in a later launch. A
+second provider, `rayline-resp`, lists the same models over OpenAI Responses.
+Hosted OpenAI tools such as `web_search` are not carried on Chat Completions;
+ordinary function tools are.
+
+The launcher gives the router key to OpenClaw as a file SecretRef that reads an
 owner-only `router-key` file next to that config, so the key stays out of
 OpenClaw's own files and out of the environment its tools inherit. The other
 launchers (`raydock opencode`, `pi`, `omp`, `hermes`) likewise write the key into
@@ -305,7 +313,10 @@ provider's `apiKey` as a SecretRef to it:
 "models": {
   "providers": {
     "rayline": {
-      "apiKey": { "source": "file", "provider": "rayline", "id": "value" }
+      "baseUrl": "https://api.rayline.ai/v1",
+      "api": "openai-completions",
+      "apiKey": { "source": "file", "provider": "rayline", "id": "value" },
+      "models": [{ "id": "arc-sage-1.0", "compat": { "sendSessionAffinityHeaders": true } }]
     }
   }
 }

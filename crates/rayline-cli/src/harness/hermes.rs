@@ -4,15 +4,18 @@
 //!
 //! Episode keying: Hermes sends its session id as `x-session-affinity` on
 //! Responses, which the router keys the episode on, and `-c` / `--resume`
-//! keeps it. On `anthropic_messages` Hermes sends no session id, so the
-//! default Messages provider always carries the per-launch `x-conversation-id`
-//! (unless `RAYLINE_HARNESS_CONV_ID_FALLBACK=0`): one launch is one episode,
-//! and a resumed session in a new launch starts a new one. Hermes applies a
-//! provider's `extra_headers` on Messages from v2026.9.21; earlier releases
-//! ignore them there, so each Messages turn is its own episode. The
-//! `rayline-resp` provider (`--provider rayline-resp`) speaks Responses. Each
-//! entry has its own base_url because Hermes looks up `extra_headers` by
-//! base_url.
+//! keeps it. On `anthropic_messages` Hermes sends no session id, and the
+//! default Messages provider sends no per-launch `x-conversation-id` either
+//! (unless `RAYLINE_HARNESS_CONV_ID_FALLBACK=1`): the router derives the
+//! episode from the opening messages, which keeps a `delegate_task`
+//! subagent's turns, and the title side call, out of the parent's episode.
+//! A per-launch id would put all of them in one episode, since Hermes attaches
+//! a provider's `extra_headers` to every request of the process. Under
+//! `raydock hybrid run` the execution core refuses a request with no identity,
+//! so the Messages provider carries the per-launch id there. Hermes applies
+//! `extra_headers` on Messages from v2026.9.21. The `rayline-resp` provider
+//! (`--provider rayline-resp`) speaks Responses. Each entry has its own
+//! base_url because Hermes looks up `extra_headers` by base_url.
 //!
 //! `config.yaml` also holds the user's Hermes settings (`hermes config set`,
 //! `hermes tools`), so each launch merges only Rayline's keys ([`OWNED`]) into
@@ -59,7 +62,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
         "api_mode": "codex_responses",
         "models": models
     });
-    if ctx.conversation_id.enabled(true) {
+    if ctx.conversation_id.enabled() {
         responses["extra_headers"] = json!({ super::CONV_HEADER: format!("${{{CONV_ID_ENV}}}") });
     }
     let mut messages = json!({
@@ -68,9 +71,9 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
         "api_mode": "anthropic_messages",
         "models": models
     });
-    // No native session id on Messages, so the per-launch id is on there
-    // unless forced off.
-    if ctx.conversation_id.enabled(false) {
+    // No native session id on Messages: the hosted router derives the episode
+    // (see the module docs), but the hybrid core needs an explicit one.
+    if ctx.conversation_id.enabled() || ctx.capabilities.is_some() {
         messages["extra_headers"] = json!({ super::CONV_HEADER: format!("${{{CONV_ID_ENV}}}") });
     }
     // Under hybrid routing the default is Responses: on Messages Hermes always
@@ -146,19 +149,48 @@ mod tests {
                 .contains("x-conversation-id: \"${RAYLINE_CONV_ID}\"");
             (messages, responses)
         };
-        // Messages has no native session id, so it carries the id on dev too.
+        // Neither provider sends the per-launch id unless forced: Responses
+        // carries x-session-affinity, and on Messages the router derives the
+        // episode, keeping a subagent's turns out of the parent's.
+        assert_eq!(headers(ConversationIdFallback::new(None)), (false, false));
         assert_eq!(
-            headers(ConversationIdFallback::new("dev", None)),
-            (true, false)
-        );
-        assert_eq!(
-            headers(ConversationIdFallback::new("prod", None)),
+            headers(ConversationIdFallback::new(Some("1"))),
             (true, true)
         );
         assert_eq!(
-            headers(ConversationIdFallback::new("prod", Some("0"))),
+            headers(ConversationIdFallback::new(Some("0"))),
             (false, false)
         );
+    }
+
+    /// The hybrid core refuses a request with no identity, and Hermes sends
+    /// none on Messages, so that provider keeps the per-launch id under hybrid.
+    #[test]
+    fn hybrid_messages_provider_keeps_the_conversation_id() {
+        use super::super::tests::{TEST_KEY, TEST_URL, temp_dir};
+        use super::super::{ConversationIdFallback, RenderContext, write_files};
+        let dir = temp_dir("hermes-hybrid");
+        let capabilities = rayline_local_router::ModelCapabilities {
+            context_window: 16384,
+            max_output_tokens: 8192,
+            input_modalities: vec!["text".into()],
+        };
+        let ctx = RenderContext {
+            env_name: "hybrid",
+            key: TEST_KEY,
+            router_url: TEST_URL,
+            config_dir: &dir,
+            conversation_id: ConversationIdFallback { forced: None },
+            allow_empty_signature: true,
+            capabilities: Some(&capabilities),
+            harness_major_version: None,
+        };
+        write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
+        let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
+        let (messages, responses) = config.split_once("  rayline-resp:").unwrap();
+        assert!(messages.contains("x-conversation-id: \"${RAYLINE_CONV_ID}\""));
+        assert!(!responses.contains("x-conversation-id"));
+        assert!(config.contains("provider: \"custom:rayline-resp\""));
     }
 
     /// Launch Hermes twice over a config Hermes and the user already wrote.
@@ -174,7 +206,7 @@ mod tests {
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id: ConversationIdFallback::new("dev", None),
+            conversation_id: ConversationIdFallback::new(None),
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
@@ -234,7 +266,7 @@ fallback_model:
                 key: super::super::tests::TEST_KEY,
                 router_url: TEST_URL,
                 config_dir: &dir,
-                conversation_id: ConversationIdFallback::new("dev", None),
+                conversation_id: ConversationIdFallback::new(None),
                 allow_empty_signature: false,
                 capabilities: None,
                 harness_major_version: None,
@@ -255,8 +287,6 @@ providers:
     api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
     base_url: \"https://api-dev.rayline.ai\"
-    extra_headers:
-      x-conversation-id: \"${RAYLINE_CONV_ID}\"
     models:
       arc-sage-1.0:
         context_length: 200000
@@ -305,7 +335,7 @@ fallback_providers: []
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id: ConversationIdFallback::new("dev", None),
+            conversation_id: ConversationIdFallback::new(None),
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
@@ -334,8 +364,6 @@ providers:
     api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
     base_url: \"https://api-dev.rayline.ai\"
-    extra_headers:
-      x-conversation-id: \"${RAYLINE_CONV_ID}\"
     models:
       arc-sage-1.0:
         context_length: 200000

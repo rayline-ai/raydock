@@ -102,7 +102,7 @@ mod tests {
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
-            conversation_id: super::super::ConversationIdFallback::new(env_name, None),
+            conversation_id: super::super::ConversationIdFallback::new(None),
             allow_empty_signature: allow,
             capabilities: None,
             harness_major_version: None,

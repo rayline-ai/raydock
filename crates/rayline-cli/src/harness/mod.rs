@@ -14,32 +14,37 @@
 //! one env with different explicit `RAYLINE_ROUTER_API_KEY` values share the
 //! last-written key.
 //!
-//! Every config uses Anthropic Messages, `contextWindow` 200000 / `maxTokens`
-//! 32000 against the hosted router. The main agent defaults to ARC Sage
-//! (`arc-sage-1.0`) and, where the harness has a separate small/background
-//! model role, that role to ARC Swift (`arc-swift-1.0`); each provider also
-//! lists the Legacy Rules Router (`rayline-router`), which the harness's own
-//! model picker or flag selects ([`LaunchModels`]). Under `raydock hybrid run`
-//! every renderer keeps `rayline-router` (the execution core's virtual model)
-//! and advertises the hybrid runtime's admitted limits instead
-//! ([`RenderContext::capabilities`]): a harness that asks for more output than
-//! the execution core admits has every turn refused.
+//! Every config uses Anthropic Messages, except OpenClaw, whose default
+//! provider speaks OpenAI Chat Completions, with `contextWindow` 200000 /
+//! `maxTokens` 32000 against the hosted router. The main agent defaults to ARC
+//! Sage (`arc-sage-1.0`) and, where the harness has a separate
+//! small/background model role, that role to ARC Swift (`arc-swift-1.0`); each
+//! provider also lists the Legacy Rules Router (`rayline-router`), which the
+//! harness's own model picker or flag selects ([`LaunchModels`]). Under
+//! `raydock hybrid run` every renderer keeps `rayline-router` (the execution
+//! core's virtual model) and advertises the hybrid runtime's admitted limits
+//! instead ([`RenderContext::capabilities`]): a harness that asks for more
+//! output than the execution core admits has every turn refused.
 //!
 //! Episode keying: the router keys a routing episode on each harness's own
 //! session id where it reads them: opencode and
 //! Hermes (on Responses) send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
-//! mode from omp 18.1.10), and pi and OpenClaw send `x-session-affinity` once
-//! their config sets `compat.sendSessionAffinityHeaders`. On Responses, pi's
-//! and OpenClaw's `prompt_cache_key` keys the session. A harness session is
-//! one episode, so `--resume` / `-c` in a later launch keeps the episode.
+//! mode from omp 18.1.10), and pi (on Messages) and OpenClaw (on Chat
+//! Completions) send `x-session-affinity` once their config sets
+//! `compat.sendSessionAffinityHeaders`. On Responses, pi's and OpenClaw's
+//! `prompt_cache_key` keys the session. A harness session is one episode, so
+//! `--resume` / `-c` / `--session-id` in a later launch keeps the episode.
 //!
-//! The per-launch conversation id ([`ConversationIdFallback`]) is the
-//! fallback for a gateway that does not read native ids (prod today), and for
-//! a wire that sends no native id (OpenClaw and Hermes on Messages): every
-//! launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as `x-conversation-id`,
-//! so one launch is one episode and a resume in a new launch starts a new one.
-//! The native compat flags stay on either way; the gateway ranks
-//! `x-conversation-id` first when both arrive.
+//! The per-launch conversation id ([`ConversationIdFallback`]) is off by
+//! default: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on for every wire,
+//! and then each launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as
+//! `x-conversation-id`, so one launch is one episode and a resume in a new
+//! launch starts a new one. The native compat flags stay on either way; the
+//! gateway ranks `x-conversation-id` first when both arrive. A wire with no
+//! native id (Hermes on Messages) sends nothing, and the router derives the
+//! episode from the opening messages, which also keeps a subagent's turns
+//! apart from its parent's. Under `raydock hybrid run` the execution core
+//! refuses a request with no identity, so that wire keeps the header there.
 
 mod hermes;
 mod omp;
@@ -110,37 +115,28 @@ pub const CONTEXT_WINDOW: u64 = 200_000;
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// Runtime override for [`ConversationIdFallback`]: `1` or `0`.
 pub const CONV_ID_FALLBACK_ENV: &str = "RAYLINE_HARNESS_CONV_ID_FALLBACK";
-/// Envs whose router keys episodes on native harness session ids; the
-/// per-launch `x-conversation-id` fallback is off there.
-/// TODO: add "prod" (turning the fallback off there) once the prod router
-/// reads native session ids.
-const NATIVE_SESSION_KEY_ENVS: &[&str] = &["dev"];
 
-/// When a config sends the per-launch `x-conversation-id`.
+/// When a config sends the per-launch `x-conversation-id`: only when
+/// [`CONV_ID_FALLBACK_ENV`] forces it. The router keys episodes on native
+/// harness session ids, or derives one where a wire has none.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ConversationIdFallback {
     /// [`CONV_ID_FALLBACK_ENV`]: `Some(true)` always, `Some(false)` never.
     pub forced: Option<bool>,
-    /// The env's gateway does not key on native session ids (prod today).
-    pub env_needs_it: bool,
 }
 
 impl ConversationIdFallback {
     /// `override_value` is [`CONV_ID_FALLBACK_ENV`] (`1`/`true`/`on` or
     /// `0`/`false`/`off`; anything else is ignored).
-    pub(crate) fn new(env_name: &str, override_value: Option<&str>) -> Self {
+    pub(crate) fn new(override_value: Option<&str>) -> Self {
         Self {
             forced: parse_switch(override_value),
-            env_needs_it: !NATIVE_SESSION_KEY_ENVS.contains(&env_name),
         }
     }
 
-    /// Whether a config sends the header. `native_session_id` is false for a
-    /// wire on which the harness sends no session id the gateway can key on;
-    /// the header is then on unless forced off.
-    pub(crate) fn enabled(self, native_session_id: bool) -> bool {
-        self.forced
-            .unwrap_or(self.env_needs_it || !native_session_id)
+    /// Whether a config sends the header.
+    pub(crate) fn enabled(self) -> bool {
+        self.forced == Some(true)
     }
 }
 
@@ -318,17 +314,11 @@ impl RenderContext<'_> {
         format!("{}/v1", self.router_url)
     }
 
-    /// Conversation-id headers for a wire on which the harness sends its
-    /// native session id: `{CONV_HEADER: value}` (`value` is the harness's
-    /// reference to [`CONV_ID_ENV`]) when the fallback is on, else `{}`.
+    /// Conversation-id headers: `{CONV_HEADER: value}` (`value` is the
+    /// harness's reference to [`CONV_ID_ENV`]) when the fallback is forced
+    /// on, else `{}`.
     pub fn conversation_headers(&self, value: &str) -> Value {
-        self.conversation_headers_for(value, true)
-    }
-
-    /// As [`Self::conversation_headers`], for a wire with or without a native
-    /// session id.
-    pub fn conversation_headers_for(&self, value: &str, native_session_id: bool) -> Value {
-        if self.conversation_id.enabled(native_session_id) {
+        if self.conversation_id.enabled() {
             serde_json::json!({ CONV_HEADER: value })
         } else {
             serde_json::json!({})
@@ -418,7 +408,6 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         router_url: &router_url,
         config_dir: &config_dir,
         conversation_id: ConversationIdFallback::new(
-            &env_name,
             std::env::var(CONV_ID_FALLBACK_ENV).ok().as_deref(),
         ),
         allow_empty_signature: pi::allow_empty_signature(
@@ -442,7 +431,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         .files
         .iter()
         .any(|file| file.contents.contains(CONV_ID_ENV))
-        .then(|| conversation_id_for(harness, &request.args));
+        .then(new_conversation_id);
     let episode = match &conv_id {
         Some(id) => format!("conversation {id}"),
         None => "episode keyed on the harness session".to_owned(),
@@ -597,18 +586,6 @@ pub(crate) fn build_command(
         None => command.env_remove(CONV_ID_ENV),
     };
     command
-}
-
-/// The conversation id for this launch: stable for a harness session the
-/// args name (OpenClaw `--session-id`), so relaunching it keeps the episode;
-/// otherwise a fresh UUID.
-pub(crate) fn conversation_id_for(harness: Harness, args: &[OsString]) -> String {
-    match harness {
-        Harness::OpenClaw => {
-            openclaw::session_conversation_id(args).unwrap_or_else(new_conversation_id)
-        }
-        _ => new_conversation_id(),
-    }
 }
 
 /// A random (v4) UUID. One per launch; see [`ConversationIdFallback`].
@@ -819,17 +796,17 @@ pub(crate) mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
-            conversation_id: ConversationIdFallback::new("dev", None),
+            conversation_id: ConversationIdFallback::new(None),
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
         }
     }
 
-    /// Render `harness` for dev with no override into a temp dir and return
+    /// Render `harness` with no override into a temp dir and return
     /// (dir, plan).
     pub(crate) fn render(harness: Harness) -> (PathBuf, Plan) {
-        render_with(harness, ConversationIdFallback::new("dev", None))
+        render_with(harness, ConversationIdFallback::new(None))
     }
 
     /// Render `harness` with the given fallback policy.
@@ -977,47 +954,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn conversation_id_fallback_defaults_by_env() {
-        let dev = ConversationIdFallback::new("dev", None);
-        assert!(!dev.enabled(true));
-        // A wire with no native id (OpenClaw Messages) keeps it even on dev.
-        assert!(dev.enabled(false));
-        for env in ["prod", "staging"] {
-            let fallback = ConversationIdFallback::new(env, None);
-            assert!(fallback.enabled(true) && fallback.enabled(false), "{env}");
-        }
+    fn conversation_id_fallback_is_off_by_default() {
+        assert!(!ConversationIdFallback::new(None).enabled());
     }
 
     #[test]
     fn conversation_id_fallback_override() {
         for on in ["1", "true", "ON", " on "] {
-            let fallback = ConversationIdFallback::new("dev", Some(on));
-            assert!(fallback.enabled(true), "{on:?}");
+            assert!(ConversationIdFallback::new(Some(on)).enabled(), "{on:?}");
         }
         for off in ["0", "false", "Off"] {
-            let fallback = ConversationIdFallback::new("prod", Some(off));
-            assert!(
-                !fallback.enabled(true) && !fallback.enabled(false),
-                "{off:?}"
-            );
+            assert!(!ConversationIdFallback::new(Some(off)).enabled(), "{off:?}");
         }
-        // Unrecognized or empty values keep the env default.
-        assert!(ConversationIdFallback::new("prod", Some("")).enabled(true));
-        assert!(!ConversationIdFallback::new("dev", Some("maybe")).enabled(true));
+        // Unrecognized or empty values keep the default (off).
+        assert!(!ConversationIdFallback::new(Some("")).enabled());
+        assert!(!ConversationIdFallback::new(Some("maybe")).enabled());
     }
 
     #[test]
-    fn native_session_keys_are_the_dev_default() {
+    fn native_session_keys_are_the_default() {
         let command = build_command(Path::new("/bin/true"), &Plan::default(), None, &[]);
         let conv = command
             .get_envs()
             .find(|(k, _)| *k == std::ffi::OsStr::new(CONV_ID_ENV));
         assert_eq!(conv, Some((std::ffi::OsStr::new(CONV_ID_ENV), None)));
-        // OpenClaw and Hermes are the exceptions: no native id on Messages.
-        for harness in Harness::ALL
-            .into_iter()
-            .filter(|harness| !matches!(harness, Harness::OpenClaw | Harness::Hermes))
-        {
+        for harness in Harness::ALL {
             let (dir, plan) = render(harness);
             for file in &plan.files {
                 let text = fs::read_to_string(dir.join(file.name)).unwrap();
@@ -1032,9 +993,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn per_launch_fallback_sends_the_conversation_header() {
+    fn forced_fallback_sends_the_conversation_header() {
         for harness in Harness::ALL {
-            let (dir, plan) = render_with(harness, ConversationIdFallback::new("prod", None));
+            let (dir, plan) = render_with(harness, ConversationIdFallback::new(Some("1")));
             let sends = plan.files.iter().any(|file| {
                 let text = fs::read_to_string(dir.join(file.name)).unwrap();
                 text.contains(CONV_HEADER) && text.contains(CONV_ID_ENV)
@@ -1049,8 +1010,8 @@ pub(crate) mod tests {
         // rewritten each launch must never reference it.
         for harness in Harness::ALL {
             for fallback in [
-                ConversationIdFallback::new("dev", None),
-                ConversationIdFallback::new("prod", None),
+                ConversationIdFallback::new(None),
+                ConversationIdFallback::new(Some("1")),
             ] {
                 let (_dir, plan) = render_with(harness, fallback);
                 for file in plan.files.iter().filter(|file| !file.overwrite) {
