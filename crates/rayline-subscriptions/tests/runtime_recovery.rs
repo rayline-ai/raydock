@@ -187,6 +187,15 @@ async fn runtime(
     token: &Endpoint,
     persisted: bool,
 ) -> Arc<SubscriptionPoolRuntime> {
+    runtime_with_backoff(root, usage, token, persisted, Duration::from_millis(1)).await
+}
+async fn runtime_with_backoff(
+    root: &Path,
+    usage: &Endpoint,
+    token: &Endpoint,
+    persisted: bool,
+    recovery_backoff: Duration,
+) -> Arc<SubscriptionPoolRuntime> {
     let root = std::fs::canonicalize(root).expect("physical temp root");
     std::fs::create_dir_all(root.join("control")).expect("control");
     SubscriptionPoolRuntime::start(
@@ -207,7 +216,7 @@ async fn runtime(
             trusted_ca_pem: Some(token.pem.as_bytes().to_vec()),
             home_dir: None,
             state_dir: persisted.then(|| root.join("state")),
-            recovery_backoff: Duration::from_millis(1),
+            recovery_backoff,
             ..Default::default()
         },
     )
@@ -346,14 +355,38 @@ async fn persistence_failure_keeps_rotated_grant_and_retries_save_not_oauth() {
 }
 
 #[tokio::test]
-async fn quiesce_saves_a_pending_rotated_grant_and_reports_what_it_could_not() {
+async fn quiesce_reports_a_rotated_grant_it_still_cannot_save() {
+    let temp = tempfile::tempdir().expect("temp");
+    let profile = temp.path().join("profile");
+    credentials(&profile);
+    let usage = endpoint(false, USAGE, false).await;
+    let token = endpoint(true, GRANT, true).await;
+    // A long backoff: the shutdown save must not wait for it.
+    let pool =
+        runtime_with_backoff(temp.path(), &usage, &token, false, Duration::from_secs(600)).await;
+    let p = pool.clone();
+    let refresh = tokio::spawn(async move { p.force_refresh("a").await });
+    token.wait().await;
+    std::fs::remove_file(profile.join(".credentials.json")).expect("remove");
+    std::fs::create_dir(profile.join(".credentials.json")).expect("obstruct save");
+    token.resume();
+    refresh.await.expect("task").expect("pending grant");
+
+    // Still obstructed: reported, not lost silently, and no new OAuth call.
+    assert_eq!(pool.quiesce_credentials().await, vec!["a".to_owned()]);
+    assert_eq!(token.count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quiesce_persists_a_pending_grant_inside_the_backoff_without_oauth() {
     let temp = tempfile::tempdir().expect("temp");
     let profile = temp.path().join("profile");
     credentials(&profile);
     let original = std::fs::read(profile.join(".credentials.json")).expect("original");
     let usage = endpoint(false, USAGE, false).await;
     let token = endpoint(true, GRANT, true).await;
-    let pool = runtime(temp.path(), &usage, &token, false).await;
+    let pool =
+        runtime_with_backoff(temp.path(), &usage, &token, false, Duration::from_secs(600)).await;
     let p = pool.clone();
     let refresh = tokio::spawn(async move { p.force_refresh("a").await });
     token.wait().await;
@@ -363,9 +396,13 @@ async fn quiesce_saves_a_pending_rotated_grant_and_reports_what_it_could_not() {
     refresh.await.expect("task").expect("pending grant");
     std::fs::remove_dir(profile.join(".credentials.json")).expect("remove obstruction");
     std::fs::write(profile.join(".credentials.json"), original).expect("restore source");
-    tokio::time::sleep(Duration::from_millis(2)).await;
+
     assert!(pool.quiesce_credentials().await.is_empty());
-    assert_eq!(token.count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        token.count.load(Ordering::SeqCst),
+        1,
+        "no second OAuth call"
+    );
     assert!(
         std::fs::read_to_string(profile.join(".credentials.json"))
             .expect("saved")
