@@ -1,9 +1,12 @@
 //! `csub`: a standalone owner for a pool of Claude subscriptions.
 //!
-//! The library exposes the registry/status commands (also used by the Rayline
-//! CLI), the loopback gateway, the daemon and its launchd service.
+//! The library exposes the command line (also mounted as `rayline
+//! subscriptions`), the registry/status commands, the loopback gateway, the
+//! daemon, its launchd service, and the `csub claude` launcher.
 
+pub mod app;
 pub mod cli;
 pub mod gateway;
+pub mod launch;
 pub mod serve;
 pub mod service;

@@ -1545,6 +1545,7 @@ dependencies = [
  "base64",
  "clap",
  "crossterm",
+ "csub",
  "dirs",
  "libc",
  "minisign-verify",
