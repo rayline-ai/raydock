@@ -121,10 +121,16 @@ pub fn install(options: &ServiceOptions) -> Result<String, anyhow::Error> {
             .transpose()?,
         port: options.port,
     };
-    let binary = std::env::current_exe()
-        .context("locate the csub binary")?
-        .canonicalize()
-        .context("resolve the csub binary path")?;
+    // Keep the path the binary was started by (e.g. Homebrew's bin symlink)
+    // so an upgrade that removes the versioned target does not strand the job.
+    let binary = std::env::current_exe().context("locate the csub binary")?;
+    let binary = if binary.is_absolute() {
+        binary
+    } else {
+        binary
+            .canonicalize()
+            .context("resolve the csub binary path")?
+    };
     let plist = plist_path(&home);
     if let Some(parent) = plist.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;

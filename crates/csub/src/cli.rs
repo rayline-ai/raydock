@@ -59,18 +59,22 @@ pub async fn run(command: &SubscriptionCommand) -> Result<String, String> {
             config_path,
             claude_config_dir,
             control_config_dir,
-        } => add(
-            account_id,
-            pool_id,
-            config_path.as_deref(),
-            claude_config_dir,
-            control_config_dir.as_deref(),
-        ),
+        } => with_registry_lock(config_path.as_deref(), || {
+            add(
+                account_id,
+                pool_id,
+                config_path.as_deref(),
+                claude_config_dir,
+                control_config_dir.as_deref(),
+            )
+        }),
         SubscriptionCommand::Remove {
             account_id,
             pool_id,
             config_path,
-        } => remove(account_id, pool_id, config_path.as_deref()),
+        } => with_registry_lock(config_path.as_deref(), || {
+            remove(account_id, pool_id, config_path.as_deref())
+        }),
         SubscriptionCommand::List { config_path, json } => list(config_path.as_deref(), *json),
         SubscriptionCommand::Status {
             pool_id,
@@ -1103,10 +1107,12 @@ fn status_paint(text: &str, ansi: &str, color: bool) -> String {
     }
 }
 
+/// The daemon port the client commands talk to: `CSUB_PORT`, as `csub serve`
+/// reads it, then the legacy Rayline variable, then the default.
 fn subscription_metrics_port() -> u16 {
-    std::env::var("RAYLINE_SUBSCRIPTION_METRICS_PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
+    ["CSUB_PORT", "RAYLINE_SUBSCRIPTION_METRICS_PORT"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok()?.parse::<u16>().ok())
         .unwrap_or(DEFAULT_SUBSCRIPTION_METRICS_PORT)
 }
 
@@ -1219,7 +1225,7 @@ async fn reload_pool_credentials_at(pool_id: &str, port: u16, timeout: Duration)
     if summary.pool_id != pool_id {
         let served = &summary.pool_id;
         return ReloadOutcome::Failed(format!(
-            "the subscription daemon on 127.0.0.1:{port} serves pool {served:?}, not {pool_id:?}, and reloaded {served:?} instead; point RAYLINE_SUBSCRIPTION_METRICS_PORT at the daemon for {pool_id:?}"
+            "the subscription daemon on 127.0.0.1:{port} serves pool {served:?}, not {pool_id:?}, and reloaded {served:?} instead; point CSUB_PORT at the daemon for {pool_id:?}"
         ));
     }
     ReloadOutcome::Reloaded(summary)
@@ -1261,6 +1267,46 @@ fn expand_home(path: &Path) -> Result<PathBuf, String> {
             .ok_or_else(|| "home directory not found".to_owned());
     }
     Ok(path.to_owned())
+}
+
+/// Holds an exclusive lock beside the registry across a whole
+/// read-modify-write, so concurrent `add`/`remove` runs cannot lose each
+/// other's changes. The atomic rename alone only prevents torn files.
+fn with_registry_lock(
+    config_path: Option<&Path>,
+    update: impl FnOnce() -> Result<String, String>,
+) -> Result<String, String> {
+    use fs2::FileExt as _;
+    let path = config_path
+        .map(Path::to_owned)
+        .map_or_else(default_config_path, Ok)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("subscription config {} has no parent", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create subscription config directory: {error}"))?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| format!("subscription config {} has no file name", path.display()))?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(file_name);
+    lock_name.push(".lock");
+    let lock_path = parent.join(lock_name);
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options
+        .open(&lock_path)
+        .map_err(|error| format!("open registry lock {}: {error}", lock_path.display()))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("lock registry {}: {error}", lock_path.display()))?;
+    let result = update();
+    let _ = fs2::FileExt::unlock(&lock);
+    result
 }
 
 fn write_config(path: &Path, config: &SubscriptionPoolsConfig) -> Result<(), String> {
@@ -1762,6 +1808,38 @@ mod tests {
             pool.accounts[1].credential_source.claude_config_dir,
             second.canonicalize().expect("second canonical")
         );
+    }
+
+    #[test]
+    fn concurrent_adds_keep_every_account() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let control = temp.path().join("control");
+        fs::create_dir_all(&control).expect("control");
+        let config_path = temp.path().join("subscriptions.json");
+        let threads = (0..8)
+            .map(|index| {
+                let source = temp.path().join(format!("source-{index}"));
+                fs::create_dir_all(&source).expect("source");
+                let (config_path, control) = (config_path.clone(), control.clone());
+                std::thread::spawn(move || {
+                    with_registry_lock(Some(&config_path), || {
+                        add(
+                            &format!("account-{index}"),
+                            "default",
+                            Some(&config_path),
+                            &source,
+                            Some(&control),
+                        )
+                    })
+                    .expect("add")
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().expect("thread");
+        }
+        let (_, config) = load_config(Some(&config_path)).expect("load");
+        assert_eq!(config.pools["default"].accounts.len(), 8);
     }
 
     #[cfg(unix)]
