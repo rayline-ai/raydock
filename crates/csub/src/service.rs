@@ -66,6 +66,7 @@ pub fn render_plist(binary: &Path, home: &Path, options: &ServiceOptions) -> Str
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>
+  <key>ExitTimeOut</key><integer>60</integer>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
@@ -106,6 +107,20 @@ pub fn install(options: &ServiceOptions) -> Result<String, anyhow::Error> {
         );
     }
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
+    let options = &ServiceOptions {
+        pool_id: options.pool_id.clone(),
+        // launchd runs the job from /, so a relative registry path must be
+        // resolved now. A missing file fails here rather than in a loop.
+        config_path: options
+            .config_path
+            .as_deref()
+            .map(|path| {
+                path.canonicalize()
+                    .with_context(|| format!("resolve registry path {}", path.display()))
+            })
+            .transpose()?,
+        port: options.port,
+    };
     let binary = std::env::current_exe()
         .context("locate the csub binary")?
         .canonicalize()

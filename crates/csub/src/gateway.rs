@@ -109,12 +109,34 @@ impl Gateway {
                 ));
             }
         };
+        // Dot segments would be normalized by the HTTP client after routing
+        // was decided on the raw path; refuse them instead of guessing.
+        let path = api_path.split('?').next().unwrap_or(api_path);
+        if path
+            .split('/')
+            .any(|segment| segment == "." || segment == ".." || segment.contains('%'))
+        {
+            return Ok(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "unsupported path in subscription gateway request",
+            ));
+        }
         let upstream_url = format!("{}{}", self.upstream, api_path);
         let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())?;
-        let path = api_path.split('?').next().unwrap_or(api_path);
-        let requested_model = (parts.method == Method::POST && path == "/v1/messages")
-            .then(|| requested_model(&body))
-            .flatten();
+        let requested_model = if parts.method == Method::POST && path == "/v1/messages" {
+            // A pooled request is never billed to the client's own account.
+            let Some(model) = requested_model(&body) else {
+                return Ok(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request_error",
+                    "subscription gateway requires an uncompressed JSON body with a model",
+                ));
+            };
+            Some(model)
+        } else {
+            None
+        };
         match requested_model {
             Some(model) => {
                 self.forward_pooled(PooledRequest {

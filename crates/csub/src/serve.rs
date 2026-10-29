@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
 use hyper::body::Incoming;
@@ -14,6 +15,7 @@ use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use hyper_util::server::graceful::GracefulShutdown;
 use rayline_subscriptions::{
     PoolLock, PoolLockError, SubscriptionPoolRuntime, SubscriptionRuntimeOptions,
 };
@@ -24,6 +26,10 @@ use tracing::{info, warn};
 use crate::gateway::{Body, Gateway, LAUNCH_PREFIX, json_response};
 
 pub const DEFAULT_PORT: u16 = 20816;
+
+/// Longest wait for in-flight requests on shutdown. The launchd job's
+/// ExitTimeOut is longer, so launchd never kills a draining daemon.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(45);
 
 /// Exit status when another process already owns the pool. launchd retries
 /// after its throttle interval, so a supervisor never starts a second owner.
@@ -110,6 +116,8 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
         lock.path().display()
     );
 
+    let port = options.port;
+    let graceful = GracefulShutdown::new();
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     loop {
@@ -118,6 +126,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
                 Ok(accepted) => accepted,
                 Err(error) => {
                     warn!("accept failed: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             },
@@ -125,23 +134,32 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
         };
         let runtime = runtime.clone();
         let gateway = gateway.clone();
+        let service = service_fn(move |request| {
+            let runtime = runtime.clone();
+            let gateway = gateway.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(route(request, port, &runtime, &gateway).await)
+            }
+        });
+        let connection =
+            graceful.watch(http1::Builder::new().serve_connection(TokioIo::new(stream), service));
         tokio::spawn(async move {
-            let service = service_fn(move |request| {
-                let runtime = runtime.clone();
-                let gateway = gateway.clone();
-                async move {
-                    Ok::<_, std::convert::Infallible>(route(request, &runtime, &gateway).await)
-                }
-            });
-            if let Err(error) = http1::Builder::new()
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
+            if let Err(error) = connection.await {
                 tracing::debug!("connection closed: {error}");
             }
         });
     }
-    info!("csub shutting down; flushing recovery state");
+    drop(listener);
+    // In-flight requests may be mid-refresh; let them finish before the lock
+    // is released so a successor never races a rotating grant.
+    info!("csub shutting down; draining connections");
+    if tokio::time::timeout(SHUTDOWN_GRACE, graceful.shutdown())
+        .await
+        .is_err()
+    {
+        warn!("connections still open after {SHUTDOWN_GRACE:?}; stopping anyway");
+    }
+    info!("flushing recovery state");
     if let Err(error) = runtime.flush_recovery_state().await {
         warn!("recovery state flush failed: {error}");
     }
@@ -151,9 +169,18 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
 
 async fn route(
     request: Request<Incoming>,
+    port: u16,
     runtime: &Arc<SubscriptionPoolRuntime>,
     gateway: &Gateway,
 ) -> Response<Body> {
+    // A DNS-rebound web page reaches this port with its own host name; only
+    // loopback names are served, so a browser can never spend pool quota.
+    if !is_loopback_host(request.headers(), port) {
+        return json_response(
+            StatusCode::MISDIRECTED_REQUEST,
+            json!({"ok": false, "error": "csub only serves 127.0.0.1, localhost or [::1]"}),
+        );
+    }
     let path = request.uri().path();
     if path.starts_with(LAUNCH_PREFIX) || path.starts_with("/v1/messages") {
         return gateway.handle(request).await;
@@ -187,6 +214,19 @@ async fn route(
             json!({"ok": false, "error": "not found"}),
         ),
     }
+}
+
+fn is_loopback_host(headers: &hyper::HeaderMap, port: u16) -> bool {
+    let Some(host) = headers
+        .get(hyper::header::HOST)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let host = host.trim();
+    ["127.0.0.1", "localhost", "[::1]"].iter().any(|name| {
+        host.eq_ignore_ascii_case(name) || host.eq_ignore_ascii_case(&format!("{name}:{port}"))
+    })
 }
 
 fn sends_json(request: &Request<Incoming>) -> bool {
@@ -231,5 +271,30 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host(value: &str) -> hyper::HeaderMap {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::HOST,
+            hyper::header::HeaderValue::from_str(value).expect("host"),
+        );
+        headers
+    }
+
+    #[test]
+    fn serves_only_loopback_host_names() {
+        assert!(is_loopback_host(&host("127.0.0.1:20816"), 20816));
+        assert!(is_loopback_host(&host("localhost:20816"), 20816));
+        assert!(is_loopback_host(&host("[::1]:20816"), 20816));
+        assert!(is_loopback_host(&host("LOCALHOST"), 20816));
+        assert!(!is_loopback_host(&host("attacker.example:20816"), 20816));
+        assert!(!is_loopback_host(&host("127.0.0.1:80"), 20816));
+        assert!(!is_loopback_host(&hyper::HeaderMap::new(), 20816));
     }
 }
