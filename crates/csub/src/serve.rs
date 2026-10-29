@@ -52,6 +52,11 @@ pub enum ServeError {
 }
 
 pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
+    // Installed before any credential work: startup polls usage and may
+    // rotate an expired grant, and the default disposition would kill the
+    // process mid-refresh. A signal that arrives during startup is held and
+    // handled by the orderly shutdown below once startup returns.
+    let mut signals = Signals::install().context("install signal handlers")?;
     let home = dirs::home_dir().ok_or_else(|| anyhow!("home directory not found"))?;
     let state_dir = options
         .state_dir
@@ -104,7 +109,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
     )
     .await
     .context("start subscription pool")?;
-    let _monitor = runtime.spawn_monitor();
+    let monitor = runtime.spawn_monitor();
     let gateway = Arc::new(
         Gateway::new(runtime.clone(), options.anthropic_base_url.clone())
             .context("build gateway HTTP client")?,
@@ -118,8 +123,6 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
 
     let port = options.port;
     let graceful = GracefulShutdown::new();
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
     loop {
         let (stream, _) = tokio::select! {
             accepted = listener.accept() => match accepted {
@@ -130,7 +133,7 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
                     continue;
                 }
             },
-            () = &mut shutdown => break,
+            () = signals.recv() => break,
         };
         let runtime = runtime.clone();
         let gateway = gateway.clone();
@@ -159,7 +162,22 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
                 warn!("connections still open after {SHUTDOWN_GRACE:?}; stopping anyway");
             }
         }
-        () = shutdown_signal() => warn!("second signal; stopping without draining"),
+        () = signals.recv() => warn!("second signal; stopping without draining"),
+    }
+    // Background usage polls and recoveries run on their own tasks; stop
+    // scheduling them and let any refresh in flight persist its rotated grant
+    // before the lock is released.
+    if let Some(monitor) = monitor {
+        monitor.abort();
+    }
+    info!("waiting for in-flight credential refreshes");
+    tokio::select! {
+        result = tokio::time::timeout(SHUTDOWN_GRACE, runtime.quiesce_credentials()) => {
+            if result.is_err() {
+                warn!("credential refresh still running after {SHUTDOWN_GRACE:?}; stopping anyway");
+            }
+        }
+        () = signals.recv() => warn!("second signal; not waiting for credential refreshes"),
     }
     info!("flushing recovery state");
     if let Err(error) = runtime.flush_recovery_state().await {
@@ -167,6 +185,13 @@ pub async fn serve(options: ServeOptions) -> Result<(), ServeError> {
     }
     drop(lock);
     Ok(())
+}
+
+fn is_browser_request<B>(request: &Request<B>) -> bool {
+    request.method() == Method::OPTIONS
+        || ["origin", "sec-fetch-site", "sec-fetch-mode"]
+            .iter()
+            .any(|name| request.headers().contains_key(*name))
 }
 
 async fn route(
@@ -181,6 +206,16 @@ async fn route(
         return json_response(
             StatusCode::MISDIRECTED_REQUEST,
             json!({"ok": false, "error": "csub only serves 127.0.0.1, localhost or [::1]"}),
+        );
+    }
+    // Claude Code and the csub CLI never send browser headers. Anything with
+    // an Origin (or a CORS preflight) is a web page; refusing it outright
+    // keeps a site the user visits from spending pool quota through
+    // fetch(..., {mode: "no-cors"}).
+    if is_browser_request(&request) {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            json!({"ok": false, "error": "csub does not serve browser requests"}),
         );
     }
     let path = request.uri().path();
@@ -254,25 +289,40 @@ fn legacy_rld_pool_daemon(home: &Path) -> Option<u32> {
     (command.contains("rld") && command.contains(" proxy")).then_some(pid)
 }
 
-async fn shutdown_signal() {
+/// SIGTERM (launchd) and SIGINT (Ctrl-C), registered eagerly so that from
+/// `install` on neither terminates the process by default.
+struct Signals {
     #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        match signal(SignalKind::terminate()) {
-            Ok(mut terminate) => {
-                tokio::select! {
-                    _ = terminate.recv() => {}
-                    _ = tokio::signal::ctrl_c() => {}
-                }
-            }
-            Err(_) => {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                terminate: signal(SignalKind::terminate())?,
+                interrupt: signal(SignalKind::interrupt())?,
+            })
         }
+        #[cfg(not(unix))]
+        Ok(Self {})
     }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
+
+    /// Cancel-safe: a signal not yet received stays pending.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => {}
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
     }
 }
 
@@ -298,5 +348,30 @@ mod tests {
         assert!(!is_loopback_host(&host("attacker.example:20816"), 20816));
         assert!(!is_loopback_host(&host("127.0.0.1:80"), 20816));
         assert!(!is_loopback_host(&hyper::HeaderMap::new(), 20816));
+    }
+
+    #[test]
+    fn refuses_browser_requests() {
+        let request = |method: Method, header: Option<(&str, &str)>| {
+            let mut builder = Request::builder().method(method).uri("/v1/messages");
+            if let Some((name, value)) = header {
+                builder = builder.header(name, value);
+            }
+            builder.body(()).expect("request")
+        };
+        assert!(!is_browser_request(&request(Method::POST, None)));
+        assert!(is_browser_request(&request(Method::OPTIONS, None)));
+        assert!(is_browser_request(&request(
+            Method::POST,
+            Some(("origin", "https://attacker.example"))
+        )));
+        assert!(is_browser_request(&request(
+            Method::POST,
+            Some(("origin", "null"))
+        )));
+        assert!(is_browser_request(&request(
+            Method::GET,
+            Some(("sec-fetch-mode", "no-cors"))
+        )));
     }
 }

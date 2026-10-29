@@ -561,6 +561,19 @@ impl SubscriptionPoolRuntime {
         }
     }
 
+    /// For orderly shutdown: waits for every in-flight OAuth refresh to finish
+    /// (each persists its rotated grant before releasing the gate) and refuses
+    /// new ones. Recoveries run on their own tasks, so without this, dropping
+    /// the Tokio runtime could cancel a refresh after the provider already
+    /// rotated the grant, leaving the stored login unusable.
+    pub async fn quiesce_credentials(&self) {
+        for account in &self.accounts {
+            // Err only when already closed, which is what we want anyway.
+            let _permit = account.refresh_gate.acquire().await;
+            account.refresh_gate.close();
+        }
+    }
+
     /// Waits for a complete recovery snapshot write (for orderly shutdown).
     pub async fn flush_recovery_state(&self) -> Result<(), SubscriptionRuntimeError> {
         if self.read_only {
