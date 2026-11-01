@@ -19,13 +19,14 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `CLAUDE_CODE_SUBAGENT_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, OpenCode's
   `small_model`, omp's `smol` role, Codex's `subagent` route). The Legacy Rules
   Router stays available by explicit choice: `--model rayline-router`, the
-  harness's own model flag or picker (every generated config lists it;
+  harness's own model flag or picker (except hosted omp, which lists only ARC;
   `raydock codex --model rayline-router` too), or a route model in
   `router.json`. Choices you made are kept: an explicit model,
   your own Claude Code model variables, `--config` routes, and the model pi
   and omp saved (Hermes and OpenClaw configs are rewritten each launch, as
-  before, so pick Legacy there per run). Generated defaults that were never edited (the 0.2.x
-  `router.json`, pi `settings.json` and omp `config.yml`) move to ARC once.
+  before, so pick Legacy there per run). Untouched 0.2.x `router.json` and pi
+  `settings.json` defaults move to ARC once. Hosted omp also migrates retired
+  Legacy references in customized saved roles and sessions.
   Local and hybrid sessions are unchanged.
 - A cloud-only `raydock claude --config` launches the main agent with the model
   its `routes.main` names and, with `--route all`, subagents with its
@@ -52,6 +53,35 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   into the parent's episode. Under `raydock hybrid run` the Hermes Messages
   provider keeps the per-launch id, since the execution core refuses a request
   with no identity.
+
+### Fixed
+
+- **omp's ARC models no longer appear free.** `raydock omp` supplies Sage and
+  Swift's fixed input, output, cache-read and cache-write rates (effective card
+  26, 2026-10-27). Hosted ARC entries advertise text input and leave reasoning
+  effort to ARC instead of exposing unsupported client thinking controls.
+  Existing context/output budgets, saved role choices and hybrid capabilities
+  are unchanged. Hybrid prices remain variable; omp versions that label missing
+  prices as free must not be used as billing evidence. The
+  [omp onboarding guide](docs/getting-started.md#oh-my-pi-omp) now starts with
+  the launcher, explains isolation and resuming, and includes a no-inference
+  metadata check.
+- **omp model labels omit deployment environments:** the picker and composer
+  show `ARC Sage` and `ARC Swift` without `(prod)` or other environment
+  suffixes. The launch banner still identifies the environment.
+- **Hosted omp no longer lists the Legacy Rules Router.** Its model picker
+  offers only ARC Sage and ARC Swift. Hybrid retains the execution core's
+  active virtual model, which happens to use the same `rayline-router` wire ID.
+- **Existing omp sessions survive the Legacy model's removal.** Hosted
+  launches migrate retired role and session selections to ARC while preserving
+  other settings and historical messages, usage and served-model metadata.
+  Journal modification times are retained so `--continue` keeps selecting the
+  correct conversation. Migration cooperates with omp's settings lock and
+  refuses active writers, concurrent changes and unsafe state instead of
+  overwriting it; hybrid state is never migrated by this cutover.
+- **Supply-chain checks recognize the reviewed Boost license** for the pinned
+  `xxhash-rust` dependency used by omp's native lock compatibility. The exception
+  is crate/version-scoped, and distributed notices include the license text.
 
 ## 0.2.14 (2026-10-27)
 

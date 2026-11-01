@@ -71,15 +71,35 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let entries: Vec<_> = launch
         .offered
         .iter()
+        // Hosted omp offers only current ARC tiers. Hybrid still needs the
+        // execution core's virtual model, which shares Legacy's wire ID.
+        .filter(|model| ctx.capabilities.is_some() || **model != ROUTER_MODEL)
         .map(|model| {
-            json!({
+            let hosted_arc = ctx.capabilities.is_none()
+                && matches!(*model, crate::ARC_SAGE_MODEL | crate::ARC_SWIFT_MODEL);
+            let mut entry = json!({
                 "id": model,
-                "name": format!("{} ({})", model_display_name(launch, model), ctx.env_name),
-                "reasoning": true,
-                "input": ctx.input_modalities(),
+                "name": model_display_name(launch, model),
+                // ARC owns reasoning effort; do not expose omp thinking controls.
+                "reasoning": !hosted_arc,
+                "input": if hosted_arc { json!(["text"]) } else { ctx.input_modalities() },
                 "contextWindow": ctx.context_window(),
                 "maxTokens": ctx.max_output_tokens()
-            })
+            });
+            if hosted_arc {
+                // USD / million tokens, effective card 26 (2026-10-27).
+                // https://docs.rayline.ai/arc/pricing
+                // No fixed card applies to Legacy or hybrid's virtual model.
+                entry["cost"] = match *model {
+                    crate::ARC_SAGE_MODEL => json!({
+                        "input": 1.0, "output": 5.0, "cacheRead": 0.05, "cacheWrite": 1.25
+                    }),
+                    _ => json!({
+                        "input": 0.05, "output": 0.25, "cacheRead": 0.005, "cacheWrite": 0.0625
+                    }),
+                };
+            }
+            entry
         })
         .collect();
     let models = json!({
@@ -109,13 +129,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             }
         })
     };
-    let mut config_file = yaml_file("config.yml", &config(launch.main, launch.background), false);
-    // The seed 0.2.x wrote (Legacy in every role); still exactly that means the
-    // user never changed a role, so it moves to the new defaults.
-    if launch.main != ROUTER_MODEL {
-        config_file.replaces_seed =
-            Some(yaml_file("config.yml", &config(ROUTER_MODEL, ROUTER_MODEL), false).contents);
-    }
+    let config_file = yaml_file("config.yml", &config(launch.main, launch.background), false);
     Plan {
         files: vec![yaml_file("models.yml", &models, true), config_file],
         env_set: vec![("PI_CODING_AGENT_DIR", ctx.config_dir.as_os_str().to_owned())],
@@ -136,37 +150,6 @@ mod tests {
             Some(&dir.clone().into_os_string())
         );
         assert!(plan.env_remove.contains(&"CLAUDE_CONFIG_DIR"));
-        let models = std::fs::read_to_string(dir.join("models.yml")).unwrap();
-        assert_eq!(
-            models,
-            "providers:
-  rayline:
-    api: \"anthropic-messages\"
-    apiKey: \"rlk-test\"
-    auth: \"apiKey\"
-    baseUrl: \"https://api-dev.rayline.ai\"
-    headers: {}
-    models:
-      - contextWindow: 200000
-        id: \"arc-sage-1.0\"
-        input: [\"text\", \"image\"]
-        maxTokens: 32000
-        name: \"ARC Sage (dev)\"
-        reasoning: true
-      - contextWindow: 200000
-        id: \"arc-swift-1.0\"
-        input: [\"text\", \"image\"]
-        maxTokens: 32000
-        name: \"ARC Swift (dev)\"
-        reasoning: true
-      - contextWindow: 200000
-        id: \"rayline-router\"
-        input: [\"text\", \"image\"]
-        maxTokens: 32000
-        name: \"Legacy Rules Router (dev)\"
-        reasoning: true
-"
-        );
         let config = std::fs::read_to_string(dir.join("config.yml")).unwrap();
         assert!(config.starts_with("modelRoles:\n"));
         for role in ["default", "slow", "plan"] {
@@ -175,34 +158,21 @@ mod tests {
         assert!(config.contains("  smol: \"rayline/arc-swift-1.0\"\n"));
     }
 
-    const LEGACY_SEED: &str = "modelRoles:
-  default: \"rayline/rayline-router\"
-  plan: \"rayline/rayline-router\"
-  slow: \"rayline/rayline-router\"
-  smol: \"rayline/rayline-router\"
-";
-
     #[test]
-    fn untouched_legacy_seed_moves_to_arc_and_an_edited_one_is_kept() {
-        let dir = super::super::tests::temp_dir("omp-seed");
-        let ctx = super::super::tests::render_context(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // The exact seed 0.2.x wrote: no role was ever chosen.
-        std::fs::write(dir.join("config.yml"), LEGACY_SEED).unwrap();
-        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
-        let config = std::fs::read_to_string(dir.join("config.yml")).unwrap();
-        assert!(
-            config.contains("  default: \"rayline/arc-sage-1.0\"\n"),
-            "{config}"
-        );
-        // Legacy chosen for one role (any edit): the file is kept as is.
-        let chosen = LEGACY_SEED.replace("  smol: \"rayline/rayline-router\"\n", "");
-        std::fs::write(dir.join("config.yml"), &chosen).unwrap();
-        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("config.yml")).unwrap(),
-            chosen
-        );
+    fn hosted_picker_excludes_legacy_but_hybrid_keeps_its_virtual_model() {
+        let dir = super::super::tests::temp_dir("omp-model-roster");
+        let mut ctx = super::super::tests::render_context(&dir);
+        let hosted = super::plan(&ctx);
+        assert!(!hosted.files[0].contents.contains("id: \"rayline-router\""));
+        let capabilities = rayline_local_router::ModelCapabilities {
+            context_window: 16384,
+            max_output_tokens: 8192,
+            input_modalities: vec!["text".into()],
+        };
+        ctx.capabilities = Some(&capabilities);
+        let hybrid = super::plan(&ctx);
+        assert!(hybrid.files[0].contents.contains("id: \"rayline-router\""));
+        assert!(!hybrid.files[0].contents.contains("id: \"arc-sage-1.0\""));
     }
 
     #[test]

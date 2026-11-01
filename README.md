@@ -86,6 +86,17 @@ raydock router logs --lines 120
 raydock router stop
 ```
 
+Use **oh-my-pi (omp)** on ARC with no manual provider configuration:
+
+```bash
+raydock omp
+```
+
+Raydock handles sign-in, registers the Rayline provider with ARC token prices,
+and defaults to Sage for main work and Swift for the smol role. Your normal omp
+profile stays separate; choices saved in Raydock's profile survive relaunches.
+See [omp setup and troubleshooting](docs/getting-started.md#oh-my-pi-omp).
+
 Run Codex CLI through Raydock's local OpenAI Responses-compatible router. By
 default, main-agent and subagent requests go to Rayline Platform's hosted router
 on ARC (`arc-sage-1.0` for the main agent, `arc-swift-1.0` for subagents),
@@ -200,7 +211,8 @@ and TypeScript, grouped by routing path:
 Hosted launches (`raydock claude`, `raydock codex`, and the `opencode`, `pi`,
 `omp`, `hermes` and `openclaw` launchers) run on ARC by default: the main agent
 on `arc-sage-1.0`, and subagents and background tasks on `arc-swift-1.0` where
-the harness gives them their own model setting. The Legacy Rules Router stays
+the harness gives them their own model setting. Hosted omp offers only those
+two ARC tiers. On the other launchers, the Legacy Rules Router stays
 available as `rayline-router` — for example `raydock claude --model
 rayline-router` or `raydock opencode -m rayline/rayline-router` — and a model
 you chose yourself is kept. Local and hybrid sessions are unchanged. See
