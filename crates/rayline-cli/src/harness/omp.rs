@@ -129,13 +129,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             }
         })
     };
-    let mut config_file = yaml_file("config.yml", &config(launch.main, launch.background), false);
-    // The seed 0.2.x wrote (Legacy in every role); still exactly that means the
-    // user never changed a role, so it moves to the new defaults.
-    if launch.main != ROUTER_MODEL {
-        config_file.replaces_seed =
-            Some(yaml_file("config.yml", &config(ROUTER_MODEL, ROUTER_MODEL), false).contents);
-    }
+    let config_file = yaml_file("config.yml", &config(launch.main, launch.background), false);
     Plan {
         files: vec![yaml_file("models.yml", &models, true), config_file],
         env_set: vec![("PI_CODING_AGENT_DIR", ctx.config_dir.as_os_str().to_owned())],
@@ -179,36 +173,6 @@ mod tests {
         let hybrid = super::plan(&ctx);
         assert!(hybrid.files[0].contents.contains("id: \"rayline-router\""));
         assert!(!hybrid.files[0].contents.contains("id: \"arc-sage-1.0\""));
-    }
-
-    const LEGACY_SEED: &str = "modelRoles:
-  default: \"rayline/rayline-router\"
-  plan: \"rayline/rayline-router\"
-  slow: \"rayline/rayline-router\"
-  smol: \"rayline/rayline-router\"
-";
-
-    #[test]
-    fn untouched_legacy_seed_moves_to_arc_and_an_edited_one_is_kept() {
-        let dir = super::super::tests::temp_dir("omp-seed");
-        let ctx = super::super::tests::render_context(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // The exact seed 0.2.x wrote: no role was ever chosen.
-        std::fs::write(dir.join("config.yml"), LEGACY_SEED).unwrap();
-        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
-        let config = std::fs::read_to_string(dir.join("config.yml")).unwrap();
-        assert!(
-            config.contains("  default: \"rayline/arc-sage-1.0\"\n"),
-            "{config}"
-        );
-        // Legacy chosen for one role (any edit): the file is kept as is.
-        let chosen = LEGACY_SEED.replace("  smol: \"rayline/rayline-router\"\n", "");
-        std::fs::write(dir.join("config.yml"), &chosen).unwrap();
-        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.join("config.yml")).unwrap(),
-            chosen
-        );
     }
 
     #[test]

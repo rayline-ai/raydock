@@ -24,8 +24,9 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `router.json`. Choices you made are kept: an explicit model,
   your own Claude Code model variables, `--config` routes, and the model pi
   and omp saved (Hermes and OpenClaw configs are rewritten each launch, as
-  before, so pick Legacy there per run). Generated defaults that were never edited (the 0.2.x
-  `router.json`, pi `settings.json` and omp `config.yml`) move to ARC once.
+  before, so pick Legacy there per run). Untouched 0.2.x `router.json` and pi
+  `settings.json` defaults move to ARC once. Hosted omp also migrates retired
+  Legacy references in customized saved roles and sessions.
   Local and hybrid sessions are unchanged.
 - A cloud-only `raydock claude --config` launches the main agent with the model
   its `routes.main` names and, with `--route all`, subagents with its
@@ -71,6 +72,13 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 - **Hosted omp no longer lists the Legacy Rules Router.** Its model picker
   offers only ARC Sage and ARC Swift. Hybrid retains the execution core's
   active virtual model, which happens to use the same `rayline-router` wire ID.
+- **Existing omp sessions survive the Legacy model's removal.** Hosted
+  launches migrate retired role and session selections to ARC while preserving
+  other settings and historical messages, usage and served-model metadata.
+  Journal modification times are retained so `--continue` keeps selecting the
+  correct conversation. Migration cooperates with omp's settings lock and
+  refuses active writers, concurrent changes and unsafe state instead of
+  overwriting it; hybrid state is never migrated by this cutover.
 
 ## 0.2.14 (2026-10-27)
 

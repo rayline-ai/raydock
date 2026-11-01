@@ -111,8 +111,17 @@ Raydock keeps its isolated omp configuration and sessions under
 
 - `models.yml` is managed by Raydock and refreshed on every launch, including
   pricing corrections. Do not edit it for persistent customizations.
-- `config.yml` is seeded once; your saved role choices are preserved. An
-  untouched old Legacy-only seed is migrated to ARC.
+- `config.yml` is seeded once. On hosted launches, retired
+  `rayline/rayline-router` role choices migrate to Sage (`smol` to Swift);
+  other saved choices, comments and settings are preserved.
+- Saved sessions migrate their Legacy model selections too, so noninteractive
+  `--continue --print` and `--resume` still work. Historical messages, usage and
+  served-model labels are not rewritten. Explicit `--session-dir`, `--resume`
+  and `--restore` paths are included. Journal modification times are preserved
+  so `--continue` does not switch to an older conversation just because it
+  migrated. Raydock cooperates with omp's settings lock and refuses active
+  writers, concurrent edits, symlinks and malformed targeted state instead of
+  overwriting it; close the settings/session writer before retrying.
 - The generated key is stored in owner-only configuration, not exported to
   omp's tool subprocesses. Do not share the generated file.
 - `OMP_PROFILE`, `PI_PROFILE`, and `CLAUDE_CONFIG_DIR` are removed from the
@@ -369,9 +378,9 @@ Claude Code (subagents then inherit it, as before), a cloud-only `--config`'s
 `routes.subagent`, subagents follow `routes.main`), a `--router-config-path`
 subagent allowlist (Raydock then sets no subagent model), your own `CLAUDE_CODE_SUBAGENT_MODEL` or
 `ANTHROPIC_DEFAULT_HAIKU_MODEL`, a `--config` route, and the model pi and omp
-saved. The pi `settings.json` and omp `config.yml` that Raydock seeds only once
-are moved to ARC only while they still read exactly as an 0.2.x release wrote
-them, which means no model was ever picked there. Raydock rewrites its model
+saved, except that hosted omp replaces retired Legacy references with ARC in
+both saved roles and session selections. Pi's `settings.json` moves to ARC only
+while it still reads exactly as an 0.2.x release wrote it. Raydock rewrites its model
 keys in the Hermes and OpenClaw configs on every launch (as before), so pick
 Legacy there per run.
 
