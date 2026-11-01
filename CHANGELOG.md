@@ -79,6 +79,9 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   correct conversation. Migration cooperates with omp's settings lock and
   refuses active writers, concurrent changes and unsafe state instead of
   overwriting it; hybrid state is never migrated by this cutover.
+- **Supply-chain checks recognize the reviewed Boost license** for the pinned
+  `xxhash-rust` dependency used by omp's native lock compatibility. The exception
+  is crate/version-scoped, and distributed notices include the license text.
 
 ## 0.2.14 (2026-10-27)
 

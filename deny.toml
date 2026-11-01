@@ -24,6 +24,11 @@ confidence-threshold = 0.8
 # so any other MPL-2.0 dependency still requires explicit review.
 exceptions = [
     { allow = ["MPL-2.0"], crate = "option-ext" },
+    # Reviewed Boost Software License 1.0: permissive use/redistribution, with
+    # notice retention for source copies and an exception for compiled objects.
+    # This pinned crate reproduces omp's Linux/Windows native lock names.
+    # Other crates and future versions still require explicit license review.
+    { allow = ["BSL-1.0"], crate = "xxhash-rust@0.8.15" },
 ]
 
 [licenses.private]
