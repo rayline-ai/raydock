@@ -5,6 +5,19 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ## 0.3.1 (2026-11-02)
 
+### New
+
+- **Each forwarded request records the cloud router's id.** When Rayline Local
+  forwards a request to the router, the id the router gives it
+  (`x-rayline-route-id`) is kept with the request: the route log
+  line is followed by `… route upstream request_id=… upstream_request_id=rt_…`,
+  the metrics snapshot's request rows gain `upstream_request_id`, `raydock top`
+  shows it in an `UPSTREAM` column on its wide layout, and the response carries
+  it back as `x-rayline-upstream-request-id`. Route log lines now also name the
+  local `request_id`, so the two lines can be matched. A request answered on the
+  device without a cloud routing hop has no upstream id and shows `-`; one the
+  router redirected to the device keeps the router's id.
+
 ### Changed
 
 - Hosted `raydock claude` now picks the model of every Claude Code subagent and

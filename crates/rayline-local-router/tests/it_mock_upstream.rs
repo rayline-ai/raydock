@@ -669,6 +669,297 @@ fn header<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
     resp.headers().get(name).and_then(|v| v.to_str().ok())
 }
 
+/// `response` (a raw HTTP/1.1 reply) with one more header after the status line.
+fn with_header(response: &str, header: &str) -> String {
+    response.replacen("\r\n", &format!("\r\n{header}\r\n"), 1)
+}
+
+/// Start a router that reports into `metrics`, and wait for it to be healthy.
+async fn start_router_with_metrics(
+    port: u16,
+    config_path: PathBuf,
+    metrics: std::sync::Arc<rayline_metrics::RouterMetrics>,
+) {
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config_path),
+        metrics: Some(metrics),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("router on port {port} did not become healthy");
+}
+
+/// The `upstream_request_id` the metrics hold for `request_id`, whether the
+/// request is still streaming or already finished.
+fn metrics_upstream_request_id(
+    metrics: &rayline_metrics::RouterMetrics,
+    request_id: &str,
+) -> Option<String> {
+    let snapshot = metrics.snapshot();
+    snapshot
+        .active
+        .iter()
+        .chain(snapshot.recent.iter())
+        .find(|row| row.request_id == request_id)
+        .and_then(|row| row.upstream_request_id.clone())
+}
+
+/// The finished (`recent`) metrics row for `request_id`, if the request is done.
+fn recent_metrics_row(
+    metrics: &rayline_metrics::RouterMetrics,
+    request_id: &str,
+) -> Option<rayline_metrics::RequestSnapshot> {
+    metrics
+        .snapshot()
+        .recent
+        .into_iter()
+        .find(|row| row.request_id == request_id)
+}
+
+fn anthropic_endpoint_config(name: &str, up_port: u16) -> PathBuf {
+    write_config(
+        name,
+        &json!({
+            "endpoints": [{
+                "id": "anthropic-compatible",
+                "protocol": "anthropic_messages",
+                "base_url": format!("http://127.0.0.1:{up_port}"),
+                "models": ["claude-mock"]
+            }],
+            "routes": {
+                "main": {"endpoint": "anthropic-compatible", "model": "claude-mock"},
+                "default": {"endpoint": "anthropic-compatible", "model": "claude-mock"}
+            }
+        }),
+    )
+}
+
+/// The cloud router names each forwarded request in `x-rayline-route-id`. A
+/// passthrough forward keeps that id on the response it returns and on the
+/// request's metrics row, so `rayline top` and the log can name the cloud route a
+/// local request became; the id is on the headers, so a streaming response needs
+/// no buffering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forwarded_anthropic_request_keeps_the_upstream_request_id() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    tokio::spawn(serve_once(
+        upstream,
+        with_header(&anthropic_sse("Hi"), "x-rayline-route-id: rt_passthrough"),
+    ));
+    let path = anthropic_endpoint_config("upstream-id-passthrough", up_port);
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    start_router_with_metrics(port, path.clone(), metrics.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .header("x-rayline-request-id", "req_passthrough")
+        .json(&json!({
+            "model": "rayline-router",
+            "stream": true,
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "x-rayline-upstream-request-id"),
+        Some("rt_passthrough")
+    );
+    assert_eq!(
+        metrics_upstream_request_id(&metrics, "req_passthrough").as_deref(),
+        Some("rt_passthrough"),
+        "the metrics row carries the upstream id as soon as the headers are in"
+    );
+    let events = collect_sse(resp).await;
+    assert_eq!(sse_text(&events), "Hi");
+    let _ = std::fs::remove_file(path);
+}
+
+/// A translated forward (Codex Responses in, OpenAI Chat out) builds a fresh
+/// response, so the id has to be carried over explicitly. This
+/// translation completes the metrics row before the handler returns, so the id
+/// must be on the finished row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn translated_responses_request_keeps_the_upstream_request_id() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let completion = json!({
+        "id": "chatcmpl-mock", "object": "chat.completion", "model": "m",
+        "choices": [{"index": 0, "finish_reason": "stop",
+                     "message": {"role": "assistant", "content": "translated"}}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    });
+    tokio::spawn(serve_once(
+        upstream,
+        with_header(&http_json(&completion), "x-rayline-route-id: rt_legacy"),
+    ));
+    let path = write_config(
+        "upstream-id-translated",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "openai_chat",
+                           "base_url": format!("http://127.0.0.1:{up_port}/v1"), "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    start_router_with_metrics(port, path.clone(), metrics.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .header("x-rayline-request-id", "req_translated")
+        .json(&json!({"model": "rayline-router", "stream": false, "input": "hi"}))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "x-rayline-upstream-request-id"),
+        Some("rt_legacy")
+    );
+    let row = recent_metrics_row(&metrics, "req_translated").expect("the row is finished");
+    assert_eq!(row.state, "completed");
+    assert_eq!(row.upstream_request_id.as_deref(), Some("rt_legacy"));
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"][0]["content"][0]["text"], "translated");
+    let _ = std::fs::remove_file(path);
+}
+
+/// Codex's compaction side call is forwarded as a one-shot Anthropic request and
+/// answered with a synthetic Responses body; the cloud's id rides along on the
+/// response and the metrics row all the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synthetic_compaction_call_keeps_the_upstream_request_id() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let message = json!({
+        "id": "msg_mock", "type": "message", "role": "assistant", "model": "claude-mock",
+        "content": [{"type": "text", "text": "compact summary"}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 3, "output_tokens": 1}
+    });
+    tokio::spawn(serve_once(
+        upstream,
+        with_header(&http_json(&message), "x-rayline-route-id: rt_compact"),
+    ));
+    let path = anthropic_endpoint_config("upstream-id-compact", up_port);
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    start_router_with_metrics(port, path.clone(), metrics.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses/compact"))
+        .header("x-rayline-request-id", "req_compact")
+        .json(&json!({"model": "rayline-router", "input": "compact this"}))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "x-rayline-upstream-request-id"),
+        Some("rt_compact")
+    );
+    let row = recent_metrics_row(&metrics, "req_compact").expect("the row is finished");
+    assert_eq!(row.upstream_request_id.as_deref(), Some("rt_compact"));
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["output"][0]["encrypted_content"], "compact summary");
+    let _ = std::fs::remove_file(path);
+}
+
+/// The id is recorded when the upstream headers arrive, so an answer whose body
+/// then fails to translate still leaves it on the errored metrics row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upstream_request_id_survives_a_body_that_fails_to_translate() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let broken = "HTTP/1.1 200 OK\r\nx-rayline-route-id: rt_broken\r\ncontent-type: application/json\r\ncontent-length: 9\r\nconnection: close\r\n\r\nnot json!";
+    tokio::spawn(serve_once(upstream, broken.to_owned()));
+    let path = write_config(
+        "upstream-id-broken",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": "openai_chat",
+                           "base_url": format!("http://127.0.0.1:{up_port}/v1"), "models": ["m"]}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    start_router_with_metrics(port, path.clone(), metrics.clone()).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .header("x-rayline-request-id", "req_broken")
+        .json(&json!({"model": "rayline-router", "stream": false, "input": "hi"}))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 502);
+    let row = recent_metrics_row(&metrics, "req_broken").expect("the row is finished");
+    assert_eq!(row.state, "error");
+    assert_eq!(row.upstream_request_id.as_deref(), Some("rt_broken"));
+    let _ = std::fs::remove_file(path);
+}
+
+/// Chat Completions translated to Anthropic Messages carries the id too, and a
+/// local-only answer (an upstream that sends no id) adds no header at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn translated_chat_request_keeps_the_upstream_request_id_when_sent() {
+    let message = json!({
+        "id": "msg_mock", "type": "message", "role": "assistant", "model": "claude-mock",
+        "content": [{"type": "text", "text": "chat"}],
+        "stop_reason": "end_turn", "usage": {"input_tokens": 3, "output_tokens": 1}
+    });
+    for upstream_header in [Some("x-rayline-route-id: rt_chat"), None] {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_port = upstream.local_addr().unwrap().port();
+        let reply = http_json(&message);
+        tokio::spawn(serve_once(
+            upstream,
+            upstream_header.map_or_else(|| reply.clone(), |h| with_header(&reply, h)),
+        ));
+        let path = anthropic_endpoint_config("upstream-id-chat", up_port);
+        let port = free_port();
+        start_router(port, path.clone()).await;
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&json!({"model": "rayline-router",
+                          "messages": [{"role": "user", "content": "hi"}]}))
+            .send()
+            .await
+            .expect("router request");
+        assert_eq!(resp.status(), 200);
+        assert_eq!(
+            header(&resp, "x-rayline-upstream-request-id"),
+            upstream_header.map(|_| "rt_chat")
+        );
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "chat");
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// End-to-end (headless / agent path): a single `--config` with distinct `main`
 /// and `subagent` routes must send the MAIN request to one upstream and a SUBAGENT
 /// request to ANOTHER, over real HTTP. This is the SDK-through-the-router proof for

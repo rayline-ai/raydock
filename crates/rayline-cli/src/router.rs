@@ -1191,8 +1191,19 @@ fn top_table_header(width: u16) -> String {
         )
     } else {
         format!(
-            "{:<18} {:<12} {:<8} {:<10} {:>7} {:>7} {:>7} {:>8} {:>8} {:>6} {:>6} MODEL / POLICY",
-            "REQ", "AGENT", "TARGET", "STATE", "IN", "OUT", "CACHE %", "AGE", "TTFT", "PF", "TG"
+            "{:<18} {:<16} {:<12} {:<8} {:<10} {:>7} {:>7} {:>7} {:>8} {:>8} {:>6} {:>6} MODEL / POLICY",
+            "REQ",
+            "UPSTREAM",
+            "AGENT",
+            "TARGET",
+            "STATE",
+            "IN",
+            "OUT",
+            "CACHE %",
+            "AGE",
+            "TTFT",
+            "PF",
+            "TG"
         )
     }
 }
@@ -1222,10 +1233,11 @@ fn top_table_row(row: &Value, width: u16) -> String {
         );
     }
 
+    let upstream = truncate_cell(value_str(row, "upstream_request_id"), 16);
     let input_tokens = count_cell(row, "input_tokens");
     let age = ms_cell(row, "duration_ms");
     format!(
-        "{request_id:<18} {agent:<12} {target:<8} {state:<10} {input_tokens:>7} {output_tokens:>7} {cache_hit:>7} {age:>8} {ttft:>8} {prefill_tps:>6} {generation_tps:>6} {model}"
+        "{request_id:<18} {upstream:<16} {agent:<12} {target:<8} {state:<10} {input_tokens:>7} {output_tokens:>7} {cache_hit:>7} {age:>8} {ttft:>8} {prefill_tps:>6} {generation_tps:>6} {model}"
     )
 }
 
@@ -1267,6 +1279,7 @@ fn format_top_snapshot(snapshot: &Value, show_all: bool) -> String {
 
 fn format_top_row(row: &Value) -> String {
     let request_id = value_str(row, "request_id");
+    let upstream = value_str(row, "upstream_request_id");
     let agent = value_str(row, "agent_type");
     let target = top_target_cell(row);
     let model = value_str(row, "selected_model");
@@ -1277,7 +1290,7 @@ fn format_top_row(row: &Value) -> String {
     let generation_tps = rate_cell(row, "output_tps");
     let cache_hit = percent_cell(row, "cache_hit_ratio");
     format!(
-        "{request_id:<22} {agent:<12} {target:<10} {state:<10} out={output_tokens:<7} cache%={cache_hit:<7} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} {model}\n"
+        "{request_id:<22} upstream={upstream:<16} {agent:<12} {target:<10} {state:<10} out={output_tokens:<7} cache%={cache_hit:<7} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} {model}\n"
     )
 }
 
@@ -4033,9 +4046,47 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         assert_eq!(
-            &cells[4..11],
+            &cells[5..12],
             ["10.2k", "1.2M", "88%", "10.2s", "999ms", "12.0k", "1.2M"]
         );
+    }
+
+    #[test]
+    fn top_table_shows_the_upstream_request_id_after_the_request_id() {
+        let header = top_table_header(140);
+        let req = header.find("REQ").expect("header includes request column");
+        let upstream = header
+            .find("UPSTREAM")
+            .expect("header includes upstream column");
+        let agent = header.find("AGENT").expect("header includes agent column");
+        assert!(req < upstream);
+        assert!(upstream < agent);
+
+        let row = serde_json::json!({
+            "request_id": "req_1",
+            "upstream_request_id": "rt_0123456789abcdefghij",
+            "agent_type": "main",
+            "target": "remote",
+            "state": "completed",
+            "selected_model": "model",
+        });
+        let cells = top_table_row(&row, 140)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(cells[0], "req_1");
+        assert_eq!(cells[1].chars().count(), 16);
+        assert!(cells[1].starts_with("rt_0123456789"));
+        assert_eq!(cells[2], "main");
+
+        let local = serde_json::json!({"request_id": "req_2", "target": "local"});
+        let cells = top_table_row(&local, 140)
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(&cells[..2], ["req_2", "-"]);
+        assert!(format_top_row(&local).contains("upstream=-"));
+        assert!(format_top_row(&row).contains("upstream=rt_0123456789abcdefghij"));
     }
 
     #[test]

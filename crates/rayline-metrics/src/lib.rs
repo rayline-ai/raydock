@@ -7,6 +7,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 pub const REQUEST_ID_HEADER: &str = "x-rayline-request-id";
+/// The cloud router's own id for a forwarded request (`rt_…`). The gateway sets
+/// this on every turn it routes; `x-workshop-route-id` carries the same value
+/// under a legacy name, so reading one name is enough.
+///
+/// Deliberately NOT `x-request-id`: the gateway sets that to the route id only
+/// on an ARC cell turn, and a direct-provider forward relays the *provider's*
+/// own `x-request-id` instead — a different id space. Recording that here would
+/// make `upstream_request_id` mean "a cloud route" sometimes and "an OpenAI
+/// request" other times, which is exactly the ambiguity this field removes.
+pub const UPSTREAM_ROUTE_ID_HEADER: &str = "x-rayline-route-id";
 pub const DEFAULT_METRICS_PORT: u16 = 20813;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -53,6 +63,9 @@ pub struct RouterTotals {
 pub struct RequestSnapshot {
     pub request_id: String,
     pub route_id: Option<String>,
+    /// The id the upstream (cloud router) gave the forwarded request, when it
+    /// sent one; `None` for local inference and for upstreams that send none.
+    pub upstream_request_id: Option<String>,
     pub source: String,
     pub state: String,
     pub target: Option<String>,
@@ -111,6 +124,12 @@ pub enum MetricsUpdate {
     },
     FirstToken {
         request_id: String,
+    },
+    /// The upstream's own id for a forwarded request, read from its response
+    /// headers once they arrive.
+    UpstreamRequestId {
+        request_id: String,
+        upstream_request_id: String,
     },
     TokenUsage {
         request_id: String,
@@ -269,6 +288,25 @@ impl RouterMetrics {
                 record.state = "streaming".to_owned();
                 record.first_token_at_unix_ms.get_or_insert(now);
             }
+            MetricsUpdate::UpstreamRequestId {
+                request_id,
+                upstream_request_id,
+            } => {
+                // The forwarder records this as soon as the upstream headers are
+                // in, which can be before anything else announced the request
+                // (Codex's auxiliary endpoints) or after a short response already
+                // completed. Like `FirstToken`, start the row when it is new; the
+                // same forwarder completes it. Holding `active` while checking
+                // `recent` pairs with completion holding it across `push_recent`,
+                // so the id cannot fall between the two.
+                let mut active = self.active.lock().expect("metrics active lock poisoned");
+                if !self.merge_recent_upstream_request_id(request_id, upstream_request_id) {
+                    let record = active
+                        .entry(request_id.clone())
+                        .or_insert_with(|| RequestRecord::new(request_id.clone(), now));
+                    record.upstream_request_id = Some(upstream_request_id.clone());
+                }
+            }
             MetricsUpdate::TokenUsage {
                 request_id,
                 input_tokens,
@@ -324,19 +362,21 @@ impl RouterMetrics {
                 output_tokens,
                 selected_model,
             } => {
-                let record = {
-                    let mut active = self.active.lock().expect("metrics active lock poisoned");
-                    let mut record = active
-                        .remove(request_id)
-                        .unwrap_or_else(|| RequestRecord::new(request_id.clone(), now));
-                    record.state = "completed".to_owned();
-                    record.completed_at_unix_ms = Some(now);
-                    record.status_code = *status_code;
-                    merge_option(&mut record.input_tokens, *input_tokens);
-                    merge_option(&mut record.output_tokens, *output_tokens);
-                    merge_option(&mut record.selected_model, selected_model.clone());
-                    record
-                };
+                // Hold `active` until the row is in `recent`: a late update for
+                // this request (its upstream id, usage) must find it in one
+                // place or the other, never in neither. `push_recent` takes
+                // `totals` then `recent` under it, so the order is always
+                // active -> totals -> recent.
+                let mut active = self.active.lock().expect("metrics active lock poisoned");
+                let mut record = active
+                    .remove(request_id)
+                    .unwrap_or_else(|| RequestRecord::new(request_id.clone(), now));
+                record.state = "completed".to_owned();
+                record.completed_at_unix_ms = Some(now);
+                record.status_code = *status_code;
+                merge_option(&mut record.input_tokens, *input_tokens);
+                merge_option(&mut record.output_tokens, *output_tokens);
+                merge_option(&mut record.selected_model, selected_model.clone());
                 self.push_recent(record);
             }
             MetricsUpdate::RequestErrored {
@@ -344,17 +384,15 @@ impl RouterMetrics {
                 status_code,
                 error,
             } => {
-                let record = {
-                    let mut active = self.active.lock().expect("metrics active lock poisoned");
-                    let mut record = active
-                        .remove(request_id)
-                        .unwrap_or_else(|| RequestRecord::new(request_id.clone(), now));
-                    record.state = "error".to_owned();
-                    record.completed_at_unix_ms = Some(now);
-                    record.status_code = *status_code;
-                    record.error = Some(error.clone());
-                    record
-                };
+                // Same lock discipline as `RequestCompleted`.
+                let mut active = self.active.lock().expect("metrics active lock poisoned");
+                let mut record = active
+                    .remove(request_id)
+                    .unwrap_or_else(|| RequestRecord::new(request_id.clone(), now));
+                record.state = "error".to_owned();
+                record.completed_at_unix_ms = Some(now);
+                record.status_code = *status_code;
+                record.error = Some(error.clone());
                 {
                     let mut totals = self.totals.lock().expect("metrics totals lock poisoned");
                     totals.errored_requests = totals.errored_requests.saturating_add(1);
@@ -438,6 +476,27 @@ impl RouterMetrics {
         }
     }
 
+    /// A short response can complete before its upstream id is recorded; attach
+    /// it to the finished row. Returns whether such a row was found.
+    fn merge_recent_upstream_request_id(
+        &self,
+        request_id: &str,
+        upstream_request_id: &str,
+    ) -> bool {
+        let mut recent = self.recent.lock().expect("metrics recent lock poisoned");
+        match recent
+            .iter_mut()
+            .rev()
+            .find(|record| record.request_id == request_id)
+        {
+            Some(record) => {
+                record.upstream_request_id = Some(upstream_request_id.to_owned());
+                true
+            }
+            None => false,
+        }
+    }
+
     fn merge_recent_prompt_cache(
         &self,
         request_id: &str,
@@ -496,6 +555,7 @@ impl MetricsSink for RouterMetrics {
 struct RequestRecord {
     request_id: String,
     route_id: Option<String>,
+    upstream_request_id: Option<String>,
     source: String,
     state: String,
     target: Option<String>,
@@ -525,6 +585,7 @@ impl RequestRecord {
         Self {
             request_id,
             route_id: None,
+            upstream_request_id: None,
             source: "unknown".to_owned(),
             state: "started".to_owned(),
             target: None,
@@ -579,6 +640,7 @@ impl RequestRecord {
         RequestSnapshot {
             request_id: self.request_id.clone(),
             route_id: self.route_id.clone(),
+            upstream_request_id: self.upstream_request_id.clone(),
             source: self.source.clone(),
             state: self.state.clone(),
             target: self.target.clone(),
@@ -753,6 +815,151 @@ mod tests {
         assert_eq!(corrected.recent[0].output_tokens, Some(18));
         assert_eq!(corrected.totals.input_tokens, 8);
         assert_eq!(corrected.totals.output_tokens, 18);
+    }
+
+    #[test]
+    fn upstream_request_id_attaches_to_active_and_recent_rows() {
+        let metrics = RouterMetrics::new("test-router");
+        metrics.record(MetricsUpdate::RequestStarted {
+            request_id: "req-1".to_owned(),
+            source: "local-router".to_owned(),
+            requested_model: None,
+            agent_id: None,
+            agent_type: None,
+        });
+        metrics.record(MetricsUpdate::UpstreamRequestId {
+            request_id: "req-1".to_owned(),
+            upstream_request_id: "rt_active".to_owned(),
+        });
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.active[0].upstream_request_id.as_deref(),
+            Some("rt_active")
+        );
+
+        metrics.record(MetricsUpdate::RequestCompleted {
+            request_id: "req-1".to_owned(),
+            status_code: Some(200),
+            input_tokens: None,
+            output_tokens: None,
+            selected_model: None,
+        });
+        // A short response completes before its handler reads the header: the
+        // id still lands on the finished row and nothing is reactivated.
+        metrics.record(MetricsUpdate::UpstreamRequestId {
+            request_id: "req-1".to_owned(),
+            upstream_request_id: "rt_recent".to_owned(),
+        });
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.recent.len(), 1);
+        assert_eq!(
+            snapshot.recent[0].upstream_request_id.as_deref(),
+            Some("rt_recent")
+        );
+
+        // Nothing announced this request yet (Codex's auxiliary endpoints only
+        // report once the stream starts): the id starts the row, and the
+        // forwarder's completion finds it there.
+        metrics.record(MetricsUpdate::UpstreamRequestId {
+            request_id: "req-new".to_owned(),
+            upstream_request_id: "rt_first".to_owned(),
+        });
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.active.len(), 1);
+        assert_eq!(snapshot.active[0].request_id, "req-new");
+        assert_eq!(
+            snapshot.active[0].upstream_request_id.as_deref(),
+            Some("rt_first")
+        );
+        metrics.record(MetricsUpdate::FirstToken {
+            request_id: "req-new".to_owned(),
+        });
+        metrics.record(MetricsUpdate::RequestCompleted {
+            request_id: "req-new".to_owned(),
+            status_code: Some(200),
+            input_tokens: None,
+            output_tokens: None,
+            selected_model: None,
+        });
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(
+            snapshot.recent[0].upstream_request_id.as_deref(),
+            Some("rt_first")
+        );
+    }
+
+    /// Stress the invariant that a row is reachable throughout completion: with
+    /// one thread completing requests and another recording their upstream ids,
+    /// every finished row keeps its own id.
+    ///
+    /// Not a deterministic reproduction of the lost-update race. The barrier
+    /// releases both threads before either finishes its operation, so the
+    /// scheduler may serialise them; pinning the interleaving would need a sync
+    /// point inside `apply` or a model checker. The sequential half of the
+    /// invariant is covered deterministically by
+    /// `upstream_request_id_attaches_to_active_and_recent_rows`.
+    #[test]
+    fn upstream_request_id_survives_concurrent_completion() {
+        use std::sync::Barrier;
+
+        let metrics = RouterMetrics::new("test-router");
+        let rounds = 100;
+        let barrier = Arc::new(Barrier::new(2));
+        let completer = {
+            let metrics = metrics.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                for round in 0..rounds {
+                    metrics.record(MetricsUpdate::RequestStarted {
+                        request_id: format!("req-{round}"),
+                        source: "test".to_owned(),
+                        requested_model: None,
+                        agent_id: None,
+                        agent_type: None,
+                    });
+                    barrier.wait();
+                    metrics.record(MetricsUpdate::RequestCompleted {
+                        request_id: format!("req-{round}"),
+                        status_code: Some(200),
+                        input_tokens: None,
+                        output_tokens: None,
+                        selected_model: None,
+                    });
+                    barrier.wait();
+                }
+            })
+        };
+        let tagger = {
+            let metrics = metrics.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                for round in 0..rounds {
+                    barrier.wait();
+                    metrics.record(MetricsUpdate::UpstreamRequestId {
+                        request_id: format!("req-{round}"),
+                        upstream_request_id: format!("rt-{round}"),
+                    });
+                    barrier.wait();
+                }
+            })
+        };
+        completer.join().expect("completer thread");
+        tagger.join().expect("tagger thread");
+
+        let snapshot = metrics.snapshot();
+        assert!(snapshot.active.is_empty());
+        assert_eq!(snapshot.recent.len(), rounds);
+        for row in &snapshot.recent {
+            let round = row.request_id.trim_start_matches("req-");
+            assert_eq!(
+                row.upstream_request_id.as_deref(),
+                Some(format!("rt-{round}").as_str()),
+                "row {} lost its upstream id",
+                row.request_id
+            );
+        }
     }
 
     #[test]
