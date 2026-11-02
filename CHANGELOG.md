@@ -3,31 +3,10 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
-## 0.3.0 (unreleased)
+## 0.3.1 (2026-11-02)
 
 ### Changed
 
-- **Rayline Local is now Raydock.** Use `raydock` for new commands; `rayline`
-  remains a supported alias. Configuration, credentials, environment variables
-  and update channels keep their paths and names. The source repository is now
-  [rayline-ai/raydock](https://github.com/rayline-ai/raydock).
-- **Harness launches run on ARC by default** instead of the Legacy Rules
-  Router. Hosted `raydock claude`, `raydock codex` (default Rc-Rc) and the
-  `opencode`, `pi`, `omp`, `hermes` and `openclaw` launchers give the main agent
-  `arc-sage-1.0`, and subagents and background tasks `arc-swift-1.0` where the
-  harness has a separate setting for them (Claude Code's
-  `CLAUDE_CODE_SUBAGENT_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, OpenCode's
-  `small_model`, omp's `smol` role, Codex's `subagent` route). The Legacy Rules
-  Router stays available by explicit choice: `--model rayline-router`, the
-  harness's own model flag or picker (except hosted omp, which lists only ARC;
-  `raydock codex --model rayline-router` too), or a route model in
-  `router.json`. Choices you made are kept: an explicit model,
-  your own Claude Code model variables, `--config` routes, and the model pi
-  and omp saved (Hermes and OpenClaw configs are rewritten each launch, as
-  before, so pick Legacy there per run). Untouched 0.2.x `router.json` and pi
-  `settings.json` defaults move to ARC once. Hosted omp also migrates retired
-  Legacy references in customized saved roles and sessions.
-  Local and hybrid sessions are unchanged.
 - Hosted `raydock claude` now picks the model of every Claude Code subagent and
   background task, ignoring the models Claude Code's own agent definitions
   name. Without `--model`, they run on `arc-swift-1.0`; with `--model X`
@@ -41,11 +20,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   says. Your own `CLAUDE_CODE_SUBAGENT_MODEL` keeps Claude Code's precedence.
   The hosted router still replaces a `claude-*` model on subagent and
   background turns.
-- A cloud-only `raydock claude --config` launches the main agent with the model
-  its `routes.main` names and, with `--route all`, subagents with its
-  `routes.subagent` model.
-- Under `--route subagents`, a request naming an ARC model (`arc-*`) always
-  goes to the router, like `rayline-router`: Anthropic serves neither.
 - Under `--route subagents` with the hosted router, a routed subagent that
   names a Claude model now runs on its `--config` route's model
   (`routes.subagents.<type>`, then `routes.subagent`), else `arc-swift-1.0`,
@@ -99,6 +73,36 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 - **Supply-chain checks recognize the reviewed Boost license** for the pinned
   `xxhash-rust` dependency used by omp's native lock compatibility. The exception
   is crate/version-scoped, and distributed notices include the license text.
+
+## 0.3.0 (2026-10-28)
+
+### Changed
+
+- **Rayline Local is now Raydock.** Use `raydock` for new commands; `rayline`
+  remains a supported alias. Configuration, credentials, environment variables
+  and update channels keep their paths and names. The source repository is now
+  [rayline-ai/raydock](https://github.com/rayline-ai/raydock).
+- **Harness launches run on ARC by default** instead of the Legacy Rules
+  Router. Hosted `raydock claude`, `raydock codex` (default Rc-Rc) and the
+  `opencode`, `pi`, `omp`, `hermes` and `openclaw` launchers give the main agent
+  `arc-sage-1.0`, and subagents and background tasks `arc-swift-1.0` where the
+  harness has a separate setting for them (Claude Code's
+  `CLAUDE_CODE_SUBAGENT_MODEL` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`, OpenCode's
+  `small_model`, omp's `smol` role, Codex's `subagent` route). The Legacy Rules
+  Router stays available by explicit choice: `--model rayline-router`, the
+  harness's own model flag or picker (every generated config lists it;
+  `raydock codex --model rayline-router` too), or a route model in
+  `router.json`. Choices you made are kept: an explicit model,
+  your own Claude Code model variables, `--config` routes, and the model pi
+  and omp saved (Hermes and OpenClaw configs are rewritten each launch, as
+  before, so pick Legacy there per run). Generated defaults that were never edited (the 0.2.x
+  `router.json`, pi `settings.json` and omp `config.yml`) move to ARC once.
+  Local and hybrid sessions are unchanged.
+- A cloud-only `raydock claude --config` launches the main agent with the model
+  its `routes.main` names and, with `--route all`, subagents with its
+  `routes.subagent` model.
+- Under `--route subagents`, a request naming an ARC model (`arc-*`) always
+  goes to the router, like `rayline-router`: Anthropic serves neither.
 
 ## 0.2.14 (2026-10-27)
 
