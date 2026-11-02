@@ -142,10 +142,11 @@ Run Claude Code through Rayline hosted routing. Use --local for the
 local static router path.
 
 Hosted routing defaults to ARC: the main agent on arc-sage-1.0, subagents
-and background tasks on arc-swift-1.0 (CLAUDE_CODE_SUBAGENT_MODEL and
-ANTHROPIC_DEFAULT_HAIKU_MODEL, unless you set them). For the Legacy Rules
-Router, pass --model rayline-router (and, with --route subagents, set
-CLAUDE_CODE_SUBAGENT_MODEL=rayline-router).
+and background tasks on arc-swift-1.0 (CLAUDE_CODE_SUBAGENT_MODEL, forced on
+every subagent, and ANTHROPIC_DEFAULT_HAIKU_MODEL, unless you set them). With
+--model X and --route all, subagents and background tasks run on X too. For
+the Legacy Rules Router, pass --model rayline-router (and, with --route
+subagents, set CLAUDE_CODE_SUBAGENT_MODEL=rayline-router).
 
 Options:
   -m, --model <model>               Main-agent model (default: arc-sage-1.0;

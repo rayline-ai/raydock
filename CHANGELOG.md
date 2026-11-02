@@ -28,6 +28,19 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `settings.json` defaults move to ARC once. Hosted omp also migrates retired
   Legacy references in customized saved roles and sessions.
   Local and hybrid sessions are unchanged.
+- Hosted `raydock claude` now picks the model of every Claude Code subagent and
+  background task, ignoring the models Claude Code's own agent definitions
+  name. Without `--model`, they run on `arc-swift-1.0`; with `--model X`
+  (before or after `--`, or `ANTHROPIC_MODEL`) and `--route all`, they run on X
+  too, instead of only the main agent. A cloud-only `--config` uses its
+  `routes.subagent`, else the main model. Raydock sets
+  `CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` for this, so Claude Code's Explore and
+  Plan agents no longer inherit the main agent's model, and a model a custom
+  agent names, or the main agent passes when spawning, is overridden too. Under
+  `--route subagents`, subagents stay on `arc-swift-1.0` whatever `--model`
+  says. Your own `CLAUDE_CODE_SUBAGENT_MODEL` keeps Claude Code's precedence.
+  The hosted router still replaces a `claude-*` model on subagent and
+  background turns.
 - A cloud-only `raydock claude --config` launches the main agent with the model
   its `routes.main` names and, with `--route all`, subagents with its
   `routes.subagent` model.
