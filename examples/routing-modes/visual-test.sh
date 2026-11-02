@@ -93,9 +93,12 @@ if [ "$CLIENT" = codex ]; then
     fi
   }
 else
-  INVOCATION="$RAYLINE_BIN claude --config $MODE.json --via proxy -- -p"
-  LEFT_CMD="'$RAYLINE_BIN' claude --config '$CFG' --via proxy -- -p '$PROMPT'"
-  run_client() { "$RAYLINE_BIN" claude --config "$CFG" --via proxy -- -p "$PROMPT"; }
+  # `--setting-sources project,local` keeps the user's ~/.claude/settings.json (its env
+  # and model) out of the run, so the config alone decides routing. Headless runs read
+  # stdin from /dev/null so `claude -p` doesn't wait on it.
+  INVOCATION="$RAYLINE_BIN claude --config $MODE.json --via proxy -- --setting-sources project,local -p"
+  LEFT_CMD="'$RAYLINE_BIN' claude --config '$CFG' --via proxy -- --setting-sources project,local -p '$PROMPT'"
+  run_client() { "$RAYLINE_BIN" claude --config "$CFG" --via proxy -- --setting-sources project,local -p "$PROMPT" < /dev/null; }
 fi
 
 # Headless: no TTY (CI / scripted) or DEMO_HEADLESS=1. asciinema/tmux need a real

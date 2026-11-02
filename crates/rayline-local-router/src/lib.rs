@@ -7097,14 +7097,15 @@ mod tests {
         fn ep(id: &str) -> RouteSelection {
             RouteSelection::Endpoint(id.to_owned())
         }
-        let cloud = || (ep("rayline-cloud"), "rayline-router".to_owned());
+        let cloud_main = || (ep("rayline-cloud"), "arc-sage-1.0".to_owned());
+        let cloud_sub = || (ep("rayline-cloud"), "arc-swift-1.0".to_owned());
         let ollama_def = || (ep("ollama"), "qwen3.5:9b".to_owned());
         let anthropic = || (ep("anthropic"), "claude-sonnet-5".to_owned());
 
         // main routed + subagent routed (the routes the local router executes):
         let st = load_state(include_str!("../../../examples/routing-modes/Rc-Rc.json"));
-        assert_eq!(main_route(&st), cloud());
-        assert_eq!(sub_route(&st, "reviewer"), cloud());
+        assert_eq!(main_route(&st), cloud_main());
+        assert_eq!(sub_route(&st, "reviewer"), cloud_sub());
 
         // Rl-Rl: `router: rayline-local` makes the LSR the router; it forwards to the
         // `rayline-cloud` endpoint but pins each class's `model` on-device instead of
@@ -7128,23 +7129,23 @@ mod tests {
         // Rcl-Rcl: `router`/`local_models` are may-local advertisement metadata; they do
         // not change the LSR's routing — main + subagents still resolve to cloud.
         let st = load_state(include_str!("../../../examples/routing-modes/Rcl-Rcl.json"));
-        assert_eq!(main_route(&st), cloud());
-        assert_eq!(sub_route(&st, "reviewer"), cloud());
+        assert_eq!(main_route(&st), cloud_main());
+        assert_eq!(sub_route(&st, "reviewer"), cloud_sub());
 
         let st = load_state(include_str!("../../../examples/routing-modes/Rc-L.json"));
-        assert_eq!(main_route(&st), cloud());
+        assert_eq!(main_route(&st), cloud_main());
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
         let st = load_state(include_str!("../../../examples/routing-modes/L-Rc.json"));
         assert_eq!(main_route(&st), ollama_def());
-        assert_eq!(sub_route(&st, "reviewer"), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), cloud_sub());
 
         let st = load_state(include_str!("../../../examples/routing-modes/L-L.json"));
         assert_eq!(main_route(&st), ollama_def());
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
 
         let st = load_state(include_str!("../../../examples/routing-modes/Rc-K.json"));
-        assert_eq!(main_route(&st), cloud());
+        assert_eq!(main_route(&st), cloud_main());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
 
         let st = load_state(include_str!("../../../examples/routing-modes/L-K.json"));
@@ -7177,7 +7178,7 @@ mod tests {
 
         // subscription main (stripped) → assert subagents only:
         let st = load_state(include_str!("../../../examples/routing-modes/S-Rc.json"));
-        assert_eq!(sub_route(&st, "reviewer"), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), cloud_sub());
 
         let st = load_state(include_str!("../../../examples/routing-modes/S-L.json"));
         assert_eq!(sub_route(&st, "reviewer"), ollama_def());
@@ -7186,13 +7187,13 @@ mod tests {
         let st = load_state(include_str!(
             "../../../examples/routing-modes/Rc-L-per-type.json"
         ));
-        assert_eq!(main_route(&st), cloud());
+        assert_eq!(main_route(&st), cloud_main());
         assert_eq!(
             sub_route(&st, "Explore"),
             (ep("ollama"), "qwen2.5-coder:7b".to_owned())
         );
         assert_eq!(sub_route(&st, "Plan"), ollama_def());
-        assert_eq!(sub_route(&st, "reviewer"), cloud());
+        assert_eq!(sub_route(&st, "reviewer"), cloud_sub());
 
         // router: rayline-local on the rayline class (Rl-K/Rl-L/S-Rl/L-Rl) — the LSR
         // routes that class to rayline-cloud and pins its model; the other class is
@@ -7236,7 +7237,7 @@ mod tests {
         let st = load_state(include_str!(
             "../../../examples/routing-modes/S-Rc-per-type.json"
         ));
-        assert_eq!(sub_route(&st, "Explore"), cloud());
+        assert_eq!(sub_route(&st, "Explore"), cloud_sub());
     }
 
     #[test]
