@@ -33,6 +33,10 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `routes.subagent` model.
 - Under `--route subagents`, a request naming an ARC model (`arc-*`) always
   goes to the router, like `rayline-router`: Anthropic serves neither.
+- Under `--route subagents` with the hosted router, a routed subagent that
+  names a Claude model now runs on its `--config` route's model
+  (`routes.subagents.<type>`, then `routes.subagent`), else `arc-swift-1.0`,
+  instead of always on the Legacy Rules Router (`rayline-router`).
 - **`raydock openclaw` speaks Chat Completions and keys its own episode.**
   The generated `rayline` provider is now `openai-completions` (OpenClaw's
   default protocol) with `compat.sendSessionAffinityHeaders`, so OpenClaw

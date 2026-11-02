@@ -476,8 +476,9 @@ What goes through the router versus straight to Anthropic:
   Claude. This is the hybrid path — quality main agent, offloaded subagents.
   With the cloud router, Raydock sets `CLAUDE_CODE_SUBAGENT_MODEL=arc-swift-1.0`
   (unless you set it), so subagents run on ARC Swift. A routed subagent turn that
-  still names a Claude model is sent as `rayline-router`, so the router picks its
-  model; a subagent that names another model keeps it.
+  still names a Claude model is sent with its `--config` route's model
+  (`routes.subagents.<type>`, then `routes.subagent`), else `arc-swift-1.0`; a
+  subagent that names another model keeps it.
 
 When the router serves the main agent (`--route all`), refusals are the
 router's to handle, so Rayline turns off Claude Code's own refusal recovery:

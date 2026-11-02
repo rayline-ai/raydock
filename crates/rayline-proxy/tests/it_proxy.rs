@@ -598,7 +598,7 @@ async fn selective_proxy_routes_only_subagent_messages_to_router() {
         Some("2023-06-01".to_string())
     );
     let router_body: serde_json::Value = serde_json::from_slice(&router_seen[0].body).unwrap();
-    assert_eq!(router_body["model"], "rayline-router");
+    assert_eq!(router_body["model"], rayline_proxy::ARC_SWIFT_MODEL);
     assert_eq!(
         router_seen[0].header("content-length"),
         Some(router_seen[0].body.len().to_string())

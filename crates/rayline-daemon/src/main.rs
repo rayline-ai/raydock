@@ -704,7 +704,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
         opts.local_healthy = local_available.clone();
         opts.route_status_path = Some(resolve_route_status_path(args.route_status_path.clone()));
         opts.routing_mode = args.proxy_routing_mode.into();
-        opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
+        opts.selective_subagents = selective_subagents(args.router_config_path.as_deref());
         opts.local_router_owns_metrics = args.decision_plane == DecisionPlaneArg::Local;
         opts.metrics = Some(metrics_sink.clone());
         Some(opts)
@@ -847,7 +847,7 @@ async fn run_proxy(args: ProxyArgs) -> Result<()> {
     opts.upstream_ca_path = args.upstream_ca_path.clone();
     opts.route_status_path = Some(resolve_route_status_path(args.route_status_path.clone()));
     opts.routing_mode = args.proxy_routing_mode.into();
-    opts.selective_subagent_ids = selective_subagent_ids(args.router_config_path.as_deref());
+    opts.selective_subagents = selective_subagents(args.router_config_path.as_deref());
     opts.local_router_owns_metrics = args.local_router_owns_metrics;
     // Forward to a serve daemon when one owns metrics; otherwise self-host so
     // `rayline top` works for cloud-only and isolated proxy sessions too.
@@ -1044,31 +1044,12 @@ fn normalize_upstream_target(url: &str) -> String {
     stripped.trim_end_matches('/').to_string()
 }
 
-fn selective_subagent_ids(config_path: Option<&Path>) -> Vec<String> {
-    let Some(path) = config_path else {
-        return Vec::new();
-    };
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return Vec::new();
-    };
-    let Some(subagents) = value
-        .get("routes")
-        .and_then(|routes| routes.get("subagents"))
-        .and_then(serde_json::Value::as_object)
-    else {
-        return Vec::new();
-    };
-    let mut ids = subagents
-        .keys()
-        .map(|key| key.trim())
-        .filter(|key| !key.is_empty())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    ids.sort();
-    ids
+fn selective_subagents(config_path: Option<&Path>) -> rayline_proxy::SelectiveSubagentRoutes {
+    config_path
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .map(|config| rayline_proxy::SelectiveSubagentRoutes::from_router_config(&config))
+        .unwrap_or_default()
 }
 
 fn resolve_route_status_path(explicit: Option<PathBuf>) -> PathBuf {
@@ -1494,7 +1475,7 @@ mod tests {
     }
 
     #[test]
-    fn selective_subagent_ids_reads_router_config_subagent_keys() {
+    fn selective_subagents_reads_router_config_subagent_routes() {
         let path = std::env::temp_dir().join(format!(
             "rld-router-config-{}-{}.json",
             std::process::id(),
@@ -1505,13 +1486,16 @@ mod tests {
         ));
         std::fs::write(
             &path,
-            r#"{"routes":{"subagents":{"Review":{"endpoint":"local","model":"m"},"Explore":{"endpoint":"local","model":"m"}," ":{"endpoint":"local","model":"m"}}}}"#,
+            r#"{"routes":{"subagent":{"endpoint":"rayline-cloud","model":"arc-swift-1.0"},"subagents":{"Review":{"endpoint":"local","model":"m"},"Explore":{"endpoint":"local","model":"m"}," ":{"endpoint":"local","model":"m"}}}}"#,
         )
         .unwrap();
 
+        let routes = selective_subagents(Some(&path));
+        assert_eq!(routes.agents().collect::<Vec<_>>(), ["Explore", "Review"]);
+        assert_eq!(routes.default_model.as_deref(), Some("arc-swift-1.0"));
         assert_eq!(
-            selective_subagent_ids(Some(&path)),
-            vec!["Explore".to_owned(), "Review".to_owned()]
+            selective_subagents(None),
+            rayline_proxy::SelectiveSubagentRoutes::default()
         );
         let _ = std::fs::remove_file(path);
     }
