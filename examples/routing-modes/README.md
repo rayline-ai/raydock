@@ -316,8 +316,8 @@ export RAYLINE_ROUTER_API_KEY="rlk-…"    # NOT $(raydock auth token)
 raydock router start --config examples/routing-modes/L-Rc.json
 ```
 
-The 403 is identical for an unpinned `rayline-router` route, so it is never about
-which model a route pins.
+The 403 is the same whichever model the route names (`arc-sage-1.0`, the Legacy
+`rayline-router`, or a pinned id), so it is never about the model.
 
 **Check the router log, not just the exit status.** On a local-main config the main
 answers regardless, so the run prints a plausible final message and exits 0 while the
@@ -382,12 +382,12 @@ looked up by `id`; its `model` is rewritten into the request body.
 {
   "endpoints": [
     { "id": "rayline-cloud", "protocol": "anthropic_messages", "base_url": "https://api.rayline.ai",
-      "models": ["rayline-router"], "api_key_env": "RAYLINE_ROUTER_API_KEY", "auth": "api_key" },
+      "models": ["arc-sage-1.0", "arc-swift-1.0"], "api_key_env": "RAYLINE_ROUTER_API_KEY", "auth": "api_key" },
     { "id": "ollama", "protocol": "openai_chat", "base_url": "http://127.0.0.1:11434/v1",
       "models": ["qwen3.5:9b", "qwen2.5-coder:7b"] }     // local, no auth
   ],
   "routes": {
-    "main":     { "endpoint": "rayline-cloud", "model": "rayline-router" },
+    "main":     { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" },
     "subagent": { "endpoint": "ollama", "model": "qwen3.5:9b" },   // singular = subagent default
     "subagents": {                                                 // optional per-type overrides
       "Explore": { "endpoint": "ollama", "model": "qwen2.5-coder:7b" }
@@ -402,15 +402,19 @@ looked up by `id`; its `model` is rewritten into the request body.
 ### What `model` means at the `rayline-cloud` endpoint
 
 A route's `model` is rewritten into the request body, so at the hosted RCR it is the
-whole instruction. Two values, two meanings:
+whole instruction. The shipped `rayline-cloud` configs route on **ARC**: `routes.main`
+names `arc-sage-1.0` and `routes.subagent` names `arc-swift-1.0`.
 
 | `model` on the wire | RCR behaviour |
 |---|---|
-| `rayline-router` (or absent) | **route** — the RCR's rules/ML pick the model |
+| `arc-sage-1.0` / `arc-swift-1.0` | **route on ARC** — the RCR picks the model; Sage is the main-agent tier, Swift the subagent tier |
+| `rayline-router` | **route on the Legacy Rules Router** — an explicit opt-in; nothing here defaults to it |
 | any concrete id (`claude-opus-5`, `z-ai/glm-5.2`, `gpt-5.5`, …) | **pin** — that exact model is used, and the rules/ML tiering, stickiness and ML override are all skipped |
 
-The rule is the same for every provider. Asking to be routed is what `rayline-router`
-is *for*; naming a model instead means you want that model.
+The rule is the same for every provider. Asking to be routed is what the ARC ids (and
+the Legacy `rayline-router`) are *for*; naming a model instead means you want that
+model. To use the Legacy Rules Router from a config, set its `rayline-cloud` route
+models to `rayline-router`.
 
 Claude ids may also be written provider-qualified: `anthropic/claude-opus-5` pins
 exactly like the bare spelling, on `/v1/models` as well as `/v1/messages`. The prefix
@@ -440,7 +444,7 @@ Two details of that second lane matter when you are picking a subagent model:
 Use `router: rayline-local` (`Rl`) to decide subagent models on-device and avoid the
 question entirely.
 
-The `rayline-router` sentinel is treated the same way on a subagent turn: it runs the
+The Legacy `rayline-router` sentinel is treated the same way on a subagent turn: it runs the
 delegated policy, so `rules.delegated_subagent` applies instead of the balanced
 policy's cheap slot. Naming a specific policy — `workshop-router-fast`,
 `workshop-router-frontier` — is a deliberate choice and is honoured as written.
@@ -451,7 +455,7 @@ A route targeting the `raydock` cloud endpoint accepts two optional fields:
 
 ```jsonc
 "main": {
-  "endpoint": "rayline-cloud", "model": "rayline-router",
+  "endpoint": "rayline-cloud", "model": "arc-sage-1.0",
   "router": "rayline-cloud",              // rayline-cloud (default) | rayline-local (Rl)
   "local_models": ["qwen2.5-coder:7b"]    // non-empty ⇒ may-local ON (Rcl); must be served by a declared local endpoint
 }

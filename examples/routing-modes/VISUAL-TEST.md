@@ -67,32 +67,32 @@ move to the next mode. Don't batch them; one at a time.
 
 - `target=anthropic`, `policy=selective_main_passthrough` → **Claude subscription passthrough** (main of S-Rc/S-Rcl/S-Rl/S-L).
 - `target=local` or `policy` contains `local-adapter` / `:may-local` → **served by a local model** (the may-local redirect, or the LSR sending it local).
-- `target=remote` → an upstream endpoint; use **`selected_model`** to tell which:
+- `target=remote` → an upstream endpoint; use **`requested_model`** and **`selected_model`** to tell which:
+  - `requested_model=arc-sage-1.0` (main) / `arc-swift-1.0` (subagents) → **cloud RCR routing on ARC**; `selected_model` is whatever the RCR reports back (non-deterministic).
   - `qwen3.5:9b` / `qwen2.5-coder:7b` → **local (ollama)** routed by the LSR.
   - `z-ai/glm-5.2`, `deepseek/deepseek-v4-pro` → **cloud, pinned by the JSON** (LSR rewrote the model).
-  - `claude-*`, `deepseek/deepseek-v4-flash`, etc. with no pin → **cloud RCR's own pick** (non-deterministic).
   - `claude-sonnet-5` on a **subagent** in Rc-K/Rl-K → the **anthropic API-key endpoint** (distinguish from an RCR pick by the mode's intent).
 
 ---
 
 ## 4. Per-mode criteria
 
-`S/K/R/L` = provider class per leg (main/subagent); "cloud(pick)" = RCR-chosen model (any cloud model, REVIEW).
+`S/K/R/L` = provider class per leg (main/subagent); "ARC Sage" / "ARC Swift" = the RCR routing on `arc-sage-1.0` / `arc-swift-1.0` (`requested_model`); the model it picks varies, so those legs are REVIEW.
 "DONE finished" in the report means the run completed; local-main runs often won't.
 
 | Mode | Expected main → | Expected subagents → | PASS when | Class |
 |---|---|---|---|---|
-| **Rc-Rc** | cloud (RCR pick) | cloud (RCR pick); Explore may→local (local ON) | main `target=remote`; subagents remote, OR Explore local (may-local) | REVIEW (cloud pick + may-local) |
-| **Rc-K** | cloud (RCR pick) | anthropic (API key) | main remote; subagent `claude-sonnet-5` via anthropic | FAIL if `ANTHROPIC_API_KEY` unset |
-| **Rc-L** | cloud (RCR pick) | **ollama** `qwen3.5:9b` | main remote; subagents `selected_model=qwen3.5:9b` | PASS (deterministic subagent) |
-| **Rcl-Rcl** § | cloud (RCR pick) | cloud + may-local | same as Rc-Rc; behaviorally ≡ Rc-Rc (may-local account-gated) | REVIEW |
+| **Rc-Rc** | cloud (ARC Sage) | cloud (ARC Swift); Explore may→local (local ON) | main `target=remote` `arc-sage-1.0`; subagents remote `arc-swift-1.0`, OR Explore local (may-local) | REVIEW (cloud pick + may-local) |
+| **Rc-K** | cloud (ARC Sage) | anthropic (API key) | main remote; subagent `claude-sonnet-5` via anthropic | FAIL if `ANTHROPIC_API_KEY` unset |
+| **Rc-L** | cloud (ARC Sage) | **ollama** `qwen3.5:9b` | main remote; subagents `selected_model=qwen3.5:9b` | PASS (deterministic subagent) |
+| **Rcl-Rcl** § | cloud (ARC Sage) | cloud + may-local | same as Rc-Rc; behaviorally ≡ Rc-Rc (may-local account-gated) | REVIEW |
 | **Rl-Rl** | cloud **pinned `z-ai/glm-5.2`** | cloud **pinned `deepseek/deepseek-v4-pro`** | main `selected_model=z-ai/glm-5.2`; subagents `deepseek/deepseek-v4-pro` | **PASS (deterministic, exact models)** |
 | **Rl-K** | cloud **pinned `z-ai/glm-5.2`** | anthropic (API key) | main `z-ai/glm-5.2`; subagent anthropic `claude-sonnet-5` | main PASS; subagent FAIL if no key |
-| **Rc-L-per-type** | cloud (RCR pick) | `Explore`→ollama `qwen2.5-coder:7b`, `Plan`→ollama `qwen3.5:9b`, other→cloud | Explore `qwen2.5-coder:7b`; general-purpose remote (cloud) | **PASS (deterministic per-type)** |
-| **S-Rc** | **subscription** (passthrough) | cloud (RCR pick) | main `target=anthropic`/`selective_main_passthrough`; subagents remote | REVIEW (cloud pick) |
-| **S-Rcl** § | subscription | cloud + may-local | main passthrough; subagents remote or Explore→local | REVIEW |
+| **Rc-L-per-type** | cloud (ARC Sage) | `Explore`→ollama `qwen2.5-coder:7b`, `Plan`→ollama `qwen3.5:9b`, other→cloud (ARC Swift) | Explore `qwen2.5-coder:7b`; general-purpose remote (cloud) | **PASS (deterministic per-type)** |
+| **S-Rc** | **subscription** (passthrough) | cloud (ARC Swift) | main `target=anthropic`/`selective_main_passthrough`; subagents remote `arc-swift-1.0` | REVIEW (cloud pick) |
+| **S-Rcl** § | subscription | cloud (ARC Swift) + may-local | main passthrough; subagents remote `arc-swift-1.0` or Explore→local | REVIEW |
 | **S-L** | subscription | **ollama** `qwen…` | main passthrough; subagents `qwen*` (local) | **PASS** (passthrough + local) |
-| **L-Rc** ‡ | **ollama** `qwen3.5:9b` | cloud (RCR pick) | main `selected_model=qwen3.5:9b`; subagents remote | REVIEW (local main; pin the window first) |
+| **L-Rc** ‡ | **ollama** `qwen3.5:9b` | cloud (ARC Swift) | main `selected_model=qwen3.5:9b`; subagents remote | REVIEW (local main; pin the window first) |
 | **L-Rl** ‡ | ollama `qwen3.5:9b` | cloud pinned `deepseek/deepseek-v4-pro` | main `qwen3.5:9b`; subagents `deepseek/deepseek-v4-pro` | REVIEW (local main; the pin can 403) |
 | **L-K** ‡ | ollama `qwen3.5:9b` | anthropic (API key) | main `qwen3.5:9b`; subagents `claude-sonnet-5` | REVIEW (local main + needs key) |
 | **L-L** ‡ | ollama `qwen3.5:9b` | **ollama** | main `qwen3.5:9b`; subagents `qwen3.5:9b` | REVIEW (local main) |
@@ -103,6 +103,10 @@ move to the next mode. Don't batch them; one at a time.
 decision; with local ON it usually sends `Explore` to local, but it's discretionary.
 Because the implicit account-local path also advertises, Rc-Rc/S-Rc behave the same —
 so Rcl-Rcl/S-Rcl are **not** distinguishable from Rc-Rc/S-Rc by routing alone. Mark REVIEW.
+
+**Explore in route-all modes (Rc-Rc/Rcl-Rcl):** Claude Code's `Explore` subagent currently
+requests `arc-sage-1.0` there while `general-purpose` requests `arc-swift-1.0`. This is a
+known launcher issue, not a config one; record it but don't score it as a routing failure.
 
 **‡ local-main (L-Rc/L-Rl/L-K/L-L):** the main runs on a small local model. **Pin its
 context window first** — ollama's VRAM-derived default (often 4096; check `ollama ps`,

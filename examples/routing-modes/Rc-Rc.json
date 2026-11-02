@@ -7,18 +7,19 @@
       "api_key_env": "RAYLINE_ROUTER_API_KEY",
       "auth": "api_key",
       "models": [
-        "rayline-router"
+        "arc-sage-1.0",
+        "arc-swift-1.0"
       ]
     }
   ],
   "routes": {
     "main": {
       "endpoint": "rayline-cloud",
-      "model": "rayline-router"
+      "model": "arc-sage-1.0"
     },
     "subagent": {
       "endpoint": "rayline-cloud",
-      "model": "rayline-router"
+      "model": "arc-swift-1.0"
     }
   }
 }

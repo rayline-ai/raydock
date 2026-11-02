@@ -1285,6 +1285,67 @@ mod tests {
         //   needs_local = a route targets a non-cloud endpoint (engages the LSR)
         //   fires       = the CLI actually wires may-local advertisement, which is
         //                 gated on the cloud-only path (!needs_local) in claude.rs.
+        // Rcl-K, Rcl-L and L-Rcl are unsupported, so they aren't shipped as
+        // examples; their shapes stay here to keep may-local off for them.
+        let home = tmp_home();
+        let cloud = json!({
+            "id": "rayline-cloud", "protocol": "anthropic_messages",
+            "base_url": "https://api.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
+            "auth": "api_key", "models": ["arc-sage-1.0", "arc-swift-1.0"]
+        });
+        let ollama = json!({
+            "id": "ollama", "protocol": "openai_chat", "base_url": "http://127.0.0.1:11434/v1",
+            "models": ["qwen3.5:9b", "qwen2.5-coder:7b"]
+        });
+        let anthropic = json!({
+            "id": "anthropic", "protocol": "anthropic_messages",
+            "base_url": "https://api.anthropic.com", "api_key_env": "ANTHROPIC_API_KEY",
+            "auth": "api_key", "models": ["claude-sonnet-5"]
+        });
+        let may_local = |model: &str| {
+            json!({
+                "endpoint": "rayline-cloud", "model": model, "router": "rayline-cloud",
+                "local_models": ["qwen2.5-coder:7b"]
+            })
+        };
+        let unshipped = [
+            (
+                "Rcl-K.json",
+                json!({
+                    "endpoints": [cloud.clone(), anthropic, ollama.clone()],
+                    "routes": {
+                        "main": may_local("arc-sage-1.0"),
+                        "subagent": {"endpoint": "anthropic", "model": "claude-sonnet-5"}
+                    }
+                }),
+            ),
+            (
+                "Rcl-L.json",
+                json!({
+                    "endpoints": [cloud.clone(), ollama.clone()],
+                    "routes": {
+                        "main": may_local("arc-sage-1.0"),
+                        "subagent": {"endpoint": "ollama", "model": "qwen3.5:9b"}
+                    }
+                }),
+            ),
+            (
+                "L-Rcl.json",
+                json!({
+                    "endpoints": [cloud.clone(), ollama.clone()],
+                    "routes": {
+                        "main": {"endpoint": "ollama", "model": "qwen3.5:9b"},
+                        "subagent": may_local("arc-swift-1.0")
+                    }
+                }),
+            ),
+        ];
+        let mut paths = std::collections::HashMap::new();
+        for (file, config) in unshipped {
+            let path = home.join(file);
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            paths.insert(file, path);
+        }
         // (file, expect_resolves, expect_needs_local, expect_fires)
         let cases = [
             ("Rcl-Rcl.json", true, false, true),
@@ -1294,7 +1355,10 @@ mod tests {
             ("L-Rcl.json", true, true, false),
         ];
         for (file, resolves, needs_local, fires) in cases {
-            let path = examples_dir().join(file);
+            let path = paths
+                .get(file)
+                .cloned()
+                .unwrap_or_else(|| examples_dir().join(file));
             assert!(path.exists(), "missing {file}");
             assert_eq!(
                 config_may_local(&path).is_some(),
@@ -1310,6 +1374,7 @@ mod tests {
                 !config_needs_local_router(&path) && config_may_local(&path).is_some();
             assert_eq!(actually_fires, fires, "{file}: may-local wired by CLI");
         }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
