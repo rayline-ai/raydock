@@ -104,10 +104,6 @@ decision; with local ON it usually sends `Explore` to local, but it's discretion
 Because the implicit account-local path also advertises, Rc-Rc/S-Rc behave the same —
 so Rcl-Rcl/S-Rcl are **not** distinguishable from Rc-Rc/S-Rc by routing alone. Mark REVIEW.
 
-**Explore in route-all modes (Rc-Rc/Rcl-Rcl):** Claude Code's `Explore` subagent currently
-requests `arc-sage-1.0` there while `general-purpose` requests `arc-swift-1.0`. This is a
-known launcher issue, not a config one; record it but don't score it as a routing failure.
-
 **‡ local-main (L-Rc/L-Rl/L-K/L-L):** the main runs on a small local model. **Pin its
 context window first** — ollama's VRAM-derived default (often 4096; check `ollama ps`,
 CONTEXT column) truncates the tool schemas out of the prompt, and the model then
