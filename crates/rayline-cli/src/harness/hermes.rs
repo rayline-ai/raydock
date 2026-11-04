@@ -26,7 +26,11 @@
 //! per-launch id. A per-launch id would instead put a subagent, the parent and
 //! the side call in one episode, since Hermes attaches a provider's
 //! `extra_headers` to every request of the process and the gateway ranks
-//! `x-conversation-id` ahead of `x-session-affinity`. One Hermes call skips
+//! `x-conversation-id` ahead of `x-session-affinity`. Hermes runs turns in a
+//! shared gateway process per `HERMES_HOME`, so a forced id reaches the wire
+//! only when the launch starts that gateway; a gateway left running by an
+//! earlier launch sends the literal `${RAYLINE_CONV_ID}` instead, which the
+//! router then keys every such launch on. One Hermes call skips
 //! the affinity merge: the summary it requests on reaching its iteration cap,
 //! on Messages only. Under hybrid on `--provider rayline-anth` the core
 //! refuses that call and Hermes reports the cap with no summary.
