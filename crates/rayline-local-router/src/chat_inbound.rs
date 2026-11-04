@@ -42,6 +42,45 @@ pub(crate) async fn handle_chat_completions(
         t_start.elapsed().as_millis(),
         request_id
     );
+    // The same lifecycle as the Messages and Responses listeners: the row is
+    // announced here and closed by the forward, by a refusal below, or by
+    // the error recorded for a failed forward, so no row is left active.
+    let agent_id = headers
+        .get(CLAUDE_CODE_AGENT_ID_HEADER)
+        .or_else(|| headers.get(OPENAI_SUBAGENT_HEADER))
+        .and_then(header_str);
+    let agent_type = headers
+        .get(RAYLINE_AGENT_TYPE_HEADER)
+        .or_else(|| headers.get(OPENAI_SUBAGENT_HEADER))
+        .and_then(header_str);
+    record_route_decided(
+        state.opts.metrics.as_ref(),
+        &request_id,
+        &decision,
+        agent_id,
+        agent_type,
+    );
+    let response =
+        forward_chat_completions(&state, &headers, &parsed, &decision, &request_id).await;
+    if let Err(error) = response.as_ref() {
+        record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
+    }
+    if let Ok(response) = response.as_ref() {
+        log_upstream_request_id("chat", &request_id, response);
+    }
+    response
+}
+
+/// Forward the routed request and translate the answer. A refusal (`Ok` with
+/// a 4xx) closes the metrics row here; an `Err` is closed by the caller.
+async fn forward_chat_completions(
+    state: &AppState,
+    headers: &HeaderMap,
+    parsed: &Value,
+    decision: &RouteDecision,
+    request_id: &str,
+) -> Result<Response<BoxBody>> {
+    let metrics = state.opts.metrics.as_ref();
     let want_stream = parsed
         .get("stream")
         .and_then(Value::as_bool)
@@ -50,18 +89,29 @@ pub(crate) async fn handle_chat_completions(
         .pointer("/stream_options/include_usage")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let response = match &decision.target {
+    let translation = |anthropic: &Value, tool_names: ToolNameRewrites| ChatTranslation {
+        request_id: request_id.to_owned(),
+        want_stream,
+        include_usage,
+        tool_names,
+        estimated_input_tokens: approximate_input_tokens(anthropic),
+    };
+    let refuse = |code: &'static str, refusal: Response<BoxBody>| {
+        record_request_error(metrics, request_id, Some(refusal.status().as_u16()), code);
+        Ok(refusal)
+    };
+    match &decision.target {
         RouteSelection::Local => {
-            if let Some(refusal) = chat_translation_refusal(&parsed) {
-                return Ok(refusal);
+            if let Some((code, refusal)) = chat_translation_refusal(parsed) {
+                return refuse(code, refusal);
             }
             let (anthropic, tool_names) =
-                chat_to_anthropic_request(&parsed, &decision.selected_model);
+                chat_to_anthropic_request(parsed, &decision.selected_model);
             let url = format!(
                 "http://127.0.0.1:{}/api/v1/messages?usage_doc_id={}&rayline_request_id={}",
                 state.opts.local_adapter_port,
                 query_escape(&decision.route_id),
-                query_escape(&request_id)
+                query_escape(request_id)
             );
             let resp = state
                 .http
@@ -70,15 +120,11 @@ pub(crate) async fn handle_chat_completions(
                 .json(&anthropic)
                 .send()
                 .await?;
-            anthropic_response_to_chat(
-                resp,
-                &decision,
-                &request_id,
-                want_stream,
-                include_usage,
-                tool_names,
-            )
-            .await
+            // No metrics here: the on-device adapter records this request's
+            // tokens and completion itself, under the same request id.
+            // Recording it again would double-count it in the totals.
+            anthropic_response_to_chat(resp, decision, None, translation(&anthropic, tool_names))
+                .await
         }
         RouteSelection::Endpoint(endpoint_id) => {
             let endpoint = state
@@ -89,11 +135,11 @@ pub(crate) async fn handle_chat_completions(
                 .ok_or_else(|| anyhow!("endpoint {endpoint_id:?} not found"))?;
             match endpoint.protocol {
                 EndpointProtocol::AnthropicMessages => {
-                    if let Some(refusal) = chat_translation_refusal(&parsed) {
-                        return Ok(refusal);
+                    if let Some((code, refusal)) = chat_translation_refusal(parsed) {
+                        return refuse(code, refusal);
                     }
                     let (anthropic, tool_names) =
-                        chat_to_anthropic_request(&parsed, &decision.selected_model);
+                        chat_to_anthropic_request(parsed, &decision.selected_model);
                     let url = format!("{}/v1/messages", endpoint.base_url.trim_end_matches('/'));
                     let mut outbound = state
                         .http
@@ -105,31 +151,39 @@ pub(crate) async fn handle_chat_completions(
                     let resp = outbound.send().await?;
                     anthropic_response_to_chat(
                         resp,
-                        &decision,
-                        &request_id,
-                        want_stream,
-                        include_usage,
-                        tool_names,
+                        decision,
+                        state.opts.metrics.clone(),
+                        translation(&anthropic, tool_names),
                     )
                     .await
                 }
                 EndpointProtocol::OpenAIResponses => {
                     // A Responses-only backend has no Chat Completions surface,
                     // and this listener does not translate Chat to Responses.
-                    return Ok(chat_invalid_request(
+                    refuse(
                         "unsupported_route",
-                        "model",
-                        format!(
-                            "the route for model {:?} targets endpoint {endpoint_id:?}, which \
-                             speaks openai_responses; Chat Completions requests can only be \
-                             routed to openai_chat or anthropic_messages endpoints",
-                            decision.requested_model
+                        chat_invalid_request(
+                            "unsupported_route",
+                            "model",
+                            format!(
+                                "the route for model {:?} targets endpoint {endpoint_id:?}, which \
+                                 speaks openai_responses; Chat Completions requests can only be \
+                                 routed to openai_chat or anthropic_messages endpoints",
+                                decision.requested_model
+                            ),
                         ),
-                    ));
+                    )
                 }
                 EndpointProtocol::OpenAIChat => {
                     let mut body = parsed.clone();
                     body["model"] = json!(decision.selected_model);
+                    // A stream carries usage only when asked for: ask for the
+                    // metrics row when the client did not, and keep that
+                    // chunk from the client.
+                    let strip_usage_chunk = want_stream
+                        && !include_usage
+                        && metrics.is_some()
+                        && request_stream_usage(&mut body);
                     let url = format!(
                         "{}/chat/completions",
                         endpoint.base_url.trim_end_matches('/')
@@ -146,23 +200,62 @@ pub(crate) async fn handle_chat_completions(
                     // own Authorization (and account headers), never the
                     // router's own inbound token.
                     let forwarded =
-                        without_inbound_token(&headers, state.opts.inbound_guard.as_ref());
+                        without_inbound_token(headers, state.opts.inbound_guard.as_ref());
                     copy_openai_passthrough_headers(&mut outbound, &forwarded, true, client_bearer);
                     outbound = outbound.json(&body);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
-                    let resp = outbound.send().await?;
-                    passthrough_response(resp, &decision).await
+                    let mut request = outbound.build()?;
+                    // Metrics read the body as it streams (and the filter
+                    // searches it for SSE delimiters), so it must not arrive
+                    // compressed: reqwest is built without decompression, and
+                    // compressed bytes would yield no usage and no terminal
+                    // event. Set on the built request because `header`
+                    // appends, which would leave an `accept-encoding` from
+                    // the endpoint config in play.
+                    if state.opts.metrics.is_some() {
+                        request.headers_mut().insert(
+                            hyper::header::ACCEPT_ENCODING,
+                            HeaderValue::from_static("identity"),
+                        );
+                    }
+                    let resp = http.execute(request).await?;
+                    passthrough_response(
+                        resp,
+                        decision,
+                        state.opts.metrics.clone(),
+                        request_id,
+                        approximate_input_tokens(parsed),
+                        strip_usage_chunk,
+                        want_stream.then(|| requested_choices(parsed)),
+                    )
+                    .await
                 }
             }
         }
-    };
-    if let Err(error) = response.as_ref() {
-        record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
     }
-    if let Ok(response) = response.as_ref() {
-        log_upstream_request_id("chat", &request_id, response);
+}
+
+/// How many choices the request asked for (`n`, default 1): a stream is only
+/// complete once every one of them finished.
+fn requested_choices(body: &Value) -> u64 {
+    body.get("n").and_then(Value::as_u64).unwrap_or(1).max(1)
+}
+
+/// Ask for the stream's usage chunk (`stream_options.include_usage`); false
+/// when `stream_options` is not an object, which is left for the upstream
+/// to refuse.
+pub(crate) fn request_stream_usage(body: &mut Value) -> bool {
+    match body.get_mut("stream_options") {
+        Some(Value::Object(options)) => {
+            options.insert("include_usage".to_owned(), Value::Bool(true));
+            true
+        }
+        Some(Value::Null) | None => {
+            body["stream_options"] = json!({"include_usage": true});
+            true
+        }
+        Some(_) => false,
     }
-    response
 }
 
 /// `headers` without an `Authorization` that carries the router's inbound
@@ -192,12 +285,27 @@ fn without_inbound_token(headers: &HeaderMap, guard: Option<&InboundGuard>) -> H
     forwarded
 }
 
-/// An OpenAI-protocol upstream's answer, unchanged (streamed as it arrives).
+/// An OpenAI-protocol upstream's answer, unchanged (streamed as it arrives),
+/// with its lifecycle recorded from the Chat `usage` it carries.
 async fn passthrough_response(
     resp: reqwest::Response,
     decision: &RouteDecision,
+    metrics: Option<SharedMetricsSink>,
+    request_id: &str,
+    estimated_input_tokens: u64,
+    strip_usage_chunk: bool,
+    stream_choices: Option<u64>,
 ) -> Result<Response<BoxBody>> {
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let upstream_status = resp.status();
+    let status = StatusCode::from_u16(upstream_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    if !upstream_status.is_success() {
+        warn!(
+            "upstream returned HTTP {} (task={} selected={} request={request_id})",
+            upstream_status.as_u16(),
+            decision.task_class,
+            decision.selected_model
+        );
+    }
     // The body is relayed byte for byte, so the upstream's end-to-end headers
     // (Retry-After, Content-Encoding, rate-limit headers, ...) stay valid.
     let mut headers_out = HeaderMap::new();
@@ -218,28 +326,45 @@ async fn passthrough_response(
             HeaderValue::from_static("application/json"),
         );
     }
-    // Chat Completions has no metrics lifecycle yet: it emits neither
-    // `RequestStarted` nor `RouteDecided`, and nothing completes its rows.
-    // Recording the id here WOULD create a row (the metrics arm starts one when
-    // it finds none), and nothing would ever close it — an orphan stuck active
-    // in `raydock top`. So only the response header carries the id until that
-    // lifecycle exists.
-    stamp_upstream_request_id(
-        &mut headers_out,
-        upstream_request_id(resp.headers()).as_deref(),
+    // The cloud's id for this request: keep it on the metrics row now, before
+    // the body relay below can fail, and pass it to the client.
+    let upstream_request_id = upstream_request_id(resp.headers());
+    record_upstream_request_id(metrics.as_ref(), request_id, upstream_request_id.as_deref());
+    stamp_upstream_request_id(&mut headers_out, upstream_request_id.as_deref());
+    if strip_usage_chunk {
+        // Withholding the injected usage chunk shortens the body, so a
+        // length the upstream computed for the unfiltered body would
+        // over-promise and the client would see a truncated response.
+        headers_out.remove(hyper::header::CONTENT_LENGTH);
+    }
+    let content_type = headers_out
+        .get(hyper::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<none>")
+        .to_owned();
+    // The model the upstream reports (the Rayline router's native path) beats
+    // the route's own, which may be a sentinel.
+    let selected_model = prefer_upstream_selected_model(
+        resp.headers()
+            .get("x-rayline-selected-model")
+            .and_then(|value| value.to_str().ok()),
+        Some(decision),
     );
-    let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
-    tokio::spawn(async move {
-        use futures::StreamExt;
-        let mut stream = resp.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let frame = chunk.map(Frame::data).map_err(std::io::Error::other);
-            if tx.send(frame).await.is_err() {
-                break;
-            }
-        }
-    });
-    let body: BoxBody = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed();
+    let body = relay_body_with_metrics(
+        resp,
+        upstream_status,
+        RelayMeter {
+            metrics,
+            request_id: Some(request_id.to_owned()),
+            estimated_input_tokens: Some(estimated_input_tokens),
+            selected_model,
+            content_type,
+            // A Chat client that stops reading cancels its generation.
+            stop_when_client_leaves: true,
+            chat_stream_choices: stream_choices,
+            strip_usage_chunk,
+        },
+    );
     let mut response = Response::builder().status(status).body(body)?;
     *response.headers_mut() = headers_out;
     add_decision_headers(response.headers_mut(), decision);
@@ -286,19 +411,23 @@ pub(crate) fn untranslatable_chat_tool_types(body: &Value) -> Vec<String> {
 }
 
 /// Why a Chat request cannot be translated to Anthropic Messages without
-/// silently dropping or loosening part of it, as an OpenAI-shaped 400; `None`
-/// when it can. Like the Responses translation, anything the route cannot
-/// carry is refused instead of forwarded without it.
-fn chat_translation_refusal(body: &Value) -> Option<Response<BoxBody>> {
+/// silently dropping or loosening part of it, as its error `code` and an
+/// OpenAI-shaped 400; `None` when it can. Like the Responses translation,
+/// anything the route cannot carry is refused instead of forwarded without it.
+fn chat_translation_refusal(body: &Value) -> Option<(&'static str, Response<BoxBody>)> {
     if chat_uses_legacy_functions(body) {
         warn!("local router: refusing Chat Completions request with legacy function fields");
-        return Some(chat_invalid_request(
-            "unsupported_parameter",
-            "functions",
-            "Raydock cannot translate the deprecated functions / function_call fields \
-             (or role \"function\" messages) on this route. Declare them as tools and use \
-             tool_choice and tool messages instead."
-                .to_owned(),
+        let code = "unsupported_parameter";
+        return Some((
+            code,
+            chat_invalid_request(
+                code,
+                "functions",
+                "Raydock cannot translate the deprecated functions / function_call fields \
+                 (or role \"function\" messages) on this route. Declare them as tools and use \
+                 tool_choice and tool messages instead."
+                    .to_owned(),
+            ),
         ));
     }
     // Chat's built-in search is requested outside `tools`; this translation
@@ -308,38 +437,50 @@ fn chat_translation_refusal(body: &Value) -> Option<Response<BoxBody>> {
         .is_some_and(|options| !options.is_null())
     {
         warn!("local router: refusing Chat Completions request with web_search_options");
-        return Some(chat_invalid_request(
-            "unsupported_parameter",
-            "web_search_options",
-            "Raydock cannot run Chat Completions web search on this route: it translates \
-             Chat Completions to Anthropic Messages without web search. Remove \
-             web_search_options, or route to an endpoint that speaks Chat Completions natively."
-                .to_owned(),
+        let code = "unsupported_parameter";
+        return Some((
+            code,
+            chat_invalid_request(
+                code,
+                "web_search_options",
+                "Raydock cannot run Chat Completions web search on this route: it translates \
+                 Chat Completions to Anthropic Messages without web search. Remove \
+                 web_search_options, or route to an endpoint that speaks Chat Completions natively."
+                    .to_owned(),
+            ),
         ));
     }
     if let Some(refusal) = untranslatable_chat_tools_response(body) {
-        return Some(refusal);
+        return Some(("unsupported_tool_type", refusal));
     }
     if chat_has_untranslatable_tool_call(body) {
         warn!("local router: refusing Chat Completions request replaying a non-function tool call");
-        return Some(chat_invalid_request(
-            "unsupported_tool_type",
-            "messages",
-            "Raydock cannot replay an assistant tool call that is not a named function \
-             call (a custom tool call, for example) on this route: it translates Chat \
-             Completions to Anthropic Messages, which supports only function tools."
-                .to_owned(),
+        let code = "unsupported_tool_type";
+        return Some((
+            code,
+            chat_invalid_request(
+                code,
+                "messages",
+                "Raydock cannot replay an assistant tool call that is not a named function \
+                 call (a custom tool call, for example) on this route: it translates Chat \
+                 Completions to Anthropic Messages, which supports only function tools."
+                    .to_owned(),
+            ),
         ));
     }
     if chat_required_tool_unavailable(body) {
         warn!("local router: refusing Chat Completions request whose tool_choice cannot be met");
-        return Some(chat_invalid_request(
-            "required_tool_unavailable",
-            "tool_choice",
-            "tool_choice requires a tool call this route cannot make: the tool it forces, or \
-             every tool it permits, is not a declared function tool. Declare the tool, or relax \
-             tool_choice."
-                .to_owned(),
+        let code = "required_tool_unavailable";
+        return Some((
+            code,
+            chat_invalid_request(
+                code,
+                "tool_choice",
+                "tool_choice requires a tool call this route cannot make: the tool it forces, or \
+                 every tool it permits, is not a declared function tool. Declare the tool, or relax \
+                 tool_choice."
+                    .to_owned(),
+            ),
         ));
     }
     None
@@ -816,21 +957,162 @@ pub(crate) fn anthropic_message_to_chat(
     })
 }
 
-async fn anthropic_response_to_chat(
-    resp: reqwest::Response,
-    decision: &RouteDecision,
-    request_id: &str,
+/// How a translated Chat answer is produced and reported.
+struct ChatTranslation {
+    request_id: String,
     want_stream: bool,
     include_usage: bool,
     tool_names: ToolNameRewrites,
-) -> Result<Response<BoxBody>> {
-    let status = resp.status();
-    if !status.is_success() {
-        return anthropic_error_to_chat(resp, status, decision, request_id).await;
+    /// The prompt size reported until the upstream states its own count.
+    estimated_input_tokens: u64,
+}
+
+/// A translated Chat answer's lifecycle in metrics: `FirstToken` once the
+/// first content reached the client, `TokenUsage` as the counts change, then
+/// `RequestCompleted` (with `PromptCache` for cached tokens) or
+/// `RequestErrored`. Tokens are the Chat `usage` counts (`prompt_tokens`,
+/// `completion_tokens`, `cached_tokens`). A `None` sink records nothing.
+struct ChatMeter {
+    metrics: Option<SharedMetricsSink>,
+    request_id: String,
+    estimated_input_tokens: u64,
+    selected_model: String,
+    reported: Option<AnthropicUsage>,
+    saw_first_token: bool,
+}
+
+impl ChatMeter {
+    fn new(
+        metrics: Option<SharedMetricsSink>,
+        selected_model: String,
+        request_id: String,
+        estimated_input_tokens: u64,
+    ) -> Self {
+        Self {
+            metrics,
+            request_id,
+            estimated_input_tokens,
+            selected_model,
+            reported: None,
+            saw_first_token: false,
+        }
     }
+
+    /// The counts metrics get from `usage`: the whole prompt (the estimate
+    /// until the upstream reports one), the completion, and the cache-read
+    /// tokens when any were reported.
+    fn tokens(&self, usage: AnthropicUsage) -> (u64, u64, Option<u64>) {
+        let prompt = if usage.has_prompt_tokens() {
+            usage.prompt_tokens()
+        } else {
+            self.estimated_input_tokens
+        };
+        let cached = (usage.cache_read_input_tokens > 0).then_some(usage.cache_read_input_tokens);
+        (prompt, usage.output_tokens_or(|| 0), cached)
+    }
+
+    /// The stream began: report the prompt estimate, like the other streams.
+    fn started(&mut self) {
+        self.usage(AnthropicUsage::default());
+    }
+
+    fn first_token(&mut self) {
+        if self.saw_first_token {
+            return;
+        }
+        self.saw_first_token = true;
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.record(MetricsUpdate::FirstToken {
+                request_id: self.request_id.clone(),
+            });
+        }
+    }
+
+    /// `TokenUsage` when the counts changed since the last report.
+    fn usage(&mut self, usage: AnthropicUsage) {
+        if self.reported == Some(usage) {
+            return;
+        }
+        self.reported = Some(usage);
+        let (prompt, completion, _) = self.tokens(usage);
+        record_remote_token_usage(
+            self.metrics.as_ref(),
+            Some(&self.request_id),
+            Some(prompt),
+            Some(completion),
+            Some(self.selected_model.clone()),
+        );
+    }
+
+    fn completed(mut self, usage: AnthropicUsage) {
+        self.first_token();
+        let Some(metrics) = self.metrics.as_ref() else {
+            return;
+        };
+        let (prompt, completion, cached) = self.tokens(usage);
+        emit_completed_metrics(
+            metrics,
+            &self.request_id,
+            StatusCode::OK.as_u16(),
+            Some(prompt),
+            Some(completion),
+            cached,
+            Some(self.selected_model.clone()),
+        );
+    }
+
+    fn errored(self, status_code: Option<u16>, error: &str) {
+        record_request_error(self.metrics.as_ref(), &self.request_id, status_code, error);
+    }
+}
+
+async fn anthropic_response_to_chat(
+    resp: reqwest::Response,
+    decision: &RouteDecision,
+    metrics: Option<SharedMetricsSink>,
+    translation: ChatTranslation,
+) -> Result<Response<BoxBody>> {
+    let ChatTranslation {
+        request_id,
+        want_stream,
+        include_usage,
+        tool_names,
+        estimated_input_tokens,
+    } = translation;
+    let status = resp.status();
+    // Keep the cloud's id on the row now, so an upstream error or a body that
+    // later fails to parse still leaves it on the (errored) row.
     let upstream_request_id = upstream_request_id(resp.headers());
+    record_upstream_request_id(
+        metrics.as_ref(),
+        &request_id,
+        upstream_request_id.as_deref(),
+    );
+    if !status.is_success() {
+        record_request_error(
+            metrics.as_ref(),
+            &request_id,
+            Some(status.as_u16()),
+            format!("upstream returned HTTP {}", status.as_u16()),
+        );
+        return anthropic_error_to_chat(resp, status, decision, &request_id).await;
+    }
     let id = chat_completion_id(decision);
     let model = decision.requested_model.clone();
+    // Prefer the model the upstream actually used over the decision's, which
+    // may be the routing sentinel, exactly as the passthrough path does.
+    let selected_model = prefer_upstream_selected_model(
+        resp.headers()
+            .get("x-rayline-selected-model")
+            .and_then(|value| value.to_str().ok()),
+        Some(decision),
+    );
+    let mut meter = ChatMeter::new(
+        metrics,
+        selected_model.unwrap_or_else(|| decision.selected_model.clone()),
+        request_id,
+        estimated_input_tokens,
+    );
     let is_sse = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -842,14 +1124,48 @@ async fn anthropic_response_to_chat(
             use futures::StreamExt;
             let mut translator =
                 AnthropicToChatTranslator::new(id, model, include_usage, tool_names);
+            meter.started();
             let mut stream = resp.bytes_stream();
-            while let Some(chunk) = stream.next().await {
+            loop {
+                // Notice a client that leaves while the upstream is stalled:
+                // translation can emit nothing for several chunks, so a send
+                // alone would not reveal it, and the row would stay active
+                // with the upstream still generating.
+                let chunk = tokio::select! {
+                    biased;
+                    () = tx.closed() => {
+                        // A client that leaves after the stream finished got
+                        // its whole answer; only an unfinished one was cut
+                        // short. Either way there is nothing left to send.
+                        match translator.failure.as_deref() {
+                            Some(error) => {
+                                meter.errored(Some(StatusCode::BAD_GATEWAY.as_u16()), error)
+                            }
+                            None if translator.finished => meter.completed(translator.usage),
+                            None => meter.errored(
+                                None,
+                                "client disconnected before the response completed",
+                            ),
+                        }
+                        return;
+                    }
+                    chunk = stream.next() => chunk,
+                };
+                let Some(chunk) = chunk else {
+                    break;
+                };
                 match chunk {
                     Ok(bytes) => {
                         let out = translator.push_bytes(&bytes);
+                        if translator.saw_content {
+                            meter.first_token();
+                        }
+                        meter.usage(translator.usage);
                         if !out.is_empty()
                             && tx.send(Ok(Frame::data(Bytes::from(out)))).await.is_err()
                         {
+                            meter
+                                .errored(None, "client disconnected before the response completed");
                             return;
                         }
                     }
@@ -862,7 +1178,8 @@ async fn anthropic_response_to_chat(
                         if !out.is_empty() {
                             let _ = tx.send(Ok(Frame::data(Bytes::from(out)))).await;
                         }
-                        let _ = tx.send(Err(std::io::Error::other(message))).await;
+                        let _ = tx.send(Err(std::io::Error::other(message.clone()))).await;
+                        meter.errored(Some(StatusCode::BAD_GATEWAY.as_u16()), &message);
                         return;
                     }
                 }
@@ -870,6 +1187,10 @@ async fn anthropic_response_to_chat(
             let tail = translator.end_of_stream();
             if !tail.is_empty() {
                 let _ = tx.send(Ok(Frame::data(Bytes::from(tail)))).await;
+            }
+            match translator.failure.as_deref() {
+                Some(error) => meter.errored(Some(StatusCode::BAD_GATEWAY.as_u16()), error),
+                None => meter.completed(translator.usage),
             }
         });
         let body: BoxBody =
@@ -881,12 +1202,22 @@ async fn anthropic_response_to_chat(
             .body(body)?;
         return Ok(finish(response, decision, upstream_request_id.as_deref()));
     }
+    // A buffered SSE body can still carry a failure: an `error` event or a
+    // stream that stopped before `message_stop`. The client gets whatever
+    // text arrived, as before, but the row must not call that a completion.
+    let mut sse_failure = None;
     let message = if is_sse {
-        anthropic_sse_text_to_message(&resp.text().await?, 0)
+        let text = resp.text().await?;
+        sse_failure = anthropic_sse_failure(&text);
+        anthropic_sse_text_to_message(&text, 0)
     } else {
         resp.json::<Value>().await?
     };
     let completion = anthropic_message_to_chat(&message, &id, &model, &tool_names);
+    match sse_failure.as_deref() {
+        Some(error) => meter.errored(Some(StatusCode::BAD_GATEWAY.as_u16()), error),
+        None => meter.completed(AnthropicUsage::from_chat(completion.get("usage"))),
+    }
     if want_stream {
         // The upstream answered in one piece: replay it as chunks.
         let mut translator = AnthropicToChatTranslator::new(id, model, include_usage, tool_names);
@@ -986,6 +1317,10 @@ pub(crate) struct AnthropicToChatTranslator {
     usage: AnthropicUsage,
     started: bool,
     finished: bool,
+    /// Whether any content or tool call has been sent to the client.
+    saw_content: bool,
+    /// Why the stream ended without completing, once it has.
+    failure: Option<String>,
 }
 
 impl AnthropicToChatTranslator {
@@ -1008,6 +1343,8 @@ impl AnthropicToChatTranslator {
             usage: AnthropicUsage::default(),
             started: false,
             finished: false,
+            saw_content: false,
+            failure: None,
         }
     }
 
@@ -1065,6 +1402,7 @@ impl AnthropicToChatTranslator {
             return String::new();
         }
         self.finished = true;
+        self.failure = Some(message.to_owned());
         let data = json!({"error": {"message": message, "type": kind,
                                     "param": Value::Null, "code": Value::Null}});
         format!("data: {data}\n\n")
@@ -1110,6 +1448,7 @@ impl AnthropicToChatTranslator {
                         "type": "function",
                         "function": {"name": name, "arguments": arguments},
                     }]});
+                    self.saw_content = true;
                     out.push_str(&self.chunk(delta, None));
                 }
             }
@@ -1134,6 +1473,7 @@ impl AnthropicToChatTranslator {
                         if let Some(text) = value.pointer("/delta/text").and_then(Value::as_str)
                             && !text.is_empty()
                         {
+                            self.saw_content = true;
                             out.push_str(&self.chunk(json!({"content": text}), None));
                         }
                     }
@@ -1146,6 +1486,7 @@ impl AnthropicToChatTranslator {
                         ) && !partial.is_empty()
                         {
                             *has_arguments = true;
+                            self.saw_content = true;
                             let index = *index;
                             out.push_str(&self.chunk(
                                 json!({"tool_calls": [{"index": index, "function": {"arguments": partial}}]}),
@@ -1269,8 +1610,9 @@ mod tests {
 
         // Nothing declared is permitted: a required call cannot be made.
         let undeclared = json!([{"type": "function", "function": {"name": "write"}}]);
-        let refusal =
+        let (code, refusal) =
             chat_translation_refusal(&allowed("required", undeclared.clone())).expect("refused");
+        assert_eq!(code, "required_tool_unavailable");
         assert_eq!(refusal.status(), StatusCode::BAD_REQUEST);
         assert!(chat_translation_refusal(&allowed("auto", undeclared)).is_none());
     }
@@ -1315,7 +1657,8 @@ mod tests {
             json!({"messages": [{"role": "assistant", "content": null,
                                  "function_call": {"name": "read", "arguments": "{}"}}]}),
         ] {
-            let refusal = chat_translation_refusal(&body).expect("refused");
+            let (code, refusal) = chat_translation_refusal(&body).expect("refused");
+            assert_eq!(code, "unsupported_parameter", "{body}");
             assert_eq!(refusal.status(), StatusCode::BAD_REQUEST, "{body}");
         }
         assert!(
@@ -1341,7 +1684,9 @@ mod tests {
                    "custom": {"name": "apply_patch", "input": "*** Begin Patch"}}),
             json!({"id": "call_1", "type": "function", "function": {"arguments": "{}"}}),
         ] {
-            let refusal = chat_translation_refusal(&replaying(call.clone())).expect("refused");
+            let (code, refusal) =
+                chat_translation_refusal(&replaying(call.clone())).expect("refused");
+            assert_eq!(code, "unsupported_tool_type", "{call}");
             assert_eq!(refusal.status(), StatusCode::BAD_REQUEST, "{call}");
         }
         assert!(
