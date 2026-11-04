@@ -91,10 +91,10 @@ These are effective card 26 (2026-10-27). See
 [Rayline Usage](https://platform.rayline.ai) for actual charges. omp's local
 cost estimates use the rate card bundled with your Raydock release.
 
-Hosted ARC entries advertise text input, a 200,000-token context window and
-the launcher's existing 32,000-token output budget. The output budget is a
-client setting, not a guarantee that every routed model can produce that many
-tokens. Client-controlled thinking is disabled because ARC selects effort.
+Hosted ARC entries advertise text and image input, a 1,000,000-token context
+window, and a 128,000-token output limit. The output limit is a client setting,
+not a guarantee that every routed model can produce that many tokens.
+Client-controlled thinking is disabled because ARC selects effort.
 Intelligence and speed columns may be empty: no benchmark scores are supplied,
 and speed measurements depend on omp and the requests actually served.
 
@@ -364,11 +364,11 @@ harness gives them their own model setting:
 |---|---|---|---|
 | `raydock claude` (hosted) | `arc-sage-1.0` | `arc-swift-1.0` (`CLAUDE_CODE_SUBAGENT_MODEL`, forced on every subagent, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` with `--route all`); with `--model X` and `--route all`, X | `--model rayline-router`; with `--route subagents`, `CLAUDE_CODE_SUBAGENT_MODEL=rayline-router` |
 | `raydock codex` (default Rc-Rc) | `arc-sage-1.0` | `arc-swift-1.0` | `--model rayline-router`, or set the route models in `router.json` to `rayline-router` |
-| `raydock opencode` | `arc-sage-1.0` | `small_model`: `arc-swift-1.0` | `-m rayline/rayline-router` |
-| `raydock pi` | `arc-sage-1.0` | — | `--model rayline/rayline-router`, or pi's model picker |
+| `raydock opencode` | `arc-sage-1.0` | `small_model`: `arc-swift-1.0` | Not offered |
+| `raydock pi` | `arc-sage-1.0` | — | Not offered |
 | `raydock omp` | `arc-sage-1.0` (`default`, `slow`, `plan`) | `smol`: `arc-swift-1.0` | Not offered |
-| `raydock hermes` | `arc-sage-1.0` | — | `--model rayline-router` (per run) |
-| `raydock openclaw` | `arc-sage-1.0` | — | switch the session's model to `rayline/rayline-router` (per run) |
+| `raydock hermes` | `arc-sage-1.0` | — | Not offered |
+| `raydock openclaw` | `arc-sage-1.0` | — | Not offered |
 
 Hosted `raydock claude` picks the model of every subagent and background task
 itself, and ignores the models Claude Code's own agent definitions name. It sets
@@ -383,10 +383,9 @@ cloud-only `--config`'s `routes.subagent` takes precedence. Under
 per agent, export your own `CLAUDE_CODE_SUBAGENT_MODEL` (it keeps Claude Code's
 own precedence) or launch `claude` without Raydock.
 
-Hosted omp lists only ARC Sage and ARC Swift; the other generated harness
-configs also list the Legacy Rules Router. A model you set
-yourself is kept: `--model` (before or after `--`) or `ANTHROPIC_MODEL` for
-Claude Code (subagents and background tasks then run on it too), a cloud-only `--config`'s
+Hosted generated harness configs list only ARC Sage and ARC Swift. A model
+you set yourself is kept: `--model` (before or after `--`) or `ANTHROPIC_MODEL`
+for Claude Code (subagents and background tasks then run on it too), a cloud-only `--config`'s
 `routes.main` and `routes.subagent` models (with `--route all`; without a
 `routes.subagent`, subagents follow `routes.main`), a `--router-config-path`
 subagent allowlist (Raydock then sets no subagent model), your own `CLAUDE_CODE_SUBAGENT_MODEL` or

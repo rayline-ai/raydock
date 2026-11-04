@@ -81,9 +81,7 @@ Commands:
 
 Harness launches default to ARC: arc-sage-1.0 for the main agent and
 arc-swift-1.0 for subagents and background tasks where the harness has a
-separate role for them. The Legacy Rules Router stays available as
-rayline-router: pick it with the harness's own model flag or picker (for
-example `raydock opencode -m rayline/rayline-router`).
+separate role for them.
   router     Start, inspect, or stop the local Rayline router runtime
   hybrid     Start the ARC execution core or connect a harness to it
   top        Show live router request metrics

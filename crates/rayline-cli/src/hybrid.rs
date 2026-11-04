@@ -803,7 +803,6 @@ fn harness_command(
             let config_dir = paths.dir.join("harness").join(name);
             private_dir(&config_dir)?;
             let ctx = crate::harness::RenderContext {
-                env_name: "hybrid",
                 key: token,
                 router_url: endpoint,
                 config_dir: &config_dir,

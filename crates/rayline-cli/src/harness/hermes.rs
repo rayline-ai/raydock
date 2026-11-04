@@ -176,7 +176,6 @@ mod tests {
             input_modalities: vec!["text".into()],
         };
         let ctx = RenderContext {
-            env_name: "hybrid",
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
@@ -202,7 +201,6 @@ mod tests {
         let path = dir.join(CONFIG_FILE);
         std::fs::write(&path, "agent:\n  max_turns: 40\n").unwrap();
         let ctx = RenderContext {
-            env_name: "dev",
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
@@ -262,7 +260,6 @@ fallback_model:
         }
         let launch = || {
             let ctx = RenderContext {
-                env_name: "dev",
                 key: super::super::tests::TEST_KEY,
                 router_url: TEST_URL,
                 config_dir: &dir,
@@ -281,7 +278,7 @@ fallback_model:
   default: \"arc-sage-1.0\"
   provider: \"custom:rayline-anth\"
   reasoning_effort: high
-  context_length: 200000
+  context_length: 1000000
 providers:
   rayline-anth:
     api_key: \"rlk-test\"
@@ -289,11 +286,9 @@ providers:
     base_url: \"https://api-dev.rayline.ai\"
     models:
       arc-sage-1.0:
-        context_length: 200000
+        context_length: 1000000
       arc-swift-1.0:
-        context_length: 200000
-      rayline-router:
-        context_length: 200000
+        context_length: 1000000
   mine:
     base_url: https://mine.example
   rayline-resp:
@@ -302,11 +297,9 @@ providers:
     base_url: \"https://api-dev.rayline.ai/v1\"
     models:
       arc-sage-1.0:
-        context_length: 200000
+        context_length: 1000000
       arc-swift-1.0:
-        context_length: 200000
-      rayline-router:
-        context_length: 200000
+        context_length: 1000000
 agent:
   max_turns: 40
   disabled_toolsets:
@@ -331,7 +324,6 @@ fallback_providers: []
         let dir = temp_dir("hermes-bad");
         std::fs::write(dir.join(CONFIG_FILE), "---\nmodel: x\n").unwrap();
         let ctx = RenderContext {
-            env_name: "dev",
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
@@ -356,7 +348,7 @@ fallback_providers: []
             config,
             "fallback_providers: []
 model:
-  context_length: 200000
+  context_length: 1000000
   default: \"arc-sage-1.0\"
   provider: \"custom:rayline-anth\"
 providers:
@@ -366,22 +358,18 @@ providers:
     base_url: \"https://api-dev.rayline.ai\"
     models:
       arc-sage-1.0:
-        context_length: 200000
+        context_length: 1000000
       arc-swift-1.0:
-        context_length: 200000
-      rayline-router:
-        context_length: 200000
+        context_length: 1000000
   rayline-resp:
     api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
     base_url: \"https://api-dev.rayline.ai/v1\"
     models:
       arc-sage-1.0:
-        context_length: 200000
+        context_length: 1000000
       arc-swift-1.0:
-        context_length: 200000
-      rayline-router:
-        context_length: 200000
+        context_length: 1000000
 "
         );
     }

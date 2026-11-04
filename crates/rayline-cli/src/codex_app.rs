@@ -721,7 +721,7 @@ mod tests {
     fn config_unchanged_when_settings_present_whatever_the_app_layout() {
         // Same settings, but the app moved [tools] above our table, added its own
         // root key and re-serialised our table (order, spacing): still "unchanged".
-        let existing = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nwire_api=\"responses\"\nname = \"Raydock\"\nbase_url =   \"http://127.0.0.1:20811/v1\"\n\n[desktop]\nx = 1\n";
+        let existing = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nwire_api=\"responses\"\nname = \"Rayline\"\nbase_url =   \"http://127.0.0.1:20811/v1\"\n\n[desktop]\nx = 1\n";
         assert!(!generated_config_differs(
             existing,
             &snippet("rayline-local", false)

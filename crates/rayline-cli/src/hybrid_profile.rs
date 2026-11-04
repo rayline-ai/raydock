@@ -49,7 +49,7 @@ const LOCAL_CONTEXT_WINDOW_RANGE: std::ops::RangeInclusive<u64> = 2048..=1_000_0
 /// 5.5 (pricing snapshot 2026-10-16, `context_window_tokens`).
 const CLOUD_CONTEXT_WINDOW: u64 = 1_000_000;
 /// Output ceiling of every hybrid deployment: the harness default
-/// (`harness::MAX_OUTPUT_TOKENS`). The core admits the smallest deployment
+/// (`harness::MAX_OUTPUT_TOKENS`), not the larger hosted ARC ceiling. The core admits the smallest deployment
 /// cap for the whole session, and a 4096 cap cut long local turns short
 /// before any edit landed (Mac hybrid test, 2026-10-27).
 const MAX_OUTPUT_TOKENS: u64 = crate::harness::MAX_OUTPUT_TOKENS;

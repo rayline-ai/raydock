@@ -265,7 +265,7 @@ pub async fn run(mut request: RunRequest) -> ExitCode {
         .arg("-c")
         .arg(format!("model={}", toml_string(model)))
         .arg("-c")
-        .arg("model_providers.rayline.name=\"Raydock\"")
+        .arg("model_providers.rayline.name=\"Rayline\"")
         .arg("-c")
         .arg(format!(
             "model_providers.rayline.base_url={}",
@@ -351,7 +351,7 @@ pub fn rayline_provider_config_toml(
     };
     format!(
         "model = {}\nmodel_provider = \"rayline\"\n{}\
-\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = {}\nwire_api = \"responses\"\n{}{}",
+\n[model_providers.rayline]\nname = \"Rayline\"\nbase_url = {}\nwire_api = \"responses\"\n{}{}",
         toml_string(model),
         if subscription_auth {
             "forced_login_method = \"chatgpt\"\n"
