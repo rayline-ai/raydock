@@ -42,7 +42,9 @@ use hyper::service::service_fn;
 use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use rayline_metrics::{MetricsUpdate, REQUEST_ID_HEADER, SharedMetricsSink, new_request_id};
+use rayline_metrics::{
+    MetricsUpdate, REQUEST_ID_HEADER, SharedMetricsSink, UPSTREAM_ROUTE_ID_HEADER, new_request_id,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
     PublicKeyData,
@@ -736,6 +738,14 @@ async fn forward_anthropic_request(
         }
     };
     let status = resp.status();
+    if let Some(metrics) = state.opts.metrics.as_ref().filter(|_| proxy_owns_metrics) {
+        if let Some(upstream_request_id) = upstream_request_id(resp.headers()) {
+            metrics.record(MetricsUpdate::UpstreamRequestId {
+                request_id: request_id.clone(),
+                upstream_request_id,
+            });
+        }
+    }
     let location = resp
         .headers()
         .get("location")
@@ -2306,6 +2316,17 @@ fn claude_code_agent_id(headers: &HeaderMap) -> Option<&str> {
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+/// The cloud router's own route id for a forwarded request, so `raydock top`
+/// can name the cloud route a request became. Blank values count as absent.
+fn upstream_request_id(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    headers
+        .get(UPSTREAM_ROUTE_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn rayline_request_id(headers: &HeaderMap) -> Option<&str> {
@@ -3901,6 +3922,21 @@ mod tests {
             );
         }
         headers
+    }
+
+    #[test]
+    fn upstream_request_id_reads_only_the_gateway_route_id() {
+        let gateway = header_map(&[
+            ("x-request-id", "provider_id"),
+            ("x-workshop-route-id", "rt_legacy"),
+            ("x-rayline-route-id", " rt_rayline "),
+        ]);
+        assert_eq!(upstream_request_id(&gateway).as_deref(), Some("rt_rayline"));
+        // A direct-provider forward's own id is not a cloud route id.
+        let provider_only = header_map(&[("x-request-id", "provider_id")]);
+        assert_eq!(upstream_request_id(&provider_only), None);
+        let blank = header_map(&[("x-rayline-route-id", "")]);
+        assert_eq!(upstream_request_id(&blank), None);
     }
 
     #[test]

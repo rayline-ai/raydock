@@ -39,6 +39,12 @@ pub mod inbound_guard;
 
 use anthropic_usage::AnthropicUsage;
 pub use inbound_guard::InboundGuard;
+mod upstream_request_id;
+pub use upstream_request_id::RAYLINE_UPSTREAM_REQUEST_ID_HEADER;
+use upstream_request_id::{
+    log_upstream_request_id, record_upstream_request_id, stamp_upstream_request_id,
+    stamped_upstream_request_id, upstream_request_id,
+};
 
 pub const DEFAULT_PORT: u16 = 20811;
 pub const DEFAULT_LOCAL_ADAPTER_PORT: u16 = 20808;
@@ -1312,7 +1318,7 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
         .and_then(header_str)
         .unwrap_or("<none>");
     info!(
-        "local route {} requested={} selected={} policy={} task={} agent_id={} agent_type={} elapsed_ms={}",
+        "local route {} requested={} selected={} policy={} task={} agent_id={} agent_type={} elapsed_ms={} request_id={}",
         route_target_label(&decision.target),
         decision.requested_model,
         decision.selected_model,
@@ -1320,7 +1326,8 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
         decision.task_class,
         agent_id,
         agent_type,
-        t_start.elapsed().as_millis()
+        t_start.elapsed().as_millis(),
+        request_id
     );
     if let Some(metrics) = state.opts.metrics.as_ref() {
         metrics.record(MetricsUpdate::RouteDecided {
@@ -1342,7 +1349,7 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             agent_type: (agent_type != "<none>").then(|| agent_type.to_owned()),
         });
     }
-    match &decision.target {
+    let response = match &decision.target {
         RouteSelection::Local => Ok(local_redirect_response(&state, &decision, &request_id)),
         RouteSelection::Endpoint(endpoint_id) => {
             let endpoint = match state
@@ -1389,7 +1396,11 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
             }
             response
         }
+    };
+    if let Ok(response) = response.as_ref() {
+        log_upstream_request_id("local", &request_id, response);
     }
+    response
 }
 
 async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Response<BoxBody>> {
@@ -1405,14 +1416,15 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
         .and_then(header_str)
         .unwrap_or("<none>");
     info!(
-        "codex route {} requested={} selected={} policy={} task={} subagent={} elapsed_ms={}",
+        "codex route {} requested={} selected={} policy={} task={} subagent={} elapsed_ms={} request_id={}",
         route_target_label(&decision.target),
         decision.requested_model,
         decision.selected_model,
         decision.policy,
         decision.task_class,
         subagent,
-        t_start.elapsed().as_millis()
+        t_start.elapsed().as_millis(),
+        request_id
     );
     if let Some(metrics) = state.opts.metrics.as_ref() {
         metrics.record(MetricsUpdate::RouteDecided {
@@ -1524,6 +1536,9 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
     if let Err(error) = response.as_ref() {
         record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
     }
+    if let Ok(response) = response.as_ref() {
+        log_upstream_request_id("codex", &request_id, response);
+    }
     response
 }
 
@@ -1542,7 +1557,7 @@ async fn handle_openai_passthrough_family(
     let parsed = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
-    forward_openai_family_or_unsupported(
+    let response = forward_openai_family_or_unsupported(
         &state,
         &decision,
         OpenAIPassthroughRequest {
@@ -1555,7 +1570,23 @@ async fn handle_openai_passthrough_family(
             rewrite_model: true,
         },
     )
-    .await
+    .await;
+    finish_codex_family_response(&state, &request_id, response)
+}
+
+/// Shared tail of the Codex-family handlers: an error closes the metrics row
+/// the forwarder may already have started (it records the upstream id as soon
+/// as the headers are in), a response gets its upstream id logged.
+fn finish_codex_family_response(
+    state: &AppState,
+    request_id: &str,
+    response: Result<Response<BoxBody>>,
+) -> Result<Response<BoxBody>> {
+    match response.as_ref() {
+        Err(error) => record_request_error(state.opts.metrics.as_ref(), request_id, None, error),
+        Ok(response) => log_upstream_request_id("codex", request_id, response),
+    }
+    response
 }
 
 async fn handle_openai_auxiliary(
@@ -1574,7 +1605,11 @@ async fn handle_openai_auxiliary(
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Codex);
     let request_id = request_id_from_headers(&headers);
 
-    if let Some(response) = maybe_handle_synthetic_auxiliary(
+    // A synthetic side call (compaction, memory summarization) is answered here;
+    // anything else falls through to the upstream forward below. Both outcomes
+    // leave through `finish_codex_family_response`, so neither can skip closing
+    // the metrics row on error or logging the upstream id on success.
+    match maybe_handle_synthetic_auxiliary(
         &state,
         &decision,
         &headers,
@@ -1582,12 +1617,16 @@ async fn handle_openai_auxiliary(
         &parsed,
         &request_id,
     )
-    .await?
+    .await
     {
-        return Ok(response);
+        Ok(None) => {}
+        Ok(Some(response)) => {
+            return finish_codex_family_response(&state, &request_id, Ok(response));
+        }
+        Err(error) => return finish_codex_family_response(&state, &request_id, Err(error)),
     }
 
-    forward_openai_family_or_unsupported(
+    let response = forward_openai_family_or_unsupported(
         &state,
         &decision,
         OpenAIPassthroughRequest {
@@ -1600,7 +1639,8 @@ async fn handle_openai_auxiliary(
             rewrite_model: true,
         },
     )
-    .await
+    .await;
+    finish_codex_family_response(&state, &request_id, response)
 }
 
 async fn forward_openai_family_or_unsupported(
@@ -1699,9 +1739,12 @@ async fn synthetic_compact_response(
     if let Some(obj) = request_body.as_object_mut() {
         obj.insert("stream".to_owned(), Value::Bool(false));
     }
-    let (anthropic_message, estimated_input_tokens) =
-        run_synthetic_unary_response(state, decision, inbound_headers, &request_body, request_id)
-            .await?;
+    let UpstreamAnswer {
+        message: anthropic_message,
+        estimated_input_tokens,
+        upstream_request_id,
+    } = run_synthetic_unary_response(state, decision, inbound_headers, &request_body, request_id)
+        .await?;
     let text = anthropic_message_text(&anthropic_message);
     let item = match output_kind {
         SyntheticOutputKind::Compaction => json!({
@@ -1733,6 +1776,7 @@ async fn synthetic_compact_response(
     );
     let mut response = json_response(StatusCode::OK, json!({"output": [item]}));
     add_decision_headers(response.headers_mut(), decision);
+    stamp_upstream_request_id(response.headers_mut(), upstream_request_id.as_deref());
     Ok(response)
 }
 
@@ -1744,9 +1788,12 @@ async fn synthetic_memory_summarize_response(
     request_id: &str,
 ) -> Result<Response<BoxBody>> {
     let request_body = memory_summarize_to_responses_request(body, &decision.requested_model);
-    let (anthropic_message, estimated_input_tokens) =
-        run_synthetic_unary_response(state, decision, inbound_headers, &request_body, request_id)
-            .await?;
+    let UpstreamAnswer {
+        message: anthropic_message,
+        estimated_input_tokens,
+        upstream_request_id,
+    } = run_synthetic_unary_response(state, decision, inbound_headers, &request_body, request_id)
+        .await?;
     let text = anthropic_message_text(&anthropic_message);
     let output = parse_memory_summarize_output(body, &text);
     let output_tokens = anthropic_message
@@ -1766,7 +1813,17 @@ async fn synthetic_memory_summarize_response(
     );
     let mut response = json_response(StatusCode::OK, json!({"output": output}));
     add_decision_headers(response.headers_mut(), decision);
+    stamp_upstream_request_id(response.headers_mut(), upstream_request_id.as_deref());
     Ok(response)
+}
+
+/// An upstream's complete answer to a side call, as an Anthropic message.
+struct UpstreamAnswer {
+    message: Value,
+    estimated_input_tokens: u64,
+    /// Carried rather than re-read: the response it belongs to is consumed here,
+    /// so the caller cannot get at its headers when it builds its own reply.
+    upstream_request_id: Option<String>,
 }
 
 async fn run_synthetic_unary_response(
@@ -1775,7 +1832,7 @@ async fn run_synthetic_unary_response(
     inbound_headers: &HeaderMap,
     body: &Value,
     request_id: &str,
-) -> Result<(Value, u64)> {
+) -> Result<UpstreamAnswer> {
     // Text-only synthetic turns (title/memory summarization): no tool calls come
     // back, so no name rewrites need restoring.
     let (anthropic, _tool_names) = responses_to_anthropic_request(body, &decision.selected_model);
@@ -1795,7 +1852,13 @@ async fn run_synthetic_unary_response(
                 .json(&anthropic)
                 .send()
                 .await?;
-            parse_anthropic_unary_response(resp, estimated_input_tokens).await
+            let (message, estimated_input_tokens) =
+                parse_anthropic_unary_response(resp, estimated_input_tokens).await?;
+            Ok(UpstreamAnswer {
+                message,
+                estimated_input_tokens,
+                upstream_request_id: None,
+            })
         }
         RouteSelection::Endpoint(endpoint_id) => {
             let endpoint = state
@@ -1824,7 +1887,19 @@ async fn run_synthetic_unary_response(
                     }
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
                     let resp = outbound.send().await?;
-                    parse_anthropic_unary_response(resp, estimated_input_tokens).await
+                    let upstream_request_id = upstream_request_id(resp.headers());
+                    record_upstream_request_id(
+                        state.opts.metrics.as_ref(),
+                        request_id,
+                        upstream_request_id.as_deref(),
+                    );
+                    let (message, estimated_input_tokens) =
+                        parse_anthropic_unary_response(resp, estimated_input_tokens).await?;
+                    Ok(UpstreamAnswer {
+                        message,
+                        estimated_input_tokens,
+                        upstream_request_id,
+                    })
                 }
                 EndpointProtocol::OpenAIChat => {
                     let request_body =
@@ -1840,14 +1915,24 @@ async fn run_synthetic_unary_response(
                         .json(&request_body);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
                     let resp = outbound.send().await?;
+                    let upstream_request_id = upstream_request_id(resp.headers());
+                    record_upstream_request_id(
+                        state.opts.metrics.as_ref(),
+                        request_id,
+                        upstream_request_id.as_deref(),
+                    );
                     if !resp.status().is_success() {
                         return Err(anyhow!("upstream returned HTTP {}", resp.status().as_u16()));
                     }
                     let value = resp.json::<Value>().await?;
-                    Ok((
-                        openai_chat_response_to_anthropic(&value, &decision.selected_model),
+                    Ok(UpstreamAnswer {
+                        message: openai_chat_response_to_anthropic(
+                            &value,
+                            &decision.selected_model,
+                        ),
                         estimated_input_tokens,
-                    ))
+                        upstream_request_id,
+                    })
                 }
                 EndpointProtocol::OpenAIResponses => Err(anyhow!(
                     "native OpenAI Responses endpoint should have used passthrough"
@@ -2377,14 +2462,29 @@ async fn forward_openai_passthrough_endpoint(
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         if let Some(location) = location {
-            return follow_local_responses_redirect(
+            // The cloud's id for this turn is on the 307 itself; the adapter
+            // the redirect lands on has none to offer.
+            let redirect_upstream_request_id = upstream_request_id(resp.headers());
+            record_upstream_request_id(
+                state.opts.metrics.as_ref(),
+                passthrough.request_id,
+                redirect_upstream_request_id.as_deref(),
+            );
+            let mut response = follow_local_responses_redirect(
                 state,
                 endpoint,
                 &location,
                 &passthrough.body,
                 passthrough.request_id,
             )
-            .await;
+            .await?;
+            if stamped_upstream_request_id(response.headers()).is_none() {
+                stamp_upstream_request_id(
+                    response.headers_mut(),
+                    redirect_upstream_request_id.as_deref(),
+                );
+            }
+            return Ok(response);
         }
         // A 307 with no/invalid Location can't be followed; the raw 307 falls
         // through to the client (which won't follow it). Log a breadcrumb so a
@@ -2425,6 +2525,15 @@ async fn follow_local_responses_redirect(
     // `http://<loopback>:<local_adapter_port>/api/v1/responses`.
     if !is_expected_local_adapter_redirect(location, state.opts.local_adapter_port) {
         warn!("may-local: refusing 307 to unexpected location {location:?}");
+        // Nothing downstream will serve this turn, so close its metrics row here:
+        // the caller only logs a returned response, and the row may exist solely
+        // because the 307's upstream id was recorded before we got here.
+        record_request_error(
+            state.opts.metrics.as_ref(),
+            request_id,
+            Some(StatusCode::BAD_GATEWAY.as_u16()),
+            "may-local redirect rejected: unexpected location",
+        );
         return Ok(json_response(
             StatusCode::BAD_GATEWAY,
             json!({
@@ -2682,6 +2791,12 @@ async fn forward_responses_to_openai_chat_endpoint(
         )
         .await;
     }
+    let upstream_request_id = upstream_request_id(resp.headers());
+    record_upstream_request_id(
+        state.opts.metrics.as_ref(),
+        request_id,
+        upstream_request_id.as_deref(),
+    );
     let value = resp.json::<Value>().await?;
     let anthropic = openai_chat_response_to_anthropic(&value, &decision.selected_model);
     record_remote_completion(
@@ -2692,25 +2807,27 @@ async fn forward_responses_to_openai_chat_endpoint(
         usage_u64(&anthropic, "output_tokens"),
         Some(decision.selected_model.clone()),
     );
-    if responses_wants_stream(body) {
-        Ok(synthetic_responses_sse(
+    let mut response = if responses_wants_stream(body) {
+        synthetic_responses_sse(
             decision,
             &anthropic,
             request_id,
             estimated_input_tokens,
             output_kind,
             &tool_names,
-        ))
+        )
     } else {
-        Ok(synthetic_responses_json(
+        synthetic_responses_json(
             decision,
             &anthropic,
             request_id,
             estimated_input_tokens,
             output_kind,
             &tool_names,
-        ))
-    }
+        )
+    };
+    stamp_upstream_request_id(response.headers_mut(), upstream_request_id.as_deref());
+    Ok(response)
 }
 
 async fn forward_anthropic_endpoint(
@@ -2873,15 +2990,23 @@ async fn forward_openai_chat_endpoint(
         )
         .await;
     }
+    let upstream_request_id = upstream_request_id(resp.headers());
+    record_upstream_request_id(
+        state.opts.metrics.as_ref(),
+        request_id,
+        upstream_request_id.as_deref(),
+    );
     if want_stream {
         // True streaming: translate OpenAI Chat SSE -> Anthropic SSE chunk by chunk.
-        return Ok(openai_chat_stream_to_anthropic(
+        let mut response = openai_chat_stream_to_anthropic(
             resp,
             decision,
             state.opts.metrics.clone(),
             request_id.to_owned(),
             estimated_input_tokens,
-        ));
+        );
+        stamp_upstream_request_id(response.headers_mut(), upstream_request_id.as_deref());
+        return Ok(response);
     }
     let value = resp.json::<Value>().await?;
     let anthropic = openai_chat_response_to_anthropic(&value, &decision.selected_model);
@@ -2893,13 +3018,15 @@ async fn forward_openai_chat_endpoint(
         usage_u64(&anthropic, "output_tokens"),
         Some(decision.selected_model.clone()),
     );
-    if want_stream {
-        Ok(synthetic_anthropic_sse(decision, &anthropic))
+    let mut response = if want_stream {
+        synthetic_anthropic_sse(decision, &anthropic)
     } else {
         let mut response = json_response(StatusCode::OK, anthropic);
         add_decision_headers(response.headers_mut(), decision);
-        Ok(response)
-    }
+        response
+    };
+    stamp_upstream_request_id(response.headers_mut(), upstream_request_id.as_deref());
+    Ok(response)
 }
 
 #[derive(Clone, Copy)]
@@ -2979,7 +3106,7 @@ async fn response_from_reqwest(
     // upstream chose comes back in its `x-rayline-selected-model` response header,
     // whereas `decision.selected_model` is only the sentinel (`rayline-router`).
     // Prefer the upstream value for both the re-stamped outbound header and the
-    // usage metric, so `rayline top` shows the real model — never overwrite an
+    // usage metric, so `raydock top` shows the real model — never overwrite an
     // upstream-provided value with the sentinel.
     let upstream_selected_model = resp
         .headers()
@@ -3001,6 +3128,13 @@ async fn response_from_reqwest(
         };
         headers_out.append(name, value);
     }
+    // Read the cloud's id off the upstream headers once: keep it on the metrics
+    // row (before the body task below can fail) and pass it to the client.
+    let upstream_request_id = upstream_request_id(resp.headers());
+    if let Some(request_id) = request_id.as_deref() {
+        record_upstream_request_id(metrics.as_ref(), request_id, upstream_request_id.as_deref());
+    }
+    stamp_upstream_request_id(&mut headers_out, upstream_request_id.as_deref());
     if let Some(decision) = decision {
         add_decision_headers(&mut headers_out, decision);
         // Restore the upstream-chosen model when present (add_decision_headers
@@ -4814,9 +4948,11 @@ async fn anthropic_response_to_responses(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if content_type.contains("text/event-stream") {
+    let upstream_request_id = upstream_request_id(resp.headers());
+    record_upstream_request_id(metrics.as_ref(), request_id, upstream_request_id.as_deref());
+    let mut response = if content_type.contains("text/event-stream") {
         if want_stream {
-            return Ok(anthropic_stream_to_responses(
+            anthropic_stream_to_responses(
                 resp,
                 decision,
                 metrics,
@@ -4824,40 +4960,43 @@ async fn anthropic_response_to_responses(
                 estimated_input_tokens,
                 output_kind,
                 tool_names.clone(),
-            ));
+            )
+        } else {
+            let text = resp.text().await?;
+            let value = anthropic_sse_text_to_message(&text, estimated_input_tokens);
+            synthetic_responses_json(
+                decision,
+                &value,
+                request_id,
+                estimated_input_tokens,
+                output_kind,
+                tool_names,
+            )
         }
-        let text = resp.text().await?;
-        let value = anthropic_sse_text_to_message(&text, estimated_input_tokens);
-        Ok(synthetic_responses_json(
-            decision,
-            &value,
-            request_id,
-            estimated_input_tokens,
-            output_kind,
-            tool_names,
-        ))
     } else {
         let value = resp.json::<Value>().await?;
         if !want_stream {
-            Ok(synthetic_responses_json(
+            synthetic_responses_json(
                 decision,
                 &value,
                 request_id,
                 estimated_input_tokens,
                 output_kind,
                 tool_names,
-            ))
+            )
         } else {
-            Ok(synthetic_responses_sse(
+            synthetic_responses_sse(
                 decision,
                 &value,
                 request_id,
                 estimated_input_tokens,
                 output_kind,
                 tool_names,
-            ))
+            )
         }
-    }
+    };
+    stamp_upstream_request_id(response.headers_mut(), upstream_request_id.as_deref());
+    Ok(response)
 }
 
 fn anthropic_stream_to_responses(
@@ -6743,6 +6882,71 @@ mod tests {
             None
         );
         assert_eq!(guard_status(Method::POST, URI, &[JSON]), None);
+    }
+
+    /// A 307 whose `Location` fails the loopback guard is answered 502 and never
+    /// reaches an adapter, so nothing downstream closes the request's metrics
+    /// row — and that row may exist only because the 307's upstream id was
+    /// recorded. The rejection must close it, or `raydock top` shows the turn
+    /// active forever.
+    #[tokio::test]
+    async fn rejected_may_local_redirect_closes_the_metrics_row() {
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        let sink: SharedMetricsSink = metrics.clone();
+        let opts = LocalRouterOptions {
+            metrics: Some(sink.clone()),
+            ..LocalRouterOptions::default()
+        };
+        let state = AppState {
+            opts: Arc::new(opts),
+            config: Arc::new(default_config("local-model")),
+            http: reqwest::Client::new(),
+            http_ipv4: reqwest::Client::new(),
+            route_counter: Arc::new(AtomicU64::new(1)),
+            started_at: chrono_like_now(),
+        };
+        // No credential: the rejection happens before any auth is attached, and
+        // this endpoint must never be reached over the network.
+        let endpoint = EndpointConfig {
+            id: "rcr".to_owned(),
+            kind: "provider".to_owned(),
+            protocol: EndpointProtocol::OpenAIResponses,
+            base_url: "https://api.rayline.ai".to_owned(),
+            api_key_env: None,
+            models: vec!["rayline-router".to_owned()],
+            headers: HashMap::new(),
+            auth: None,
+        };
+        // The 307's id is recorded before the redirect is followed, which is what
+        // creates the row for a request nothing else announced.
+        record_upstream_request_id(Some(&sink), "req_rejected", Some("rt_rejected"));
+        assert_eq!(metrics.snapshot().active.len(), 1);
+
+        // Off-box location: refused by the exfiltration guard.
+        let response = follow_local_responses_redirect(
+            &state,
+            &endpoint,
+            "http://10.0.0.5:20808/api/v1/responses",
+            &Bytes::from_static(b"{}"),
+            "req_rejected",
+        )
+        .await
+        .expect("a rejected redirect answers 502 rather than erroring");
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+        let snapshot = metrics.snapshot();
+        assert!(
+            snapshot.active.is_empty(),
+            "the rejected turn must not stay active"
+        );
+        let row = snapshot
+            .recent
+            .iter()
+            .find(|row| row.request_id == "req_rejected")
+            .expect("the row is finished");
+        assert_eq!(row.state, "error");
+        assert_eq!(row.status_code, Some(502));
+        assert_eq!(row.upstream_request_id.as_deref(), Some("rt_rejected"));
     }
 
     #[test]

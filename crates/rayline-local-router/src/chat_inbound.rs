@@ -33,13 +33,14 @@ pub(crate) async fn handle_chat_completions(
     let decision = select_route_with_warn(&state, &headers, &parsed, ApiSurface::Anthropic);
     let request_id = request_id_from_headers(&headers);
     info!(
-        "chat route {} requested={} selected={} policy={} task={} elapsed_ms={}",
+        "chat route {} requested={} selected={} policy={} task={} elapsed_ms={} request_id={}",
         route_target_label(&decision.target),
         decision.requested_model,
         decision.selected_model,
         decision.policy,
         decision.task_class,
-        t_start.elapsed().as_millis()
+        t_start.elapsed().as_millis(),
+        request_id
     );
     let want_stream = parsed
         .get("stream")
@@ -158,6 +159,9 @@ pub(crate) async fn handle_chat_completions(
     if let Err(error) = response.as_ref() {
         record_request_error(state.opts.metrics.as_ref(), &request_id, None, error);
     }
+    if let Ok(response) = response.as_ref() {
+        log_upstream_request_id("chat", &request_id, response);
+    }
     response
 }
 
@@ -214,6 +218,16 @@ async fn passthrough_response(
             HeaderValue::from_static("application/json"),
         );
     }
+    // Chat Completions has no metrics lifecycle yet: it emits neither
+    // `RequestStarted` nor `RouteDecided`, and nothing completes its rows.
+    // Recording the id here WOULD create a row (the metrics arm starts one when
+    // it finds none), and nothing would ever close it — an orphan stuck active
+    // in `raydock top`. So only the response header carries the id until that
+    // lifecycle exists.
+    stamp_upstream_request_id(
+        &mut headers_out,
+        upstream_request_id(resp.headers()).as_deref(),
+    );
     let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
     tokio::spawn(async move {
         use futures::StreamExt;
@@ -814,6 +828,7 @@ async fn anthropic_response_to_chat(
     if !status.is_success() {
         return anthropic_error_to_chat(resp, status, decision, request_id).await;
     }
+    let upstream_request_id = upstream_request_id(resp.headers());
     let id = chat_completion_id(decision);
     let model = decision.requested_model.clone();
     let is_sse = resp
@@ -859,13 +874,12 @@ async fn anthropic_response_to_chat(
         });
         let body: BoxBody =
             StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx)).boxed();
-        let mut response = Response::builder()
+        let response = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
             .header("cache-control", "no-cache")
             .body(body)?;
-        add_decision_headers(response.headers_mut(), decision);
-        return Ok(response);
+        return Ok(finish(response, decision, upstream_request_id.as_deref()));
     }
     let message = if is_sse {
         anthropic_sse_text_to_message(&resp.text().await?, 0)
@@ -877,16 +891,17 @@ async fn anthropic_response_to_chat(
         // The upstream answered in one piece: replay it as chunks.
         let mut translator = AnthropicToChatTranslator::new(id, model, include_usage, tool_names);
         let out = translator.replay_completion(&completion);
-        let mut response = Response::builder()
+        let response = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/event-stream")
             .body(full_body(out))?;
-        add_decision_headers(response.headers_mut(), decision);
-        return Ok(response);
+        return Ok(finish(response, decision, upstream_request_id.as_deref()));
     }
-    let mut response = json_response(StatusCode::OK, completion);
-    add_decision_headers(response.headers_mut(), decision);
-    Ok(response)
+    Ok(finish(
+        json_response(StatusCode::OK, completion),
+        decision,
+        upstream_request_id.as_deref(),
+    ))
 }
 
 /// An Anthropic-shaped error body (`{"type":"error","error":{"type","message"}}`)
@@ -928,6 +943,7 @@ async fn anthropic_error_to_chat(
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
+    let upstream_request_id = upstream_request_id(resp.headers());
     let body = resp.bytes().await.unwrap_or_default();
     let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = json_response(status, anthropic_error_body_to_openai(&body));
@@ -936,8 +952,21 @@ async fn anthropic_error_to_chat(
     {
         response.headers_mut().insert("retry-after", value);
     }
+    Ok(finish(response, decision, upstream_request_id.as_deref()))
+}
+
+/// Every Chat response this module returns carries the route decision and, when
+/// the upstream named one, its request id. The two always travel together, and
+/// the translated path has three exits (true stream, replayed stream, unary),
+/// so stamping them in one place keeps an exit from silently missing either.
+fn finish(
+    mut response: Response<BoxBody>,
+    decision: &RouteDecision,
+    upstream_request_id: Option<&str>,
+) -> Response<BoxBody> {
     add_decision_headers(response.headers_mut(), decision);
-    Ok(response)
+    stamp_upstream_request_id(response.headers_mut(), upstream_request_id);
+    response
 }
 
 /// Anthropic Messages SSE -> `chat.completion.chunk` SSE.
