@@ -122,11 +122,12 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             .map(|model| {
                 json!({
                     "id": model,
-                    "name": format!("{} ({})", model_display_name(launch, model), ctx.env_name),
-                    "reasoning": true,
+                    "name": model_display_name(launch, model),
+                    // ARC selects thinking effort; clients must not expose controls.
+                    "reasoning": ctx.capabilities.is_some(),
                     "input": ctx.input_modalities(),
                     "contextWindow": ctx.context_window(),
-                    "maxTokens": ctx.max_output_tokens(),
+                    "maxTokens": ctx.max_output_tokens(model),
                     "compat": compat
                 })
             })
@@ -232,8 +233,13 @@ mod tests {
         assert_eq!(provider["headers"], serde_json::json!({}));
         let model = &provider["models"][0];
         assert_eq!(model["id"], "arc-sage-1.0");
-        assert_eq!(model["contextWindow"], 200000);
-        assert_eq!(model["maxTokens"], 32000);
+        assert_eq!(model["name"], "ARC Sage");
+        assert_eq!(model["reasoning"], false);
+        assert_eq!(model["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(model["contextWindow"], 1000000);
+        assert_eq!(model["maxTokens"], 128000);
+        assert_eq!(provider["models"][1]["name"], "ARC Swift");
+        assert_eq!(provider["models"][1]["maxTokens"], 128000);
         for model in provider["models"].as_array().unwrap() {
             assert_eq!(
                 model["compat"],
@@ -251,8 +257,7 @@ mod tests {
             .iter()
             .map(|model| model["id"].as_str().unwrap())
             .collect();
-        // Legacy stays selectable (`rayline/rayline-router`).
-        assert_eq!(ids, ["arc-sage-1.0", "arc-swift-1.0", "rayline-router"]);
+        assert_eq!(ids, ["arc-sage-1.0", "arc-swift-1.0"]);
         assert_eq!(
             responses["models"][0]["compat"]["supportsPromptCacheKey"],
             true

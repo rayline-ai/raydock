@@ -50,11 +50,12 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         .map(|model| {
             json!({
                 "id": model,
-                "name": format!("{} ({})", model_display_name(launch, model), ctx.env_name),
-                "reasoning": true,
+                "name": model_display_name(launch, model),
+                // ARC selects thinking effort; clients must not expose controls.
+                "reasoning": ctx.capabilities.is_some(),
                 "input": ctx.input_modalities(),
                 "contextWindow": ctx.context_window(),
-                "maxTokens": ctx.max_output_tokens()
+                "maxTokens": ctx.max_output_tokens(model)
             })
         })
         .collect();
@@ -78,11 +79,24 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         })
     };
     let mut settings_file = json_file("settings.json", &settings(launch.main), false);
-    // The seed 0.2.x wrote (Legacy as the default); still exactly that means
-    // the user never picked a model, so it moves to the new default.
+    // Hosted catalogs no longer list Legacy. Move an existing Rayline Legacy
+    // selection to Sage, retaining every other Pi setting a user saved.
     if launch.main != ROUTER_MODEL {
-        settings_file.replaces_seed =
-            Some(json_file("settings.json", &settings(ROUTER_MODEL), false).contents);
+        let path = ctx.config_dir.join("settings.json");
+        if let Ok(existing) = std::fs::read_to_string(&path)
+            && let Ok(mut saved) = serde_json::from_str::<serde_json::Value>(&existing)
+            && saved["defaultProvider"] == PROVIDER_ID
+            && saved["defaultModel"] == ROUTER_MODEL
+        {
+            saved["defaultModel"] = json!(launch.main);
+            settings_file = json_file("settings.json", &saved, true);
+            settings_file.merged_from = Some(existing);
+        } else {
+            // The seed 0.2.x wrote (Legacy as the default); still exactly that
+            // means the user never picked a model, so it moves to the new default.
+            settings_file.replaces_seed =
+                Some(json_file("settings.json", &settings(ROUTER_MODEL), false).contents);
+        }
     }
     Plan {
         files: vec![json_file("models.json", &models, true), settings_file],
@@ -96,9 +110,8 @@ mod tests {
     use super::super::Harness;
     use super::super::tests::{TEST_URL, env_value, render};
 
-    fn render_models(dir: &std::path::Path, env_name: &str, allow: bool) -> serde_json::Value {
+    fn render_models(dir: &std::path::Path, allow: bool) -> serde_json::Value {
         let ctx = super::super::RenderContext {
-            env_name,
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
@@ -126,17 +139,17 @@ mod tests {
     #[test]
     fn allow_empty_signature_is_rendered_only_when_on_and_rewritten_each_launch() {
         let dir = super::super::tests::temp_dir("pi-sig");
-        let on = render_models(&dir, "dev", true);
+        let on = render_models(&dir, true);
         assert_eq!(
             on["providers"]["rayline"]["compat"]["allowEmptySignature"],
             true
         );
         // The next launch (prod, or forced off) rewrites models.json without it.
-        let off = render_models(&dir, "prod", false);
+        let off = render_models(&dir, false);
         let compat = &off["providers"]["rayline"]["compat"];
         assert!(compat.get("allowEmptySignature").is_none(), "{compat}");
         assert_eq!(compat["sendSessionAffinityHeaders"], true);
-        let on_again = render_models(&dir, "prod", true);
+        let on_again = render_models(&dir, true);
         assert_eq!(
             on_again["providers"]["rayline"]["compat"]["allowEmptySignature"],
             true
@@ -166,18 +179,22 @@ mod tests {
             .iter()
             .map(|model| model["id"].as_str().unwrap())
             .collect();
-        // ARC first; Legacy stays selectable in pi's model picker.
-        assert_eq!(ids, ["arc-sage-1.0", "arc-swift-1.0", "rayline-router"]);
+        assert_eq!(ids, ["arc-sage-1.0", "arc-swift-1.0"]);
         let model = &provider["models"][0];
-        assert_eq!(model["contextWindow"], 200000);
-        assert_eq!(model["maxTokens"], 32000);
+        assert_eq!(model["name"], "ARC Sage");
+        assert_eq!(model["reasoning"], false);
+        assert_eq!(model["input"], serde_json::json!(["text", "image"]));
+        assert_eq!(model["contextWindow"], 1000000);
+        assert_eq!(model["maxTokens"], 128000);
+        assert_eq!(provider["models"][1]["name"], "ARC Swift");
+        assert_eq!(provider["models"][1]["maxTokens"], 128000);
         let settings = read("settings.json");
         assert_eq!(settings["defaultProvider"], "rayline");
         assert_eq!(settings["defaultModel"], "arc-sage-1.0");
     }
 
     #[test]
-    fn untouched_legacy_seed_moves_to_arc_and_a_saved_pick_is_kept() {
+    fn saved_legacy_pick_moves_to_arc_without_losing_other_settings() {
         let dir = super::super::tests::temp_dir("pi-seed");
         let ctx = super::super::tests::render_context(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -194,10 +211,18 @@ mod tests {
         let upgraded: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
         assert_eq!(upgraded["defaultModel"], "arc-sage-1.0");
-        // A pick pi saved (Legacy, with pi's own settings): kept.
+        // A saved Legacy pick must move to Sage even when pi added settings.
         let picked = "{\n  \"defaultProvider\": \"rayline\",\n  \"defaultModel\": \"rayline-router\",\n  \"theme\": \"dark\"\n}\n";
         std::fs::write(&settings, picked).unwrap();
         super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
-        assert_eq!(std::fs::read_to_string(&settings).unwrap(), picked);
+        let migrated: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(migrated["defaultModel"], "arc-sage-1.0");
+        assert_eq!(migrated["theme"], "dark");
+        // A non-Rayline pick remains the user's explicit choice.
+        let other = "{\n  \"defaultProvider\": \"other\",\n  \"defaultModel\": \"rayline-router\",\n  \"theme\": \"dark\"\n}\n";
+        std::fs::write(&settings, other).unwrap();
+        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), other);
     }
 }

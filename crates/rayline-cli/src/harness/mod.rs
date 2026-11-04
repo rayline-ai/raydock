@@ -15,12 +15,10 @@
 //! last-written key.
 //!
 //! Every config uses Anthropic Messages, except OpenClaw, whose default
-//! provider speaks OpenAI Chat Completions, with `contextWindow` 200000 /
-//! `maxTokens` 32000 against the hosted router. The main agent defaults to ARC
+//! provider speaks OpenAI Chat Completions, with `contextWindow` 1000000 and
+//! `maxTokens` 128000 for the hosted ARC tiers. The main agent defaults to ARC
 //! Sage (`arc-sage-1.0`) and, where the harness has a separate
-//! small/background model role, that role to ARC Swift (`arc-swift-1.0`); each
-//! provider except hosted omp also lists the Legacy Rules Router
-//! (`rayline-router`), selected through the harness's model picker or flag.
+//! small/background model role, that role to ARC Swift (`arc-swift-1.0`).
 //! Under `raydock hybrid run` every renderer keeps `rayline-router` (the execution
 //! core's virtual model) and advertises the hybrid runtime's admitted limits
 //! instead ([`RenderContext::capabilities`]): a harness that asks for more
@@ -89,11 +87,11 @@ pub(crate) struct LaunchModels {
     pub offered: &'static [&'static str],
 }
 
-/// A hosted launch: ARC by default, Legacy by explicit choice.
+/// A hosted launch offers the current ARC tiers only.
 pub(crate) const HOSTED_MODELS: LaunchModels = LaunchModels {
     main: crate::ARC_SAGE_MODEL,
     background: crate::ARC_SWIFT_MODEL,
-    offered: &[crate::ARC_SAGE_MODEL, crate::ARC_SWIFT_MODEL, ROUTER_MODEL],
+    offered: &[crate::ARC_SAGE_MODEL, crate::ARC_SWIFT_MODEL],
 };
 
 /// `raydock hybrid run`: the execution core serves one virtual model.
@@ -114,8 +112,14 @@ pub(crate) fn model_display_name(models: LaunchModels, model: &str) -> &'static 
         _ => "Raydock",
     }
 }
-pub const CONTEXT_WINDOW: u64 = 200_000;
+/// Maximum input context ARC accepts on `arc-sage-1.0` and
+/// `arc-swift-1.0`.
+pub const ARC_CONTEXT_WINDOW: u64 = 1_000_000;
+/// Output ceiling for models outside the hosted ARC tiers (Legacy Rules
+/// Router, hybrid): the harness default the router and execution core admit.
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
+/// Maximum output ARC accepts on `arc-sage-1.0` and `arc-swift-1.0`.
+pub const ARC_MAX_OUTPUT_TOKENS: u64 = 128_000;
 /// Runtime override for [`ConversationIdFallback`]: `1` or `0`.
 pub const CONV_ID_FALLBACK_ENV: &str = "RAYLINE_HARNESS_CONV_ID_FALLBACK";
 
@@ -255,7 +259,6 @@ pub struct RunRequest {
 
 /// What a harness renderer needs.
 pub(crate) struct RenderContext<'a> {
-    pub env_name: &'a str,
     /// The router key, written into the Rayline-owned config.
     pub key: &'a str,
     /// Router origin with no trailing `/` and no `/v1`
@@ -290,13 +293,20 @@ impl RenderContext<'_> {
     /// Context window to advertise for the router model.
     pub fn context_window(&self) -> u64 {
         self.capabilities
-            .map_or(CONTEXT_WINDOW, |caps| caps.context_window)
+            .map_or(ARC_CONTEXT_WINDOW, |caps| caps.context_window)
     }
 
-    /// Output cap to advertise for the router model.
-    pub fn max_output_tokens(&self) -> u64 {
-        self.capabilities
-            .map_or(MAX_OUTPUT_TOKENS, |caps| caps.max_output_tokens)
+    /// Output cap to advertise for `model`: the hybrid runtime's admitted
+    /// limit under `raydock hybrid run`, 128,000 for a hosted ARC tier, and the
+    /// harness default for the Legacy Rules Router.
+    pub fn max_output_tokens(&self, model: &str) -> u64 {
+        match self.capabilities {
+            Some(caps) => caps.max_output_tokens,
+            None if matches!(model, crate::ARC_SAGE_MODEL | crate::ARC_SWIFT_MODEL) => {
+                ARC_MAX_OUTPUT_TOKENS
+            }
+            None => MAX_OUTPUT_TOKENS,
+        }
     }
 
     /// Input modalities to advertise for the router model.
@@ -406,7 +416,6 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
 
     let config_dir = config_dir(&home, harness, &env_name);
     let ctx = RenderContext {
-        env_name: &env_name,
         key: &key,
         router_url: &router_url,
         config_dir: &config_dir,
@@ -799,7 +808,6 @@ pub(crate) mod tests {
     /// A hosted dev context writing into `dir`.
     pub(crate) fn render_context(dir: &Path) -> RenderContext<'_> {
         RenderContext {
-            env_name: "dev",
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
@@ -824,7 +832,6 @@ pub(crate) mod tests {
         let home = temp_dir(harness.name());
         let dir = config_dir(&home, harness, "dev");
         let ctx = RenderContext {
-            env_name: "dev",
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,

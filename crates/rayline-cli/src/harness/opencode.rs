@@ -33,9 +33,17 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let models = ctx.models();
     let mut entries = serde_json::Map::new();
     for model in models.offered {
+        // Hosted OpenCode exposes ARC Sage and ARC Swift only. The hybrid
+        // launcher has one virtual router model supplied by its execution core.
+        if ctx.capabilities.is_none()
+            && *model != crate::ARC_SAGE_MODEL
+            && *model != crate::ARC_SWIFT_MODEL
+        {
+            continue;
+        }
         let mut entry = json!({
             "name": model_display_name(models, model),
-            "limit": { "context": ctx.context_window(), "output": ctx.max_output_tokens() },
+            "limit": { "context": ctx.context_window(), "output": ctx.max_output_tokens(model) },
             "modalities": { "input": ctx.input_modalities(), "output": ["text"] },
             "tool_call": true
         });
@@ -59,7 +67,11 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         "small_model": format!("{PROVIDER_ID}/{}", models.background),
         "provider": {
             PROVIDER_ID: {
-                "name": format!("Raydock ({})", ctx.env_name),
+                // OpenCode appends the provider label to each model's `name` in
+                // its selector. Keep this stable and product-facing: the model
+                // entry supplies `ARC Sage` / `ARC Swift`, while this identifies
+                // their provider as Rayline without leaking an environment name.
+                "name": "Rayline",
                 // Messages rather than opencode's default for custom providers
                 // (chat completions): the launcher's chosen protocol.
                 "npm": "@ai-sdk/anthropic",
@@ -211,23 +223,25 @@ mod tests {
         assert_eq!(config["model"], "rayline/arc-sage-1.0");
         assert_eq!(config["small_model"], "rayline/arc-swift-1.0");
         let provider = &config["provider"]["rayline"];
+        assert_eq!(provider["name"], "Rayline");
         assert_eq!(provider["npm"], "@ai-sdk/anthropic");
         assert_eq!(provider["options"]["baseURL"], format!("{TEST_URL}/v1"));
         assert_eq!(provider["options"]["apiKey"], TEST_KEY);
         assert_eq!(provider["options"]["headers"], serde_json::json!({}));
-        // Legacy stays selectable (`-m rayline/rayline-router`).
+        // OpenCode's hosted Rayline provider exposes only the two ARC tiers.
         let ids: Vec<_> = provider["models"].as_object().unwrap().keys().collect();
-        assert_eq!(ids.len(), 3);
-        for id in ["arc-sage-1.0", "arc-swift-1.0", "rayline-router"] {
+        assert_eq!(ids.len(), 2);
+        for id in ["arc-sage-1.0", "arc-swift-1.0"] {
             assert!(provider["models"].get(id).is_some(), "{id}");
         }
-        assert_eq!(
-            provider["models"]["rayline-router"]["name"],
-            "Legacy Rules Router"
-        );
+        assert!(provider["models"].get("rayline-router").is_none());
         let model = &provider["models"]["arc-sage-1.0"];
-        assert_eq!(model["limit"]["context"], 200000);
-        assert_eq!(model["limit"]["output"], 32000);
+        assert_eq!(model["limit"]["context"], 1000000);
+        assert_eq!(model["limit"]["output"], 128000);
+        assert_eq!(
+            provider["models"]["arc-swift-1.0"]["limit"],
+            serde_json::json!({ "context": 1000000, "output": 128000 })
+        );
         assert_eq!(
             model["modalities"]["input"],
             serde_json::json!(["text", "image"])
@@ -294,7 +308,6 @@ mod tests {
     fn opencode_1_keeps_its_attachment_and_reasoning_flags() {
         let dir = super::super::tests::temp_dir("opencode-1");
         let ctx = RenderContext {
-            env_name: "dev",
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,

@@ -82,9 +82,9 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "name": model_display_name(launch, model),
                 // ARC owns reasoning effort; do not expose omp thinking controls.
                 "reasoning": !hosted_arc,
-                "input": if hosted_arc { json!(["text"]) } else { ctx.input_modalities() },
+                "input": ctx.input_modalities(),
                 "contextWindow": ctx.context_window(),
-                "maxTokens": ctx.max_output_tokens()
+                "maxTokens": ctx.max_output_tokens(model)
             });
             if hosted_arc {
                 // USD / million tokens, effective card 26 (2026-10-27).
