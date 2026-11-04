@@ -751,7 +751,7 @@ fn anthropic_endpoint_config(name: &str, up_port: u16) -> PathBuf {
 
 /// The cloud router names each forwarded request in `x-rayline-route-id`. A
 /// passthrough forward keeps that id on the response it returns and on the
-/// request's metrics row, so `rayline top` and the log can name the cloud route a
+/// request's metrics row, so `raydock top` and the log can name the cloud route a
 /// local request became; the id is on the headers, so a streaming response needs
 /// no buffering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1561,7 +1561,7 @@ async fn responses_namespace_tools_reach_anthropic_or_are_refused() {
 }
 
 /// A request refused for a hosted tool the route cannot run is announced to
-/// metrics like any other; it must also be closed out there, or `rayline top`
+/// metrics like any other; it must also be closed out there, or `raydock top`
 /// shows it as active forever.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refused_hosted_tool_request_is_not_left_active_in_metrics() {

@@ -222,7 +222,7 @@ async fn passthrough_response(
     // `RequestStarted` nor `RouteDecided`, and nothing completes its rows.
     // Recording the id here WOULD create a row (the metrics arm starts one when
     // it finds none), and nothing would ever close it — an orphan stuck active
-    // in `rayline top`. So only the response header carries the id until that
+    // in `raydock top`. So only the response header carries the id until that
     // lifecycle exists.
     stamp_upstream_request_id(
         &mut headers_out,

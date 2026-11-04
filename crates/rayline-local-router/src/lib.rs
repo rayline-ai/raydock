@@ -3106,7 +3106,7 @@ async fn response_from_reqwest(
     // upstream chose comes back in its `x-rayline-selected-model` response header,
     // whereas `decision.selected_model` is only the sentinel (`rayline-router`).
     // Prefer the upstream value for both the re-stamped outbound header and the
-    // usage metric, so `rayline top` shows the real model — never overwrite an
+    // usage metric, so `raydock top` shows the real model — never overwrite an
     // upstream-provided value with the sentinel.
     let upstream_selected_model = resp
         .headers()
@@ -6887,7 +6887,7 @@ mod tests {
     /// A 307 whose `Location` fails the loopback guard is answered 502 and never
     /// reaches an adapter, so nothing downstream closes the request's metrics
     /// row — and that row may exist only because the 307's upstream id was
-    /// recorded. The rejection must close it, or `rayline top` shows the turn
+    /// recorded. The rejection must close it, or `raydock top` shows the turn
     /// active forever.
     #[tokio::test]
     async fn rejected_may_local_redirect_closes_the_metrics_row() {
