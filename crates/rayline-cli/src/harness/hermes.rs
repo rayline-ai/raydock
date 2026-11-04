@@ -5,12 +5,15 @@
 //! Episode keying: both providers declare [`SESSION_AFFINITY_KEY`], Hermes'
 //! opt-in per-provider key (from v2026.9.21), so Hermes sends a conversation
 //! key as `x-session-affinity` on every request, which the router keys the
-//! episode on. For a session the key is its declared scope (`gwk_…`, which
-//! `-c` / `--resume` keeps); a `delegate_task` child gets no scope of its own
-//! and sends its parent's root session id instead. The two differ, so the
-//! child's turns land outside the parent's episode while the parent's title
-//! side call stays inside it. Every child of one parent shares that second
-//! episode, and the split relies on the parent having a declared scope.
+//! episode on. Hermes resolves that key as its declared scope, else its
+//! ambient conversation root. Interactive chat runs each turn in Hermes' own
+//! gateway, which declares a scope (`gwk_…`, kept by `-c` / `--resume`), while
+//! a `delegate_task` child gets none and sends its parent's root session id.
+//! The two differ, so the child's turns land outside the parent's episode
+//! while the parent's title side call stays inside it; every child of one
+//! parent shares that second episode. A one-shot `-q` run builds its agent
+//! in-process with no declared scope, so there the parent sends its own root
+//! and a child the same value: one episode for all of them.
 //! Older Hermes releases warn once per provider that the key is unknown and
 //! then ignore it, so declaring it never fails a launch; they never applied
 //! `extra_headers` on Messages either, so the per-launch id gave them no
