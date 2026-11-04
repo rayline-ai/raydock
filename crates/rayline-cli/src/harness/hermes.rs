@@ -3,14 +3,18 @@
 //! `${VAR}` is expanded in config values.
 //!
 //! Episode keying: both providers declare [`SESSION_AFFINITY_KEY`], Hermes'
-//! opt-in per-provider key (from v2026.9.21), so Hermes sends its own
-//! conversation id as `x-session-affinity` on every request, which the router
-//! keys the episode on. Hermes mints that id per session and declines to mint
-//! one for an explicit fork, so a `delegate_task` subagent falls back to its
-//! own session id and lands in its own episode, while the parent's turns and
-//! its title side call stay together; `-c` / `--resume` keeps the parent's.
+//! opt-in per-provider key (from v2026.9.21), so Hermes sends a conversation
+//! key as `x-session-affinity` on every request, which the router keys the
+//! episode on. For a session the key is its declared scope (`gwk_…`, which
+//! `-c` / `--resume` keeps); a `delegate_task` child gets no scope of its own
+//! and sends its parent's root session id instead. The two differ, so the
+//! child's turns land outside the parent's episode while the parent's title
+//! side call stays inside it. Every child of one parent shares that second
+//! episode, and the split relies on the parent having a declared scope.
 //! Older Hermes releases warn once per provider that the key is unknown and
-//! then ignore it, so declaring it never fails a launch.
+//! then ignore it, so declaring it never fails a launch; they never applied
+//! `extra_headers` on Messages either, so the per-launch id gave them no
+//! identity on that wire.
 //!
 //! Neither provider sends the per-launch `x-conversation-id` unless
 //! `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` forces it, including under
@@ -19,7 +23,10 @@
 //! per-launch id. A per-launch id would instead put a subagent, the parent and
 //! the side call in one episode, since Hermes attaches a provider's
 //! `extra_headers` to every request of the process and the gateway ranks
-//! `x-conversation-id` ahead of `x-session-affinity`.
+//! `x-conversation-id` ahead of `x-session-affinity`. One Hermes call skips
+//! the affinity merge: the summary it requests on reaching its iteration cap,
+//! on Messages only. Under hybrid on `--provider rayline-anth` the core
+//! refuses that call and Hermes reports the cap with no summary.
 //!
 //! The `rayline-resp` provider (`--provider rayline-resp`) speaks Responses.
 //! Each entry has its own base_url because Hermes looks up `extra_headers` and
