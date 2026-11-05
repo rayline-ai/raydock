@@ -10,7 +10,7 @@
 //! ```json
 //! {"hybrid": {"routing": {"policy": "utility" | "prefer_local", "min_p_pass": 0.65,
 //!                         "schedule": {"model": ["cache_boundaries", "user_messages"]},
-//!                         "value_usd": 0.1},
+//!                         "v_value": 0.1},
 //!             "local_context_window": 98304}}
 //! ```
 //!
@@ -236,7 +236,7 @@ pub(crate) fn compose(
         .map(ToOwned::to_owned);
     routing.insert("policy".to_owned(), Value::Object(policy));
     if let Some(value) = set_value {
-        routing.insert("value_usd".to_owned(), json!(value));
+        routing.insert("v_value".to_owned(), json!(value));
         // The core executes the returned custom result for a configured V.
         decisions.insert("result".to_owned(), json!("custom"));
     }
@@ -274,17 +274,17 @@ pub(crate) fn compose(
 /// The mapped `routing.policy`, its source and an optional V.
 type MappedRouting = (Map<String, Value>, PolicySource, Option<f64>);
 
-/// Map the override block onto `routing.policy` and `routing.value_usd`.
+/// Map the override block onto `routing.policy` and `routing.v_value`.
 fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRouting, String> {
     let block = block.and_then(Value::as_object);
     if let Some(block) = block {
         for key in block.keys() {
             if !matches!(
                 key.as_str(),
-                "policy" | "schedule" | "value_usd" | "min_p_pass" | "local_price"
+                "policy" | "schedule" | "v_value" | "min_p_pass" | "local_price"
             ) {
                 return Err(format!(
-                    "settings hybrid.routing.{key} is not supported (policy, schedule, value_usd, min_p_pass, local_price)"
+                    "settings hybrid.routing.{key} is not supported (policy, schedule, v_value, min_p_pass, local_price)"
                 ));
             }
         }
@@ -356,13 +356,13 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
             .ok_or("profile routing.policy.overrides must be an object")?;
         overrides.insert("selection".to_owned(), json!({"min_p_pass": threshold}));
     }
-    let value = match block.and_then(|block| block.get("value_usd")) {
+    let value = match block.and_then(|block| block.get("v_value")) {
         None => None,
         Some(value) => Some(
             value
                 .as_f64()
                 .filter(|value| (0.1..=5.0).contains(value))
-                .ok_or("settings hybrid.routing.value_usd must be a number between 0.1 and 5")?,
+                .ok_or("settings hybrid.routing.v_value must be a number between 0.1 and 5")?,
         ),
     };
     Ok((policy, source, value))
@@ -514,7 +514,7 @@ pub(crate) fn default_profile(
     prices.insert(LOCAL_REGISTRY_MODEL.to_owned(), legs);
     let mut decisions = json!({"api_mode": API_MODE_V2, "url": format!("{router}/v1/routes"),
                                "auth_env": ROUTER_KEY_ENV, "model": "rayline-router", "result": "custom",
-                               "routing": {"value_usd": DEFAULT_VALUE_USD, "prices": prices, "exclusive": false},
+                               "routing": {"v_value": DEFAULT_VALUE_USD, "prices": prices, "exclusive": false},
                                "price_sha256": caller_price_sha256(LOCAL_REGISTRY_MODEL, local_price)});
     if let Some(cell) = cell {
         decisions["cell_tag"] = json!(cell);
@@ -948,14 +948,14 @@ mod tests {
             json!({"preset": HYBRID_DEFAULT_PRESET})
         );
         assert_eq!(decisions["result"], "top");
-        assert!(decisions["routing"].get("value_usd").is_none());
+        assert!(decisions["routing"].get("v_value").is_none());
         assert_eq!(composed.policy, PolicySource::Default);
         assert_eq!(composed.config["package_path"], "/profiles/package.json");
     }
 
     #[test]
     fn override_block_maps_to_policy_schedule_and_value() {
-        let block = json!({"policy": "utility", "schedule": {"model": ["cache_boundaries", "user_messages"], "thinking": ["all_turns"]}, "value_usd": 0.1});
+        let block = json!({"policy": "utility", "schedule": {"model": ["cache_boundaries", "user_messages"], "thinking": ["all_turns"]}, "v_value": 0.1});
         let composed = compose(
             profile(),
             Some(&settings(Some(block))),
@@ -968,7 +968,7 @@ mod tests {
             decisions["routing"]["policy"],
             json!({"preset": HYBRID_DEFAULT_PRESET, "overrides": {"schedule": {"model": ["cache_boundaries", "user_messages"], "thinking": ["all_turns"]}}})
         );
-        assert_eq!(decisions["routing"]["value_usd"], 0.1);
+        assert_eq!(decisions["routing"]["v_value"], 0.1);
         assert_eq!(decisions["result"], "custom");
         assert_eq!(composed.policy, PolicySource::Settings);
     }
@@ -1123,7 +1123,7 @@ mod tests {
             json!({"qwen/qwen3.8-27b": {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0}})
         );
         assert_eq!(decisions["routing"]["exclusive"], false);
-        assert_eq!(decisions["routing"]["value_usd"], 0.5);
+        assert_eq!(decisions["routing"]["v_value"], 0.5);
         assert_eq!(decisions["result"], "custom");
         // Equal to the dev service's own echo for this price world.
         assert_eq!(
@@ -1131,7 +1131,7 @@ mod tests {
             "5c2ccbe09f4b5f9938df5ca93282b5a39b3573cae108d5e6abf89de3466d254c"
         );
         // A user V override keeps the local price.
-        let block = json!({"value_usd": 2.0});
+        let block = json!({"v_value": 2.0});
         let profile = default_profile(
             "https://api-dev.rayline.ai",
             "http://127.0.0.1:8080/v1",
@@ -1149,7 +1149,7 @@ mod tests {
         )
         .unwrap()
         .config;
-        assert_eq!(config["decisions"]["routing"]["value_usd"], 2.0);
+        assert_eq!(config["decisions"]["routing"]["v_value"], 2.0);
         assert!(config["decisions"]["routing"].get("prices").is_some());
         // local_price is configurable and validated; it is refused for a profile file.
         let priced = settings(Some(json!({"local_price": 0.05})));
@@ -1323,7 +1323,7 @@ mod tests {
         assert!(
             compose(
                 legacy,
-                Some(&settings(Some(json!({"value_usd": 1.0})))),
+                Some(&settings(Some(json!({"v_value": 1.0})))),
                 Path::new("/p"),
                 ProfileOrigin::File
             )
@@ -1360,10 +1360,11 @@ mod tests {
             json!({"schedule": {"model": []}}),
             json!({"schedule": {"model": ["user_messages", "user_messages"]}}),
             json!({"schedule": {"tools": ["all_turns"]}}),
-            json!({"value_usd": -1}),
-            json!({"value_usd": 0}),
-            json!({"value_usd": 6}),
-            json!({"value_usd": "0.1"}),
+            json!({"v_value": -1}),
+            json!({"v_value": 0}),
+            json!({"v_value": 6}),
+            json!({"v_value": "0.1"}),
+            json!({"value_usd": 0.5}),
             json!({"selection": {"min_p_pass": 0.5}}),
         ] {
             assert!(
@@ -1395,7 +1396,7 @@ mod tests {
         assert!(
             compose(
                 legacy,
-                Some(&settings(Some(json!({"value_usd": 1.0})))),
+                Some(&settings(Some(json!({"v_value": 1.0})))),
                 Path::new("/p"),
                 ProfileOrigin::File
             )

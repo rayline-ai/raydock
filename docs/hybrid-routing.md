@@ -117,7 +117,7 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   ```json
   {"hybrid": {"routing": {"policy": "utility",
                           "schedule": {"model": ["cache_boundaries", "user_messages"]},
-                          "value_usd": 0.1}}}
+                          "v_value": 0.1}}}
   ```
 
   `policy: "utility"` is the hybrid default preset; `"prefer_local"` selects
@@ -127,7 +127,7 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   `routing.policy.overrides.schedule`; each dimension (`model`, `thinking`)
   lists switch-point classes from `cache_boundaries`, `user_messages` and
   `all_turns`, and the service refuses a class the package does not admit.
-  `value_usd` becomes `routing.value_usd` and selects the returned `custom`
+  `v_value` becomes `routing.v_value` and selects the returned `custom`
   result. Unknown keys are refused.
 - **Local model.** A profile deployment marked `"from_local_model": true`
   takes its endpoint and served model from `local_model`
@@ -465,7 +465,7 @@ resource-constrained dependency scheduler against cases kept outside the agent's
 editable task directory. Agent-written tests do not determine success.
 
 The required `--proof routing` mode verifies that the same configured custom
-`value_usd` and caller price identity were applied to both tasks. Supply inline
+`v_value` and caller price identity were applied to both tasks. Supply inline
 `prices` or a service `price_profile_id`; acceptance requires an explicit
 `price_profile_version` (a positive integer), configured `price_sha256`, and
 `--price-profile-content-hash sha256:<hex>` for a profile. These are separate

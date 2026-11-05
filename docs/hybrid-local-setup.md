@@ -102,7 +102,7 @@ those caller prices with `exclusive: false` so cloud models keep their market
 prices, and uses a moderate V of 0.5. Under these defaults easy work stays on
 device and harder work goes to the cloud. Change them in the override block
 with `local_price` (USD per million tokens, applied to every leg of the local
-model) and `value_usd`.
+model) and `v_value`.
 
 ## Routing policy
 
@@ -124,7 +124,7 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 {"hybrid": {"routing": {"policy": "prefer_local",
                         "min_p_pass": 0.65,
                         "schedule": {"model": ["cache_boundaries", "user_messages"]},
-                        "value_usd": 1.0}}}
+                        "v_value": 1.0}}}
 ```
 
 | Key | Meaning |
@@ -133,7 +133,7 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
 | `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). It must be 0 or between 1e-6 and 1e6. `start --config` refuses it, because a profile file sets its own prices. |
-| `value_usd` | Your V: what a successful task is worth to you in dollars, from 0.1 to 5 (checked at `start`). A higher V favours more capable, more expensive models. It selects ARC's custom result. |
+| `v_value` | Your V: what a successful task is worth to you in dollars, from 0.1 to 5 (checked at `start`). A higher V favours more capable, more expensive models. It selects ARC's custom result. |
 
 Unknown keys are refused. If `settings.json` cannot be read or is not valid
 JSON, or the block is invalid, `start` stops with an error that names the file.

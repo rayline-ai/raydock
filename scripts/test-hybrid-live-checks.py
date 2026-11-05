@@ -11,9 +11,9 @@ CHECKS = runpy.run_path(str(Path(__file__).with_name("test-hybrid-live.py")))
 class RoutingEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.decisions = {"result": "custom", "price_sha256": "a" * 64,
-                          "routing": {"value_usd": .01, "price_profile_id": "local-discount", "price_profile_version": 1}}
+                          "routing": {"v_value": .01, "price_profile_id": "local-discount", "price_profile_version": 1}}
         self.profile_hash = "sha256:" + "b" * 64
-        self.event = {"applied_value_usd": .01, "price_basis": "caller", "price_sha256": "a" * 64,
+        self.event = {"applied_v_value": .01, "price_basis": "caller", "price_sha256": "a" * 64,
                       "price_profile": {"id": "local-discount", "version": 1, "content_hash": "sha256:" + "b" * 64}}
 
     def test_profile_and_inline_prices_are_admitted(self):
@@ -21,7 +21,7 @@ class RoutingEvidenceTests(unittest.TestCase):
             with self.subTest(profile=profile):
                 decisions = copy.deepcopy(self.decisions)
                 if not profile:
-                    decisions["routing"] = {"value_usd": .01, "prices": {"local": {"input": 0}}}
+                    decisions["routing"] = {"v_value": .01, "prices": {"local": {"input": 0}}}
                 CHECKS["require_routing_config"](decisions, self.profile_hash if profile else None)
                 CHECKS["require_applied_routing"](decisions, [self.event], self.profile_hash if profile else None)
 
@@ -42,7 +42,7 @@ class RoutingEvidenceTests(unittest.TestCase):
             CHECKS["require_routing_config"](self.decisions, self.profile_hash)
 
     def test_every_decision_must_have_exact_applied_identity(self):
-        changes = [{"applied_value_usd": .02}, {"price_basis": "catalog"}, {"price_sha256": "b" * 64},
+        changes = [{"applied_v_value": .02}, {"price_basis": "catalog"}, {"price_sha256": "b" * 64},
                    {"price_profile": None}]
         for field in ("id", "version", "content_hash"):
             changed = dict(self.event["price_profile"], **{field: "unexpected"})

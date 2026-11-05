@@ -51,7 +51,7 @@ def require_admitted_decisions(events):
 def require_routing_config(decisions, profile_content_hash=None):
     routing = decisions["routing"]
     assert decisions["result"] == "custom", "routing proof requires an explicit custom V result"
-    assert "value_usd" in routing and decisions.get("price_sha256"), "routing proof requires pinned V and caller price identity"
+    assert "v_value" in routing and decisions.get("price_sha256"), "routing proof requires pinned V and caller price identity"
     if "price_profile_id" in routing:
         version = routing.get("price_profile_version")
         assert routing["price_profile_id"] and type(version) is int and 0 < version <= 2**53 - 1, "routing proof requires a profile ID and explicit positive integer version"
@@ -64,7 +64,7 @@ def require_routing_config(decisions, profile_content_hash=None):
 
 def require_applied_routing(decisions, selected, profile_content_hash=None):
     routing = decisions["routing"]
-    assert selected and all(event["applied_value_usd"] == routing["value_usd"] and event["price_basis"] == "caller"
+    assert selected and all(event["applied_v_value"] == routing["v_value"] and event["price_basis"] == "caller"
                             and event["price_sha256"] == decisions["price_sha256"] for event in selected), "V or discounted prices were not applied"
     if "price_profile_id" in routing:
         expected = {"id": routing["price_profile_id"], "version": routing["price_profile_version"],
