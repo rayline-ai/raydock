@@ -1718,6 +1718,19 @@ fn assert_row_closed(
     assert_eq!(row.input_tokens, Some(input_tokens));
     assert_eq!(row.output_tokens, Some(output_tokens));
     assert_eq!(row.prompt_cache_tokens, prompt_cache_tokens);
+    // The cache column is a rate, so the row needs the prompt total the cached
+    // part is measured against, not just the cached count.
+    match prompt_cache_tokens {
+        Some(cached) => {
+            assert_eq!(row.prompt_tokens, Some(input_tokens));
+            assert_eq!(
+                row.cache_hit_ratio,
+                Some(cached as f64 / input_tokens as f64),
+                "cache hit rate should be reported, not blank"
+            );
+        }
+        None => assert_eq!(row.cache_hit_ratio, None),
+    }
     assert_eq!(
         (snapshot.totals.input_tokens, snapshot.totals.output_tokens),
         (input_tokens, output_tokens)
@@ -1764,6 +1777,41 @@ async fn responses_anthropic_sse_answer_non_streaming_client_closes_metrics_row(
         "responses-sse-nonstream-metrics",
         anthropic_sse("done"),
         false,
+    )
+    .await;
+    assert_row_closed(&snapshot, 1, 1, None);
+}
+
+/// Streaming on both sides is the normal interactive Codex turn: the upstream
+/// SSE is translated event by event and the stream task closes the row. That
+/// row must carry the cached prompt count too, or `raydock top`'s cache column
+/// reads as a miss for the shape most turns take. The upstream here sends the
+/// Rayline router's placeholder `message_start` (zero input, `null` cache) with
+/// the real counts in the final `message_delta`, as a translating gateway does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_anthropic_sse_answer_streaming_closes_metrics_row_with_cache_tokens() {
+    let upstream = http_sse(concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"x\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":null,\"output_tokens\":0}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":42,\"cache_read_input_tokens\":5,\"output_tokens\":17}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    ));
+    let snapshot = responses_turn_metrics("responses-sse-stream-metrics", upstream, true).await;
+    assert_row_closed(&snapshot, 47, 17, Some(5));
+}
+
+/// A streamed turn whose upstream never reports cache tokens leaves the cache
+/// count unset rather than claiming a zero-token hit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_anthropic_sse_answer_streaming_without_cache_tokens_leaves_cache_unset() {
+    let snapshot = responses_turn_metrics(
+        "responses-sse-stream-nocache-metrics",
+        anthropic_sse("done"),
+        true,
     )
     .await;
     assert_row_closed(&snapshot, 1, 1, None);

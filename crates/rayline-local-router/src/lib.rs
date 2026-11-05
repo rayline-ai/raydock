@@ -5447,13 +5447,18 @@ fn anthropic_stream_to_responses(
                         request_id: request_id.clone(),
                     });
                 }
-                metrics.record(MetricsUpdate::RequestCompleted {
-                    request_id: request_id.clone(),
-                    status_code: Some(StatusCode::OK.as_u16()),
-                    input_tokens: Some(translator.input_tokens()),
-                    output_tokens: Some(translator.output_tokens_estimate()),
-                    selected_model: Some(selected_model),
-                });
+                // Same counts the streamed body reports, so the row carries the
+                // cached part too; the buffered branches already do this.
+                let usage = translator.usage_or_estimates();
+                emit_completed_metrics(
+                    metrics,
+                    &request_id,
+                    StatusCode::OK.as_u16(),
+                    Some(usage.prompt_tokens()),
+                    usage.output_tokens,
+                    Some(usage.cache_read_input_tokens).filter(|count| *count > 0),
+                    Some(selected_model),
+                );
             }
         }
     });
