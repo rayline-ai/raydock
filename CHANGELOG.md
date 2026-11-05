@@ -20,6 +20,14 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Changed
 
+- **V is now `v_value` (breaking).** The `hybrid.routing` override in
+  `settings.json` takes V as `v_value`, and hybrid routing sends it to the
+  Routes API as `routing.v_value`, which is the API's new name for the
+  member. The old `value_usd` key is refused at `start`
+  (`settings hybrid.routing.value_usd is not supported`); rename it in
+  `settings.json`. A profile file sets V under `decisions.routing.v_value`.
+  Hybrid routing needs this release from the moment the Routes API stops
+  accepting `value_usd`.
 - Hosted `raydock claude` now picks the model of every Claude Code subagent and
   background task, ignoring the models Claude Code's own agent definitions
   name. Without `--model`, they run on `arc-swift-1.0`; with `--model X`

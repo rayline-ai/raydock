@@ -3083,7 +3083,7 @@ mod tests {
         let path = settings_file(&home);
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         for bad in [
-            "{\"hybrid\": {\"routing\": {\"value_usd\": 1e999}}}",
+            "{\"hybrid\": {\"routing\": {\"v_value\": 1e999}}}",
             "{\"hybrid\": {\"routing\": {\"policy\": \"utility\",}}}",
             "",
         ] {
@@ -3096,12 +3096,12 @@ mod tests {
             // The lenient reader other commands use is unchanged.
             assert!(read_settings(&home).is_none());
         }
-        fs::write(&path, "{\"hybrid\": {\"routing\": {\"value_usd\": 1}}}").expect("write");
+        fs::write(&path, "{\"hybrid\": {\"routing\": {\"v_value\": 1}}}").expect("write");
         let (found, value) = read_settings_checked(&home)
             .expect("valid")
             .expect("present");
         assert_eq!(found, path);
-        assert_eq!(value["hybrid"]["routing"]["value_usd"], 1);
+        assert_eq!(value["hybrid"]["routing"]["v_value"], 1);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -117,7 +117,7 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   ```json
   {"hybrid": {"routing": {"policy": "utility",
                           "schedule": {"model": ["cache_boundaries", "user_messages"]},
-                          "value_usd": 0.1}}}
+                          "v_value": 0.1}}}
   ```
 
   `policy: "utility"` is the hybrid default preset; `"prefer_local"` selects
@@ -127,7 +127,7 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   `routing.policy.overrides.schedule`; each dimension (`model`, `thinking`)
   lists switch-point classes from `cache_boundaries`, `user_messages` and
   `all_turns`, and the service refuses a class the package does not admit.
-  `value_usd` becomes `routing.value_usd` and selects the returned `custom`
+  `v_value` becomes `routing.v_value` and selects the returned `custom`
   result. Unknown keys are refused.
 - **Local model.** A profile deployment marked `"from_local_model": true`
   takes its endpoint and served model from `local_model`
@@ -239,9 +239,11 @@ unchanged body. Requests without usable identity must fail in the core.
 Branch identity uses `x-rayline-branch-id`, then Codex `thread-id`, then
 `x-claude-code-agent-id`. An OpenCode request with `x-parent-session-id` uses its
 child session header for the branch. Other requests explicitly use branch
-`main`. Parent and child headers reach the core unchanged. Launchers whose
-harness cannot emit native identity use the existing explicit per-launch
-conversation header.
+`main`. Parent and child headers reach the core unchanged. Every launcher's
+harness emits native identity on the wires it uses (Hermes with the caveats
+its launcher module documents); the explicit per-launch
+`x-conversation-id` is opt-in (`RAYLINE_HARNESS_CONV_ID_FALLBACK=1`) and, when
+sent, ranks ahead of the harness-native identities.
 
 Every start creates a new execution instance and new gateway/core credentials.
 `status` verifies the live instance ID and both process IDs. A core crash closes
@@ -463,7 +465,7 @@ resource-constrained dependency scheduler against cases kept outside the agent's
 editable task directory. Agent-written tests do not determine success.
 
 The required `--proof routing` mode verifies that the same configured custom
-`value_usd` and caller price identity were applied to both tasks. Supply inline
+`v_value` and caller price identity were applied to both tasks. Supply inline
 `prices` or a service `price_profile_id`; acceptance requires an explicit
 `price_profile_version` (a positive integer), configured `price_sha256`, and
 `--price-profile-content-hash sha256:<hex>` for a profile. These are separate

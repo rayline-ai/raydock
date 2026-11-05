@@ -806,19 +806,25 @@ fn harness_command(
                 key: token,
                 router_url: endpoint,
                 config_dir: &config_dir,
-                conversation_id: crate::harness::ConversationIdFallback { forced: None },
+                conversation_id: crate::harness::ConversationIdFallback::new(
+                    std::env::var(crate::harness::CONV_ID_FALLBACK_ENV)
+                        .ok()
+                        .as_deref(),
+                ),
                 allow_empty_signature: true,
                 capabilities: Some(capabilities),
                 harness_major_version: major_version,
             };
             let plan = harness.plan(&ctx).map_err(io::Error::other)?;
             crate::harness::write_files(&config_dir, &plan.files)?;
-            // Used only by harnesses which cannot transmit native session identity.
-            let conversation_id = format!("hybrid-{:032x}", rand::random::<u128>());
+            // The per-launch id is opt-in here as on the hosted path, and is
+            // exported only when a rendered config references it.
+            let conversation_id =
+                crate::harness::conversation_id_for(&plan, crate::harness::new_conversation_id);
             command = crate::harness::build_command(
                 Path::new(name),
                 &plan,
-                Some(&conversation_id),
+                conversation_id.as_deref(),
                 &args,
             );
             command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
@@ -991,6 +997,9 @@ fn private_log(path: &Path) -> io::Result<fs::File> {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that set a process-wide env var.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_dir(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1074,11 +1083,11 @@ mod tests {
         let path = Path::new("/home/user/.config/rayline/settings.json");
         let error = settings_error(
             Some(path),
-            "settings hybrid.routing.value_usd must be a number between 0.1 and 5".to_owned(),
+            "settings hybrid.routing.v_value must be a number between 0.1 and 5".to_owned(),
         );
         assert_eq!(
             error.to_string(),
-            "/home/user/.config/rayline/settings.json: settings hybrid.routing.value_usd must be a number between 0.1 and 5"
+            "/home/user/.config/rayline/settings.json: settings hybrid.routing.v_value must be a number between 0.1 and 5"
         );
         let other = settings_error(
             Some(path),
@@ -1153,6 +1162,10 @@ mod tests {
     /// defaults the core refuses (#123).
     #[test]
     fn every_harness_advertises_the_admitted_limits() {
+        // The launcher reads the fallback override from the process env.
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let core = ModelCapabilities {
             context_window: 98_304,
             max_output_tokens: 4096,
@@ -1251,6 +1264,96 @@ mod tests {
             "{args:?}"
         );
         let _ = fs::remove_dir_all(&paths.dir);
+    }
+
+    /// Sets the fallback override for one scope and restores the prior value
+    /// on drop, also while unwinding, so a failed assertion cannot leak `1`
+    /// into later tests. Callers hold [`ENV_LOCK`].
+    struct FallbackOverride(Option<std::ffi::OsString>);
+
+    impl FallbackOverride {
+        fn set(value: Option<&str>) -> Self {
+            let prior = std::env::var_os(crate::harness::CONV_ID_FALLBACK_ENV);
+            // SAFETY: serialized by ENV_LOCK among the tests that take it and
+            // by the `--test-threads=1` gate for the rest; restored by Drop.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(crate::harness::CONV_ID_FALLBACK_ENV, value),
+                    None => std::env::remove_var(crate::harness::CONV_ID_FALLBACK_ENV),
+                }
+            }
+            Self(prior)
+        }
+    }
+
+    impl Drop for FallbackOverride {
+        fn drop(&mut self) {
+            // SAFETY: serialized as above; ENV_LOCK is still held by the caller.
+            unsafe {
+                match &self.0 {
+                    Some(prior) => std::env::set_var(crate::harness::CONV_ID_FALLBACK_ENV, prior),
+                    None => std::env::remove_var(crate::harness::CONV_ID_FALLBACK_ENV),
+                }
+            }
+        }
+    }
+
+    /// A hybrid launch keys the episode on the harness's own session id, so no
+    /// config references the per-launch id and none is exported. Setting
+    /// `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on here as on the hosted
+    /// path, and only then is the env var set.
+    #[test]
+    fn hybrid_conversation_id_fallback_is_opt_in() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capabilities = harness_capabilities(ModelCapabilities {
+            context_window: 98_304,
+            max_output_tokens: 4096,
+            input_modalities: vec!["text".into()],
+        });
+        let conv_env = std::ffi::OsStr::new(crate::harness::CONV_ID_ENV);
+        let launch = |paths: &Paths, name: &str| {
+            let command = harness_command(
+                paths,
+                name,
+                &[],
+                "http://127.0.0.1:20815",
+                "local-token",
+                &capabilities,
+            )
+            .unwrap();
+            // Every file the launch wrote for this harness, so the assertion
+            // does not depend on which one carries the header.
+            let config: String = fs::read_dir(paths.dir.join("harness").join(name))
+                .unwrap()
+                .filter_map(|entry| fs::read_to_string(entry.unwrap().path()).ok())
+                .collect();
+            let exported = command
+                .get_envs()
+                .find(|(key, _)| *key == conv_env)
+                .map(|(_, value)| value.is_some());
+            (config, exported)
+        };
+        // Off: explicitly unset, so a value inherited from the developer's
+        // shell cannot turn the fallback on. An exported-but-removed id
+        // (`Some(false)`) shows an inherited id cannot leak in either.
+        for (forced, sends) in [(None, false), (Some("1"), true)] {
+            let _override = FallbackOverride::set(forced);
+            for name in ["hermes", "pi", "opencode", "omp", "openclaw"] {
+                let paths = Paths {
+                    dir: temp_dir(&format!("conv-{}-{name}", if sends { "on" } else { "off" })),
+                };
+                let (config, exported) = launch(&paths, name);
+                assert_eq!(
+                    config.contains(crate::harness::CONV_HEADER),
+                    sends,
+                    "{name}: {config}"
+                );
+                assert_eq!(exported, Some(sends), "{name}");
+                let _ = fs::remove_dir_all(&paths.dir);
+            }
+        }
     }
 
     #[test]
