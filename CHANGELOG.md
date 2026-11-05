@@ -94,6 +94,19 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 - **Supply-chain checks recognize the reviewed Boost license** for the pinned
   `xxhash-rust` dependency used by omp's native lock compatibility. The exception
   is crate/version-scoped, and distributed notices include the license text.
+- **Non-streaming Responses turns on an Anthropic route no longer stay active
+  in `raydock top`.** When a Codex `/v1/responses` turn is served through an
+  `anthropic_messages` endpoint and the translation is not stream-to-stream
+  (a `stream: false` turn such as Codex compaction, or a `stream: true` turn
+  the upstream answered in one piece), the local router now closes the
+  request's metrics row with the upstream's token counts (whole prompt,
+  output, cached part) and the selected model. Those turns were left in
+  `active` with state `routed` forever, so `raydock top` listed them as
+  never finishing, `active_requests` was wrong and the completed and token
+  totals missed them. A buffered upstream stream that reported an error or
+  stopped early is recorded as an error, not a completion. Response bodies
+  are unchanged. A Responses turn served on-device is recorded by the
+  adapter, as before, and no longer also leaves a bare duplicate row.
 
 ## 0.3.0 (2026-10-28)
 

@@ -2716,10 +2716,13 @@ async fn forward_responses_to_local_adapter(
         .json(&anthropic)
         .send()
         .await?;
+    // No metrics here: the local adapter records FirstToken/RequestCompleted for
+    // this same request id (it is in the query string), so closing the row here
+    // too would push a second, bare row into `recent` and double-count totals.
     anthropic_response_to_responses(
         resp,
         decision,
-        state.opts.metrics.clone(),
+        None,
         ResponsesTranslation {
             request_id: request_id.to_owned(),
             estimated_input_tokens,
@@ -5246,33 +5249,63 @@ async fn anthropic_response_to_responses(
         .to_ascii_lowercase();
     let upstream_request_id = upstream_request_id(resp.headers());
     record_upstream_request_id(metrics.as_ref(), request_id, upstream_request_id.as_deref());
-    let mut response = if content_type.contains("text/event-stream") {
-        if want_stream {
-            anthropic_stream_to_responses(
-                resp,
-                decision,
-                metrics,
-                request_id.clone(),
-                estimated_input_tokens,
-                output_kind,
-                tool_names.clone(),
-            )
-        } else {
-            let text = resp.text().await?;
-            let value = anthropic_sse_text_to_message(&text, estimated_input_tokens);
-            synthetic_responses_json(
-                decision,
-                &value,
-                request_id,
-                estimated_input_tokens,
-                output_kind,
-                tool_names,
-            )
-        }
+    let upstream_is_sse = content_type.contains("text/event-stream");
+    let mut response = if upstream_is_sse && want_stream {
+        // The stream task closes the metrics row when the upstream finishes.
+        anthropic_stream_to_responses(
+            resp,
+            decision,
+            metrics,
+            request_id.clone(),
+            estimated_input_tokens,
+            output_kind,
+            tool_names.clone(),
+        )
     } else {
-        let value = resp.json::<Value>().await?;
-        if !want_stream {
-            synthetic_responses_json(
+        // The other three shapes (SSE→JSON, JSON→JSON, JSON→SSE) are answered
+        // from a fully buffered upstream message. A read/parse failure
+        // propagates to the dispatcher, which records `RequestErrored` for this
+        // request id.
+        // A buffered SSE body can still carry a failure: an `error` event or a
+        // stream that stopped before `message_stop`. The client gets whatever
+        // text arrived, as before, but the row must not call that a completion.
+        let mut sse_failure = None;
+        let value = if upstream_is_sse {
+            let text = resp.text().await?;
+            sse_failure = anthropic_sse_failure(&text);
+            anthropic_sse_text_to_message(&text, estimated_input_tokens)
+        } else {
+            resp.json::<Value>().await?
+        };
+        // Close the row now: the whole answer is known, so this is both the
+        // first token and completion. The counts are the ones the synthetic
+        // body reports: the upstream's `usage` when present, else the estimates.
+        if let Some(metrics) = metrics.as_ref() {
+            if let Some(error) = sse_failure {
+                record_request_error(
+                    Some(metrics),
+                    request_id,
+                    Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    error,
+                );
+            } else {
+                let usage = buffered_anthropic_usage(&value, estimated_input_tokens);
+                metrics.record(MetricsUpdate::FirstToken {
+                    request_id: request_id.clone(),
+                });
+                emit_completed_metrics(
+                    metrics,
+                    request_id,
+                    StatusCode::OK.as_u16(),
+                    Some(usage.prompt_tokens()),
+                    usage.output_tokens,
+                    Some(usage.cache_read_input_tokens).filter(|count| *count > 0),
+                    Some(decision.selected_model.clone()),
+                );
+            }
+        }
+        if want_stream {
+            synthetic_responses_sse(
                 decision,
                 &value,
                 request_id,
@@ -5281,7 +5314,7 @@ async fn anthropic_response_to_responses(
                 tool_names,
             )
         } else {
-            synthetic_responses_sse(
+            synthetic_responses_json(
                 decision,
                 &value,
                 request_id,
@@ -5293,6 +5326,27 @@ async fn anthropic_response_to_responses(
     };
     stamp_upstream_request_id(response.headers_mut(), upstream_request_id.as_deref());
     Ok(response)
+}
+
+/// Token counts for a buffered Anthropic message, as the synthetic Responses
+/// bodies report them: the upstream's `usage` when it carries them, otherwise
+/// the caller's prompt estimate and a chars/4 estimate over the text blocks.
+fn buffered_anthropic_usage(message: &Value, estimated_input_tokens: u64) -> AnthropicUsage {
+    let mut usage = AnthropicUsage::default();
+    usage.merge(message.get("usage"));
+    if !usage.has_prompt_tokens() {
+        usage.input_tokens = estimated_input_tokens;
+    }
+    let text_len: usize = message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .map(str::len)
+        .sum();
+    usage.output_tokens = Some(usage.output_tokens_or(|| (text_len as u64 / 4).max(1)));
+    usage
 }
 
 fn anthropic_stream_to_responses(
