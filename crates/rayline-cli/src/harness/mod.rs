@@ -39,7 +39,8 @@
 //! default on every wire: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on,
 //! and then each launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as
 //! `x-conversation-id`, so one launch is one episode and a resume in a new
-//! launch starts a new one. That also collapses a subagent's turns into its
+//! launch starts a new one (for Hermes only when the launch starts its shared
+//! gateway, see [`hermes`]). That also collapses a subagent's turns into its
 //! parent's episode where the harness attaches the header to every request of
 //! the process. The native compat flags and config keys stay on either way;
 //! the gateway ranks `x-conversation-id` first when both arrive. The override

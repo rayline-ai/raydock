@@ -240,7 +240,8 @@ Branch identity uses `x-rayline-branch-id`, then Codex `thread-id`, then
 `x-claude-code-agent-id`. An OpenCode request with `x-parent-session-id` uses its
 child session header for the branch. Other requests explicitly use branch
 `main`. Parent and child headers reach the core unchanged. Every launcher's
-harness emits native identity on the wires it uses; the explicit per-launch
+harness emits native identity on the wires it uses (Hermes with the caveats
+its launcher module documents); the explicit per-launch
 `x-conversation-id` is opt-in (`RAYLINE_HARNESS_CONV_ID_FALLBACK=1`) and ranks
 first when sent.
 

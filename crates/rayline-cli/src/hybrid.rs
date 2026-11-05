@@ -817,12 +817,10 @@ fn harness_command(
             };
             let plan = harness.plan(&ctx).map_err(io::Error::other)?;
             crate::harness::write_files(&config_dir, &plan.files)?;
-            // Used only by harnesses which cannot transmit native session
-            // identity, so it is exported only when a rendered config asks for
-            // it (the fallback is opt-in here as on the hosted path).
-            let conversation_id = crate::harness::conversation_id_for(&plan, || {
-                format!("hybrid-{:032x}", rand::random::<u128>())
-            });
+            // The per-launch id is opt-in here as on the hosted path, and is
+            // exported only when a rendered config references it.
+            let conversation_id =
+                crate::harness::conversation_id_for(&plan, crate::harness::new_conversation_id);
             command = crate::harness::build_command(
                 Path::new(name),
                 &plan,
@@ -1276,7 +1274,8 @@ mod tests {
     impl FallbackOverride {
         fn set(value: Option<&str>) -> Self {
             let prior = std::env::var_os(crate::harness::CONV_ID_FALLBACK_ENV);
-            // SAFETY: serialized by ENV_LOCK, held by the caller; restored by Drop.
+            // SAFETY: serialized by ENV_LOCK among the tests that take it and
+            // by the `--test-threads=1` gate for the rest; restored by Drop.
             unsafe {
                 match value {
                     Some(value) => std::env::set_var(crate::harness::CONV_ID_FALLBACK_ENV, value),
@@ -1289,7 +1288,7 @@ mod tests {
 
     impl Drop for FallbackOverride {
         fn drop(&mut self) {
-            // SAFETY: serialized by ENV_LOCK, still held by the caller.
+            // SAFETY: serialized as above; ENV_LOCK is still held by the caller.
             unsafe {
                 match &self.0 {
                     Some(prior) => std::env::set_var(crate::harness::CONV_ID_FALLBACK_ENV, prior),

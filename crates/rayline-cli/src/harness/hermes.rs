@@ -21,8 +21,9 @@
 //!
 //! Neither provider sends the per-launch `x-conversation-id` unless
 //! `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` forces it, including under
-//! `raydock hybrid run`: Hermes now declares an identity on both wires, so the
-//! execution core's `session_identity_required` check is satisfied without a
+//! `raydock hybrid run`: Hermes sends a session key on both wires (the header
+//! on Messages, `prompt_cache_key` on Responses), so the execution core's
+//! `session_identity_required` check is satisfied without a
 //! per-launch id. A per-launch id would instead put a subagent, the parent and
 //! the side call in one episode, since Hermes attaches a provider's
 //! `extra_headers` to every request of the process and the gateway ranks
@@ -83,16 +84,22 @@ const OWNED: &[&[&str]] = &[
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
     let launch = ctx.models();
-    let models: serde_json::Map<_, _> = launch
-        .offered
-        .iter()
-        .map(|model| {
-            (
-                (*model).to_owned(),
-                json!({ "context_length": ctx.context_window() }),
-            )
-        })
-        .collect();
+    // `prompt_caching` makes Hermes place its Anthropic cache markers for a
+    // model whose name does not look like Claude; without it the router sees
+    // no `cache_control` and nothing upstream adds one for a Messages client.
+    let models = |prompt_caching: bool| -> serde_json::Map<_, _> {
+        launch
+            .offered
+            .iter()
+            .map(|model| {
+                let mut entry = json!({ "context_length": ctx.context_window() });
+                if prompt_caching {
+                    entry[PROMPT_CACHING_KEY] = json!(true);
+                }
+                ((*model).to_owned(), entry)
+            })
+            .collect()
+    };
     // Responses: no affinity header. Hermes sends a per-session (and per
     // delegate child) `prompt_cache_key` there, which the router and the hybrid
     // core both read as the conversation; the header would merge the children.
@@ -100,31 +107,19 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
         "base_url": ctx.v1_base(),
         "api_key": ctx.key,
         "api_mode": "codex_responses",
-        "models": models
+        "models": models(false)
     });
     // Messages: the header is the only identity Hermes can send on this wire.
-    // `prompt_caching` makes Hermes place its Anthropic cache markers for a
-    // model whose name does not look like Claude; without it the router sees
-    // no `cache_control` and nothing upstream adds one for a Messages client.
-    let cached_models: serde_json::Map<_, _> = launch
-        .offered
-        .iter()
-        .map(|model| {
-            (
-                (*model).to_owned(),
-                json!({ "context_length": ctx.context_window(), PROMPT_CACHING_KEY: true }),
-            )
-        })
-        .collect();
     let mut messages = json!({
         "base_url": ctx.messages_base(),
         "api_key": ctx.key,
         "api_mode": "anthropic_messages",
-        "models": cached_models,
+        "models": models(true),
         SESSION_AFFINITY_KEY: super::SESSION_AFFINITY_HEADER
     });
-    // Both wires carry Hermes' own conversation id (see the module docs), so
-    // the per-launch id is opt-in on both, with no hybrid exception.
+    // Both wires carry a Hermes session key (the header on Messages,
+    // `prompt_cache_key` on Responses), so the per-launch id is opt-in on
+    // both, with no hybrid exception.
     if ctx.conversation_id.enabled() {
         let header = json!({ super::CONV_HEADER: format!("${{{CONV_ID_ENV}}}") });
         responses["extra_headers"] = header.clone();
@@ -204,9 +199,9 @@ mod tests {
                 .contains("x-conversation-id: \"${RAYLINE_CONV_ID}\"");
             (messages, responses)
         };
-        // Neither provider sends the per-launch id unless forced: both declare
-        // session_affinity_header, so Hermes' own conversation id keys the
-        // episode and a subagent's turns stay out of the parent's.
+        // Neither provider sends the per-launch id unless forced: Messages
+        // declares session_affinity_header and Responses relies on Hermes'
+        // prompt_cache_key, so Hermes' own keys drive the episode.
         assert_eq!(headers(ConversationIdFallback::new(None)), (false, false));
         assert_eq!(
             headers(ConversationIdFallback::new(Some("1"))),
@@ -253,6 +248,36 @@ mod tests {
             "{responses}"
         );
         assert!(config.contains("provider: \"custom:rayline-resp\""));
+    }
+
+    /// Turning the fallback off after a forced launch drops the stale
+    /// `extra_headers` from both providers in place: each provider map is
+    /// owned whole, so the merge replaces it rather than keeping old children.
+    #[test]
+    fn unforcing_removes_the_per_launch_header_in_place() {
+        use super::super::tests::{TEST_KEY, TEST_URL, temp_dir};
+        use super::super::{ConversationIdFallback, RenderContext, write_files};
+        let dir = temp_dir("hermes-toggle");
+        let render = |forced: Option<&str>| {
+            let ctx = RenderContext {
+                key: TEST_KEY,
+                router_url: TEST_URL,
+                config_dir: &dir,
+                conversation_id: ConversationIdFallback::new(forced),
+                allow_empty_signature: false,
+                capabilities: None,
+                harness_major_version: None,
+            };
+            write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
+            std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap()
+        };
+        assert_eq!(render(Some("1")).matches("x-conversation-id").count(), 2);
+        let off = render(None);
+        assert!(
+            !off.contains("x-conversation-id") && !off.contains("extra_headers"),
+            "{off}"
+        );
+        assert_eq!(render(None), off);
     }
 
     /// Launch Hermes twice over a config Hermes and the user already wrote.
