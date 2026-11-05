@@ -98,9 +98,10 @@ Client-controlled thinking is disabled because ARC selects effort.
 Intelligence and speed columns may be empty: no benchmark scores are supplied,
 and speed measurements depend on omp and the requests actually served.
 
-The hosted omp picker lists only **ARC Sage** and **ARC Swift**. The old
-`rayline-router` Legacy model is no longer offered. Hybrid routing is separate:
-its execution core still uses `rayline-router` as an active virtual model.
+The hosted omp picker lists only **ARC Sage** and **ARC Swift**. The hosted
+router no longer serves the old `rayline-router` Legacy model. Hybrid routing is
+separate: its execution core still uses `rayline-router` as an active virtual
+model.
 Hybrid has no single ARC tier rate; if omp displays it as free, use your
 upstream billing records instead. Hybrid runtime capabilities are unchanged.
 
@@ -169,10 +170,7 @@ With no `--config`, `raydock codex` defaults to **Rc-Rc** — it routes everythi
 authenticated with your `raydock auth login` session key, on ARC: the main agent
 on `arc-sage-1.0` and subagents on `arc-swift-1.0`. This mirrors the default
 `raydock claude`, which likewise routes everything to the cloud router on ARC; a
-`--config` overrides selected routes to local/API-key/subscription endpoints. For
-the Legacy Rules Router, pass `--model rayline-router` (with a hosted `routes.main`,
-Raydock pins it to Legacy when it prepares the config for Codex), or set the route models in the generated
-`~/.config/rayline/router.json` to `rayline-router`.
+`--config` overrides selected routes to local/API-key/subscription endpoints.
 
 To use your ChatGPT/Codex subscription for the main agent instead, pass
 `--auth subscription` (Codex reuses its existing ChatGPT login; subagents route
@@ -181,8 +179,7 @@ hosted auth.
 
 Use `--model <name>` before `--` to request a different Rayline or configured
 model. Without it the session runs on ARC (see [Which model runs](#which-model-runs-arc-by-default));
-`--model rayline-router` selects the Legacy Rules Router, and naming a concrete
-model instead **pins** it, so the router's choice is skipped. Two lanes ignore an inherited `claude-*` id by
+naming a concrete model **pins** it, so the router's choice is skipped. Two lanes ignore an inherited `claude-*` id by
 design — background haiku calls and Claude Code subagent turns. See
 [routing-modes](../examples/routing-modes/README.md#what-model-means-at-the-rayline-cloud-endpoint).
 
@@ -360,15 +357,15 @@ Hosted launches run on ARC unless you choose otherwise. The main agent uses
 `arc-sage-1.0`; subagents and background tasks use `arc-swift-1.0` wherever the
 harness gives them their own model setting:
 
-| Launcher | Main agent | Subagents / background | Legacy Rules Router |
-|---|---|---|---|
-| `raydock claude` (hosted) | `arc-sage-1.0` | `arc-swift-1.0` (`CLAUDE_CODE_SUBAGENT_MODEL`, forced on every subagent, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` with `--route all`); with `--model X` and `--route all`, X | `--model rayline-router`; with `--route subagents`, `CLAUDE_CODE_SUBAGENT_MODEL=rayline-router` |
-| `raydock codex` (default Rc-Rc) | `arc-sage-1.0` | `arc-swift-1.0` | `--model rayline-router`, or set the route models in `router.json` to `rayline-router` |
-| `raydock opencode` | `arc-sage-1.0` | `small_model`: `arc-swift-1.0` | Not offered |
-| `raydock pi` | `arc-sage-1.0` | — | Not offered |
-| `raydock omp` | `arc-sage-1.0` (`default`, `slow`, `plan`) | `smol`: `arc-swift-1.0` | Not offered |
-| `raydock hermes` | `arc-sage-1.0` | — | Not offered |
-| `raydock openclaw` | `arc-sage-1.0` | — | Not offered |
+| Launcher | Main agent | Subagents / background |
+|---|---|---|
+| `raydock claude` (hosted) | `arc-sage-1.0` | `arc-swift-1.0` (`CLAUDE_CODE_SUBAGENT_MODEL`, forced on every subagent, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` with `--route all`); with `--model X` and `--route all`, X |
+| `raydock codex` (default Rc-Rc) | `arc-sage-1.0` | `arc-swift-1.0` |
+| `raydock opencode` | `arc-sage-1.0` | `small_model`: `arc-swift-1.0` |
+| `raydock pi` | `arc-sage-1.0` | — |
+| `raydock omp` | `arc-sage-1.0` (`default`, `slow`, `plan`) | `smol`: `arc-swift-1.0` |
+| `raydock hermes` | `arc-sage-1.0` | — |
+| `raydock openclaw` | `arc-sage-1.0` | — |
 
 Hosted `raydock claude` picks the model of every subagent and background task
 itself, and ignores the models Claude Code's own agent definitions name. It sets
@@ -393,8 +390,7 @@ subagent allowlist (Raydock then sets no subagent model), your own `CLAUDE_CODE_
 saved, except that hosted omp replaces retired Legacy references with ARC in
 both saved roles and session selections. Pi's `settings.json` moves to ARC only
 while it still reads exactly as an 0.2.x release wrote it. Raydock rewrites its model
-keys in the Hermes and OpenClaw configs on every launch (as before), so pick
-Legacy there per run.
+keys in the Hermes and OpenClaw configs on every launch (as before).
 
 The local and hybrid paths (`--local`, a local-plane `--config`, account-local
 and may-local routing, `raydock hybrid run`) are unchanged: they keep the local
@@ -655,15 +651,14 @@ pure-keyed version of this split: one OpenRouter endpoint serving two models, wi
 The same applies to the hosted cloud router: a config needs only its `main`
 entry, and subagents then follow that model. The generated default
 `~/.config/rayline/router.json` routes `main` to `arc-sage-1.0` and `subagent` to
-`arc-swift-1.0`, and also lists `rayline-router` (the Legacy Rules Router) for a
-route that names it. With a non-prod
+`arc-swift-1.0`. With a non-prod
 `--env <name>` and no `--config`, `raydock codex` generates and reads
 `~/.config/rayline/router.<name>.json` instead, pointed at that environment's
 router, so a non-prod key never reaches the prod router. The file is created
-once and never rewritten, with one exception: a file that is still exactly the
-Legacy default an 0.2.x release generated (never edited) is upgraded to the ARC
-default once, with a notice. Any edit, including a route you set to
-`rayline-router`, keeps the file as it is. If you customized `router.json` for a
+once and never rewritten. The hosted router no longer serves `rayline-router`,
+so a file that still routes to it (including the default an 0.2.x release
+generated) fails visibly with the router's error until you change those routes
+to an ARC model. If you customized `router.json` for a
 non-prod environment before, copy those routes into `router.<name>.json`.
 
 ## Connecting Provider Endpoints

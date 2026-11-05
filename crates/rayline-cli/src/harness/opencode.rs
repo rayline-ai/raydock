@@ -42,7 +42,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             continue;
         }
         let mut entry = json!({
-            "name": model_display_name(models, model),
+            "name": model_display_name(model),
             "limit": { "context": ctx.context_window(), "output": ctx.max_output_tokens(model) },
             "modalities": { "input": ctx.input_modalities(), "output": ["text"] },
             "tool_call": true
@@ -272,8 +272,8 @@ mod tests {
                 &["--standalone", "--prompt", "run tests"],
             ),
             (
-                &["-m", "rayline/rayline-router", "run", "hi"],
-                &["-m", "rayline/rayline-router", "run", "--standalone", "hi"],
+                &["-m", "rayline/arc-sage-1.0", "run", "hi"],
+                &["-m", "rayline/arc-sage-1.0", "run", "--standalone", "hi"],
             ),
             (&["--agent", "build"], &["--standalone", "--agent", "build"]),
             // Already picks a server, or a command that never attaches.

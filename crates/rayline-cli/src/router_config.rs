@@ -39,9 +39,7 @@ pub fn default_config_path_for_env(home: &Path, env_name: &str) -> PathBuf {
 
 /// Default content: route everything to the hosted cloud router at
 /// `router_url` on ARC — the main agent on ARC Sage, subagents on ARC Swift.
-/// The endpoint also lists the Legacy Rules Router, which a route selects by
-/// naming `rayline-router`. Users edit this to send subagents/main to local or
-/// custom endpoints.
+/// Users edit this to send subagents/main to local or custom endpoints.
 pub fn default_config_json(router_url: &str) -> Value {
     json!({
         "endpoints": [
@@ -50,11 +48,7 @@ pub fn default_config_json(router_url: &str) -> Value {
                 "protocol": "anthropic_messages",
                 "base_url": router_url,
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": [
-                    crate::ARC_SAGE_MODEL,
-                    crate::ARC_SWIFT_MODEL,
-                    crate::LEGACY_ROUTER_MODEL
-                ]
+                "models": [crate::ARC_SAGE_MODEL, crate::ARC_SWIFT_MODEL]
             }
         ],
         "routes": {
@@ -66,63 +60,22 @@ pub fn default_config_json(router_url: &str) -> Value {
     })
 }
 
-/// The default this launcher generated before ARC became the default (0.2.x):
-/// everything on the Legacy Rules Router. A file that still holds exactly this
-/// was never edited, so it carries no choice of the user's.
-fn legacy_default_config_json(router_url: &str) -> Value {
-    json!({
-        "endpoints": [
-            {
-                "id": "rayline-cloud",
-                "protocol": "anthropic_messages",
-                "base_url": router_url,
-                "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": [crate::LEGACY_ROUTER_MODEL]
-            }
-        ],
-        "routes": {
-            "main": { "endpoint": "rayline-cloud", "model": crate::LEGACY_ROUTER_MODEL },
-            "default": { "endpoint": "rayline-cloud", "model": crate::LEGACY_ROUTER_MODEL },
-            "subagents": {}
-        }
-    })
-}
-
 /// Create the default config for `env_name` if absent, pointing its cloud
 /// endpoint at `router_url` (the environment's resolved router). Idempotent;
-/// never overwrites user edits.
-///
-/// A file that is exactly the generated Legacy default (see
-/// [`legacy_default_config_json`]) is the old default, not a choice, so it is
-/// replaced with the ARC default. Any other content, including a file that
-/// names `rayline-router` alongside any edit, is the user's and is kept.
+/// never overwrites an existing file.
 pub fn ensure_default_config(home: &Path, env_name: &str, router_url: &str) -> io::Result<PathBuf> {
     let path = default_config_path_for_env(home, env_name);
-    let write_default = match std::fs::read(&path) {
-        Ok(raw) => serde_json::from_slice::<Value>(&raw)
-            .is_ok_and(|existing| existing == legacy_default_config_json(router_url)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+    match std::fs::metadata(&path) {
+        Ok(_) => return Ok(path),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
-    };
-    if write_default {
-        let upgrading = path.exists();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        let body = serde_json::to_vec_pretty(&default_config_json(router_url))
-            .map_err(io::Error::other)?;
-        std::fs::write(&path, body)?;
-        if upgrading {
-            eprintln!(
-                "Updated the generated router config {} to ARC ({} main, {} subagents). \
-                 To keep the Legacy Rules Router, set its route models to {}.",
-                path.display(),
-                crate::ARC_SAGE_MODEL,
-                crate::ARC_SWIFT_MODEL,
-                crate::LEGACY_ROUTER_MODEL
-            );
-        }
     }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let body =
+        serde_json::to_vec_pretty(&default_config_json(router_url)).map_err(io::Error::other)?;
+    std::fs::write(&path, body)?;
     Ok(path)
 }
 
@@ -287,12 +240,6 @@ pub const ROUTER_RAYLINE_CLOUD: &str = "rayline-cloud";
 /// class per the static JSON and pins its `model`, rather than the hosted RCR.
 pub const ROUTER_RAYLINE_LOCAL: &str = "rayline-local";
 
-/// The virtual model that asks the hosted RCR to decide (its balanced tiering).
-/// A may-local `rayline-cloud` route may declare only `local_models` and omit
-/// `model`; the local router rejects a non-local route with an empty `model`, so
-/// materialization fills this sentinel before startup.
-const RAYLINE_ROUTER_MODEL: &str = "rayline-router";
-
 /// The local model the hosted cloud router may redirect a `rayline` class to
 /// ("may-local"), resolved from the config. Returns the advertised model id and
 /// the base URL of the local endpoint that serves it (the redirect target the
@@ -417,57 +364,6 @@ fn config_advertised_local_model(cfg: &Value) -> Option<String> {
         .next()
 }
 
-/// Fill a missing/empty `model` on any non-`rayline-local` route that declares
-/// `local_models`, using the `rayline-router` sentinel. `config_may_local` accepts
-/// a may-local `rayline-cloud` route that carries only `local_models` (no `model`),
-/// but the local router rejects a non-local route with an empty `model` at startup
-/// (`route to endpoint … must include a model`). Without this, such an accepted
-/// may-local config fails at daemon start instead of enabling may-local. Scans the
-/// same route set as `config_advertised_local_model`. Returns whether it changed.
-fn ensure_may_local_route_models(cfg: &mut Value) -> bool {
-    let Some(routes) = cfg.get_mut("routes").and_then(Value::as_object_mut) else {
-        return false;
-    };
-    let mut changed = false;
-    let mut fill = |route: &mut Value| {
-        // Only routes that advertise may-local (non-`rayline-local`, has
-        // `local_models`) and lack a usable `model`.
-        if route.get("router").and_then(Value::as_str) == Some(ROUTER_RAYLINE_LOCAL) {
-            return;
-        }
-        let has_local_models = route
-            .get("local_models")
-            .and_then(Value::as_array)
-            .is_some_and(|a| a.iter().any(|m| m.as_str().is_some_and(|s| !s.is_empty())));
-        let missing_model = route
-            .get("model")
-            .and_then(Value::as_str)
-            .is_none_or(str::is_empty);
-        if has_local_models && missing_model {
-            if let Some(obj) = route.as_object_mut() {
-                obj.insert(
-                    "model".to_owned(),
-                    Value::String(RAYLINE_ROUTER_MODEL.to_owned()),
-                );
-                changed = true;
-            }
-        }
-    };
-    for key in ["main", "subagent", "default"] {
-        if let Some(route) = routes.get_mut(key) {
-            fill(route);
-        }
-    }
-    for key in ["subagents", "model_routes"] {
-        if let Some(map) = routes.get_mut(key).and_then(Value::as_object_mut) {
-            for route in map.values_mut() {
-                fill(route);
-            }
-        }
-    }
-    changed
-}
-
 /// A single route's advertised local model, if it has may-local on.
 fn route_advertised_local_model(route: &Value) -> Option<String> {
     // `rayline-local` routes never advertise may-local (N/A).
@@ -575,9 +471,6 @@ pub fn materialize_codex_subscription_for_local_router(
     // A*-subagent-cloud case: a `rayline-cloud` subagent endpoint pointed at the
     // hosted RCR must also forward native Responses + carry `x-rayline-client`.
     changed |= rewrite_rayline_cloud_for_codex_native(&mut cfg);
-    // …and if that may-local subagent route declares only `local_models`, fill the
-    // RCR sentinel model so the local router doesn't reject it at startup.
-    changed |= ensure_may_local_route_models(&mut cfg);
     // After the rewrite `routes.main` is the concrete codex-subscription endpoint,
     // so pinning the sentinel `--model` to it points Codex's MAIN turns there. The
     // local router skips this model_route on subagent turns (so `routes.subagent`
@@ -607,12 +500,7 @@ pub fn materialize_codex_subscription_for_local_router(
 pub fn materialize_codex_config_for_local_router(path: &Path, home: &Path) -> io::Result<PathBuf> {
     let raw = std::fs::read(path)?;
     let mut cfg: Value = serde_json::from_slice(&raw).map_err(io::Error::other)?;
-    let mut changed = ensure_codex_legacy_model_route(&mut cfg);
-    changed |= ensure_codex_config_model_routes(&mut cfg);
-    // A may-local `rayline-cloud` route may declare only `local_models` and omit
-    // `model` (accepted by config_may_local); fill the RCR sentinel so the local
-    // router's non-empty-model check doesn't reject it at startup.
-    changed |= ensure_may_local_route_models(&mut cfg);
+    let mut changed = ensure_codex_config_model_routes(&mut cfg);
     // Codex `R*` main → hosted RCR: forward native Responses (not the lossy
     // Anthropic bridge) and stamp `x-rayline-client: codex`. Host-guarded.
     changed |= rewrite_rayline_cloud_for_codex_native(&mut cfg);
@@ -678,44 +566,6 @@ fn ensure_codex_config_model_routes(cfg: &mut Value) -> bool {
         changed = true;
     }
     changed
-}
-
-/// Pin an explicit Codex `--model rayline-router` to the Legacy Rules Router
-/// when `routes.main` is a hosted RCR. The local router reads a requested
-/// `rayline-router` as its virtual marker ("route by `routes.main`"), so with
-/// an ARC main (the generated default) that explicit choice would run on ARC.
-/// Codex's own "no model" sentinel is `rayline-local`, so on the Codex surface
-/// `rayline-router` is only ever the user's pick. Claude Code launches send
-/// `rayline-router` as the marker itself, which is why this is added here, in
-/// the Codex materialization, and never to the shared config. A main on a
-/// local or custom endpoint keeps the marker meaning, and an existing
-/// `model_routes` entry is left as is.
-fn ensure_codex_legacy_model_route(cfg: &mut Value) -> bool {
-    let Some(main_endpoint) = cfg
-        .get("routes")
-        .and_then(|routes| routes.get("main"))
-        .and_then(route_endpoint)
-    else {
-        return false;
-    };
-    if !hosted_rcr_endpoint_ids(cfg).contains(&main_endpoint) {
-        return false;
-    }
-    let Some(routes) = cfg.get_mut("routes").and_then(Value::as_object_mut) else {
-        return false;
-    };
-    let model_routes = routes.entry("model_routes").or_insert_with(|| json!({}));
-    let Some(model_routes) = model_routes.as_object_mut() else {
-        return false;
-    };
-    if model_routes.contains_key(crate::LEGACY_ROUTER_MODEL) {
-        return false;
-    }
-    model_routes.insert(
-        crate::LEGACY_ROUTER_MODEL.to_owned(),
-        json!({ "endpoint": main_endpoint, "model": crate::LEGACY_ROUTER_MODEL }),
-    );
-    true
 }
 
 /// `x-rayline-client` value the edge stamps on Codex requests forwarded to the
@@ -968,11 +818,11 @@ mod tests {
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline-cloud", "protocol": "anthropic_messages",
-                  "base_url": "https://api-dev.rayline.ai", "models": ["rayline-router"] },
+                  "base_url": "https://api-dev.rayline.ai", "models": ["arc-sage-1.0"] },
                 { "id": "local-bundled", "protocol": "openai_responses",
                   "base_url": "http://127.0.0.1:8899", "models": ["m"] }
             ],
-            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" } }
         });
         assert_eq!(
             config_value_hosted_rcr_base_url(&cfg).as_deref(),
@@ -985,9 +835,9 @@ mod tests {
         let with_v1 = json!({
             "endpoints": [
                 { "id": "rayline-cloud", "protocol": "openai_responses",
-                  "base_url": "https://api.rayline.ai/v1", "models": ["rayline-router"] }
+                  "base_url": "https://api.rayline.ai/v1", "models": ["arc-sage-1.0"] }
             ],
-            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" } }
         });
         assert_eq!(
             config_value_hosted_rcr_base_url(&with_v1).as_deref(),
@@ -1012,15 +862,15 @@ mod tests {
         let cfg = json!({
             "endpoints": [
                 { "id": "rcr-prod", "protocol": "anthropic_messages",
-                  "base_url": "https://api.rayline.ai", "models": ["rayline-router"] },
+                  "base_url": "https://api.rayline.ai", "models": ["arc-sage-1.0"] },
                 { "id": "rcr-dev", "protocol": "anthropic_messages",
-                  "base_url": "https://api-dev.rayline.ai", "models": ["rayline-router"] },
+                  "base_url": "https://api-dev.rayline.ai", "models": ["arc-sage-1.0"] },
                 { "id": "local-bundled", "protocol": "openai_responses",
                   "base_url": "http://127.0.0.1:8899", "models": ["m"] }
             ],
             "routes": {
-                "main": { "endpoint": "rcr-prod", "model": "rayline-router" },
-                "subagent": { "endpoint": "rcr-dev", "model": "rayline-router",
+                "main": { "endpoint": "rcr-prod", "model": "arc-sage-1.0" },
+                "subagent": { "endpoint": "rcr-dev", "model": "arc-sage-1.0",
                               "router": "rayline-cloud", "local_models": ["m"] }
             }
         });
@@ -1035,10 +885,10 @@ mod tests {
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline-cloud", "protocol": "anthropic_messages",
-                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] }
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["arc-sage-1.0"] }
             ],
             "routes": {
-                "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+                "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" },
                 "subagents": { "Explore": { "endpoint": "local" } }
             }
         });
@@ -1050,12 +900,12 @@ mod tests {
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline-cloud", "protocol": "anthropic_messages",
-                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] },
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["arc-sage-1.0"] },
                 { "id": "ollama", "protocol": "openai_chat",
                   "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
             ],
             "routes": {
-                "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+                "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" },
                 "subagents": { "Explore": { "endpoint": "ollama", "model": "qwen2.5-coder:7b" } }
             }
         });
@@ -1106,82 +956,41 @@ mod tests {
         assert_eq!(cfg["routes"]["main"]["model"], "arc-sage-1.0");
         assert_eq!(cfg["routes"]["subagent"]["model"], "arc-swift-1.0");
         assert_eq!(cfg["routes"]["default"]["model"], "arc-sage-1.0");
-        // Legacy stays selectable on the same endpoint.
         assert_eq!(
             cfg["endpoints"][0]["models"],
-            json!(["arc-sage-1.0", "arc-swift-1.0", "rayline-router"])
+            json!(["arc-sage-1.0", "arc-swift-1.0"])
         );
     }
 
     #[test]
-    fn default_codex_config_pins_an_explicit_legacy_model() {
-        // `raydock codex --model rayline-router` must reach Legacy, while the
-        // Codex sentinel (no --model) follows routes.main (ARC Sage).
+    fn default_codex_config_follows_routes_main() {
+        // The Codex sentinel (no --model) follows routes.main (ARC Sage).
         let home = tmp_home();
         let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
         let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
         let routes = &cfg["routes"]["model_routes"];
-        assert_eq!(routes["rayline-router"]["model"], "rayline-router");
-        assert_eq!(routes["rayline-router"]["endpoint"], "rayline-cloud");
+        assert!(routes.get("rayline-router").is_none());
         assert_eq!(routes["rayline-local"]["model"], "arc-sage-1.0");
         assert_eq!(cfg["routes"]["subagent"]["model"], "arc-swift-1.0");
-        // The shared file carries no pin: Claude Code sends `rayline-router`
-        // as its "follow routes.main" marker.
         let shared: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert!(shared["routes"].get("model_routes").is_none());
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn codex_legacy_pin_only_for_a_hosted_main() {
-        // A local main keeps the marker meaning for `rayline-router`.
-        let mut local = json!({
-            "endpoints": [
-                { "id": "rayline-cloud", "protocol": "anthropic_messages",
-                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] },
-                { "id": "ollama", "protocol": "openai_chat",
-                  "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen"] }
-            ],
-            "routes": { "main": { "endpoint": "ollama", "model": "qwen" } }
-        });
-        assert!(!ensure_codex_legacy_model_route(&mut local));
-        assert!(local["routes"].get("model_routes").is_none());
-        // A user's own entry wins.
-        let mut own = default_config_json(crate::ROUTER_PROD_URL);
-        own["routes"]["model_routes"] = json!({
-            "rayline-router": { "endpoint": "rayline-cloud", "model": "arc-swift-1.0" } });
-        assert!(!ensure_codex_legacy_model_route(&mut own));
-        assert_eq!(
-            own["routes"]["model_routes"]["rayline-router"]["model"],
-            "arc-swift-1.0"
-        );
-    }
-
-    #[test]
-    fn ensure_default_config_upgrades_only_the_untouched_legacy_default() {
+    fn ensure_default_config_keeps_an_existing_file() {
+        // A file naming a model the router no longer serves is kept as is, so
+        // the router's own "model not found" says what to fix.
         let home = tmp_home();
         let path = default_config_path(&home);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        // The file 0.2.x generated, never edited: it is the old default.
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&legacy_default_config_json(crate::ROUTER_PROD_URL)).unwrap(),
-        )
-        .unwrap();
+        let mut existing = default_config_json(crate::ROUTER_PROD_URL);
+        existing["routes"]["main"]["model"] = json!("rayline-router");
+        let body = serde_json::to_vec_pretty(&existing).unwrap();
+        std::fs::write(&path, &body).unwrap();
         ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
-        let upgraded: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(upgraded, default_config_json(crate::ROUTER_PROD_URL));
-
-        // An explicit Legacy choice (any edit to the generated file) is kept.
-        let mut chosen = legacy_default_config_json(crate::ROUTER_PROD_URL);
-        chosen["routes"]["subagents"] = json!({ "Explore": {
-            "endpoint": "rayline-cloud", "model": "rayline-router" } });
-        let chosen_body = serde_json::to_vec_pretty(&chosen).unwrap();
-        std::fs::write(&path, &chosen_body).unwrap();
-        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), chosen_body);
-        assert_eq!(config_main_model(&path).as_deref(), Some("rayline-router"));
+        assert_eq!(std::fs::read(&path).unwrap(), body);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1407,8 +1216,8 @@ mod tests {
         // An all-cloud config normally stays on the hosted path...
         let all_cloud = json!({
             "endpoints": [{ "id": "rayline-cloud", "protocol": "anthropic_messages",
-                "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] }],
-            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+                "base_url": crate::ROUTER_PROD_URL, "models": ["arc-sage-1.0"] }],
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" } }
         });
         assert!(!config_value_needs_local_router(&all_cloud));
         // ...but `router: rayline-local` forces on-device routing.
@@ -1628,54 +1437,13 @@ mod tests {
     }
 
     #[test]
-    fn materialize_fills_missing_model_on_may_local_cloud_route() {
-        // Regression: a may-local `rayline-cloud` route may declare only
-        // `local_models` and omit `model` (accepted by config_may_local). The local
-        // router rejects a non-local route with an empty model at startup, so
-        // materialization must fill the `rayline-router` sentinel first.
-        let home = tmp_home();
-        let path = home.join("codex-maylocal-no-model.json");
-        std::fs::write(
-            &path,
-            serde_json::to_vec_pretty(&json!({
-                "endpoints": [
-                    { "id": "rayline-cloud", "protocol": "anthropic_messages",
-                      "base_url": "https://api-dev.rayline.ai",
-                      "api_key_env": "RAYLINE_ROUTER_API_KEY", "models": ["rayline-router"] },
-                    { "id": "local-bundled", "protocol": "openai_responses",
-                      "base_url": "http://127.0.0.1:8899", "models": ["qwen3.6-27b-iq3xxs"] }
-                ],
-                "routes": {
-                    // No `model` — only `local_models`.
-                    "subagent": { "endpoint": "rayline-cloud",
-                                  "local_models": ["qwen3.6-27b-iq3xxs"] }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
-        let cfg: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
-        // The RCR sentinel model is filled, so the local router's non-empty-model
-        // check accepts the route; local_models is preserved.
-        assert_eq!(cfg["routes"]["subagent"]["model"], "rayline-router");
-        assert_eq!(
-            cfg["routes"]["subagent"]["local_models"][0],
-            "qwen3.6-27b-iq3xxs"
-        );
-
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
     fn may_local_resolves_model_and_upstream_for_rrcl() {
         // Rcl-Rcl: rayline-cloud routes carrying `local_models`, plus a local endpoint
         // that serves the advertised model.
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline", "protocol": "anthropic_messages",
-                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] },
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["arc-sage-1.0"] },
                 { "id": "ollama", "protocol": "openai_chat",
                   "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
             ],
@@ -1701,7 +1469,7 @@ mod tests {
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline", "protocol": "anthropic_messages",
-                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] }
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["arc-sage-1.0"] }
             ],
             "routes": {
                 "main": { "endpoint": "rayline", "router": "rayline-cloud" },
@@ -1719,7 +1487,7 @@ mod tests {
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline", "protocol": "anthropic_messages",
-                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] },
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["arc-sage-1.0"] },
                 { "id": "ollama", "protocol": "openai_chat",
                   "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
             ],
@@ -1739,7 +1507,7 @@ mod tests {
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline", "protocol": "anthropic_messages",
-                  "base_url": crate::ROUTER_PROD_URL, "models": ["rayline-router"] }
+                  "base_url": crate::ROUTER_PROD_URL, "models": ["arc-sage-1.0"] }
             ],
             "routes": {
                 "main": { "endpoint": "rayline", "router": "rayline-cloud",
@@ -1759,11 +1527,11 @@ mod tests {
         let cfg = json!({
             "endpoints": [
                 { "id": "rayline-cloud", "protocol": "anthropic_messages",
-                  "base_url": "https://api.rayline.ai", "models": ["rayline-router"] }
+                  "base_url": "https://api.rayline.ai", "models": ["arc-sage-1.0"] }
             ],
             "routes": {
-                "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
-                "default": { "endpoint": "rayline-cloud", "model": "rayline-router" }
+                "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" },
+                "default": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" }
             }
         });
         assert!(!config_value_needs_local_router(&cfg));
@@ -1777,7 +1545,7 @@ mod tests {
             json!({
                 "endpoints": [
                     { "id": "rayline", "protocol": "anthropic_messages",
-                      "base_url": base_url, "models": ["rayline-router"] },
+                      "base_url": base_url, "models": ["arc-sage-1.0"] },
                     { "id": "ollama", "protocol": "openai_chat",
                       "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
                 ],
@@ -1817,11 +1585,11 @@ mod tests {
             "endpoints": [
                 { "id": "rayline-cloud", "protocol": "anthropic_messages",
                   "base_url": "https://api.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                  "auth": "api_key", "models": ["rayline-router"] },
+                  "auth": "api_key", "models": ["arc-sage-1.0"] },
                 { "id": "my-anthropic", "protocol": "anthropic_messages",
                   "base_url": "https://my-gateway.example.com", "auth": "api_key" }
             ],
-            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" } }
         });
 
         let changed = rewrite_rayline_cloud_for_codex_native(&mut cfg);
@@ -1856,9 +1624,9 @@ mod tests {
             "endpoints": [
                 { "id": "rayline-cloud", "protocol": "anthropic_messages",
                   "base_url": "https://api-dev.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                  "auth": "api_key", "models": ["rayline-router"] }
+                  "auth": "api_key", "models": ["arc-sage-1.0"] }
             ],
-            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" } }
         });
 
         assert!(rewrite_rayline_cloud_for_codex_native(&mut cfg));
@@ -1901,11 +1669,11 @@ mod tests {
                 "endpoints": [
                     { "id": "rayline-cloud", "protocol": "anthropic_messages",
                       "base_url": "https://api.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                      "auth": "api_key", "models": ["rayline-router"] }
+                      "auth": "api_key", "models": ["arc-sage-1.0"] }
                 ],
                 "routes": {
-                    "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
-                    "subagent": { "endpoint": "rayline-cloud", "model": "rayline-router" }
+                    "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" },
+                    "subagent": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" }
                 }
             }))
             .unwrap(),
@@ -1935,9 +1703,9 @@ mod tests {
                     "endpoints": [
                         { "id": "rayline-cloud", "protocol": "anthropic_messages",
                           "base_url": base_url, "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                          "auth": "api_key", "models": ["rayline-router"] }
+                          "auth": "api_key", "models": ["arc-sage-1.0"] }
                     ],
-                    "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+                    "routes": { "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" } }
                 }))
                 .unwrap(),
             )
@@ -1996,9 +1764,9 @@ mod tests {
             "endpoints": [
                 { "id": "rayline-cloud", "protocol": "openai_responses",
                   "base_url": "https://api.rayline.ai", "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                  "auth": "api_key", "models": ["rayline-router"] }
+                  "auth": "api_key", "models": ["arc-sage-1.0"] }
             ],
-            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" } }
         });
         assert!(rewrite_rayline_cloud_for_codex_native(&mut cfg));
         let ep = &cfg["endpoints"][0];
@@ -2021,7 +1789,7 @@ mod tests {
                 { "id": "rayline-cloud", "protocol": "anthropic_messages",
                   "base_url": "https://not-the-rcr.example.com", "auth": "api_key" }
             ],
-            "routes": { "main": { "endpoint": "rayline-cloud", "model": "rayline-router" } }
+            "routes": { "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" } }
         });
         assert!(!rewrite_rayline_cloud_for_codex_native(&mut cfg));
         assert_eq!(cfg["endpoints"][0]["protocol"], "anthropic_messages");

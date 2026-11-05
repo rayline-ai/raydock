@@ -16,7 +16,7 @@ const DEFAULT_CLAUDE_SETTINGS_SUFFIX: &str = ".claude/settings.json";
 const DEFAULT_MODEL: &str = crate::ARC_SAGE_MODEL;
 /// The local static router's virtual model: "let `routes.main` decide". The
 /// default on the local and may-local planes, which stay as they were.
-const LOCAL_PLANE_DEFAULT_MODEL: &str = crate::LEGACY_ROUTER_MODEL;
+const LOCAL_PLANE_DEFAULT_MODEL: &str = crate::VIRTUAL_ROUTER_MODEL;
 /// Claude Code's model for subagents that name no model of their own
 /// (`CLAUDE_CODE_SUBAGENT_MODEL`).
 const SUBAGENT_MODEL_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL";
@@ -196,9 +196,7 @@ struct RoleModelInputs<'a> {
 /// The subagent and background-task models for the turns the router serves
 /// besides the main agent's, as `(env var, value)`: the child runs with each
 /// `Some`, and a reused Claude Code daemon must already hold it. A value the
-/// user exported (non-empty) is always kept
-/// (`CLAUDE_CODE_SUBAGENT_MODEL=rayline-router` keeps subagents on the Legacy
-/// Rules Router).
+/// user exported (non-empty) is always kept.
 ///
 /// Raydock, not Claude Code, decides the subagent model. In route-all modes
 /// subagents and background tasks run on a cloud-only `--config`'s
@@ -975,7 +973,7 @@ async fn run_command_from_home(
 
     let inherited_anthropic_model = env::var_os("ANTHROPIC_MODEL").is_some();
     // A cloud-only `--config` names the main agent's model in `routes.main`;
-    // that explicit choice (ARC or Legacy) wins over the launch default.
+    // that explicit choice wins over the launch default.
     let config_main_model = if config_cloud_only {
         effective_config
             .as_deref()
@@ -1030,13 +1028,13 @@ async fn run_command_from_home(
     // a passthrough main, which stays on the caller's own model.
     let (model, set_model_env) =
         if config_engages_local && !config_main_passthrough && request.model.is_none() {
-            ("rayline-router".to_owned(), true)
+            (LOCAL_PLANE_DEFAULT_MODEL.to_owned(), true)
         } else {
             (model, set_model_env)
         };
     // An explicit flag/env wins. Otherwise Claude Code sizes the session itself
     // unless the hosted router knows a window for a launch model Claude Code
-    // doesn't (`rayline-router`, an ARC id, another provider's model). A Claude
+    // doesn't (an ARC id, another provider's model). A Claude
     // Code alias (`opus`, `sonnet[1m]`, ...) is Claude Code's own, so it skips the
     // lookup. The local plane has no hosted router and no served window to report.
     let auto_compact_window = match explicit_auto_compact_window(request) {
@@ -3152,7 +3150,7 @@ mod router_auto_compact_window_tests {
     ) -> (Result<Option<String>, String>, String) {
         let (base, served) = settings_stub(status, body).await;
         let window =
-            router_auto_compact_window("dev", &base, Some("token"), "key", "rayline-router[1m]")
+            router_auto_compact_window("dev", &base, Some("token"), "key", "arc-sage-1.0[1m]")
                 .await
                 .map_err(|error| error.to_string());
         (window, served.await.unwrap())
@@ -3164,8 +3162,7 @@ mod router_auto_compact_window_tests {
             window("200 OK", r#"{"settings":{},"autoCompactWindow":262144}"#).await;
         assert_eq!(window, Ok(Some("262144".to_owned())));
         assert!(
-            request_line
-                .starts_with("GET /v1/settings?model=rayline-router%5B1m%5D&client_sizes=1 "),
+            request_line.starts_with("GET /v1/settings?model=arc-sage-1.0%5B1m%5D&client_sizes=1 "),
             "{request_line}"
         );
     }
@@ -3687,13 +3684,6 @@ mod arc_default_tests {
             }),
             all("z-ai/glm-5.2")
         );
-        assert_eq!(
-            roles(Launch {
-                chosen: Some("rayline-router"),
-                ..Launch::default()
-            }),
-            all("rayline-router")
-        );
         // A Claude Code alias is no model id for the haiku slot.
         assert_eq!(
             roles(Launch {
@@ -3811,11 +3801,11 @@ mod arc_default_tests {
     fn exported_values_are_kept() {
         assert_eq!(
             roles(Launch {
-                inherited: &[(SUBAGENT_MODEL_ENV, "rayline-router")],
+                inherited: &[(SUBAGENT_MODEL_ENV, "z-ai/glm-5.2")],
                 ..Launch::default()
             }),
             (
-                Some("rayline-router".to_owned()),
+                Some("z-ai/glm-5.2".to_owned()),
                 None,
                 Some("arc-swift-1.0".to_owned())
             )
@@ -3840,8 +3830,8 @@ mod arc_default_tests {
     fn forwarded_model_flags_are_explicit_choices() {
         let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
         assert_eq!(
-            forwarded_model_arg(&args(&["--model", "rayline-router", "-p", "hi"])).as_deref(),
-            Some("rayline-router")
+            forwarded_model_arg(&args(&["--model", "arc-swift-1.0", "-p", "hi"])).as_deref(),
+            Some("arc-swift-1.0")
         );
         assert_eq!(
             forwarded_model_arg(&args(&["-p", "--model=opus", "hi"])).as_deref(),

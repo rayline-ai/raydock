@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, model_display_name, yaml_file};
+use super::{CONV_ID_ENV, Plan, RenderContext, model_display_name, yaml_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 /// First omp that sends `X-Claude-Code-Session-Id` in `auth: apiKey` mode.
@@ -71,15 +71,12 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let entries: Vec<_> = launch
         .offered
         .iter()
-        // Hosted omp offers only current ARC tiers. Hybrid still needs the
-        // execution core's virtual model, which shares Legacy's wire ID.
-        .filter(|model| ctx.capabilities.is_some() || **model != ROUTER_MODEL)
         .map(|model| {
             let hosted_arc = ctx.capabilities.is_none()
                 && matches!(*model, crate::ARC_SAGE_MODEL | crate::ARC_SWIFT_MODEL);
             let mut entry = json!({
                 "id": model,
-                "name": model_display_name(launch, model),
+                "name": model_display_name(model),
                 // ARC owns reasoning effort; do not expose omp thinking controls.
                 "reasoning": !hosted_arc,
                 "input": ctx.input_modalities(),
@@ -89,7 +86,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             if hosted_arc {
                 // USD / million tokens, effective card 26 (2026-10-27).
                 // https://docs.rayline.ai/arc/pricing
-                // No fixed card applies to Legacy or hybrid's virtual model.
+                // No fixed card applies to hybrid's virtual model.
                 entry["cost"] = match *model {
                     crate::ARC_SAGE_MODEL => json!({
                         "input": 1.0, "output": 5.0, "cacheRead": 0.05, "cacheWrite": 1.25

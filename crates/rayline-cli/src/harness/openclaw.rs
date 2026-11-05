@@ -122,7 +122,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             .map(|model| {
                 json!({
                     "id": model,
-                    "name": model_display_name(launch, model),
+                    "name": model_display_name(model),
                     // ARC selects thinking effort; clients must not expose controls.
                     "reasoning": ctx.capabilities.is_some(),
                     "input": ctx.input_modalities(),

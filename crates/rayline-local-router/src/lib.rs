@@ -2329,8 +2329,7 @@ async fn forward_openai_responses_endpoint(
 /// or the selected route model. The explore signal can live in either: Codex may
 /// send an explore-named per-agent model as the requested model (the agent TOML's
 /// `model`), OR the config's subagent route may carry an explore-named model that
-/// becomes `selected_model` (when the caller used the sentinel). Materialization
-/// can also fill a non-explore `model` (rayline-router) on that route, so checking
+/// becomes `selected_model` (when the caller used the sentinel), so checking
 /// only one field misses the other case. Any `explore` match wins.
 fn subagent_role_signal(requested_model: &str, selected_model: &str) -> &'static str {
     let indicates_explore = |m: &str| m.to_ascii_lowercase().contains("explore");
@@ -6972,12 +6971,7 @@ fn normalize_model_name(model: &str) -> String {
     } else {
         model
     };
-    match trimmed.strip_prefix("claude-rayline-router-") {
-        Some("balanced") => DEFAULT_VIRTUAL_MODEL.to_owned(),
-        Some(suffix) => format!("rayline-router-{suffix}"),
-        None if trimmed == "rayline-router-balanced" => DEFAULT_VIRTUAL_MODEL.to_owned(),
-        None => trimmed.to_owned(),
-    }
+    trimmed.to_owned()
 }
 
 fn route_target_label(target: &RouteSelection) -> String {
@@ -9538,17 +9532,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_rayline_router_aliases() {
+    fn retired_router_aliases_are_not_the_virtual_model() {
+        for alias in ["claude-rayline-router-balanced", "rayline-router-balanced"] {
+            assert_eq!(normalize_model_name(alias), alias);
+        }
         assert_eq!(
-            normalize_model_name("claude-rayline-router-balanced"),
-            DEFAULT_VIRTUAL_MODEL
-        );
-        assert_eq!(
-            normalize_model_name("claude-rayline-router-fast"),
-            "rayline-router-fast"
-        );
-        assert_eq!(
-            normalize_model_name("rayline-router-balanced"),
+            normalize_model_name("rayline-router[1m]"),
             DEFAULT_VIRTUAL_MODEL
         );
     }
@@ -9697,24 +9686,23 @@ mod tests {
     }
 
     #[test]
-    fn codex_explicit_legacy_model_route_beats_the_virtual_marker() {
-        // The shape `raydock codex` generates: ARC by default, with a
-        // `model_routes` entry pinning an explicit `rayline-router` to Legacy.
+    fn codex_virtual_marker_follows_routes_main() {
+        // The shape `raydock codex` generates: ARC on the hosted router. The
+        // virtual model names no hosted model, so it follows `routes.main`.
         let config = serde_json::from_str::<RouterConfig>(
             r#"{"endpoints":[{"id":"rayline-cloud","protocol":"openai_responses",
                 "base_url":"https://api.rayline.ai/v1",
-                "models":["arc-sage-1.0","arc-swift-1.0","rayline-router"]}],
+                "models":["arc-sage-1.0","arc-swift-1.0"]}],
                "routes":{"main":{"endpoint":"rayline-cloud","model":"arc-sage-1.0"},
                  "subagent":{"endpoint":"rayline-cloud","model":"arc-swift-1.0"},
                  "model_routes":{
-                   "rayline-router":{"endpoint":"rayline-cloud","model":"rayline-router"},
                    "rayline-local":{"endpoint":"rayline-cloud","model":"arc-sage-1.0"}}}}"#,
         )
         .unwrap();
         let state = state(config);
         let headers = HeaderMap::new();
         for (requested, selected) in [
-            ("rayline-router", "rayline-router"),
+            ("rayline-router", "arc-sage-1.0"),
             ("rayline-local", "arc-sage-1.0"),
         ] {
             let body = json!({"model": requested, "input": []});
@@ -10937,7 +10925,7 @@ mod tests {
     #[test]
     fn catalog_hides_internal_sentinels_declared_as_endpoint_models() {
         // A `rayline-cloud` endpoint declares the `rayline-router` sentinel as its
-        // model (Rc-Rc configs do). It is an internal wire marker, not a picker entry,
+        // model (configs from before 0.4.1 do). It is an internal wire marker, not a picker entry,
         // so the catalog must offer only `rayline-local` ("Raydock Auto") — never a
         // garbled "Raydock rayline-cloud rayline-router" row.
         let config = RouterConfig {
@@ -11336,11 +11324,11 @@ mod tests {
                 "protocol": "anthropic_messages",
                 "base_url": "https://api.rayline.ai",
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": ["rayline-router"]
+                "models": ["arc-sage-1.0"]
               }],
               "routes": {
-                "main": { "endpoint": "rayline-cloud", "model": "rayline-router" },
-                "default": { "endpoint": "rayline-cloud", "model": "rayline-router" },
+                "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" },
+                "default": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" },
                 "subagents": {}
               }
             }"#,
@@ -11353,7 +11341,7 @@ mod tests {
             sub.target,
             RouteSelection::Endpoint("rayline-cloud".to_owned())
         );
-        assert_eq!(sub.selected_model, "rayline-router");
+        assert_eq!(sub.selected_model, "arc-sage-1.0");
         assert_eq!(sub.task_class, "subagent");
     }
 
