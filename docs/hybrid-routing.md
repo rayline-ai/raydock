@@ -196,7 +196,7 @@ Rayline launchers. OpenClaw agent turns receive `--local` through the shared
 argument adapter so they use this launch configuration; container mode is
 rejected because it cannot see the hybrid gateway configuration. Claude uses
 Messages; Codex uses Responses; OpenClaw uses Chat Completions. All launches use
-the virtual model `rayline-router` and the local gateway credential. Protocol
+the virtual model `rayline-auto` and the local gateway credential. Protocol
 and model capabilities remain the core's responsibility.
 
 Every harness's hybrid configuration advertises the explicit

@@ -3271,7 +3271,7 @@ mod claude_code_model_alias_tests {
             "claude-opus-4-8",
             "claude-opus-4-8[1m]",
             "claude-sonnet-5",
-            "rayline-router",
+            "rayline-auto",
             "opus-4",
             "",
         ] {
@@ -3583,7 +3583,7 @@ mod arc_default_tests {
         for mode in [RoutingMode::Override, RoutingMode::Proxy] {
             assert_eq!(default_model_for_routing_mode(mode, false), "arc-sage-1.0");
             // The local planes keep the local router's virtual model.
-            assert_eq!(default_model_for_routing_mode(mode, true), "rayline-router");
+            assert_eq!(default_model_for_routing_mode(mode, true), "rayline-auto");
         }
         // `--route subagents`: the main agent stays on Claude.
         for local in [false, true] {

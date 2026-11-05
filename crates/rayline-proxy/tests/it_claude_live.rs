@@ -218,13 +218,13 @@ async fn spawn_fake_router(default_redirect_port: u16) -> FakeHttpServer {
                                     .body(Full::new(Bytes::from_static(b"{}")))
                                     .unwrap(),
                             )
-                        } else if path.starts_with("/v1/models/rayline-router") {
+                        } else if path.starts_with("/v1/models/rayline-auto") {
                             Ok::<_, Infallible>(
                                 Response::builder()
                                     .status(StatusCode::OK)
                                     .header("content-type", "application/json")
                                     .body(Full::new(Bytes::from_static(
-                                        br#"{"id":"rayline-router","type":"model","display_name":"Rayline Router","created_at":"2026-05-27T00:00:00Z"}"#,
+                                        br#"{"id":"rayline-auto","type":"model","display_name":"Rayline Router","created_at":"2026-05-27T00:00:00Z"}"#,
                                     )))
                                     .unwrap(),
                             )
@@ -234,7 +234,7 @@ async fn spawn_fake_router(default_redirect_port: u16) -> FakeHttpServer {
                                     .status(StatusCode::OK)
                                     .header("content-type", "application/json")
                                     .body(Full::new(Bytes::from_static(
-                                        br#"{"data":[{"id":"rayline-router","type":"model","display_name":"Rayline Router","created_at":"2026-05-27T00:00:00Z"}],"has_more":false,"first_id":"rayline-router","last_id":"rayline-router"}"#,
+                                        br#"{"data":[{"id":"rayline-auto","type":"model","display_name":"Rayline Router","created_at":"2026-05-27T00:00:00Z"}],"has_more":false,"first_id":"rayline-auto","last_id":"rayline-auto"}"#,
                                     )))
                                     .unwrap(),
                             )
@@ -336,7 +336,7 @@ async fn real_claude_bare_follows_local_redirect_and_records_usage() {
             .arg("Reply exactly: local-proxy-live-ok")
             .env("CLAUDE_CONFIG_DIR", claude_config.path())
             .env("ANTHROPIC_API_KEY", "rayline-dummy-anthropic-key")
-            .env("ANTHROPIC_MODEL", "rayline-router")
+            .env("ANTHROPIC_MODEL", "rayline-auto")
             .env("HTTPS_PROXY", format!("http://127.0.0.1:{proxy_port}"))
             .env("NODE_EXTRA_CA_CERTS", &ca_cert_path)
             .env("CLAUDE_CODE_DISABLE_AGENT_VIEW", "1")

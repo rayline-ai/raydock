@@ -168,7 +168,7 @@ async fn openai_chat_streaming_translation_through_mock_no_auth() {
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": true,
             "max_tokens": 32,
             "messages": [{"role": "user", "content": "hi"}]
@@ -257,7 +257,7 @@ async fn anthropic_messages_passthrough_preserves_deltas_through_mock() {
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": true,
             "max_tokens": 32,
             "messages": [{"role": "user", "content": "hi"}]
@@ -448,7 +448,7 @@ async fn openai_responses_client_bearer_forwards_codex_subscription_headers() {
 /// In client-bearer subscription mode `/v1/models` should be authoritative from
 /// the Codex backend, while appending only the single Codex-default sentinel
 /// `rayline-local` (what the CLI stamps as Codex's default `model`, so it must be
-/// reselectable). The other sentinels (`rayline-router`/`rayline-subagent`
+/// reselectable). The other sentinels (`rayline-auto`/`rayline-subagent`
 /// /`rayline-codex`) stay valid wire values but must not pollute the picker.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
@@ -504,7 +504,7 @@ async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
         .collect::<Vec<_>>();
     assert!(slugs.contains(&"gpt-5.4"));
     assert!(slugs.contains(&"rayline-local"));
-    assert!(!slugs.contains(&"rayline-router"));
+    assert!(!slugs.contains(&"rayline-auto"));
     assert!(!slugs.contains(&"rayline-codex"));
     assert!(!slugs.contains(&"rayline-subagent"));
 
@@ -772,7 +772,7 @@ async fn forwarded_anthropic_request_keeps_the_upstream_request_id() {
         .header("anthropic-version", "2023-06-01")
         .header("x-rayline-request-id", "req_passthrough")
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": true,
             "max_tokens": 32,
             "messages": [{"role": "user", "content": "hi"}]
@@ -829,7 +829,7 @@ async fn translated_responses_request_keeps_the_upstream_request_id() {
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/responses"))
         .header("x-rayline-request-id", "req_translated")
-        .json(&json!({"model": "rayline-router", "stream": false, "input": "hi"}))
+        .json(&json!({"model": "rayline-auto", "stream": false, "input": "hi"}))
         .send()
         .await
         .expect("router request");
@@ -870,7 +870,7 @@ async fn synthetic_compaction_call_keeps_the_upstream_request_id() {
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/responses/compact"))
         .header("x-rayline-request-id", "req_compact")
-        .json(&json!({"model": "rayline-router", "input": "compact this"}))
+        .json(&json!({"model": "rayline-auto", "input": "compact this"}))
         .send()
         .await
         .expect("router request");
@@ -910,7 +910,7 @@ async fn upstream_request_id_survives_a_body_that_fails_to_translate() {
     let resp = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/responses"))
         .header("x-rayline-request-id", "req_broken")
-        .json(&json!({"model": "rayline-router", "stream": false, "input": "hi"}))
+        .json(&json!({"model": "rayline-auto", "stream": false, "input": "hi"}))
         .send()
         .await
         .expect("router request");
@@ -944,7 +944,7 @@ async fn translated_chat_request_keeps_the_upstream_request_id_when_sent() {
 
         let resp = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
-            .json(&json!({"model": "rayline-router",
+            .json(&json!({"model": "rayline-auto",
                           "messages": [{"role": "user", "content": "hi"}]}))
             .send()
             .await
@@ -996,7 +996,7 @@ async fn config_routes_main_and_subagent_to_distinct_endpoints() {
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
-            "model": "rayline-router", "stream": true, "max_tokens": 16,
+            "model": "rayline-auto", "stream": true, "max_tokens": 16,
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .send()
@@ -1017,7 +1017,7 @@ async fn config_routes_main_and_subagent_to_distinct_endpoints() {
         .header("x-claude-code-agent-id", "abc123")
         .header("x-rayline-claude-code-agent-type", "reviewer")
         .json(&json!({
-            "model": "rayline-router", "stream": true, "max_tokens": 16,
+            "model": "rayline-auto", "stream": true, "max_tokens": 16,
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .send()
@@ -1071,7 +1071,7 @@ async fn main_only_config_routes_subagents_to_main_over_http() {
     let client = reqwest::Client::new();
 
     let body = json!({
-        "model": "rayline-router", "stream": true, "max_tokens": 16,
+        "model": "rayline-auto", "stream": true, "max_tokens": 16,
         "messages": [{"role": "user", "content": "hi"}]
     });
 
@@ -1237,7 +1237,7 @@ async fn anthropic_messages_adapts_body_for_claude_5_upstream() {
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": true,
             "max_tokens": 2048,
             "temperature": 1,
@@ -1305,7 +1305,7 @@ async fn anthropic_messages_leaves_legacy_family_body_untouched() {
     start_router(port, path.clone()).await;
 
     let request = json!({
-        "model": "rayline-router",
+        "model": "rayline-auto",
         "max_tokens": 2048,
         "temperature": 1,
         "thinking": {"type": "enabled", "budget_tokens": 1024},
@@ -2253,7 +2253,7 @@ async fn browser_reachable_requests_never_reach_the_provider() {
     start_router(port, path.clone()).await;
 
     let url = format!("http://127.0.0.1:{port}/v1/messages");
-    let body = json!({"model": "rayline-router", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
+    let body = json!({"model": "rayline-auto", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
     let client = reqwest::Client::new();
     let cross_origin = client
         .post(&url)

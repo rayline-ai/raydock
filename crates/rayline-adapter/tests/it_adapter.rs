@@ -769,7 +769,7 @@ async fn drive_responses_streaming_and_capture_close(upstream_port: u16, doc_id:
             "http://127.0.0.1:{adapter_port}/api/v1/responses?usage_doc_id={doc_id}"
         ))
         .json(&json!({
-            "model": "rayline-router", "stream": true,
+            "model": "rayline-auto", "stream": true,
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
         }))
         .send()
@@ -1119,7 +1119,7 @@ async fn adapter_strips_web_search_hosted_tool_on_responses_path() {
 
     let client = reqwest::Client::new();
     let req_body = json!({
-        "model": "rayline-router",
+        "model": "rayline-auto",
         "stream": false,
         "input": [{"role": "user", "content": [{"type": "input_text", "text": "find it"}]}],
         "tools": [

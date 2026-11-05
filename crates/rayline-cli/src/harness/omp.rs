@@ -160,7 +160,7 @@ mod tests {
         let dir = super::super::tests::temp_dir("omp-model-roster");
         let mut ctx = super::super::tests::render_context(&dir);
         let hosted = super::plan(&ctx);
-        assert!(!hosted.files[0].contents.contains("id: \"rayline-router\""));
+        assert!(!hosted.files[0].contents.contains("id: \"rayline-auto\""));
         let capabilities = rayline_local_router::ModelCapabilities {
             context_window: 16384,
             max_output_tokens: 8192,
@@ -168,7 +168,7 @@ mod tests {
         };
         ctx.capabilities = Some(&capabilities);
         let hybrid = super::plan(&ctx);
-        assert!(hybrid.files[0].contents.contains("id: \"rayline-router\""));
+        assert!(hybrid.files[0].contents.contains("id: \"rayline-auto\""));
         assert!(!hybrid.files[0].contents.contains("id: \"arc-sage-1.0\""));
     }
 

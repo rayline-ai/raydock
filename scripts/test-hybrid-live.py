@@ -230,7 +230,7 @@ def main():
             report["tasks"].append(task_report)
             stdout_path, stderr_path = output / f"{name}-pi.jsonl", output / f"{name}-pi.stderr"
             with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
-                process = subprocess.Popen(cli + ["run", "pi", "--", "--provider", "rayline", "--model", "rayline-router",
+                process = subprocess.Popen(cli + ["run", "pi", "--", "--provider", "rayline", "--model", "rayline-auto",
                     "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
                     "--tools", "read,write,edit,bash", "--thinking", "off", "--mode", "json", "--print", prompt],
                     env=env, cwd=cwd, stdout=stdout, stderr=stderr, start_new_session=True)

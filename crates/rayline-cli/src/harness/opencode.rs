@@ -234,7 +234,7 @@ mod tests {
         for id in ["arc-sage-1.0", "arc-swift-1.0"] {
             assert!(provider["models"].get(id).is_some(), "{id}");
         }
-        assert!(provider["models"].get("rayline-router").is_none());
+        assert!(provider["models"].get("rayline-auto").is_none());
         let model = &provider["models"]["arc-sage-1.0"];
         assert_eq!(model["limit"]["context"], 1000000);
         assert_eq!(model["limit"]["output"], 128000);

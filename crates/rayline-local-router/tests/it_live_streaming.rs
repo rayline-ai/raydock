@@ -189,7 +189,7 @@ async fn openai_chat_true_streaming_text() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": true,
             "max_tokens": 256,
             "messages": [{"role": "user", "content": "Count from 1 to 20, space separated."}]
@@ -246,7 +246,7 @@ async fn openai_chat_tool_use_streaming() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": true,
             "max_tokens": 256,
             "tool_choice": {"type": "tool", "name": "get_weather"},
@@ -313,7 +313,7 @@ async fn openai_chat_image_shape_detection() {
     let resp = client
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": false,
             "max_tokens": 64,
             "messages": [{
@@ -387,7 +387,7 @@ async fn openrouter_anthropic_streaming() {
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": true,
             "max_tokens": 256,
             "messages": [{"role": "user", "content": "Count from 1 to 20, space separated."}]
@@ -462,7 +462,7 @@ async fn openrouter_anthropic_image_shape_detection() {
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": false,
             "max_tokens": 64,
             "messages": [{
@@ -541,7 +541,7 @@ async fn openrouter_anthropic_default_xapikey_auth() {
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
-            "model": "rayline-router",
+            "model": "rayline-auto",
             "stream": false,
             "max_tokens": 16,
             "messages": [{"role": "user", "content": "Reply with the single word PONG."}]

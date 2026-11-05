@@ -18,11 +18,16 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   not rewritten: its turns fail with the router's 404 until you change them to
   `arc-sage-1.0` or `arc-swift-1.0`. That includes the default `router.json`
   an 0.2.x release generated, which Raydock no longer upgrades. The omp and pi
-  migrations of saved Legacy picks to ARC stay. The local and hybrid routers
-  keep `rayline-router` as their on-device virtual model ("route by
-  `routes.main`"); it never reaches the hosted router. The local router and
-  the proxy no longer rewrite the retired `claude-rayline-router-*` and
-  `rayline-router-balanced` aliases to it.
+  migrations of saved Legacy picks to ARC stay.
+- **The on-device virtual model is now `rayline-auto` (breaking).** The local
+  router, the proxy and the hybrid execution core used `rayline-router` as
+  their "route by `routes.main`" model; they now use `rayline-auto`, and no
+  longer treat `rayline-router` specially. On the local router it is now an
+  unknown model name like any other, so it follows `routes.main`: `raydock
+  codex --model rayline-router` and an exported
+  `ANTHROPIC_MODEL=rayline-router` on the local plane run on the config's main
+  route. The local router and the proxy no longer rewrite the retired
+  `claude-rayline-router-*` and `rayline-router-balanced` aliases either.
 
 ## 0.4.0 (2026-11-05)
 

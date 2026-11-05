@@ -212,9 +212,9 @@ def main():
             # the retained tail holds the last tool exchange.
             pi_dir = state / "harness" / "pi"
             pi_dir.mkdir(parents=True, mode=0o700)
-            (pi_dir / "settings.json").write_text(json.dumps({"defaultProvider": "rayline", "defaultModel": "rayline-router",
+            (pi_dir / "settings.json").write_text(json.dumps({"defaultProvider": "rayline", "defaultModel": "rayline-auto",
                                                                "compaction": {"keepRecentTokens": 4000}}))
-            output = cli("run", "pi", "--", "--provider", "rayline", "--model", "rayline-router", "--no-session",
+            output = cli("run", "pi", "--", "--provider", "rayline", "--model", "rayline-auto", "--no-session",
                          "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
                          "--tools", "read", "--thinking", "off", "--print",
                          f"Read {sample} three times, then reply with Synthetic execution complete.")

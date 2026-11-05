@@ -48,7 +48,7 @@ use upstream_request_id::{
 
 pub const DEFAULT_PORT: u16 = 20811;
 pub const DEFAULT_LOCAL_ADAPTER_PORT: u16 = 20808;
-pub const DEFAULT_VIRTUAL_MODEL: &str = "rayline-router";
+pub const DEFAULT_VIRTUAL_MODEL: &str = "rayline-auto";
 pub const DEFAULT_SUBAGENT_MODEL: &str = "rayline-subagent";
 /// Codex sentinel `--model` names — virtual "do-routing" markers (the Codex
 /// analogue of [`DEFAULT_VIRTUAL_MODEL`]). Codex must send *some* `model` on
@@ -896,7 +896,7 @@ struct CatalogModel {
 /// stamps this as Codex's default `model` (its `CODEX_DEFAULT_SENTINEL_MODEL`),
 /// so it must appear in the picker — otherwise the configured default cannot be
 /// reselected and shows as a raw/blank entry. The other sentinels
-/// (`rayline-router`/`rayline-subagent`/`rayline-codex`) stay valid wire values
+/// (`rayline-auto`/`rayline-subagent`/`rayline-codex`) stay valid wire values
 /// but are internal markers, not picker entries.
 const CATALOG_SENTINEL_MODEL: &str = "rayline-local";
 
@@ -916,7 +916,7 @@ fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
             continue;
         }
         for model in &endpoint.models {
-            // Internal sentinels (`rayline-router`/`rayline-subagent`/`rayline-codex`)
+            // Internal sentinels (`rayline-auto`/`rayline-subagent`/`rayline-codex`)
             // are valid wire values but not picker entries — the one picker sentinel
             // (`rayline-local` → "Raydock Auto") is added above. An endpoint that
             // declares a sentinel as its `models` (e.g. `rayline-cloud`) would
@@ -936,7 +936,7 @@ fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
 /// Sentinel model names that are internal routing markers, never picker entries.
 /// Excludes `rayline-local` (the one advertised picker sentinel, added explicitly).
 fn is_internal_sentinel_model(model: &str) -> bool {
-    model == DEFAULT_VIRTUAL_MODEL      // rayline-router
+    model == DEFAULT_VIRTUAL_MODEL      // rayline-auto
         || model == DEFAULT_SUBAGENT_MODEL  // rayline-subagent
         || model == "rayline-codex"
 }
@@ -2018,7 +2018,7 @@ fn select_route(
     // Codex's sentinel `--model` (`rayline-local`/`rayline-codex`) is a virtual
     // "do-routing" marker: Codex must send *some* `model` on every Responses
     // request, so the CLI stamps it when the user picks no model, and it rides on
-    // main AND subagent turns alike. The Codex analogue of Claude's `rayline-router`.
+    // main AND subagent turns alike. The Codex analogue of Claude's `rayline-auto`.
     // Gated to Codex traffic: on the Anthropic surface these names carry no
     // sentinel meaning, so an explicit `model: rayline-local` there keeps its
     // ordinary `model_routes` force-local semantics.
@@ -2893,7 +2893,7 @@ fn budget_to_effort(budget: u64) -> &'static str {
 
 /// Rewrite a Claude Code Messages body for the model the router selected. The
 /// client shaped the request for the model it was told about (a sentinel such
-/// as `rayline-router`, or an older Sonnet), so when the selected model is a
+/// as `rayline-auto`, or an older Sonnet), so when the selected model is a
 /// family that only accepts adaptive thinking, translate the legacy enabled
 /// shape and drop the deprecated sampling params instead of leaking the
 /// upstream 400 back to the client. A caller-supplied `output_config.effort`
@@ -3080,7 +3080,7 @@ async fn response_from_reqwest(
         .to_owned();
     // Native passthrough (e.g. the RCR OpenAI/Codex path): the real model the
     // upstream chose comes back in its `x-rayline-selected-model` response header,
-    // whereas `decision.selected_model` is only the sentinel (`rayline-router`).
+    // whereas `decision.selected_model` is only the sentinel (`rayline-auto`).
     // Prefer the upstream value for both the re-stamped outbound header and the
     // usage metric, so `raydock top` shows the real model — never overwrite an
     // upstream-provided value with the sentinel.
@@ -3868,7 +3868,7 @@ fn record_remote_token_usage(
 /// response: prefer the model the upstream actually chose (its
 /// `x-rayline-selected-model` response header — set by the RCR on the native
 /// OpenAI/Codex path) over the edge's own `decision.selected_model`, which is
-/// only the routing sentinel (`rayline-router`). Falls back to the decision
+/// only the routing sentinel (`rayline-auto`). Falls back to the decision
 /// model when the upstream reports none.
 fn prefer_upstream_selected_model(
     upstream: Option<&str>,
@@ -7285,7 +7285,7 @@ mod tests {
             protocol: EndpointProtocol::OpenAIResponses,
             base_url: "https://api.rayline.ai".to_owned(),
             api_key_env: None,
-            models: vec!["rayline-router".to_owned()],
+            models: vec!["rayline-auto".to_owned()],
             headers: HashMap::new(),
             auth: None,
         };
@@ -7402,7 +7402,7 @@ mod tests {
         // explorer role that Codex strips from the wire header.
         // Requested is the explore per-agent model; selected is a filled sentinel.
         assert_eq!(
-            subagent_role_signal("rayline-explore", "rayline-router"),
+            subagent_role_signal("rayline-explore", "rayline-auto"),
             "explorer"
         );
         // Requested is the sentinel; selected is the explore-named subagent route.
@@ -7418,7 +7418,7 @@ mod tests {
         // Neither indicates explore → a bare subagent assertion (RCR gates it on
         // read-only tools): sentinel / worker / unknown.
         assert_eq!(
-            subagent_role_signal("rayline-local", "rayline-router"),
+            subagent_role_signal("rayline-local", "rayline-auto"),
             "true"
         );
         assert_eq!(
@@ -7685,7 +7685,7 @@ mod tests {
 
         // Rl-Rl: `router: rayline-local` makes the LSR the router; it forwards to the
         // `rayline-cloud` endpoint but pins each class's `model` on-device instead of
-        // sending the `rayline-router` virtual model for the RCR to pick. Covers all
+        // sending the `rayline-auto` virtual model for the RCR to pick. Covers all
         // three routing slots — main, default subagent, and a per-type override —
         // each a distinct model, proving the LSR (not the RCR) is choosing.
         let st = load_state(include_str!("../../../examples/routing-modes/Rl-Rl.json"));
@@ -9537,7 +9537,7 @@ mod tests {
             assert_eq!(normalize_model_name(alias), alias);
         }
         assert_eq!(
-            normalize_model_name("rayline-router[1m]"),
+            normalize_model_name("rayline-auto[1m]"),
             DEFAULT_VIRTUAL_MODEL
         );
     }
@@ -9702,7 +9702,7 @@ mod tests {
         let state = state(config);
         let headers = HeaderMap::new();
         for (requested, selected) in [
-            ("rayline-router", "arc-sage-1.0"),
+            ("rayline-auto", "arc-sage-1.0"),
             ("rayline-local", "arc-sage-1.0"),
         ] {
             let body = json!({"model": requested, "input": []});
@@ -10924,15 +10924,15 @@ mod tests {
 
     #[test]
     fn catalog_hides_internal_sentinels_declared_as_endpoint_models() {
-        // A `rayline-cloud` endpoint declares the `rayline-router` sentinel as its
-        // model (configs from before 0.4.1 do). It is an internal wire marker, not a picker entry,
+        // A `rayline-cloud` endpoint may declare the `rayline-auto` sentinel as its
+        // model. It is an internal wire marker, not a picker entry,
         // so the catalog must offer only `rayline-local` ("Raydock Auto") — never a
-        // garbled "Raydock rayline-cloud rayline-router" row.
+        // garbled "Raydock rayline-cloud rayline-auto" row.
         let config = RouterConfig {
             endpoints: vec![endpoint(
                 "rayline-cloud",
                 EndpointProtocol::OpenAIResponses,
-                &["rayline-router"],
+                &["rayline-auto"],
             )],
             ..RouterConfig::default()
         };

@@ -715,7 +715,7 @@ mod tests {
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "req-1".to_owned(),
             source: "proxy".to_owned(),
-            requested_model: Some("rayline-router".to_owned()),
+            requested_model: Some("rayline-auto".to_owned()),
             agent_id: Some("agent-1".to_owned()),
             agent_type: Some("Explore".to_owned()),
         });
@@ -725,7 +725,7 @@ mod tests {
             target: "local".to_owned(),
             endpoint_id: Some("local".to_owned()),
             selected_model: Some("qwen".to_owned()),
-            requested_model: Some("rayline-router".to_owned()),
+            requested_model: Some("rayline-auto".to_owned()),
             policy: Some("subagent:Explore".to_owned()),
             task_class: Some("subagent".to_owned()),
             agent_id: Some("agent-1".to_owned()),
@@ -763,7 +763,7 @@ mod tests {
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "req-1".to_owned(),
             source: "proxy".to_owned(),
-            requested_model: Some("rayline-router".to_owned()),
+            requested_model: Some("rayline-auto".to_owned()),
             agent_id: None,
             agent_type: None,
         });

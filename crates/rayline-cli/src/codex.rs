@@ -27,7 +27,7 @@ pub const CODEX_SUBSCRIPTION_MODELS: [&str; 5] = [
 /// The internal virtual-marker model Codex is pointed at when the user picks no
 /// `--model`. Codex must send *some* `model` on every Responses request, so this
 /// sentinel stands in for "no explicit model — let the router's config decide"
-/// (mirrors Claude Code's `rayline-router`). The local router recognizes it as a
+/// (mirrors Claude Code's `rayline-auto`). The local router recognizes it as a
 /// marker and applies main/subagent routing rather than treating it as a real
 /// model. Users select a real model (e.g. one of CODEX_SUBSCRIPTION_DEFAULT_MODEL)
 /// via `--model` instead.

@@ -120,7 +120,7 @@ def main():
         settings["hybrid"] = {"routing": routing}
     (home / ".config" / "rayline").mkdir(parents=True, mode=0o700)
     (home / ".config" / "rayline" / "settings.json").write_text(json.dumps(settings))
-    pi_settings = {"defaultProvider": "rayline", "defaultModel": "rayline-router"}
+    pi_settings = {"defaultProvider": "rayline", "defaultModel": "rayline-auto"}
     if args.scenario == "c":
         pi_settings["compaction"] = {"enabled": False}  # no compaction point in the harness
     (state / "harness" / "pi").mkdir(parents=True, mode=0o700)
@@ -173,7 +173,7 @@ def main():
         started = True
         log = state / "runtime.log"
         with (output / "pi.jsonl").open("w") as stdout, (output / "pi.stderr").open("w") as stderr:
-            process = subprocess.Popen(cli + ["run", "pi", "--", "--provider", "rayline", "--model", "rayline-router",
+            process = subprocess.Popen(cli + ["run", "pi", "--", "--provider", "rayline", "--model", "rayline-auto",
                                               "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates",
                                               "--no-context-files", "--tools", tools, "--thinking", "off", "--mode", "json", "--print", *prompts],
                                        env=env, cwd=work, stdout=stdout, stderr=stderr, start_new_session=True)

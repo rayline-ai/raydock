@@ -87,7 +87,7 @@ assert 'RAYLINE_TEST_LOCAL_ALIAS' not in os.environ
 assert not os.environ['ANTHROPIC_AUTH_TOKEN'].startswith('synthetic-runtime-only-')
 assert os.environ['CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK'] == '1'
 request = urllib.request.Request(os.environ['ANTHROPIC_BASE_URL'] + '/v1/messages',
-    data=b'{"model":"rayline-router","metadata":{"user_id":"session_fixture"}}',
+    data=b'{"model":"rayline-auto","metadata":{"user_id":"session_fixture"}}',
     headers={'Authorization':'Bearer ' + os.environ['ANTHROPIC_AUTH_TOKEN'],
              'Content-Type':'application/json'})
 with urllib.request.urlopen(request) as response:

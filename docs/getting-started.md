@@ -100,8 +100,7 @@ and speed measurements depend on omp and the requests actually served.
 
 The hosted omp picker lists only **ARC Sage** and **ARC Swift**. The hosted
 router no longer serves the old `rayline-router` Legacy model. Hybrid routing is
-separate: its execution core still uses `rayline-router` as an active virtual
-model.
+separate: its execution core uses its own virtual model, `rayline-auto`.
 Hybrid has no single ARC tier rate; if omp displays it as free, use your
 upstream billing records instead. Hybrid runtime capabilities are unchanged.
 
@@ -393,8 +392,10 @@ while it still reads exactly as an 0.2.x release wrote it. Raydock rewrites its 
 keys in the Hermes and OpenClaw configs on every launch (as before).
 
 The local and hybrid paths (`--local`, a local-plane `--config`, account-local
-and may-local routing, `raydock hybrid run`) are unchanged: they keep the local
-router's virtual model, `rayline-router`, which tells it to apply its own routes.
+and may-local routing, `raydock hybrid run`) use the local router's virtual
+model, `rayline-auto` (`rayline-router` before 0.4.1), which tells it to apply
+its own routes. Any other model name the local router does not know, including
+`rayline-router`, also follows `routes.main`.
 `raydock claude-desktop` already runs on ARC, and `raydock codex --auth
 subscription` keeps your ChatGPT subscription for the main agent.
 

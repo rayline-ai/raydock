@@ -770,7 +770,7 @@ fn harness_command(
                     "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
                     capabilities.max_output_tokens.to_string(),
                 )
-                .args(["--model", "rayline-router"]);
+                .args(["--model", "rayline-auto"]);
             let recovery = crate::claude::refusal_recovery_values(
                 crate::claude::RoutingMode::Override,
                 |name| std::env::var_os(name),
@@ -789,7 +789,7 @@ fn harness_command(
             command.env("RAYLINE_HYBRID_GATEWAY_TOKEN", token);
             for setting in [
                 "model_provider=\"rayline-hybrid\"".to_owned(),
-                "model=\"rayline-router\"".to_owned(),
+                "model=\"rayline-auto\"".to_owned(),
                 "model_providers.rayline-hybrid.name=\"Raydock Hybrid\"".to_owned(),
                 format!("model_providers.rayline-hybrid.base_url=\"{endpoint}/v1\""),
                 "model_providers.rayline-hybrid.wire_api=\"responses\"".to_owned(),
@@ -1201,7 +1201,7 @@ mod tests {
             (&pi["contextWindow"], &pi["maxTokens"], &pi["input"]),
             (&json!(1_000_000), &json!(4096), &json!(["text"]))
         );
-        let opencode = &json("harness/opencode/opencode.json")["provider"]["rayline"]["models"]["rayline-router"];
+        let opencode = &json("harness/opencode/opencode.json")["provider"]["rayline"]["models"]["rayline-auto"];
         assert_eq!(
             opencode["limit"],
             json!({"context": 1_000_000, "output": 4096})

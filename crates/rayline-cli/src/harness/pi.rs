@@ -26,6 +26,8 @@ pub(crate) const PROVIDER_ID: &str = "rayline";
 /// Runtime override for [`allow_empty_signature`]: `1` or `0`.
 pub(crate) const ALLOW_EMPTY_SIGNATURE_ENV: &str = "RAYLINE_PI_ALLOW_EMPTY_SIGNATURE";
 
+/// The retired Legacy model that 0.2.x seeded and users picked; migrated to ARC.
+const LEGACY_MODEL: &str = "rayline-router";
 /// Envs whose router drops unsigned reasoning before an Anthropic Messages
 /// upstream. Elsewhere an unsigned thinking block would be forwarded as is and
 /// rejected, so the flag stays off.
@@ -86,7 +88,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         if let Ok(existing) = std::fs::read_to_string(&path)
             && let Ok(mut saved) = serde_json::from_str::<serde_json::Value>(&existing)
             && saved["defaultProvider"] == PROVIDER_ID
-            && saved["defaultModel"] == ROUTER_MODEL
+            && saved["defaultModel"] == LEGACY_MODEL
         {
             saved["defaultModel"] = json!(launch.main);
             settings_file = json_file("settings.json", &saved, true);
@@ -95,7 +97,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             // The seed 0.2.x wrote (Legacy as the default); still exactly that
             // means the user never picked a model, so it moves to the new default.
             settings_file.replaces_seed =
-                Some(json_file("settings.json", &settings(ROUTER_MODEL), false).contents);
+                Some(json_file("settings.json", &settings(LEGACY_MODEL), false).contents);
         }
     }
     Plan {
