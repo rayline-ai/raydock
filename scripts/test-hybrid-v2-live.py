@@ -78,7 +78,6 @@ def main():
     parser.add_argument("--local-context-window", type=int, help="no-profile start: local window when the runtime does not report it")
     parser.add_argument("--policy", choices=("utility", "prefer_local"), help="settings hybrid.routing.policy")
     parser.add_argument("--min-p-pass", type=float, help="settings hybrid.routing.min_p_pass")
-    parser.add_argument("--v-value", type=float, help="settings hybrid.routing.v_value")
     parser.add_argument("--scenario", choices=("a", "b", "c"), required=True)
     parser.add_argument("--schedule-model", nargs="+", help="settings hybrid.routing.schedule.model (e.g. cache_boundaries user_messages)")
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -117,8 +116,6 @@ def main():
         routing["policy"] = args.policy
     if args.min_p_pass is not None:
         routing["min_p_pass"] = args.min_p_pass
-    if args.v_value is not None:
-        routing["v_value"] = args.v_value
     if routing:
         settings["hybrid"] = {"routing": routing}
     (home / ".config" / "rayline").mkdir(parents=True, mode=0o700)
