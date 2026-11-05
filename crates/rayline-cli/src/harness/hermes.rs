@@ -2,10 +2,10 @@
 //! state: sessions, memories, skills). `api_key` is the literal key and
 //! `${VAR}` is expanded in config values.
 //!
-//! Episode keying: both providers declare [`SESSION_AFFINITY_KEY`], Hermes'
-//! opt-in per-provider key (from v2026.9.21), so Hermes sends a conversation
-//! key as `x-session-affinity` on every request, which the router keys the
-//! episode on. Hermes resolves that key as its declared scope, else its
+//! Episode keying: the Messages provider declares [`SESSION_AFFINITY_KEY`],
+//! Hermes' opt-in per-provider key (from v2026.9.21), so Hermes sends a
+//! conversation key as `x-session-affinity` on every request there, which the
+//! router keys the episode on. Hermes resolves that key as its declared scope, else its
 //! ambient conversation root. A session declares a scope (`gwk_…`, kept by
 //! `-c` / `--resume`; seen on interactive, `-q` and `-z` runs of Hermes
 //! 0.22.5), while a `delegate_task` child gets none and sends its parent's
@@ -35,9 +35,20 @@
 //! on Messages only. Under hybrid on `--provider rayline-anth` the core
 //! refuses that call and Hermes reports the cap with no summary.
 //!
-//! The `rayline-resp` provider (`--provider rayline-resp`) speaks Responses.
-//! Each entry has its own base_url because Hermes looks up `extra_headers` and
-//! the affinity header by base_url.
+//! The `rayline-resp` provider (`--provider rayline-resp`, the default under
+//! `raydock hybrid run`) speaks Responses and declares no header: Hermes sends
+//! a `prompt_cache_key` there that is distinct per session and per delegate
+//! child, which the router's ladder and the hybrid core both read as the
+//! conversation, so each child lands in its own episode. A header would rank
+//! above it and merge the children. Each entry has its own base_url because
+//! Hermes looks up `extra_headers`, the affinity header and model
+//! capabilities by base_url.
+//!
+//! Prompt caching: Hermes places Anthropic `cache_control` markers on a custom
+//! Messages route only for a model whose name looks like Claude or whose entry
+//! sets [`PROMPT_CACHING_KEY`]. The ARC names look like neither, so the
+//! Messages models declare it; on Responses the router's cell places one
+//! breakpoint itself.
 //!
 //! `config.yaml` also holds the user's Hermes settings (`hermes config set`,
 //! `hermes tools`), so each launch merges only Rayline's keys ([`OWNED`]) into
@@ -54,6 +65,8 @@ pub(crate) const MESSAGES_PROVIDER: &str = "rayline-anth";
 pub(crate) const RESPONSES_PROVIDER: &str = "rayline-resp";
 /// Hermes' per-provider key naming the header its conversation id rides on.
 pub(crate) const SESSION_AFFINITY_KEY: &str = "session_affinity_header";
+/// Hermes' per-model capability that turns on Anthropic cache markers.
+pub(crate) const PROMPT_CACHING_KEY: &str = "prompt_caching";
 
 /// The keys Rayline sets in `config.yaml`. `fallback_providers` stays empty
 /// and the legacy `fallback_model` is removed, so a failed turn never moves
@@ -80,18 +93,34 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
             )
         })
         .collect();
+    // Responses: no affinity header. Hermes sends a per-session (and per
+    // delegate child) `prompt_cache_key` there, which the router and the hybrid
+    // core both read as the conversation; the header would merge the children.
     let mut responses = json!({
         "base_url": ctx.v1_base(),
         "api_key": ctx.key,
         "api_mode": "codex_responses",
-        "models": models,
-        SESSION_AFFINITY_KEY: super::SESSION_AFFINITY_HEADER
+        "models": models
     });
+    // Messages: the header is the only identity Hermes can send on this wire.
+    // `prompt_caching` makes Hermes place its Anthropic cache markers for a
+    // model whose name does not look like Claude; without it the router sees
+    // no `cache_control` and nothing upstream adds one for a Messages client.
+    let cached_models: serde_json::Map<_, _> = launch
+        .offered
+        .iter()
+        .map(|model| {
+            (
+                (*model).to_owned(),
+                json!({ "context_length": ctx.context_window(), PROMPT_CACHING_KEY: true }),
+            )
+        })
+        .collect();
     let mut messages = json!({
         "base_url": ctx.messages_base(),
         "api_key": ctx.key,
         "api_mode": "anthropic_messages",
-        "models": models,
+        "models": cached_models,
         SESSION_AFFINITY_KEY: super::SESSION_AFFINITY_HEADER
     });
     // Both wires carry Hermes' own conversation id (see the module docs), so
@@ -189,10 +218,11 @@ mod tests {
         );
     }
 
-    /// Hermes declares an identity on both wires, so the hybrid core's
-    /// identity check is satisfied with no per-launch id anywhere.
+    /// Under hybrid the Messages provider declares the header and the
+    /// Responses provider relies on Hermes' `prompt_cache_key`, which the core
+    /// reads as identity, so no per-launch id is needed anywhere.
     #[test]
-    fn hybrid_providers_key_on_session_affinity_only() {
+    fn hybrid_identity_needs_no_per_launch_id() {
         use super::super::tests::{TEST_KEY, TEST_URL, temp_dir};
         use super::super::{ConversationIdFallback, RenderContext, write_files};
         let dir = temp_dir("hermes-hybrid");
@@ -214,12 +244,14 @@ mod tests {
         let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
         let (messages, responses) = config.split_once("  rayline-resp:").unwrap();
         assert!(!config.contains("x-conversation-id"));
-        for provider in [messages, responses] {
-            assert!(
-                provider.contains("session_affinity_header: \"x-session-affinity\""),
-                "{provider}"
-            );
-        }
+        assert!(
+            messages.contains("session_affinity_header: \"x-session-affinity\""),
+            "{messages}"
+        );
+        assert!(
+            !responses.contains("session_affinity_header"),
+            "{responses}"
+        );
         assert!(config.contains("provider: \"custom:rayline-resp\""));
     }
 
@@ -318,8 +350,10 @@ providers:
     models:
       arc-sage-1.0:
         context_length: 1000000
+        prompt_caching: true
       arc-swift-1.0:
         context_length: 1000000
+        prompt_caching: true
     session_affinity_header: \"x-session-affinity\"
   mine:
     base_url: https://mine.example
@@ -332,7 +366,6 @@ providers:
         context_length: 1000000
       arc-swift-1.0:
         context_length: 1000000
-    session_affinity_header: \"x-session-affinity\"
 agent:
   max_turns: 40
   disabled_toolsets:
@@ -392,8 +425,10 @@ providers:
     models:
       arc-sage-1.0:
         context_length: 1000000
+        prompt_caching: true
       arc-swift-1.0:
         context_length: 1000000
+        prompt_caching: true
     session_affinity_header: \"x-session-affinity\"
   rayline-resp:
     api_key: \"rlk-test\"
@@ -404,7 +439,6 @@ providers:
         context_length: 1000000
       arc-swift-1.0:
         context_length: 1000000
-    session_affinity_header: \"x-session-affinity\"
 "
         );
     }

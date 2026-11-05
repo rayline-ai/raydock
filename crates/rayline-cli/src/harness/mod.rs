@@ -28,10 +28,10 @@
 //! session id where it reads them ([`SESSION_AFFINITY_HEADER`]). opencode
 //! sends it on its own; omp sends `X-Claude-Code-Session-Id` (apiKey mode from
 //! omp 18.1.10); pi (on Messages) and OpenClaw (on Chat Completions) send it
-//! once their config sets `compat.sendSessionAffinityHeaders`; Hermes (on both
-//! its wires) once its provider entry names the header in
-//! `session_affinity_header` (from Hermes v2026.9.21). On Responses, pi's and
-//! OpenClaw's `prompt_cache_key` keys the session instead. A harness session
+//! once their config sets `compat.sendSessionAffinityHeaders`; Hermes (on
+//! Messages) once its provider entry names the header in
+//! `session_affinity_header` (from Hermes v2026.9.21). On Responses, pi's,
+//! OpenClaw's and Hermes' `prompt_cache_key` keys the session instead. A harness session
 //! is one episode, so `--resume` / `-c` / `--session-id` in a later launch
 //! keeps the episode.
 //!
