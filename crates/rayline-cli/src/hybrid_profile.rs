@@ -41,7 +41,6 @@ pub(crate) const DECISIONS_MODEL: &str = "arc-swift-1.0";
 const LOCAL_REGISTRY_MODEL: &str = "qwen/qwen3.8-27b";
 /// The default V with a zero-priced local model: easy work stays on device,
 /// harder work goes to the cloud (dev cell probe, 2026-10-25).
-const CALLER_PRICES_SCHEMA: &str = "arc-caller-prices.v1";
 /// The local model's default window: 96k tokens keeps Qwen3.8-27B's KV cache
 /// within a laptop's memory, and a longer turn hands off to cloud.
 pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW: u64 = 98_304;
@@ -92,28 +91,6 @@ fn local_price(settings: Option<&Value>) -> Result<f64, String> {
     }
 }
 
-/// RFC 8785 number spelling for the admitted range (no exponent form).
-fn canonical_number(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{}", value as i64)
-    } else {
-        format!("{value}")
-    }
-}
-
-/// The service's caller price digest: sha256(JCS({schema, exclusive, prices})).
-fn caller_price_sha256(model: &str, price: f64) -> String {
-    use sha2::Digest;
-    let number = canonical_number(price);
-    let canonical = format!(
-        "{{\"exclusive\":false,\"prices\":{{{}:{{\"cache_read\":{number},\"cache_write\":{number},\"input\":{number},\"output\":{number}}}}},\"schema\":\"{CALLER_PRICES_SCHEMA}\"}}",
-        serde_json::to_string(model).expect("model id serializes")
-    );
-    sha2::Sha256::digest(canonical.as_bytes())
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
-}
 const SCHEDULE_CLASSES: &[&str] = &["cache_boundaries", "user_messages", "all_turns"];
 
 /// Where the applied policy came from, for the start message.
@@ -500,10 +477,13 @@ pub(crate) fn default_profile(
     let legs = json!({"input": local_price, "output": local_price, "cache_read": local_price, "cache_write": local_price});
     let mut prices = Map::new();
     prices.insert(LOCAL_REGISTRY_MODEL.to_owned(), legs);
+    // Routes API V1: the caller's V is `v_value`; the caller prices only the
+    // local model and the service fills every other candidate from its
+    // catalog, so there is no `exclusive` member and no digest to precompute
+    // (the core verifies the service's digest from the echoed table).
     let mut decisions = json!({"api_mode": API_MODE_V2, "url": format!("{router}/v1/routes"),
                                "auth_env": ROUTER_KEY_ENV, "model": DECISIONS_MODEL, "result": "swift",
-                               "routing": {"prices": prices, "exclusive": false},
-                               "price_sha256": caller_price_sha256(LOCAL_REGISTRY_MODEL, local_price)});
+                               "routing": {"prices": prices}});
     if let Some(cell) = cell {
         decisions["cell_tag"] = json!(cell);
     }
@@ -726,9 +706,8 @@ fn ollama_identity(show: &Value) -> LocalIdentity {
 }
 
 /// Removes the local deployment and its action from the default profile:
-/// every turn then goes to cloud. Caller prices keep the local entry, so
-/// their pinned digest is unchanged; a price for an unoffered model selects
-/// nothing.
+/// every turn then goes to cloud. Caller prices keep the local entry; a
+/// price for an unoffered model selects nothing.
 pub(crate) fn without_local(profile: &mut Value) {
     let mut local_ids = Vec::new();
     if let Some(deployments) = profile.get_mut("deployments").and_then(Value::as_array_mut) {
@@ -1110,14 +1089,11 @@ mod tests {
             decisions["routing"]["prices"],
             json!({"qwen/qwen3.8-27b": {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0}})
         );
-        assert_eq!(decisions["routing"]["exclusive"], false);
+        // Routes API V1: no `exclusive` member and no precomputed digest.
+        assert!(decisions["routing"].get("exclusive").is_none());
         assert!(decisions["routing"].get("v_value").is_none());
         assert_eq!(decisions["result"], "swift");
-        // Equal to the dev service's own echo for this price world.
-        assert_eq!(
-            decisions["price_sha256"],
-            "5c2ccbe09f4b5f9938df5ca93282b5a39b3573cae108d5e6abf89de3466d254c"
-        );
+        assert!(decisions.get("price_sha256").is_none());
         // local_price is configurable and validated; it is refused for a profile file.
         let priced = settings(Some(json!({"local_price": 0.05})));
         let profile = default_profile(
@@ -1132,10 +1108,6 @@ mod tests {
         assert_eq!(
             profile["decisions"]["routing"]["prices"]["qwen/qwen3.8-27b"]["input"],
             0.05
-        );
-        assert_ne!(
-            profile["decisions"]["price_sha256"],
-            "5c2ccbe09f4b5f9938df5ca93282b5a39b3573cae108d5e6abf89de3466d254c"
         );
         let negative = settings(Some(json!({"local_price": -1})));
         assert!(
@@ -1737,7 +1709,6 @@ mod tests {
             None,
         )
         .unwrap();
-        let price_sha = profile["decisions"]["price_sha256"].clone();
         without_local(&mut profile);
         let composed = compose(
             profile,
@@ -1761,8 +1732,8 @@ mod tests {
             .map(|action| action["deployment_id"].as_str().unwrap())
             .collect();
         assert_eq!(actions, ["cloud-opus", "cloud-sonnet"]);
-        // Caller prices and their pinned digest are unchanged.
-        assert_eq!(config["decisions"]["price_sha256"], price_sha);
+        // Caller prices are unchanged and no digest is pinned.
+        assert!(config["decisions"].get("price_sha256").is_none());
         assert!(
             config["decisions"]["routing"]["prices"]
                 .get(LOCAL_REGISTRY_MODEL)
