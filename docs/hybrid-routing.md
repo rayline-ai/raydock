@@ -239,9 +239,11 @@ unchanged body. Requests without usable identity must fail in the core.
 Branch identity uses `x-rayline-branch-id`, then Codex `thread-id`, then
 `x-claude-code-agent-id`. An OpenCode request with `x-parent-session-id` uses its
 child session header for the branch. Other requests explicitly use branch
-`main`. Parent and child headers reach the core unchanged. Launchers whose
-harness cannot emit native identity use the existing explicit per-launch
-conversation header.
+`main`. Parent and child headers reach the core unchanged. Every launcher's
+harness emits native identity on the wires it uses (Hermes with the caveats
+its launcher module documents); the explicit per-launch
+`x-conversation-id` is opt-in (`RAYLINE_HARNESS_CONV_ID_FALLBACK=1`) and, when
+sent, ranks ahead of the harness-native identities.
 
 Every start creates a new execution instance and new gateway/core credentials.
 `status` verifies the live instance ID and both process IDs. A core crash closes

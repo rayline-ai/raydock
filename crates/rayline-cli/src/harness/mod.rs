@@ -25,24 +25,29 @@
 //! output than the execution core admits has every turn refused.
 //!
 //! Episode keying: the router keys a routing episode on each harness's own
-//! session id where it reads them: opencode and
-//! Hermes (on Responses) send `x-session-affinity`, omp `X-Claude-Code-Session-Id` (apiKey
-//! mode from omp 18.1.10), and pi (on Messages) and OpenClaw (on Chat
-//! Completions) send `x-session-affinity` once their config sets
-//! `compat.sendSessionAffinityHeaders`. On Responses, pi's and OpenClaw's
-//! `prompt_cache_key` keys the session. A harness session is one episode, so
-//! `--resume` / `-c` / `--session-id` in a later launch keeps the episode.
+//! session id where it reads them ([`SESSION_AFFINITY_HEADER`]). opencode
+//! sends it on its own; omp sends `X-Claude-Code-Session-Id` (apiKey mode from
+//! omp 18.1.10); pi (on Messages) and OpenClaw (on Chat Completions) send it
+//! once their config sets `compat.sendSessionAffinityHeaders`; Hermes (on
+//! Messages) once its provider entry names the header in
+//! `session_affinity_header` (from Hermes v2026.9.21). On Responses, pi's,
+//! OpenClaw's and Hermes' `prompt_cache_key` keys the session instead. A harness session
+//! is one episode, so `--resume` / `-c` / `--session-id` in a later launch
+//! keeps the episode.
 //!
 //! The per-launch conversation id ([`ConversationIdFallback`]) is off by
-//! default: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on for every wire,
+//! default on every wire: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on,
 //! and then each launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as
 //! `x-conversation-id`, so one launch is one episode and a resume in a new
-//! launch starts a new one. The native compat flags stay on either way; the
-//! gateway ranks `x-conversation-id` first when both arrive. A wire with no
-//! native id (Hermes on Messages) sends nothing, and the router derives the
-//! episode from the opening messages, which also keeps a subagent's turns
-//! apart from its parent's. Under `raydock hybrid run` the execution core
-//! refuses a request with no identity, so that wire keeps the header there.
+//! launch starts a new one (for Hermes only when the launch starts its shared
+//! gateway, see [`hermes`]). That also collapses a subagent's turns into its
+//! parent's episode where the harness attaches the header to every request of
+//! the process. The native compat flags and config keys stay on either way;
+//! the gateway ranks `x-conversation-id` first when both arrive. The override
+//! applies to `raydock hybrid run` too, so forcing it there accepts the same
+//! episode collapse rather than silently doing nothing on that path; either
+//! path exports [`CONV_ID_ENV`] only when a rendered config references it
+//! ([`conversation_id_for`]).
 
 mod hermes;
 mod omp;
@@ -72,6 +77,11 @@ const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 pub const CONV_ID_ENV: &str = "RAYLINE_CONV_ID";
 /// Header the gateway reads as the conversation (episode) key.
 pub const CONV_HEADER: &str = "x-conversation-id";
+/// Header a harness's own session id rides on, which the gateway keys the
+/// episode on when no [`CONV_HEADER`] arrives. Most harnesses send it under
+/// this name on their own; Hermes needs the name written into its config
+/// ([`hermes::SESSION_AFFINITY_KEY`]).
+pub const SESSION_AFFINITY_HEADER: &str = "x-session-affinity";
 /// The Legacy Rules Router on the hosted router, and the execution core's
 /// virtual model under `raydock hybrid run`.
 pub const ROUTER_MODEL: &str = crate::LEGACY_ROUTER_MODEL;
@@ -442,12 +452,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    // Set the id only when a rendered config references it.
-    let conv_id = plan
-        .files
-        .iter()
-        .any(|file| file.contents.contains(CONV_ID_ENV))
-        .then(new_conversation_id);
+    let conv_id = conversation_id_for(&plan, new_conversation_id);
     let episode = match &conv_id {
         Some(id) => format!("conversation {id}"),
         None => "episode keyed on the harness session".to_owned(),
@@ -602,6 +607,17 @@ pub(crate) fn build_command(
         None => command.env_remove(CONV_ID_ENV),
     };
     command
+}
+
+/// The per-launch id to export, minted by `mint` only when a rendered config
+/// actually references [`CONV_ID_ENV`]. A harness that keys the episode on its
+/// own session id references nothing, and then exporting an id would leave an
+/// unused variable in the environment every tool subprocess inherits.
+pub(crate) fn conversation_id_for(plan: &Plan, mint: impl FnOnce() -> String) -> Option<String> {
+    plan.files
+        .iter()
+        .any(|file| file.contents.contains(CONV_ID_ENV))
+        .then(mint)
 }
 
 /// A random (v4) UUID. One per launch; see [`ConversationIdFallback`].
