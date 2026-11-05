@@ -39,8 +39,6 @@ const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 /// model most.
 pub(crate) const DECISIONS_MODEL: &str = "arc-swift-1.0";
 const LOCAL_REGISTRY_MODEL: &str = "qwen/qwen3.8-27b";
-/// The default V with a zero-priced local model: easy work stays on device,
-/// harder work goes to the cloud (dev cell probe, 2026-10-25).
 /// The local model's default window: 96k tokens keeps Qwen3.8-27B's KV cache
 /// within a laptop's memory, and a longer turn hands off to cloud.
 pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW: u64 = 98_304;
@@ -76,7 +74,8 @@ pub(crate) fn local_context_window(settings: Option<&Value>) -> Result<u64, Stri
 }
 
 /// `hybrid.routing.local_price`: USD per million tokens for every leg of the
-/// local model, 0 or within [1e-6, 1e6] so its canonical spelling is plain.
+/// local model, 0 or within [1e-6, 1e6]; the service prices every other
+/// candidate from its catalog.
 fn local_price(settings: Option<&Value>) -> Result<f64, String> {
     let value = settings
         .and_then(|settings| settings.get("hybrid"))
@@ -1732,12 +1731,11 @@ mod tests {
             .map(|action| action["deployment_id"].as_str().unwrap())
             .collect();
         assert_eq!(actions, ["cloud-opus", "cloud-sonnet"]);
-        // Caller prices are unchanged and no digest is pinned.
+        // Every caller price is unchanged and no digest is pinned.
         assert!(config["decisions"].get("price_sha256").is_none());
-        assert!(
-            config["decisions"]["routing"]["prices"]
-                .get(LOCAL_REGISTRY_MODEL)
-                .is_some()
+        assert_eq!(
+            config["decisions"]["routing"]["prices"][LOCAL_REGISTRY_MODEL],
+            json!({"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0})
         );
         // prefer_local still needs a counted local deployment; none is left.
         let mut cloud_only = default_profile(
