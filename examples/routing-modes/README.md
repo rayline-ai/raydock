@@ -316,8 +316,8 @@ export RAYLINE_ROUTER_API_KEY="rlk-…"    # NOT $(raydock auth token)
 raydock router start --config examples/routing-modes/L-Rc.json
 ```
 
-The 403 is the same whichever model the route names (`arc-sage-1.0`, the Legacy
-`rayline-router`, or a pinned id), so it is never about the model.
+The 403 is the same whichever model the route names (`arc-sage-1.0` or a pinned
+id), so it is never about the model.
 
 **Check the router log, not just the exit status.** On a local-main config the main
 answers regardless, so the run prints a plausible final message and exits 0 while the
@@ -408,13 +408,11 @@ names `arc-sage-1.0` and `routes.subagent` names `arc-swift-1.0`.
 | `model` on the wire | RCR behaviour |
 |---|---|
 | `arc-sage-1.0` / `arc-swift-1.0` | **route on ARC** — the RCR picks the model; Sage is the main-agent tier, Swift the subagent tier |
-| `rayline-router` | **route on the Legacy Rules Router** — an explicit opt-in; nothing here defaults to it |
+| `rayline-router` | **refused** (404) — the Legacy Rules Router is retired; use an ARC id |
 | any concrete id (`claude-opus-5`, `z-ai/glm-5.2`, `gpt-5.5`, …) | **pin** — that exact model is used, and the rules/ML tiering, stickiness and ML override are all skipped |
 
-The rule is the same for every provider. Asking to be routed is what the ARC ids (and
-the Legacy `rayline-router`) are *for*; naming a model instead means you want that
-model. To use the Legacy Rules Router from a config, set its `rayline-cloud` route
-models to `rayline-router`.
+The rule is the same for every provider. Asking to be routed is what the ARC ids are
+*for*; naming a model instead means you want that model.
 
 Claude ids may also be written provider-qualified: `anthropic/claude-opus-5` pins
 exactly like the bare spelling, on `/v1/models` as well as `/v1/messages`. The prefix
@@ -443,11 +441,6 @@ Two details of that second lane matter when you are picking a subagent model:
 
 Use `router: rayline-local` (`Rl`) to decide subagent models on-device and avoid the
 question entirely.
-
-The Legacy `rayline-router` sentinel is treated the same way on a subagent turn: it runs the
-delegated policy, so `rules.delegated_subagent` applies instead of the balanced
-policy's cheap slot. Naming a specific policy — `workshop-router-fast`,
-`workshop-router-frontier` — is a deliberate choice and is honoured as written.
 
 ### `raydock`-only route fields
 

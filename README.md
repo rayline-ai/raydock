@@ -215,8 +215,7 @@ Hosted launches (`raydock claude`, `raydock codex`, and the `opencode`, `pi`,
 `omp`, `hermes` and `openclaw` launchers) run on ARC by default: the main agent
 on `arc-sage-1.0`, and subagents and background tasks on `arc-swift-1.0` where
 the harness gives them their own model setting. Hosted generated harness
-configs offer only those two ARC tiers. `raydock claude --model rayline-router`
-remains a separate compatibility path; local and hybrid sessions are unchanged.
+configs offer only those two ARC tiers. Local and hybrid sessions are unchanged.
 See [Which model runs](docs/getting-started.md#which-model-runs-arc-by-default).
 
 ## Supported Clients

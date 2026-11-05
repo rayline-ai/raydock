@@ -3,6 +3,27 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
+## Unreleased
+
+### Changed
+
+- **The Legacy Rules Router is removed (breaking).** The hosted router no
+  longer serves `rayline-router`, and Raydock no longer offers or sends it:
+  the generated `router.json` lists only `arc-sage-1.0` and `arc-swift-1.0`,
+  `raydock codex` no longer pins `rayline-router` to the Legacy model, the
+  `--model rayline-router` help text and the "Legacy Rules Router" model label
+  are gone, and a may-local `rayline-cloud` route without a `model` is refused
+  at `router start` instead of being filled with `rayline-router`. A file or
+  setting of yours that still names `rayline-router` for the hosted router is
+  not rewritten: its turns fail with the router's 404 until you change them to
+  `arc-sage-1.0` or `arc-swift-1.0`. That includes the default `router.json`
+  an 0.2.x release generated, which Raydock no longer upgrades. The omp and pi
+  migrations of saved Legacy picks to ARC stay. The local and hybrid routers
+  keep `rayline-router` as their on-device virtual model ("route by
+  `routes.main`"); it never reaches the hosted router. The local router and
+  the proxy no longer rewrite the retired `claude-rayline-router-*` and
+  `rayline-router-balanced` aliases to it.
+
 ## 0.4.0 (2026-11-05)
 
 ### New
