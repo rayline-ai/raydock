@@ -3,7 +3,7 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
-## Unreleased
+## 0.4.1 (2026-11-05)
 
 ### Changed
 
