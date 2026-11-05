@@ -232,11 +232,6 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                             configured
                         }
                     };
-                    if env == crate::status::PROD_ENV {
-                        eprintln!(
-                            "Note: hybrid routing v2 is in preview on the development router; the production router accepts it after the catalog migration. Use --env dev for the preview."
-                        );
-                    }
                     // `raydock auth login` is enough: mint the router key on first use.
                     if std::env::var_os("RAYLINE_ROUTER_API_KEY")
                         .is_none_or(|value| value.is_empty())

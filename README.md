@@ -15,9 +15,12 @@ The explicit `raydock hybrid` mode connects an unmodified coding harness to ARC
 decisions and the standalone execution core, with your own local model server
 (llama.cpp, Ollama or MLX) and named cloud targets. Easy work stays on device;
 harder work, and context that outgrows the local window, goes to the cloud.
-Start with [hybrid setup](docs/hybrid-local-setup.md) (sign in, point at your
-local model, start); see [ARC hybrid execution](docs/hybrid-routing.md) for
-configuration, lifecycle, and validation.
+Unlike `--local`, it needs a signed-in Rayline key and bills one ARC decision
+per turn, local turns included; cloud turns also bill the provider's
+pass-through price. Start with [hybrid setup](docs/hybrid-local-setup.md)
+(sign in, point at your local model, start); see
+[ARC hybrid execution](docs/hybrid-routing.md) for configuration, lifecycle,
+and validation.
 
 Raydock was previously called Rayline Local. Use `raydock` for new commands;
 `rayline` remains a supported alias. Configuration, credentials, environment

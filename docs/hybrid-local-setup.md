@@ -16,22 +16,20 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
   Rayline does not start, download or stop it.
 - Nothing else. A profile file is optional (see [Advanced: a profile file](#advanced-a-profile-file)).
 
-## Three steps
+## What it costs
 
-> **Preview: development router only.** Hybrid routing v2 is served by the
-> development router today. The production router accepts its request fields
-> after the model catalog migration. Until then, use the preview commands
-> below. The development environment must already be configured in
-> `~/.config/rayline/settings.json` (see "Custom hosted environments" in
-> [Getting started](getting-started.md)). The isolated preview cell scales to
-> zero when idle, so the first decision after a pause can return 502 or 504
-> while it starts; retry after a minute.
+Every turn of a hybrid session bills one ARC decision against your Rayline
+balance, including turns that run on your machine; a cloud turn additionally
+bills the provider's pass-through price. The local model's price in the profile
+(0 by default) steers which target ARC selects; it never changes what the
+decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
+
+## Three steps
 
 1. **Sign in.**
 
    ```bash
-   raydock --env dev auth login        # preview
-   raydock auth login                  # once production serves v2
+   raydock auth login
    ```
 
    `start` mints your Rayline API key on first use if none is saved. That key
@@ -53,7 +51,7 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 3. **Start and connect a harness.**
 
    ```bash
-   raydock hybrid start --env dev --cell pf-5505cbf8-v2   # preview
+   raydock hybrid start
    raydock hybrid run pi -- "Fix the failing test in parser.py"
    raydock hybrid status
    raydock hybrid stop
@@ -78,12 +76,12 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    Raise or lower it with `"hybrid": {"local_context_window": 131072}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
    `start`. A turn whose prompt does not fit the local window goes to a cloud
-   model; harnesses are told the window is 1,000,000 tokens. Once production
-   serves v2, plain `raydock hybrid start` uses the production router.
+   model; harnesses are told the window is 1,000,000 tokens. `start` uses the
+   production router by default; `--env dev` selects the development one.
 
    `start` checks Decisions once before it reports ready: a rejected key
-   fails with the `raydock --env dev auth login` command to run, and a
-   preview cell that is still starting is waited for.
+   fails with the `raydock auth login` command to run, and a development cell
+   (`--cell`) that is still starting is waited for.
 
    `start` prints the profile, the routing policy and the local model it bound.
    `run` also supports `claude`, `codex`, `opencode`, `omp`, `hermes` and
@@ -96,7 +94,9 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 
 ## Pricing defaults
 
-On-device inference costs you about nothing per token. The default profile
+These are the prices Raydock tells ARC, which steer selection; they are not
+what you are charged (see "What it costs" above). On-device inference costs
+you about nothing per token. The default profile
 therefore prices the local model at 0 per million tokens on every leg, sends
 those caller prices (the cloud models keep their catalog prices), and asks ARC
 Swift, which decides at its own fixed V and picks cheap. Under these defaults
