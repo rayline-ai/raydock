@@ -213,11 +213,13 @@ mod tests {
         );
     }
 
-    /// Under hybrid the Messages provider declares the header and the
-    /// Responses provider relies on Hermes' `prompt_cache_key`, which the core
-    /// reads as identity, so no per-launch id is needed anywhere.
+    /// Under hybrid the rendered config carries no per-launch id: the Messages
+    /// provider declares the header and the Responses provider relies on
+    /// Hermes' `prompt_cache_key`, which the core reads as identity. (The one
+    /// Hermes request that sends neither is documented in the module docs;
+    /// this checks the config contract, not runtime identity.)
     #[test]
-    fn hybrid_identity_needs_no_per_launch_id() {
+    fn hybrid_config_carries_no_per_launch_id() {
         use super::super::tests::{TEST_KEY, TEST_URL, temp_dir};
         use super::super::{ConversationIdFallback, RenderContext, write_files};
         let dir = temp_dir("hermes-hybrid");
@@ -326,6 +328,9 @@ mod tests {
 providers:
   rayline-anth:
     base_url: https://stale.example
+    models:
+      arc-sage-1.0:
+        prompt_caching: false
   mine:
     base_url: https://mine.example
 agent:
