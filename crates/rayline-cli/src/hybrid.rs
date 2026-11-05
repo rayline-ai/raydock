@@ -770,6 +770,14 @@ fn harness_command(
                     "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
                     capabilities.max_output_tokens.to_string(),
                 )
+                // `rayline-auto` is not in Claude Code's model catalog, so it
+                // assumes a 200k window and auto-compacts long before the
+                // gateway's. State the window the gateway advertises, as
+                // `model_context_window` already does for codex.
+                .env(
+                    "CLAUDE_CODE_MAX_CONTEXT_TOKENS",
+                    capabilities.context_window.to_string(),
+                )
                 .args(["--model", "rayline-auto"]);
             let recovery = crate::claude::refusal_recovery_values(
                 crate::claude::RoutingMode::Override,
@@ -1251,6 +1259,14 @@ mod tests {
                 .get_envs()
                 .any(|(key, value)| key == "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
                     && value == Some(std::ffi::OsStr::new("4096")))
+        );
+        // `rayline-auto` is not in Claude Code's catalog, so the window it
+        // may budget against is stated rather than assumed (200k).
+        assert!(
+            claude
+                .get_envs()
+                .any(|(key, value)| key == "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
+                    && value == Some(std::ffi::OsStr::new("1000000")))
         );
         let codex = harness_command(
             &paths,
