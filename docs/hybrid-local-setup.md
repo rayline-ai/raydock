@@ -98,11 +98,11 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 
 On-device inference costs you about nothing per token. The default profile
 therefore prices the local model at 0 per million tokens on every leg, sends
-those caller prices with `exclusive: false` so cloud models keep their market
-prices, and asks ARC Swift, which decides at its own fixed V and picks cheap.
-Under these defaults easy work stays on device and harder work goes to the
-cloud. Change the local price in the override block with `local_price` (USD
-per million tokens, applied to every leg of the local model).
+those caller prices (the cloud models keep their catalog prices), and asks ARC
+Swift, which decides at its own fixed V and picks cheap. Under these defaults
+easy work stays on device and harder work goes to the cloud. Change the local
+price in the override block with `local_price` (USD per million tokens, applied
+to every leg of the local model).
 
 ## Routing policy
 
@@ -193,7 +193,10 @@ No harness extension or patch is needed.
 
 `raydock hybrid start --config /absolute/path/to/hybrid.json` uses a qualified
 execution-core profile instead of the default. The `hybrid.routing` overrides
-still apply. Use one to:
+still apply. The profile is passed to the core as written, so one from before
+the Routes API V1 contract (a `routing.exclusive` member, `value_usd` instead
+of `v_value`, or a precomputed `price_sha256`) is refused by the core at
+startup; the refusal names the replacement in the runtime log. Use one to:
 
 - pin a policy package and its actions;
 - choose other cloud targets;

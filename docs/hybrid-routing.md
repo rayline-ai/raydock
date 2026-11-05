@@ -456,6 +456,11 @@ macOS 13](https://go.dev/doc/go1.27#darwin).
 
 ## Live Pi acceptance
 
+This runner is the legacy `current` / `execution_context_v1` acceptance and
+predates the Routes API V1 contract: the configured `v_value` and the pinned
+`price_sha256` it proves are that older profile's members. The default profile and the hybrid
+v2 path are exercised by `scripts/test-hybrid-v2-live.py` instead.
+
 `scripts/test-hybrid-live.py` consumes a supplied real core configuration and
 credential environment. It starts only `rld` and the Go core. It creates no
 Decisions or inference fixtures and does not start the model runtime. The two
