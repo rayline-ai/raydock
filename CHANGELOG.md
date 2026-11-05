@@ -3,7 +3,7 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
-## 0.3.1 (2026-11-02)
+## 0.4.0 (2026-11-05)
 
 ### New
 
@@ -33,6 +33,38 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   are refused at `start` (`settings hybrid.routing.v_value is not
   supported`); remove the key. A profile file that wants its own V sets
   `decisions.routing.v_value` with model `arc-1.0`.
+
+### Fixed
+
+- **Chat Completions requests show in `raydock top`.** The local router's
+  `/v1/chat/completions` listener now records the same request lifecycle as
+  the Messages and Responses listeners: the route when it is decided, the
+  first token, the Chat `usage` counts (prompt, completion, cached) and the
+  completion, or the error for an upstream failure, a cut-off stream or a
+  refused request. Cloud requests from OpenAI-compatible harnesses (OpenClaw,
+  Roomote, Cline in OpenAI mode) were missing from `raydock top` and its
+  totals; requests served on-device already appeared and are unchanged. On a
+  passthrough route, a streaming request that did not ask for usage now asks
+  the upstream for it so the row carries real token counts; that extra usage
+  chunk is withheld from the client, whose stream is unchanged.
+- **Non-streaming Responses turns on an Anthropic route no longer stay active
+  in `raydock top`.** When a Codex `/v1/responses` turn is served through an
+  `anthropic_messages` endpoint and the translation is not stream-to-stream
+  (a `stream: false` turn such as Codex compaction, or a `stream: true` turn
+  the upstream answered in one piece), the local router now closes the
+  request's metrics row with the upstream's token counts (whole prompt,
+  output, cached part) and the selected model. Those turns were left in
+  `active` with state `routed` forever, so `raydock top` listed them as
+  never finishing, `active_requests` was wrong and the completed and token
+  totals missed them. A buffered upstream stream that reported an error or
+  stopped early is recorded as an error, not a completion. Response bodies
+  are unchanged. A Responses turn served on-device is recorded by the
+  adapter, as before, and no longer also leaves a bare duplicate row.
+
+## 0.3.1 (2026-11-02)
+
+### Changed
+
 - Hosted `raydock claude` now picks the model of every Claude Code subagent and
   background task, ignoring the models Claude Code's own agent definitions
   name. Without `--model`, they run on `arc-swift-1.0`; with `--model X`
@@ -99,19 +131,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 - **Supply-chain checks recognize the reviewed Boost license** for the pinned
   `xxhash-rust` dependency used by omp's native lock compatibility. The exception
   is crate/version-scoped, and distributed notices include the license text.
-- **Non-streaming Responses turns on an Anthropic route no longer stay active
-  in `raydock top`.** When a Codex `/v1/responses` turn is served through an
-  `anthropic_messages` endpoint and the translation is not stream-to-stream
-  (a `stream: false` turn such as Codex compaction, or a `stream: true` turn
-  the upstream answered in one piece), the local router now closes the
-  request's metrics row with the upstream's token counts (whole prompt,
-  output, cached part) and the selected model. Those turns were left in
-  `active` with state `routed` forever, so `raydock top` listed them as
-  never finishing, `active_requests` was wrong and the completed and token
-  totals missed them. A buffered upstream stream that reported an error or
-  stopped early is recorded as an error, not a completion. Response bodies
-  are unchanged. A Responses turn served on-device is recorded by the
-  adapter, as before, and no longer also leaves a bare duplicate row.
 
 ## 0.3.0 (2026-10-28)
 
@@ -142,20 +161,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `routes.subagent` model.
 - Under `--route subagents`, a request naming an ARC model (`arc-*`) always
   goes to the router, like `rayline-router`: Anthropic serves neither.
-
-### Fixed
-
-- **Chat Completions requests show in `raydock top`.** The local router's
-  `/v1/chat/completions` listener now records the same request lifecycle as
-  the Messages and Responses listeners: the route when it is decided, the
-  first token, the Chat `usage` counts (prompt, completion, cached) and the
-  completion, or the error for an upstream failure, a cut-off stream or a
-  refused request. Cloud requests from OpenAI-compatible harnesses (OpenClaw,
-  Roomote, Cline in OpenAI mode) were missing from `raydock top` and its
-  totals; requests served on-device already appeared and are unchanged. On a
-  passthrough route, a streaming request that did not ask for usage now asks
-  the upstream for it so the row carries real token counts; that extra usage
-  chunk is withheld from the client, whose stream is unchanged.
 
 ## 0.2.14 (2026-10-27)
 
