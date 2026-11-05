@@ -301,7 +301,7 @@ def main():
                     raise AssertionError(f"HTTP {error.code}: {error.read().decode()}") from error
 
             messages = [{"role": "user", "content": "Call lookup for sample, then report its result."}]
-            base = {"model": "rayline-router", "max_tokens": 512, "tools": [{"name": "lookup",
+            base = {"model": "rayline-auto", "max_tokens": 512, "tools": [{"name": "lookup",
                 "description": "Lookup a synthetic record", "input_schema": {"type": "object",
                     "properties": {"name": {"type": "string"}}, "required": ["name"]}}]}
             one, _ = request("/v1/messages", dict(base, messages=messages))
@@ -331,9 +331,9 @@ def main():
             request("/v1/messages", dict(base, messages=messages))
             assert private_text not in json.dumps(dispatches[3]["body"])
             assert private_text not in json.dumps(decisions)
-            chat, _ = request("/v1/chat/completions", {"model": "rayline-router", "messages": [{"role": "user", "content": "chat wire"}]}, "chat-session")
+            chat, _ = request("/v1/chat/completions", {"model": "rayline-auto", "messages": [{"role": "user", "content": "chat wire"}]}, "chat-session")
             assert chat["choices"][0]["message"]["content"] == "Synthetic execution complete."
-            responses, _ = request("/v1/responses", {"model": "rayline-router", "input": "responses wire"}, "responses-session")
+            responses, _ = request("/v1/responses", {"model": "rayline-auto", "input": "responses wire"}, "responses-session")
             assert responses["output"][0]["content"][0]["text"] == "Synthetic execution complete."
             assert [d["target"] for d in dispatches[:4]] == ["local", "cloud", "cloud", "local"]
             actual_local = None
@@ -357,7 +357,7 @@ def main():
                 harness_scenario.update(active=True, path=str(sample))
                 prompt = f"Read {sample} and then reply with Synthetic execution complete."
                 if args.pi:
-                    output = cli("run", "pi", "--", "--provider", "rayline", "--model", "rayline-router",
+                    output = cli("run", "pi", "--", "--provider", "rayline", "--model", "rayline-auto",
                         "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates",
                         "--no-context-files", "--tools", "read", "--thinking", "off", "--print", prompt)
                 else:

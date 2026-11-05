@@ -367,7 +367,7 @@ async fn proxy_routes_router_and_anthropic_paths_with_correct_auth() {
         .header("authorization", "Bearer claude-oauth")
         .header("x-api-key", "claude-api-key")
         .header("anthropic-version", "2023-06-01")
-        .body(r#"{"model":"rayline-router"}"#)
+        .body(r#"{"model":"rayline-auto"}"#)
         .send()
         .await
         .unwrap();
@@ -388,7 +388,7 @@ async fn proxy_routes_router_and_anthropic_paths_with_correct_auth() {
     );
     assert_eq!(
         String::from_utf8(router_seen[0].body.clone()).unwrap(),
-        r#"{"model":"rayline-router"}"#
+        r#"{"model":"rayline-auto"}"#
     );
 
     let anthropic_resp = client
@@ -441,7 +441,7 @@ async fn proxy_refuses_router_bound_thread_continuation_so_claude_resends_histor
     // The message-threads continuation Claude Code sends after a tool result
     // when it believes it is talking to first-party Anthropic.
     let continuation = json!({
-        "model": "rayline-router",
+        "model": "rayline-auto",
         "thread": {"type": "continue", "previous_message_id": "msg_prev"},
         "messages": [{"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_1", "content": "ok"}
@@ -467,7 +467,7 @@ async fn proxy_refuses_router_bound_thread_continuation_so_claude_resends_histor
     // Claude Code tags every full-history turn, the resend included, with
     // `thread.type = "create"`; it must pass or the resend would loop.
     let full_history = json!({
-        "model": "rayline-router",
+        "model": "rayline-auto",
         "thread": {"type": "create"},
         "messages": [
             {"role": "user", "content": "list files"},
@@ -613,7 +613,7 @@ async fn selective_proxy_routes_model_list_discovery_to_router() {
         FakeResponse {
             status: StatusCode::OK,
             headers: vec![("content-type".to_string(), "application/json".to_string())],
-            body: Bytes::from_static(br#"{"data":[{"id":"rayline-router"}]}"#),
+            body: Bytes::from_static(br#"{"data":[{"id":"rayline-auto"}]}"#),
         },
     )
     .await;
@@ -649,7 +649,7 @@ async fn selective_proxy_routes_model_list_discovery_to_router() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(
         resp.json::<serde_json::Value>().await.unwrap()["data"][0]["id"],
-        "rayline-router"
+        "rayline-auto"
     );
 
     let provider_detail_resp = client
@@ -692,7 +692,7 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
                 ),
                 (
                     "x-rayline-virtual-model".to_string(),
-                    "rayline-router".to_string(),
+                    "rayline-auto".to_string(),
                 ),
                 ("x-rayline-policy".to_string(), "balanced".to_string()),
                 ("x-rayline-task-class".to_string(), "debugging".to_string()),
@@ -733,7 +733,7 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
         .header("x-rayline-local-available", "false")
         .header("x-rayline-local-model-id", "stale-client-model")
         .header("x-rayline-local-hint", "1")
-        .body(r#"{"model":"rayline-router"}"#)
+        .body(r#"{"model":"rayline-auto"}"#)
         .send()
         .await
         .unwrap();
@@ -750,7 +750,7 @@ async fn proxy_writes_route_status_sidecar_from_rayline_headers() {
     }
     let parsed = parsed.expect("route-status sidecar should be written");
     assert_eq!(parsed["selected_model"], "glm-4.6");
-    assert_eq!(parsed["virtual_model"], "rayline-router");
+    assert_eq!(parsed["virtual_model"], "rayline-auto");
     assert_eq!(parsed["policy"], "balanced");
     assert_eq!(parsed["task_class"], "debugging");
     assert_eq!(parsed["route_id"], "route-it");
@@ -772,7 +772,7 @@ async fn selective_main_passthrough_clears_route_status_sidecar() {
                 ),
                 (
                     "x-rayline-virtual-model".to_string(),
-                    "rayline-router".to_string(),
+                    "rayline-auto".to_string(),
                 ),
                 ("x-rayline-policy".to_string(), "delegated".to_string()),
                 (
@@ -999,7 +999,7 @@ async fn local_proxy_redirect_uses_shared_router_auth_for_usage_update() {
     let resp = client
         .post("https://api.anthropic.com/v1/messages")
         .header("authorization", "Bearer claude-oauth")
-        .body(r#"{"model":"rayline-router"}"#)
+        .body(r#"{"model":"rayline-auto"}"#)
         .send()
         .await
         .unwrap();

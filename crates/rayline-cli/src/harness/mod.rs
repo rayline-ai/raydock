@@ -19,7 +19,7 @@
 //! `maxTokens` 128000 for the hosted ARC tiers. The main agent defaults to ARC
 //! Sage (`arc-sage-1.0`) and, where the harness has a separate
 //! small/background model role, that role to ARC Swift (`arc-swift-1.0`).
-//! Under `raydock hybrid run` every renderer keeps `rayline-router` (the execution
+//! Under `raydock hybrid run` every renderer keeps `rayline-auto` (the execution
 //! core's virtual model) and advertises the hybrid runtime's admitted limits
 //! instead ([`RenderContext::capabilities`]): a harness that asks for more
 //! output than the execution core admits has every turn refused.

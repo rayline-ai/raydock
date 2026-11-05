@@ -158,7 +158,7 @@ async fn all_protocols_preserve_body_and_identity_then_stop_owned_core() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let unauthorized = client.get(format!("{url}/healthz")).send().await.unwrap();
     assert_eq!(unauthorized.status(), 401);
-    let body = "{ \"model\":\"rayline-router\", \"thinking\":{\"type\":\"adaptive\"},\"messages\":[],\"input\":[],\"private\":\"unaltered\" }";
+    let body = "{ \"model\":\"rayline-auto\", \"thinking\":{\"type\":\"adaptive\"},\"messages\":[],\"input\":[],\"private\":\"unaltered\" }";
     for path in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
         let response = client
             .post(format!("{url}{path}"))

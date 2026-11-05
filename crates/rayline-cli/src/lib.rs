@@ -44,7 +44,7 @@ pub const ARC_SWIFT_MODEL: &str = "arc-swift-1.0";
 /// The virtual model of the routers that run on this machine: the local
 /// router reads it as "route by `routes.main`", and it is the hybrid execution
 /// core's only model. It names no hosted model; the hosted router refuses it.
-pub const VIRTUAL_ROUTER_MODEL: &str = "rayline-router";
+pub const VIRTUAL_ROUTER_MODEL: &str = "rayline-auto";
 pub const UPDATE_BASE_URL: &str = "https://get.rayline.ai";
 pub const INSTALLER_URL: &str = "https://get.rayline.ai/install.sh";
 pub const UV_TOOL_NAME: &str = "rayline-cli";

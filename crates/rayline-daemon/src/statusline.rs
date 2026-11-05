@@ -187,17 +187,17 @@ mod tests {
     #[test]
     fn future_timestamp_clock_skew_is_stale() {
         let future = sidecar(NOW + 10_000);
-        let session = json!({"model": {"id": "rayline-router"}});
+        let session = json!({"model": {"id": "rayline-auto"}});
         let line = render(Some(&future), Some(&session), NOW);
         assert!(!line.contains("glm-4.6"));
-        assert!(line.contains("rayline-router"));
+        assert!(line.contains("rayline-auto"));
     }
 
     #[test]
     fn missing_sidecar_uses_virtual_id() {
-        let session = json!({"model": {"id": "rayline-router"}});
+        let session = json!({"model": {"id": "rayline-auto"}});
         let line = render(None, Some(&session), NOW);
-        assert!(line.contains("rayline-router"));
+        assert!(line.contains("rayline-auto"));
     }
 
     #[test]
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn virtual_model_accepts_plain_string() {
-        let session = json!({"model": "rayline-router"});
-        assert_eq!(virtual_model(&session), Some("rayline-router"));
+        let session = json!({"model": "rayline-auto"});
+        assert_eq!(virtual_model(&session), Some("rayline-auto"));
     }
 }

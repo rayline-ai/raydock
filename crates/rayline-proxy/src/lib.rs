@@ -65,7 +65,7 @@ pub const DEFAULT_ANTHROPIC_URL: &str = "https://api.anthropic.com";
 pub const DEFAULT_ROUTER_URL: &str = "https://api.rayline.ai";
 const CLAUDE_CODE_AGENT_ID_HEADER: &str = "x-claude-code-agent-id";
 const RAYLINE_AGENT_TYPE_HEADER: &str = "x-rayline-claude-code-agent-type";
-const VIRTUAL_MODEL: &str = "rayline-router";
+const VIRTUAL_MODEL: &str = "rayline-auto";
 /// Claude Code writes `agent-<id>.meta.json` (which carries `agentType`)
 /// concurrently with — sometimes a few ms after — it fires the subagent's
 /// first request. Resolving the type just once races that write and can fall
@@ -3506,7 +3506,7 @@ mod tests {
             &Method::POST,
             "/v1/messages/count_tokens",
             &headers,
-            Bytes::from_static(br#"{"model":"rayline-router"}"#),
+            Bytes::from_static(br#"{"model":"rayline-auto"}"#),
             ProxyRoutingMode::SelectiveSubagents,
         );
 
@@ -3517,7 +3517,7 @@ mod tests {
 
     #[test]
     fn selective_mode_routes_virtual_model_names_with_ttl_suffix() {
-        assert_eq!(normalize_model_name("rayline-router[1m]"), "rayline-router");
+        assert_eq!(normalize_model_name("rayline-auto[1m]"), "rayline-auto");
         // Retired router aliases name no model: nothing maps them.
         assert_eq!(
             normalize_model_name("claude-rayline-router-balanced"),
@@ -3529,7 +3529,7 @@ mod tests {
             &Method::POST,
             "/v1/messages",
             &headers,
-            Bytes::from_static(br#"{"model":"rayline-router[1m]"}"#),
+            Bytes::from_static(br#"{"model":"rayline-auto[1m]"}"#),
             ProxyRoutingMode::SelectiveSubagents,
         );
 
@@ -3543,7 +3543,7 @@ mod tests {
         assert_eq!(
             classify_anthropic_request_for_mode(
                 &Method::GET,
-                "/v1/models/rayline-router",
+                "/v1/models/rayline-auto",
                 ProxyRoutingMode::SelectiveSubagents,
             )
             .target,
@@ -3931,14 +3931,14 @@ mod tests {
     fn route_status_extracts_selected_model_and_metadata() {
         let headers = header_map(&[
             ("x-rayline-selected-model", "glm-4.6"),
-            ("x-rayline-virtual-model", "rayline-router"),
+            ("x-rayline-virtual-model", "rayline-auto"),
             ("x-rayline-policy", "balanced"),
             ("x-rayline-task-class", "debugging"),
             ("x-rayline-route-id", "route-123"),
         ]);
         let status = RouteStatus::from_headers(&headers, None).unwrap();
         assert_eq!(status.selected_model, "glm-4.6");
-        assert_eq!(status.virtual_model.as_deref(), Some("rayline-router"));
+        assert_eq!(status.virtual_model.as_deref(), Some("rayline-auto"));
         assert_eq!(status.policy.as_deref(), Some("balanced"));
         assert_eq!(status.task_class.as_deref(), Some("debugging"));
         assert_eq!(status.route_id.as_deref(), Some("route-123"));
@@ -3970,7 +3970,7 @@ mod tests {
         let path = dir.path().join("nested").join("route-status.json");
         let status = RouteStatus {
             selected_model: "glm-4.6".to_string(),
-            virtual_model: Some("rayline-router".to_string()),
+            virtual_model: Some("rayline-auto".to_string()),
             policy: Some("balanced".to_string()),
             task_class: Some("debugging".to_string()),
             route_id: Some("route-123".to_string()),
@@ -4000,7 +4000,7 @@ mod tests {
         let io = Arc::new(AsyncMutex::new(()));
         let status = RouteStatus {
             selected_model: "glm-4.6".to_string(),
-            virtual_model: Some("rayline-router".to_string()),
+            virtual_model: Some("rayline-auto".to_string()),
             policy: Some("balanced".to_string()),
             task_class: Some("debugging".to_string()),
             route_id: Some("route-123".to_string()),
