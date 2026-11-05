@@ -117,6 +117,20 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 - Under `--route subagents`, a request naming an ARC model (`arc-*`) always
   goes to the router, like `rayline-router`: Anthropic serves neither.
 
+### Fixed
+
+- **Chat Completions requests show in `raydock top`.** The local router's
+  `/v1/chat/completions` listener now records the same request lifecycle as
+  the Messages and Responses listeners: the route when it is decided, the
+  first token, the Chat `usage` counts (prompt, completion, cached) and the
+  completion, or the error for an upstream failure, a cut-off stream or a
+  refused request. Cloud requests from OpenAI-compatible harnesses (OpenClaw,
+  Roomote, Cline in OpenAI mode) were missing from `raydock top` and its
+  totals; requests served on-device already appeared and are unchanged. On a
+  passthrough route, a streaming request that did not ask for usage now asks
+  the upstream for it so the row carries real token counts; that extra usage
+  chunk is withheld from the client, whose stream is unchanged.
+
 ## 0.2.14 (2026-10-27)
 
 ### Fixed

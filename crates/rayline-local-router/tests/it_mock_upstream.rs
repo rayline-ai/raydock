@@ -2668,3 +2668,1158 @@ async fn inbound_chat_completions_go_through_the_inbound_guard() {
     );
     let _ = std::fs::remove_file(config);
 }
+
+// --- Chat Completions metrics lifecycle --------------------------------------
+
+/// Route one Chat Completions `request` to the mock endpoint `endpoint(port)`
+/// answering `upstream` (a raw HTTP response), drain the answer, and return
+/// the request's settled metrics row with the router totals.
+async fn chat_metrics_row(
+    name: &str,
+    endpoint: impl FnOnce(u16) -> Value,
+    upstream: Option<String>,
+    request: Value,
+) -> (
+    rayline_metrics::RequestSnapshot,
+    rayline_metrics::RouterTotals,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = listener.local_addr().unwrap().port();
+    if let Some(upstream) = upstream {
+        tokio::spawn(serve_once(listener, upstream));
+    }
+    let config = chat_route_config(name, endpoint(upstream_port));
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        metrics: Some(metrics.clone()),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .timeout(Duration::from_secs(5))
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    // A cut-off stream is a body error; the row is closed either way.
+    let _ = response.bytes().await;
+    let _ = std::fs::remove_file(config);
+    // The forwarder closes the row after the last body byte went out.
+    for _ in 0..100 {
+        let snapshot = metrics.snapshot();
+        if snapshot.totals.active_requests == 0 && snapshot.recent.len() == 1 {
+            let mut recent = snapshot.recent;
+            return (recent.remove(0), snapshot.totals);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "the request was not closed in metrics: {:?}",
+        metrics.snapshot()
+    );
+}
+
+fn openai_chat_endpoint(upstream_port: u16) -> Value {
+    json!({"id": "up", "protocol": "openai_chat",
+           "base_url": format!("http://127.0.0.1:{upstream_port}/v1"), "models": ["m"]})
+}
+
+fn chat_request(stream: bool) -> Value {
+    json!({"model": "m", "stream": stream,
+           "messages": [{"role": "user", "content": "ping"}]})
+}
+
+/// A remote Chat Completions request has the same row as a Messages request:
+/// announced with the route, closed as completed with the Chat `usage`
+/// counts (whole prompt, completion, cached), so `raydock top` lists it and
+/// the totals count it. Both translated answer shapes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_translated_requests_complete_their_metrics_row() {
+    let message = http_json(&json!({
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+        "content": [{"type": "text", "text": "PONG"}], "stop_reason": "end_turn",
+        "usage": {"input_tokens": 9, "output_tokens": 2, "cache_read_input_tokens": 5}
+    }));
+    let sse = http_sse(concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":0,\"cache_read_input_tokens\":null}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"PONG\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"input_tokens\":8686,\"output_tokens\":17,\"cache_read_input_tokens\":5508}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    ));
+    for (name, upstream, stream, expected) in [
+        (
+            "chat-metrics-json",
+            message.clone(),
+            false,
+            (14, 2, Some(5)),
+        ),
+        ("chat-metrics-replay", message, true, (14, 2, Some(5))),
+        ("chat-metrics-sse", sse, true, (14194, 17, Some(5508))),
+    ] {
+        let (row, totals) = chat_metrics_row(
+            name,
+            anthropic_endpoint,
+            Some(upstream),
+            chat_request(stream),
+        )
+        .await;
+        assert_eq!(row.state, "completed", "{name}: {row:?}");
+        assert_eq!(row.status_code, Some(200), "{name}");
+        assert_eq!(row.target.as_deref(), Some("remote"), "{name}");
+        assert_eq!(row.endpoint_id.as_deref(), Some("up"), "{name}");
+        assert_eq!(row.requested_model.as_deref(), Some("m"), "{name}");
+        assert_eq!(row.selected_model.as_deref(), Some("m"), "{name}");
+        assert!(
+            row.route_id.is_some() && row.policy.is_some(),
+            "{name}: {row:?}"
+        );
+        assert!(row.first_token_at_unix_ms.is_some(), "{name}: {row:?}");
+        assert_eq!(
+            (row.input_tokens, row.output_tokens, row.prompt_cache_tokens),
+            (Some(expected.0), Some(expected.1), expected.2),
+            "{name}"
+        );
+        assert_eq!(totals.completed_requests, 1, "{name}");
+        assert_eq!(totals.remote_requests, 1, "{name}");
+        assert_eq!(totals.errored_requests, 0, "{name}");
+        assert_eq!(
+            (totals.input_tokens, totals.output_tokens),
+            (expected.0, expected.1),
+            "{name}"
+        );
+    }
+}
+
+/// A Chat Completions request passed through to an OpenAI-compatible
+/// endpoint completes its row from the `usage` the upstream sends, in JSON
+/// and in the stream's usage chunk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_passthrough_requests_complete_their_metrics_row() {
+    let completion = http_json(&json!({
+        "id": "chatcmpl_1", "object": "chat.completion", "created": 1, "model": "m",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "PONG"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6}
+    }));
+    let chunks = http_sse(&format!(
+        "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+               "choices": [{"index": 0, "delta": {"role": "assistant", "content": "PONG"},
+                            "finish_reason": null}]}),
+        json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+        json!({"id": "chatcmpl_1", "object": "chat.completion.chunk", "choices": [],
+               "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15,
+                         "prompt_tokens_details": {"cached_tokens": 4}}}),
+    ));
+    for (name, upstream, stream, expected) in [
+        ("chat-metrics-pass-json", completion, false, (5, 1, None)),
+        ("chat-metrics-pass-sse", chunks, true, (12, 3, Some(4))),
+    ] {
+        let (row, totals) = chat_metrics_row(
+            name,
+            openai_chat_endpoint,
+            Some(upstream),
+            chat_request(stream),
+        )
+        .await;
+        assert_eq!(row.state, "completed", "{name}: {row:?}");
+        assert_eq!(row.status_code, Some(200), "{name}");
+        assert_eq!(row.target.as_deref(), Some("remote"), "{name}");
+        assert_eq!(row.endpoint_id.as_deref(), Some("up"), "{name}");
+        assert_eq!(row.selected_model.as_deref(), Some("m"), "{name}");
+        assert!(row.first_token_at_unix_ms.is_some(), "{name}: {row:?}");
+        assert_eq!(
+            (row.input_tokens, row.output_tokens, row.prompt_cache_tokens),
+            (Some(expected.0), Some(expected.1), expected.2),
+            "{name}"
+        );
+        assert_eq!(totals.completed_requests, 1, "{name}");
+        assert_eq!(totals.remote_requests, 1, "{name}");
+    }
+}
+
+/// Every way a Chat Completions request can fail after it was announced
+/// closes its row as an error, so nothing is left active: an upstream
+/// non-2xx on both routes, a stream cut off mid-answer, a stream closed
+/// cleanly before its last chunk, an SSE `error` event after a 200, a
+/// request the translated route refuses, and a route to a Responses-only
+/// endpoint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_failures_close_their_metrics_row() {
+    let too_many = |body: Value| {
+        let body = body.to_string();
+        format!(
+            "HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let anthropic_429 = too_many(json!({"type": "error",
+        "error": {"type": "rate_limit_error", "message": "slow down"}}));
+    let openai_429 =
+        too_many(json!({"error": {"message": "slow down", "type": "rate_limit_error"}}));
+    // A chunked body that ends before its terminating chunk.
+    let cut_off = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{SSE_START}\r\n",
+        SSE_START.len()
+    );
+    let unsearchable = json!({"model": "m", "web_search_options": {},
+                              "messages": [{"role": "user", "content": "ping"}]});
+    let responses_endpoint = |upstream_port: u16| {
+        json!({"id": "up", "protocol": "openai_responses",
+               "base_url": format!("http://127.0.0.1:{upstream_port}/v1"), "models": ["m"]})
+    };
+    struct Failure {
+        name: &'static str,
+        endpoint: fn(u16) -> Value,
+        upstream: Option<String>,
+        request: Value,
+        status: Option<u16>,
+        error: &'static str,
+    }
+    let cases = [
+        Failure {
+            name: "chat-metrics-anthropic-429",
+            endpoint: anthropic_endpoint,
+            upstream: Some(anthropic_429),
+            request: chat_request(false),
+            status: Some(429),
+            error: "upstream returned HTTP 429",
+        },
+        Failure {
+            name: "chat-metrics-openai-429",
+            endpoint: openai_chat_endpoint,
+            upstream: Some(openai_429),
+            request: chat_request(false),
+            status: Some(429),
+            error: "upstream returned HTTP 429",
+        },
+        Failure {
+            name: "chat-metrics-cut-off",
+            endpoint: anthropic_endpoint,
+            upstream: Some(cut_off),
+            request: chat_request(true),
+            status: Some(502),
+            error: "upstream stream",
+        },
+        Failure {
+            name: "chat-metrics-clean-eof",
+            endpoint: openai_chat_endpoint,
+            // A close-delimited 200 that stops before its last chunk: a
+            // normal EOF, not a transport error.
+            upstream: Some(http_sse(&format!(
+                "data: {}\n\n",
+                json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                       "choices": [{"index": 0, "delta": {"content": "PO"},
+                                    "finish_reason": null}]}),
+            ))),
+            request: chat_request(true),
+            status: Some(200),
+            error: "ended before the response completed",
+        },
+        Failure {
+            name: "chat-metrics-sse-error",
+            endpoint: openai_chat_endpoint,
+            upstream: Some(http_sse(&format!(
+                "data: {}\n\ndata: {}\n\n",
+                json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                       "choices": [{"index": 0, "delta": {"content": "PO"}, "finish_reason": null}]}),
+                json!({"error": {"message": "boom", "type": "server_error"}}),
+            ))),
+            request: chat_request(true),
+            status: Some(200),
+            error: "boom",
+        },
+        Failure {
+            name: "chat-metrics-refused",
+            endpoint: anthropic_endpoint,
+            upstream: None,
+            request: unsearchable,
+            status: Some(400),
+            error: "unsupported_parameter",
+        },
+        Failure {
+            name: "chat-metrics-responses-route",
+            endpoint: responses_endpoint,
+            upstream: None,
+            request: chat_request(false),
+            status: Some(400),
+            error: "unsupported_route",
+        },
+    ];
+    for Failure {
+        name,
+        endpoint,
+        upstream,
+        request,
+        status,
+        error,
+    } in cases
+    {
+        let (row, totals) = chat_metrics_row(name, endpoint, upstream, request).await;
+        assert_eq!(row.state, "error", "{name}: {row:?}");
+        assert_eq!(row.status_code, status, "{name}: {row:?}");
+        assert!(
+            row.error.as_deref().is_some_and(|e| e.contains(error)),
+            "{name}: {row:?}"
+        );
+        assert_eq!(row.target.as_deref(), Some("remote"), "{name}");
+        assert_eq!(totals.errored_requests, 1, "{name}");
+        assert_eq!(totals.completed_requests, 1, "{name}");
+    }
+}
+
+/// A Chat client that stops reading mid-stream cancels its generation on
+/// both routes: the router stops reading the upstream (so the upstream's
+/// next write fails) and closes the row as an error instead of draining the
+/// rest of the answer and recording it as completed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_client_disconnect_cancels_upstream_and_closes_row() {
+    let anthropic_piece = sse_text_delta("more");
+    let openai_piece = format!(
+        "data: {}\n\n",
+        json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+               "choices": [{"index": 0, "delta": {"content": "more"}, "finish_reason": null}]})
+    );
+    type Endpoint = fn(u16) -> Value;
+    for (name, endpoint, piece) in [
+        (
+            "chat-cancel-anthropic",
+            anthropic_endpoint as Endpoint,
+            anthropic_piece,
+        ),
+        (
+            "chat-cancel-openai",
+            openai_chat_endpoint as Endpoint,
+            openai_piece,
+        ),
+    ] {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel::<bool>();
+        // An answer that keeps streaming for seconds unless the reader goes
+        // away; reports whether a write failed before it ran out of pieces.
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = upstream.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            let _ = sock.write_all(SSE_START.as_bytes()).await;
+            let mut cancelled = false;
+            for _ in 0..40 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if sock.write_all(piece.as_bytes()).await.is_err() || sock.flush().await.is_err() {
+                    cancelled = true;
+                    break;
+                }
+            }
+            let _ = cancelled_tx.send(cancelled);
+        });
+        let config = chat_route_config(name, endpoint(upstream_port));
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        let port = free_port();
+        let opts = LocalRouterOptions {
+            port,
+            config_path: Some(config.clone()),
+            metrics: Some(metrics.clone()),
+            ..LocalRouterOptions::default()
+        };
+        tokio::spawn(async move {
+            let _ = serve(opts).await;
+        });
+        let client = reqwest::Client::new();
+        for _ in 0..100 {
+            if client
+                .get(format!("http://127.0.0.1:{port}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&chat_request(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{name}");
+        let mut stream = response.bytes_stream();
+        let _ = stream.next().await.expect("first chunk");
+        drop(stream);
+        let _ = std::fs::remove_file(config);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(3), cancelled_rx)
+                .await
+                .expect("the upstream kept streaming to a client that left")
+                .unwrap_or(false),
+            "{name}: the upstream never saw the cancellation"
+        );
+        let mut row = None;
+        for _ in 0..100 {
+            let snapshot = metrics.snapshot();
+            if snapshot.totals.active_requests == 0 && !snapshot.recent.is_empty() {
+                row = snapshot.recent.into_iter().next();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let row = row.expect("the row was closed");
+        assert_eq!(row.state, "error", "{name}: {row:?}");
+        assert!(
+            row.error
+                .as_deref()
+                .is_some_and(|e| e.contains("client disconnected")),
+            "{name}: {row:?}"
+        );
+    }
+}
+
+/// A streaming client that did not ask for usage still gets a metered row:
+/// the router asks the upstream for the usage chunk and keeps it from the
+/// client, whose stream is otherwise byte for byte what the upstream sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_passthrough_requests_usage_the_client_did_not() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let content = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                         "choices": [{"index": 0, "delta": {"content": "PONG"},
+                                      "finish_reason": null}]});
+    let finish = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]});
+    let usage = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk", "choices": [],
+                       "usage": {"prompt_tokens": 31, "completion_tokens": 7, "total_tokens": 38,
+                                 "prompt_tokens_details": {"cached_tokens": 11}}});
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        http_sse(&format!(
+            "data: {content}\n\ndata: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n"
+        )),
+        tx,
+    ));
+    let config = chat_route_config("chat-usage-injected", openai_chat_endpoint(upstream_port));
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        metrics: Some(metrics.clone()),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // No `stream_options`: this client never asked for usage.
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&json!({"model": "m", "stream": true,
+                      "messages": [{"role": "user", "content": "ping"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = String::from_utf8(response.bytes().await.unwrap().to_vec()).expect("utf-8");
+    let _ = std::fs::remove_file(config);
+
+    // The router asked the upstream for the usage chunk.
+    let forwarded = rx.await.expect("upstream saw the request");
+    let sent: Value =
+        serde_json::from_str(forwarded.split("\r\n\r\n").nth(1).expect("body")).expect("json");
+    assert_eq!(
+        sent["stream_options"]["include_usage"],
+        json!(true),
+        "{sent}"
+    );
+
+    // The client got the answer and the terminator, but not the usage chunk
+    // it never asked for.
+    assert!(body.contains("PONG") && body.contains("[DONE]"), "{body}");
+    assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
+    assert!(
+        !body.contains("prompt_tokens"),
+        "the client saw a usage chunk it did not request: {body}"
+    );
+
+    // And the row carries the upstream's real counts, not the estimate.
+    let mut row = None;
+    for _ in 0..100 {
+        let snapshot = metrics.snapshot();
+        if snapshot.totals.active_requests == 0 && !snapshot.recent.is_empty() {
+            row = snapshot.recent.into_iter().next();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let row = row.expect("the row was closed");
+    assert_eq!(row.state, "completed", "{row:?}");
+    assert_eq!(
+        (row.input_tokens, row.output_tokens, row.prompt_cache_tokens),
+        (Some(31), Some(7), Some(11)),
+        "{row:?}"
+    );
+}
+
+/// A client that asked for usage itself keeps seeing the usage chunk: the
+/// router only withholds a chunk it requested on the client's behalf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_passthrough_keeps_usage_the_client_asked_for() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let finish = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": "PONG"},
+                                     "finish_reason": "stop"}]});
+    let usage = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk", "choices": [],
+                       "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}});
+    tokio::spawn(serve_once(
+        upstream,
+        http_sse(&format!(
+            "data: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n"
+        )),
+    ));
+    let config = chat_route_config("chat-usage-kept", openai_chat_endpoint(upstream_port));
+    let port = free_port();
+    start_router(port, config.clone()).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&json!({"model": "m", "stream": true,
+                      "stream_options": {"include_usage": true},
+                      "messages": [{"role": "user", "content": "ping"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = String::from_utf8(response.bytes().await.unwrap().to_vec()).expect("utf-8");
+    assert!(body.contains("\"prompt_tokens\":4"), "{body}");
+    assert!(body.contains("[DONE]"), "{body}");
+    let _ = std::fs::remove_file(config);
+}
+
+/// A multi-choice stream (`n > 1`) is only complete once every choice
+/// finished: one choice's `finish_reason` must not make a clean EOF that
+/// truncated its sibling look like a success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_multi_choice_truncation_is_not_recorded_as_completed() {
+    let first_done = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                            "choices": [{"index": 0, "delta": {"content": "A"},
+                                         "finish_reason": "stop"}]});
+    let second_open = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                             "choices": [{"index": 1, "delta": {"content": "B"},
+                                          "finish_reason": null}]});
+    let second_done = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                             "choices": [{"index": 1, "delta": {}, "finish_reason": "stop"}]});
+    // Choice 0 finished, choice 1 was cut off: a clean close, no [DONE].
+    let truncated = http_sse(&format!("data: {first_done}\n\ndata: {second_open}\n\n"));
+    // Both choices finished, still no [DONE]: a complete answer.
+    let complete = http_sse(&format!(
+        "data: {first_done}\n\ndata: {second_open}\n\ndata: {second_done}\n\n"
+    ));
+    for (name, upstream, expected_state) in [
+        ("chat-multi-truncated", truncated, "error"),
+        ("chat-multi-complete", complete, "completed"),
+    ] {
+        let (row, _totals) = chat_metrics_row(
+            name,
+            openai_chat_endpoint,
+            Some(upstream),
+            json!({"model": "m", "stream": true, "n": 2,
+                   "messages": [{"role": "user", "content": "ping"}]}),
+        )
+        .await;
+        assert_eq!(row.state, expected_state, "{name}: {row:?}");
+        if expected_state == "error" {
+            assert!(
+                row.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("ended before the response completed")),
+                "{name}: {row:?}"
+            );
+        }
+    }
+}
+
+/// Withholding the injected usage chunk shortens the body, so a
+/// `Content-Length` the upstream computed for the unfiltered body must not
+/// be forwarded: the client would otherwise see fewer bytes than promised
+/// and report a truncated response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_filtered_stream_drops_a_stale_content_length() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_port = upstream.local_addr().unwrap().port();
+    let finish = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": "PONG"},
+                                     "finish_reason": "stop"}]});
+    let usage = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk", "choices": [],
+                       "usage": {"prompt_tokens": 9, "completion_tokens": 2, "total_tokens": 11}});
+    let body = format!("data: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+    // An SSE body with a declared length, as a non-streaming upstream sends.
+    tokio::spawn(serve_once(
+        upstream,
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        ),
+    ));
+    let config = chat_route_config("chat-stale-length", openai_chat_endpoint(upstream_port));
+    let metrics = rayline_metrics::RouterMetrics::new("test");
+    let port = free_port();
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config.clone()),
+        metrics: Some(metrics.clone()),
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&chat_request(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    // No length may promise the unfiltered body's size.
+    let promised = header(&response, "content-length").map(ToOwned::to_owned);
+    // The body must arrive whole, not cut off at a stale length.
+    let received = response.bytes().await.expect("a complete body").len();
+    let _ = std::fs::remove_file(config);
+    assert!(received > 0 && received < body.len(), "{received}");
+    if let Some(promised) = promised {
+        assert_eq!(
+            promised.parse::<usize>().ok(),
+            Some(received),
+            "a stale content-length was forwarded"
+        );
+    }
+}
+
+/// A metered response must not arrive compressed: metrics read the body as
+/// it streams and reqwest is built without decompression, so compressed
+/// bytes would yield no usage and no terminal event. This holds whether or
+/// not the client asked for usage itself (only the first filters), and an
+/// endpoint that configures `accept-encoding` must not win over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_metered_stream_asks_for_an_unencoded_body() {
+    let finish = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+                        "choices": [{"index": 0, "delta": {"content": "PONG"},
+                                     "finish_reason": "stop"}]});
+    let usage = json!({"id": "chatcmpl_1", "object": "chat.completion.chunk", "choices": [],
+                       "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}});
+    // Left: the client asked for usage (no filtering). Right: it did not.
+    for (name, request) in [
+        (
+            "chat-identity-client-usage",
+            json!({"model": "m", "stream": true,
+                   "stream_options": {"include_usage": true},
+                   "messages": [{"role": "user", "content": "ping"}]}),
+        ),
+        ("chat-identity-injected-usage", chat_request(true)),
+    ] {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(serve_once_capture(
+            upstream,
+            http_sse(&format!(
+                "data: {finish}\n\ndata: {usage}\n\ndata: [DONE]\n\n"
+            )),
+            tx,
+        ));
+        let config = chat_route_config(
+            name,
+            json!({"id": "up", "protocol": "openai_chat",
+                   "base_url": format!("http://127.0.0.1:{upstream_port}/v1"),
+                   "models": ["m"],
+                   // A config that would otherwise hand metrics gzip bytes.
+                   "headers": {"accept-encoding": "gzip"}}),
+        );
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        let port = free_port();
+        let opts = LocalRouterOptions {
+            port,
+            config_path: Some(config.clone()),
+            metrics: Some(metrics.clone()),
+            ..LocalRouterOptions::default()
+        };
+        tokio::spawn(async move {
+            let _ = serve(opts).await;
+        });
+        let client = reqwest::Client::new();
+        for _ in 0..100 {
+            if client
+                .get(format!("http://127.0.0.1:{port}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{name}");
+        let _ = response.bytes().await;
+        let _ = std::fs::remove_file(config);
+        let forwarded = rx.await.expect("upstream saw the request");
+        let encodings: Vec<&str> = forwarded
+            .lines()
+            .filter_map(|line| {
+                let (header, value) = line.split_once(':')?;
+                header
+                    .trim()
+                    .eq_ignore_ascii_case("accept-encoding")
+                    .then(|| value.trim())
+            })
+            .collect();
+        assert_eq!(encodings, vec!["identity"], "{name}: {forwarded}");
+
+        // And the row carries the upstream's counts, not just the estimate.
+        let mut row = None;
+        for _ in 0..100 {
+            let snapshot = metrics.snapshot();
+            if snapshot.totals.active_requests == 0 && !snapshot.recent.is_empty() {
+                row = snapshot.recent.into_iter().next();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let row = row.expect("the row was closed");
+        assert_eq!(row.state, "completed", "{name}: {row:?}");
+        assert_eq!(
+            (row.input_tokens, row.output_tokens),
+            (Some(8), Some(2)),
+            "{name}: {row:?}"
+        );
+    }
+}
+
+/// A non-streaming passthrough answer is relayed without being scanned for
+/// SSE events: a compact JSON body has no delimiter, so draining it would
+/// retain the whole response and rescan it per chunk. Its usage still lands
+/// on the row, read from the body once the stream ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_passthrough_json_is_not_scanned_as_sse() {
+    let body = json!({
+        "id": "chatcmpl_1", "object": "chat.completion", "created": 1, "model": "m",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "PONG"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 21, "completion_tokens": 6, "total_tokens": 27}
+    });
+    let (row, totals) = chat_metrics_row(
+        "chat-json-not-sse",
+        openai_chat_endpoint,
+        Some(http_json(&body)),
+        chat_request(false),
+    )
+    .await;
+    // A JSON answer has no terminal SSE event, and must not be judged by one.
+    assert_eq!(row.state, "completed", "{row:?}");
+    assert_eq!(
+        (row.input_tokens, row.output_tokens),
+        (Some(21), Some(6)),
+        "{row:?}"
+    );
+    assert_eq!(totals.completed_requests, 1);
+    assert_eq!(totals.errored_requests, 0);
+}
+
+/// A client that leaves while the upstream is stalled is noticed then, on
+/// both the passthrough and the translated route: the row is closed as an
+/// error rather than staying active while the upstream holds the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_stalled_upstream_notices_a_departed_client() {
+    type Endpoint = fn(u16) -> Value;
+    for (name, endpoint) in [
+        ("chat-stall-passthrough", openai_chat_endpoint as Endpoint),
+        ("chat-stall-translated", anthropic_endpoint as Endpoint),
+    ] {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        // Send a first event, then stall: never another byte, never a close.
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = upstream.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            let _ = sock.write_all(SSE_START.as_bytes()).await;
+            let _ = sock.write_all(sse_text_delta("hi").as_bytes()).await;
+            let _ = sock.flush().await;
+            // Hold the connection open well past the assertions below.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let config = chat_route_config(name, endpoint(upstream_port));
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        let port = free_port();
+        let opts = LocalRouterOptions {
+            port,
+            config_path: Some(config.clone()),
+            metrics: Some(metrics.clone()),
+            ..LocalRouterOptions::default()
+        };
+        tokio::spawn(async move {
+            let _ = serve(opts).await;
+        });
+        let client = reqwest::Client::new();
+        for _ in 0..100 {
+            if client
+                .get(format!("http://127.0.0.1:{port}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&chat_request(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{name}");
+        // Read the first chunk, then drop the body while the upstream stalls.
+        let mut stream = response.bytes_stream();
+        let _ = stream.next().await.expect("first chunk");
+        drop(stream);
+        let _ = std::fs::remove_file(config);
+        // The row must close without waiting for the upstream to send again.
+        let mut row = None;
+        for _ in 0..150 {
+            let snapshot = metrics.snapshot();
+            if snapshot.totals.active_requests == 0 && !snapshot.recent.is_empty() {
+                row = snapshot.recent.into_iter().next();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let row = row
+            .unwrap_or_else(|| panic!("{name}: the row stayed active while the upstream stalled"));
+        assert_eq!(row.state, "error", "{name}: {row:?}");
+        assert!(
+            row.error
+                .as_deref()
+                .is_some_and(|e| e.contains("client disconnected")),
+            "{name}: {row:?}"
+        );
+    }
+}
+
+/// A non-streaming Chat request whose Anthropic upstream answers with a
+/// buffered SSE body that failed — an `error` event, or a stream that
+/// stopped before `message_stop` — is recorded as an error, not a
+/// completion, matching the streaming path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_buffered_sse_failure_is_not_recorded_as_completed() {
+    let error_event = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "event: error\n",
+        "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
+    );
+    let truncated = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"par\"}}\n\n",
+    );
+    let complete = concat!(
+        "event: message_start\n",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n",
+        "event: content_block_delta\n",
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+        "event: message_delta\n",
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+        "event: message_stop\n",
+        "data: {\"type\":\"message_stop\"}\n\n",
+    );
+    for (name, sse, expected_state, expected_error) in [
+        (
+            "chat-buffered-error",
+            error_event,
+            "error",
+            Some("overloaded"),
+        ),
+        (
+            "chat-buffered-truncated",
+            truncated,
+            "error",
+            Some("ended before the response completed"),
+        ),
+        ("chat-buffered-complete", complete, "completed", None),
+    ] {
+        // stream: false, so the SSE body is read in one piece.
+        let (row, _totals) = chat_metrics_row(
+            name,
+            anthropic_endpoint,
+            Some(http_sse(sse)),
+            chat_request(false),
+        )
+        .await;
+        assert_eq!(row.state, expected_state, "{name}: {row:?}");
+        if let Some(expected_error) = expected_error {
+            assert!(
+                row.error
+                    .as_deref()
+                    .is_some_and(|e| e.contains(expected_error)),
+                "{name}: {row:?}"
+            );
+        }
+    }
+}
+
+/// A client that stops reading after the stream's terminal event, without
+/// waiting for the body's EOF, already has its whole answer: the row is a
+/// completion, not a cancellation. Both routes, against an upstream that
+/// finishes the protocol and then holds the connection open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_client_leaving_after_the_terminal_event_still_completes() {
+    let chat_done = format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+               "choices": [{"index": 0, "delta": {"content": "PONG"}, "finish_reason": null}]}),
+        json!({"id": "chatcmpl_1", "object": "chat.completion.chunk",
+               "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+    );
+    let anthropic_done = format!("{SSE_START}{}{SSE_STOP}", sse_text_delta("PONG"));
+    type Endpoint = fn(u16) -> Value;
+    for (name, endpoint, body) in [
+        (
+            "chat-done-then-idle-passthrough",
+            openai_chat_endpoint as Endpoint,
+            chat_done,
+        ),
+        (
+            "chat-done-then-idle-translated",
+            anthropic_endpoint as Endpoint,
+            anthropic_done,
+        ),
+    ] {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        // Send the complete answer, then hold the socket open: no EOF.
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = upstream.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 16384];
+            let _ = sock.read(&mut buf).await;
+            let _ = sock.write_all(SSE_HEAD.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+            let _ = sock.flush().await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        let config = chat_route_config(name, endpoint(upstream_port));
+        let metrics = rayline_metrics::RouterMetrics::new("test");
+        let port = free_port();
+        let opts = LocalRouterOptions {
+            port,
+            config_path: Some(config.clone()),
+            metrics: Some(metrics.clone()),
+            ..LocalRouterOptions::default()
+        };
+        tokio::spawn(async move {
+            let _ = serve(opts).await;
+        });
+        let client = reqwest::Client::new();
+        for _ in 0..100 {
+            if client
+                .get(format!("http://127.0.0.1:{port}/healthz"))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .json(&chat_request(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "{name}");
+        // Read until the terminator, then hang up without awaiting EOF.
+        let mut stream = response.bytes_stream();
+        let mut seen = String::new();
+        while let Some(chunk) = stream.next().await {
+            seen.push_str(&String::from_utf8_lossy(&chunk.expect("chunk")));
+            if seen.contains("[DONE]") {
+                break;
+            }
+        }
+        assert!(seen.contains("[DONE]"), "{name}: {seen}");
+        drop(stream);
+        let _ = std::fs::remove_file(config);
+        let mut row = None;
+        for _ in 0..150 {
+            let snapshot = metrics.snapshot();
+            if snapshot.totals.active_requests == 0 && !snapshot.recent.is_empty() {
+                row = snapshot.recent.into_iter().next();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let row = row.unwrap_or_else(|| panic!("{name}: the row was never closed"));
+        assert_eq!(row.state, "completed", "{name}: {row:?}");
+        assert!(row.error.is_none(), "{name}: {row:?}");
+    }
+}
+
+/// A translated Chat request is attributed to the model the upstream
+/// actually used when it reports one, not to the route's own value, which
+/// may be the routing sentinel. The passthrough path already did this.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_translated_row_reports_the_upstream_model() {
+    let message = json!({
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+        "content": [{"type": "text", "text": "PONG"}], "stop_reason": "end_turn",
+        "usage": {"input_tokens": 4, "output_tokens": 1}
+    })
+    .to_string();
+    let upstream_response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-rayline-selected-model: real-model-1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{message}",
+        message.len()
+    );
+    let (row, _totals) = chat_metrics_row(
+        "chat-translated-model",
+        anthropic_endpoint,
+        Some(upstream_response),
+        chat_request(false),
+    )
+    .await;
+    assert_eq!(row.state, "completed", "{row:?}");
+    assert_eq!(
+        row.selected_model.as_deref(),
+        Some("real-model-1"),
+        "{row:?}"
+    );
+}
+
+/// The cloud router's id for a forwarded Chat request lands on its metrics
+/// row, on both the passthrough and the translated route, and stays on the
+/// row when the upstream answered with an error: the id is recorded as soon
+/// as the headers are in, before the body can fail. Before the Chat listener
+/// had a lifecycle the id could only be stamped on the response header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn inbound_chat_row_carries_the_upstream_request_id() {
+    let with_route_id = |status: &str, content_type: &str, route_id: &str, body: String| {
+        format!(
+            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\nx-rayline-route-id: {route_id}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    let chat_json = json!({
+        "id": "chatcmpl_1", "object": "chat.completion", "created": 1, "model": "m",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "PONG"},
+                     "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    })
+    .to_string();
+    let anthropic_json = json!({
+        "id": "msg_1", "type": "message", "role": "assistant", "model": "m",
+        "content": [{"type": "text", "text": "PONG"}], "stop_reason": "end_turn",
+        "usage": {"input_tokens": 3, "output_tokens": 1}
+    })
+    .to_string();
+    let anthropic_429 = json!({"type": "error",
+        "error": {"type": "rate_limit_error", "message": "slow down"}})
+    .to_string();
+    type Endpoint = fn(u16) -> Value;
+    for (name, endpoint, upstream, expected_state, route_id) in [
+        (
+            "chat-upstream-id-passthrough",
+            openai_chat_endpoint as Endpoint,
+            with_route_id("200 OK", "application/json", "rt_pass_1", chat_json),
+            "completed",
+            "rt_pass_1",
+        ),
+        (
+            "chat-upstream-id-translated",
+            anthropic_endpoint as Endpoint,
+            with_route_id("200 OK", "application/json", "rt_tr_1", anthropic_json),
+            "completed",
+            "rt_tr_1",
+        ),
+        (
+            "chat-upstream-id-on-error",
+            anthropic_endpoint as Endpoint,
+            with_route_id(
+                "429 Too Many Requests",
+                "application/json",
+                "rt_err_1",
+                anthropic_429,
+            ),
+            "error",
+            "rt_err_1",
+        ),
+    ] {
+        let (row, _totals) =
+            chat_metrics_row(name, endpoint, Some(upstream), chat_request(false)).await;
+        assert_eq!(row.state, expected_state, "{name}: {row:?}");
+        assert_eq!(
+            row.upstream_request_id.as_deref(),
+            Some(route_id),
+            "{name}: {row:?}"
+        );
+    }
+}

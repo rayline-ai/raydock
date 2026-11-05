@@ -5,7 +5,7 @@
 //! OSS-shaped milestone local/client-side only: static rules, configured
 //! provider endpoints, and local-model redirects.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -1329,26 +1329,13 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
         t_start.elapsed().as_millis(),
         request_id
     );
-    if let Some(metrics) = state.opts.metrics.as_ref() {
-        metrics.record(MetricsUpdate::RouteDecided {
-            request_id: request_id.clone(),
-            route_id: Some(decision.route_id.clone()),
-            target: match &decision.target {
-                RouteSelection::Local => "local".to_owned(),
-                RouteSelection::Endpoint(_) => "remote".to_owned(),
-            },
-            endpoint_id: match &decision.target {
-                RouteSelection::Local => Some("local".to_owned()),
-                RouteSelection::Endpoint(endpoint_id) => Some(endpoint_id.clone()),
-            },
-            selected_model: Some(decision.selected_model.clone()),
-            requested_model: Some(decision.requested_model.clone()),
-            policy: Some(decision.policy.clone()),
-            task_class: Some(decision.task_class.clone()),
-            agent_id: (agent_id != "<none>").then(|| agent_id.to_owned()),
-            agent_type: (agent_type != "<none>").then(|| agent_type.to_owned()),
-        });
-    }
+    record_route_decided(
+        state.opts.metrics.as_ref(),
+        &request_id,
+        &decision,
+        (agent_id != "<none>").then_some(agent_id),
+        (agent_type != "<none>").then_some(agent_type),
+    );
     let response = match &decision.target {
         RouteSelection::Local => Ok(local_redirect_response(&state, &decision, &request_id)),
         RouteSelection::Endpoint(endpoint_id) => {
@@ -1426,26 +1413,13 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
         t_start.elapsed().as_millis(),
         request_id
     );
-    if let Some(metrics) = state.opts.metrics.as_ref() {
-        metrics.record(MetricsUpdate::RouteDecided {
-            request_id: request_id.clone(),
-            route_id: Some(decision.route_id.clone()),
-            target: match &decision.target {
-                RouteSelection::Local => "local".to_owned(),
-                RouteSelection::Endpoint(_) => "remote".to_owned(),
-            },
-            endpoint_id: match &decision.target {
-                RouteSelection::Local => Some("local".to_owned()),
-                RouteSelection::Endpoint(endpoint_id) => Some(endpoint_id.clone()),
-            },
-            selected_model: Some(decision.selected_model.clone()),
-            requested_model: Some(decision.requested_model.clone()),
-            policy: Some(decision.policy.clone()),
-            task_class: Some(decision.task_class.clone()),
-            agent_id: (subagent != "<none>").then(|| subagent.to_owned()),
-            agent_type: (subagent != "<none>").then(|| subagent.to_owned()),
-        });
-    }
+    record_route_decided(
+        state.opts.metrics.as_ref(),
+        &request_id,
+        &decision,
+        (subagent != "<none>").then_some(subagent),
+        (subagent != "<none>").then_some(subagent),
+    );
 
     // Never forward a translated request without a tool the caller declared,
     // or with a restriction the caller set lifted: translate what the target
@@ -3151,26 +3125,105 @@ async fn response_from_reqwest(
         headers_out.remove("x-openai-model");
     }
 
-    let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
-    let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
-    let body_out: BoxBody = stream_body.boxed();
     // Prefer the upstream-reported model (native passthrough) over the sentinel.
     let selected_model =
         prefer_upstream_selected_model(upstream_selected_model.as_deref(), decision);
+    let body_out = relay_body_with_metrics(
+        resp,
+        status,
+        RelayMeter {
+            metrics,
+            request_id,
+            estimated_input_tokens,
+            selected_model,
+            content_type,
+            stop_when_client_leaves: false,
+            chat_stream_choices: None,
+            strip_usage_chunk: false,
+        },
+    );
+
+    let mut builder = Response::builder().status(status.as_u16());
+    if let Some(headers) = builder.headers_mut() {
+        *headers = headers_out;
+    }
+    Ok(builder.body(body_out).unwrap())
+}
+
+/// What [`relay_body_with_metrics`] reports a request as, and how it treats
+/// the stream. Without both a sink and a request id nothing is recorded (and
+/// nothing is buffered).
+struct RelayMeter {
+    metrics: Option<SharedMetricsSink>,
+    request_id: Option<String>,
+    estimated_input_tokens: Option<u64>,
+    selected_model: Option<String>,
+    /// The upstream's `content-type`: names the body in diagnostics, and an
+    /// SSE body is checked for completion when `chat_stream` is set.
+    content_type: String,
+    /// Stop reading the upstream once the client is gone, cancelling its
+    /// generation, and close the row as an error; otherwise keep draining it
+    /// so its final usage is still recorded.
+    stop_when_client_leaves: bool,
+    /// The body is a Chat Completions answer with this many choices (the
+    /// request's `n`): a 2xx SSE body that ends before `[DONE]` or before
+    /// every choice reported a `finish_reason` was cut off, and is recorded
+    /// as an error. `None` for a body that is not a Chat stream.
+    chat_stream_choices: Option<u64>,
+    /// Keep the usage-only chunk (`choices: []`) from the client: the router
+    /// asked the upstream for it, the client did not.
+    strip_usage_chunk: bool,
+}
+
+/// Relay `resp`'s body downstream byte for byte while recording its
+/// lifecycle: `FirstToken` on the first chunk, `TokenUsage` as counts arrive
+/// (Anthropic and OpenAI `usage` shapes alike, SSE or JSON), then
+/// `RequestCompleted` (and `PromptCache` when cache tokens were reported), or
+/// `RequestErrored` for a failed or cut-off stream, an SSE `error` event or
+/// an upstream non-2xx `status`.
+fn relay_body_with_metrics(
+    resp: reqwest::Response,
+    status: reqwest::StatusCode,
+    meter: RelayMeter,
+) -> BoxBody {
+    let RelayMeter {
+        metrics,
+        request_id,
+        estimated_input_tokens,
+        selected_model,
+        content_type,
+        stop_when_client_leaves,
+        chat_stream_choices,
+        strip_usage_chunk,
+    } = meter;
+    let (tx, rx) = mpsc::channel::<std::io::Result<Frame<Bytes>>>(16);
+    let stream_body = StreamBody::new(tokio_stream::wrappers::ReceiverStream::new(rx));
+    let body_out: BoxBody = stream_body.boxed();
     // Body accumulation is only needed for end-of-stream usage extraction when metrics are active.
     // Mirror the proxy's observe_response gate so large responses are not buffered unnecessarily.
     let has_metrics = metrics.is_some() && request_id.is_some();
+    let is_sse = content_type
+        .to_ascii_lowercase()
+        .contains("text/event-stream");
+    // Only an SSE body has events to drain, and only a metered request needs
+    // them. A compact JSON body has no delimiter, so draining it would retain
+    // the whole response in `sse_buffer` and rescan it per chunk; its usage is
+    // read from the retained body once the stream ends.
+    let observe_events = has_metrics && is_sse;
     tokio::spawn(async move {
         use futures::StreamExt;
         let mut stream = resp.bytes_stream();
         let mut body = Vec::new();
         let mut sse_buffer = String::new();
+        let mut signals = SseSignals::default();
+        let mut usage_filter = strip_usage_chunk.then(UsageChunkFilter::default);
         let mut input_tokens = estimated_input_tokens;
         let mut output_tokens = None;
         let mut prompt_cache_tokens = None;
         let mut saw_first_token = false;
         let mut downstream_open = true;
         let mut stream_error = None;
+        let mut client_left = false;
         record_remote_token_usage(
             metrics.as_ref(),
             request_id.as_deref(),
@@ -3178,7 +3231,31 @@ async fn response_from_reqwest(
             output_tokens,
             selected_model.clone(),
         );
-        while let Some(chunk) = stream.next().await {
+        loop {
+            // A client that goes away while the upstream is stalled must be
+            // noticed then, not at the next send: otherwise the row stays
+            // active for as long as the upstream holds the connection open,
+            // and its generation is never cancelled. A withheld usage chunk
+            // sends nothing downstream, so a send alone cannot be the signal.
+            let chunk = if stop_when_client_leaves {
+                tokio::select! {
+                    biased;
+                    () = tx.closed() => {
+                        // Leaving after the terminal event is not a
+                        // cancellation: the client already has the whole
+                        // answer and simply did not wait for the body's EOF.
+                        client_left = chat_stream_choices
+                            .is_none_or(|choices| !signals.chat_completed(choices));
+                        break;
+                    }
+                    chunk = stream.next() => chunk,
+                }
+            } else {
+                stream.next().await
+            };
+            let Some(chunk) = chunk else {
+                break;
+            };
             match chunk {
                 Ok(bytes) => {
                     if !saw_first_token {
@@ -3193,13 +3270,16 @@ async fn response_from_reqwest(
                     }
                     let previous_input_tokens = input_tokens;
                     let previous_output_tokens = output_tokens;
-                    observe_anthropic_sse_chunk(
-                        &bytes,
-                        &mut sse_buffer,
-                        &mut input_tokens,
-                        &mut output_tokens,
-                        &mut prompt_cache_tokens,
-                    );
+                    if observe_events {
+                        observe_sse_chunk(
+                            &bytes,
+                            &mut sse_buffer,
+                            &mut input_tokens,
+                            &mut output_tokens,
+                            &mut prompt_cache_tokens,
+                            &mut signals,
+                        );
+                    }
                     if input_tokens != previous_input_tokens
                         || output_tokens != previous_output_tokens
                     {
@@ -3212,8 +3292,20 @@ async fn response_from_reqwest(
                         );
                     }
                     retain_for_metrics(has_metrics, &mut body, &bytes);
-                    if downstream_open && tx.send(Ok(Frame::data(bytes))).await.is_err() {
+                    let downstream = match usage_filter.as_mut() {
+                        Some(filter) => filter.push(&bytes),
+                        None => bytes,
+                    };
+                    if downstream_open
+                        && !downstream.is_empty()
+                        && tx.send(Ok(Frame::data(downstream))).await.is_err()
+                    {
                         downstream_open = false;
+                        if stop_when_client_leaves {
+                            // Dropping `stream` below cancels the upstream.
+                            client_left = true;
+                            break;
+                        }
                     }
                 }
                 Err(error) => {
@@ -3227,13 +3319,17 @@ async fn response_from_reqwest(
         }
         let previous_input_tokens = input_tokens;
         let previous_output_tokens = output_tokens;
-        observe_anthropic_sse_chunk(
-            b"\n\n",
-            &mut sse_buffer,
-            &mut input_tokens,
-            &mut output_tokens,
-            &mut prompt_cache_tokens,
-        );
+        if observe_events {
+            // A final event may be missing its trailing blank line.
+            observe_sse_chunk(
+                b"\n\n",
+                &mut sse_buffer,
+                &mut input_tokens,
+                &mut output_tokens,
+                &mut prompt_cache_tokens,
+                &mut signals,
+            );
+        }
         if input_tokens != previous_input_tokens || output_tokens != previous_output_tokens {
             record_remote_token_usage(
                 metrics.as_ref(),
@@ -3242,6 +3338,13 @@ async fn response_from_reqwest(
                 output_tokens,
                 selected_model.clone(),
             );
+        }
+        if downstream_open && stream_error.is_none() {
+            if let Some(tail) = usage_filter.as_mut().map(UsageChunkFilter::flush) {
+                if !tail.is_empty() {
+                    let _ = tx.send(Ok(Frame::data(tail))).await;
+                }
+            }
         }
         let previous_input_tokens = input_tokens;
         let previous_output_tokens = output_tokens;
@@ -3260,7 +3363,13 @@ async fn response_from_reqwest(
             );
         }
         if let (Some(metrics), Some(request_id)) = (metrics.as_ref(), request_id.as_ref()) {
-            if let Some(error) = stream_error {
+            if client_left {
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: None,
+                    error: "client disconnected before the response completed".to_owned(),
+                });
+            } else if let Some(error) = stream_error.or(signals.error.take()) {
                 metrics.record(MetricsUpdate::RequestErrored {
                     request_id: request_id.clone(),
                     status_code: Some(status.as_u16()),
@@ -3271,6 +3380,16 @@ async fn response_from_reqwest(
                     request_id: request_id.clone(),
                     status_code: Some(status.as_u16()),
                     error: format!("upstream returned HTTP {}", status.as_u16()),
+                });
+            } else if is_sse
+                && chat_stream_choices.is_some_and(|choices| !signals.chat_completed(choices))
+            {
+                // A clean close before the last chunk is an EOF, not a
+                // transport error: the answer was cut off all the same.
+                metrics.record(MetricsUpdate::RequestErrored {
+                    request_id: request_id.clone(),
+                    status_code: Some(status.as_u16()),
+                    error: "upstream stream ended before the response completed".to_owned(),
                 });
             } else {
                 if output_tokens.is_none() && estimated_input_tokens.unwrap_or(0) > 1 {
@@ -3296,12 +3415,106 @@ async fn response_from_reqwest(
             }
         }
     });
+    body_out
+}
 
-    let mut builder = Response::builder().status(status.as_u16());
-    if let Some(headers) = builder.headers_mut() {
-        *headers = headers_out;
+/// Keeps the usage-only chunk of a Chat Completions stream (`choices: []`
+/// with `usage`, sent last when `stream_options.include_usage` is set) from
+/// the client, forwarding every other event once it is complete. The bytes
+/// are not decoded, so a character split across upstream chunks survives.
+#[derive(Default)]
+struct UsageChunkFilter {
+    buffer: Vec<u8>,
+}
+
+impl UsageChunkFilter {
+    fn push(&mut self, bytes: &[u8]) -> Bytes {
+        self.buffer.extend_from_slice(bytes);
+        let mut out = Vec::with_capacity(bytes.len());
+        while let Some(end) = sse_event_end(&self.buffer) {
+            let event = self.buffer.drain(..end).collect::<Vec<u8>>();
+            if !is_usage_only_chunk(&event) {
+                out.extend_from_slice(&event);
+            }
+        }
+        Bytes::from(out)
     }
-    Ok(builder.body(body_out).unwrap())
+
+    /// What the end of the stream left: an event without its delimiter.
+    /// Only a tail that is nothing but the usage chunk is withheld — a tail
+    /// holding anything else is the client's answer and must survive.
+    fn flush(&mut self) -> Bytes {
+        let tail = std::mem::take(&mut self.buffer);
+        if is_single_usage_only_event(&tail) {
+            return Bytes::new();
+        }
+        Bytes::from(tail)
+    }
+}
+
+/// The end, past its blank-line delimiter, of the first complete SSE event
+/// in `buffer`.
+fn sse_event_end(buffer: &[u8]) -> Option<usize> {
+    sse_delimiter(buffer).map(|(idx, len)| idx + len)
+}
+
+/// The offset and length of the first SSE event delimiter in `buffer`: a
+/// blank line, i.e. one line terminator immediately followed by another.
+/// SSE accepts `\n`, `\r\n` and a lone `\r`, and does not require a stream
+/// to use the same one throughout, so the two terminators may differ
+/// (`...\n\r\n`). The earliest delimiter wins.
+fn sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index < buffer.len() {
+        let Some(first) = line_terminator(&buffer[index..]) else {
+            index += 1;
+            continue;
+        };
+        match line_terminator(&buffer[index + first..]) {
+            Some(second) => return Some((index, first + second)),
+            // Not a blank line: resume past this terminator.
+            None => index += first,
+        }
+    }
+    None
+}
+
+/// The length of the SSE line terminator at the start of `bytes`: `\r\n`
+/// (2), or a lone `\n` / `\r` (1). `None` when `bytes` does not start with
+/// one.
+fn line_terminator(bytes: &[u8]) -> Option<usize> {
+    match bytes.first()? {
+        b'\r' if bytes.get(1) == Some(&b'\n') => Some(2),
+        b'\r' | b'\n' => Some(1),
+        _ => None,
+    }
+}
+
+/// Whether `tail` is a single usage-only event and nothing else. Used for
+/// the unterminated remainder at end of stream, where
+/// [`is_usage_only_chunk`] alone would discard real content that happens to
+/// share the buffer with a usage chunk.
+fn is_single_usage_only_event(tail: &[u8]) -> bool {
+    let payloads = String::from_utf8_lossy(tail)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count();
+    payloads == 1 && is_usage_only_chunk(tail)
+}
+
+/// Whether the SSE `event` is a Chat chunk carrying only `usage`.
+fn is_usage_only_chunk(event: &[u8]) -> bool {
+    String::from_utf8_lossy(event)
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:"))
+        .filter_map(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+        .any(|chunk| {
+            chunk.get("usage").is_some_and(Value::is_object)
+                && chunk
+                    .get("choices")
+                    .and_then(Value::as_array)
+                    .is_some_and(Vec::is_empty)
+        })
 }
 
 /// Accumulates `chunk` into `buf` only when `has_metrics` is true.
@@ -3312,12 +3525,37 @@ fn retain_for_metrics(has_metrics: bool, buf: &mut Vec<u8>, chunk: &[u8]) {
     }
 }
 
-fn observe_anthropic_sse_chunk(
+/// What a stream signalled besides usage.
+#[derive(Debug, Default)]
+struct SseSignals {
+    /// The message of the first `error` payload, which ends the stream as a
+    /// failure.
+    error: Option<String>,
+    /// Saw `data: [DONE]`, which ends a Chat stream whatever its choices did.
+    saw_done: bool,
+    /// The `choices[].index` values that reported a `finish_reason`. Some
+    /// upstreams send no `[DONE]`, so a stream also counts as complete once
+    /// every requested choice finished — but one finished choice must not
+    /// stand in for a sibling still generating (`n > 1`).
+    finished_choices: BTreeSet<u64>,
+}
+
+impl SseSignals {
+    /// Whether a Chat stream carrying `expected_choices` reached its end.
+    fn chat_completed(&self, expected_choices: u64) -> bool {
+        self.saw_done || self.finished_choices.len() as u64 >= expected_choices.max(1)
+    }
+}
+
+/// Merge the usage from the SSE events completed by `bytes` (Anthropic and
+/// OpenAI `usage` shapes alike) and note what else they signalled.
+fn observe_sse_chunk(
     bytes: &[u8],
     buffer: &mut String,
     input_tokens: &mut Option<u64>,
     output_tokens: &mut Option<u64>,
     prompt_cache_tokens: &mut Option<u64>,
+    signals: &mut SseSignals,
 ) {
     buffer.push_str(&String::from_utf8_lossy(bytes));
     while let Some(event) = drain_sse_event(buffer) {
@@ -3326,31 +3564,56 @@ fn observe_anthropic_sse_chunk(
                 continue;
             };
             let payload = payload.trim();
-            if payload.is_empty() || payload == "[DONE]" {
+            if payload.is_empty() {
+                continue;
+            }
+            if payload == "[DONE]" {
+                signals.saw_done = true;
                 continue;
             }
             let Ok(value) = serde_json::from_str::<Value>(payload) else {
                 continue;
             };
+            if signals.error.is_none() {
+                signals.error = sse_error_message(&value);
+            }
+            collect_finished_choices(&value, &mut signals.finished_choices);
             usage_from_value(&value).merge_into(input_tokens, output_tokens, prompt_cache_tokens);
         }
     }
 }
 
-fn drain_sse_event(buffer: &mut String) -> Option<String> {
-    let lf = buffer.find("\n\n").map(|idx| (idx, 2));
-    let crlf = buffer.find("\r\n\r\n").map(|idx| (idx, 4));
-    let (idx, delimiter_len) = match (lf, crlf) {
-        (Some(left), Some(right)) => {
-            if left.0 <= right.0 {
-                left
-            } else {
-                right
-            }
+/// The message of an SSE `error` payload (`{"error": {...}}`, the shape both
+/// Anthropic and OpenAI streams report a failure in after a 200).
+fn sse_error_message(value: &Value) -> Option<String> {
+    let error = value.get("error").filter(|error| error.is_object())?;
+    Some(
+        error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("upstream stream reported an error")
+            .to_owned(),
+    )
+}
+
+/// Record the `index` of each choice in `value` that reported a
+/// `finish_reason`: the last chunk for that choice. A chunk without an
+/// explicit index is choice 0, as OpenAI only omits it for single answers.
+fn collect_finished_choices(value: &Value, finished: &mut BTreeSet<u64>) {
+    for choice in value
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if choice.get("finish_reason").is_some_and(Value::is_string) {
+            finished.insert(choice.get("index").and_then(Value::as_u64).unwrap_or(0));
         }
-        (Some(value), None) | (None, Some(value)) => value,
-        (None, None) => return None,
-    };
+    }
+}
+
+fn drain_sse_event(buffer: &mut String) -> Option<String> {
+    let (idx, delimiter_len) = sse_delimiter(buffer.as_bytes())?;
     let event = buffer[..idx].to_owned();
     buffer.drain(..idx + delimiter_len);
     Some(event)
@@ -3476,6 +3739,39 @@ fn display_optional_u64(value: Option<u64>) -> String {
     value
         .map(|value| value.to_string())
         .unwrap_or_else(|| "-".to_owned())
+}
+
+/// Announce a routed request to metrics: the row `raydock top` shows until
+/// the forwarder closes it with `RequestCompleted`/`RequestErrored`. Every
+/// listener records the same fields so the surfaces compare like for like.
+fn record_route_decided(
+    metrics: Option<&SharedMetricsSink>,
+    request_id: &str,
+    decision: &RouteDecision,
+    agent_id: Option<&str>,
+    agent_type: Option<&str>,
+) {
+    let Some(metrics) = metrics else {
+        return;
+    };
+    metrics.record(MetricsUpdate::RouteDecided {
+        request_id: request_id.to_owned(),
+        route_id: Some(decision.route_id.clone()),
+        target: match &decision.target {
+            RouteSelection::Local => "local".to_owned(),
+            RouteSelection::Endpoint(_) => "remote".to_owned(),
+        },
+        endpoint_id: match &decision.target {
+            RouteSelection::Local => Some("local".to_owned()),
+            RouteSelection::Endpoint(endpoint_id) => Some(endpoint_id.clone()),
+        },
+        selected_model: Some(decision.selected_model.clone()),
+        requested_model: Some(decision.requested_model.clone()),
+        policy: Some(decision.policy.clone()),
+        task_class: Some(decision.task_class.clone()),
+        agent_id: agent_id.map(str::to_owned),
+        agent_type: agent_type.map(str::to_owned),
+    });
 }
 
 fn record_remote_completion(
@@ -5696,6 +5992,34 @@ fn anthropic_sse_text_to_message(sse_text: &str, estimated_input_tokens: u64) ->
             "output_tokens": usage.output_tokens_or(|| (text.len() as u64 / 4).max(1)),
         },
     })
+}
+
+/// Why a buffered Anthropic SSE body is not a completed answer: an `error`
+/// event's message, or the absence of `message_stop`. `None` when the stream
+/// ran to completion. The streaming translator makes the same judgement as
+/// events arrive; this is for a body read in one piece.
+pub(crate) fn anthropic_sse_failure(sse_text: &str) -> Option<String> {
+    let mut buffer = sse_text.to_owned();
+    let mut saw_stop = false;
+    while let Some(event) = drain_sse_event(&mut buffer) {
+        let Some((name, data)) = parse_sse_event(&event) else {
+            continue;
+        };
+        let value = serde_json::from_str::<Value>(&data).unwrap_or(Value::Null);
+        if name == "error" || value.get("type").and_then(Value::as_str) == Some("error") {
+            return Some(
+                value
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream stream reported an error")
+                    .to_owned(),
+            );
+        }
+        if value.get("type").and_then(Value::as_str) == Some("message_stop") {
+            saw_stop = true;
+        }
+    }
+    (!saw_stop).then(|| "upstream stream ended before the response completed".to_owned())
 }
 
 fn build_openai_chat_request(body: &Value, model: &str, want_stream: bool) -> Value {
@@ -9612,12 +9936,13 @@ mod tests {
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
         let mut prompt_cache_tokens = None;
-        observe_anthropic_sse_chunk(
+        observe_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
             &mut prompt_cache_tokens,
+            &mut SseSignals::default(),
         );
 
         assert_eq!(input_tokens, Some(42));
@@ -9630,12 +9955,13 @@ mod tests {
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
         let mut prompt_cache_tokens = None;
-        observe_anthropic_sse_chunk(
+        observe_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":0}}}\r\n\r\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\r\n\r\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
             &mut prompt_cache_tokens,
+            &mut SseSignals::default(),
         );
 
         assert_eq!(input_tokens, Some(42));
@@ -9649,21 +9975,23 @@ mod tests {
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
         let mut prompt_cache_tokens = None;
-        observe_anthropic_sse_chunk(
+        observe_sse_chunk(
             b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
             &mut prompt_cache_tokens,
+            &mut SseSignals::default(),
         );
         assert_eq!(output_tokens, None);
 
-        observe_anthropic_sse_chunk(
+        observe_sse_chunk(
             b"\n\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
             &mut prompt_cache_tokens,
+            &mut SseSignals::default(),
         );
         assert_eq!(output_tokens, Some(17));
         assert!(buffer.is_empty());
@@ -9675,12 +10003,13 @@ mod tests {
         let mut input_tokens = Some(12);
         let mut output_tokens = None;
         let mut prompt_cache_tokens = None;
-        observe_anthropic_sse_chunk(
+        observe_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}\n\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\n\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
             &mut prompt_cache_tokens,
+            &mut SseSignals::default(),
         );
 
         assert_eq!(input_tokens, Some(42));
@@ -9799,14 +10128,174 @@ mod tests {
         let mut output_tokens = None;
         let mut prompt_cache_tokens = None;
         // SSE with cache_read_input_tokens=1234 — the bug was that this field was lost.
-        observe_anthropic_sse_chunk(
+        observe_sse_chunk(
             b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10,\"cache_read_input_tokens\":1234,\"output_tokens\":0}}}\n\n",
             &mut buffer,
             &mut input_tokens,
             &mut output_tokens,
             &mut prompt_cache_tokens,
+            &mut SseSignals::default(),
         );
         assert_eq!(prompt_cache_tokens, Some(1234)); // was lost before the fix
+    }
+
+    /// Every SSE line ending frames an event, and the delimiter search is
+    /// byte-exact: `\r\n\r\n` must not be read as a lone-CR delimiter, and a
+    /// multi-byte character before the delimiter must not be sliced apart.
+    #[test]
+    fn sse_delimiter_handles_every_line_ending() {
+        for (raw, expected_event, expected_rest) in [
+            ("a\n\nb", "a", "b"),
+            ("a\r\n\r\nb", "a", "b"),
+            ("a\r\rb", "a", "b"),
+            // A lone CR inside the data is not a delimiter on its own.
+            ("a\rb\n\nc", "a\rb", "c"),
+            // Multi-byte characters are kept whole.
+            ("dat\u{e9}\n\nnext", "dat\u{e9}", "next"),
+            // SSE does not require one terminator throughout: a blank line
+            // may be formed by two different ones.
+            ("a\n\r\nb", "a", "b"),
+            ("a\r\n\nb", "a", "b"),
+            ("a\r\rb", "a", "b"),
+            ("a\n\rb", "a", "b"),
+        ] {
+            let mut buffer = raw.to_owned();
+            assert_eq!(
+                drain_sse_event(&mut buffer).as_deref(),
+                Some(expected_event),
+                "{raw:?}"
+            );
+            assert_eq!(buffer, expected_rest, "{raw:?}");
+        }
+        // An incomplete event is left for the next chunk.
+        let mut partial = "a\n".to_owned();
+        assert_eq!(drain_sse_event(&mut partial), None);
+        assert_eq!(partial, "a\n");
+    }
+
+    /// The end-of-stream flush withholds only a tail that is nothing but the
+    /// usage chunk. A tail that also holds the answer must survive: dropping
+    /// it would lose the client's whole response.
+    #[test]
+    fn usage_chunk_filter_flush_keeps_a_tail_that_holds_content() {
+        let usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7}}";
+        let content = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}";
+
+        // Only the usage chunk, unterminated: withheld.
+        let mut filter = UsageChunkFilter::default();
+        assert!(filter.push(usage.as_bytes()).is_empty());
+        assert!(filter.flush().is_empty());
+
+        // The answer sharing the tail with a usage chunk: kept whole.
+        let mut filter = UsageChunkFilter::default();
+        let tail = format!("{content}\n{usage}");
+        assert!(filter.push(tail.as_bytes()).is_empty());
+        assert_eq!(
+            String::from_utf8(filter.flush().to_vec()).expect("utf-8"),
+            tail
+        );
+    }
+
+    /// Mixed line endings still frame events, so a stream using them is
+    /// forwarded as it arrives rather than buffered until EOF.
+    #[test]
+    fn usage_chunk_filter_frames_mixed_line_endings() {
+        let content = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\r\n";
+        let usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7}}\n\r\n";
+        let mut filter = UsageChunkFilter::default();
+        assert_eq!(
+            String::from_utf8(filter.push(content.as_bytes()).to_vec()).expect("utf-8"),
+            content,
+            "content must be forwarded, not buffered"
+        );
+        assert!(filter.push(usage.as_bytes()).is_empty());
+        assert!(filter.flush().is_empty());
+    }
+
+    /// The usage filter frames on lone-CR delimiters too, so a stream using
+    /// them is forwarded as it arrives instead of buffered until EOF.
+    #[test]
+    fn usage_chunk_filter_frames_lone_cr_streams() {
+        let content = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\r\r";
+        let usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7}}\r\r";
+        let mut filter = UsageChunkFilter::default();
+        // The content event is forwarded as soon as its delimiter arrives.
+        assert_eq!(
+            String::from_utf8(filter.push(content.as_bytes()).to_vec()).expect("utf-8"),
+            content
+        );
+        assert!(filter.push(usage.as_bytes()).is_empty());
+        assert!(filter.flush().is_empty());
+    }
+
+    /// The injected usage chunk is withheld even when it arrives split
+    /// across upstream reads, and every other event is relayed byte for
+    /// byte. A filter that matched on a single chunk would leak the usage
+    /// into the client's stream.
+    #[test]
+    fn usage_chunk_filter_withholds_a_split_usage_chunk_only() {
+        let content = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n";
+        let usage = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7}}\n\n";
+        let done = "data: [DONE]\n\n";
+        let stream = format!("{content}{usage}{done}");
+        let bytes = stream.as_bytes();
+        // Every split point of the same stream must behave identically.
+        for split in 1..bytes.len() {
+            let mut filter = UsageChunkFilter::default();
+            let mut out = Vec::new();
+            out.extend_from_slice(&filter.push(&bytes[..split]));
+            out.extend_from_slice(&filter.push(&bytes[split..]));
+            out.extend_from_slice(&filter.flush());
+            assert_eq!(
+                String::from_utf8(out).expect("utf-8"),
+                format!("{content}{done}"),
+                "split at {split}"
+            );
+        }
+    }
+
+    /// A terminal usage chunk with no trailing delimiter is still withheld,
+    /// and a usage chunk that also carries a choice (a provider that reports
+    /// usage alongside content) is NOT withheld, since the client needs it.
+    #[test]
+    fn usage_chunk_filter_keeps_chunks_that_carry_content() {
+        let mut filter = UsageChunkFilter::default();
+        let kept = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"x\"}}],\"usage\":{\"prompt_tokens\":3}}\n\n";
+        assert_eq!(
+            String::from_utf8(filter.push(kept.as_bytes()).to_vec()).expect("utf-8"),
+            kept
+        );
+        // No blank line terminates this one: the stream just ended.
+        let mut filter = UsageChunkFilter::default();
+        assert!(
+            filter
+                .push(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7}}")
+                .is_empty()
+        );
+        assert!(filter.flush().is_empty());
+    }
+
+    /// `stream_options` the router cannot extend (a client sent a non-object)
+    /// is left exactly as the client wrote it, for the upstream to refuse,
+    /// and no filtering is claimed.
+    #[test]
+    fn request_stream_usage_leaves_a_malformed_stream_options_alone() {
+        let mut malformed = json!({"model": "m", "stream_options": "yes"});
+        assert!(!chat_inbound::request_stream_usage(&mut malformed));
+        assert_eq!(malformed["stream_options"], json!("yes"));
+
+        for mut body in [
+            json!({"model": "m"}),
+            json!({"model": "m", "stream_options": Value::Null}),
+            json!({"model": "m", "stream_options": {"include_usage": false}}),
+        ] {
+            assert!(chat_inbound::request_stream_usage(&mut body), "{body}");
+            assert_eq!(
+                body["stream_options"]["include_usage"],
+                json!(true),
+                "{body}"
+            );
+        }
     }
 
     /// Regression test: `emit_completed_metrics` must emit a `PromptCache` update
