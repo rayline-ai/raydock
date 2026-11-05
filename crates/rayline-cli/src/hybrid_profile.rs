@@ -5,12 +5,11 @@
 //! (`routing.policy: {"preset": "arc-policy.hybrid-default.v1"}`) through the
 //! core's `execution_context_v2` Decisions contract; it never relies on an
 //! absent policy. The optional `hybrid.routing` block in settings.json maps
-//! onto `routing.policy` and V:
+//! onto `routing.policy`:
 //!
 //! ```json
 //! {"hybrid": {"routing": {"policy": "utility" | "prefer_local", "min_p_pass": 0.65,
-//!                         "schedule": {"model": ["cache_boundaries", "user_messages"]},
-//!                         "v_value": 0.1},
+//!                         "schedule": {"model": ["cache_boundaries", "user_messages"]}},
 //!             "local_context_window": 98304}}
 //! ```
 //!
@@ -35,10 +34,13 @@ pub(crate) const HYBRID_DEFAULT_PRESET: &str = "arc-policy.hybrid-default.v1";
 pub(crate) const PREFER_LOCAL_PRESET: &str = "arc-policy.prefer-local.v1";
 const API_MODE_V2: &str = "execution_context_v2";
 const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
+/// The ARC model the default profile asks for decisions. Swift decides at its
+/// own fixed V (no `routing.v_value`), which picks cheap and so uses the local
+/// model most.
+pub(crate) const DECISIONS_MODEL: &str = "arc-swift-1.0";
 const LOCAL_REGISTRY_MODEL: &str = "qwen/qwen3.8-27b";
 /// The default V with a zero-priced local model: easy work stays on device,
 /// harder work goes to the cloud (dev cell probe, 2026-10-25).
-const DEFAULT_VALUE_USD: f64 = 0.5;
 const CALLER_PRICES_SCHEMA: &str = "arc-caller-prices.v1";
 /// The local model's default window: 96k tokens keeps Qwen3.8-27B's KV cache
 /// within a laptop's memory, and a longer turn hands off to cloud.
@@ -229,17 +231,12 @@ pub(crate) fn compose(
         .as_object_mut()
         .ok_or("decisions.routing must be an object")?;
     let existing = routing.get("policy").cloned();
-    let (policy, source, set_value) = map_block(block, existing.as_ref())?;
+    let (policy, source) = map_block(block, existing.as_ref())?;
     let preset = policy
         .get("preset")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     routing.insert("policy".to_owned(), Value::Object(policy));
-    if let Some(value) = set_value {
-        routing.insert("v_value".to_owned(), json!(value));
-        // The core executes the returned custom result for a configured V.
-        decisions.insert("result".to_owned(), json!("custom"));
-    }
     if preset.as_deref() == Some(PREFER_LOCAL_PRESET) {
         // Prefer-local excludes a local target whose capacity is unknown, so
         // without a qualified token counter it would never choose local.
@@ -271,20 +268,20 @@ pub(crate) fn compose(
     })
 }
 
-/// The mapped `routing.policy`, its source and an optional V.
-type MappedRouting = (Map<String, Value>, PolicySource, Option<f64>);
+/// The mapped `routing.policy` and its source.
+type MappedRouting = (Map<String, Value>, PolicySource);
 
-/// Map the override block onto `routing.policy` and `routing.v_value`.
+/// Map the override block onto `routing.policy`.
 fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRouting, String> {
     let block = block.and_then(Value::as_object);
     if let Some(block) = block {
         for key in block.keys() {
             if !matches!(
                 key.as_str(),
-                "policy" | "schedule" | "v_value" | "min_p_pass" | "local_price"
+                "policy" | "schedule" | "min_p_pass" | "local_price"
             ) {
                 return Err(format!(
-                    "settings hybrid.routing.{key} is not supported (policy, schedule, v_value, min_p_pass, local_price)"
+                    "settings hybrid.routing.{key} is not supported (policy, schedule, min_p_pass, local_price)"
                 ));
             }
         }
@@ -356,16 +353,7 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
             .ok_or("profile routing.policy.overrides must be an object")?;
         overrides.insert("selection".to_owned(), json!({"min_p_pass": threshold}));
     }
-    let value = match block.and_then(|block| block.get("v_value")) {
-        None => None,
-        Some(value) => Some(
-            value
-                .as_f64()
-                .filter(|value| (0.1..=5.0).contains(value))
-                .ok_or("settings hybrid.routing.v_value must be a number between 0.1 and 5")?,
-        ),
-    };
-    Ok((policy, source, value))
+    Ok((policy, source))
 }
 
 fn validate_schedule(schedule: &Value) -> Result<(), String> {
@@ -477,7 +465,7 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
 
 /// The default package-less profile: local Qwen from `local_model`, Opus and
 /// Sonnet through the signed-in router (exact model pins), decisions from the
-/// router's `rayline-router` model with the hybrid default preset applied by
+/// router's [`DECISIONS_MODEL`] with the hybrid default preset applied by
 /// [`compose`]. Actions are derived by the core from its embedded registry.
 pub(crate) fn default_profile(
     router_url: &str,
@@ -513,8 +501,8 @@ pub(crate) fn default_profile(
     let mut prices = Map::new();
     prices.insert(LOCAL_REGISTRY_MODEL.to_owned(), legs);
     let mut decisions = json!({"api_mode": API_MODE_V2, "url": format!("{router}/v1/routes"),
-                               "auth_env": ROUTER_KEY_ENV, "model": "rayline-router", "result": "custom",
-                               "routing": {"v_value": DEFAULT_VALUE_USD, "prices": prices, "exclusive": false},
+                               "auth_env": ROUTER_KEY_ENV, "model": DECISIONS_MODEL, "result": "swift",
+                               "routing": {"prices": prices, "exclusive": false},
                                "price_sha256": caller_price_sha256(LOCAL_REGISTRY_MODEL, local_price)});
     if let Some(cell) = cell {
         decisions["cell_tag"] = json!(cell);
@@ -954,8 +942,8 @@ mod tests {
     }
 
     #[test]
-    fn override_block_maps_to_policy_schedule_and_value() {
-        let block = json!({"policy": "utility", "schedule": {"model": ["cache_boundaries", "user_messages"], "thinking": ["all_turns"]}, "v_value": 0.1});
+    fn override_block_maps_to_policy_and_schedule() {
+        let block = json!({"policy": "utility", "schedule": {"model": ["cache_boundaries", "user_messages"], "thinking": ["all_turns"]}});
         let composed = compose(
             profile(),
             Some(&settings(Some(block))),
@@ -968,8 +956,8 @@ mod tests {
             decisions["routing"]["policy"],
             json!({"preset": HYBRID_DEFAULT_PRESET, "overrides": {"schedule": {"model": ["cache_boundaries", "user_messages"], "thinking": ["all_turns"]}}})
         );
-        assert_eq!(decisions["routing"]["v_value"], 0.1);
-        assert_eq!(decisions["result"], "custom");
+        assert_eq!(decisions["result"], "top");
+        assert!(decisions["routing"].get("v_value").is_none());
         assert_eq!(composed.policy, PolicySource::Settings);
     }
 
@@ -1040,7 +1028,7 @@ mod tests {
             config["decisions"]["url"],
             "https://api-dev.rayline.ai/v1/routes"
         );
-        assert_eq!(config["decisions"]["model"], "rayline-router");
+        assert_eq!(config["decisions"]["model"], "arc-swift-1.0");
         assert_eq!(
             config["decisions"]["routing"]["policy"],
             json!({"preset": HYBRID_DEFAULT_PRESET})
@@ -1123,34 +1111,13 @@ mod tests {
             json!({"qwen/qwen3.8-27b": {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0}})
         );
         assert_eq!(decisions["routing"]["exclusive"], false);
-        assert_eq!(decisions["routing"]["v_value"], 0.5);
-        assert_eq!(decisions["result"], "custom");
+        assert!(decisions["routing"].get("v_value").is_none());
+        assert_eq!(decisions["result"], "swift");
         // Equal to the dev service's own echo for this price world.
         assert_eq!(
             decisions["price_sha256"],
             "5c2ccbe09f4b5f9938df5ca93282b5a39b3573cae108d5e6abf89de3466d254c"
         );
-        // A user V override keeps the local price.
-        let block = json!({"v_value": 2.0});
-        let profile = default_profile(
-            "https://api-dev.rayline.ai",
-            "http://127.0.0.1:8080/v1",
-            "q",
-            16384,
-            None,
-            None,
-        )
-        .unwrap();
-        let config = compose(
-            profile,
-            Some(&settings(Some(block))),
-            Path::new("/state"),
-            ProfileOrigin::Default,
-        )
-        .unwrap()
-        .config;
-        assert_eq!(config["decisions"]["routing"]["v_value"], 2.0);
-        assert!(config["decisions"]["routing"].get("prices").is_some());
         // local_price is configurable and validated; it is refused for a profile file.
         let priced = settings(Some(json!({"local_price": 0.05})));
         let profile = default_profile(
@@ -1323,7 +1290,7 @@ mod tests {
         assert!(
             compose(
                 legacy,
-                Some(&settings(Some(json!({"v_value": 1.0})))),
+                Some(&settings(Some(json!({"policy": "utility"})))),
                 Path::new("/p"),
                 ProfileOrigin::File
             )
@@ -1360,10 +1327,7 @@ mod tests {
             json!({"schedule": {"model": []}}),
             json!({"schedule": {"model": ["user_messages", "user_messages"]}}),
             json!({"schedule": {"tools": ["all_turns"]}}),
-            json!({"v_value": -1}),
-            json!({"v_value": 0}),
-            json!({"v_value": 6}),
-            json!({"v_value": "0.1"}),
+            json!({"v_value": 0.5}),
             json!({"value_usd": 0.5}),
             json!({"selection": {"min_p_pass": 0.5}}),
         ] {
@@ -1396,7 +1360,7 @@ mod tests {
         assert!(
             compose(
                 legacy,
-                Some(&settings(Some(json!({"v_value": 1.0})))),
+                Some(&settings(Some(json!({"policy": "utility"})))),
                 Path::new("/p"),
                 ProfileOrigin::File
             )

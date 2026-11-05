@@ -73,7 +73,8 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   pf-5505cbf8-v2`; a default `--env prod` start is refused by that router.
 - **No profile file:** `start` builds a package-less default profile.
   - Decisions go to the signed-in router (`--env`, default `prod`) with model
-    `rayline-router`.
+    `arc-swift-1.0` and no V: Swift decides at its own fixed V and picks
+    cheap, so it uses the local model most.
   - `local_model` is the local Chat deployment (`registry_model`
     `qwen/qwen3.8-27b`). Its context window is `--local-context-window`, else
     settings `hybrid.local_context_window`, else 98304 tokens; a llama.cpp
@@ -116,8 +117,7 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
 
   ```json
   {"hybrid": {"routing": {"policy": "utility",
-                          "schedule": {"model": ["cache_boundaries", "user_messages"]},
-                          "v_value": 0.1}}}
+                          "schedule": {"model": ["cache_boundaries", "user_messages"]}}}}
   ```
 
   `policy: "utility"` is the hybrid default preset; `"prefer_local"` selects
@@ -127,8 +127,8 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   `routing.policy.overrides.schedule`; each dimension (`model`, `thinking`)
   lists switch-point classes from `cache_boundaries`, `user_messages` and
   `all_turns`, and the service refuses a class the package does not admit.
-  `v_value` becomes `routing.v_value` and selects the returned `custom`
-  result. Unknown keys are refused.
+  Unknown keys are refused, `v_value` among them: a profile file that wants
+  its own V sets `decisions.routing.v_value` with model `arc-1.0`.
 - **Local model.** A profile deployment marked `"from_local_model": true`
   takes its endpoint and served model from `local_model`
   (`raydock local custom --url http://127.0.0.1:11434/v1 --model qwen3.8:27b`); its protocol

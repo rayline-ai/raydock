@@ -60,7 +60,7 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
    ```
 
    With no profile file, `start` builds the default profile:
-   - Decisions come from your signed-in router's `rayline-router` model.
+   - Decisions come from your signed-in router's `arc-swift-1.0` model.
    - Your `local_model` is the local target.
    - Claude Opus 5.5 and Sonnet 5.5, through the same router, are the cloud
      targets.
@@ -99,10 +99,10 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 On-device inference costs you about nothing per token. The default profile
 therefore prices the local model at 0 per million tokens on every leg, sends
 those caller prices with `exclusive: false` so cloud models keep their market
-prices, and uses a moderate V of 0.5. Under these defaults easy work stays on
-device and harder work goes to the cloud. Change them in the override block
-with `local_price` (USD per million tokens, applied to every leg of the local
-model) and `v_value`.
+prices, and asks ARC Swift, which decides at its own fixed V and picks cheap.
+Under these defaults easy work stays on device and harder work goes to the
+cloud. Change the local price in the override block with `local_price` (USD
+per million tokens, applied to every leg of the local model).
 
 ## Routing policy
 
@@ -123,8 +123,7 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 ```json
 {"hybrid": {"routing": {"policy": "prefer_local",
                         "min_p_pass": 0.65,
-                        "schedule": {"model": ["cache_boundaries", "user_messages"]},
-                        "v_value": 1.0}}}
+                        "schedule": {"model": ["cache_boundaries", "user_messages"]}}}}
 ```
 
 | Key | Meaning |
@@ -133,7 +132,6 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
 | `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). It must be 0 or between 1e-6 and 1e6. `start --config` refuses it, because a profile file sets its own prices. |
-| `v_value` | Your V: what a successful task is worth to you in dollars, from 0.1 to 5 (checked at `start`). A higher V favours more capable, more expensive models. It selects ARC's custom result. |
 
 Unknown keys are refused. If `settings.json` cannot be read or is not valid
 JSON, or the block is invalid, `start` stops with an error that names the file.

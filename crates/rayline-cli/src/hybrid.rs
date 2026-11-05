@@ -257,13 +257,15 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     if local_refused {
                         crate::hybrid_profile::without_local(&mut profile);
                         println!(
-                            "Default hybrid profile: decisions via {} (model rayline-router), cloud only",
-                            hosted.router_url
+                            "Default hybrid profile: decisions via {} (model {}), cloud only",
+                            hosted.router_url,
+                            crate::hybrid_profile::DECISIONS_MODEL
                         );
                     } else {
                         println!(
-                            "Default hybrid profile: decisions via {} (model rayline-router), local window {window} tokens",
-                            hosted.router_url
+                            "Default hybrid profile: decisions via {} (model {}), local window {window} tokens",
+                            hosted.router_url,
+                            crate::hybrid_profile::DECISIONS_MODEL
                         );
                     }
                     (profile, paths.dir.clone())
@@ -489,8 +491,8 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
 }
 
 /// Send one Decisions request with the key the core will use and classify
-/// the answer. A development cell (`cell_tag`) gets a real routing request,
-/// which also starts a scale-to-zero cell; while it answers 502/503/504 the
+/// the answer. A development cell (`cell_tag`) gets a real routing request
+/// (the profile's model, and its V when it has one), which also starts a scale-to-zero cell; while it answers 502/503/504 the
 /// probe waits and retries within the startup deadline. Without a cell an
 /// empty body is enough: the router authenticates before it validates.
 /// Skipped for a loopback Decisions URL.
@@ -531,14 +533,7 @@ async fn probe_decisions(
             ))
         })?;
     let cell = decisions.get("cell_tag").and_then(Value::as_str);
-    let body = match cell {
-        Some(_) => json!({
-            "model": decisions.get("model").and_then(Value::as_str).unwrap_or("rayline-router"),
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "raydock hybrid start: readiness check"}]
-        }),
-        None => json!({}),
-    };
+    let body = probe_body(decisions);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
@@ -612,6 +607,23 @@ enum ProbeVerdict {
 }
 
 /// `Err(())`: no HTTP answer (connect error or timeout).
+/// The readiness body: empty without a cell, else a routing request with the
+/// profile's model, and its V when it has one.
+fn probe_body(decisions: &Value) -> Value {
+    if decisions.get("cell_tag").and_then(Value::as_str).is_none() {
+        return json!({});
+    }
+    let mut body = json!({
+        "model": decisions.get("model"),
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "raydock hybrid start: readiness check"}]
+    });
+    if let Some(v_value) = decisions.pointer("/routing/v_value") {
+        body["routing"] = json!({"v_value": v_value});
+    }
+    body
+}
+
 fn probe_verdict(outcome: Result<u16, ()>) -> ProbeVerdict {
     match outcome {
         Err(()) => ProbeVerdict::Unavailable,
@@ -1083,11 +1095,11 @@ mod tests {
         let path = Path::new("/home/user/.config/rayline/settings.json");
         let error = settings_error(
             Some(path),
-            "settings hybrid.routing.v_value must be a number between 0.1 and 5".to_owned(),
+            "settings hybrid.routing.min_p_pass must be a number in (0, 1)".to_owned(),
         );
         assert_eq!(
             error.to_string(),
-            "/home/user/.config/rayline/settings.json: settings hybrid.routing.v_value must be a number between 0.1 and 5"
+            "/home/user/.config/rayline/settings.json: settings hybrid.routing.min_p_pass must be a number in (0, 1)"
         );
         let other = settings_error(
             Some(path),
