@@ -36,6 +36,14 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Fixed
 
+- **Hybrid routing decides again on the hosted router.** Since the router moved
+  to the Routes API V1 contract (2026-11-04), every `raydock hybrid` decision
+  was refused with `routing has unsupported member(s): exclusive` and the turn
+  failed. The default profile no longer sends `exclusive` or a precomputed
+  `price_sha256`, and the bundled execution core checks the router's V1 price
+  acknowledgement. A profile file from before V1 (with `routing.exclusive`,
+  `value_usd` or a precomputed `price_sha256`) is refused by the core at
+  startup, and the runtime log names the replacement.
 - **Chat Completions requests show in `raydock top`.** The local router's
   `/v1/chat/completions` listener now records the same request lifecycle as
   the Messages and Responses listeners: the route when it is decided, the
