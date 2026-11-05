@@ -100,6 +100,18 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   stopped early is recorded as an error, not a completion. Response bodies
   are unchanged. A Responses turn served on-device is recorded by the
   adapter, as before, and no longer also leaves a bare duplicate row.
+- **Streamed Responses turns on an Anthropic route record their cache-read
+  tokens.** When a Codex `/v1/responses` turn is served through an
+  `anthropic_messages` endpoint and both sides stream, the local router now
+  closes the metrics row with the cached part of the prompt as well as the
+  prompt and output counts, so `raydock top`'s cache column covers the shape an
+  interactive turn normally takes. The row also gains the prompt total the
+  cache hit rate is measured against, so that column reads as a rate rather
+  than a blank. Those counts were dropped for stream-to-stream turns only; the
+  buffered shapes and the Chat Completions and Messages paths already recorded
+  them. An upstream that reports no cache tokens still leaves the count unset
+  rather than reporting a zero. Response bodies and the `usage` the client
+  receives are unchanged.
 
 ## 0.3.1 (2026-11-02)
 
