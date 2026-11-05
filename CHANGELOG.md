@@ -33,6 +33,12 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   are refused at `start` (`settings hybrid.routing.v_value is not
   supported`); remove the key. A profile file that wants its own V sets
   `decisions.routing.v_value` with model `arc-1.0`.
+- **Hybrid routing is no longer a development-router preview.** A production
+  `raydock hybrid start` no longer prints the preview note: hybrid uses the
+  production router by default, and `--env dev` selects the development one.
+  The hybrid docs now say what a turn costs: every turn bills one ARC decision,
+  local turns included, and a cloud turn also bills the provider's
+  pass-through price.
 
 ### Fixed
 
