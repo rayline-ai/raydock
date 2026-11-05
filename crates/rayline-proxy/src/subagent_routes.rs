@@ -96,7 +96,7 @@ mod tests {
         let parsed = routes(json!({"routes": {
             "subagent": {"endpoint": "rayline-cloud", "model": " arc-sage-1.0 "},
             "subagents": {
-                "Review": {"endpoint": "rayline-cloud", "model": "rayline-router"},
+                "Review": {"endpoint": "rayline-cloud", "model": "z-ai/glm-5.2"},
                 "Explore": {"endpoint": "rayline-cloud"},
                 " ": {"endpoint": "rayline-cloud", "model": "m"}
             }
@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(parsed.agents().collect::<Vec<_>>(), ["Explore", "Review"]);
         assert_eq!(parsed.default_model.as_deref(), Some("arc-sage-1.0"));
         assert_eq!(parsed.by_agent[0].model, None);
-        assert_eq!(parsed.by_agent[1].model.as_deref(), Some("rayline-router"));
+        assert_eq!(parsed.by_agent[1].model.as_deref(), Some("z-ai/glm-5.2"));
     }
 
     #[test]
@@ -132,12 +132,12 @@ mod tests {
         let parsed = routes(json!({"routes": {
             "subagent": {"model": "arc-sage-1.0"},
             "subagents": {
-                "Review": {"model": "rayline-router"},
+                "Review": {"model": "z-ai/glm-5.2"},
                 "Explore": {}
             }
         }}));
 
-        assert_eq!(parsed.model_for("id", Some("review")), "rayline-router");
+        assert_eq!(parsed.model_for("id", Some("review")), "z-ai/glm-5.2");
         assert_eq!(parsed.model_for("id", Some("Explore")), "arc-sage-1.0");
         assert_eq!(parsed.model_for("id", Some("Plan")), "arc-sage-1.0");
         assert_eq!(

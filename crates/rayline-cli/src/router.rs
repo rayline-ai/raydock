@@ -4476,14 +4476,14 @@ mod tests {
             serde_json::to_vec(&json!({
                 "endpoints": [
                     { "id": "rayline-cloud", "protocol": "anthropic_messages",
-                      "base_url": "https://api.rayline.ai", "models": ["rayline-router"] },
+                      "base_url": "https://api.rayline.ai", "models": ["arc-sage-1.0"] },
                     { "id": "ollama", "protocol": "openai_chat",
                       "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
                 ],
                 "routes": {
-                    "main":     { "endpoint": "rayline-cloud", "model": "rayline-router",
+                    "main":     { "endpoint": "rayline-cloud", "model": "arc-sage-1.0",
                                   "router": "rayline-cloud", "local_models": ["qwen2.5-coder:7b"] },
-                    "subagent": { "endpoint": "rayline-cloud", "model": "rayline-router",
+                    "subagent": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0",
                                   "router": "rayline-cloud", "local_models": ["qwen2.5-coder:7b"] }
                 }
             }))
@@ -4498,11 +4498,11 @@ mod tests {
             serde_json::to_vec(&json!({
                 "endpoints": [
                     { "id": "rayline-cloud", "protocol": "anthropic_messages",
-                      "base_url": "https://api.rayline.ai", "models": ["rayline-router"] }
+                      "base_url": "https://api.rayline.ai", "models": ["arc-sage-1.0"] }
                 ],
                 "routes": {
-                    "main":     { "endpoint": "rayline-cloud", "model": "rayline-router" },
-                    "subagent": { "endpoint": "rayline-cloud", "model": "rayline-router" }
+                    "main":     { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" },
+                    "subagent": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0" }
                 }
             }))
             .unwrap(),

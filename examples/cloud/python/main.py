@@ -29,9 +29,9 @@ API_KEY = os.environ.get("RAYLINE_API_KEY", "rlk-REPLACE_ME")
 client = Anthropic(base_url=BASE_URL, auth_token=API_KEY)
 
 message = client.messages.create(
-    # "rayline-router" lets the router pick the concrete model. You can also pass
+    # "arc-sage-1.0" lets ARC pick the concrete model. You can also pass
     # a concrete id such as "claude-sonnet-5".
-    model="rayline-router",
+    model="arc-sage-1.0",
     max_tokens=512,
     messages=[
         {"role": "user", "content": "In one sentence, what is Rayline?"},

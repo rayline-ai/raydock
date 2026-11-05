@@ -82,9 +82,8 @@ pub const CONV_HEADER: &str = "x-conversation-id";
 /// this name on their own; Hermes needs the name written into its config
 /// ([`hermes::SESSION_AFFINITY_KEY`]).
 pub const SESSION_AFFINITY_HEADER: &str = "x-session-affinity";
-/// The Legacy Rules Router on the hosted router, and the execution core's
-/// virtual model under `raydock hybrid run`.
-pub const ROUTER_MODEL: &str = crate::LEGACY_ROUTER_MODEL;
+/// The execution core's virtual model under `raydock hybrid run`.
+pub const ROUTER_MODEL: &str = crate::VIRTUAL_ROUTER_MODEL;
 
 /// The models a rendered config selects and offers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -112,21 +111,19 @@ pub(crate) const HYBRID_MODELS: LaunchModels = LaunchModels {
 };
 
 /// Display name for a model a provider entry lists.
-pub(crate) fn model_display_name(models: LaunchModels, model: &str) -> &'static str {
+pub(crate) fn model_display_name(model: &str) -> &'static str {
     match model {
         crate::ARC_SAGE_MODEL => "ARC Sage",
         crate::ARC_SWIFT_MODEL => "ARC Swift",
-        // Under hybrid it is the execution core's only model, not Legacy.
-        ROUTER_MODEL if models == HYBRID_MODELS => "Raydock router",
-        ROUTER_MODEL => "Legacy Rules Router",
+        ROUTER_MODEL => "Raydock router",
         _ => "Raydock",
     }
 }
 /// Maximum input context ARC accepts on `arc-sage-1.0` and
 /// `arc-swift-1.0`.
 pub const ARC_CONTEXT_WINDOW: u64 = 1_000_000;
-/// Output ceiling for models outside the hosted ARC tiers (Legacy Rules
-/// Router, hybrid): the harness default the router and execution core admit.
+/// Output ceiling for models outside the hosted ARC tiers: the harness
+/// default the router admits.
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
 /// Maximum output ARC accepts on `arc-sage-1.0` and `arc-swift-1.0`.
 pub const ARC_MAX_OUTPUT_TOKENS: u64 = 128_000;
@@ -308,7 +305,7 @@ impl RenderContext<'_> {
 
     /// Output cap to advertise for `model`: the hybrid runtime's admitted
     /// limit under `raydock hybrid run`, 128,000 for a hosted ARC tier, and the
-    /// harness default for the Legacy Rules Router.
+    /// harness default otherwise.
     pub fn max_output_tokens(&self, model: &str) -> u64 {
         match self.capabilities {
             Some(caps) => caps.max_output_tokens,

@@ -28,9 +28,9 @@ const API_KEY = process.env.RAYLINE_API_KEY ?? "rlk-REPLACE_ME";
 const client = new Anthropic({ baseURL: BASE_URL, authToken: API_KEY });
 
 const message = await client.messages.create({
-  // "rayline-router" lets the router pick the concrete model. You can also pass
+  // "arc-sage-1.0" lets ARC pick the concrete model. You can also pass
   // a concrete id such as "claude-sonnet-5".
-  model: "rayline-router",
+  model: "arc-sage-1.0",
   max_tokens: 512,
   messages: [{ role: "user", content: "In one sentence, what is Rayline?" }],
 });

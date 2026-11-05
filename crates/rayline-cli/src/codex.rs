@@ -564,7 +564,7 @@ mod tests {
         // `ensure_router_key`.
         let path = write_config(
             "rrc-cloud",
-            r#"{"endpoints":[{"id":"rayline-cloud","protocol":"openai_responses","base_url":"https://api.rayline.ai","models":["rayline-router"],"api_key_env":"RAYLINE_ROUTER_API_KEY","auth":"bearer"}],"routes":{"main":{"endpoint":"rayline-cloud","model":"rayline-router"}}}"#,
+            r#"{"endpoints":[{"id":"rayline-cloud","protocol":"openai_responses","base_url":"https://api.rayline.ai","models":["arc-sage-1.0"],"api_key_env":"RAYLINE_ROUTER_API_KEY","auth":"bearer"}],"routes":{"main":{"endpoint":"rayline-cloud","model":"arc-sage-1.0"}}}"#,
         );
         assert!(crate::router_config::config_routes_to_hosted_rcr(&path));
 

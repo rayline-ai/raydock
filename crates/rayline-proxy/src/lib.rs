@@ -2302,12 +2302,7 @@ fn normalize_model_name(model: &str) -> String {
     } else {
         model
     };
-    match trimmed.strip_prefix("claude-rayline-router-") {
-        Some("balanced") => "rayline-router".to_owned(),
-        Some(suffix) => format!("rayline-router-{suffix}"),
-        None if trimmed == "rayline-router-balanced" => "rayline-router".to_owned(),
-        None => trimmed.to_owned(),
-    }
+    trimmed.to_owned()
 }
 
 fn claude_code_agent_id(headers: &HeaderMap) -> Option<&str> {
@@ -3242,14 +3237,14 @@ mod tests {
             "subagent": {"endpoint": "rayline-cloud", "model": "arc-sage-1.0"},
             "subagents": {
                 "Explore": {"endpoint": "rayline-cloud", "model": "arc-swift-1.0"},
-                "Review": {"endpoint": "rayline-cloud", "model": "rayline-router"},
+                "Review": {"endpoint": "rayline-cloud", "model": "z-ai/glm-5.2"},
                 "Plan": {"endpoint": "rayline-cloud"}
             }
         }}));
 
         for (agent_type, expected) in [
             ("Explore", "arc-swift-1.0"),
-            ("Review", "rayline-router"),
+            ("Review", "z-ai/glm-5.2"),
             ("Plan", "arc-sage-1.0"),
         ] {
             let prepared =
@@ -3523,17 +3518,10 @@ mod tests {
     #[test]
     fn selective_mode_routes_virtual_model_names_with_ttl_suffix() {
         assert_eq!(normalize_model_name("rayline-router[1m]"), "rayline-router");
+        // Retired router aliases name no model: nothing maps them.
         assert_eq!(
             normalize_model_name("claude-rayline-router-balanced"),
-            "rayline-router"
-        );
-        assert_eq!(
-            normalize_model_name("claude-rayline-router-fast"),
-            "rayline-router-fast"
-        );
-        assert_eq!(
-            normalize_model_name("rayline-router-balanced[1m]"),
-            "rayline-router"
+            "claude-rayline-router-balanced"
         );
 
         let headers = HeaderMap::new();
