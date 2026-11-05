@@ -1083,11 +1083,11 @@ mod tests {
         let path = Path::new("/home/user/.config/rayline/settings.json");
         let error = settings_error(
             Some(path),
-            "settings hybrid.routing.value_usd must be a number between 0.1 and 5".to_owned(),
+            "settings hybrid.routing.v_value must be a number between 0.1 and 5".to_owned(),
         );
         assert_eq!(
             error.to_string(),
-            "/home/user/.config/rayline/settings.json: settings hybrid.routing.value_usd must be a number between 0.1 and 5"
+            "/home/user/.config/rayline/settings.json: settings hybrid.routing.v_value must be a number between 0.1 and 5"
         );
         let other = settings_error(
             Some(path),
