@@ -30,6 +30,7 @@ sha2 = "0.10"
 tar = "0.4"
 tokio.workspace = true
 url = "2"
+csub = { path = "../csub" }
 rayline-hf = { path = "../rayline-hf" }
 rayline-llama = { path = "../rayline-llama" }
 rayline-local-router = { path = "../rayline-local-router" }
