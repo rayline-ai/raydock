@@ -218,8 +218,20 @@ reports the smallest window, the local model's; the harness is told 1,000,000
 because a turn that outgrows the local window is handed off to cloud, and
 harnesses such as Pi 1.1 cap `max_tokens` by the window that remains, so the
 local window would starve that handoff. The ordinary hosted launchers keep
-their existing configuration. The hybrid gateway does not reduce a submitted
-output allowance: requests outside admitted limits fail visibly in the core.
+their existing configuration.
+
+A harness states one output allowance for the whole session, but the
+deployments do not share one limit, and the advertised allowance is the
+smallest of them. A harness that takes that number is within every cap. One
+that asks for more has its local turns refused: Hermes sends a fixed 128,000
+on the Messages wire, from its own defaults for a model its catalog does not
+describe, and has no setting to lower it. The local deployment therefore sets
+`clamp_output_allowance`, and the core lowers an allowance over that cap to
+it, logging `stated` and `sent`. The cloud deployments do not: an allowance
+over a cloud ceiling means the number is wrong, and the core refuses it
+visibly rather than quietly shortening the answer. A turn whose admitted
+thinking budget reaches the cap is refused too, rather than clamped into a
+request Anthropic would reject.
 
 For an SDK or another harness, read the gateway address from `ready.json` and
 its private credential from `gateway-token` inside the state directory. Use
