@@ -149,9 +149,13 @@ core adds the output limit, then tells ARC whether the request fits.
 
 The default profile sets the local output limit to a quarter of the local
 window, at most 32,000 tokens (24,576 at the default 96k window), and the cloud
-targets' limit to 32,000. The core admits the smallest limit for the session,
-so a long local answer has room to finish, and a prompt larger than about
-three quarters of the local window goes to cloud.
+targets' limit to 32,000. The core advertises the smallest of them as the
+session's limit, so a long local answer has room to finish, and a prompt larger
+than about three quarters of the local window goes to cloud. Each limit is
+enforced against the deployment the turn lands on, not against that smallest
+figure: a harness that asks for more than the local cap has its local turns
+lowered to it rather than refused, and the cloud limits still bound cloud
+turns.
 
 When the conversation grows past the local window, for example during a long
 tool loop with no compaction, ARC hands the turn to a cloud target. The receipt
