@@ -148,14 +148,29 @@ own tokenizer. The count covers tools, history and private instructions. The
 core adds the output limit, then tells ARC whether the request fits.
 
 The default profile sets the local output limit to a quarter of the local
-window, at most 32,000 tokens (24,576 at the default 96k window), and the cloud
-targets' limit to 32,000. The core advertises the smallest of them as the
-session's limit, so a long local answer has room to finish, and a prompt larger
-than about three quarters of the local window goes to cloud. Each limit is
-enforced against the deployment the turn lands on, not against that smallest
-figure: a harness that asks for more than the local cap has its local turns
-lowered to it rather than refused, and the cloud limits still bound cloud
-turns.
+window, at most 32,000 tokens (24,576 at the default 96k window). Each cloud
+target takes its own model's ceiling, 128,000 tokens on both Claude 5.5 pins,
+so a cloud answer is not capped at a fraction of what the model allows. Set
+`hybrid.cloud_output_tokens` to declare those ceilings yourself, keyed by the
+pinned model:
+
+```json
+{
+  "hybrid": {
+    "cloud_output_tokens": {
+      "anthropic/claude-opus-5.5": 128000,
+      "anthropic/claude-sonnet-5.5": 128000
+    }
+  }
+}
+```
+
+The core advertises the smallest of all the limits as the session's, so a long
+local answer has room to finish, and a prompt larger than about three quarters
+of the local window goes to cloud. Each limit is enforced against the
+deployment the turn lands on, not against that smallest figure: a harness that
+asks for more than the local cap has its local turns lowered to it rather than
+refused, and each cloud ceiling bounds its own target.
 
 When the conversation grows past the local window, for example during a long
 tool loop with no compaction, ARC hands the turn to a cloud target. The receipt

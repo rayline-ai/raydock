@@ -53,6 +53,26 @@ const CLOUD_CONTEXT_WINDOW: u64 = 1_000_000;
 /// cap against the deployment the turn lands on; a 4096 cap cut long local
 /// turns short before any edit landed (Mac hybrid test, 2026-10-27).
 const MAX_OUTPUT_TOKENS: u64 = crate::harness::MAX_OUTPUT_TOKENS;
+/// The default profile's cloud deployments, as `(id, wire_model,
+/// max_output_tokens)`.
+///
+/// The ceiling is each pinned model's own, not the harness default: a single
+/// constant for both capped every cloud answer at a fraction of what the model
+/// allows. These are the models this profile pins, so their ceilings are
+/// declared here beside them (catalog figures, 2026-11-06, matching dev and
+/// prod), as [`CLOUD_CONTEXT_WINDOW`] is. Override them per model with
+/// `hybrid.cloud_output_tokens`.
+pub(crate) const CLOUD_MODELS: &[(&str, &str, u64)] = &[
+    ("cloud-opus", "anthropic/claude-opus-5.5", 128_000),
+    ("cloud-sonnet", "anthropic/claude-sonnet-5.5", 128_000),
+];
+/// Sanity bounds on a declared cloud output ceiling, not a check that the
+/// provider allows it: the lower bound leaves room for output beside
+/// Anthropic's 1024-token minimum thinking budget, and a larger budget needs
+/// more than the bound alone guarantees; the upper is a policy ceiling well
+/// above anything the catalog publishes, not proof any model serves it. The
+/// core refuses a budget that reaches the admitted limit either way.
+const CLOUD_OUTPUT_RANGE: std::ops::RangeInclusive<u64> = 1025..=1_000_000;
 
 /// `hybrid.local_context_window` from settings, or the default.
 pub(crate) fn local_context_window(settings: Option<&Value>) -> Result<u64, String> {
@@ -89,6 +109,63 @@ fn local_price(settings: Option<&Value>) -> Result<f64, String> {
             .filter(|price| *price == 0.0 || (1e-6..=1e6).contains(price))
             .ok_or_else(|| "settings hybrid.routing.local_price must be 0 or a price in USD per million tokens (1e-6 to 1e6)".to_owned()),
     }
+}
+
+/// Each [`CLOUD_MODELS`] pin with the output ceiling to declare for it:
+/// `hybrid.cloud_output_tokens` when settings set it, else the ceiling
+/// declared beside the pin.
+///
+/// Nothing is read over the network for this. The profile pins these exact
+/// models, so their ceilings are ours to state; discovering a number we chose
+/// ourselves would only make a launch depend on a request that can fail.
+///
+/// The settings block is keyed by `wire_model` and is all-or-nothing: a
+/// partial block is refused rather than mixed with the declared figures, so a
+/// profile's ceilings have one source.
+fn cloud_pins(settings: Option<&Value>) -> Result<Vec<(&'static str, &'static str, u64)>, String> {
+    let declared = || {
+        CLOUD_MODELS
+            .iter()
+            .map(|(id, wire, c)| (*id, *wire, *c))
+            .collect()
+    };
+    let Some(value) = settings
+        .and_then(|settings| settings.get("hybrid"))
+        .and_then(|hybrid| hybrid.get("cloud_output_tokens"))
+    else {
+        return Ok(declared());
+    };
+    let block = value.as_object().ok_or_else(|| {
+        "settings hybrid.cloud_output_tokens must map each cloud model to its output ceiling"
+            .to_owned()
+    })?;
+    if block.len() != CLOUD_MODELS.len() {
+        return Err(format!(
+            "settings hybrid.cloud_output_tokens needs an output ceiling for each model the default profile pins: {}",
+            CLOUD_MODELS
+                .iter()
+                .map(|(_, wire, _)| *wire)
+                .collect::<Vec<_>>()
+                .join(" and ")
+        ));
+    }
+    CLOUD_MODELS
+        .iter()
+        .map(|(id, wire, _)| {
+            let ceiling = block
+                .get(*wire)
+                .and_then(Value::as_u64)
+                .filter(|ceiling| CLOUD_OUTPUT_RANGE.contains(ceiling))
+                .ok_or_else(|| {
+                    format!(
+                        "settings hybrid.cloud_output_tokens needs {wire} as a whole number of tokens from {} to {}",
+                        CLOUD_OUTPUT_RANGE.start(),
+                        CLOUD_OUTPUT_RANGE.end()
+                    )
+                })?;
+            Ok((*id, *wire, ceiling))
+        })
+        .collect()
 }
 
 const SCHEDULE_CLASSES: &[&str] = &["cache_boundaries", "user_messages", "all_turns"];
@@ -443,7 +520,11 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
 /// The default package-less profile: local Qwen from `local_model`, Opus and
 /// Sonnet through the signed-in router (exact model pins), decisions from the
 /// router's [`DECISIONS_MODEL`] with the hybrid default preset applied by
-/// [`compose`]. Actions are derived by the core from its embedded registry.
+/// [`compose`]. The core derives each action's controls from its embedded
+/// registry.
+///
+/// One cloud deployment and one action per [`CLOUD_MODELS`] pin, the
+/// deployment carrying the ceiling [`cloud_pins`] resolves for it.
 pub(crate) fn default_profile(
     router_url: &str,
     base_url: &str,
@@ -452,6 +533,9 @@ pub(crate) fn default_profile(
     cell: Option<&str>,
     settings: Option<&Value>,
 ) -> Result<Value, String> {
+    // Each pin's ceiling: `hybrid.cloud_output_tokens` when set, else the one
+    // declared beside the pin.
+    let cloud_pins = cloud_pins(settings)?;
     // On-device inference costs the user about nothing per token: price the
     // local model at `local_price` (default 0, every leg, USD per million
     // tokens) and leave cloud models at their market prices.
@@ -467,11 +551,11 @@ pub(crate) fn default_profile(
         crate::local_model::normalize_base_url(base_url)
     );
     let max_output = (context_window / 4).clamp(1024, MAX_OUTPUT_TOKENS);
-    let cloud = |id: &str, wire: &str| {
+    let cloud = |id: &str, wire: &str, max_output_tokens: u64| {
         json!({"id": id, "kind": "cloud", "cloud_transport": "model_pin", "url": format!("{router}/v1/messages"),
                "protocol": "anthropic.messages.v1", "wire_model": wire, "registry_model": wire,
                "registry_provider": "openrouter", "runtime_identity": "rayline-catalog-model-pin-v1",
-               "max_output_tokens": MAX_OUTPUT_TOKENS, "context_window": CLOUD_CONTEXT_WINDOW, "input_modalities": ["text"],
+               "max_output_tokens": max_output_tokens, "context_window": CLOUD_CONTEXT_WINDOW, "input_modalities": ["text"],
                "token_units": "", "auth_env": ROUTER_KEY_ENV})
     };
     let legs = json!({"input": local_price, "output": local_price, "cache_read": local_price, "cache_write": local_price});
@@ -487,29 +571,36 @@ pub(crate) fn default_profile(
     if let Some(cell) = cell {
         decisions["cell_tag"] = json!(cell);
     }
+    let mut deployments = vec![json!(
+        {"id": "local", "kind": "local", "url": local_url, "protocol": "openai.chat.v1", "wire_model": model,
+         "registry_model": LOCAL_REGISTRY_MODEL, "registry_provider": "openai",
+         "runtime_identity": format!("local_model:{model}"), "max_output_tokens": max_output,
+         "context_window": context_window, "input_modalities": ["text"], "token_units": "",
+         // This is the smallest cap, and a harness asking for more has its
+         // local turns refused: Hermes sends a fixed 128,000 on the Messages
+         // wire with no setting to lower it. The core lowers such a turn to
+         // this cap. The cloud deployments stay out, where an over-cap
+         // allowance means the number is wrong.
+         "clamp_output_allowance": true})];
+    // One deployment and one derived action per pin, from the same list: the
+    // core only checks that an action names a known deployment, so a pin with
+    // a deployment and no action would be unroutable without any error.
+    let mut derived_actions =
+        vec![json!({"model": "qwen3.8-27b", "worker": "qwen3.8-27b", "deployment_id": "local"})];
+    for (id, wire, ceiling) in &cloud_pins {
+        deployments.push(cloud(id, wire, *ceiling));
+        // The action names the model as the core's registry knows it: the pin
+        // without the provider prefix its wire ref carries.
+        let registry_model = wire.rsplit('/').next().unwrap_or(wire);
+        derived_actions.push(json!({"model": registry_model, "worker": registry_model,
+                                    "deployment_id": id, "bases": ["default"]}));
+    }
     Ok(json!({
         "contract_version": 1,
         "allow_experimental_controls": true,
         "decisions": decisions,
-        "deployments": [
-            {"id": "local", "kind": "local", "url": local_url, "protocol": "openai.chat.v1", "wire_model": model,
-             "registry_model": LOCAL_REGISTRY_MODEL, "registry_provider": "openai",
-             "runtime_identity": format!("local_model:{model}"), "max_output_tokens": max_output,
-             "context_window": context_window, "input_modalities": ["text"], "token_units": "",
-             // This is the smallest cap, and a harness asking for more has
-             // its local turns refused: Hermes sends a fixed 128,000 on the
-             // Messages wire with no setting to lower it. The core lowers
-             // such a turn to this cap. The cloud deployments stay out,
-             // where an over-cap allowance means the number is wrong.
-             "clamp_output_allowance": true},
-            cloud("cloud-opus", "anthropic/claude-opus-5.5"),
-            cloud("cloud-sonnet", "anthropic/claude-sonnet-5.5")
-        ],
-        "derived_actions": [
-            {"model": "qwen3.8-27b", "worker": "qwen3.8-27b", "deployment_id": "local"},
-            {"model": "claude-opus-5.5", "worker": "claude-opus-5.5", "deployment_id": "cloud-opus", "bases": ["default"]},
-            {"model": "claude-sonnet-5.5", "worker": "claude-sonnet-5.5", "deployment_id": "cloud-sonnet", "bases": ["default"]}
-        ]
+        "deployments": deployments,
+        "derived_actions": derived_actions
     }))
 }
 
@@ -1027,8 +1118,13 @@ mod tests {
         // Only the local cap lowers an over-cap allowance; a cloud
         // deployment asked for more than its ceiling still refuses.
         assert_eq!(local["clamp_output_allowance"], true);
-        for cloud in &config["deployments"].as_array().unwrap()[1..] {
-            assert_eq!(cloud["max_output_tokens"], 32_000);
+        // Each cloud deployment declares the ceiling it was given, its own
+        // model's, not one constant for both.
+        for (cloud, (_, _, ceiling)) in config["deployments"].as_array().unwrap()[1..]
+            .iter()
+            .zip(CLOUD_MODELS)
+        {
+            assert_eq!(cloud["max_output_tokens"], *ceiling);
             assert!(cloud.get("clamp_output_allowance").is_none());
         }
         assert_eq!(config["derived_actions"].as_array().unwrap().len(), 3);
@@ -1057,6 +1153,170 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&home);
         assert!(default_profile("https://r", "http://l", "m", 1000, None, None).is_err());
+    }
+
+    /// Each cloud deployment declares its own model's ceiling, and settings
+    /// may replace them per model. One constant for both capped every cloud
+    /// answer at the smallest arm's figure.
+    #[test]
+    fn each_cloud_deployment_declares_its_own_output_ceiling() {
+        let built = |settings: Option<&Value>| {
+            let profile = default_profile(
+                "https://r.example",
+                "http://127.0.0.1:11434/v1",
+                "q",
+                98304,
+                None,
+                settings,
+            )
+            .unwrap();
+            let ceilings: Vec<_> = profile["deployments"].as_array().unwrap()[1..]
+                .iter()
+                .map(|cloud| cloud["max_output_tokens"].as_u64().unwrap())
+                .collect();
+            (
+                ceilings,
+                profile["deployments"][0]["max_output_tokens"].clone(),
+            )
+        };
+        // Each pin's declared ceiling.
+        let declared: Vec<_> = CLOUD_MODELS.iter().map(|(_, _, c)| *c).collect();
+        let (ceilings, local) = built(None);
+        assert_eq!(ceilings, declared);
+        // The local cap keeps its own rule, a quarter of the local window.
+        assert_eq!(local, 24_576);
+        // Settings replace them per model.
+        let mut overridden = settings(None);
+        overridden["hybrid"]["cloud_output_tokens"] = json!({
+            "anthropic/claude-opus-5.5": 96_000,
+            "anthropic/claude-sonnet-5.5": 64_000
+        });
+        assert_eq!(built(Some(&overridden)).0, vec![96_000, 64_000]);
+    }
+
+    /// `hybrid.cloud_output_tokens` overrides the declared ceilings, keyed by
+    /// the pinned `wire_model`, and is refused unless it names every pinned
+    /// model with a usable figure.
+    #[test]
+    fn settings_may_declare_every_cloud_ceiling() {
+        let with = |block: Value| {
+            let mut settings = settings(None);
+            settings["hybrid"]["cloud_output_tokens"] = block;
+            settings
+        };
+        // The range's own bounds are accepted, so the error names a figure
+        // genuinely outside it.
+        let bounds = with(json!({
+            "anthropic/claude-opus-5.5": CLOUD_OUTPUT_RANGE.start(),
+            "anthropic/claude-sonnet-5.5": CLOUD_OUTPUT_RANGE.end()
+        }));
+        assert_eq!(
+            cloud_pins(Some(&bounds)).map(|pins| pins.iter().map(|(_, _, c)| *c).collect()),
+            Ok(vec![*CLOUD_OUTPUT_RANGE.start(), *CLOUD_OUTPUT_RANGE.end()])
+        );
+        let both = with(json!({
+            "anthropic/claude-opus-5.5": 96_000,
+            "anthropic/claude-sonnet-5.5": 64_000
+        }));
+        assert_eq!(
+            cloud_pins(Some(&both)).map(|pins| pins.iter().map(|(_, _, c)| *c).collect()),
+            Ok(vec![96_000, 64_000])
+        );
+        // Absent: each pin's declared ceiling.
+        let declared = CLOUD_MODELS.iter().map(|(_, _, c)| *c).collect::<Vec<_>>();
+        for absent in [Some(&settings(None)), None] {
+            assert_eq!(
+                cloud_pins(absent).map(|pins| pins.iter().map(|(_, _, c)| *c).collect::<Vec<_>>()),
+                Ok(declared.clone())
+            );
+        }
+        for refused in [
+            // One model named, so the other would have to come from elsewhere.
+            json!({"anthropic/claude-opus-5.5": 96_000}),
+            // A model this profile does not pin.
+            json!({
+                "anthropic/claude-opus-5.5": 96_000,
+                "anthropic/claude-sonnet-5.5": 64_000,
+                "anthropic/claude-haiku-5.5": 64_000
+            }),
+            // The right number of models, one of them not pinned: the count
+            // alone cannot catch this, so each pin is looked up by name.
+            json!({
+                "anthropic/claude-opus-5.5": 96_000,
+                "anthropic/claude-haiku-5.5": 64_000
+            }),
+            // Out of range, and not a whole number of tokens.
+            json!({"anthropic/claude-opus-5.5": 1024, "anthropic/claude-sonnet-5.5": 64_000}),
+            json!({"anthropic/claude-opus-5.5": 96_000, "anthropic/claude-sonnet-5.5": 0}),
+            json!({"anthropic/claude-opus-5.5": 96_000, "anthropic/claude-sonnet-5.5": "64000"}),
+            json!({"anthropic/claude-opus-5.5": 96_000, "anthropic/claude-sonnet-5.5": 1_000_001}),
+            json!([96_000, 64_000]),
+        ] {
+            assert!(
+                cloud_pins(Some(&with(refused.clone()))).is_err(),
+                "{refused} was accepted"
+            );
+        }
+    }
+
+    /// Every cloud deployment has a derived action naming it. The core only
+    /// checks that an action names a known deployment, so a pin that gained a
+    /// deployment without an action would be unroutable and silent.
+    #[test]
+    fn every_cloud_deployment_has_a_derived_action() {
+        let profile = default_profile(
+            "https://r.example",
+            "http://127.0.0.1:11434/v1",
+            "q",
+            98304,
+            None,
+            None,
+        )
+        .unwrap();
+        let routed: Vec<_> = profile["derived_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| action["deployment_id"].as_str().unwrap())
+            .collect();
+        for deployment in profile["deployments"].as_array().unwrap() {
+            let id = deployment["id"].as_str().unwrap();
+            assert!(routed.contains(&id), "{id} has no derived action");
+        }
+        // Each cloud action names the model the core's registry knows, not
+        // the wire ref's full pin. Found by deployment, not by position.
+        for (id, wire, _) in CLOUD_MODELS {
+            let action = profile["derived_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|action| action["deployment_id"] == *id)
+                .unwrap_or_else(|| panic!("{id} has no derived action"));
+            assert_eq!(action["model"], wire.rsplit('/').next().unwrap());
+            assert_eq!(action["worker"], action["model"]);
+        }
+    }
+
+    /// Every pin declares a positive ceiling within the range settings are
+    /// held to, so the built-in figures and an override are the same contract.
+    #[test]
+    fn every_pinned_model_declares_a_usable_ceiling() {
+        for (id, wire, ceiling) in CLOUD_MODELS {
+            assert!(
+                CLOUD_OUTPUT_RANGE.contains(ceiling),
+                "{id} ({wire}) declares {ceiling}, outside {CLOUD_OUTPUT_RANGE:?}"
+            );
+            assert!(
+                *ceiling <= CLOUD_CONTEXT_WINDOW,
+                "{id} ({wire}) declares an output ceiling over its context window"
+            );
+            // The action's model name is the pin's last path component, so a
+            // pin ending in `/` would name an action nothing can route to.
+            assert!(
+                !wire.rsplit('/').next().unwrap_or_default().is_empty(),
+                "{id} ({wire}) has no model name after its provider prefix"
+            );
+        }
     }
 
     /// The core advertises the smallest deployment cap, so a long local turn
@@ -1127,7 +1387,7 @@ mod tests {
                 "q",
                 16384,
                 None,
-                Some(&negative)
+                Some(&negative),
             )
             .is_err()
         );
