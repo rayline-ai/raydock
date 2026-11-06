@@ -48,9 +48,10 @@ const LOCAL_CONTEXT_WINDOW_RANGE: std::ops::RangeInclusive<u64> = 2048..=1_000_0
 /// 5.5 (pricing snapshot 2026-10-16, `context_window_tokens`).
 const CLOUD_CONTEXT_WINDOW: u64 = 1_000_000;
 /// Output ceiling of every hybrid deployment: the harness default
-/// (`harness::MAX_OUTPUT_TOKENS`), not the larger hosted ARC ceiling. The core admits the smallest deployment
-/// cap for the whole session, and a 4096 cap cut long local turns short
-/// before any edit landed (Mac hybrid test, 2026-10-27).
+/// (`harness::MAX_OUTPUT_TOKENS`), not the larger hosted ARC ceiling. The core
+/// advertises the smallest deployment cap as the session's, and enforces each
+/// cap against the deployment the turn lands on; a 4096 cap cut long local
+/// turns short before any edit landed (Mac hybrid test, 2026-10-27).
 const MAX_OUTPUT_TOKENS: u64 = crate::harness::MAX_OUTPUT_TOKENS;
 
 /// `hybrid.local_context_window` from settings, or the default.
@@ -494,7 +495,13 @@ pub(crate) fn default_profile(
             {"id": "local", "kind": "local", "url": local_url, "protocol": "openai.chat.v1", "wire_model": model,
              "registry_model": LOCAL_REGISTRY_MODEL, "registry_provider": "openai",
              "runtime_identity": format!("local_model:{model}"), "max_output_tokens": max_output,
-             "context_window": context_window, "input_modalities": ["text"], "token_units": ""},
+             "context_window": context_window, "input_modalities": ["text"], "token_units": "",
+             // This is the smallest cap, and a harness asking for more has
+             // its local turns refused: Hermes sends a fixed 128,000 on the
+             // Messages wire with no setting to lower it. The core lowers
+             // such a turn to this cap. The cloud deployments stay out,
+             // where an over-cap allowance means the number is wrong.
+             "clamp_output_allowance": true},
             cloud("cloud-opus", "anthropic/claude-opus-5.5"),
             cloud("cloud-sonnet", "anthropic/claude-sonnet-5.5")
         ],
@@ -1017,8 +1024,12 @@ mod tests {
         assert_eq!(local["wire_model"], "qwen3.8:27b");
         assert_eq!(local["context_window"], 16384);
         assert_eq!(local["max_output_tokens"], 4096);
+        // Only the local cap lowers an over-cap allowance; a cloud
+        // deployment asked for more than its ceiling still refuses.
+        assert_eq!(local["clamp_output_allowance"], true);
         for cloud in &config["deployments"].as_array().unwrap()[1..] {
             assert_eq!(cloud["max_output_tokens"], 32_000);
+            assert!(cloud.get("clamp_output_allowance").is_none());
         }
         assert_eq!(config["derived_actions"].as_array().unwrap().len(), 3);
         assert_eq!(
@@ -1048,7 +1059,7 @@ mod tests {
         assert!(default_profile("https://r", "http://l", "m", 1000, None, None).is_err());
     }
 
-    /// The core admits the smallest deployment cap, so a long local turn
+    /// The core advertises the smallest deployment cap, so a long local turn
     /// gets a quarter of the local window up to the harness default.
     #[test]
     fn default_profile_output_cap_scales_with_the_local_window() {
