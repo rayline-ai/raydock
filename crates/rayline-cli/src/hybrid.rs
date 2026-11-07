@@ -728,6 +728,21 @@ async fn health(client: &reqwest::Client, paths: &Paths, state: &Value) -> io::R
     Ok(health)
 }
 
+/// The program to launch for harness `name`. Windows process creation does
+/// not apply PATHEXT, so npm's `.cmd` launchers (codex, pi) are resolved the
+/// way a shell would; Unix keeps the bare name and its usual PATH lookup.
+fn harness_program(name: &str, path: Option<std::ffi::OsString>) -> PathBuf {
+    if cfg!(windows) {
+        let names = crate::harness::executable_names(name, true);
+        if let Some(found) = path.and_then(|path| {
+            std::env::split_paths(&path).find_map(|dir| crate::harness::find_in_dir(&dir, &names))
+        }) {
+            return found;
+        }
+    }
+    PathBuf::from(name)
+}
+
 fn harness_command(
     paths: &Paths,
     name: &str,
@@ -737,7 +752,8 @@ fn harness_command(
     capabilities: &ModelCapabilities,
 ) -> io::Result<Command> {
     require_fresh_session(name, args)?;
-    let mut command = Command::new(name);
+    let program = harness_program(name, std::env::var_os("PATH"));
+    let mut command = Command::new(&program);
     crate::codex::withhold_router_key(&mut command);
     command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
     match name {
@@ -818,12 +834,8 @@ fn harness_command(
             // exported only when a rendered config references it.
             let conversation_id =
                 crate::harness::conversation_id_for(&plan, crate::harness::new_conversation_id);
-            command = crate::harness::build_command(
-                Path::new(name),
-                &plan,
-                conversation_id.as_deref(),
-                &args,
-            );
+            command =
+                crate::harness::build_command(&program, &plan, conversation_id.as_deref(), &args);
             command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
             return Ok(command);
         }
@@ -960,6 +972,12 @@ fn spawn_supervisor(command: &mut Command) -> io::Result<Child> {
         // opens), and its own process group, so console events of the
         // launching terminal never reach it.
         let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        // CreateProcess inherits every inheritable handle, and this process's
+        // own standard handles usually are (a shell hands them down that way).
+        // rld would then hold the caller's stdout pipe open for its lifetime,
+        // so `raydock hybrid start | ...` never saw EOF. rld's own stdio is
+        // set explicitly above, so keep ours out of it while it spawns.
+        let _quiet = NonInheritableStdHandles::new();
         // Leave the terminal's job too, where the job allows it: a job that
         // kills its processes on close would otherwise take rld with it.
         match command
@@ -974,6 +992,65 @@ fn spawn_supervisor(command: &mut Command) -> io::Result<Child> {
                 command.creation_flags(flags).spawn()
             }
             Err(error) => Err(error),
+        }
+    }
+}
+
+/// Clears the inherit flag on this process's standard handles while it lives
+/// and puts the original flags back when dropped.
+#[cfg(windows)]
+struct NonInheritableStdHandles {
+    saved: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl NonInheritableStdHandles {
+    fn new() -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        };
+        let handles = [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ];
+        let mut saved: Vec<(HANDLE, u32)> = Vec::new();
+        for handle in handles {
+            let handle = handle as HANDLE;
+            if handle.is_null()
+                || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+                || saved.iter().any(|(seen, _)| *seen == handle)
+            {
+                continue;
+            }
+            let mut flags = 0u32;
+            // SAFETY: `handle` is one of this process's standard handles and
+            // `flags` is a valid out pointer.
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0
+                || flags & HANDLE_FLAG_INHERIT == 0
+            {
+                continue;
+            }
+            // SAFETY: as above; only the inherit bit changes.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                saved.push((handle, flags));
+            }
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NonInheritableStdHandles {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        for (handle, flags) in &self.saved {
+            // SAFETY: restores the inherit bit this guard cleared on a handle
+            // the process still owns.
+            unsafe {
+                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, flags & HANDLE_FLAG_INHERIT)
+            };
         }
     }
 }
@@ -1147,6 +1224,31 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harness_program_resolves_windows_launchers_only_on_windows() {
+        let dir = std::env::temp_dir().join(format!(
+            "rayline-hybrid-program-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        // npm installs an extensionless sh shim beside the `.cmd` launcher.
+        fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
+        fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        let path = Some(std::env::join_paths([&dir]).unwrap());
+        let program = harness_program("codex", path.clone());
+        if cfg!(windows) {
+            assert_eq!(program, dir.join("codex.cmd"));
+        } else {
+            assert_eq!(program, PathBuf::from("codex"));
+        }
+        assert_eq!(harness_program("pi", path), PathBuf::from("pi"));
         let _ = fs::remove_dir_all(&dir);
     }
 
