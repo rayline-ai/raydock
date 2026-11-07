@@ -68,12 +68,11 @@ const client = new Anthropic({
 const message = await client.messages.create({
   // The default local config maps this model name to your on-device endpoint.
   model: "rayline-local",
-  max_tokens: 256,
+  max_tokens: 2048,
   messages: [
     {
       role: "user",
-      content:
-        "Use the Explore subagent to count the files in the current directory and tell me how many there are.",
+      content: "In two sentences, explain what a reverse proxy does.",
     },
   ],
 });

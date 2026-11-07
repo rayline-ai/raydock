@@ -31,7 +31,7 @@ const message = await client.messages.create({
   // "arc-sage-1.0" lets ARC pick the concrete model. You can also pass
   // a concrete id such as "claude-sonnet-5".
   model: "arc-sage-1.0",
-  max_tokens: 512,
+  max_tokens: 2048,
   messages: [{ role: "user", content: "In one sentence, what is Rayline?" }],
 });
 

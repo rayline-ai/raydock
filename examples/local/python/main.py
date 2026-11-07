@@ -32,8 +32,7 @@ Run:
 
 import os
 
-import httpx
-from anthropic import Anthropic
+from anthropic import Anthropic, DefaultHttpxClient
 
 # Rayline's local transparent proxy (override port with RAYLINE_PROXY_PORT).
 PROXY = "http://127.0.0.1:20810"
@@ -48,17 +47,18 @@ BASE_URL = "https://api.anthropic.com"
 # is just a non-empty placeholder the SDK requires to construct a client.
 API_KEY = "rayline"
 
-http_client = httpx.Client(proxy=PROXY, verify=CA_CERT)
+# The SDK's own HTTP client, so this works whichever httpx package the SDK uses.
+http_client = DefaultHttpxClient(proxy=PROXY, verify=CA_CERT)
 client = Anthropic(http_client=http_client, base_url=BASE_URL, auth_token=API_KEY)
 
 message = client.messages.create(
     # The default local config maps this model name to your on-device endpoint.
     model="rayline-local",
-    max_tokens=256,
+    max_tokens=2048,
     messages=[
         {
             "role": "user",
-            "content": "Use the Explore subagent to count the files in the current directory and tell me how many there are.",
+            "content": "In two sentences, explain what a reverse proxy does.",
         },
     ],
 )

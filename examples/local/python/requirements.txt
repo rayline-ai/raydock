@@ -1,2 +1,2 @@
-# Anthropic SDK (pulls in httpx, used for the proxy + CA config).
+# Anthropic SDK (its HTTP client carries the proxy + CA config).
 anthropic>=0.40
