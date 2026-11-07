@@ -201,16 +201,20 @@ pub fn is_owner_only(path: &Path) -> io::Result<bool> {
         if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        // SAFETY: every ACE starts with an ACE_HEADER.
-        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        let ace = std::ptr::NonNull::new(ace)
+            .ok_or_else(|| io::Error::other("GetAce returned a null ACE"))?;
+        // SAFETY: GetAce succeeded, so `ace` points at an ACE inside the DACL,
+        // and every ACE starts with an ACE_HEADER.
+        let header = unsafe { ace.cast::<ACE_HEADER>().as_ptr().read_unaligned() };
         if header.AceType != ACCESS_ALLOWED_ACE_TYPE
             || u32::from(header.AceFlags) & INHERITED_ACE != 0
         {
             return Ok(false);
         }
         // SAFETY: an ACCESS_ALLOWED_ACE stores its SID from SidStart.
-        let sid =
-            unsafe { std::ptr::addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart) as PSID };
+        let sid = unsafe {
+            std::ptr::addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>().as_ptr()).SidStart) as PSID
+        };
         // SAFETY: both SIDs are valid for the duration of the call.
         if unsafe { EqualSid(sid, user.sid()) } == 0 {
             return Ok(false);
