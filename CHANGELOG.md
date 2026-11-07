@@ -3,6 +3,97 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
+## 0.4.2 (2026-11-07)
+
+### New
+
+- **Hybrid mode runs on Windows.** `raydock hybrid start`, `status`, `stop`
+  and `run` no longer refuse Windows. A second `hybrid start` waits on a real
+  start lock, the hybrid state directory and its token, ready, supervisor,
+  config and log files are readable by the current user only, and `rld` runs
+  detached, so closing the console that started it no longer stops it.
+  `hybrid stop` shuts `rld` and the execution core down gracefully and removes
+  their token and ready files; the timeout and hard-kill fallback are
+  unchanged. `hybrid run codex` and `hybrid run pi` find npm's `.cmd`
+  launchers. Windows CI now runs the hybrid lifecycle tests. macOS and Linux
+  behaviour is unchanged.
+- **`raydock router start` runs `rld` detached on Windows, as hybrid does.**
+  The router and proxy that `router start`, `raydock claude --local` and the
+  other harness launches start no longer hold the caller's standard handles
+  or live in its console, so `raydock router start | cat` and
+  `$(raydock router start)` return as soon as start finishes, and closing the
+  console that ran `router start` no longer stops `rld`. macOS and Linux
+  behaviour is unchanged.
+
+### Fixed
+
+- **`raydock hybrid run claude` works on cloud routes.** The execution core
+  (`rayline-core`) is pinned to a newer source commit whose `model_pin`
+  Messages transport forwards the `system` rows Claude Code 2.x sends inside
+  `messages` and no longer refuses a request body that merely contains the
+  string `"xhigh"`. Before, every Claude Code 2.x turn on a cloud route failed
+  with `400 model_pin Messages cannot preserve in-array system or developer
+  messages`. The root effort fields are still stripped before dispatch, and
+  in-array `developer` rows are still refused (see Known issues).
+- **Hybrid tells Claude Code the gateway's context window.** `raydock hybrid
+  run claude` now sets `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to the window the
+  gateway advertises, so Claude Code no longer assumes 200k for
+  `rayline-auto`, auto-compacts early or warns about an unrecognized model on
+  every launch. Other harnesses already got their window through their config
+  files.
+- **The local deployment lowers an over-cap output allowance.** A harness that
+  asks for more output than the local deployment's cap (a quarter of the local
+  window, 24,576 tokens at the default 96k), such as Hermes with its fixed
+  128,000, has its local turns lowered to the cap instead of refused with
+  `output allowance exceeds the admitted deployment limit`. Cloud deployments
+  still refuse an allowance over their ceiling.
+- **Streamed Responses turns on an Anthropic route record their cache-read
+  tokens.** When a Codex `/v1/responses` turn is served through an
+  `anthropic_messages` endpoint and both sides stream, the local router now
+  closes the metrics row with the cached part of the prompt as well as the
+  prompt and output counts, so `raydock top`'s cache column covers the shape an
+  interactive turn normally takes. The row also gains the prompt total the
+  cache hit rate is measured against, so that column reads as a rate rather
+  than a blank. Those counts were dropped for stream-to-stream turns only; the
+  buffered shapes and the Chat Completions and Messages paths already recorded
+  them. An upstream that reports no cache tokens still leaves the count unset
+  rather than reporting a zero. Response bodies and the `usage` the client
+  receives are unchanged.
+- **Python 3.13+ clients trust the proxy's certificates.** Proxy leaf
+  certificates now carry an Authority Key Identifier, filled from the CA's own
+  Subject Key Identifier, so it matches CAs already on disk. Python 3.13+
+  rejects a leaf without one (`CERTIFICATE_VERIFY_FAILED: Missing Authority
+  Key Identifier`), so any Python client that trusted the proxy CA failed its
+  TLS handshake.
+
+### Changed
+
+- **Responses cost details use the upstream spelling.** The execution core
+  now names the provider charge's `cost_details` halves
+  `upstream_inference_input_cost` and `upstream_inference_output_cost` on
+  Responses (Chat Completions keeps the prompt/completions spelling). Raydock
+  reads either spelling.
+
+### Docs
+
+- The routing-modes examples follow the `rayline-router` removal: configs pin
+  current model ids, the retired `Rcl` modes are documented as behaving like
+  `Rc`, and a Hybrid mode section links the setup guide.
+- The SDK examples run as shipped: `local/python` builds its client with the
+  SDK's own HTTP client, the local examples ask a question a raw API call can
+  answer, and the examples allow 2048 output tokens so reasoning models print
+  an answer.
+- The hybrid setup guide states that Qwen3.8-27B needs a machine with at
+  least 32 GB of memory, and that a runtime which reports no model name gets a
+  warning and is assumed to be Qwen3.8-27B.
+
+### Known issues
+
+- **Codex through hybrid still fails on cloud `model_pin` Messages routes.**
+  The execution core refuses the in-array `developer` messages Codex sends on
+  that transport, so `raydock hybrid run codex` turns that land on such a
+  route fail. Local turns and Claude Code are not affected.
+
 ## 0.4.1 (2026-11-05)
 
 ### Changed
@@ -100,18 +191,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   stopped early is recorded as an error, not a completion. Response bodies
   are unchanged. A Responses turn served on-device is recorded by the
   adapter, as before, and no longer also leaves a bare duplicate row.
-- **Streamed Responses turns on an Anthropic route record their cache-read
-  tokens.** When a Codex `/v1/responses` turn is served through an
-  `anthropic_messages` endpoint and both sides stream, the local router now
-  closes the metrics row with the cached part of the prompt as well as the
-  prompt and output counts, so `raydock top`'s cache column covers the shape an
-  interactive turn normally takes. The row also gains the prompt total the
-  cache hit rate is measured against, so that column reads as a rate rather
-  than a blank. Those counts were dropped for stream-to-stream turns only; the
-  buffered shapes and the Chat Completions and Messages paths already recorded
-  them. An upstream that reports no cache tokens still leaves the count unset
-  rather than reporting a zero. Response bodies and the `usage` the client
-  receives are unchanged.
 
 ## 0.3.1 (2026-11-02)
 
