@@ -392,7 +392,7 @@ while it still reads exactly as an 0.2.x release wrote it. Raydock rewrites its 
 keys in the Hermes and OpenClaw configs on every launch (as before).
 
 The local and hybrid paths (`--local`, a local-plane `--config`, account-local
-and may-local routing, `raydock hybrid run`) use the local router's virtual
+routing, `raydock hybrid run`) use the local router's virtual
 model, `rayline-auto` (`rayline-router` before 0.4.1), which tells it to apply
 its own routes. Any other model name the local router does not know, including
 `rayline-router`, also follows `routes.main`.

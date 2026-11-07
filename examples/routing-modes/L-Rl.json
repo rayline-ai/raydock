@@ -17,7 +17,7 @@
       "models": [
         "arc-sage-1.0",
         "arc-swift-1.0",
-        "deepseek/deepseek-v4-pro"
+        "deepseek/deepseek-v4-pro-0813"
       ]
     }
   ],
@@ -28,7 +28,7 @@
     },
     "subagent": {
       "endpoint": "rayline-cloud",
-      "model": "deepseek/deepseek-v4-pro",
+      "model": "deepseek/deepseek-v4-pro-0813",
       "router": "rayline-local"
     }
   }

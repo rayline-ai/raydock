@@ -7,10 +7,9 @@ Run modes individually — do **not** wrap them in one long script: local-main m
 hang, and a per-mode loop lets you recover and continue.
 
 > Honest scope: the *config-driven* routing (which endpoint each class hits, and the
-> pinned/local models) is deterministic and verifiable. The *hosted* parts — the
-> cloud router's model pick, and the may-local redirect — are **non-deterministic
-> and account-gated**, so those rows are **REVIEW** (record what happened, judge by
-> the rules below), not mechanical PASS/FAIL.
+> pinned/local models) is deterministic and verifiable. The *hosted* part — the
+> cloud router's model pick — is **non-deterministic**, so those rows are **REVIEW**
+> (record what happened, judge by the rules below), not mechanical PASS/FAIL.
 
 ---
 
@@ -24,9 +23,8 @@ hang, and a per-mode loop lets you recover and continue.
 | 3b | `RAYLINE_ROUTER_API_KEY` is an **`rlk-`** key, for the Router column | `case $RAYLINE_ROUTER_API_KEY in rlk-*) ;; *) echo wrong;; esac` | cloud subagent legs 401 (unset) or **403** (session token) — see README ⁷. `raydock auth token` returns an `rls_` session token and is **not** usable here |
 | 4 | `claude` (Claude Code) on PATH + Claude **subscription** logged in | `command -v claude` | passthrough modes (S-Rc/S-Rcl/S-Rl/S-L main) can't run |
 | 5 | ollama up with both models | `curl -s localhost:11434/api/tags` shows `qwen3.5:9b` + `qwen2.5-coder:7b` | `ollama pull qwen3.5:9b && ollama pull qwen2.5-coder:7b` |
-| 6 | local model configured + ON | `raydock local show` → "Custom endpoint … qwen2.5-coder:7b" + "account: ON" | `raydock local custom --url http://127.0.0.1:11434 --model qwen2.5-coder:7b`; the script runs `raydock local on` |
-| 7 | `python3` available | `python3 --version` | install python3 |
-| 8 | ports 20809–20813 free | script handles via killing `rld` | — |
+| 6 | `python3` available | `python3 --version` | install python3 |
+| 7 | ports 20809–20813 free | script handles via killing `rld` | — |
 
 asciinema/tmux are **not** required (the script runs the demo headless).
 
@@ -66,11 +64,11 @@ move to the next mode. Don't batch them; one at a time.
 ## 3. How to read `target` / `policy` (the signals)
 
 - `target=anthropic`, `policy=selective_main_passthrough` → **Claude subscription passthrough** (main of S-Rc/S-Rcl/S-Rl/S-L).
-- `target=local` or `policy` contains `local-adapter` / `:may-local` → **served by a local model** (the may-local redirect, or the LSR sending it local).
+- `target=anthropic`, `policy=selective_passthrough_path`, no model → **Claude Code's own startup requests** (bootstrap, MCP registry), in every proxy mode. Not model turns; ignore them.
 - `target=remote` → an upstream endpoint; use **`requested_model`** and **`selected_model`** to tell which:
   - `requested_model=arc-sage-1.0` (main) / `arc-swift-1.0` (subagents) → **cloud RCR routing on ARC**; `selected_model` is whatever the RCR reports back (non-deterministic).
   - `qwen3.5:9b` / `qwen2.5-coder:7b` → **local (ollama)** routed by the LSR.
-  - `z-ai/glm-5.2`, `deepseek/deepseek-v4-pro` → **cloud, pinned by the JSON** (LSR rewrote the model).
+  - `glm-5.3`, `deepseek/deepseek-v4-pro-0813`, `deepseek/deepseek-v4.1-flash-1017` → **cloud, pinned by the JSON** (LSR rewrote the model).
   - `claude-sonnet-5` on a **subagent** in Rc-K/Rl-K → the **anthropic API-key endpoint** (distinguish from an RCR pick by the mode's intent).
 
 ---
@@ -82,27 +80,26 @@ move to the next mode. Don't batch them; one at a time.
 
 | Mode | Expected main → | Expected subagents → | PASS when | Class |
 |---|---|---|---|---|
-| **Rc-Rc** | cloud (ARC Sage) | cloud (ARC Swift); Explore may→local (local ON) | main `target=remote` `arc-sage-1.0`; subagents remote `arc-swift-1.0`, OR Explore local (may-local) | REVIEW (cloud pick + may-local) |
+| **Rc-Rc** | cloud (ARC Sage) | cloud (ARC Swift) | main `target=remote` `arc-sage-1.0`; subagents remote `arc-swift-1.0` | REVIEW (cloud pick) |
 | **Rc-K** | cloud (ARC Sage) | anthropic (API key) | main remote; subagent `claude-sonnet-5` via anthropic | FAIL if `ANTHROPIC_API_KEY` unset |
 | **Rc-L** | cloud (ARC Sage) | **ollama** `qwen3.5:9b` | main remote; subagents `selected_model=qwen3.5:9b` | PASS (deterministic subagent) |
-| **Rcl-Rcl** § | cloud (ARC Sage) | cloud + may-local | same as Rc-Rc; behaviorally ≡ Rc-Rc (may-local account-gated) | REVIEW |
-| **Rl-Rl** | cloud **pinned `z-ai/glm-5.2`** | cloud **pinned `deepseek/deepseek-v4-pro`** | main `selected_model=z-ai/glm-5.2`; subagents `deepseek/deepseek-v4-pro` | **PASS (deterministic, exact models)** |
-| **Rl-K** | cloud **pinned `z-ai/glm-5.2`** | anthropic (API key) | main `z-ai/glm-5.2`; subagent anthropic `claude-sonnet-5` | main PASS; subagent FAIL if no key |
+| **Rcl-Rcl** § | cloud (ARC Sage) | cloud (ARC Swift) | same as Rc-Rc; no turn local | REVIEW (cloud pick) |
+| **Rl-Rl** | cloud **pinned `glm-5.3`** | cloud **pinned `deepseek/deepseek-v4-pro-0813`**; `Explore` **`deepseek/deepseek-v4.1-flash-1017`** | main `selected_model=glm-5.3`; subagents the pinned ids | **PASS (deterministic, exact models)** |
+| **Rl-K** | cloud **pinned `glm-5.3`** | anthropic (API key) | main `glm-5.3`; subagent anthropic `claude-sonnet-5` | main PASS; subagent FAIL if no key |
 | **Rc-L-per-type** | cloud (ARC Sage) | `Explore`→ollama `qwen2.5-coder:7b`, `Plan`→ollama `qwen3.5:9b`, other→cloud (ARC Swift) | Explore `qwen2.5-coder:7b`; general-purpose remote (cloud) | **PASS (deterministic per-type)** |
 | **S-Rc** | **subscription** (passthrough) | cloud (ARC Swift) | main `target=anthropic`/`selective_main_passthrough`; subagents remote `arc-swift-1.0` | REVIEW (cloud pick) |
-| **S-Rcl** § | subscription | cloud (ARC Swift) + may-local | main passthrough; subagents remote `arc-swift-1.0` or Explore→local | REVIEW |
+| **S-Rcl** § | subscription | cloud (ARC Swift) | same as S-Rc; no turn local | REVIEW (cloud pick) |
 | **S-L** | subscription | **ollama** `qwen…` | main passthrough; subagents `qwen*` (local) | **PASS** (passthrough + local) |
 | **L-Rc** ‡ | **ollama** `qwen3.5:9b` | cloud (ARC Swift) | main `selected_model=qwen3.5:9b`; subagents remote | REVIEW (local main; pin the window first) |
-| **L-Rl** ‡ | ollama `qwen3.5:9b` | cloud pinned `deepseek/deepseek-v4-pro` | main `qwen3.5:9b`; subagents `deepseek/deepseek-v4-pro` | REVIEW (local main; the pin can 403) |
+| **L-Rl** ‡ | ollama `qwen3.5:9b` | cloud pinned `deepseek/deepseek-v4-pro-0813` | main `qwen3.5:9b`; subagents `deepseek/deepseek-v4-pro-0813` | REVIEW (local main; the pin can 403) |
 | **L-K** ‡ | ollama `qwen3.5:9b` | anthropic (API key) | main `qwen3.5:9b`; subagents `claude-sonnet-5` | REVIEW (local main + needs key) |
 | **L-L** ‡ | ollama `qwen3.5:9b` | **ollama** | main `qwen3.5:9b`; subagents `qwen3.5:9b` | REVIEW (local main) |
-| **Rl-L** | cloud **pinned `z-ai/glm-5.2`** | **ollama** `qwen2.5-coder:7b` | main `z-ai/glm-5.2`; subagents `qwen2.5-coder:7b` | **PASS (deterministic)** |
-| **S-Rl** | subscription | cloud **pinned `deepseek/deepseek-v4-pro`** | main passthrough; subagents `deepseek/deepseek-v4-pro` | **PASS (deterministic subagent)** |
+| **Rl-L** | cloud **pinned `glm-5.3`** | **ollama** `qwen2.5-coder:7b` | main `glm-5.3`; subagents `qwen2.5-coder:7b` | **PASS (deterministic)** |
+| **S-Rl** | subscription | cloud **pinned `deepseek/deepseek-v4-pro-0813`** | main passthrough; subagents `deepseek/deepseek-v4-pro-0813` | **PASS (deterministic subagent)** |
 
-**§ may-local (Rcl-Rcl/S-Rcl):** the redirect is the hosted RCR's **account-gated**
-decision; with local ON it usually sends `Explore` to local, but it's discretionary.
-Because the implicit account-local path also advertises, Rc-Rc/S-Rc behave the same —
-so Rcl-Rcl/S-Rcl are **not** distinguishable from Rc-Rc/S-Rc by routing alone. Mark REVIEW.
+**§ `Rcl` retired (Rcl-Rcl/S-Rcl):** the hosted router no longer redirects a turn to a
+local model, so these behave exactly like Rc-Rc/S-Rc. A subagent served by a local
+model here is a **FAIL**. See the README's §.
 
 **‡ local-main (L-Rc/L-Rl/L-K/L-L):** the main runs on a small local model. **Pin its
 context window first** — ollama's VRAM-derived default (often 4096; check `ollama ps`,
@@ -129,9 +126,9 @@ returns 403 from the model data plane. See README ⁷.
 
 | Mode | Why |
 |---|---|
-| **Rcl-K** | `--local-model=on` is on the **main** (agent) class; the main never goes local (may-local is subagents-only) → the `Rcl` engine is **inert**; ≡ Rc-K. |
-| **Rcl-L** | same as Rcl-K on the main class → inert; ≡ Rc-L. |
-| **L-Rcl** | subagent may-local would need the LSR to defer to the RCR (advertise + follow the 307); not implemented. The naive on-device shortcut collapsed to L-L and was reverted. |
+| **Rcl-K** | never shipped: `Rcl` is retired (README §); use Rc-K. |
+| **Rcl-L** | never shipped: `Rcl` is retired (README §); use Rc-L. |
+| **L-Rcl** | never shipped: `Rcl` is retired (README §); use L-Rc. |
 
 ---
 
@@ -142,7 +139,7 @@ For each of the 16 supported modes, output one line:
 `MODE — <PASS|REVIEW|FAIL> — main: <target/model>, subagents: <observed> — <note>`
 
 - **PASS**: deterministic expectation met (Rl-Rl, Rl-L, S-Rl, Rc-L, Rc-L-per-type, S-L).
-- **REVIEW**: hosted/non-deterministic (cloud pick, may-local) or local-main — state what was observed and whether it's consistent with the expected intent.
+- **REVIEW**: hosted/non-deterministic (cloud pick) or local-main — state what was observed and whether it's consistent with the expected intent.
 - **FAIL**: a deterministic expectation was wrong, OR an env prereq blocked it (say which, e.g. "no ANTHROPIC_API_KEY").
 
 Then list Rcl-K/Rcl-L/L-Rcl as **NOT SUPPORTED**. Finish with a one-line summary

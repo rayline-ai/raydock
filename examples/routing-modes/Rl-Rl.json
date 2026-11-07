@@ -9,27 +9,27 @@
       "models": [
         "arc-sage-1.0",
         "arc-swift-1.0",
-        "z-ai/glm-5.2",
-        "deepseek/deepseek-v4-pro",
-        "deepseek/deepseek-v4-flash"
+        "glm-5.3",
+        "deepseek/deepseek-v4-pro-0813",
+        "deepseek/deepseek-v4.1-flash-1017"
       ]
     }
   ],
   "routes": {
     "main": {
       "endpoint": "rayline-cloud",
-      "model": "z-ai/glm-5.2",
+      "model": "glm-5.3",
       "router": "rayline-local"
     },
     "subagent": {
       "endpoint": "rayline-cloud",
-      "model": "deepseek/deepseek-v4-pro",
+      "model": "deepseek/deepseek-v4-pro-0813",
       "router": "rayline-local"
     },
     "subagents": {
       "Explore": {
         "endpoint": "rayline-cloud",
-        "model": "deepseek/deepseek-v4-flash",
+        "model": "deepseek/deepseek-v4.1-flash-1017",
         "router": "rayline-local"
       }
     }

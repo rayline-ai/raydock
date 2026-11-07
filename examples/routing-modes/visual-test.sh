@@ -11,10 +11,10 @@
 #
 # Usage:
 #   ./visual-test.sh [MODE] [PROMPT]
-#     MODE    one of the configs in this dir (default: Rc-Rc), e.g. Rc-Rc Rc-L S-Rcl Rl-Rl L-L S-L ...
+#     MODE    one of the configs in this dir (default: Rc-Rc), e.g. Rc-Rc Rc-L S-Rc Rl-Rl L-L S-L ...
 #     PROMPT  the prompt sent to the client; overrides the default. The Claude
-#             default spawns subagents so subagent routing — may-local
-#             (Rcl-Rcl/S-Rcl) and per-class LSR routing (Rl-Rl) — is actually visible.
+#             default spawns subagents so subagent routing, including per-class
+#             LSR routing (Rl-Rl), is actually visible.
 #             (A plain "say pong" never spawns a subagent.) Codex has no `Task`
 #             subagents, so its default is a plain prompt (only `routes.main` runs).
 #
@@ -60,7 +60,7 @@ else
 fi
 
 # Codex auth: `auto` derives from the mode's main provider (the mode name's first
-# letter — A = your subscription, so ChatGPT for Codex → `--auth subscription`).
+# letter — S = your subscription, so ChatGPT for Codex → `--auth subscription`).
 CODEX_SUBSCRIPTION=""   # non-empty => pass `--auth subscription`
 if [ "$CLIENT" = codex ]; then
   case "${CODEX_AUTH:-auto}" in

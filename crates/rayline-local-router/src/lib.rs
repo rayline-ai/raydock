@@ -7694,17 +7694,20 @@ mod tests {
         // three routing slots — main, default subagent, and a per-type override —
         // each a distinct model, proving the LSR (not the RCR) is choosing.
         let st = load_state(include_str!("../../../examples/routing-modes/Rl-Rl.json"));
-        assert_eq!(
-            main_route(&st),
-            (ep("rayline-cloud"), "z-ai/glm-5.2".to_owned())
-        );
+        assert_eq!(main_route(&st), (ep("rayline-cloud"), "glm-5.3".to_owned()));
         assert_eq!(
             sub_route(&st, "reviewer"),
-            (ep("rayline-cloud"), "deepseek/deepseek-v4-pro".to_owned())
+            (
+                ep("rayline-cloud"),
+                "deepseek/deepseek-v4-pro-0813".to_owned()
+            )
         );
         assert_eq!(
             sub_route(&st, "Explore"),
-            (ep("rayline-cloud"), "deepseek/deepseek-v4-flash".to_owned())
+            (
+                ep("rayline-cloud"),
+                "deepseek/deepseek-v4.1-flash-1017".to_owned()
+            )
         );
 
         // Rcl-Rcl: `router`/`local_models` are may-local advertisement metadata; they do
@@ -7779,8 +7782,13 @@ mod tests {
         // router: rayline-local on the rayline class (Rl-K/Rl-L/S-Rl/L-Rl) — the LSR
         // routes that class to rayline-cloud and pins its model; the other class is
         // anthropic (API key) / ollama / subscription, per the JSON.
-        let glm = || (ep("rayline-cloud"), "z-ai/glm-5.2".to_owned());
-        let ds_pro = || (ep("rayline-cloud"), "deepseek/deepseek-v4-pro".to_owned());
+        let glm = || (ep("rayline-cloud"), "glm-5.3".to_owned());
+        let ds_pro = || {
+            (
+                ep("rayline-cloud"),
+                "deepseek/deepseek-v4-pro-0813".to_owned(),
+            )
+        };
         let st = load_state(include_str!("../../../examples/routing-modes/Rl-K.json"));
         assert_eq!(main_route(&st), glm());
         assert_eq!(sub_route(&st, "reviewer"), anthropic());
