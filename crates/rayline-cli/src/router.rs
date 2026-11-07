@@ -2483,18 +2483,9 @@ fn spawn_router(
         .stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file));
 
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let child = command.spawn()?;
+    // Away from the launching terminal, and on Windows without the caller's
+    // standard handles: `raydock router start | ...` must see EOF.
+    let child = crate::detach::spawn_detached(&mut command)?;
     let pid = child.id() as i32;
     write_pid_meta_atomic(&paths.pid_file, &paths.meta_file, pid, &requested_meta)?;
 
@@ -2624,18 +2615,9 @@ fn spawn_proxy(
         .stdout(Stdio::from(log_file.try_clone()?))
         .stderr(Stdio::from(log_file));
 
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-
-    let child = command.spawn()?;
+    // Away from the launching terminal, and on Windows without the caller's
+    // standard handles: `raydock router start | ...` must see EOF.
+    let child = crate::detach::spawn_detached(&mut command)?;
     let pid = child.id() as i32;
     write_pid_meta_atomic(
         &paths.proxy_pid_file,
