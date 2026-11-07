@@ -9,7 +9,7 @@
       "models": [
         "arc-sage-1.0",
         "arc-swift-1.0",
-        "z-ai/glm-5.2"
+        "glm-5.3"
       ]
     },
     {
@@ -26,7 +26,7 @@
   "routes": {
     "main": {
       "endpoint": "rayline-cloud",
-      "model": "z-ai/glm-5.2",
+      "model": "glm-5.3",
       "router": "rayline-local"
     },
     "subagent": {
