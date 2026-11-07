@@ -75,10 +75,22 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     `arc-swift-1.0` and no V: Swift decides at its own fixed V and picks
     cheap, so it uses the local model most.
   - `local_model` is the local Chat deployment (`registry_model`
-    `qwen/qwen3.8-27b`). Its context window is `--local-context-window`, else
-    settings `hybrid.local_context_window`, else 98304 tokens; a llama.cpp
-    runtime loaded with a smaller window (`/props`) lowers it.
-  - The local model must be Qwen3.8-27B (Hugging Face `Qwen/Qwen3.8-27B`,
+    `qwen/qwen3.8-27b`, or settings `hybrid.local_registry_model`). Its
+    context window is `--local-context-window`, else settings
+    `hybrid.local_context_window`, else 98304 tokens. A runtime loaded with a
+    smaller window lowers it: llama.cpp's `/props` `n_ctx`, else the served
+    model's `max_model_len` or `context_length` from `/v1/models` (vLLM,
+    TensorFold; the entry whose `id` is the configured model, or the only
+    entry). A larger loaded window never raises it.
+  - `hybrid.local_registry_model` declares another local model by its
+    registry id (`provider/model`, such as `z-ai/glm-5.3-flash`). It sets the
+    deployment's `registry_model`, the local derived action (`glm-5.3-flash`)
+    and the caller price key. Raydock checks only the id's shape; the core
+    refuses a model its embedded registry does not know at startup, and
+    `start`'s error then names the setting. A declared model skips the
+    Qwen3.8-27B identity check below, and `start` prints the declared model.
+    `start --config` refuses the setting.
+  - Without that setting the local model must be Qwen3.8-27B (Hugging Face `Qwen/Qwen3.8-27B`,
     Ollama `qwen3.8:27b`): its capacity count uses that model's tokenizer and
     chat template. `start` reads what the runtime has loaded: llama.cpp's
     `/props` `model_path` (the same request that reads its window; the file
@@ -104,6 +116,12 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     for every cloud window is refused by the cloud provider ("prompt is too
     long"), which the harness's compaction recognises. An older core leaves
     local capacity unknown, and only a llama.cpp context refusal re-consults.
+    The core counts Qwen3.8-27B with its embedded tokenizer
+    (`local_measured`); a core with `caller_bounded` support (not yet
+    released) labels any other local model's byte bound `caller_bounded`,
+    which ARC admits as a fit. `prefer_local` works
+    with this profile on such a core; an older core makes ARC exclude a
+    non-Qwen local target (`capacity_unknown_local`).
 - **`--config`:** names a qualified profile instead.
 
 - **Hybrid routing works with no overrides.** For the default profile, a
@@ -122,6 +140,9 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   `policy: "utility"` is the hybrid default preset; `"prefer_local"` selects
   `arc-policy.prefer-local.v1` (local when Stage 1 predicts it passes, else
   utility), whose threshold `min_p_pass` (in (0, 1)) may be set beside it.
+  `start` accepts `prefer_local` when the session has a local deployment:
+  one with a llama.cpp prompt counter, or one the core sizes itself (the
+  default profile). It refuses it when local routing is off.
   `schedule` becomes
   `routing.policy.overrides.schedule`; each dimension (`model`, `thinking`)
   lists switch-point classes from `cache_boundaries`, `user_messages` and
