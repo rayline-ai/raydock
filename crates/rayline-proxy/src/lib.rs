@@ -2671,7 +2671,8 @@ impl LocalCa {
         })
     }
 
-    fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {
+    /// A leaf certificate for `host` signed by this CA, as (cert PEM, key PEM).
+    fn leaf_pem_for_host(&self, host: &str) -> Result<(String, String)> {
         let ca_key_pair = rcgen::KeyPair::from_pem(&self.key_pem).context("parse CA key")?;
         let ca = rcgen::Issuer::from_ca_cert_pem(&self.cert_pem, ca_key_pair)
             .context("parse local CA certificate")?;
@@ -2683,10 +2684,17 @@ impl LocalCa {
         leaf_params.distinguished_name = dn;
         leaf_params.is_ca = IsCa::NoCa;
         leaf_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        // Strict verifiers (Python 3.13+'s default context sets
+        // VERIFY_X509_STRICT) reject a leaf without an Authority Key Identifier.
+        // rcgen fills it from the CA's own Subject Key Identifier.
+        leaf_params.use_authority_key_identifier_extension = true;
         let leaf_key_pair = KeyPair::generate()?;
         let leaf = leaf_params.signed_by(&leaf_key_pair, &ca)?;
-        let leaf_pem = leaf.pem();
-        let leaf_key_pem = leaf_key_pair.serialize_pem();
+        Ok((leaf.pem(), leaf_key_pair.serialize_pem()))
+    }
+
+    fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>> {
+        let (leaf_pem, leaf_key_pem) = self.leaf_pem_for_host(host)?;
 
         let cert_chain = certs_from_pem(&leaf_pem)?
             .into_iter()
@@ -3802,6 +3810,33 @@ mod tests {
         let ca = LocalCa::generate().unwrap();
         let config = ca.server_config_for_host(ANTHROPIC_HOST).unwrap();
         drop(config);
+    }
+
+    #[test]
+    fn leaf_certificate_names_the_ca_key_as_its_authority_key() {
+        use x509_parser::extensions::ParsedExtension;
+        fn key_ids(pem: &str) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+            let der = certs_from_pem(pem).unwrap().remove(0);
+            let (_, cert) = x509_parser::parse_x509_certificate(&der).unwrap();
+            let (mut ski, mut aki) = (None, None);
+            for ext in cert.extensions() {
+                match ext.parsed_extension() {
+                    ParsedExtension::SubjectKeyIdentifier(id) => ski = Some(id.0.to_vec()),
+                    ParsedExtension::AuthorityKeyIdentifier(id) => {
+                        aki = id.key_identifier.as_ref().map(|id| id.0.to_vec());
+                    }
+                    _ => {}
+                }
+            }
+            (ski, aki)
+        }
+
+        let ca = LocalCa::generate().unwrap();
+        let (leaf_pem, _) = ca.leaf_pem_for_host(ANTHROPIC_HOST).unwrap();
+        let (ca_ski, _) = key_ids(&ca.cert_pem);
+        let (_, leaf_aki) = key_ids(&leaf_pem);
+        assert!(ca_ski.is_some());
+        assert_eq!(leaf_aki, ca_ski);
     }
 
     #[test]
