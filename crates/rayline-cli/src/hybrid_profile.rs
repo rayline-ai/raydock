@@ -802,10 +802,12 @@ fn served_window(models: &Value, model: &str) -> Option<u64> {
             [only] => Some(only),
             _ => None,
         })?;
-    ["max_model_len", "context_length"]
-        .iter()
-        .find_map(|key| entry.get(*key).and_then(Value::as_u64))
-        .filter(|window| *window > 0)
+    ["max_model_len", "context_length"].iter().find_map(|key| {
+        entry
+            .get(*key)
+            .and_then(Value::as_u64)
+            .filter(|window| *window > 0)
+    })
 }
 
 /// A reported name, lower case, letters and digits only.
@@ -2093,6 +2095,8 @@ mod tests {
         assert_eq!(served_window(&vllm, "c"), None);
         let context_only = json!({"data": [{"id": "m", "context_length": 8192}]});
         assert_eq!(served_window(&context_only, "m"), Some(8192));
+        let zero_max = json!({"data": [{"id": "m", "max_model_len": 0, "context_length": 8192}]});
+        assert_eq!(served_window(&zero_max, "m"), Some(8192));
         for unknown in [
             json!({"data": [{"id": "m"}]}),
             json!({"data": [{"id": "m", "max_model_len": 0}]}),
