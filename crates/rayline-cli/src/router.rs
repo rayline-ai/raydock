@@ -5452,10 +5452,8 @@ pub(crate) fn force_stop_process_group(pid: i32) -> io::Result<()> {
 /// available.  The lock is automatically released when the returned `File`
 /// is dropped (i.e. when the guard goes out of scope or the process dies).
 ///
-/// On non-unix platforms the lock is a no-op: the function opens the file and
-/// returns it as a guard so call-sites compile unmodified, but no exclusion is
-/// enforced.  macOS and Linux are the supported targets; Windows support is a
-/// known gap documented in the crate README.
+/// Unix uses `flock`; Windows uses `LockFileEx`, which blocks the same way and
+/// is released when the handle closes.
 #[cfg(unix)]
 pub(crate) fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
     use std::os::unix::io::AsRawFd;
@@ -5471,15 +5469,34 @@ pub(crate) fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File>
     Ok(file)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 pub(crate) fn acquire_router_lock(lock_path: &Path) -> io::Result<std::fs::File> {
-    // Non-unix stub: open the file so the guard type is consistent.
-    // No actual locking — Windows is a known gap.
-    std::fs::OpenOptions::new()
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(lock_path)
+        .open(lock_path)?;
+    // Lock the whole range; nothing reads or writes the lock file's bytes.
+    // SAFETY: a valid file handle and a zeroed OVERLAPPED (offset 0), used
+    // synchronously because the file was not opened for overlapped I/O.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
 }
 
 /// Write `pid` and `meta` to their respective paths atomically via

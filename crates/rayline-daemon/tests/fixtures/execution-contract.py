@@ -19,6 +19,8 @@ token = os.environ["RAYLINE_EXEC_AUTH_TOKEN"]
 credential_env = [entry["auth_env"] for entry in
                   [config.get("decisions", {})] + config.get("deployments", []) if entry.get("auth_env")]
 pathlib.Path(args.config).with_suffix(".pid").write_text(str(os.getpid()))
+# Windows runs this script through a .cmd launcher, the process rld spawned.
+core_pid = os.getppid() if config.get("launcher") else os.getpid()
 
 
 def parent_watchdog():
@@ -81,7 +83,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.path == "/unready":
             Handler.ready = False
         if self.path == "/pending":
-            if not self.rfile.read(1):
+            try:
+                more = self.rfile.read(1)
+            except (ConnectionResetError, ConnectionAbortedError):
+                more = b""
+            if not more:
                 pathlib.Path(config["cancelled"] + "-pending").write_text("cancelled before headers")
             return
         if self.path == "/stream":
@@ -93,7 +99,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.wfile.write(b"data: " + b"x" * 8192 + b"\n\n")
                     self.wfile.flush()
                     time.sleep(0.01)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pathlib.Path(config["cancelled"]).write_text("upstream observed disconnect")
             return
         self.send_response(200)
@@ -114,5 +120,5 @@ server = Server(("127.0.0.1", 0), Handler)
 time.sleep(config.get("handshake_delay", 0))
 print(json.dumps({"contract_version": config.get("contract_version", 1),
                   "listen_url": "http://127.0.0.1:" + str(server.server_port),
-                  "pid": os.getpid()}), flush=True)
+                  "pid": core_pid}), flush=True)
 server.serve_forever()

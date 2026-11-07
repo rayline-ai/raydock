@@ -1,8 +1,6 @@
-#![cfg(unix)]
 //! Real supervisor + subprocess + HTTP connections, with an external core contract fixture.
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,12 +13,99 @@ struct Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = Command::new("kill")
-                .args(["-TERM", &self.child.id().to_string()])
-                .status();
+            let _ = request_stop(&self.child);
         }
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Ask rld to stop the way its launcher does: SIGTERM, or the Windows stop event.
+fn request_stop(child: &Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let status = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other("kill -TERM failed"));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        rayline_local_router::windows_state::request_stop(child.id())
+    }
+}
+
+/// Install the fixture as an executable core. Windows cannot run the script
+/// itself, so a .cmd launcher runs it with the Python on PATH.
+fn install_core(dir: &Path) -> PathBuf {
+    let source = include_str!("fixtures/execution-contract.py");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("core");
+        fs::write(&script, source).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        script
+    }
+    #[cfg(windows)]
+    {
+        static PYTHON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let python = PYTHON.get_or_init(|| {
+            let output = Command::new("python")
+                .args(["-c", "import sys; print(sys.executable)"])
+                .output()
+                .expect("the hybrid fixture needs Python on PATH");
+            assert!(output.status.success(), "python on PATH does not run");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        });
+        fs::write(dir.join("core.py"), source).unwrap();
+        let launcher = dir.join("core.cmd");
+        fs::write(
+            &launcher,
+            format!(
+                "@\"{python}\" \"%~dp0core.py\" %*
+"
+            ),
+        )
+        .unwrap();
+        launcher
+    }
+}
+
+/// Whether only the current user can open `path`.
+fn owner_only(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777 == 0o600
+    }
+    #[cfg(windows)]
+    {
+        rayline_local_router::windows_state::is_owner_only(path).unwrap()
+    }
+}
+
+/// Whether `pid` still runs (a zombie has exited).
+fn process_running(pid: &str) -> bool {
+    #[cfg(unix)]
+    {
+        let status = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        status.status.success() && !String::from_utf8_lossy(&status.stdout).contains('Z')
+    }
+    #[cfg(windows)]
+    {
+        let output = Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "tasklist failed");
+        String::from_utf8_lossy(&output.stdout).contains(&format!("\"{pid}\""))
     }
 }
 impl Runtime {
@@ -59,12 +144,11 @@ impl Runtime {
             rand::random::<u64>()
         ));
         fs::create_dir(&dir).unwrap();
-        let script = dir.join("core");
-        fs::write(&script, include_str!("fixtures/execution-contract.py")).unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let script = install_core(&dir);
         let mut config = json!({"events":dir.join("events.jsonl"),
             "cancelled":dir.join("cancelled"), "contract_version":version,
-            "handshake_delay":delay, "decisions": {"url": decisions_url}});
+            "handshake_delay":delay, "decisions": {"url": decisions_url},
+            "launcher": cfg!(windows)});
         if let Some(capabilities) = capabilities {
             config["capabilities"] = capabilities;
         }
@@ -106,14 +190,8 @@ impl Runtime {
             if let Ok(bytes) = fs::read(self.dir.join("ready.json")) {
                 let ready: Value = serde_json::from_slice(&bytes).unwrap();
                 let token = fs::read_to_string(self.dir.join("token")).unwrap();
-                assert_eq!(
-                    fs::metadata(self.dir.join("token"))
-                        .unwrap()
-                        .permissions()
-                        .mode()
-                        & 0o777,
-                    0o600
-                );
+                assert!(owner_only(&self.dir.join("token")));
+                assert!(owner_only(&self.dir.join("ready.json")));
                 return (ready["listen_url"].as_str().unwrap().to_owned(), token);
             }
             assert!(Instant::now() < deadline, "startup timed out");
@@ -135,11 +213,7 @@ impl Runtime {
         let pid = fs::read_to_string(self.dir.join("config.pid")).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let status = Command::new("ps")
-                .args(["-o", "stat=", "-p", &pid])
-                .output()
-                .unwrap();
-            if !status.status.success() || String::from_utf8_lossy(&status.stdout).contains('Z') {
+            if !process_running(pid.trim()) {
                 return;
             }
             assert!(
@@ -313,13 +387,7 @@ async fn shutdown_during_startup_reaps_owned_core() {
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    assert!(
-        Command::new("kill")
-            .args(["-TERM", &runtime.child.id().to_string()])
-            .status()
-            .unwrap()
-            .success()
-    );
+    request_stop(&runtime.child).unwrap();
     assert!(runtime.exited().await.success());
     runtime.core_exited().await;
     assert!(!runtime.dir.join("ready.json").exists());

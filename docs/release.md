@@ -153,9 +153,10 @@ self-update verifies the binaries and license before installing them.
 The historical Mac asset IDs remain stable for existing self-updaters. The Go
 core and hybrid execution require macOS 13+, despite those historical names;
 existing Rust deployment targets are unchanged. Linux hybrid is supported.
-Windows core cross-compiles, but Windows hybrid lifecycle is not qualified and
-the CLI refuses hybrid commands there. A successful cross-build is not runtime
-acceptance. Production Homebrew publishing uses the template and flat archives from
+Windows hybrid is supported; Windows CI runs the hybrid supervisor integration
+tests (`cargo test -p rayline-daemon --test it_hybrid`) alongside the lock and
+owner-only ACL unit tests. A successful cross-build of the core is still not
+runtime acceptance on its own. Production Homebrew publishing uses the template and flat archives from
 `atlasfutures/memex-desktop`. `packaging/homebrew/raydock.rb.template` applies
 only to this repo's manual fallback archives; see the packaging README for the
 different layouts.

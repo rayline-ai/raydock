@@ -150,6 +150,15 @@ jobs:
         shell: bash
         run: cargo test -p rayline-cli --locked --lib update::tests::windows_ -- --test-threads=1
 
+      - name: Test Windows hybrid lifecycle
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p rayline-local-router --locked --lib windows_state -- --test-threads=1
+          cargo test -p rayline-cli --locked --lib hybrid -- --test-threads=1
+          cargo test -p rayline-daemon --locked --test it_hybrid -- --test-threads=1
+
       - name: Parse Windows installer
         if: runner.os == 'Windows'
         shell: pwsh

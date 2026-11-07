@@ -131,10 +131,12 @@ pub async fn run(args: Args) -> Result<()> {
         .context("start ARC execution core")?;
     // Keep the pipe open even while Child::wait closes its own stdin handle.
     // The core exits on EOF if rld is terminated without running cleanup.
-    let _parent_pipe = child
-        .stdin
-        .take()
-        .context("execution core parent pipe unavailable")?;
+    let mut parent_pipe = Some(
+        child
+            .stdin
+            .take()
+            .context("execution core parent pipe unavailable")?,
+    );
     let outcome = async {
         let handshake = tokio::select! {
             result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
@@ -195,7 +197,7 @@ pub async fn run(args: Args) -> Result<()> {
     }
     .await;
     // Dropping serve aborts connection tasks before the core is stopped.
-    stop_child(&mut child)
+    stop_child(&mut child, &mut parent_pipe)
         .await
         .context("stop execution core")?;
     drop(cleanup);
@@ -658,6 +660,9 @@ fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
         .open(&pending)
         .with_context(|| format!("create {}", path.display()))?;
     let outcome = (|| {
+        // Owner-only before any content is written; the hard link shares it.
+        #[cfg(windows)]
+        rayline_local_router::windows_state::restrict_to_owner(&pending, false)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         std::fs::hard_link(&pending, path)?;
@@ -691,16 +696,39 @@ fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
             Ok(())
         })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        Ok(async {
-            tokio::signal::ctrl_c().await?;
+        use tokio::signal::windows::{ctrl_break, ctrl_c, ctrl_close, ctrl_shutdown};
+        let mut interrupt = ctrl_c()?;
+        let mut brk = ctrl_break()?;
+        let mut close = ctrl_close()?;
+        let mut shutdown = ctrl_shutdown()?;
+        // `raydock hybrid` runs rld without a console it can signal, so it
+        // asks for a stop through this event instead.
+        let event = rayline_local_router::windows_state::StopEvent::create()
+            .context("create hybrid stop event")?;
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        // A plain thread: a blocking-pool task would hold up runtime shutdown.
+        std::thread::spawn(move || {
+            let _ = stop_tx.send(event.wait());
+        });
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = brk.recv() => {},
+                _ = close.recv() => {},
+                _ = shutdown.recv() => {},
+                result = stop_rx => { result.context("hybrid stop event")??; },
+            };
             Ok(())
         })
     }
 }
 
-async fn stop_child(child: &mut Child) -> Result<()> {
+async fn stop_child(
+    child: &mut Child,
+    parent_pipe: &mut Option<tokio::process::ChildStdin>,
+) -> Result<()> {
     if child.try_wait()?.is_some() {
         return Ok(());
     }
@@ -717,10 +745,12 @@ async fn stop_child(child: &mut Child) -> Result<()> {
             }
         }
     }
-    #[cfg(not(unix))]
-    {
-        child.start_kill()?;
-    }
+    // Windows has no SIGTERM: closing the parent pipe is the core's request
+    // to exit. It is killed only if it does not exit in time.
+    #[cfg(windows)]
+    drop(parent_pipe.take());
+    #[cfg(not(windows))]
+    let _ = parent_pipe;
     match tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await {
         Ok(result) => {
             result?;
