@@ -14,6 +14,10 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
   includes `raydock`, `rld` and `rayline-core`.
 - A local inference server with your Qwen model: llama.cpp, Ollama or MLX.
   Rayline does not start, download or stop it.
+- Memory for Qwen3.8-27B: plan for at least 32 GB (unified memory on a Mac).
+  At 4-bit the weights alone are about 17 GB (Ollama `qwen3.8:27b`), before
+  the cache for the 98,304-token default window, so a 16 GB machine cannot
+  run it.
 - Nothing else. A profile file is optional (see [Advanced: a profile file](#advanced-a-profile-file)).
 
 ## What it costs
@@ -45,8 +49,11 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
 
    This is the local endpoint hybrid routing uses. It must serve Qwen3.8-27B
    (Hugging Face `Qwen/Qwen3.8-27B`; Ollama `qwen3.8:27b`), ARC's local model.
-   `raydock hybrid start` checks the loaded model on llama.cpp and Ollama, and
-   runs the session cloud only if it is another model.
+   `raydock hybrid start` reads the loaded model's name from llama.cpp and
+   Ollama, and runs the session cloud only if it names another model. If the
+   runtime reports no name, `start` warns that it cannot read the model and
+   assumes Qwen3.8-27B. That includes Ollama models whose file carries no
+   name metadata, so check the model yourself when you see that warning.
 
 3. **Start and connect a harness.**
 

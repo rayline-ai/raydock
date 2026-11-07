@@ -344,8 +344,11 @@ raydock hybrid stop
 ```
 
 It needs macOS 13 or later or Linux, a release that includes `rayline-core`, and a
-local server running Qwen3.8-27B (`Qwen/Qwen3.8-27B`, or `qwen3.8:27b` on Ollama). With
-any other loaded model the session runs cloud only. Every turn bills one ARC decision,
+local server running Qwen3.8-27B (`Qwen/Qwen3.8-27B`, or `qwen3.8:27b` on Ollama). Plan
+for at least 32 GB of memory: at 4-bit the weights alone are about 17 GB, before the
+cache for the 98,304-token window, so a 16 GB machine cannot run it. If the runtime
+reports another model, the session runs cloud only. If it reports no model name, `start`
+warns and assumes Qwen3.8-27B. Every turn bills one ARC decision,
 including turns that run on your machine, and a cloud turn also bills the provider's
 pass-through price.
 
