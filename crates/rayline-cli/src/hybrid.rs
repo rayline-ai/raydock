@@ -344,7 +344,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             for (name, key) in &credentials {
                 command.env(name, key);
             }
-            let mut child = spawn_supervisor(&mut command)?;
+            let mut child = crate::detach::spawn_detached(&mut command)?;
             let startup = async {
                 write_private_json(&paths.supervisor(), &json!({"pid":child.id()}), false)?;
                 let started = Instant::now();
@@ -943,116 +943,6 @@ async fn stop_spawned(child: &mut Child) -> io::Result<()> {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok(())
-}
-
-/// Start `rld` in its own session, away from the launching terminal: closing
-/// that terminal or pressing Ctrl-C in it must not stop the runtime.
-fn spawn_supervisor(command: &mut Command) -> io::Result<Child> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid is async-signal-safe and touches no Rust state.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
-        command.spawn()
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        use windows_sys::Win32::System::Threading::{
-            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
-        };
-        // A hidden console of its own (the core shares it, so no window
-        // opens), and its own process group, so console events of the
-        // launching terminal never reach it.
-        let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
-        // CreateProcess inherits every inheritable handle, and this process's
-        // own standard handles usually are (a shell hands them down that way).
-        // rld would then hold the caller's stdout pipe open for its lifetime,
-        // so `raydock hybrid start | ...` never saw EOF. rld's own stdio is
-        // set explicitly above, so keep ours out of it while it spawns.
-        let _quiet = NonInheritableStdHandles::new();
-        // Leave the terminal's job too, where the job allows it: a job that
-        // kills its processes on close would otherwise take rld with it.
-        match command
-            .creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB)
-            .spawn()
-        {
-            Ok(child) => Ok(child),
-            Err(error)
-                if error.raw_os_error()
-                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32) =>
-            {
-                command.creation_flags(flags).spawn()
-            }
-            Err(error) => Err(error),
-        }
-    }
-}
-
-/// Clears the inherit flag on this process's standard handles while it lives
-/// and puts the original flags back when dropped.
-#[cfg(windows)]
-struct NonInheritableStdHandles {
-    saved: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
-}
-
-#[cfg(windows)]
-impl NonInheritableStdHandles {
-    fn new() -> Self {
-        use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::Foundation::{
-            GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
-        };
-        let handles = [
-            std::io::stdin().as_raw_handle(),
-            std::io::stdout().as_raw_handle(),
-            std::io::stderr().as_raw_handle(),
-        ];
-        let mut saved: Vec<(HANDLE, u32)> = Vec::new();
-        for handle in handles {
-            let handle = handle as HANDLE;
-            if handle.is_null()
-                || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
-                || saved.iter().any(|(seen, _)| *seen == handle)
-            {
-                continue;
-            }
-            let mut flags = 0u32;
-            // SAFETY: `handle` is one of this process's standard handles and
-            // `flags` is a valid out pointer.
-            if unsafe { GetHandleInformation(handle, &mut flags) } == 0
-                || flags & HANDLE_FLAG_INHERIT == 0
-            {
-                continue;
-            }
-            // SAFETY: as above; only the inherit bit changes.
-            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
-                saved.push((handle, flags));
-            }
-        }
-        Self { saved }
-    }
-}
-
-#[cfg(windows)]
-impl Drop for NonInheritableStdHandles {
-    fn drop(&mut self) {
-        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
-        for (handle, flags) in &self.saved {
-            // SAFETY: restores the inherit bit this guard cleared on a handle
-            // the process still owns.
-            unsafe {
-                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, flags & HANDLE_FLAG_INHERIT)
-            };
-        }
-    }
 }
 
 /// Ask a supervisor we spawned to stop and clean up after itself. Unix sends
