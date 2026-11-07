@@ -292,12 +292,20 @@ abrupt supervisor termination. Normal shutdown cancels active gateway requests,
 signals only its owned core, waits up to five seconds, and then kills/reaps that
 child if necessary. Inference servers remain untouched. Both cancellation before
 response headers and cancellation during SSE drop the core request connection.
+On Windows the owned core is stopped by closing that pipe (the core treats EOF
+like SIGTERM), and `raydock hybrid stop` asks `rld` to shut down through a
+per-process named event, so `rld` still removes its token and ready files; a
+hard kill is only the fallback after the same timeout. The supervisor starts
+without a console window and in its own process group, so closing the terminal
+that ran `hybrid start` does not stop it.
 
 State directories are owner-only and credential files are mode `0600` on Unix.
+On Windows the state directory, gateway token, ready and supervisor files, and
+the runtime log carry a protected DACL that grants access only to the current
+user, and the start lock is an exclusive `LockFileEx` lock.
 The gateway applies the existing Host/Origin/JSON request guard before auth.
 It is loopback-only. Direct tailnet binding, remote harness enrollment, release
-packaging for the core binary, and Windows lifecycle qualification are separate
-work; do not expose the credential-bearing gateway on a public interface.
+packaging for the core binary are separate work; do not expose the credential-bearing gateway on a public interface.
 
 ## Local validation
 
@@ -430,8 +438,7 @@ Managed inference remains a separate ownership mode. The existing local launcher
 can supply process management, but hybrid still needs a qualified launch profile
 and binding of the launched runtime's port and identity before it can safely own
 that process. This reference path uses a caller-owned inference runtime.
-Durable resume/fork state, tailnet enrollment and Windows lifecycle qualification
-also remain separate work.
+Durable resume/fork state and tailnet enrollment also remain separate work.
 
 ## Installed execution core
 
@@ -458,9 +465,8 @@ a bare `--version 0.2.12` that is not found says to use the full form. A build n
 channel's latest release reports that it is up to date and names the
 `raydock update --version <current>` command that repairs a missing core.
 
-Hybrid requires macOS 13 Ventura or later, or Linux. Windows hybrid commands
-fail explicitly because locking, private-state permissions and lifecycle have
-not been qualified; ordinary Windows commands remain available. Historical Mac
+Hybrid requires macOS 13 Ventura or later, Linux, or Windows 10/11 (x86_64).
+Historical Mac
 asset names identify the existing update paths and do not express the Go core's
 minimum OS. The core is built with Go 1.27.3, whose [supported Mac minimum is
 macOS 13](https://go.dev/doc/go1.27#darwin).

@@ -923,7 +923,15 @@ mod tests {
         assert_eq!(decisions["result"], "top");
         assert!(decisions["routing"].get("v_value").is_none());
         assert_eq!(composed.policy, PolicySource::Default);
-        assert_eq!(composed.config["package_path"], "/profiles/package.json");
+        // The package path is joined onto the profile folder with the
+        // platform's separator.
+        assert_eq!(
+            composed.config["package_path"],
+            Path::new("/profiles")
+                .join("package.json")
+                .to_string_lossy()
+                .as_ref()
+        );
     }
 
     #[test]

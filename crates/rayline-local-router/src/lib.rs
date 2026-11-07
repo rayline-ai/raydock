@@ -40,6 +40,8 @@ pub mod inbound_guard;
 use anthropic_usage::AnthropicUsage;
 pub use inbound_guard::InboundGuard;
 mod upstream_request_id;
+#[cfg(windows)]
+pub mod windows_state;
 pub use upstream_request_id::RAYLINE_UPSTREAM_REQUEST_ID_HEADER;
 use upstream_request_id::{
     log_upstream_request_id, record_upstream_request_id, stamp_upstream_request_id,

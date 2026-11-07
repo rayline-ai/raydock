@@ -107,11 +107,6 @@ pub async fn run(args: Vec<OsString>) -> ExitCode {
 }
 
 async fn execute(cli: Cli) -> io::Result<ExitCode> {
-    if !cfg!(unix) {
-        return Err(io::Error::other(
-            "hybrid routing currently requires macOS or Linux; Windows lifecycle is not yet supported",
-        ));
-    }
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/usr/bin/sw_vers")
@@ -139,7 +134,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
     let paths = Paths {
         dir: cli
             .state_dir
-            .unwrap_or_else(|| home.join(".rayline/hybrid")),
+            .unwrap_or_else(|| home.join(".rayline").join("hybrid")),
     };
     private_dir(&paths.dir)?;
     let client = reqwest::Client::builder()
@@ -349,20 +344,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             for (name, key) in &credentials {
                 command.env(name, key);
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                // SAFETY: setsid is async-signal-safe and touches no Rust state.
-                unsafe {
-                    command.pre_exec(|| {
-                        if libc::setsid() == -1 {
-                            return Err(io::Error::last_os_error());
-                        }
-                        Ok(())
-                    });
-                }
-            }
-            let mut child = command.spawn()?;
+            let mut child = spawn_supervisor(&mut command)?;
             let startup = async {
                 write_private_json(&paths.supervisor(), &json!({"pid":child.id()}), false)?;
                 let started = Instant::now();
@@ -746,6 +728,21 @@ async fn health(client: &reqwest::Client, paths: &Paths, state: &Value) -> io::R
     Ok(health)
 }
 
+/// The program to launch for harness `name`. Windows process creation does
+/// not apply PATHEXT, so npm's `.cmd` launchers (codex, pi) are resolved the
+/// way a shell would; Unix keeps the bare name and its usual PATH lookup.
+fn harness_program(name: &str, path: Option<std::ffi::OsString>) -> PathBuf {
+    if cfg!(windows) {
+        let names = crate::harness::executable_names(name, true);
+        if let Some(found) = path.and_then(|path| {
+            std::env::split_paths(&path).find_map(|dir| crate::harness::find_in_dir(&dir, &names))
+        }) {
+            return found;
+        }
+    }
+    PathBuf::from(name)
+}
+
 fn harness_command(
     paths: &Paths,
     name: &str,
@@ -755,7 +752,8 @@ fn harness_command(
     capabilities: &ModelCapabilities,
 ) -> io::Result<Command> {
     require_fresh_session(name, args)?;
-    let mut command = Command::new(name);
+    let program = harness_program(name, std::env::var_os("PATH"));
+    let mut command = Command::new(&program);
     crate::codex::withhold_router_key(&mut command);
     command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
     match name {
@@ -836,12 +834,8 @@ fn harness_command(
             // exported only when a rendered config references it.
             let conversation_id =
                 crate::harness::conversation_id_for(&plan, crate::harness::new_conversation_id);
-            command = crate::harness::build_command(
-                Path::new(name),
-                &plan,
-                conversation_id.as_deref(),
-                &args,
-            );
+            command =
+                crate::harness::build_command(&program, &plan, conversation_id.as_deref(), &args);
             command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
             return Ok(command);
         }
@@ -934,7 +928,7 @@ async fn stop_spawned(child: &mut Child) -> io::Result<()> {
         return Ok(());
     }
     let pid = i32::try_from(child.id()).map_err(io::Error::other)?;
-    match crate::router::terminate_process(pid) {
+    match request_supervisor_stop(pid) {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -951,6 +945,131 @@ async fn stop_spawned(child: &mut Child) -> io::Result<()> {
     Ok(())
 }
 
+/// Start `rld` in its own session, away from the launching terminal: closing
+/// that terminal or pressing Ctrl-C in it must not stop the runtime.
+fn spawn_supervisor(command: &mut Command) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid is async-signal-safe and touches no Rust state.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command.spawn()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{
+            CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW,
+        };
+        // A hidden console of its own (the core shares it, so no window
+        // opens), and its own process group, so console events of the
+        // launching terminal never reach it.
+        let flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+        // CreateProcess inherits every inheritable handle, and this process's
+        // own standard handles usually are (a shell hands them down that way).
+        // rld would then hold the caller's stdout pipe open for its lifetime,
+        // so `raydock hybrid start | ...` never saw EOF. rld's own stdio is
+        // set explicitly above, so keep ours out of it while it spawns.
+        let _quiet = NonInheritableStdHandles::new();
+        // Leave the terminal's job too, where the job allows it: a job that
+        // kills its processes on close would otherwise take rld with it.
+        match command
+            .creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB)
+            .spawn()
+        {
+            Ok(child) => Ok(child),
+            Err(error)
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32) =>
+            {
+                command.creation_flags(flags).spawn()
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Clears the inherit flag on this process's standard handles while it lives
+/// and puts the original flags back when dropped.
+#[cfg(windows)]
+struct NonInheritableStdHandles {
+    saved: Vec<(windows_sys::Win32::Foundation::HANDLE, u32)>,
+}
+
+#[cfg(windows)]
+impl NonInheritableStdHandles {
+    fn new() -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::{
+            GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation,
+        };
+        let handles = [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ];
+        let mut saved: Vec<(HANDLE, u32)> = Vec::new();
+        for handle in handles {
+            let handle = handle as HANDLE;
+            if handle.is_null()
+                || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE
+                || saved.iter().any(|(seen, _)| *seen == handle)
+            {
+                continue;
+            }
+            let mut flags = 0u32;
+            // SAFETY: `handle` is one of this process's standard handles and
+            // `flags` is a valid out pointer.
+            if unsafe { GetHandleInformation(handle, &mut flags) } == 0
+                || flags & HANDLE_FLAG_INHERIT == 0
+            {
+                continue;
+            }
+            // SAFETY: as above; only the inherit bit changes.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+                saved.push((handle, flags));
+            }
+        }
+        Self { saved }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NonInheritableStdHandles {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+        for (handle, flags) in &self.saved {
+            // SAFETY: restores the inherit bit this guard cleared on a handle
+            // the process still owns.
+            unsafe {
+                SetHandleInformation(*handle, HANDLE_FLAG_INHERIT, flags & HANDLE_FLAG_INHERIT)
+            };
+        }
+    }
+}
+
+/// Ask a supervisor we spawned to stop and clean up after itself. Unix sends
+/// SIGTERM; Windows sets the stop event `rld` waits on. `NotFound` means it
+/// is already gone.
+fn request_supervisor_stop(pid: i32) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        crate::router::terminate_process(pid)
+    }
+    #[cfg(windows)]
+    {
+        let pid = u32::try_from(pid).map_err(io::Error::other)?;
+        rayline_local_router::windows_state::request_stop(pid)
+    }
+}
+
 fn private_dir(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -958,6 +1077,9 @@ fn private_dir(path: &Path) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     }
+    // Files created inside inherit the owner-only entry from the start.
+    #[cfg(windows)]
+    rayline_local_router::windows_state::restrict_to_owner(path, true)?;
     Ok(())
 }
 
@@ -980,7 +1102,10 @@ fn write_private_json(path: &Path, value: &Value, pretty: bool) -> io::Result<()
         serde_json::to_vec(value)
     }
     .map_err(io::Error::other)?;
-    crate::claude_app::write_private(path, &contents)
+    crate::claude_app::write_private(path, &contents)?;
+    #[cfg(windows)]
+    rayline_local_router::windows_state::restrict_to_owner(path, false)?;
+    Ok(())
 }
 
 /// Open the append-only runtime log owner-only: never through a symlink, and
@@ -993,18 +1118,27 @@ fn private_log(path: &Path) -> io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        // Open a planted link itself, not its target, so it is refused below.
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
     let file = options.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if !file.metadata()?.is_file() {
-            return Err(io::Error::other(format!(
-                "{} is not a regular file",
-                path.display()
-            )));
-        }
         file.set_permissions(fs::Permissions::from_mode(0o600))?;
     }
+    #[cfg(windows)]
+    rayline_local_router::windows_state::restrict_to_owner(path, false)?;
     Ok(file)
 }
 
@@ -1090,6 +1224,84 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn harness_program_resolves_windows_launchers_only_on_windows() {
+        let dir = std::env::temp_dir().join(format!(
+            "rayline-hybrid-program-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        // npm installs an extensionless sh shim beside the `.cmd` launcher.
+        fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
+        fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        let path = Some(std::env::join_paths([&dir]).unwrap());
+        let program = harness_program("codex", path.clone());
+        if cfg!(windows) {
+            assert_eq!(program, dir.join("codex.cmd"));
+        } else {
+            assert_eq!(program, PathBuf::from("codex"));
+        }
+        assert_eq!(harness_program("pi", path), PathBuf::from("pi"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn state_files_end_up_owner_only_on_windows() {
+        use rayline_local_router::windows_state::is_owner_only;
+        let dir = temp_dir("acl");
+        let state = dir.join("state");
+        private_dir(&state).unwrap();
+        assert!(is_owner_only(&state).unwrap());
+        let path = state.join("core-config.json");
+        fs::write(&path, "{\"stale\": true}").unwrap();
+        write_private_json(&path, &json!({"fresh": 1}), false).unwrap();
+        assert!(is_owner_only(&path).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"fresh\":1}");
+        let log = state.join("runtime.log");
+        fs::write(
+            &log, "old
+",
+        )
+        .unwrap();
+        drop(private_log(&log).unwrap());
+        assert!(is_owner_only(&log).unwrap());
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "old
+"
+        );
+        // A folder is not a log file.
+        fs::create_dir(state.join("folder.log")).unwrap();
+        assert!(private_log(&state.join("folder.log")).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn second_lock_holder_waits_for_the_first() {
+        let dir = temp_dir("lock");
+        let path = dir.join("runtime.lock");
+        let first = crate::router::acquire_router_lock(&path).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let _second = crate::router::acquire_router_lock(&path).unwrap();
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err());
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
