@@ -556,6 +556,22 @@ pub(crate) fn default_profile(
                "protocol": "anthropic.messages.v1", "wire_model": wire, "registry_model": wire,
                "registry_provider": "openrouter", "runtime_identity": "rayline-catalog-model-pin-v1",
                "max_output_tokens": max_output_tokens, "context_window": CLOUD_CONTEXT_WINDOW, "input_modalities": ["text"],
+               // As on the local deployment: the core serves harnesses over
+               // loopback, and its callers are mostly harnesses that emit
+               // whatever their own defaults produce for a model their
+               // catalog does not describe: Hermes sends a fixed 128,000 on
+               // the Messages wire with no setting to lower it. Lowering such
+               // a number serves the turn where refusing it only loses the
+               // answer.
+               //
+               // The trade is real, not free. These ceilings are a catalog
+               // snapshot or a user's `hybrid.cloud_output_tokens`, not a
+               // figure the provider confirmed, so one that has drifted low
+               // now shortens an answer instead of failing loudly. An SDK
+               // caller stating its own allowance (`docs/hybrid-routing.md`)
+               // is clamped the same way. The core logs the stated and sent
+               // figures so a short answer can be traced to this.
+               "clamp_output_allowance": true,
                "token_units": "", "auth_env": ROUTER_KEY_ENV})
     };
     let legs = json!({"input": local_price, "output": local_price, "cache_read": local_price, "cache_write": local_price});
@@ -576,11 +592,9 @@ pub(crate) fn default_profile(
          "registry_model": LOCAL_REGISTRY_MODEL, "registry_provider": "openai",
          "runtime_identity": format!("local_model:{model}"), "max_output_tokens": max_output,
          "context_window": context_window, "input_modalities": ["text"], "token_units": "",
-         // This is the smallest cap, and a harness asking for more has its
-         // local turns refused: Hermes sends a fixed 128,000 on the Messages
-         // wire with no setting to lower it. The core lowers such a turn to
-         // this cap. The cloud deployments stay out, where an over-cap
-         // allowance means the number is wrong.
+         // The smallest cap of the three, so a caller asking for more is
+         // lowered to it here most often. Every deployment clamps; see the
+         // cloud closure above for the trade that makes.
          "clamp_output_allowance": true})];
     // One deployment and one derived action per pin, from the same list: the
     // core only checks that an action names a known deployment, so a pin with
@@ -1123,8 +1137,8 @@ mod tests {
         assert_eq!(local["wire_model"], "qwen3.8:27b");
         assert_eq!(local["context_window"], 16384);
         assert_eq!(local["max_output_tokens"], 4096);
-        // Only the local cap lowers an over-cap allowance; a cloud
-        // deployment asked for more than its ceiling still refuses.
+        // Every deployment lowers an over-cap allowance to its own ceiling:
+        // the harness that sent it could not state a smaller one.
         assert_eq!(local["clamp_output_allowance"], true);
         // Each cloud deployment declares the ceiling it was given, its own
         // model's, not one constant for both.
@@ -1133,7 +1147,7 @@ mod tests {
             .zip(CLOUD_MODELS)
         {
             assert_eq!(cloud["max_output_tokens"], *ceiling);
-            assert!(cloud.get("clamp_output_allowance").is_none());
+            assert_eq!(cloud["clamp_output_allowance"], true);
         }
         assert_eq!(config["derived_actions"].as_array().unwrap().len(), 3);
         assert_eq!(

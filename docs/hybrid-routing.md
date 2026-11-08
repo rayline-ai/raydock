@@ -228,13 +228,22 @@ Raydock's to state and nothing is read over the network to discover them.
 A harness states one output allowance for the whole session, but the
 deployments do not share one limit, and the advertised allowance is the
 smallest of them. A harness that takes that number is within every cap. One
-that asks for more has its local turns refused: Hermes sends a fixed 128,000
-on the Messages wire, from its own defaults for a model its catalog does not
-describe, and has no setting to lower it. The local deployment therefore sets
-`clamp_output_allowance`, and the core lowers an allowance over that cap to
-it, logging `stated` and `sent`. A turn whose admitted thinking budget reaches
-the cap is refused instead, rather than clamped into a request Anthropic would
-reject.
+that asks for more cannot usually be told otherwise: Hermes sends a fixed
+128,000 on the Messages wire, from its own defaults for a model its catalog
+does not describe, and has no setting to lower it. Every deployment therefore
+sets `clamp_output_allowance`, and the core lowers an allowance over that
+deployment's ceiling to it, logging `stated` and `sent`. Refusing such a turn
+would only lose the answer.
+
+That trades a visible failure for a quieter one, so it is worth knowing what
+the ceilings are: a catalog snapshot, or whatever
+`hybrid.cloud_output_tokens` declares, and not a figure the provider
+confirmed. A ceiling set or drifted below the model's own now shortens an
+answer rather than failing, and an SDK caller stating its own allowance (see
+below) is lowered on the same terms. The logged `stated` and `sent` figures
+are what connect a short answer back to this. A turn whose admitted thinking
+budget reaches the ceiling is refused instead, rather than clamped into a
+request Anthropic would reject.
 
 For an SDK or another harness, read the gateway address from `ready.json` and
 its private credential from `gateway-token` inside the state directory. Use
