@@ -1591,10 +1591,13 @@ mod tests {
             Some(json!({"default_generation_settings": {"n_ctx": 98304},
                         "model_alias": "qwen3.8-27b", "model_path": path}))
         };
-        // Unsloth's file, and llama.cpp's -hf cache name for it.
+        // Unsloth's file, llama.cpp's -hf cache name for it, and the HF hub
+        // cache snapshot the Recommended picker downloads (`qwen3.8-27b-q4km`
+        // in registry.rayline.ai/models.json).
         for path in [
             "/models/Qwen3.8-27B-UD-Q4_K_M.gguf",
             "/cache/llama.cpp/unsloth_Qwen3.8-27B-GGUF_Qwen3.8-27B-UD-Q4_K_M.gguf",
+            "/Users/u/.cache/huggingface/hub/models--unsloth--Qwen3.8-27B-GGUF/snapshots/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_M.gguf",
             "/models/qwen3.8-27b/model-q4.gguf",
         ] {
             let url = runtime_stub(props(path), None).await;
