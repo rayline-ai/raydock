@@ -718,6 +718,12 @@ fn model_capabilities(state: &Value) -> io::Result<ModelCapabilities> {
 /// Claude Code's switch between the API's in-turn auto-mode checks and its
 /// own classifier requests (code.claude.com auto-mode classifier docs).
 const AUTO_MODE_SERVER_ENV: &str = "CLAUDE_CODE_AUTO_MODE_SERVER";
+
+/// The value to set for [`AUTO_MODE_SERVER_ENV`]: `0` unless the user's
+/// environment already names one (an empty value included), which is kept.
+fn auto_mode_server_default(inherited: Option<&std::ffi::OsStr>) -> Option<&'static str> {
+    inherited.is_none().then_some("0")
+}
 /// Context window every harness is told under hybrid routing. The runtime
 /// carries any prompt up to this size: a turn too large for the local model
 /// hands off to cloud, and a prompt larger than the cloud window is refused
@@ -817,8 +823,10 @@ fn harness_command(
             // checked action is denied. Its own classifier requests, which the
             // gateway sends to the cloud classifier pin, judge them instead.
             // A value the user set is kept.
-            if std::env::var_os(AUTO_MODE_SERVER_ENV).is_none() {
-                command.env(AUTO_MODE_SERVER_ENV, "0");
+            if let Some(value) =
+                auto_mode_server_default(std::env::var_os(AUTO_MODE_SERVER_ENV).as_deref())
+            {
+                command.env(AUTO_MODE_SERVER_ENV, value);
             }
             let recovery = crate::claude::refusal_recovery_values(
                 crate::claude::RoutingMode::Override,
@@ -1443,13 +1451,14 @@ mod tests {
                     && value == Some(std::ffi::OsStr::new("1000000")))
         );
         // Auto mode's checks come from Claude Code's own classifier requests,
-        // not from the API inside a turn the local model may serve.
-        if std::env::var_os(AUTO_MODE_SERVER_ENV).is_none() {
-            assert!(
-                claude
-                    .get_envs()
-                    .any(|(key, value)| key == AUTO_MODE_SERVER_ENV
-                        && value == Some(std::ffi::OsStr::new("0")))
+        // not from the API inside a turn the local model may serve; a value
+        // the user set is kept.
+        assert_eq!(auto_mode_server_default(None), Some("0"));
+        for kept in ["0", "1", ""] {
+            assert_eq!(
+                auto_mode_server_default(Some(std::ffi::OsStr::new(kept))),
+                None,
+                "{kept:?}"
             );
         }
         let codex = harness_command(
