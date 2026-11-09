@@ -11,6 +11,11 @@ repo-specific.
 - `rayline-injector`: process/environment injection.
 - `rayline-adapter`: adapter protocol translation.
 - `rayline-local-router`: static routing policy and endpoint selection.
+- `rayline-subscriptions`: Claude subscription pool core (registry, credentials,
+  OAuth refresh, usage, placement, pool lock). No dependencies on other
+  Rayline crates; keep it that way so `csub` and `rld` can share it.
+- `csub`: standalone subscription pool daemon, gateway, launchd service, and
+  the registry/status commands the Rayline CLI reuses.
 - `rayline-hf`, `rayline-llama`, `rayline-metrics`: model/cache/runtime support.
 
 Keep protocol and routing logic in shared crates. Do not duplicate it in CLI
@@ -30,6 +35,8 @@ handlers. Prefer focused modules over growing the existing large CLI/proxy files
 - Use `--router-config-path` when `routes.subagents` is meant to constrain the
   transparent proxy allowlist. Do not rely on `RAYLINE_ROUTER_CONFIG` alone for
   that allowlist.
+- `--subscription-pool` runs Claude Code on the csub gateway via
+  `ANTHROPIC_BASE_URL`; it must not be combined with router flags.
 - `raydock top` should work for proxy-mode launches when metrics can bind.
   Metrics bind failures are best-effort and must not break proxy data flow.
 
