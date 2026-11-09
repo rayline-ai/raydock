@@ -8,11 +8,12 @@
 //! treats the request as a harness side call and holds it on the action that
 //! served the last turn, which under `prefer_local` is the local model.
 //!
-//! The gateway therefore sends a classifier request straight to the profile's
-//! cloud Sonnet pin (else its first cloud Messages pin) on the same router
-//! as Decisions, with that deployment's credential, exactly as the core would
-//! dispatch a model-pin turn. A profile with no such deployment (local only)
-//! leaves the request to the core.
+//! The gateway therefore sends a classifier request straight to a cloud model
+//! (Claude Haiku 5.5 unless the user chooses another) through the router of
+//! the profile's cloud Messages pins, on the same router as Decisions, with
+//! that deployment's credential, exactly as the core would dispatch a
+//! model-pin turn. A profile with no such deployment (local only) leaves the
+//! request to the core.
 
 use bytes::Bytes;
 use serde_json::Value;
@@ -23,7 +24,11 @@ const CLASSIFIER_PROMPT: &str = "You are a security monitor for autonomous AI co
 /// The block Claude Code puts before every system prompt.
 const BILLING_PREAMBLE: &str = "x-anthropic-billing-header:";
 
-/// A cloud Messages deployment the classifier is sent to.
+/// The classifier's model when the user names none.
+pub(crate) const DEFAULT_CLASSIFIER_MODEL: &str = "anthropic/claude-haiku-5.5";
+
+/// Where the classifier is sent: a cloud Messages pin's router and
+/// credential, with the classifier's own model.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CloudPin {
     pub url: String,
@@ -31,12 +36,14 @@ pub(crate) struct CloudPin {
     pub auth_env: String,
 }
 
-/// The cloud pin for classifier requests: a `model_pin` Messages deployment
-/// on the same origin as `decisions.url` (the router the launcher already
-/// checked), preferring a Sonnet model.
-pub(crate) fn cloud_pin(config: &Value) -> Option<CloudPin> {
+/// The classifier's route: the router URL and credential of a `model_pin`
+/// Messages deployment on the same origin as `decisions.url` (the router the
+/// launcher already checked), with `model` as the wire model. The router
+/// serves any of its models at that URL, so `model` need not be a profile
+/// target.
+pub(crate) fn cloud_pin(config: &Value, model: &str) -> Option<CloudPin> {
     let decisions = origin(config.pointer("/decisions/url")?.as_str()?)?;
-    let pins: Vec<CloudPin> = config
+    config
         .get("deployments")?
         .as_array()?
         .iter()
@@ -56,16 +63,12 @@ pub(crate) fn cloud_pin(config: &Value) -> Option<CloudPin> {
             };
             let pin = CloudPin {
                 url: field("url")?,
-                wire_model: field("wire_model")?,
+                wire_model: model.to_owned(),
                 auth_env: field("auth_env")?,
             };
             (origin(&pin.url)? == decisions).then_some(pin)
         })
-        .collect();
-    pins.iter()
-        .find(|pin| pin.wire_model.contains("sonnet"))
-        .or_else(|| pins.first())
-        .cloned()
+        .next()
 }
 
 /// Scheme, host and port of a URL; None for anything unparseable.
@@ -144,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_sonnet_on_the_decisions_router() {
+    fn takes_the_decisions_router_and_its_credential_with_the_chosen_model() {
         let config = config(json!([
             {"id": "local", "kind": "local", "url": "http://127.0.0.1:8000/v1/chat/completions",
              "protocol": "openai.chat.v1", "wire_model": "glm"},
@@ -152,12 +155,16 @@ mod tests {
             pin("cloud-sonnet", "https://api.rayline.ai/v1/messages", "anthropic/claude-sonnet-5.5"),
         ]));
         assert_eq!(
-            cloud_pin(&config),
+            cloud_pin(&config, DEFAULT_CLASSIFIER_MODEL),
             Some(CloudPin {
                 url: "https://api.rayline.ai/v1/messages".into(),
-                wire_model: "anthropic/claude-sonnet-5.5".into(),
+                wire_model: "anthropic/claude-haiku-5.5".into(),
                 auth_env: "RAYLINE_ROUTER_API_KEY".into(),
             })
+        );
+        assert_eq!(
+            cloud_pin(&config, "anthropic/claude-sonnet-5.5").map(|pin| pin.wire_model),
+            Some("anthropic/claude-sonnet-5.5".into())
         );
     }
 
@@ -168,19 +175,10 @@ mod tests {
             "https://elsewhere.example/v1/messages",
             "anthropic/claude-sonnet-5.5"
         )]));
-        assert_eq!(cloud_pin(&elsewhere), None);
+        assert_eq!(cloud_pin(&elsewhere, DEFAULT_CLASSIFIER_MODEL), None);
         let local_only = config(json!([{"id": "local", "kind": "local",
             "url": "http://127.0.0.1:8000/v1/chat/completions", "protocol": "openai.chat.v1"}]));
-        assert_eq!(cloud_pin(&local_only), None);
-        let opus_only = config(json!([pin(
-            "cloud-opus",
-            "https://api.rayline.ai/v1/messages",
-            "anthropic/claude-opus-5.5"
-        )]));
-        assert_eq!(
-            cloud_pin(&opus_only).map(|pin| pin.wire_model),
-            Some("anthropic/claude-opus-5.5".into())
-        );
+        assert_eq!(cloud_pin(&local_only, DEFAULT_CLASSIFIER_MODEL), None);
     }
 
     #[test]

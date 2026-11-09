@@ -235,9 +235,11 @@ The core infers what each request is from the harness's own wire traffic:
   reminders and harness-authored text do not count as user words.
 - **Side calls:** the harness's auxiliary requests, such as compaction summaries,
   titles and prompt suggestions. They never advance the session. Claude Code's
-  auto-mode safety classifier is the exception: it always goes to the cloud
-  Sonnet pin, because a local model's answer it cannot parse makes Claude Code
-  ask you to approve every action.
+  auto-mode safety classifier is the exception: it always goes to cloud,
+  because a local model's answer it cannot parse makes Claude Code ask you to
+  approve every action. It uses Claude Haiku 5.5 through your router; set
+  `"hybrid": {"classifier_model": "<provider/model>"}` in `settings.json`, or
+  pass `--classifier-model` to `start`, to use another model.
 - **Compaction:** detected by comparing each request with the previous one,
   including Pi's retained tail.
 

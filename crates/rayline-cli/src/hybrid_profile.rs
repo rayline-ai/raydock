@@ -112,15 +112,54 @@ pub(crate) fn local_registry_model(settings: Option<&Value>) -> Result<String, S
     };
     value
         .as_str()
-        .filter(|id| {
-            id.split_once('/').is_some_and(|(provider, model)| {
-                !provider.is_empty() && !model.is_empty() && !model.contains('/')
-            }) && !id.chars().any(char::is_whitespace)
-        })
+        .filter(|id| is_model_id(id))
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
             "settings hybrid.local_registry_model must be a registry model id \"provider/model\", such as \"z-ai/glm-5.3-flash\"".to_owned()
         })
+}
+
+/// The model Claude Code's auto-mode classifier goes to: `--classifier-model`,
+/// else `hybrid.classifier_model` from settings, else Claude Haiku 5.5. It is
+/// sent through the profile's cloud router, so any model that router serves
+/// on Messages works; Raydock checks only the `provider/model` shape. Applies
+/// with a profile file too, since the classifier is not a profile target.
+pub(crate) fn classifier_model(
+    flag: Option<&str>,
+    settings: Option<&Value>,
+) -> Result<String, String> {
+    if let Some(flag) = flag {
+        return if is_model_id(flag) {
+            Ok(flag.to_owned())
+        } else {
+            Err(format!(
+                "--classifier-model must be a router model id \"provider/model\", such as \"{CLASSIFIER_MODEL}\""
+            ))
+        };
+    }
+    let value = settings
+        .and_then(|settings| settings.get("hybrid"))
+        .and_then(|hybrid| hybrid.get("classifier_model"));
+    let Some(value) = value else {
+        return Ok(CLASSIFIER_MODEL.to_owned());
+    };
+    value
+        .as_str()
+        .filter(|id| is_model_id(id))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            format!("settings hybrid.classifier_model must be a router model id \"provider/model\", such as \"{CLASSIFIER_MODEL}\"")
+        })
+}
+
+/// Claude Code's auto-mode classifier model when the user names none.
+pub(crate) const CLASSIFIER_MODEL: &str = "anthropic/claude-haiku-5.5";
+
+/// `provider/model`: one slash, both parts non-empty, no whitespace.
+fn is_model_id(id: &str) -> bool {
+    id.split_once('/').is_some_and(|(provider, model)| {
+        !provider.is_empty() && !model.is_empty() && !model.contains('/')
+    }) && !id.chars().any(char::is_whitespace)
 }
 
 /// The derived action's model and worker name for a registry id: the part
@@ -1961,6 +2000,34 @@ mod tests {
             .unwrap();
             assert_eq!(composed.preset.as_deref(), Some(PREFER_LOCAL_PRESET));
         }
+    }
+
+    #[test]
+    fn classifier_model_is_haiku_unless_settings_or_the_flag_name_another() {
+        assert_eq!(
+            classifier_model(None, None).unwrap(),
+            "anthropic/claude-haiku-5.5"
+        );
+        let settings = json!({"hybrid": {"classifier_model": "anthropic/claude-sonnet-5.5"}});
+        assert_eq!(
+            classifier_model(None, Some(&settings)).unwrap(),
+            "anthropic/claude-sonnet-5.5"
+        );
+        assert_eq!(
+            classifier_model(Some("anthropic/claude-opus-5.5"), Some(&settings)).unwrap(),
+            "anthropic/claude-opus-5.5"
+        );
+        let bad = json!({"hybrid": {"classifier_model": "haiku"}});
+        assert!(
+            classifier_model(None, Some(&bad))
+                .unwrap_err()
+                .starts_with("settings hybrid.classifier_model")
+        );
+        assert!(
+            classifier_model(Some("claude haiku"), None)
+                .unwrap_err()
+                .starts_with("--classifier-model")
+        );
     }
 
     #[test]

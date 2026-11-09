@@ -529,7 +529,7 @@ fn fake_router() -> (String, std::thread::JoinHandle<Recorded>) {
 }
 
 #[tokio::test]
-async fn auto_mode_classifier_goes_to_the_cloud_pin_and_other_turns_to_the_core() {
+async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_to_the_core() {
     let (router, recorded) = fake_router();
     let deployments = format!(
         r#","deployments":[{{"id":"local","kind":"local","url":"http://127.0.0.1:9/v1/chat/completions","protocol":"openai.chat.v1","wire_model":"glm"}},{{"id":"cloud-opus","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"anthropic/claude-opus-5.5","auth_env":"RAYLINE_ROUTER_API_KEY"}},{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"anthropic/claude-sonnet-5.5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
@@ -570,14 +570,15 @@ async fn auto_mode_classifier_goes_to_the_cloud_pin_and_other_turns_to_the_core(
     };
     assert!(line.starts_with("POST /v1/messages "), "{line}");
     assert_eq!(header("authorization"), Some("Bearer rlk-test-key"));
+    // Claude Haiku 5.5 by default, through the cloud pins' router and key.
     assert_eq!(
         header("x-workshop-required-model"),
-        Some("anthropic/claude-sonnet-5.5")
+        Some("anthropic/claude-haiku-5.5")
     );
     assert_eq!(header("anthropic-beta"), Some("claude-code-20250219"));
     assert_eq!(header("x-conversation-id"), Some("session-one"));
     let mut expected = classifier.clone();
-    expected["model"] = json!("anthropic/claude-sonnet-5.5");
+    expected["model"] = json!("anthropic/claude-haiku-5.5");
     assert_eq!(body, expected);
 
     // A turn with tools is an ordinary turn: the core gets it unchanged.

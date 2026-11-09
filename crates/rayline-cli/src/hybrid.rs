@@ -44,6 +44,11 @@ enum Action {
         /// (llama.cpp `/props`, or `/v1/models` from vLLM or TensorFold).
         #[arg(long, value_parser = clap::value_parser!(u64).range(2048..=1_000_000))]
         local_context_window: Option<u64>,
+        /// Model for Claude Code's auto-mode safety classifier, sent through
+        /// your cloud router (default: settings `hybrid.classifier_model`, else
+        /// anthropic/claude-haiku-5.5).
+        #[arg(long)]
+        classifier_model: Option<String>,
         /// Isolated Decisions cell tag (development only).
         #[arg(long)]
         cell: Option<String>,
@@ -150,6 +155,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             config,
             env,
             local_context_window,
+            classifier_model,
             cell,
             port,
             startup_timeout_secs,
@@ -167,6 +173,11 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 None => (None, None),
             };
             let settings_error = |error| settings_error(settings_path.as_deref(), error);
+            let classifier_model = crate::hybrid_profile::classifier_model(
+                classifier_model.as_deref(),
+                settings.as_ref(),
+            )
+            .map_err(settings_error)?;
             let origin = if config.is_some() {
                 crate::hybrid_profile::ProfileOrigin::File
             } else {
@@ -315,6 +326,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             if let Some((id, url, model)) = &composed.local_model {
                 println!("Local model: {model} at {url} (deployment {id}, from local_model)");
             }
+            println!(
+                "Auto-mode classifier: {classifier_model} (Claude Code's safety checks; change with settings hybrid.classifier_model or --classifier-model)"
+            );
             for (name, _) in &credentials {
                 println!("Using the saved Rayline key for {name}");
             }
@@ -363,6 +377,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 command.arg("--router-url").arg(router_url);
             }
             command.arg("--env-name").arg(&decisions_env);
+            command.arg("--classifier-model").arg(&classifier_model);
             for (name, key) in &credentials {
                 command.env(name, key);
             }

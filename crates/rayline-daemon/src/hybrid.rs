@@ -64,6 +64,10 @@ pub struct Args {
     /// sign-in hint when Decisions refuses that key.
     #[arg(long)]
     env_name: Option<String>,
+    /// Model that answers Claude Code's auto-mode classifier, through the
+    /// profile's cloud Messages router.
+    #[arg(long, default_value = crate::hybrid_classifier::DEFAULT_CLASSIFIER_MODEL)]
+    classifier_model: String,
 }
 
 #[derive(Deserialize)]
@@ -106,9 +110,10 @@ type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 pub async fn run(args: Args) -> Result<()> {
     check_decisions_url(&args.config, &args.router_urls)?;
     let credential_env = credential_env_names(&args.config)?;
-    let classifier_pin = crate::hybrid_classifier::cloud_pin(&serde_json::from_slice(
-        &std::fs::read(&args.config)?,
-    )?);
+    let classifier_pin = crate::hybrid_classifier::cloud_pin(
+        &serde_json::from_slice(&std::fs::read(&args.config)?)?,
+        &args.classifier_model,
+    );
     let startup_timeout = Duration::from_secs(args.startup_timeout_secs);
     let startup_deadline = tokio::time::Instant::now() + startup_timeout;
     // Register before spawning so cancellation during startup also reaps the child.

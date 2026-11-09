@@ -183,10 +183,14 @@ last turn to the local model; a local model that misses the format makes Claude
 Code ask the user to approve every action. Raydock's gateway recognizes the
 classifier (a Messages request with no tools whose system prompt opens with
 Claude Code's security-monitor prompt) and sends it, without consulting
-Decisions, to the profile's cloud Sonnet pin (else its first cloud Messages
-pin) on the same router as Decisions, with that deployment's key. A profile
-with no cloud Messages pin, or a launch without its key, leaves the classifier to
-the core. Each classifier call is then billed at the cloud model's price.
+Decisions, to Claude Haiku 5.5 (`anthropic/claude-haiku-5.5`) through the
+router of the profile's cloud Messages pins, on the same router as Decisions,
+with that deployment's key. Choose another model the router serves with
+`"hybrid": {"classifier_model": "anthropic/claude-sonnet-5.5"}` in
+`~/.config/rayline/settings.json` or `raydock hybrid start --classifier-model
+<provider/model>` (the flag wins); either applies with `--config` too. A
+profile with no cloud Messages pin, or a launch without its key, leaves the
+classifier to the core. Each classifier call is billed at that model's price.
 
 **Typed signals (optional, no setup).** A client that wants Decisions signals
 (for example `topic.operation`) adds `"routing": {"signals": ["topic.operation"]}`
