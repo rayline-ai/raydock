@@ -723,6 +723,10 @@ pub(crate) struct LocalRuntime {
     /// runtime does not report one (it is then the user's to state).
     pub window: Option<u64>,
     pub identity: LocalIdentity,
+    /// The runtime refuses a prompt over its window rather than cutting it:
+    /// llama.cpp, and a server whose `/v1/models` states its window (vLLM,
+    /// TensorFold). Ollama and `mlx_lm.server` truncate and say nothing.
+    pub refuses_over_window: bool,
 }
 
 /// Whether the loaded model is the one the default profile is built for:
@@ -810,6 +814,7 @@ pub(crate) async fn read_local_runtime(
         return LocalRuntime {
             window,
             identity: llamacpp_identity(&props),
+            refuses_over_window: true,
         };
     }
     let window = answer(client.get(format!("{base}/v1/models")))
@@ -826,6 +831,20 @@ pub(crate) async fn read_local_runtime(
         identity: show
             .as_ref()
             .map_or(LocalIdentity::Unknown, ollama_identity),
+        refuses_over_window: window.is_some(),
+    }
+}
+
+/// Marks the local deployment `context_overflow: "refuses"`: when every
+/// target falls short on an estimate, the core then sends the turn to this
+/// runtime and lets its own context refusal decide, instead of answering the
+/// compaction 400 for a prompt that may well fit.
+pub(crate) fn mark_local_refuses_over_window(profile: &mut Value) {
+    let deployments = profile.get_mut("deployments").and_then(Value::as_array_mut);
+    for deployment in deployments.into_iter().flatten() {
+        if deployment.get("kind").and_then(Value::as_str) == Some("local") {
+            deployment["context_overflow"] = json!("refuses");
+        }
     }
 }
 
@@ -2174,6 +2193,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn only_the_local_deployment_is_marked_as_refusing_an_over_window_prompt() {
+        let mut profile =
+            default_profile("https://r", "http://l", "m", 98_304, None, None).unwrap();
+        mark_local_refuses_over_window(&mut profile);
+        for deployment in profile["deployments"].as_array().unwrap() {
+            let expected = (deployment["kind"] == "local").then(|| json!("refuses"));
+            assert_eq!(
+                deployment.get("context_overflow").cloned(),
+                expected,
+                "{deployment}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn an_openai_compatible_runtime_reports_its_window_through_v1_models() {
         let client = reqwest::Client::new();
@@ -2185,7 +2219,8 @@ mod tests {
             runtime,
             LocalRuntime {
                 window: Some(1_048_576),
-                identity: LocalIdentity::Unknown
+                identity: LocalIdentity::Unknown,
+                refuses_over_window: true,
             }
         );
     }
@@ -2288,7 +2323,8 @@ mod tests {
             runtime,
             LocalRuntime {
                 window: Some(4096),
-                identity: LocalIdentity::Unknown
+                identity: LocalIdentity::Unknown,
+                refuses_over_window: true,
             }
         );
     }
@@ -2307,6 +2343,8 @@ mod tests {
             let runtime = read_local_runtime(&client, &url, "qwen3.8:27b").await;
             assert_eq!(runtime.window, None);
             assert!(runtime.identity == LocalIdentity::Match, "{runtime:?}");
+            // Ollama cuts an over-window prompt rather than refusing it.
+            assert!(!runtime.refuses_over_window);
         }
         let qwen36 = json!({"model_info": {"general.basename": "Qwen3.6", "general.size_label": "27B", "general.name": "Qwen3.6 27B"}});
         let url = runtime_stub(None, Some(qwen36)).await;

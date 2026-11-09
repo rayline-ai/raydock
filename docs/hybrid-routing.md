@@ -82,6 +82,13 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     model's `max_model_len` or `context_length` from `/v1/models` (vLLM,
     TensorFold; the entry whose `id` is the configured model, or the only
     entry). A larger loaded window never raises it.
+    A runtime that refuses an over-window prompt instead of cutting it
+    (llama.cpp, or a server whose `/v1/models` states its window, such as
+    vLLM and TensorFold) gets `context_overflow: "refuses"`: when every target
+    falls short only on an estimate, the core sends the turn to it and lets
+    its own context refusal decide. Ollama and MLX keep the default
+    (`"truncates"`), so a prompt estimated over their window is never sent to
+    be silently cut.
   - `hybrid.local_registry_model` declares another local model by its
     registry id (`provider/model`, such as `z-ai/glm-5.3-flash`). It sets the
     deployment's `registry_model`, the local derived action (`glm-5.3-flash`)
