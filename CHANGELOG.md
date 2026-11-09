@@ -3,6 +3,55 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
+## 0.4.3 (2026-11-09)
+
+### New
+
+- **Hybrid mode runs on any local model, not just Qwen3.8-27B.** Set
+  `hybrid.local_registry_model` in `~/.config/rayline/settings.json` to the
+  Rayline model ID of the model you serve, such as `"z-ai/glm-5.3-flash"`.
+  ARC then predicts for the model that actually runs. The value must have the
+  form `provider/model`; the execution core refuses a model its registry
+  doesn't know, and the error names the setting. It can't be combined with
+  `--config`, since a profile file sets its own model.
+- **`prefer_local` works with any local model.** The bundled execution core
+  (`rayline-core`, now pinned to `dbde74c0`) counts Qwen3.8-27B prompts exactly
+  and bounds other models' text prompts by their byte size (`caller_bounded`),
+  so ARC can keep a turn local only when it fits the window. It no longer needs
+  a llama.cpp prompt counter. This needs the production router from
+  2026-11-09 or later.
+- **Auto-mode safety checks go to the cloud.** Claude Code's auto-mode
+  classifier calls are sent to Claude Haiku 5.5 through the router instead of
+  the local model. Change the model with `hybrid.classifier_model` or
+  `--classifier-model`.
+
+### Fixed
+
+- **Hybrid reads the context window from `/v1/models`.** When a server has no
+  llama.cpp `/props` endpoint (vLLM, TensorFold), `hybrid start` reads
+  `max_model_len` or `context_length` from the served model's entry. As with
+  llama.cpp, this can only lower the configured window; a larger loaded window
+  prints how to raise the setting.
+- **A turn too long for a vLLM or TensorFold server moves to the cloud.** When
+  the server states its window in `/v1/models`, the local deployment is marked
+  as refusing over-window prompts, and the core asks ARC again after such a
+  refusal and moves the turn to a model that fits. llama.cpp (which may
+  truncate with `--context-shift`), Ollama and MLX keep the default.
+- **Each cloud target declares its own model's output ceiling.** Both Claude
+  5.5 cloud deployments now allow 128,000 output tokens instead of a shared
+  32,000. Override per model with `hybrid.cloud_output_tokens`.
+- **Every deployment lowers an over-cap output allowance.** A request asking
+  for more output than a cloud deployment's ceiling is lowered to it instead of
+  refused, as the local deployment already did; the stated and sent figures are
+  logged. A turn whose thinking budget reaches the ceiling is still refused.
+
+### Note
+
+Hybrid routing decisions send the conversation to Rayline's router: only local
+inference stays on your machine. For fully local use, run
+`raydock claude --local` with a fully local config. See
+`docs/hybrid-local-setup.md`, "What leaves your machine".
+
 ## 0.4.2 (2026-11-07)
 
 ### New
