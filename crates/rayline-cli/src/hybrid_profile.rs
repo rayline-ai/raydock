@@ -14,9 +14,10 @@
 //!             "local_registry_model": "qwen/qwen3.8-27b"}}
 //! ```
 //!
-//! `hybrid.local_context_window` is the local model's window in tokens
-//! ([`DEFAULT_LOCAL_CONTEXT_WINDOW`] when absent). Load the local runtime with
-//! at least that window; a turn whose prompt does not fit hands off to cloud.
+//! `hybrid.local_context_window` is the local model's window in tokens. When
+//! absent, the window the runtime reports is used, else
+//! [`DEFAULT_LOCAL_CONTEXT_WINDOW`]. A turn whose prompt does not fit hands off
+//! to cloud.
 //!
 //! `hybrid.local_registry_model` declares which model the default profile's
 //! local deployment serves, as the core's registry names it
@@ -80,16 +81,19 @@ pub(crate) const CLOUD_MODELS: &[(&str, &str, u64)] = &[
 /// core refuses a budget that reaches the admitted limit either way.
 const CLOUD_OUTPUT_RANGE: std::ops::RangeInclusive<u64> = 1025..=1_000_000;
 
-/// `hybrid.local_context_window` from settings, or the default.
-pub(crate) fn local_context_window(settings: Option<&Value>) -> Result<u64, String> {
+/// `hybrid.local_context_window` from settings, if the user set one.
+pub(crate) fn configured_local_context_window(
+    settings: Option<&Value>,
+) -> Result<Option<u64>, String> {
     let value = settings
         .and_then(|settings| settings.get("hybrid"))
         .and_then(|hybrid| hybrid.get("local_context_window"));
     match value {
-        None => Ok(DEFAULT_LOCAL_CONTEXT_WINDOW),
+        None => Ok(None),
         Some(value) => value
             .as_u64()
             .filter(|window| LOCAL_CONTEXT_WINDOW_RANGE.contains(window))
+            .map(Some)
             .ok_or_else(|| {
                 format!(
                     "settings hybrid.local_context_window must be a whole number of tokens from {} to {}",
@@ -97,6 +101,56 @@ pub(crate) fn local_context_window(settings: Option<&Value>) -> Result<u64, Stri
                     LOCAL_CONTEXT_WINDOW_RANGE.end()
                 )
             }),
+    }
+}
+
+/// The local deployment's window and a note for the user.
+///
+/// `configured` is the user's window (`--local-context-window`, else settings
+/// `hybrid.local_context_window`); `loaded` is the window the runtime reports
+/// (llama.cpp `/props`, or `/v1/models` from vLLM or TensorFold). A runtime
+/// cannot hold more than it was loaded with, so a smaller loaded window always
+/// wins. With no configured window, a reported one is used as is, up to the
+/// cloud targets' window: the default exists to bound memory for a runtime
+/// whose window Raydock cannot see, and a runtime that reports one has
+/// already allocated it. Before 0.4.3 the default applied even then, so
+/// Claude Code on a non-Qwen model, whose opening request alone bounds above
+/// the default, never ran locally.
+pub(crate) fn resolve_local_window(
+    configured: Option<u64>,
+    loaded: Option<u64>,
+) -> (u64, Option<String>) {
+    let max = *LOCAL_CONTEXT_WINDOW_RANGE.end();
+    match (configured, loaded) {
+        (Some(configured), Some(loaded)) if loaded < configured => (
+            loaded,
+            Some(format!(
+                "Note: the local runtime is loaded with a {loaded}-token window, below the configured {configured}; using {loaded}. Load it with a {configured}-token window (llama.cpp `--ctx-size {configured}`, vLLM `--max-model-len {configured}`) to keep longer turns local."
+            )),
+        ),
+        (Some(configured), Some(loaded)) if loaded > configured => (
+            configured,
+            Some(format!(
+                "Note: the local runtime is loaded with a {loaded}-token window; Raydock uses the configured {configured}. Remove --local-context-window and settings hybrid.local_context_window to use the runtime's window."
+            )),
+        ),
+        (Some(configured), Some(_)) => (configured, None),
+        (None, Some(loaded)) if loaded > max => (
+            max,
+            Some(format!(
+                "Note: the local runtime is loaded with a {loaded}-token window; Raydock uses {max}, the cloud targets' window."
+            )),
+        ),
+        (None, Some(loaded)) => (loaded, None),
+        (configured, None) => {
+            let window = configured.unwrap_or(DEFAULT_LOCAL_CONTEXT_WINDOW);
+            (
+                window,
+                Some(format!(
+                    "Warning: Raydock cannot read this runtime's context window, so it assumes {window} tokens. Load the local model with at least that window (llama.cpp `--ctx-size {window}`, Ollama `OLLAMA_CONTEXT_LENGTH={window}`): a runtime loaded with less (Ollama's default is a few thousand tokens) may silently truncate longer prompts. Set a smaller window with --local-context-window if needed."
+                )),
+            )
+        }
     }
 }
 
@@ -1221,17 +1275,23 @@ mod tests {
     }
 
     #[test]
-    fn local_context_window_defaults_to_96k_and_can_be_raised() {
-        assert_eq!(local_context_window(None).unwrap(), 98_304);
+    fn local_context_window_is_unset_unless_configured() {
+        assert_eq!(configured_local_context_window(None).unwrap(), None);
         assert_eq!(
-            local_context_window(Some(&json!({"hybrid": {}}))).unwrap(),
-            98_304
+            configured_local_context_window(Some(&json!({"hybrid": {}}))).unwrap(),
+            None
         );
         let raised = json!({"hybrid": {"local_context_window": 131_072}});
-        assert_eq!(local_context_window(Some(&raised)).unwrap(), 131_072);
+        assert_eq!(
+            configured_local_context_window(Some(&raised)).unwrap(),
+            Some(131_072)
+        );
         for bad in [json!(1024), json!(2_000_000), json!("96k"), json!(-1)] {
             let settings = json!({"hybrid": {"local_context_window": bad}});
-            assert!(local_context_window(Some(&settings)).is_err(), "{bad}");
+            assert!(
+                configured_local_context_window(Some(&settings)).is_err(),
+                "{bad}"
+            );
         }
         // The cloud targets carry their 1M window.
         let profile = default_profile(
@@ -1262,6 +1322,32 @@ mod tests {
                 (json!("cloud-sonnet"), json!(1_000_000))
             ]
         );
+    }
+
+    #[test]
+    fn an_unconfigured_window_follows_the_runtime_and_a_configured_one_is_capped_by_it() {
+        // Unconfigured: the runtime's reported window, so Claude Code's
+        // ~110k opening request fits a 262k GLM server.
+        assert_eq!(resolve_local_window(None, Some(262_144)), (262_144, None));
+        assert_eq!(resolve_local_window(None, Some(32_768)), (32_768, None));
+        let (window, note) = resolve_local_window(None, Some(1_048_576));
+        assert_eq!(window, 1_000_000);
+        assert!(note.is_some());
+        // Unconfigured and unreadable (Ollama, MLX): the default, with a warning.
+        let (window, note) = resolve_local_window(None, None);
+        assert_eq!(window, DEFAULT_LOCAL_CONTEXT_WINDOW);
+        assert!(note.is_some_and(|note| note.starts_with("Warning")));
+        // Configured: kept, but never above what the runtime holds.
+        assert_eq!(
+            resolve_local_window(Some(131_072), Some(131_072)),
+            (131_072, None)
+        );
+        assert_eq!(
+            resolve_local_window(Some(131_072), Some(262_144)).0,
+            131_072
+        );
+        assert_eq!(resolve_local_window(Some(131_072), Some(65_536)).0, 65_536);
+        assert_eq!(resolve_local_window(Some(131_072), None).0, 131_072);
     }
 
     #[test]

@@ -85,23 +85,24 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
    - Claude Opus 5.5 and Sonnet 5.5, through the same router, are the cloud
      targets.
 
-   The local model's context window defaults to 98,304 tokens. Load your
-   runtime with at least that window:
-   - llama.cpp: `llama-server --ctx-size 98304 ...` (Rayline reads the loaded
-     window from `/props` and uses the smaller of the two);
-   - Ollama: `OLLAMA_CONTEXT_LENGTH=98304 ollama serve`, or `num_ctx` in the
-     model's Modelfile. Ollama's default is much smaller and it silently
-     truncates a longer prompt, so set it;
-   - vLLM and TensorFold: `--max-model-len 98304` or more (Rayline reads the
-     served model's `max_model_len` or `context_length` from `/v1/models` and
-     uses the smaller of the two);
-   - MLX (`mlx_lm.server`): check that your build's KV-cache limit, if you set
-     one, is at least 98,304 tokens.
+   Rayline uses the context window your runtime reports, so load it with the
+   window you want:
+   - llama.cpp: `llama-server --ctx-size 262144 ...` (Rayline reads the loaded
+     window from `/props`);
+   - vLLM and TensorFold: `--max-model-len 262144` (Rayline reads the served
+     model's `max_model_len` or `context_length` from `/v1/models`);
+   - Ollama and MLX report no window, so Rayline assumes 98,304 tokens. For
+     Ollama set `OLLAMA_CONTEXT_LENGTH=98304 ollama serve`, or `num_ctx` in
+     the model's Modelfile: Ollama's default is much smaller and it silently
+     truncates a longer prompt. For MLX (`mlx_lm.server`), check that your
+     build's KV-cache limit, if you set one, is at least that.
 
-   A runtime loaded with a larger window does not raise the configured one;
-   `start` notes the larger window, and you raise it as below.
+   Claude Code's opening request alone is about 110,000 tokens for a model
+   other than Qwen3.8-27B, and the window must also hold the answer (up to
+   32,000 tokens), so give such a model at least 262,144 tokens, or every
+   Claude Code turn goes to cloud.
 
-   Raise or lower it with `"hybrid": {"local_context_window": 131072}` in
+   Set the window yourself with `"hybrid": {"local_context_window": 262144}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
    `start`. A turn whose prompt does not fit the local window goes to a cloud
    model; harnesses are told the window is 1,000,000 tokens. `start` uses the
