@@ -124,23 +124,19 @@ config instead (see the [Getting Started guide](getting-started.md)).
      truncates a longer prompt. For MLX (`mlx_lm.server`), check that your
      build's KV-cache limit, if you set one, is at least that.
 
-   Claude Code's opening request alone is about 110,000 tokens for a model
-   other than Qwen3.8-27B, and the window must also hold the answer (up to
-   32,000 tokens), so give such a model at least 262,144 tokens, or every
-   Claude Code turn goes to cloud.
+   For Claude Code with a model other than Qwen3.8-27B, use a window well
+   above 110,000 tokens. The core sizes such a request by its byte length
+   plus the answer it allows, and Claude Code's opening request alone comes
+   to about 105,000 to 112,000 tokens that way, so at 98,304 every Claude
+   Code turn goes to cloud. At 131,072 a session starts locally and moves to
+   cloud once it grows past the window; a larger window, such as 262,144,
+   keeps longer sessions local.
 
    Set the window yourself with `"hybrid": {"local_context_window": 262144}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
    `start`. A turn whose prompt does not fit the local window goes to a cloud
    model; harnesses are told the window is 1,000,000 tokens. `start` uses the
    production router by default; `--env dev` selects the development one.
-
-   For Claude Code with a model other than Qwen3.8-27B, raise the window.
-   The core bounds such a prompt by its byte size, and Claude Code's opening
-   request alone bounds at about 110,000 tokens, so at the 98,304 default no
-   Claude Code turn fits locally and every turn goes to cloud. Load the runtime
-   with a larger window and start with, for example,
-   `--local-context-window 262144`.
 
    `start` checks Decisions once before it reports ready: a rejected key
    fails with the `raydock auth login` command to run, and a development cell
