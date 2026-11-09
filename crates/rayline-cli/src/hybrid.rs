@@ -40,9 +40,15 @@ enum Action {
         env: String,
         /// Local model context window in tokens (default: settings
         /// `hybrid.local_context_window`, else 98304). A turn whose prompt does
-        /// not fit hands off to cloud. llama.cpp's loaded window caps it.
+        /// not fit hands off to cloud. The runtime's loaded window caps it
+        /// (llama.cpp `/props`, or `/v1/models` from vLLM or TensorFold).
         #[arg(long, value_parser = clap::value_parser!(u64).range(2048..=1_000_000))]
         local_context_window: Option<u64>,
+        /// Model for Claude Code's auto-mode safety classifier, sent through
+        /// your cloud router (default: settings `hybrid.classifier_model`, else
+        /// anthropic/claude-haiku-5.5).
+        #[arg(long)]
+        classifier_model: Option<String>,
         /// Isolated Decisions cell tag (development only).
         #[arg(long)]
         cell: Option<String>,
@@ -149,6 +155,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             config,
             env,
             local_context_window,
+            classifier_model,
             cell,
             port,
             startup_timeout_secs,
@@ -166,11 +173,19 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 None => (None, None),
             };
             let settings_error = |error| settings_error(settings_path.as_deref(), error);
+            let classifier_model = crate::hybrid_profile::classifier_model(
+                classifier_model.as_deref(),
+                settings.as_ref(),
+            )
+            .map_err(settings_error)?;
             let origin = if config.is_some() {
                 crate::hybrid_profile::ProfileOrigin::File
             } else {
                 crate::hybrid_profile::ProfileOrigin::Default
             };
+            // A local model other than the default Qwen3.8-27B, declared in
+            // settings: named in the error if the core refuses to start.
+            let mut declared_local = None;
             let (profile, base_dir) = match config {
                 Some(config) => {
                     if env != "prod" || cell.is_some() || local_context_window.is_some() {
@@ -204,20 +219,38 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         None => crate::hybrid_profile::local_context_window(settings.as_ref())
                             .map_err(settings_error)?,
                     };
+                    let registry_model =
+                        crate::hybrid_profile::local_registry_model(settings.as_ref())
+                            .map_err(settings_error)?;
                     let runtime =
                         crate::hybrid_profile::read_local_runtime(&client, &base_url, &model).await;
-                    if let Some(message) = runtime.identity.start_message(&base_url) {
+                    // The identity check knows only Qwen3.8-27B; a declared
+                    // model is the user's statement and is not checked.
+                    let (local_refused, message) = crate::hybrid_profile::local_verdict(
+                        &registry_model,
+                        &runtime.identity,
+                        &base_url,
+                    );
+                    if let Some(message) = message {
                         eprintln!("{message}");
                     }
-                    let local_refused = runtime.identity.refuses_local();
+                    if registry_model != crate::hybrid_profile::LOCAL_REGISTRY_MODEL {
+                        declared_local = Some(registry_model);
+                    }
                     let window = match runtime.window {
                         _ if local_refused => configured,
                         // The runtime cannot hold more than it was loaded with.
                         Some(loaded) if loaded < configured => {
                             eprintln!(
-                                "Note: the local runtime is loaded with a {loaded}-token window, below the configured {configured}; using {loaded}. Restart llama.cpp with `--ctx-size {configured}` to keep longer turns local."
+                                "Note: the local runtime is loaded with a {loaded}-token window, below the configured {configured}; using {loaded}. Load it with a {configured}-token window (llama.cpp `--ctx-size {configured}`, vLLM `--max-model-len {configured}`) to keep longer turns local."
                             );
                             loaded
+                        }
+                        Some(loaded) if loaded > configured => {
+                            eprintln!(
+                                "Note: the local runtime is loaded with a {loaded}-token window; Raydock uses the configured {configured}. Raise it with --local-context-window or settings hybrid.local_context_window to keep longer turns local."
+                            );
+                            configured
                         }
                         Some(_) => configured,
                         None => {
@@ -293,6 +326,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             if let Some((id, url, model)) = &composed.local_model {
                 println!("Local model: {model} at {url} (deployment {id}, from local_model)");
             }
+            println!(
+                "Auto-mode classifier: {classifier_model} (Claude Code's safety checks; change with settings hybrid.classifier_model or --classifier-model)"
+            );
             for (name, _) in &credentials {
                 println!("Using the saved Rayline key for {name}");
             }
@@ -341,6 +377,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 command.arg("--router-url").arg(router_url);
             }
             command.arg("--env-name").arg(&decisions_env);
+            command.arg("--classifier-model").arg(&classifier_model);
             for (name, key) in &credentials {
                 command.env(name, key);
             }
@@ -350,9 +387,10 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 let started = Instant::now();
                 loop {
                     if let Some(status) = child.try_wait()? {
-                        return Err(io::Error::other(format!(
-                            "hybrid runtime exited ({status}); see {}",
-                            paths.log().display()
+                        return Err(io::Error::other(exit_message(
+                            &status.to_string(),
+                            &paths.log(),
+                            declared_local.as_deref(),
                         )));
                     }
                     if paths.ready().exists() {
@@ -974,6 +1012,19 @@ fn private_dir(path: &Path) -> io::Result<()> {
 }
 
 /// A composition error, naming the settings file when the settings caused it.
+/// The error for a runtime that exits during startup. With a declared local
+/// model it names the setting: a core whose embedded registry does not know
+/// the model refuses the profile and exits.
+fn exit_message(status: &str, log: &Path, declared_local: Option<&str>) -> String {
+    let mut message = format!("hybrid runtime exited ({status}); see {}", log.display());
+    if let Some(model) = declared_local {
+        message.push_str(&format!(
+            ". If the log says the core does not know {model}, it is not in this core's model registry: correct settings hybrid.local_registry_model, or remove it to use Qwen3.8-27B"
+        ));
+    }
+    message
+}
+
 fn settings_error(settings_path: Option<&Path>, error: String) -> io::Error {
     match settings_path {
         Some(path) if error.starts_with("settings ") => {
@@ -1193,6 +1244,22 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(5)).unwrap();
         waiter.join().unwrap();
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_runtime_exit_names_a_declared_local_model() {
+        let log = Path::new("/state/runtime.log");
+        let plain = exit_message("exit status: 1", log, None);
+        assert_eq!(
+            plain,
+            "hybrid runtime exited (exit status: 1); see /state/runtime.log"
+        );
+        let declared = exit_message("exit status: 1", log, Some("z-ai/glm-5.3-flash"));
+        assert!(declared.starts_with(&plain));
+        assert!(
+            declared.contains("z-ai/glm-5.3-flash")
+                && declared.contains("hybrid.local_registry_model")
+        );
     }
 
     #[test]

@@ -64,6 +64,10 @@ pub struct Args {
     /// sign-in hint when Decisions refuses that key.
     #[arg(long)]
     env_name: Option<String>,
+    /// Model that answers Claude Code's auto-mode classifier, through the
+    /// profile's cloud Messages router.
+    #[arg(long, default_value = crate::hybrid_classifier::DEFAULT_CLASSIFIER_MODEL)]
+    classifier_model: String,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +101,8 @@ struct Gateway {
     shutdown: mpsc::Sender<()>,
     /// The command that renews the router key Decisions uses.
     login_command: String,
+    /// Where Claude Code's auto-mode classifier goes instead of the core.
+    classifier_pin: Option<crate::hybrid_classifier::CloudPin>,
 }
 
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
@@ -104,6 +110,10 @@ type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 pub async fn run(args: Args) -> Result<()> {
     check_decisions_url(&args.config, &args.router_urls)?;
     let credential_env = credential_env_names(&args.config)?;
+    let classifier_pin = crate::hybrid_classifier::cloud_pin(
+        &serde_json::from_slice(&std::fs::read(&args.config)?)?,
+        &args.classifier_model,
+    );
     let startup_timeout = Duration::from_secs(args.startup_timeout_secs);
     let startup_deadline = tokio::time::Instant::now() + startup_timeout;
     // Register before spawning so cancellation during startup also reaps the child.
@@ -170,6 +180,7 @@ pub async fn run(args: Args) -> Result<()> {
             capabilities: capabilities.clone(),
             shutdown: shutdown_tx,
             login_command: login_command(args.env_name.as_deref()),
+            classifier_pin,
         });
         let ready = Ready {
             contract_version: CONTRACT_VERSION,
@@ -415,6 +426,13 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         }
         Err(error) => bail!("read request body: {error}"),
     };
+    if let Some(pin) = &state.classifier_pin
+        && parts.method == Method::POST
+        && crate::hybrid_classifier::is_classifier(parts.uri.path(), &body)
+        && let Some(response) = send_classifier_to_cloud(state, pin, &parts, &body).await?
+    {
+        return Ok(response);
+    }
     let mut retried = false;
     loop {
         let upstream = send_to_core(state, &parts, body.clone()).await?;
@@ -436,6 +454,72 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         }
         return buffered_response(state, status, &headers, error_body, failure);
     }
+}
+
+/// Sends an auto-mode classifier request to the cloud pin the way the core
+/// dispatches a model-pin turn. None (the core takes the request) when the
+/// pin's credential is not in this process's environment.
+async fn send_classifier_to_cloud(
+    state: &Gateway,
+    pin: &crate::hybrid_classifier::CloudPin,
+    parts: &hyper::http::request::Parts,
+    body: &[u8],
+) -> Result<Option<Response<Body>>> {
+    let Some(key) = std::env::var(&pin.auth_env)
+        .ok()
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(pinned) = crate::hybrid_classifier::pinned_body(body, &pin.wire_model) else {
+        return Ok(None);
+    };
+    let mut outgoing = state
+        .client
+        .post(&pin.url)
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("anthropic-version", "2023-06-01")
+        .header("x-workshop-required-model", &pin.wire_model);
+    for name in ["anthropic-beta", "x-claude-code-session-id"] {
+        if let Some(value) = parts.headers.get(name) {
+            outgoing = outgoing.header(name, value);
+        }
+    }
+    if let Some(session) = parts.headers.get("x-claude-code-session-id") {
+        outgoing = outgoing.header("x-conversation-id", session);
+    }
+    let upstream = outgoing.bearer_auth(key).body(pinned).send().await?;
+    let status = upstream.status();
+    tracing::info!(
+        model = %pin.wire_model,
+        status = status.as_u16(),
+        "auto-mode classifier sent to the cloud pin"
+    );
+    if !status.is_success() {
+        // The router's message can echo request content, so only its error
+        // type is logged.
+        let headers = upstream.headers().clone();
+        let error_body = upstream.bytes().await?;
+        let error_type = serde_json::from_slice::<serde_json::Value>(&error_body)
+            .ok()
+            .and_then(|error| {
+                error
+                    .pointer("/error/type")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|kind| {
+                        kind.len() <= 64
+                            && kind
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    })
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
+        tracing::warn!(status = status.as_u16(), %error_type, "cloud pin refused the auto-mode classifier");
+        return buffered_response(state, status, &headers, error_body, None).map(Some);
+    }
+    stream_response(upstream).map(Some)
 }
 
 async fn send_to_core(

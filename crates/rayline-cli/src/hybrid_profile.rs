@@ -10,12 +10,18 @@
 //! ```json
 //! {"hybrid": {"routing": {"policy": "utility" | "prefer_local", "min_p_pass": 0.65,
 //!                         "schedule": {"model": ["cache_boundaries", "user_messages"]}},
-//!             "local_context_window": 98304}}
+//!             "local_context_window": 98304,
+//!             "local_registry_model": "qwen/qwen3.8-27b"}}
 //! ```
 //!
 //! `hybrid.local_context_window` is the local model's window in tokens
 //! ([`DEFAULT_LOCAL_CONTEXT_WINDOW`] when absent). Load the local runtime with
 //! at least that window; a turn whose prompt does not fit hands off to cloud.
+//!
+//! `hybrid.local_registry_model` declares which model the default profile's
+//! local deployment serves, as the core's registry names it
+//! ([`LOCAL_REGISTRY_MODEL`] when absent). The core refuses a model its
+//! embedded registry does not know when it starts.
 //!
 //! A profile deployment marked `"from_local_model": true` takes its endpoint
 //! and served model from the `local_model` entry (`raydock local custom …`).
@@ -38,7 +44,7 @@ const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 /// own fixed V (no `routing.v_value`), which picks cheap and so uses the local
 /// model most.
 pub(crate) const DECISIONS_MODEL: &str = "arc-swift-1.0";
-const LOCAL_REGISTRY_MODEL: &str = "qwen/qwen3.8-27b";
+pub(crate) const LOCAL_REGISTRY_MODEL: &str = "qwen/qwen3.8-27b";
 /// The local model's default window: 96k tokens keeps Qwen3.8-27B's KV cache
 /// within a laptop's memory, and a longer turn hands off to cloud.
 pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW: u64 = 98_304;
@@ -92,6 +98,76 @@ pub(crate) fn local_context_window(settings: Option<&Value>) -> Result<u64, Stri
                 )
             }),
     }
+}
+
+/// `hybrid.local_registry_model` from settings, or [`LOCAL_REGISTRY_MODEL`].
+/// Raydock has no copy of the core's registry, so it checks only the shape
+/// (`provider/model`); the core refuses a model its registry does not know.
+pub(crate) fn local_registry_model(settings: Option<&Value>) -> Result<String, String> {
+    let value = settings
+        .and_then(|settings| settings.get("hybrid"))
+        .and_then(|hybrid| hybrid.get("local_registry_model"));
+    let Some(value) = value else {
+        return Ok(LOCAL_REGISTRY_MODEL.to_owned());
+    };
+    value
+        .as_str()
+        .filter(|id| is_model_id(id))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            "settings hybrid.local_registry_model must be a registry model id \"provider/model\", such as \"z-ai/glm-5.3-flash\"".to_owned()
+        })
+}
+
+/// The model Claude Code's auto-mode classifier goes to: `--classifier-model`,
+/// else `hybrid.classifier_model` from settings, else Claude Haiku 5.5. It is
+/// sent through the profile's cloud router, so any model that router serves
+/// on Messages works; Raydock checks only the `provider/model` shape. Applies
+/// with a profile file too, since the classifier is not a profile target.
+pub(crate) fn classifier_model(
+    flag: Option<&str>,
+    settings: Option<&Value>,
+) -> Result<String, String> {
+    if let Some(flag) = flag {
+        return if is_model_id(flag) {
+            Ok(flag.to_owned())
+        } else {
+            Err(format!(
+                "--classifier-model must be a router model id \"provider/model\", such as \"{CLASSIFIER_MODEL}\""
+            ))
+        };
+    }
+    let value = settings
+        .and_then(|settings| settings.get("hybrid"))
+        .and_then(|hybrid| hybrid.get("classifier_model"));
+    let Some(value) = value else {
+        return Ok(CLASSIFIER_MODEL.to_owned());
+    };
+    value
+        .as_str()
+        .filter(|id| is_model_id(id))
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            format!("settings hybrid.classifier_model must be a router model id \"provider/model\", such as \"{CLASSIFIER_MODEL}\"")
+        })
+}
+
+/// Claude Code's auto-mode classifier model when the user names none.
+pub(crate) const CLASSIFIER_MODEL: &str = "anthropic/claude-haiku-5.5";
+
+/// `provider/model`: one slash, both parts non-empty, no whitespace.
+fn is_model_id(id: &str) -> bool {
+    id.split_once('/').is_some_and(|(provider, model)| {
+        !provider.is_empty() && !model.is_empty() && !model.contains('/')
+    }) && !id.chars().any(char::is_whitespace)
+}
+
+/// The derived action's model and worker name for a registry id: the part
+/// after the provider (`qwen/qwen3.8-27b` -> `qwen3.8-27b`).
+fn registry_action_model(registry_model: &str) -> &str {
+    registry_model
+        .split_once('/')
+        .map_or(registry_model, |(_, model)| model)
 }
 
 /// `hybrid.routing.local_price`: USD per million tokens for every leg of the
@@ -236,6 +312,14 @@ pub(crate) fn compose(
         ProfileOrigin::File if priced => {
             return Err("settings hybrid.routing.local_price applies only to the default profile; a profile file (--config) sets its own prices, so remove local_price or start without --config".to_owned());
         }
+        ProfileOrigin::File
+            if settings
+                .and_then(|settings| settings.get("hybrid"))
+                .and_then(|hybrid| hybrid.get("local_registry_model"))
+                .is_some() =>
+        {
+            return Err("settings hybrid.local_registry_model applies only to the default profile; a profile file (--config) sets its own registry_model, so remove local_registry_model or start without --config".to_owned());
+        }
         ProfileOrigin::File => {}
         ProfileOrigin::Default => {
             local_price(settings)?;
@@ -292,8 +376,12 @@ pub(crate) fn compose(
         .map(ToOwned::to_owned);
     routing.insert("policy".to_owned(), Value::Object(policy));
     if preset.as_deref() == Some(PREFER_LOCAL_PRESET) {
-        // Prefer-local excludes a local target whose capacity is unknown, so
-        // without a qualified token counter it would never choose local.
+        // Prefer-local excludes a local target whose capacity is unknown. A
+        // local deployment's capacity is counted by its llama.cpp
+        // prompt_counter, or else sized by the core itself: it counts
+        // Qwen3.8-27B with its embedded tokenizer and bounds any other model
+        // by bytes (`caller_bounded`). Only a profile with no local
+        // deployment, or a malformed counter, can never select local.
         let locals: Vec<&Value> = profile
             .get("deployments")
             .and_then(Value::as_array)
@@ -301,15 +389,19 @@ pub(crate) fn compose(
             .flatten()
             .filter(|deployment| deployment.get("kind").and_then(Value::as_str) == Some("local"))
             .collect();
-        let counted = !locals.is_empty()
-            && locals.iter().all(|deployment| {
-                deployment
-                    .get("prompt_counter")
-                    .is_some_and(Value::is_object)
-            });
-        if !counted {
+        if locals.is_empty() {
             return Err(
-                "settings hybrid.routing.policy \"prefer_local\" needs a local deployment with a qualified llama.cpp prompt_counter (a profile file); without counted capacity it never selects the local model. Use \"utility\" with the default profile"
+                "settings hybrid.routing.policy \"prefer_local\" needs a local deployment, and this session has none (local routing is off); use \"utility\" or fix the local model"
+                    .to_owned(),
+            );
+        }
+        if locals.iter().any(|deployment| {
+            deployment
+                .get("prompt_counter")
+                .is_some_and(|counter| !counter.is_object())
+        }) {
+            return Err(
+                "settings hybrid.routing.policy \"prefer_local\" needs each local deployment's prompt_counter to be an object; fix or remove it in the profile"
                     .to_owned(),
             );
         }
@@ -517,7 +609,8 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
     Some((base_url, field("model")?))
 }
 
-/// The default package-less profile: local Qwen from `local_model`, Opus and
+/// The default package-less profile: the local model from `local_model`
+/// (Qwen3.8-27B unless `hybrid.local_registry_model` declares another), Opus and
 /// Sonnet through the signed-in router (exact model pins), decisions from the
 /// router's [`DECISIONS_MODEL`] with the hybrid default preset applied by
 /// [`compose`]. The core derives each action's controls from its embedded
@@ -540,6 +633,8 @@ pub(crate) fn default_profile(
     // local model at `local_price` (default 0, every leg, USD per million
     // tokens) and leave cloud models at their market prices.
     let local_price = local_price(settings)?;
+    let registry_model = local_registry_model(settings)?;
+    let action_model = registry_action_model(&registry_model);
     if context_window < 2048 {
         return Err(format!(
             "local context window {context_window} is too small"
@@ -576,7 +671,7 @@ pub(crate) fn default_profile(
     };
     let legs = json!({"input": local_price, "output": local_price, "cache_read": local_price, "cache_write": local_price});
     let mut prices = Map::new();
-    prices.insert(LOCAL_REGISTRY_MODEL.to_owned(), legs);
+    prices.insert(registry_model.clone(), legs);
     // Routes API V1: the caller's V is `v_value`; the caller prices only the
     // local model and the service fills every other candidate from its
     // catalog, so there is no `exclusive` member and no digest to precompute
@@ -589,7 +684,7 @@ pub(crate) fn default_profile(
     }
     let mut deployments = vec![json!(
         {"id": "local", "kind": "local", "url": local_url, "protocol": "openai.chat.v1", "wire_model": model,
-         "registry_model": LOCAL_REGISTRY_MODEL, "registry_provider": "openai",
+         "registry_model": registry_model, "registry_provider": "openai",
          "runtime_identity": format!("local_model:{model}"), "max_output_tokens": max_output,
          "context_window": context_window, "input_modalities": ["text"], "token_units": "",
          // The smallest cap of the three, so a caller asking for more is
@@ -600,7 +695,7 @@ pub(crate) fn default_profile(
     // core only checks that an action names a known deployment, so a pin with
     // a deployment and no action would be unroutable without any error.
     let mut derived_actions =
-        vec![json!({"model": "qwen3.8-27b", "worker": "qwen3.8-27b", "deployment_id": "local"})];
+        vec![json!({"model": action_model, "worker": action_model, "deployment_id": "local"})];
     for (id, wire, ceiling) in &cloud_pins {
         deployments.push(cloud(id, wire, *ceiling));
         // The action names the model as the core's registry knows it: the pin
@@ -622,8 +717,10 @@ pub(crate) fn default_profile(
 /// starts: its per-slot window and which model it serves.
 #[derive(Debug, PartialEq)]
 pub(crate) struct LocalRuntime {
-    /// llama.cpp's per-slot context window; None when the runtime does not
-    /// report one (it is then the user's to state).
+    /// The loaded context window: llama.cpp's per-slot `n_ctx`, or the
+    /// served model's `max_model_len` / `context_length` from an
+    /// OpenAI-compatible `/v1/models` (vLLM, TensorFold); None when the
+    /// runtime does not report one (it is then the user's to state).
     pub window: Option<u64>,
     pub identity: LocalIdentity,
 }
@@ -661,9 +758,29 @@ impl LocalIdentity {
     }
 }
 
+/// Whether local routing is refused for this session, and what to tell the
+/// user. The identity check knows only Qwen3.8-27B: a model declared in
+/// `hybrid.local_registry_model` is the user's statement and is not checked.
+pub(crate) fn local_verdict(
+    registry_model: &str,
+    identity: &LocalIdentity,
+    base_url: &str,
+) -> (bool, Option<String>) {
+    if registry_model == LOCAL_REGISTRY_MODEL {
+        (identity.refuses_local(), identity.start_message(base_url))
+    } else {
+        (
+            false,
+            Some(format!(
+                "Local model: {registry_model} (declared in settings hybrid.local_registry_model; Raydock does not check what {base_url} serves)"
+            )),
+        )
+    }
+}
+
 /// Reads what the runtime serves: llama.cpp's `/props` (its loaded file and
-/// window), else Ollama's `/api/show` for the configured model (the GGUF's
-/// `general.*` metadata). A user-chosen name such as a llama.cpp alias or the
+/// window), else `/v1/models` for the window and Ollama's `/api/show` for the
+/// configured model (the GGUF's `general.*` metadata). A user-chosen name such as a llama.cpp alias or the
 /// request's own model name is not evidence: the runtimes echo it back on
 /// every chat response, so the response cannot confirm the model either.
 pub(crate) async fn read_local_runtime(
@@ -695,6 +812,9 @@ pub(crate) async fn read_local_runtime(
             identity: llamacpp_identity(&props),
         };
     }
+    let window = answer(client.get(format!("{base}/v1/models")))
+        .await
+        .and_then(|models| served_window(&models, model));
     let show = answer(
         client
             .post(format!("{base}/api/show"))
@@ -702,11 +822,31 @@ pub(crate) async fn read_local_runtime(
     )
     .await;
     LocalRuntime {
-        window: None,
+        window,
         identity: show
             .as_ref()
             .map_or(LocalIdentity::Unknown, ollama_identity),
     }
+}
+
+/// The served model's window from an OpenAI-compatible `/v1/models` list:
+/// the entry whose `id` is the configured model, else the only entry. vLLM
+/// reports `max_model_len`; TensorFold reports it and `context_length`.
+fn served_window(models: &Value, model: &str) -> Option<u64> {
+    let entries = models.get("data")?.as_array()?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.get("id").and_then(Value::as_str) == Some(model))
+        .or(match entries.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        })?;
+    ["max_model_len", "context_length"].iter().find_map(|key| {
+        entry
+            .get(*key)
+            .and_then(Value::as_u64)
+            .filter(|window| *window > 0)
+    })
 }
 
 /// A reported name, lower case, letters and digits only.
@@ -1501,11 +1641,21 @@ mod tests {
     #[test]
     fn prefer_local_maps_to_its_preset_and_threshold() {
         let block = json!({"policy": "prefer_local", "min_p_pass": 0.65});
-        // Without a qualified counter the local target's capacity is unknown,
-        // which prefer-local excludes: refused rather than never choosing local.
+        // A local deployment without a counter is sized by the core itself.
+        let sized = compose(
+            profile(),
+            Some(&settings(Some(block.clone()))),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
+        assert_eq!(sized.preset.as_deref(), Some(PREFER_LOCAL_PRESET));
+        // A malformed counter is refused.
+        let mut malformed = profile();
+        malformed["deployments"][0]["prompt_counter"] = json!("/m.gguf");
         assert!(
             compose(
-                profile(),
+                malformed,
                 Some(&settings(Some(block.clone()))),
                 Path::new("/p"),
                 ProfileOrigin::File
@@ -1824,9 +1974,234 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn the_default_profile_prefers_local_without_a_prompt_counter() {
+        for local_settings in [settings(Some(json!({"policy": "prefer_local"}))), {
+            let mut glm = settings(Some(json!({"policy": "prefer_local"})));
+            glm["hybrid"]["local_registry_model"] = json!("z-ai/glm-5.3-flash");
+            glm
+        }] {
+            let profile = default_profile(
+                "https://r.example",
+                "http://127.0.0.1:1/v1",
+                "local-model",
+                98304,
+                None,
+                Some(&local_settings),
+            )
+            .unwrap();
+            assert!(profile["deployments"][0].get("prompt_counter").is_none());
+            let composed = compose(
+                profile,
+                Some(&local_settings),
+                Path::new("/state"),
+                ProfileOrigin::Default,
+            )
+            .unwrap();
+            assert_eq!(composed.preset.as_deref(), Some(PREFER_LOCAL_PRESET));
+        }
+    }
+
+    #[test]
+    fn classifier_model_is_haiku_unless_settings_or_the_flag_name_another() {
+        assert_eq!(
+            classifier_model(None, None).unwrap(),
+            "anthropic/claude-haiku-5.5"
+        );
+        let settings = json!({"hybrid": {"classifier_model": "anthropic/claude-sonnet-5.5"}});
+        assert_eq!(
+            classifier_model(None, Some(&settings)).unwrap(),
+            "anthropic/claude-sonnet-5.5"
+        );
+        assert_eq!(
+            classifier_model(Some("anthropic/claude-opus-5.5"), Some(&settings)).unwrap(),
+            "anthropic/claude-opus-5.5"
+        );
+        let bad = json!({"hybrid": {"classifier_model": "haiku"}});
+        assert!(
+            classifier_model(None, Some(&bad))
+                .unwrap_err()
+                .starts_with("settings hybrid.classifier_model")
+        );
+        assert!(
+            classifier_model(Some("claude haiku"), None)
+                .unwrap_err()
+                .starts_with("--classifier-model")
+        );
+    }
+
+    #[test]
+    fn local_registry_model_defaults_to_qwen() {
+        assert_eq!(local_registry_model(None).unwrap(), "qwen/qwen3.8-27b");
+        let profile = default_profile(
+            "https://r.example",
+            "http://127.0.0.1:1/v1",
+            "qwen3.8:27b",
+            98304,
+            None,
+            Some(&settings(None)),
+        )
+        .unwrap();
+        assert_eq!(
+            profile["deployments"][0]["registry_model"],
+            "qwen/qwen3.8-27b"
+        );
+        assert_eq!(
+            profile["derived_actions"][0],
+            json!({"model": "qwen3.8-27b", "worker": "qwen3.8-27b", "deployment_id": "local"})
+        );
+        assert!(profile["decisions"]["routing"]["prices"]["qwen/qwen3.8-27b"].is_object());
+    }
+
+    #[test]
+    fn a_declared_local_model_names_the_deployment_action_and_price() {
+        let mut glm = settings(None);
+        glm["hybrid"] = json!({"local_registry_model": "z-ai/glm-5.3-flash",
+                               "routing": {"local_price": 0.5}});
+        let profile = default_profile(
+            "https://r.example",
+            "http://127.0.0.1:8000/v1",
+            "GLM-5.3-Flash-EXL3",
+            98304,
+            None,
+            Some(&glm),
+        )
+        .unwrap();
+        let local = &profile["deployments"][0];
+        assert_eq!(local["registry_model"], "z-ai/glm-5.3-flash");
+        assert_eq!(local["wire_model"], "GLM-5.3-Flash-EXL3");
+        assert_eq!(
+            profile["derived_actions"][0],
+            json!({"model": "glm-5.3-flash", "worker": "glm-5.3-flash", "deployment_id": "local"})
+        );
+        let prices = profile["decisions"]["routing"]["prices"]
+            .as_object()
+            .unwrap();
+        assert_eq!(prices.keys().collect::<Vec<_>>(), ["z-ai/glm-5.3-flash"]);
+        assert_eq!(prices["z-ai/glm-5.3-flash"]["input"], 0.5);
+        // It applies to the default profile only, like local_price.
+        let mut file_settings = settings(None);
+        file_settings["hybrid"] = json!({"local_registry_model": "z-ai/glm-5.3-flash"});
+        let error = compose(
+            profile_value(),
+            Some(&file_settings),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("settings hybrid.local_registry_model"));
+    }
+
+    #[test]
+    fn a_declared_local_model_skips_the_qwen_identity_check() {
+        let url = "http://127.0.0.1:8000/v1";
+        let glm = LocalIdentity::Mismatch("GLM-5.3-Flash-EXL3".to_owned());
+        // The default model is checked: another model is refused.
+        let (refused, message) = local_verdict(LOCAL_REGISTRY_MODEL, &glm, url);
+        assert!(refused);
+        assert!(message.unwrap().starts_with("Error:"));
+        let (refused, message) = local_verdict(LOCAL_REGISTRY_MODEL, &LocalIdentity::Unknown, url);
+        assert!(!refused);
+        assert!(message.unwrap().contains("assumes Qwen3.8-27B"));
+        // A declared model is neither refused nor assumed to be Qwen.
+        for identity in [glm, LocalIdentity::Unknown, LocalIdentity::Match] {
+            let (refused, message) = local_verdict("z-ai/glm-5.3-flash", &identity, url);
+            let message = message.unwrap();
+            assert!(!refused);
+            assert!(
+                message.starts_with("Local model: z-ai/glm-5.3-flash") && !message.contains("Qwen"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_local_registry_model_is_refused() {
+        for bad in [
+            json!("glm-5.3-flash"),
+            json!("/glm-5.3-flash"),
+            json!("z-ai/"),
+            json!("z-ai/glm/5.3"),
+            json!("z-ai/glm 5.3"),
+            json!(""),
+            json!(42),
+            json!(null),
+        ] {
+            let settings = json!({"hybrid": {"local_registry_model": bad}});
+            let error = default_profile(
+                "https://r.example",
+                "http://127.0.0.1:1/v1",
+                "m",
+                98304,
+                None,
+                Some(&settings),
+            )
+            .unwrap_err();
+            // `settings ` errors are prefixed with the settings file's path.
+            assert!(
+                error.starts_with("settings hybrid.local_registry_model"),
+                "{bad}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_served_window_comes_from_the_matching_or_only_model() {
+        let tensorfold = json!({"object": "list", "data": [{"id": "GLM-5.3-Flash-EXL3",
+            "object": "model", "context_length": 1_048_576, "max_model_len": 1_048_576}]});
+        assert_eq!(
+            served_window(&tensorfold, "GLM-5.3-Flash-EXL3"),
+            Some(1_048_576)
+        );
+        // The only entry is the served model whatever it is called.
+        assert_eq!(served_window(&tensorfold, "glm"), Some(1_048_576));
+        let vllm = json!({"data": [{"id": "a", "max_model_len": 32768},
+                                   {"id": "b", "max_model_len": 65536}]});
+        assert_eq!(served_window(&vllm, "b"), Some(65536));
+        // Several entries and none named: unknown.
+        assert_eq!(served_window(&vllm, "c"), None);
+        let context_only = json!({"data": [{"id": "m", "context_length": 8192}]});
+        assert_eq!(served_window(&context_only, "m"), Some(8192));
+        let zero_max = json!({"data": [{"id": "m", "max_model_len": 0, "context_length": 8192}]});
+        assert_eq!(served_window(&zero_max, "m"), Some(8192));
+        for unknown in [
+            json!({"data": [{"id": "m"}]}),
+            json!({"data": [{"id": "m", "max_model_len": 0}]}),
+            json!({"data": []}),
+            json!({"models": []}),
+        ] {
+            assert_eq!(served_window(&unknown, "m"), None, "{unknown}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_openai_compatible_runtime_reports_its_window_through_v1_models() {
+        let client = reqwest::Client::new();
+        let models = json!({"object": "list", "data": [{"id": "GLM-5.3-Flash-EXL3",
+            "context_length": 1_048_576, "max_model_len": 1_048_576}]});
+        let url = runtime_stub_with_models(None, None, Some(models)).await;
+        let runtime = read_local_runtime(&client, &url, "GLM-5.3-Flash-EXL3").await;
+        assert_eq!(
+            runtime,
+            LocalRuntime {
+                window: Some(1_048_576),
+                identity: LocalIdentity::Unknown
+            }
+        );
+    }
+
     /// A stub runtime answering `GET /props` and `POST /api/show` with the
     /// given bodies (None: 404), for as many requests as arrive.
     async fn runtime_stub(props: Option<Value>, show: Option<Value>) -> String {
+        runtime_stub_with_models(props, show, None).await
+    }
+
+    /// [`runtime_stub`] that also answers `GET /v1/models`.
+    async fn runtime_stub_with_models(
+        props: Option<Value>,
+        show: Option<Value>,
+        models: Option<Value>,
+    ) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1839,6 +2214,8 @@ mod tests {
                     props.clone()
                 } else if request.starts_with("POST /api/show ") {
                     show.clone()
+                } else if request.starts_with("GET /v1/models ") {
+                    models.clone()
                 } else {
                     None
                 };
@@ -2030,7 +2407,7 @@ mod tests {
             config["decisions"]["routing"]["prices"][LOCAL_REGISTRY_MODEL],
             json!({"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_write": 0.0})
         );
-        // prefer_local still needs a counted local deployment; none is left.
+        // prefer_local still needs a local deployment; none is left.
         let mut cloud_only = default_profile(
             "https://r.example",
             "http://127.0.0.1:1/v1",

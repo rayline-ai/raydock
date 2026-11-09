@@ -128,6 +128,7 @@ impl Runtime {
             capabilities,
             "http://127.0.0.1:9/decisions",
             "",
+            None,
         )
     }
     fn start_with_decisions(
@@ -137,6 +138,7 @@ impl Runtime {
         capabilities: Option<Value>,
         decisions_url: &str,
         raw_members: &str,
+        router_key: Option<&str>,
     ) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "rayline-hybrid-{}-{:x}",
@@ -160,7 +162,12 @@ impl Runtime {
             text.push('}');
         }
         fs::write(dir.join("config.json"), text).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_rld"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rld"));
+        command.env_remove("RAYLINE_ROUTER_API_KEY");
+        if let Some(key) = router_key {
+            command.env("RAYLINE_ROUTER_API_KEY", key);
+        }
+        let child = command
             .arg("hybrid")
             .arg("--core")
             .arg(script)
@@ -173,7 +180,6 @@ impl Runtime {
             .arg(dir.join("token"))
             .arg("--ready-file")
             .arg(dir.join("ready.json"))
-            .env_remove("RAYLINE_ROUTER_API_KEY")
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -329,7 +335,7 @@ async fn non_router_decisions_url_never_starts_the_core() {
         "https://evil.test@api.rayline.ai/v1/routes",
         "http://api.rayline.ai/v1/routes",
     ] {
-        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, "");
+        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, "", None);
         assert!(!runtime.exited().await.success(), "{url}");
         assert!(!runtime.dir.join("config.pid").exists(), "{url}");
         assert!(!runtime.dir.join("ready.json").exists());
@@ -347,7 +353,7 @@ async fn non_router_decisions_url_never_starts_the_core() {
             r#","decisions":{"url":"https://api.rayline.ai/v1/routes"}"#,
         ),
     ] {
-        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, raw);
+        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, raw, None);
         assert!(!runtime.exited().await.success(), "{raw}");
         assert!(!runtime.dir.join("config.pid").exists(), "{raw}");
     }
@@ -473,4 +479,123 @@ async fn session_and_branch_precedence_preserves_native_fork_identity() {
         assert_eq!(event["session"], json!(session));
         assert_eq!(event["branch"], branch);
     }
+}
+
+/// A one-request router stand-in: records the request line, headers and body,
+/// then answers with a fixed Messages response.
+/// The recorded request line, lower-cased headers and JSON body.
+type Recorded = (String, Vec<(String, String)>, Value);
+
+fn fake_router() -> (String, std::thread::JoinHandle<Recorded>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let mut headers = Vec::new();
+        let mut length = 0;
+        loop {
+            let mut header = String::new();
+            reader.read_line(&mut header).unwrap();
+            let header = header.trim_end();
+            if header.is_empty() {
+                break;
+            }
+            let (name, value) = header.split_once(':').unwrap();
+            let (name, value) = (name.to_ascii_lowercase(), value.trim().to_owned());
+            if name == "content-length" {
+                length = value.parse().unwrap();
+            }
+            headers.push((name, value));
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        let answer = json!({"id": "msg_cloud", "type": "message", "role": "assistant",
+            "content": [{"type": "text", "text": "<block>no</block>"}]})
+        .to_string();
+        let mut stream = stream;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-rayline-selected-model: anthropic/claude-sonnet-5.5\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+            answer.len()
+        )
+        .unwrap();
+        (line, headers, serde_json::from_slice(&body).unwrap())
+    });
+    (url, handle)
+}
+
+#[tokio::test]
+async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_to_the_core() {
+    let (router, recorded) = fake_router();
+    let deployments = format!(
+        r#","deployments":[{{"id":"local","kind":"local","url":"http://127.0.0.1:9/v1/chat/completions","protocol":"openai.chat.v1","wire_model":"glm"}},{{"id":"cloud-opus","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"anthropic/claude-opus-5.5","auth_env":"RAYLINE_ROUTER_API_KEY"}},{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"anthropic/claude-sonnet-5.5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
+    );
+    let mut runtime = Runtime::start_with_decisions(
+        1,
+        0,
+        120,
+        None,
+        &format!("{router}/v1/routes"),
+        &deployments,
+        Some("rlk-test-key"),
+    );
+    let (url, token) = runtime.ready().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let classifier = json!({"model": "claude-sonnet-5", "max_tokens": 64,
+        "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.319"},
+                   {"type": "text", "text": "You are a security monitor for autonomous AI coding agents.\n"}],
+        "messages": [{"role": "user", "content": "<transcript>"}]});
+    let response = client
+        .post(format!("{url}/v1/messages?beta=true"))
+        .bearer_auth(&token)
+        .header("content-type", "application/json")
+        .header("anthropic-beta", "claude-code-20250219")
+        .header("x-claude-code-session-id", "session-one")
+        .json(&classifier)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json::<Value>().await.unwrap()["id"], "msg_cloud");
+    let (line, headers, body) = recorded.join().unwrap();
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    };
+    assert!(line.starts_with("POST /v1/messages "), "{line}");
+    assert_eq!(header("authorization"), Some("Bearer rlk-test-key"));
+    // Claude Haiku 5.5 by default, through the cloud pins' router and key.
+    assert_eq!(
+        header("x-workshop-required-model"),
+        Some("anthropic/claude-haiku-5.5")
+    );
+    assert_eq!(header("anthropic-beta"), Some("claude-code-20250219"));
+    assert_eq!(header("x-conversation-id"), Some("session-one"));
+    let mut expected = classifier.clone();
+    expected["model"] = json!("anthropic/claude-haiku-5.5");
+    assert_eq!(body, expected);
+
+    // A turn with tools is an ordinary turn: the core gets it unchanged.
+    let turn = "{\"model\":\"rayline-auto\",\"tools\":[{\"name\":\"Bash\"}],\"messages\":[]}";
+    let response = client
+        .post(format!("{url}/v1/messages"))
+        .bearer_auth(&token)
+        .header("content-type", "application/json")
+        .body(turn)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), turn);
+    let events = fs::read_to_string(runtime.dir.join("events.jsonl")).unwrap();
+    assert_eq!(
+        events.lines().count(),
+        1,
+        "only the ordinary turn reaches the core"
+    );
 }

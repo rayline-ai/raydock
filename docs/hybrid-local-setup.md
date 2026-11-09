@@ -55,6 +55,21 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
    assumes Qwen3.8-27B. That includes Ollama models whose file carries no
    name metadata, so check the model yourself when you see that warning.
 
+   To serve another model, declare it by its registry id in
+   `~/.config/rayline/settings.json`:
+
+   ```json
+   {"hybrid": {"local_registry_model": "z-ai/glm-5.3-flash"}}
+   ```
+
+   The id is `provider/model`, as the execution core's model registry names
+   it. Raydock checks only that shape. The core refuses a model its registry
+   does not know when it starts; `start` then names this setting in its
+   error. With a declared model, `start` skips the Qwen3.8-27B check and
+   prints the declared model instead. Raydock does not check what the runtime
+   serves, so declare the model it actually loads. The setting applies to the
+   default profile only; `start --config` refuses it.
+
 3. **Start and connect a harness.**
 
    ```bash
@@ -77,8 +92,14 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
    - Ollama: `OLLAMA_CONTEXT_LENGTH=98304 ollama serve`, or `num_ctx` in the
      model's Modelfile. Ollama's default is much smaller and it silently
      truncates a longer prompt, so set it;
+   - vLLM and TensorFold: `--max-model-len 98304` or more (Rayline reads the
+     served model's `max_model_len` or `context_length` from `/v1/models` and
+     uses the smaller of the two);
    - MLX (`mlx_lm.server`): check that your build's KV-cache limit, if you set
      one, is at least 98,304 tokens.
+
+   A runtime loaded with a larger window does not raise the configured one;
+   `start` notes the larger window, and you raise it as below.
 
    Raise or lower it with `"hybrid": {"local_context_window": 131072}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
@@ -135,7 +156,7 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 
 | Key | Meaning |
 | --- | --- |
-| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs counted local capacity, which requires a profile with a qualified llama.cpp prompt counter ([Advanced](#advanced-a-profile-file)); the default profile refuses it. |
+| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs known local capacity. The default profile has it without a prompt counter: the core counts Qwen3.8-27B with its own tokenizer and bounds any other local model (`caller_bounded`). That needs a core with `caller_bounded` support (not yet released); an older core leaves a non-Qwen local target's capacity unknown, and ARC then never selects it (`capacity_unknown_local`). `start` refuses `prefer_local` only when the session has no local target. |
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
 | `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). It must be 0 or between 1e-6 and 1e6. `start --config` refuses it, because a profile file sets its own prices. |
@@ -187,11 +208,15 @@ No tool is replayed, and nothing is reselected mid-stream. If the local runtime
 itself refuses a request for context before any output, the core re-consults
 ARC with that fact instead of truncating.
 
-With the default profile the core cannot count tokens in advance, so the local
-target's capacity is reported as unknown. It still hands off when the runtime
+With the default profile the core sizes each request itself. It counts
+Qwen3.8-27B with its embedded tokenizer (`local_measured`). For another model
+declared in `hybrid.local_registry_model`, a core with `caller_bounded`
+support bounds the request by its bytes; an older core reports that target's
+capacity as unknown. Either way the core still hands off when the runtime
 refuses a request for context (llama.cpp reports this before any output). A
 profile with a qualified llama.cpp prompt counter (see below) counts every
-request up front, so the handoff happens before dispatch.
+request with the runtime's own tokenizer, so the handoff happens before
+dispatch.
 
 For llama.cpp:
 
@@ -209,7 +234,12 @@ The core infers what each request is from the harness's own wire traffic:
 - **Tool result or typed user turn:** read from the trailing message. Injected
   reminders and harness-authored text do not count as user words.
 - **Side calls:** the harness's auxiliary requests, such as compaction summaries,
-  titles and prompt suggestions. They never advance the session.
+  titles and prompt suggestions. They never advance the session. Claude Code's
+  auto-mode safety classifier is the exception: it always goes to cloud,
+  because a local model's answer it cannot parse makes Claude Code ask you to
+  approve every action. It uses Claude Haiku 5.5 through your router; set
+  `"hybrid": {"classifier_model": "<provider/model>"}` in `settings.json`, or
+  pass `--classifier-model` to `start`, to use another model.
 - **Compaction:** detected by comparing each request with the previous one,
   including Pi's retained tail.
 
