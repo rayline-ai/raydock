@@ -140,25 +140,29 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
 
 ## Check where each turn ran
 
-Every request the core serves writes an `execution completed` line to
+Every request the core completes writes an `execution completed` line to
 `runtime.log` in the state directory (`~/.rayline/hybrid` by default, or
 `--state-dir`). Its `deployment` is `local` when the request ran on your model,
 and `worker` names the model. Side calls, such as titles and compaction
-summaries, carry `event: sidecall`. To follow requests live:
+summaries, carry `event: sidecall`. A request that is refused or cut off logs
+`execution refused` or `execution aborted` instead. To follow completed
+requests live:
 
 ```bash
 tail -f ~/.rayline/hybrid/runtime.log | grep --line-buffered '"execution completed"' \
   | jq -r '[.time[11:19], .deployment, .worker, (.decided_by // .event), .input_tokens, .output_tokens] | @tsv'
 ```
 
-`decided_by` says why: `held/schedule` kept the previous model,
-`prefer_local_threshold/schedule` chose local under `prefer_local`, and
-`capacity_handoff` moved a turn that no longer fit to cloud.
+`decided_by` says why, as `<model>/<thinking>` reasons:
+`held/schedule` kept the previous model, `prefer_local_threshold/schedule`
+chose local under `prefer_local`, and `capacity_handoff/...` moved a turn that
+no longer fit to cloud.
 
 On the Rayline Platform **Usage** page, a local turn appears only as its ARC
 decision, with **Execution** set to **Decision only** and the local model as
-the selected model. Its tokens never reach Rayline, so the page shows no
-tokens or inference cost for it. Cloud turns, and the auto-mode classifier's
+the selected model. Rayline does not run or bill its inference, so the page
+shows no tokens or inference cost for it. The decision request itself still
+sends the conversation, and the local model's token counts, to ARC. Cloud turns, and the auto-mode classifier's
 calls, appear as normal **Cloud** rows. `raydock top` does not show hybrid
 sessions yet.
 
@@ -213,9 +217,11 @@ override block is refused for it.
 ## The capacity handoff
 
 The local window is the profile's `context_window`. Before each request, the
-core counts the exact prompt the local model would receive with the runtime's
-own tokenizer. The count covers tools, history and private instructions. The
-core adds the output limit, then tells ARC whether the request fits.
+core sizes the exact prompt the local model would receive, covering tools,
+history and private instructions. For Qwen3.8-27B, or with a qualified prompt
+counter, it counts tokens with that model's tokenizer; for any other model it
+bounds the prompt by its bytes (see below). The core adds the output limit,
+then tells ARC whether the request fits.
 
 The default profile sets the local output limit to a quarter of the local
 window, at most 32,000 tokens (24,576 at the default 96k window). Each cloud
