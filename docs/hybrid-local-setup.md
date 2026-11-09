@@ -39,8 +39,11 @@ carries the conversation the harness sent, plus the local model's token
 counts, so every turn's content reaches Rayline, including turns that then run
 on your local model. Only the inference for a local turn stays on your
 hardware; a cloud turn also goes to its model provider. If conversations must
-not leave your machine, use `raydock claude --local` with a fully local router
-config instead (see the [Getting Started guide](getting-started.md)).
+not leave your machine, run every request locally instead:
+`raydock claude --local --route all --router-config-path <config>`, with a
+router config whose routes are all local (see the
+[Getting Started guide](getting-started.md)). `--local` alone routes only
+subagents locally.
 
 ## Three steps
 
@@ -125,12 +128,13 @@ config instead (see the [Getting Started guide](getting-started.md)).
      build's KV-cache limit, if you set one, is at least that.
 
    For Claude Code with a model other than Qwen3.8-27B, use a window well
-   above 110,000 tokens. The core sizes such a request by its byte length
-   plus the answer it allows, and Claude Code's opening request alone comes
-   to about 105,000 to 112,000 tokens that way, so at 98,304 every Claude
-   Code turn goes to cloud. At 131,072 a session starts locally and moves to
-   cloud once it grows past the window; a larger window, such as 262,144,
-   keeps longer sessions local.
+   above 110,000 tokens. The core counts a request as its prompt, bounded
+   from its byte length with headroom, plus the answer it allows and a
+   margin; Claude Code's opening request measured 105,000 to 112,000 tokens
+   that way. At 98,304 no Claude Code turn is eligible for the local model,
+   so every turn goes to cloud. At 131,072 the opening turns fit, so ARC can
+   choose local until the session grows past the window; a larger window,
+   such as 262,144, keeps longer sessions eligible.
 
    Set the window yourself with `"hybrid": {"local_context_window": 262144}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
