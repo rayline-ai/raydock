@@ -135,6 +135,13 @@ config instead (see the [Getting Started guide](getting-started.md)).
    model; harnesses are told the window is 1,000,000 tokens. `start` uses the
    production router by default; `--env dev` selects the development one.
 
+   For Claude Code with a model other than Qwen3.8-27B, raise the window.
+   The core bounds such a prompt by its byte size, and Claude Code's opening
+   request alone bounds at about 110,000 tokens, so at the 98,304 default no
+   Claude Code turn fits locally and every turn goes to cloud. Load the runtime
+   with a larger window and start with, for example,
+   `--local-context-window 262144`.
+
    `start` checks Decisions once before it reports ready: a rejected key
    fails with the `raydock auth login` command to run, and a development cell
    (`--cell`) that is still starting is waited for.
