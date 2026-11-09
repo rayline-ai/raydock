@@ -127,8 +127,10 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     local capacity unknown, and only a llama.cpp context refusal re-consults.
     The core counts Qwen3.8-27B with its embedded tokenizer
     (`local_measured`); a core with `caller_bounded` support (bundled from
-    Raydock 0.4.3) labels any other local model's byte bound `caller_bounded`,
-    which ARC admits as a fit. `prefer_local` works
+    Raydock 0.4.3) labels any other local model's byte bound of a text-only
+    request `caller_bounded`, which ARC admits as a fit; a request with media
+    or members outside the protocol allowlist stays `caller_estimated`
+    (unknown to ARC). `prefer_local` works
     with this profile on such a core; an older core makes ARC exclude a
     non-Qwen local target (`capacity_unknown_local`).
 - **`--config`:** names a qualified profile instead.

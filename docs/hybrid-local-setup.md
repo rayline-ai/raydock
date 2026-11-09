@@ -144,9 +144,8 @@ Every request the core completes writes an `execution completed` line to
 `runtime.log` in the state directory (`~/.rayline/hybrid` by default, or
 `--state-dir`). Its `deployment` is `local` when the request ran on your model,
 and `worker` names the model. Side calls, such as titles and compaction
-summaries, carry `event: sidecall`. A request that is refused or cut off logs
-`execution refused` or `execution aborted` instead. To follow completed
-requests live:
+summaries, carry `event: sidecall`. A request that fails or is cut off writes
+no such line. To follow completed requests live:
 
 ```bash
 tail -f ~/.rayline/hybrid/runtime.log | grep --line-buffered '"execution completed"' \
@@ -220,7 +219,9 @@ The local window is the profile's `context_window`. Before each request, the
 core sizes the exact prompt the local model would receive, covering tools,
 history and private instructions. For Qwen3.8-27B, or with a qualified prompt
 counter, it counts tokens with that model's tokenizer; for any other model it
-bounds the prompt by its bytes (see below). The core adds the output limit,
+bounds a text prompt by its bytes (see below). A prompt with images or other
+media gets only an estimate, which ARC treats as unknown capacity, so under
+`prefer_local` such a turn may go to cloud. The core adds the output limit,
 then tells ARC whether the request fits.
 
 The default profile sets the local output limit to a quarter of the local
