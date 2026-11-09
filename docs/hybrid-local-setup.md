@@ -32,6 +32,16 @@ bills the provider's pass-through price. The local model's price in the profile
 (0 by default) steers which target ARC selects; it never changes what the
 decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
 
+## What leaves your machine
+
+ARC runs on the Rayline router, not on your machine. Each decision request
+carries the conversation the harness sent, plus the local model's token
+counts, so every turn's content reaches Rayline, including turns that then run
+on your local model. Only the inference for a local turn stays on your
+hardware; a cloud turn also goes to its model provider. If conversations must
+not leave your machine, use `raydock claude --local` with a fully local router
+config instead (see the [Getting Started guide](getting-started.md)).
+
 ## Three steps
 
 1. **Sign in.**
