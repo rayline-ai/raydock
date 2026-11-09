@@ -20,6 +20,8 @@ use serde_json::Value;
 /// The opening of the classifier's own system prompt (Claude Code 2.1.319).
 /// Classifier requests carry no tools and none of Claude Code's main prompt.
 const CLASSIFIER_PROMPT: &str = "You are a security monitor for autonomous AI coding agents.";
+/// The block Claude Code puts before every system prompt.
+const BILLING_PREAMBLE: &str = "x-anthropic-billing-header:";
 
 /// A cloud Messages deployment the classifier is sent to.
 #[derive(Debug, Clone, PartialEq)]
@@ -77,7 +79,7 @@ fn origin(url: &str) -> Option<(String, String, u16)> {
 }
 
 /// Whether a request is Claude Code's auto-mode classifier: a Messages call
-/// with no tools whose system prompt contains the classifier's own block.
+/// with no tools whose system prompt opens with the classifier's own block.
 pub(crate) fn is_classifier(path: &str, body: &[u8]) -> bool {
     if path != "/v1/messages" {
         return false;
@@ -95,10 +97,13 @@ pub(crate) fn is_classifier(path: &str, body: &[u8]) -> bool {
     let opens = |text: &str| text.trim_start().starts_with(CLASSIFIER_PROMPT);
     match request.get("system") {
         Some(Value::String(text)) => opens(text),
+        // The first block after Claude Code's billing preamble must be the
+        // classifier's own, so an example quoted in a later block is not.
         Some(Value::Array(blocks)) => blocks
             .iter()
             .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .any(opens),
+            .find(|text| !text.starts_with(BILLING_PREAMBLE))
+            .is_some_and(opens),
         _ => false,
     }
 }
@@ -202,6 +207,16 @@ mod tests {
         assert!(!is_classifier(
             "/v1/messages",
             &serde_json::to_vec(&quoted).unwrap()
+        ));
+        // Nor is the prompt quoted in a system block after another prompt.
+        let later_block = json!({"system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.319"},
+            {"type": "text", "text": "You are Claude Code. Review the example in the next block."},
+            {"type": "text", "text": format!("{CLASSIFIER_PROMPT}\nAn example.")}],
+            "messages": []});
+        assert!(!is_classifier(
+            "/v1/messages",
+            &serde_json::to_vec(&later_block).unwrap()
         ));
         assert!(!is_classifier("/v1/messages", b"not json"));
     }

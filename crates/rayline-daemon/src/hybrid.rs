@@ -492,20 +492,26 @@ async fn send_classifier_to_cloud(
         "auto-mode classifier sent to the cloud pin"
     );
     if !status.is_success() {
-        // A refusal arrives before any output as one small JSON error; its
-        // message names the field or limit the router rejected.
+        // The router's message can echo request content, so only its error
+        // type is logged.
         let headers = upstream.headers().clone();
         let error_body = upstream.bytes().await?;
-        let message = serde_json::from_slice::<serde_json::Value>(&error_body)
+        let error_type = serde_json::from_slice::<serde_json::Value>(&error_body)
             .ok()
             .and_then(|error| {
                 error
-                    .pointer("/error/message")
+                    .pointer("/error/type")
                     .and_then(serde_json::Value::as_str)
-                    .map(|message| message.chars().take(300).collect::<String>())
+                    .filter(|kind| {
+                        kind.len() <= 64
+                            && kind
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                    })
+                    .map(str::to_owned)
             })
             .unwrap_or_default();
-        tracing::warn!(status = status.as_u16(), %message, "cloud pin refused the auto-mode classifier");
+        tracing::warn!(status = status.as_u16(), %error_type, "cloud pin refused the auto-mode classifier");
         return buffered_response(state, status, &headers, error_body, None).map(Some);
     }
     stream_response(upstream).map(Some)
