@@ -277,6 +277,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         settings.as_ref(),
                     )
                     .map_err(settings_error)?;
+                    if !local_refused && runtime.refuses_over_window {
+                        crate::hybrid_profile::mark_local_refuses_over_window(&mut profile);
+                    }
                     if local_refused {
                         crate::hybrid_profile::without_local(&mut profile);
                         println!(
