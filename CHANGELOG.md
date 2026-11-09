@@ -20,6 +20,12 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   so ARC can keep a turn local only when it fits the window. It no longer needs
   a llama.cpp prompt counter. This needs the production router from
   2026-11-09 or later.
+- **Claude Haiku 5.5 is a third default cloud target in hybrid mode.** The
+  default profile pins Haiku 5.5 beside Opus 5.5 and Sonnet 5.5, so a turn
+  that leaves the local model (too large for its window, or one the router
+  expects it to fail) has a cloud target priced well below Sonnet. A
+  `hybrid.cloud_output_tokens` block must now name all three pins; one written
+  for the two earlier pins is refused until it has a Haiku line.
 - **Auto-mode safety checks go to the cloud.** Claude Code's auto-mode
   classifier calls are sent to Claude Haiku 5.5 through the router instead of
   the local model. Change the model with `hybrid.classifier_model` or
@@ -49,9 +55,9 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   as refusing over-window prompts, and the core asks ARC again after such a
   refusal and moves the turn to a model that fits. llama.cpp (which may
   truncate with `--context-shift`), Ollama and MLX keep the default.
-- **Each cloud target declares its own model's output ceiling.** Both Claude
-  5.5 cloud deployments now allow 128,000 output tokens instead of a shared
-  32,000. Override per model with `hybrid.cloud_output_tokens`.
+- **Each cloud target declares its own model's output ceiling.** All three
+  Claude 5.5 cloud deployments now allow 128,000 output tokens instead of a
+  shared 32,000. Override per model with `hybrid.cloud_output_tokens`.
 - **Every deployment lowers an over-cap output allowance.** A request asking
   for more output than a cloud deployment's ceiling is lowered to it instead of
   refused, as the local deployment already did; the stated and sent figures are
