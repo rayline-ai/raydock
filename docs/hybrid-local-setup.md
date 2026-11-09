@@ -164,8 +164,9 @@ tail -f ~/.rayline/hybrid/runtime.log | grep --line-buffered '"execution complet
 
 `decided_by` says why, as `<model>/<thinking>` reasons:
 `held/schedule` kept the previous model, `prefer_local_threshold/schedule`
-chose local under `prefer_local`, and `capacity_handoff/...` moved a turn that
-no longer fit to cloud.
+chose local under `prefer_local`, and a turn that does not fit the local window
+goes to cloud as `capacity_handoff/...` or `utility_fallback/...`, with the
+local target excluded for `context_capacity`.
 
 On the Rayline Platform **Usage** page, a local turn appears only as its ARC
 decision, with **Execution** set to **Decision only** and the local model as
@@ -260,9 +261,10 @@ asks for more than a deployment's ceiling has its turns on that deployment
 lowered to it rather than refused.
 
 When the conversation grows past the local window, for example during a long
-tool loop with no compaction, ARC hands the turn to a cloud target. The receipt
-reads `decided_by: capacity_handoff`, and the local target is listed as
-excluded for `context_capacity`. The conversation continues on the cloud model.
+tool loop with no compaction, ARC hands the turn to a cloud target. The local
+target is listed as excluded for `context_capacity`, and `decided_by` reads
+`capacity_handoff/...` or, when ARC falls back to its utility choice,
+`utility_fallback/...`. The conversation continues on the cloud model.
 No tool is replayed, and nothing is reselected mid-stream. If the local runtime
 itself refuses a request for context before any output, the core re-consults
 ARC with that fact instead of truncating.
