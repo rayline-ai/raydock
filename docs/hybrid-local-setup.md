@@ -102,7 +102,7 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
    32,000 tokens), so give such a model at least 262,144 tokens, or every
    Claude Code turn goes to cloud.
 
-   Set the window yourself with `"hybrid": {"local_context_window": 131072}` in
+   Set the window yourself with `"hybrid": {"local_context_window": 262144}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
    `start`. A turn whose prompt does not fit the local window goes to a cloud
    model; harnesses are told the window is 1,000,000 tokens. `start` uses the
