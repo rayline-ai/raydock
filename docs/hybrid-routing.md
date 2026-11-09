@@ -11,8 +11,8 @@ local static routing.
 
 ## Bring your own inference server
 
-Start and configure your Qwen model using your preferred server, such as Ollama,
-MLX, or llama.cpp. Its endpoint, served model ID, protocol, runtime identity and
+Start and configure your local model using your preferred server, such as
+Ollama, MLX, llama.cpp, vLLM or TensorFold. Its endpoint, served model ID, protocol, runtime identity and
 qualified thinking-control profile belong in the execution-core configuration.
 The model's display name alone does not establish template or thinking-control
 compatibility. `rld hybrid` does not download a model, start an inference server,
@@ -66,7 +66,8 @@ Hybrid endpoints are selected by the core configuration. The root `--env` and
 `start` composes the core configuration from a profile and the user's
 `~/.config/rayline/settings.json`, and writes the result to `core-config.json`
 in the state directory (owner-only). The user's setup is: a Rayline API key, a
-`local_model` pointing at a local Qwen, and `start`.
+`local_model` pointing at a local model (Qwen3.8-27B, or another declared in
+`hybrid.local_registry_model`), and `start`.
 
 - **Environment:** `start` uses the production router by default (`--env dev` for
   the development one, `--cell` for an isolated development cell).
@@ -125,8 +126,8 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     long"), which the harness's compaction recognises. An older core leaves
     local capacity unknown, and only a llama.cpp context refusal re-consults.
     The core counts Qwen3.8-27B with its embedded tokenizer
-    (`local_measured`); a core with `caller_bounded` support (not yet
-    released) labels any other local model's byte bound `caller_bounded`,
+    (`local_measured`); a core with `caller_bounded` support (bundled from
+    Raydock 0.4.3) labels any other local model's byte bound `caller_bounded`,
     which ARC admits as a fit. `prefer_local` works
     with this profile on such a core; an older core makes ARC exclude a
     non-Qwen local target (`capacity_unknown_local`).
