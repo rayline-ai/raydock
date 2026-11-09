@@ -77,11 +77,12 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
   - `local_model` is the local Chat deployment (`registry_model`
     `qwen/qwen3.8-27b`, or settings `hybrid.local_registry_model`). Its
     context window is `--local-context-window`, else settings
-    `hybrid.local_context_window`, else 98304 tokens. A runtime loaded with a
-    smaller window lowers it: llama.cpp's `/props` `n_ctx`, else the served
-    model's `max_model_len` or `context_length` from `/v1/models` (vLLM,
-    TensorFold; the entry whose `id` is the configured model, or the only
-    entry). A larger loaded window never raises it.
+    `hybrid.local_context_window`, else the window the runtime reports, else
+    98304 tokens. The reported window is llama.cpp's `/props` `n_ctx`, else
+    the served model's `max_model_len` or `context_length` from `/v1/models`
+    (vLLM, TensorFold; the entry whose `id` is the configured model, or the
+    only entry), capped at 1,000,000. A configured window is lowered to a
+    smaller reported one and never raised by a larger one.
     A server whose `/v1/models` states its window (vLLM, TensorFold) refuses
     an over-window prompt instead of cutting it, so it gets
     `context_overflow: "refuses"`: when every target falls short only on an

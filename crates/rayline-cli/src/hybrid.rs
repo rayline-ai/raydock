@@ -39,9 +39,10 @@ enum Action {
         #[arg(long, default_value = "prod")]
         env: String,
         /// Local model context window in tokens (default: settings
-        /// `hybrid.local_context_window`, else 98304). A turn whose prompt does
-        /// not fit hands off to cloud. The runtime's loaded window caps it
-        /// (llama.cpp `/props`, or `/v1/models` from vLLM or TensorFold).
+        /// `hybrid.local_context_window`, else the window the runtime reports
+        /// through llama.cpp `/props` or `/v1/models` from vLLM or TensorFold,
+        /// else 98304). A turn whose prompt does not fit hands off to cloud.
+        /// The runtime's loaded window caps it.
         #[arg(long, value_parser = clap::value_parser!(u64).range(2048..=1_000_000))]
         local_context_window: Option<u64>,
         /// Model for Claude Code's auto-mode safety classifier, sent through
@@ -215,9 +216,11 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                             ),
                         )?;
                     let configured = match local_context_window {
-                        Some(window) => window,
-                        None => crate::hybrid_profile::local_context_window(settings.as_ref())
-                            .map_err(settings_error)?,
+                        Some(window) => Some(window),
+                        None => crate::hybrid_profile::configured_local_context_window(
+                            settings.as_ref(),
+                        )
+                        .map_err(settings_error)?,
                     };
                     let registry_model =
                         crate::hybrid_profile::local_registry_model(settings.as_ref())
@@ -237,28 +240,15 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     if registry_model != crate::hybrid_profile::LOCAL_REGISTRY_MODEL {
                         declared_local = Some(registry_model);
                     }
-                    let window = match runtime.window {
-                        _ if local_refused => configured,
-                        // The runtime cannot hold more than it was loaded with.
-                        Some(loaded) if loaded < configured => {
-                            eprintln!(
-                                "Note: the local runtime is loaded with a {loaded}-token window, below the configured {configured}; using {loaded}. Load it with a {configured}-token window (llama.cpp `--ctx-size {configured}`, vLLM `--max-model-len {configured}`) to keep longer turns local."
-                            );
-                            loaded
+                    let window = if local_refused {
+                        configured.unwrap_or(crate::hybrid_profile::DEFAULT_LOCAL_CONTEXT_WINDOW)
+                    } else {
+                        let (window, note) =
+                            crate::hybrid_profile::resolve_local_window(configured, runtime.window);
+                        if let Some(note) = note {
+                            eprintln!("{note}");
                         }
-                        Some(loaded) if loaded > configured => {
-                            eprintln!(
-                                "Note: the local runtime is loaded with a {loaded}-token window; Raydock uses the configured {configured}. Raise it with --local-context-window or settings hybrid.local_context_window to keep longer turns local."
-                            );
-                            configured
-                        }
-                        Some(_) => configured,
-                        None => {
-                            eprintln!(
-                                "Warning: Raydock cannot read this runtime's context window, so it assumes {configured} tokens. Load the local model with at least that window (llama.cpp `--ctx-size {configured}`, Ollama `OLLAMA_CONTEXT_LENGTH={configured}`): a runtime loaded with less (Ollama's default is a few thousand tokens) may silently truncate longer prompts. Set a smaller window with --local-context-window if needed."
-                            );
-                            configured
-                        }
+                        window
                     };
                     // `raydock auth login` is enough: mint the router key on first use.
                     if std::env::var_os("RAYLINE_ROUTER_API_KEY")
