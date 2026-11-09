@@ -234,7 +234,10 @@ The core infers what each request is from the harness's own wire traffic:
 - **Tool result or typed user turn:** read from the trailing message. Injected
   reminders and harness-authored text do not count as user words.
 - **Side calls:** the harness's auxiliary requests, such as compaction summaries,
-  titles and prompt suggestions. They never advance the session.
+  titles and prompt suggestions. They never advance the session. Claude Code's
+  auto-mode safety classifier is the exception: it always goes to the cloud
+  Sonnet pin, because a local model's answer it cannot parse makes Claude Code
+  ask you to approve every action.
 - **Compaction:** detected by comparing each request with the previous one,
   including Pi's retained tail.
 

@@ -176,6 +176,18 @@ the previous one, including Pi's retained tail. A harness may optionally state
 events itself through the core's `X-Rayline-Event` header or `rayline_event`
 member; no default depends on it.
 
+**Claude Code's auto-mode classifier goes to cloud.** In auto mode Claude Code
+asks a classifier whether each tool action may run, and the classifier needs a
+verdict in an exact format. Routed like any other side call, it would follow the
+last turn to the local model; a local model that misses the format makes Claude
+Code ask the user to approve every action. Raydock's gateway recognizes the
+classifier (a Messages request with no tools whose system prompt opens with
+Claude Code's security-monitor prompt) and sends it, without consulting
+Decisions, to the profile's cloud Sonnet pin (else its first cloud Messages
+pin) on the same router as Decisions, with that deployment's key. A profile
+with no cloud Messages pin, or a launch without its key, leaves the classifier to
+the core. Each classifier call is then billed at the cloud model's price.
+
 **Typed signals (optional, no setup).** A client that wants Decisions signals
 (for example `topic.operation`) adds `"routing": {"signals": ["topic.operation"]}`
 to its generation request. The core passes the names to Decisions unchanged,
