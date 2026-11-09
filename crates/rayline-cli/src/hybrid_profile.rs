@@ -724,8 +724,10 @@ pub(crate) struct LocalRuntime {
     pub window: Option<u64>,
     pub identity: LocalIdentity,
     /// The runtime refuses a prompt over its window rather than cutting it:
-    /// llama.cpp, and a server whose `/v1/models` states its window (vLLM,
-    /// TensorFold). Ollama and `mlx_lm.server` truncate and say nothing.
+    /// a server whose `/v1/models` states its window (vLLM, TensorFold).
+    /// Ollama and `mlx_lm.server` truncate and state none. llama.cpp is left
+    /// out: run with `--context-shift` it cuts the prompt, and `/props` does
+    /// not say whether it is on.
     pub refuses_over_window: bool,
 }
 
@@ -814,7 +816,7 @@ pub(crate) async fn read_local_runtime(
         return LocalRuntime {
             window,
             identity: llamacpp_identity(&props),
-            refuses_over_window: true,
+            refuses_over_window: false,
         };
     }
     let window = answer(client.get(format!("{base}/v1/models")))
@@ -2324,7 +2326,7 @@ mod tests {
             LocalRuntime {
                 window: Some(4096),
                 identity: LocalIdentity::Unknown,
-                refuses_over_window: true,
+                refuses_over_window: false,
             }
         );
     }
