@@ -200,6 +200,13 @@ with that deployment's key. Choose another model the router serves with
 profile with no cloud Messages pin, or a launch without its key, leaves the
 classifier to the core. Each classifier call is billed at that model's price.
 
+Claude Code 2.1.321 and later can instead ask the API to check each action
+inside the turn (a `safeguards` request field answered in `safeguard_results`).
+A turn the local model serves carries no such verdict, so every checked action
+would be denied. `raydock hybrid run claude` therefore sets
+`CLAUDE_CODE_AUTO_MODE_SERVER=0`, which keeps Claude Code on its own classifier
+requests above; a value you set yourself is kept.
+
 **Typed signals (optional, no setup).** A client that wants Decisions signals
 (for example `topic.operation`) adds `"routing": {"signals": ["topic.operation"]}`
 to its generation request. The core passes the names to Decisions unchanged,

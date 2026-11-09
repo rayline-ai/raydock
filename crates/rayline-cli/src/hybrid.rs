@@ -715,6 +715,9 @@ fn model_capabilities(state: &Value) -> io::Result<ModelCapabilities> {
     Ok(capabilities)
 }
 
+/// Claude Code's switch between the API's in-turn auto-mode checks and its
+/// own classifier requests (code.claude.com auto-mode classifier docs).
+const AUTO_MODE_SERVER_ENV: &str = "CLAUDE_CODE_AUTO_MODE_SERVER";
 /// Context window every harness is told under hybrid routing. The runtime
 /// carries any prompt up to this size: a turn too large for the local model
 /// hands off to cloud, and a prompt larger than the cloud window is refused
@@ -808,6 +811,15 @@ fn harness_command(
                     capabilities.context_window.to_string(),
                 )
                 .args(["--model", "rayline-auto"]);
+            // Claude Code 2.1.321+ asks the API to judge auto mode's actions
+            // inside each turn (`safeguards`, answered in `safeguard_results`).
+            // A turn the local model serves carries no verdict, so every
+            // checked action is denied. Its own classifier requests, which the
+            // gateway sends to the cloud classifier pin, judge them instead.
+            // A value the user set is kept.
+            if std::env::var_os(AUTO_MODE_SERVER_ENV).is_none() {
+                command.env(AUTO_MODE_SERVER_ENV, "0");
+            }
             let recovery = crate::claude::refusal_recovery_values(
                 crate::claude::RoutingMode::Override,
                 |name| std::env::var_os(name),
@@ -1430,6 +1442,16 @@ mod tests {
                 .any(|(key, value)| key == "CLAUDE_CODE_MAX_CONTEXT_TOKENS"
                     && value == Some(std::ffi::OsStr::new("1000000")))
         );
+        // Auto mode's checks come from Claude Code's own classifier requests,
+        // not from the API inside a turn the local model may serve.
+        if std::env::var_os(AUTO_MODE_SERVER_ENV).is_none() {
+            assert!(
+                claude
+                    .get_envs()
+                    .any(|(key, value)| key == AUTO_MODE_SERVER_ENV
+                        && value == Some(std::ffi::OsStr::new("0")))
+            );
+        }
         let codex = harness_command(
             &paths,
             "codex",
