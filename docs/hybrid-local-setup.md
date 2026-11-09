@@ -12,12 +12,16 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 
 - macOS 13 or later, or Linux, with a Rayline release installed. The release
   includes `raydock`, `rld` and `rayline-core`.
-- A local inference server with your Qwen model: llama.cpp, Ollama or MLX.
-  Rayline does not start, download or stop it.
-- Memory for Qwen3.8-27B: plan for at least 32 GB (unified memory on a Mac).
-  At 4-bit the weights alone are about 17 GB (Ollama `qwen3.8:27b`), before
-  the cache for the 98,304-token default window, so a 16 GB machine cannot
-  run it.
+- A local inference server that serves an OpenAI Chat Completions API:
+  llama.cpp, Ollama, MLX, vLLM or TensorFold, on this machine or on another
+  one you can reach (for example over your tailnet). Rayline does not start,
+  download or stop it.
+- A model the execution core knows. Qwen3.8-27B is the default. Any other
+  model, such as GLM-5.3-Flash, works once you declare it (step 2).
+- Memory for your model. For Qwen3.8-27B, plan for at least 32 GB (unified
+  memory on a Mac). At 4-bit the weights alone are about 17 GB (Ollama
+  `qwen3.8:27b`), before the cache for the 98,304-token default window, so a
+  16 GB machine cannot run it.
 - Nothing else. A profile file is optional (see [Advanced: a profile file](#advanced-a-profile-file)).
 
 ## What it costs
@@ -27,6 +31,19 @@ balance, including turns that run on your machine; a cloud turn additionally
 bills the provider's pass-through price. The local model's price in the profile
 (0 by default) steers which target ARC selects; it never changes what the
 decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
+
+## What leaves your machine
+
+ARC runs on the Rayline router, not on your machine. Each decision request
+carries the conversation the harness sent, plus the local model's token
+counts, so every turn's content reaches Rayline, including turns that then run
+on your local model. Only the inference for a local turn stays on your
+hardware; a cloud turn also goes to its model provider. If conversations must
+not leave your machine, run every request locally instead:
+`raydock claude --local --route all --router-config-path <config>`, with a
+router config whose routes are all local (see the
+[Getting Started guide](getting-started.md)). `--local` alone routes only
+subagents locally.
 
 ## Three steps
 
@@ -44,31 +61,44 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
 2. **Point Rayline at your local model.**
 
    ```bash
-   raydock local custom --url http://127.0.0.1:8080/v1 --model qwen3.8-27b
+   raydock local custom --url <server URL> --model <served model name>
    ```
 
-   This is the local endpoint hybrid routing uses. It must serve Qwen3.8-27B
-   (Hugging Face `Qwen/Qwen3.8-27B`; Ollama `qwen3.8:27b`), ARC's local model.
-   `raydock hybrid start` reads the loaded model's name from llama.cpp and
-   Ollama, and runs the session cloud only if it names another model. If the
-   runtime reports no name, `start` warns that it cannot read the model and
-   assumes Qwen3.8-27B. That includes Ollama models whose file carries no
-   name metadata, so check the model yourself when you see that warning.
+   This is the local endpoint hybrid routing uses. `--model` is the name your
+   server serves (its `/v1/models` id). The URL may end in `/v1` or not.
 
-   To serve another model, declare it by its registry id in
-   `~/.config/rayline/settings.json`:
+   Then tell Rayline which model that is. Qwen3.8-27B needs nothing more; for
+   any other model, add its registry id to `~/.config/rayline/settings.json`:
+
+   | Your server | `--url` | `--model` | `hybrid.local_registry_model` |
+   | --- | --- | --- | --- |
+   | Ollama with Qwen3.8-27B | `http://127.0.0.1:11434/v1` | `qwen3.8:27b` | not needed |
+   | llama.cpp with Qwen3.8-27B | `http://127.0.0.1:8080/v1` | `qwen3.8-27b` | not needed |
+   | vLLM or TensorFold with GLM-5.3-Flash | `http://127.0.0.1:8000/v1` | the served id, e.g. `GLM-5.3-Flash-EXL3` | `z-ai/glm-5.3-flash` |
 
    ```json
    {"hybrid": {"local_registry_model": "z-ai/glm-5.3-flash"}}
    ```
 
-   The id is `provider/model`, as the execution core's model registry names
-   it. Raydock checks only that shape. The core refuses a model its registry
+   **Qwen3.8-27B (no setting).** `raydock hybrid start` reads the loaded
+   model's name from llama.cpp and Ollama, and runs the session cloud only if
+   it names another model. If the runtime reports no name, `start` warns that
+   it cannot read the model and assumes Qwen3.8-27B. That includes Ollama
+   models whose file carries no name metadata, so check the model yourself
+   when you see that warning.
+
+   **Any other model.** The id is `provider/model`, as the execution core's
+   model registry names it (`z-ai/glm-5.3-flash`, not the server's own
+   name). Raydock checks only that shape. The core refuses a model its registry
    does not know when it starts; `start` then names this setting in its
    error. With a declared model, `start` skips the Qwen3.8-27B check and
    prints the declared model instead. Raydock does not check what the runtime
    serves, so declare the model it actually loads. The setting applies to the
    default profile only; `start --config` refuses it.
+
+   A model other than Qwen3.8-27B needs a `rayline-core` with `caller_bounded`
+   support (see [The capacity handoff](#the-capacity-handoff)). With an older
+   core, ARC never selects it and every turn goes to cloud.
 
 3. **Start and connect a harness.**
 
@@ -97,10 +127,14 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
      truncates a longer prompt. For MLX (`mlx_lm.server`), check that your
      build's KV-cache limit, if you set one, is at least that.
 
-   Claude Code's opening request alone is about 110,000 tokens for a model
-   other than Qwen3.8-27B, and the window must also hold the answer (up to
-   32,000 tokens), so give such a model at least 262,144 tokens, or every
-   Claude Code turn goes to cloud.
+   For Claude Code with a model other than Qwen3.8-27B, use a window well
+   above 110,000 tokens. The core counts a request as its prompt, bounded
+   from its byte length with headroom, plus the answer it allows and a
+   margin; Claude Code's opening request measured 105,000 to 112,000 tokens
+   that way. At 98,304 no Claude Code turn is eligible for the local model,
+   so every turn goes to cloud. At 131,072 the opening turns fit, so ARC can
+   choose local until the session grows past the window; a larger window,
+   such as 262,144, keeps longer sessions eligible.
 
    Set the window yourself with `"hybrid": {"local_context_window": 262144}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
@@ -120,6 +154,34 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
 
    `raydock local test` checks the endpoint with an OpenAI Chat Completions
    request, the API hybrid routing uses.
+
+## Check where each turn ran
+
+Every request the core completes writes an `execution completed` line to
+`runtime.log` in the state directory (`~/.rayline/hybrid` by default, or
+`--state-dir`). Its `deployment` is `local` when the request ran on your model,
+and `worker` names the model. Side calls, such as titles and compaction
+summaries, carry `event: sidecall`. A request that fails or is cut off writes
+no such line. To follow completed requests live:
+
+```bash
+tail -f ~/.rayline/hybrid/runtime.log | grep --line-buffered '"execution completed"' \
+  | jq -r '[.time[11:19], .deployment, .worker, (.decided_by // .event), .input_tokens, .output_tokens] | @tsv'
+```
+
+`decided_by` says why, as `<model>/<thinking>` reasons:
+`held/schedule` kept the previous model, `prefer_local_threshold/schedule`
+chose local under `prefer_local`, and a turn that does not fit the local window
+goes to cloud as `capacity_handoff/...` or `utility_fallback/...`, with the
+local target excluded for `context_capacity`.
+
+On the Rayline Platform **Usage** page, a local turn appears only as its ARC
+decision, with **Execution** set to **Decision only** and the local model as
+the selected model. Rayline does not run or bill its inference, so the page
+shows no tokens or inference cost for it. The decision request itself still
+sends the conversation, and the local model's token counts, to ARC. Cloud turns, and the auto-mode classifier's
+calls, appear as normal **Cloud** rows. `raydock top` does not show hybrid
+sessions yet.
 
 ## Pricing defaults
 
@@ -157,7 +219,7 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 
 | Key | Meaning |
 | --- | --- |
-| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs known local capacity. The default profile has it without a prompt counter: the core counts Qwen3.8-27B with its own tokenizer and bounds any other local model (`caller_bounded`). That needs a core with `caller_bounded` support (not yet released); an older core leaves a non-Qwen local target's capacity unknown, and ARC then never selects it (`capacity_unknown_local`). `start` refuses `prefer_local` only when the session has no local target. |
+| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs known local capacity. The default profile has it without a prompt counter: the core counts Qwen3.8-27B with its own tokenizer and bounds any other local model (`caller_bounded`). That needs a core with `caller_bounded` support, which Raydock bundles from 0.4.3; an older core leaves a non-Qwen local target's capacity unknown, and ARC then never selects it (`capacity_unknown_local`). `start` refuses `prefer_local` only when the session has no local target. |
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
 | `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). It must be 0 or between 1e-6 and 1e6. `start --config` refuses it, because a profile file sets its own prices. |
@@ -172,9 +234,13 @@ override block is refused for it.
 ## The capacity handoff
 
 The local window is the profile's `context_window`. Before each request, the
-core counts the exact prompt the local model would receive with the runtime's
-own tokenizer. The count covers tools, history and private instructions. The
-core adds the output limit, then tells ARC whether the request fits.
+core sizes the exact prompt the local model would receive, covering tools,
+history and private instructions. For Qwen3.8-27B, or with a qualified prompt
+counter, it counts tokens with that model's tokenizer; for any other model it
+bounds a text prompt by its bytes (see below). A prompt with images or other
+media gets only an estimate, which ARC treats as unknown capacity, so under
+`prefer_local` such a turn may go to cloud. The core adds the output limit,
+then tells ARC whether the request fits.
 
 The default profile sets the local output limit to a quarter of the local
 window, at most 32,000 tokens (24,576 at the default 96k window). Each cloud
@@ -202,9 +268,10 @@ asks for more than a deployment's ceiling has its turns on that deployment
 lowered to it rather than refused.
 
 When the conversation grows past the local window, for example during a long
-tool loop with no compaction, ARC hands the turn to a cloud target. The receipt
-reads `decided_by: capacity_handoff`, and the local target is listed as
-excluded for `context_capacity`. The conversation continues on the cloud model.
+tool loop with no compaction, ARC hands the turn to a cloud target. The local
+target is listed as excluded for `context_capacity`, and `decided_by` reads
+`capacity_handoff/...` or, when ARC falls back to its utility choice,
+`utility_fallback/...`. The conversation continues on the cloud model.
 No tool is replayed, and nothing is reselected mid-stream. If the local runtime
 itself refuses a request for context before any output, the core re-consults
 ARC with that fact instead of truncating.
@@ -212,9 +279,10 @@ ARC with that fact instead of truncating.
 With the default profile the core sizes each request itself. It counts
 Qwen3.8-27B with its embedded tokenizer (`local_measured`). For another model
 declared in `hybrid.local_registry_model`, a core with `caller_bounded`
-support bounds the request by its bytes; an older core reports that target's
-capacity as unknown. Either way the core still hands off when the runtime
-refuses a request for context (llama.cpp reports this before any output). A
+support (bundled from Raydock 0.4.3) bounds the request by its bytes; an older
+core reports that target's capacity as unknown. Either way the core still hands
+off when the runtime refuses a request for context (llama.cpp reports this
+before any output). A
 profile with a qualified llama.cpp prompt counter (see below) counts every
 request with the runtime's own tokenizer, so the handoff happens before
 dispatch.
