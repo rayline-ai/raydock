@@ -87,9 +87,9 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
 
    Rayline uses the context window your runtime reports, so load it with the
    window you want:
-   - llama.cpp: `llama-server --ctx-size 131072 ...` (Rayline reads the loaded
+   - llama.cpp: `llama-server --ctx-size 262144 ...` (Rayline reads the loaded
      window from `/props`);
-   - vLLM and TensorFold: `--max-model-len 131072` (Rayline reads the served
+   - vLLM and TensorFold: `--max-model-len 262144` (Rayline reads the served
      model's `max_model_len` or `context_length` from `/v1/models`);
    - Ollama and MLX report no window, so Rayline assumes 98,304 tokens. For
      Ollama set `OLLAMA_CONTEXT_LENGTH=98304 ollama serve`, or `num_ctx` in
@@ -98,8 +98,9 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
      build's KV-cache limit, if you set one, is at least that.
 
    Claude Code's opening request alone is about 110,000 tokens for a model
-   other than Qwen3.8-27B, so give such a model a window above that, such as
-   131,072 or 262,144, or every Claude Code turn goes to cloud.
+   other than Qwen3.8-27B, and the window must also hold the answer (up to
+   32,000 tokens), so give such a model at least 262,144 tokens, or every
+   Claude Code turn goes to cloud.
 
    Set the window yourself with `"hybrid": {"local_context_window": 131072}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
