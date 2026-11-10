@@ -816,7 +816,7 @@ fn explain_decisions_failure(
             "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `raydock hybrid stop` and `raydock hybrid start` so the runtime uses the new key."
         ),
         DecisionsFailure::Unavailable => format!(
-            "{message}: the Rayline routing service is unavailable or still starting (a development cell scales to zero and takes about a minute to start). This is retryable: send the turn again shortly."
+            "{message}: the Rayline routing service could not decide this turn right now (it may be unavailable, or a development cell may still be starting, which takes about a minute). This is retryable: send the turn again after the retry-after interval."
         ),
         DecisionsFailure::Throttled => format!(
             "{message}: the Rayline routing service is busy. Send the turn again after the retry-after interval."
