@@ -1389,7 +1389,8 @@ mod tests {
     #[test]
     fn an_unconfigured_window_follows_the_runtime_and_a_configured_one_is_capped_by_it() {
         // Unconfigured: the runtime's reported window, so Claude Code's
-        // ~110k opening request fits a 262k GLM server.
+        // opening request (about 73,000 tokens plus the answer allowance)
+        // fits a 262k GLM server with room to grow.
         assert_eq!(resolve_local_window(None, Some(262_144)), (262_144, None));
         assert_eq!(resolve_local_window(None, Some(32_768)), (32_768, None));
         let (window, note) = resolve_local_window(None, Some(1_048_576));
