@@ -453,10 +453,10 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         let error_body = upstream.bytes().await?;
         let failure = decisions_failure(&error_body);
         let hint = RetryHint::from_headers(&headers);
-        // The core's message names the service's HTTP status and code; the
-        // route id is the service's, when it sent one. Neither carries the
-        // prompt or a credential.
-        let detail = decisions_message(&error_body).unwrap_or_default();
+        // Only the core's own Decisions status and code are logged (a
+        // provider's error text may quote the prompt); the route id is the
+        // service's, when it sent one.
+        let detail = decisions_detail(&error_body);
         let route_id = headers
             .get("x-rayline-route-id")
             .and_then(|value| value.to_str().ok())
@@ -478,15 +478,15 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
             tokio::time::sleep(delay).await;
             continue;
         }
-        if failure.is_some() || is_decision_failed(&error_body) {
-            tracing::warn!(
-                ?failure,
-                %detail,
-                route_id,
-                resent = retried,
-                "Decisions failed the turn; returning the error to the harness"
-            );
-        }
+        // Every 502 before any output is logged: the core's Decisions
+        // failures are not all classified, and a Messages error loses its code.
+        tracing::warn!(
+            ?failure,
+            %detail,
+            route_id,
+            resent = retried,
+            "the core failed the turn before any output; returning the error to the harness"
+        );
         return buffered_response(state, status, &headers, error_body, failure, hint);
     }
 }
@@ -672,22 +672,35 @@ fn decisions_message(body: &[u8]) -> Option<String> {
     Some(message.chars().take(160).collect())
 }
 
-/// Whether a core 502 is its `decision_failed` error: the code, where the wire
-/// format keeps it, else a message from the core's `Decide` (each starts with
-/// "Decisions", such as "invalid Decisions response" or "Decisions returned
-/// no requested preset"). Covers the failures [`decisions_failure`] does not
-/// classify, so every failed decision is logged.
-fn is_decision_failed(body: &[u8]) -> bool {
-    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return false;
+/// The part of a core 502's message that is safe to log: the routing
+/// service's status and code from the core's own `Decide` messages, else
+/// `"other"`, since any other message may be a provider's text.
+fn decisions_detail(body: &[u8]) -> String {
+    let other = || "other".to_owned();
+    let Some(message) = decisions_message(body) else {
+        return other();
     };
-    if value.pointer("/error/code").and_then(|code| code.as_str()) == Some("decision_failed") {
-        return true;
+    if message == "Decisions request failed" {
+        return "request failed".to_owned();
     }
-    value
-        .pointer("/error/message")
-        .and_then(|message| message.as_str())
-        .is_some_and(|message| message.contains("Decisions"))
+    let Some(rest) = message.strip_prefix("Decisions request refused (HTTP ") else {
+        return other();
+    };
+    let status = rest.get(..3).unwrap_or_default();
+    // The code is the service's contract code: lowercase letters and '_'.
+    let code = rest
+        .get(3..)
+        .and_then(|rest| rest.strip_prefix(", "))
+        .and_then(|rest| rest.split(')').next())
+        .filter(|code| code.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+    match (
+        status.chars().all(|c| c.is_ascii_digit()) && status.len() == 3,
+        code,
+    ) {
+        (true, Some(code)) if !code.is_empty() => format!("refused {status} {code}"),
+        (true, _) => format!("refused {status}"),
+        _ => other(),
+    }
 }
 
 /// Classify the core's `decision_failed` error, in either wire format
@@ -1049,26 +1062,37 @@ mod tests {
     }
 
     #[test]
-    fn every_decision_failure_is_recognised_for_logging() {
-        let body = |value: serde_json::Value| value.to_string().into_bytes();
-        // Unclassified failures (no resend, no explanation) are still logged.
-        assert!(is_decision_failed(&body(
-            json!({"error": {"type": "invalid_request_error", "code": "decision_failed", "message": "invalid Decisions response"}})
-        )));
-        assert!(is_decision_failed(&body(
-            json!({"type": "error", "error": {"type": "invalid_request_error", "message": "Decisions returned no requested preset"}})
-        )));
+    fn only_the_cores_decisions_status_and_code_are_logged() {
+        let body = |message: &str| {
+            json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}})
+                .to_string()
+                .into_bytes()
+        };
         assert_eq!(
-            decisions_failure(&body(
-                json!({"error": {"message": "invalid Decisions response"}})
+            decisions_detail(&body(
+                "Decisions request refused (HTTP 422, projection_refused)"
             )),
-            None
+            "refused 422 projection_refused"
         );
-        // A provider's own 502 is not a decision failure.
-        assert!(!is_decision_failed(&body(
-            json!({"error": {"type": "api_error", "message": "upstream overloaded"}})
-        )));
-        assert!(!is_decision_failed(b"not json"));
+        assert_eq!(
+            decisions_detail(&body("Decisions request refused (HTTP 504)")),
+            "refused 504"
+        );
+        assert_eq!(
+            decisions_detail(&body("Decisions request failed")),
+            "request failed"
+        );
+        // Anything else may be a provider's text, which can quote the prompt.
+        assert_eq!(
+            decisions_detail(&body("Rejected input: Decisions secret text")),
+            "other"
+        );
+        assert_eq!(
+            decisions_detail(&body("Decisions request refused (HTTP 422, Secret text)")),
+            "refused 422"
+        );
+        assert_eq!(decisions_detail(&body("unexpected EOF")), "other");
+        assert_eq!(decisions_detail(b"not json"), "other");
     }
 
     #[test]
