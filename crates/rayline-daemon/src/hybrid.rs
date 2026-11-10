@@ -634,7 +634,8 @@ fn stream_response(upstream: reqwest::Response) -> Result<Response<Body>> {
 enum DecisionsFailure {
     /// Decisions refused the router key.
     Auth,
-    /// Decisions was unreachable or answered 502/503/504 (e.g. a cold cell).
+    /// Decisions was unreachable, timed out, or answered 408, 409 or 5xx
+    /// (e.g. a cold cell): it may clear on a resend.
     Unavailable,
     /// Decisions answered 429: the caller is over its admission share.
     Throttled,
@@ -654,11 +655,10 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
     let status = message.strip_prefix("Decisions request refused (HTTP ")?;
     match status.get(..3)? {
         "401" | "403" => Some(DecisionsFailure::Auth),
-        "502" | "503" | "504" => Some(DecisionsFailure::Unavailable),
         "429" => Some(DecisionsFailure::Throttled),
-        // A timeout or a conflict may clear on a resend: pass the core's 502
-        // through as before.
-        "408" | "409" => None,
+        // A timeout or a conflict may clear on a resend, like a 5xx.
+        "408" | "409" => Some(DecisionsFailure::Unavailable),
+        code if code.starts_with('5') => Some(DecisionsFailure::Unavailable),
         code if code.starts_with('4') => Some(DecisionsFailure::Refused),
         _ => None,
     }
@@ -764,7 +764,11 @@ fn buffered_response(
             }
             response = response.header("x-should-retry", "false");
             if retryable {
-                let wait = hint.retry_after.unwrap_or(DEFAULT_HARNESS_RETRY_AFTER);
+                // At least the second rld itself waits.
+                let wait = hint
+                    .retry_after
+                    .unwrap_or(DEFAULT_HARNESS_RETRY_AFTER)
+                    .max(Duration::from_secs(1));
                 response = response.header("retry-after", wait.as_secs().to_string());
             }
             body
@@ -1012,8 +1016,12 @@ mod tests {
                 Some(DecisionsFailure::Auth)
             );
             for message in [
+                "Decisions request refused (HTTP 500)",
                 "Decisions request refused (HTTP 502)",
                 "Decisions request refused (HTTP 503)",
+                "Decisions request refused (HTTP 504)",
+                "Decisions request refused (HTTP 408)",
+                "Decisions request refused (HTTP 409, code conflict)",
                 "Decisions request failed",
             ] {
                 assert_eq!(
@@ -1039,9 +1047,7 @@ mod tests {
                 );
             }
             for message in [
-                "Decisions request refused (HTTP 500)",
-                "Decisions request refused (HTTP 408)",
-                "Decisions request refused (HTTP 409, code conflict)",
+                "Decisions request refused (HTTP 302)",
                 "selected endpoint request failed",
             ] {
                 assert_eq!(decisions_failure(&encode(message)), None, "{message}");

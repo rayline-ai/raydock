@@ -627,6 +627,9 @@ async fn a_failed_decision_costs_at_most_two_lookups_and_stops_the_harness_retry
         ),
         // A wait longer than rld holds a turn goes to the harness instead.
         ("refused=503&retry_after=120", 1, 503, Some("120")),
+        // A timeout, a conflict or another 5xx: one resend, then final.
+        ("refused=408&retry_after=1", 2, 503, Some("1")),
+        ("refused=500&retry_after=0", 2, 503, Some("1")),
     ];
     let events = runtime.dir.join("events.jsonl");
     for (query, calls, status, retry_after) in cases {
