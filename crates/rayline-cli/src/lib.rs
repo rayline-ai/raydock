@@ -321,12 +321,16 @@ Print local router logs.
 ";
 
 const ROUTER_TOP_HELP: &str = "\
-Usage: raydock top [--json] [--all]
-       raydock router top [--json] [--all]
+Usage: raydock top [--hybrid [--state-dir <path>] | --legacy] [--json] [--all]
+       raydock router top [--hybrid [--state-dir <path>] | --legacy] [--json] [--all]
 
-Show live LLM request metrics.
+Show live LLM request metrics. Automatically selects a live default hybrid
+runtime when no legacy metrics are available; both live is an ambiguity error.
 
 Options:
+  --hybrid    Select hybrid explicitly (never falls back to legacy)
+  --legacy    Select legacy metrics explicitly (never discovers hybrid)
+  --state-dir <path>  Hybrid runtime directory (requires --hybrid)
   --json      Print one snapshot as JSON
   --all       Include proxied Anthropic sideband traffic
 ";
@@ -2000,7 +2004,7 @@ where
 }
 
 fn parse_router_top_request<'a, I>(
-    args: std::iter::Peekable<I>,
+    mut args: std::iter::Peekable<I>,
     root_env_explicit: bool,
 ) -> Option<crate::router::RouterTopRequest>
 where
@@ -2008,19 +2012,45 @@ where
 {
     let mut json = false;
     let mut show_all = false;
-    for arg in args {
+    let mut hybrid = false;
+    let mut legacy = false;
+    let mut state_dir = None;
+    while let Some(arg) = args.next() {
+        if arg == "--state-dir" {
+            let path = args.next()?;
+            if path.is_empty() {
+                return None;
+            }
+            state_dir = Some(std::path::PathBuf::from(path));
+            continue;
+        }
         let arg = arg.to_str()?;
+        if let Some(path) = arg.strip_prefix("--state-dir=") {
+            if path.is_empty() {
+                return None;
+            }
+            state_dir = Some(std::path::PathBuf::from(path));
+            continue;
+        }
         match arg {
             "--json" => json = true,
             "--all" => show_all = true,
+            "--hybrid" => hybrid = true,
+            "--legacy" => legacy = true,
             "--help" => return None,
             _ => return None,
         }
+    }
+    if (hybrid && legacy) || (!hybrid && state_dir.is_some()) {
+        return None;
     }
 
     Some(crate::router::RouterTopRequest {
         json,
         show_all,
+        hybrid,
+        legacy,
+        state_dir,
         root_env_explicit,
     })
 }
@@ -2928,6 +2958,9 @@ mod tests {
             RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
                 json: true,
                 show_all: false,
+                hybrid: false,
+                legacy: false,
+                state_dir: None,
                 root_env_explicit: true,
             })
         );
@@ -2946,9 +2979,57 @@ mod tests {
             RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
                 json: true,
                 show_all: true,
+                hybrid: false,
+                legacy: false,
+                state_dir: None,
                 root_env_explicit: true,
             })
         );
+    }
+
+    #[test]
+    fn public_parser_selects_hybrid_top_and_requires_explicit_state_scope() {
+        assert_eq!(
+            rayline_dispatch_for_argv(&argv(&["raydock", "top", "--legacy", "--json"])),
+            RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
+                json: true,
+                show_all: false,
+                hybrid: false,
+                legacy: true,
+                state_dir: None,
+                root_env_explicit: false,
+            })
+        );
+        for state_args in [
+            vec!["--state-dir", "/private/hybrid"],
+            vec!["--state-dir=/private/hybrid"],
+        ] {
+            let mut args = vec!["raydock", "top", "--hybrid", "--json"];
+            args.extend(state_args);
+            assert_eq!(
+                rayline_dispatch_for_argv(&argv(&args)),
+                RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
+                    json: true,
+                    show_all: false,
+                    hybrid: true,
+                    legacy: false,
+                    state_dir: Some(std::path::PathBuf::from("/private/hybrid")),
+                    root_env_explicit: false,
+                })
+            );
+        }
+        for args in [
+            vec!["raydock", "top", "--state-dir", "/private/hybrid"],
+            vec!["raydock", "top", "--hybrid", "--state-dir"],
+            vec!["raydock", "top", "--hybrid", "--state-dir="],
+            vec!["raydock", "top", "--hybrid", "--legacy"],
+            vec!["raydock", "top", "--legacy", "--state-dir=/private/hybrid"],
+        ] {
+            assert_eq!(
+                rayline_dispatch_for_argv(&argv(&args)),
+                RaylineDispatch::Unavailable
+            );
+        }
     }
 
     #[test]

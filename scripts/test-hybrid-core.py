@@ -5,6 +5,7 @@ This is not a live ARC/model evaluation. All manifests and requests are syntheti
 controls come from the public compiled registry supplied by the caller.
 """
 import argparse
+import concurrent.futures
 import hashlib
 import http.server
 import json
@@ -90,6 +91,7 @@ def main():
     package_sha = digest(package_bytes)
     decisions, dispatches = [], []
     decision_times, first_completion = [], []
+    first_dispatch_started = threading.Event()
     harness_scenario = {"active": False, "turns": 0, "path": ""}
     cloud_key = "synthetic-cloud-credential"
     provider_key = cloud_key
@@ -163,6 +165,7 @@ def main():
             dispatches.append({"target": target, "body": body})
             save_artifact(f"{target}-{len(decisions)}.json", body)
             headers = {}
+            assert body["model"] == ("fixture-local-model" if target == "local" else cloud_wire_model)
             if target == "local":
                 assert self.headers.get("Authorization") is None
             else:
@@ -182,6 +185,8 @@ def main():
                     "type": "function", "function": {"name": tool_name, "arguments": json.dumps({parameter: harness_scenario["path"]})}}]}
                 finish = "tool_calls"
             elif len(dispatches) == 1:
+                # Observe a genuinely in-flight gateway request before the core replies.
+                first_dispatch_started.set()
                 # Age must start after this generation completes, not before it.
                 time.sleep(1.1)
                 message = {"role": "assistant", "content": None, "tool_calls": [{"id": "call_fixture",
@@ -276,12 +281,25 @@ def main():
             CLAUDE_CONFIG_DIR=str(root / "claude"), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
         env.pop("RAYLINE_ROUTER_API_KEY", None)
 
-        def cli(*parts):
-            result = subprocess.run([str(args.rayline.resolve()), "hybrid", "--state-dir", str(state), *parts],
+        def assert_no_secrets(value):
+            text = value if isinstance(value, str) else json.dumps(value)
+            secrets = ["synthetic-decisions-credential", cloud_key, provider_key, private_text]
+            if (state / "gateway-token").exists():
+                secrets.append((state / "gateway-token").read_text().strip())
+            if args.local_auth_file:
+                secrets.append(args.local_auth_file.read_text().strip())
+            assert not any(secret and secret in text for secret in secrets), "credentials/private instruction leaked"
+
+        def run_cli(*parts):
+            result = subprocess.run([str(args.rayline.resolve()), *parts],
                                     env=env, cwd=root, capture_output=True, text=True, timeout=180)
-            assert result.returncode == 0, (result.stdout, result.stderr,
-                (state / "runtime.log").read_text() if (state / "runtime.log").exists() else "")
+            assert_no_secrets(result.stdout)
+            assert_no_secrets(result.stderr)
+            assert result.returncode == 0, (result.stdout, result.stderr)
             return result.stdout
+
+        def cli(*parts):
+            return run_cli("hybrid", "--state-dir", str(state), *parts)
 
         def start():
             cli("start", "--core", str(args.core.resolve()), "--config", str(config_path), "--port", "0")
@@ -300,18 +318,88 @@ def main():
                 except urllib.error.HTTPError as error:
                     raise AssertionError(f"HTTP {error.code}: {error.read().decode()}") from error
 
+            def snapshot():
+                token = (state / "gateway-token").read_text().strip()
+                req = urllib.request.Request(current["listen_url"] + "/v1/router/top/snapshot",
+                    headers={"Authorization": "Bearer " + token})
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    result = json.load(response)
+                assert_no_secrets(result)
+                assert result["ok"] and result["runtime"] == "rayline-hybrid", result
+                for key in ("pid", "core_pid", "instance_id"):
+                    assert result[key] == current[key], (key, result)
+                return result
+
+            def rejected_snapshot(token=None):
+                req = urllib.request.Request(current["listen_url"] + "/v1/router/top/snapshot",
+                    headers={"Authorization": "Bearer " + token} if token else {})
+                try:
+                    with urllib.request.urlopen(req, timeout=10):
+                        raise AssertionError("gateway admitted an unauthenticated/stale snapshot credential")
+                except urllib.error.HTTPError as error:
+                    assert error.code == 401, error.code
+                    assert_no_secrets(error.read().decode())
+
+            def completed_snapshot(expected_targets):
+                result = snapshot()
+                totals = result["totals"]
+                assert result["active"] == [] and totals["active_requests"] == 0, result
+                assert totals["completed_requests"] == len(expected_targets), result
+                assert totals["errored_requests"] == 0, result
+                assert totals["local_requests"] == expected_targets.count("local"), result
+                assert totals["remote_requests"] == expected_targets.count("cloud"), result
+                rows = list(reversed(result["recent"]))
+                assert len(rows) == len(expected_targets), result
+                for index, (row, target) in enumerate(zip(rows, expected_targets)):
+                    selected = actions[target]
+                    assert row["state"] == "completed" and row["status_code"] == 200, row
+                    assert row["source"] == "hybrid" and row["requested_model"] == "rayline-auto", row
+                    assert row["target"] == ("local" if target == "local" else "remote"), row
+                    assert row["endpoint_id"] == target, row
+                    assert row["selected_model"] == selected["model"], row
+                    assert row["executed_model"] == selected["model"], row
+                    assert row["decision_model"] == selected["model"], row
+                    assert row["executed_worker"] == target, row
+                    assert row["executed_action_id"] == selected["action_id"], row
+                    assert row["wire_model"] == dispatches[index]["body"]["model"], row
+                    assert row["completed_at_unix_ms"] >= row["started_at_unix_ms"], row
+                return result
+
+            def routing_headers(headers, target):
+                headers = {name.lower(): value for name, value in headers.items()}
+                selected = actions[target]
+                for name, expected in {"instance-id": current["instance_id"],
+                        "selected-model": selected["model"], "executed-model": selected["model"],
+                        "executed-worker": target, "action-id": selected["action_id"],
+                        "executed-action-id": selected["action_id"],
+                        "executed-control-id": selected["control_id"]}.items():
+                    assert headers.get("x-rayline-" + name) == expected, name
+                assert_no_secrets(headers)
+
+            rejected_snapshot()
+            completed_snapshot([])
             messages = [{"role": "user", "content": "Call lookup for sample, then report its result."}]
             base = {"model": "rayline-auto", "max_tokens": 512, "tools": [{"name": "lookup",
                 "description": "Lookup a synthetic record", "input_schema": {"type": "object",
                     "properties": {"name": {"type": "string"}}, "required": ["name"]}}]}
-            one, _ = request("/v1/messages", dict(base, messages=messages))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                pending = executor.submit(request, "/v1/messages", dict(base, messages=messages))
+                assert first_dispatch_started.wait(10), "real core never dispatched the first request"
+                in_flight = snapshot()
+                assert len(in_flight["active"]) == 1 and in_flight["totals"]["active_requests"] == 1, in_flight
+                assert in_flight["recent"] == [] and in_flight["totals"]["completed_requests"] == 0, in_flight
+                one, headers = pending.result(timeout=15)
+            routing_headers(headers, "local")
+            completed_snapshot(["local"])
             assert one["stop_reason"] == "tool_use", one
             tool = next(block for block in one["content"] if block["type"] == "tool_use")
             assert tool["id"] == "call_fixture" and tool["input"] == {"name": "sample"}
             messages += [{"role": "assistant", "content": one["content"]},
                          {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool["id"], "content": "record found"}]}]
             time.sleep(0.12)
-            two, _ = request("/v1/messages", dict(base, messages=messages))
+            two, headers = request("/v1/messages", dict(base, messages=messages))
+            routing_headers(headers, "cloud")
+            completed_snapshot(["local", "cloud"])
             second = decisions[1]["routing"]["execution"]
             assert second["hold"]["action_id"] == local["action_id"]
             assert len(second["workers"]) == 1, second
@@ -325,16 +413,31 @@ def main():
             assert any(m["role"] == "tool" and m.get("tool_call_id") == "call_fixture"
                        for m in dispatches[1]["body"]["messages"])
             messages += [{"role": "assistant", "content": two["content"]}, {"role": "user", "content": "Confirm once more."}]
-            three, _ = request("/v1/messages", dict(base, messages=messages))
+            three, headers = request("/v1/messages", dict(base, messages=messages))
+            routing_headers(headers, "cloud")
+            completed_snapshot(["local", "cloud", "cloud"])
             assert json.dumps(dispatches[2]["body"]).count(private_text) == 1
             messages += [{"role": "assistant", "content": three["content"]}, {"role": "user", "content": "Return to the local worker."}]
-            request("/v1/messages", dict(base, messages=messages))
+            _, headers = request("/v1/messages", dict(base, messages=messages))
+            routing_headers(headers, "local")
+            gateway_top = completed_snapshot(["local", "cloud", "cloud", "local"])
+            cli_top = json.loads(run_cli("top", "--hybrid", "--state-dir", str(state), "--json"))
+            assert cli_top["runtime"] in ("hybrid", "rayline-hybrid"), cli_top
+            for key in ("pid", "core_pid", "instance_id", "totals", "active"):
+                assert cli_top[key] == gateway_top[key], key
+            assert [row["request_id"] for row in cli_top["recent"]] == [row["request_id"] for row in gateway_top["recent"]]
+            for cli_row, gateway_row in zip(cli_top["recent"], gateway_top["recent"]):
+                for key in ("selected_model", "decision_model", "executed_model", "target", "endpoint_id", "wire_model"):
+                    assert cli_row[key] == gateway_row[key], (key, cli_row)
             assert private_text not in json.dumps(dispatches[3]["body"])
             assert private_text not in json.dumps(decisions)
-            chat, _ = request("/v1/chat/completions", {"model": "rayline-auto", "messages": [{"role": "user", "content": "chat wire"}]}, "chat-session")
+            chat, headers = request("/v1/chat/completions", {"model": "rayline-auto", "messages": [{"role": "user", "content": "chat wire"}]}, "chat-session")
+            routing_headers(headers, "local")
             assert chat["choices"][0]["message"]["content"] == "Synthetic execution complete."
-            responses, _ = request("/v1/responses", {"model": "rayline-auto", "input": "responses wire"}, "responses-session")
+            responses, headers = request("/v1/responses", {"model": "rayline-auto", "input": "responses wire"}, "responses-session")
+            routing_headers(headers, "local")
             assert responses["output"][0]["content"][0]["text"] == "Synthetic execution complete."
+            completed_snapshot(["local", "cloud", "cloud", "local", "local", "local"])
             assert [d["target"] for d in dispatches[:4]] == ["local", "cloud", "cloud", "local"]
             actual_local = None
             if args.local_deployment:
@@ -404,6 +507,8 @@ def main():
             old_instance = current["instance_id"]
             current = start()
             assert current["instance_id"] != old_instance
+            rejected_snapshot(previous_token.strip())
+            completed_snapshot([])
             stale_health = urllib.request.Request(current["listen_url"] + "/healthz",
                 headers={"Authorization": "Bearer " + previous_token})
             try:
@@ -435,7 +540,7 @@ def main():
             cli("stop")
             server.shutdown()
             server.server_close()
-    print("Real Rust + Go hybrid acceptance passed: three wires, local/cloud/local, tools, private append, completion age, external ownership, restart and parent death. HTTP Decisions and the baseline model responses were synthetic fixtures.")
+    print("Real Rust + Go hybrid acceptance passed: authenticated snapshot and CLI top, actual execution identity, active/completed totals, three wires, local/cloud/local, tools, private append, completion age, external ownership, restart and parent death. HTTP Decisions and the baseline model responses were synthetic fixtures.")
     if args.claude:
         print("Installed Claude Code completed a real Read tool exchange across local/cloud execution.")
     if args.pi:

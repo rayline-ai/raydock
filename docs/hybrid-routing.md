@@ -9,6 +9,34 @@ static router or adapter.
 This is an explicit mode. `raydock claude --local` continues to mean auth-free
 local static routing.
 
+## Live request metrics
+
+Use `raydock top --hybrid` for the hybrid runtime, or
+`raydock top --hybrid --state-dir /path/to/instance --json` for one JSON snapshot
+from a separate instance. Top reads `ready.json` and the private `gateway-token`,
+verifies live gateway/core process identity through authenticated health, and
+uses `/v1/router/top/snapshot` on the existing gateway. No extra port is opened.
+Explicit hybrid selection never falls back to legacy metrics.
+
+Plain `raydock top` selects the default hybrid instance when it is live and no
+legacy snapshot endpoint is available. If both are live, it reports ambiguity;
+select `--hybrid` or `--legacy` (mutually exclusive). `--state-dir` requires
+`--hybrid`. Every fetched hybrid snapshot must match the initially verified
+gateway/core PIDs and instance ID, including each TUI refresh. Display and JSON identify the
+runtime. Hybrid remote execution is displayed as cloud; unknown execution stays
+unknown, never the virtual requested model. Execution identity and usage come
+from the gateway, not Claude trace enrichment. `--all` also shows sideband
+traffic; interactive top retains its usual refresh, pause and sort controls.
+
+Rows describe the model actually executed, using the core's response receipt;
+JSON also preserves the original decision model and the deployment's served
+`wire_model`. A deployment declared `local` remains local even when its server
+is on your LAN. Missing or ambiguous receipts are not counted as cloud traffic.
+Routing becomes visible when response headers arrive, not while Decisions is
+still running. Internal reconsult/fallback history and cost estimates are not
+included. Metrics are in memory and reset when the hybrid runtime restarts;
+no prompts, tool content, credentials, or raw provider errors are stored.
+
 ## Bring your own inference server
 
 Start and configure your Qwen model using your preferred server, such as Ollama,

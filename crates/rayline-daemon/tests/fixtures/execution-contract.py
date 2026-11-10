@@ -82,7 +82,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             os._exit(23)
         if self.path == "/unready":
             Handler.ready = False
-        if self.path == "/pending":
+        if self.path == "/pending" or (self.path == "/v1/messages" and json.loads(body).get("fixture_pending")):
             try:
                 more = self.rfile.read(1)
             except (ConnectionResetError, ConnectionAbortedError):
@@ -90,7 +90,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not more:
                 pathlib.Path(config["cancelled"] + "-pending").write_text("cancelled before headers")
             return
-        if self.path == "/stream":
+        if self.path == "/stream" or (self.path == "/v1/messages" and json.loads(body).get("stream")):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -106,6 +106,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("x-rayline-selected-model", "fixture-model")
+        if config.get("derived_actions"):
+            requested = json.loads(body)["model"]
+            entry = next(row for row in config["derived_actions"] if row["model"] == requested)
+            self.send_header("x-rayline-instance-id", f"fixture-{os.getpid()}")
+            self.send_header("x-rayline-executed-model", entry["model"])
+            self.send_header("x-rayline-executed-worker", entry["worker"])
+            self.send_header("x-rayline-executed-action-id", "dynamic-registry-action")
         self.end_headers()
         self.wfile.write(body)
 

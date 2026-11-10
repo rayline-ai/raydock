@@ -20,6 +20,16 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
   run it.
 - Nothing else. A profile file is optional (see [Advanced: a profile file](#advanced-a-profile-file)).
 
+## Watch requests
+
+After starting hybrid, run `raydock top --hybrid` to watch local/cloud execution,
+or `raydock top --hybrid --json` for a single snapshot. For a separate instance,
+add `--state-dir /path/to/instance`. No additional metrics port is needed.
+Plain `raydock top` discovers the default live hybrid instance only when legacy
+metrics are not also live; use `--hybrid` or `--legacy` to resolve that ambiguity.
+These flags are mutually exclusive; `--state-dir` requires `--hybrid`. Unknown
+execution models remain unknown rather than showing the harness's virtual model.
+
 ## What it costs
 
 Every turn of a hybrid session bills one ARC decision against your Rayline

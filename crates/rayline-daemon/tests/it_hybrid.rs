@@ -231,6 +231,61 @@ impl Runtime {
     }
 }
 
+async fn top_snapshot(client: &reqwest::Client, url: &str, token: &str) -> Value {
+    let response = client
+        .get(format!("{url}/v1/router/top/snapshot"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let body = response.text().await.unwrap();
+    assert!(
+        !body.contains(token),
+        "snapshot exposed its gateway credential"
+    );
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(snapshot["runtime"], "rayline-hybrid");
+    snapshot
+}
+
+async fn assert_cancelled_snapshot(client: &reqwest::Client, url: &str, token: &str, id: &Value) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = top_snapshot(client, url, token).await;
+        if snapshot["active"].as_array().unwrap().is_empty() {
+            assert_eq!(snapshot["totals"]["active_requests"], 0);
+            assert_eq!(snapshot["totals"]["completed_requests"], 1);
+            assert_eq!(snapshot["totals"]["errored_requests"], 1);
+            let recent = snapshot["recent"].as_array().unwrap();
+            assert_eq!(
+                recent.len(),
+                1,
+                "disconnect produced duplicate terminal rows"
+            );
+            assert_eq!(&recent[0]["request_id"], id);
+            assert_eq!(recent[0]["state"], "error");
+            assert!(
+                recent[0]["error"]
+                    .as_str()
+                    .is_some_and(|error| !error.is_empty())
+            );
+            assert!(recent[0]["completed_at_unix_ms"].is_number());
+            assert!(
+                recent[0]["target"].is_null(),
+                "fixture has no execution receipt"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cancelled request stayed active: {snapshot}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+}
+
 #[tokio::test]
 async fn all_protocols_preserve_body_and_identity_then_stop_owned_core() {
     let mut runtime = Runtime::start(1);
@@ -238,6 +293,17 @@ async fn all_protocols_preserve_body_and_identity_then_stop_owned_core() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let unauthorized = client.get(format!("{url}/healthz")).send().await.unwrap();
     assert_eq!(unauthorized.status(), 401);
+    let unauthorized_top = client
+        .get(format!("{url}/v1/router/top/snapshot"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthorized_top.status(), 401);
+    let initial = top_snapshot(&client, &url, &token).await;
+    assert_eq!(initial["pid"], runtime.child.id());
+    assert_eq!(initial["totals"]["active_requests"], 0);
+    assert_eq!(initial["totals"]["completed_requests"], 0);
+    assert!(initial["recent"].as_array().unwrap().is_empty());
     let body = "{ \"model\":\"rayline-auto\", \"thinking\":{\"type\":\"adaptive\"},\"messages\":[],\"input\":[],\"private\":\"unaltered\" }";
     for path in ["/v1/messages", "/v1/chat/completions", "/v1/responses"] {
         let response = client
@@ -256,6 +322,12 @@ async fn all_protocols_preserve_body_and_identity_then_stop_owned_core() {
         );
         assert_eq!(response.text().await.unwrap(), body);
     }
+    let snapshot = top_snapshot(&client, &url, &token).await;
+    assert_eq!(snapshot["totals"]["local_requests"], 0);
+    assert_eq!(
+        snapshot["totals"]["remote_requests"], 0,
+        "missing receipts must not imply remote routing"
+    );
     let events: Vec<Value> = fs::read_to_string(runtime.dir.join("events.jsonl"))
         .unwrap()
         .lines()
@@ -284,18 +356,79 @@ async fn all_protocols_preserve_body_and_identity_then_stop_owned_core() {
 }
 
 #[tokio::test]
+async fn derived_models_sharing_a_worker_attribute_the_executed_deployment() {
+    // Derived action IDs are produced by the core, not enumerated in daemon config.
+    // The shared worker alone is ambiguous; the executed model disambiguates it.
+    let members = r#","deployments":[{"id":"local","kind":"local","wire_model":"local-wire"},{"id":"cloud","kind":"cloud","wire_model":"cloud-wire"}],"derived_actions":[{"worker":"shared","model":"local-model","deployment_id":"local"},{"worker":"shared","model":"cloud-model","deployment_id":"cloud"}]"#;
+    let mut runtime = Runtime::start_with_decisions(
+        1,
+        0,
+        120,
+        None,
+        "http://127.0.0.1:9/decisions",
+        members,
+        None,
+    );
+    let (url, token) = runtime.ready().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (index, (model, deployment, target, wire)) in [
+        ("local-model", "local", "local", "local-wire"),
+        ("cloud-model", "cloud", "remote", "cloud-wire"),
+        ("local-model", "local", "local", "local-wire"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        client
+            .post(format!("{url}/v1/messages"))
+            .bearer_auth(&token)
+            .json(&json!({"model": model, "messages": []}))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let snapshot = top_snapshot(&client, &url, &token).await;
+        assert!(snapshot["active"].as_array().unwrap().is_empty());
+        assert_eq!(snapshot["recent"].as_array().unwrap().len(), index + 1);
+        let row = &snapshot["recent"][0];
+        assert_eq!(row["state"], "completed");
+        assert_eq!(row["decision_model"], "fixture-model");
+        assert_eq!(row["selected_model"], model);
+        assert_eq!(row["executed_model"], model);
+        assert_eq!(row["executed_worker"], "shared");
+        assert_eq!(row["endpoint_id"], deployment);
+        assert_eq!(row["target"], target);
+        assert_eq!(row["wire_model"], wire);
+        assert_eq!(snapshot["totals"]["completed_requests"], index + 1);
+        assert_eq!(snapshot["totals"]["errored_requests"], 0);
+    }
+    let snapshot = top_snapshot(&client, &url, &token).await;
+    assert_eq!(snapshot["totals"]["local_requests"], 2);
+    assert_eq!(snapshot["totals"]["remote_requests"], 1);
+}
+
+#[tokio::test]
 async fn client_cancellation_reaches_core_and_core_crash_stops_gateway() {
     let mut runtime = Runtime::start(1);
     let (url, token) = runtime.ready().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let mut stream = client
-        .post(format!("{url}/stream"))
+        .post(format!("{url}/v1/messages"))
         .bearer_auth(&token)
-        .json(&json!({}))
+        .json(&json!({"model": "rayline-auto", "stream": true}))
         .send()
         .await
         .unwrap();
     assert!(stream.chunk().await.unwrap().is_some());
+    let active = top_snapshot(&client, &url, &token).await;
+    assert_eq!(active["totals"]["active_requests"], 1);
+    assert_eq!(active["active"].as_array().unwrap().len(), 1);
+    assert!(active["recent"].as_array().unwrap().is_empty());
+    let request_id = active["active"][0]["request_id"].clone();
     drop(stream);
     let deadline = Instant::now() + Duration::from_secs(5);
     while !runtime.dir.join("cancelled").exists() {
@@ -305,6 +438,7 @@ async fn client_cancellation_reaches_core_and_core_crash_stops_gateway() {
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+    assert_cancelled_snapshot(&client, &url, &token, &request_id).await;
     let _ = client
         .post(format!("{url}/crash"))
         .bearer_auth(&token)
@@ -418,12 +552,19 @@ async fn cancellation_before_headers_reaches_core() {
     let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", endpoint.port().unwrap()))
         .await
         .unwrap();
-    socket.write_all(format!("POST /pending HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}", endpoint.port().unwrap(), token).as_bytes()).await.unwrap();
+    let body = r#"{"model":"rayline-auto","fixture_pending":true}"#;
+    socket.write_all(format!("POST /v1/messages HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}", endpoint.port().unwrap(), token, body.len(), body).as_bytes()).await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !runtime.dir.join("events.jsonl").exists() {
         assert!(Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let active = top_snapshot(&client, &url, &token).await;
+    assert_eq!(active["totals"]["active_requests"], 1);
+    assert_eq!(active["active"].as_array().unwrap().len(), 1);
+    assert!(active["recent"].as_array().unwrap().is_empty());
+    let request_id = active["active"][0]["request_id"].clone();
     drop(socket);
     while !runtime.dir.join("cancelled-pending").exists() {
         assert!(
@@ -432,6 +573,7 @@ async fn cancellation_before_headers_reaches_core() {
         );
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
+    assert_cancelled_snapshot(&client, &url, &token, &request_id).await;
 }
 
 #[tokio::test]
@@ -481,49 +623,58 @@ async fn session_and_branch_precedence_preserves_native_fork_identity() {
     }
 }
 
-/// A one-request router stand-in: records the request line, headers and body,
-/// then answers with a fixed Messages response.
+/// A two-request router stand-in: records requests and answers the malformed
+/// response probe with HTTP 200 plus invalid JSON.
 /// The recorded request line, lower-cased headers and JSON body.
 type Recorded = (String, Vec<(String, String)>, Value);
 
-fn fake_router() -> (String, std::thread::JoinHandle<Recorded>) {
+fn fake_router() -> (String, std::thread::JoinHandle<Vec<Recorded>>) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        let mut headers = Vec::new();
-        let mut length = 0;
-        loop {
-            let mut header = String::new();
-            reader.read_line(&mut header).unwrap();
-            let header = header.trim_end();
-            if header.is_empty() {
-                break;
+        let mut recorded = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut headers = Vec::new();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                let (name, value) = header.split_once(':').unwrap();
+                let (name, value) = (name.to_ascii_lowercase(), value.trim().to_owned());
+                if name == "content-length" {
+                    length = value.parse().unwrap();
+                }
+                headers.push((name, value));
             }
-            let (name, value) = header.split_once(':').unwrap();
-            let (name, value) = (name.to_ascii_lowercase(), value.trim().to_owned());
-            if name == "content-length" {
-                length = value.parse().unwrap();
-            }
-            headers.push((name, value));
-        }
-        let mut body = vec![0; length];
-        reader.read_exact(&mut body).unwrap();
-        let answer = json!({"id": "msg_cloud", "type": "message", "role": "assistant",
-            "content": [{"type": "text", "text": "<block>no</block>"}]})
-        .to_string();
-        let mut stream = stream;
-        write!(
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            let answer = if body["messages"][0]["content"] == "fixture-malformed-response" {
+                "{private-provider-response-do-not-log".to_owned()
+            } else {
+                json!({"id": "msg_cloud", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": "<block>no</block>"}]})
+                .to_string()
+            };
+            let mut stream = stream;
+            write!(
             stream,
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-rayline-selected-model: anthropic/claude-sonnet-5.5\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
             answer.len()
         )
         .unwrap();
-        (line, headers, serde_json::from_slice(&body).unwrap())
+            recorded.push((line, headers, body));
+        }
+        recorded
     });
     (url, handle)
 }
@@ -561,7 +712,38 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
         .unwrap();
     assert_eq!(response.status(), 200);
     assert_eq!(response.json::<Value>().await.unwrap()["id"], "msg_cloud");
-    let (line, headers, body) = recorded.join().unwrap();
+    let initial = top_snapshot(&client, &url, &token).await;
+    assert_eq!(initial["recent"][0]["state"], "completed");
+    let mut malformed = classifier.clone();
+    malformed["messages"][0]["content"] = json!("fixture-malformed-response");
+    let response = client
+        .post(format!("{url}/v1/messages"))
+        .bearer_auth(&token)
+        .json(&malformed)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.text().await.unwrap(),
+        "{private-provider-response-do-not-log"
+    );
+    let snapshot = top_snapshot(&client, &url, &token).await;
+    assert!(snapshot["active"].as_array().unwrap().is_empty());
+    assert_eq!(snapshot["recent"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["recent"][0]["state"], "error");
+    assert_eq!(snapshot["recent"][0]["status_code"], 200);
+    assert_eq!(snapshot["totals"]["errored_requests"], 1);
+    assert!(
+        !snapshot
+            .to_string()
+            .contains("private-provider-response-do-not-log")
+    );
+    assert!(!snapshot.to_string().contains("rlk-test-key"));
+    let mut recorded = recorded.join().unwrap().into_iter();
+    let (line, headers, body) = recorded.next().unwrap();
+    let (_, _, malformed_body) = recorded.next().unwrap();
+    assert_eq!(malformed_body["messages"], malformed["messages"]);
     let header = |name: &str| {
         headers
             .iter()
@@ -592,6 +774,13 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
         .await
         .unwrap();
     assert_eq!(response.text().await.unwrap(), turn);
+    let snapshot = top_snapshot(&client, &url, &token).await;
+    assert!(snapshot["recent"][0]["target"].is_null());
+    assert_eq!(snapshot["totals"]["local_requests"], 0);
+    assert_eq!(
+        snapshot["totals"]["remote_requests"], 2,
+        "receipt-less ordinary turn counted as remote"
+    );
     let events = fs::read_to_string(runtime.dir.join("events.jsonl")).unwrap();
     assert_eq!(
         events.lines().count(),
