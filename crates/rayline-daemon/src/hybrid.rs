@@ -478,7 +478,7 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
             tokio::time::sleep(delay).await;
             continue;
         }
-        if failure.is_some() {
+        if failure.is_some() || is_decision_failed(&error_body) {
             tracing::warn!(
                 ?failure,
                 %detail,
@@ -670,6 +670,24 @@ fn decisions_message(body: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
     let message = value.pointer("/error/message")?.as_str()?;
     Some(message.chars().take(160).collect())
+}
+
+/// Whether a core 502 is its `decision_failed` error: the code, where the wire
+/// format keeps it, else a message from the core's `Decide` (each starts with
+/// "Decisions", such as "invalid Decisions response" or "Decisions returned
+/// no requested preset"). Covers the failures [`decisions_failure`] does not
+/// classify, so every failed decision is logged.
+fn is_decision_failed(body: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return false;
+    };
+    if value.pointer("/error/code").and_then(|code| code.as_str()) == Some("decision_failed") {
+        return true;
+    }
+    value
+        .pointer("/error/message")
+        .and_then(|message| message.as_str())
+        .is_some_and(|message| message.contains("Decisions"))
 }
 
 /// Classify the core's `decision_failed` error, in either wire format
@@ -1028,6 +1046,29 @@ mod tests {
         json!({"error": {"type": "invalid_request_error", "code": "decision_failed", "message": message}})
             .to_string()
             .into_bytes()
+    }
+
+    #[test]
+    fn every_decision_failure_is_recognised_for_logging() {
+        let body = |value: serde_json::Value| value.to_string().into_bytes();
+        // Unclassified failures (no resend, no explanation) are still logged.
+        assert!(is_decision_failed(&body(
+            json!({"error": {"type": "invalid_request_error", "code": "decision_failed", "message": "invalid Decisions response"}})
+        )));
+        assert!(is_decision_failed(&body(
+            json!({"type": "error", "error": {"type": "invalid_request_error", "message": "Decisions returned no requested preset"}})
+        )));
+        assert_eq!(
+            decisions_failure(&body(
+                json!({"error": {"message": "invalid Decisions response"}})
+            )),
+            None
+        );
+        // A provider's own 502 is not a decision failure.
+        assert!(!is_decision_failed(&body(
+            json!({"error": {"type": "api_error", "message": "upstream overloaded"}})
+        )));
+        assert!(!is_decision_failed(b"not json"));
     }
 
     #[test]
