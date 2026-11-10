@@ -33,7 +33,11 @@
 //! `session_affinity_header` (from Hermes v2026.9.21). On Responses, pi's,
 //! OpenClaw's and Hermes' `prompt_cache_key` keys the session instead. A harness session
 //! is one episode, so `--resume` / `-c` / `--session-id` in a later launch
-//! keeps the episode.
+//! keeps the episode. These launchers talk to the hosted router directly; a
+//! client that reaches it through `rld`'s local router keeps its session
+//! headers too (`x-session-affinity`, `x-claude-code-session-id`,
+//! `x-session-id`, `x-conversation-id`), which that router forwards only to
+//! the hosted Rayline router.
 //!
 //! The per-launch conversation id ([`ConversationIdFallback`]) is off by
 //! default on every wire: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on,

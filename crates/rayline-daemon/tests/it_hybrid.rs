@@ -937,6 +937,56 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
     );
 }
 
+/// The classifier pin is the Rayline router, so it is keyed like the turn it
+/// classifies: every session header the client sent reaches it unchanged, a
+/// client-set conversation id wins over the Claude Code session id, and the
+/// client's own credentials never do.
+#[tokio::test]
+async fn classifier_pin_carries_every_client_session_header_and_no_client_auth() {
+    let (router, recorded) = fake_router_for(1);
+    let deployments = format!(
+        r#","deployments":[{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"claude-sonnet-5-5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
+    );
+    let mut runtime = Runtime::start_with_decisions(
+        1,
+        0,
+        120,
+        None,
+        &format!("{router}/v1/routes"),
+        &deployments,
+        Some("rlk-test-key"),
+    );
+    let (url, token) = runtime.ready().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = client
+        .post(format!("{url}/v1/messages"))
+        .bearer_auth(&token)
+        .header("x-api-key", "client-key-must-not-leave")
+        .header("x-session-affinity", "affinity-one")
+        .header("x-claude-code-session-id", "claude-session-one")
+        .header("x-session-id", "session-id-one")
+        .header("x-conversation-id", "conversation-one")
+        .json(&classifier_request("<transcript>"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let (_, headers, _) = recorded.join().unwrap().into_iter().next().unwrap();
+    let values = |name: &str| {
+        headers
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values("x-session-affinity"), ["affinity-one"]);
+    assert_eq!(values("x-claude-code-session-id"), ["claude-session-one"]);
+    assert_eq!(values("x-session-id"), ["session-id-one"]);
+    assert_eq!(values("x-conversation-id"), ["conversation-one"]);
+    assert_eq!(values("authorization"), ["Bearer rlk-test-key"]);
+    assert!(values("x-api-key").is_empty(), "{headers:?}");
+}
+
 /// One harness turn whose Decisions call fails is sent to the core at most
 /// twice (rld's one resend), and the harness is told not to resend:
 /// `x-should-retry: false`, which Claude Code's SDK honours.

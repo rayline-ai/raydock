@@ -722,6 +722,7 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
             metrics: Some(metrics_sink.clone()),
             may_local_advertise: args.may_local_advertise,
             inbound_guard: rayline_local_router::InboundGuard::from_env(),
+            session_headers_to_loopback: false,
         })
     } else {
         None

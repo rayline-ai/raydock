@@ -83,6 +83,11 @@ pub struct LocalRouterOptions {
     /// A per-instance token required on every request but `GET /healthz`
     /// (`rayline claude-desktop`). `None` for every other run.
     pub inbound_guard: Option<InboundGuard>,
+    /// Tests only: also forward the client's session headers to loopback
+    /// upstreams, so a mock upstream can stand in for the hosted router. Off in
+    /// every real run; see `endpoint_receives_session_headers`.
+    #[doc(hidden)]
+    pub session_headers_to_loopback: bool,
 }
 
 impl Default for LocalRouterOptions {
@@ -95,6 +100,7 @@ impl Default for LocalRouterOptions {
             metrics: None,
             may_local_advertise: false,
             inbound_guard: None,
+            session_headers_to_loopback: false,
         }
     }
 }
@@ -475,6 +481,66 @@ fn endpoint_is_hosted_rcr(base_url: &str) -> bool {
         .ok()
         .and_then(|url| url.host_str().map(|h| h.to_ascii_lowercase()))
         .is_some_and(|host| host == "api.rayline.ai" || host == "api-dev.rayline.ai")
+}
+
+/// Client session headers the hosted router keys episodes (conversations) on.
+/// A client that names its session only in a header would otherwise be keyed
+/// on a derived id once its request passes through this router.
+const SESSION_HEADERS: [&str; 4] = [
+    "x-session-affinity",
+    "x-claude-code-session-id",
+    "x-session-id",
+    "x-conversation-id",
+];
+
+/// Whether an upstream may receive the client's session headers: only the
+/// hosted Rayline router, which is what keys on them. A provider such as
+/// api.anthropic.com, OpenRouter or a custom upstream never sees them.
+fn endpoint_receives_session_headers(opts: &LocalRouterOptions, endpoint: &EndpointConfig) -> bool {
+    endpoint_is_hosted_rcr(&endpoint.base_url)
+        || (opts.session_headers_to_loopback && base_url_is_loopback(&endpoint.base_url))
+}
+
+fn base_url_is_loopback(base_url: &str) -> bool {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
+        .is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
+/// Copy exactly the client's session headers (`SESSION_HEADERS`) onto a request
+/// bound for the hosted router. Nothing else is copied: auth and every other
+/// client header keep their per-builder policy. A header the endpoint config
+/// sets itself is left to the config.
+fn copy_session_headers(
+    mut outbound: reqwest::RequestBuilder,
+    inbound_headers: &HeaderMap,
+    endpoint: &EndpointConfig,
+    opts: &LocalRouterOptions,
+) -> reqwest::RequestBuilder {
+    if !endpoint_receives_session_headers(opts, endpoint) {
+        return outbound;
+    }
+    for name in SESSION_HEADERS {
+        if endpoint
+            .headers
+            .keys()
+            .any(|configured| configured.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        if let Some(value) = inbound_headers.get(name) {
+            outbound = outbound.header(name, value.clone());
+        }
+    }
+    outbound
 }
 
 fn normalize_route_target(route: &mut RouteTarget, local_model_id: &str) -> Result<()> {
@@ -1372,8 +1438,15 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
                     .await
                 }
                 EndpointProtocol::OpenAIChat => {
-                    forward_openai_chat_endpoint(&state, endpoint, &decision, parsed, &request_id)
-                        .await
+                    forward_openai_chat_endpoint(
+                        &state,
+                        endpoint,
+                        &decision,
+                        &headers,
+                        parsed,
+                        &request_id,
+                    )
+                    .await
                 }
                 EndpointProtocol::OpenAIResponses => Err(anyhow!(
                     "endpoint {:?} uses openai_responses, which is only supported for /v1/responses requests",
@@ -1500,6 +1573,7 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
                         &state,
                         endpoint,
                         &decision,
+                        &headers,
                         &parsed,
                         &request_id,
                         output_kind,
@@ -1861,6 +1935,8 @@ async fn run_synthetic_unary_response(
                     if let Some(beta) = inbound_headers.get("anthropic-beta").and_then(header_str) {
                         outbound = outbound.header("anthropic-beta", beta);
                     }
+                    outbound =
+                        copy_session_headers(outbound, inbound_headers, endpoint, &state.opts);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
                     let resp = outbound.send().await?;
                     let upstream_request_id = upstream_request_id(resp.headers());
@@ -1889,6 +1965,8 @@ async fn run_synthetic_unary_response(
                         .post(url)
                         .header("content-type", "application/json")
                         .json(&request_body);
+                    outbound =
+                        copy_session_headers(outbound, inbound_headers, endpoint, &state.opts);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
                     let resp = outbound.send().await?;
                     let upstream_request_id = upstream_request_id(resp.headers());
@@ -2378,6 +2456,7 @@ async fn forward_openai_passthrough_endpoint(
         !passthrough.body.is_empty(),
         endpoint.auth == Some(AuthMode::ClientBearer),
     );
+    outbound = copy_session_headers(outbound, passthrough.inbound_headers, endpoint, &state.opts);
     // Codex may-local: advertise the on-device model on the native RCR forward
     // (the proxy-less analogue of the proxy's `x-rayline-local-*` headers), so the
     // RCR may 307-redirect an eligible subagent turn to the local adapter. Custom
@@ -2678,6 +2757,7 @@ async fn forward_responses_to_anthropic_endpoint(
     if let Some(beta) = inbound_headers.get("anthropic-beta").and_then(header_str) {
         outbound = outbound.header("anthropic-beta", beta);
     }
+    outbound = copy_session_headers(outbound, inbound_headers, endpoint, &state.opts);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
     let resp = outbound.send().await?;
     anthropic_response_to_responses(
@@ -2739,6 +2819,7 @@ async fn forward_responses_to_openai_chat_endpoint(
     state: &AppState,
     endpoint: &EndpointConfig,
     decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
     body: &Value,
     request_id: &str,
     output_kind: SyntheticOutputKind,
@@ -2755,6 +2836,7 @@ async fn forward_responses_to_openai_chat_endpoint(
         .post(url)
         .header("content-type", "application/json")
         .json(&request_body);
+    outbound = copy_session_headers(outbound, inbound_headers, endpoint, &state.opts);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
     let resp = outbound.send().await?;
     let status = resp.status();
@@ -2840,6 +2922,7 @@ async fn forward_anthropic_endpoint(
     {
         outbound = outbound.header("anthropic-beta", beta);
     }
+    outbound = copy_session_headers(outbound, inbound_headers, endpoint, &state.opts);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
     let resp = outbound.send().await?;
     let status = resp.status();
@@ -2939,6 +3022,7 @@ async fn forward_openai_chat_endpoint(
     state: &AppState,
     endpoint: &EndpointConfig,
     decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
     body: Value,
     request_id: &str,
 ) -> Result<Response<BoxBody>> {
@@ -2954,6 +3038,7 @@ async fn forward_openai_chat_endpoint(
         .post(url)
         .header("content-type", "application/json")
         .json(&request_body);
+    outbound = copy_session_headers(outbound, inbound_headers, endpoint, &state.opts);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
     let resp = outbound.send().await?;
     let status = resp.status();
@@ -7385,6 +7470,64 @@ mod tests {
         ));
         // Garbage.
         assert!(!is_expected_local_adapter_redirect("not-a-url", port));
+    }
+
+    #[test]
+    fn only_the_hosted_router_receives_client_session_headers() {
+        let endpoint = |base_url: &str| EndpointConfig {
+            id: "up".to_owned(),
+            kind: default_endpoint_kind(),
+            protocol: EndpointProtocol::AnthropicMessages,
+            base_url: base_url.to_owned(),
+            api_key_env: None,
+            models: Vec::new(),
+            headers: HashMap::new(),
+            auth: None,
+        };
+        let real = LocalRouterOptions::default();
+        assert!(endpoint_receives_session_headers(
+            &real,
+            &endpoint("https://api.rayline.ai")
+        ));
+        assert!(endpoint_receives_session_headers(
+            &real,
+            &endpoint("https://api-dev.rayline.ai/v1")
+        ));
+        for other in [
+            "https://api.anthropic.com",
+            "https://openrouter.ai/api/v1",
+            "https://api.openai.com/v1",
+            "https://chatgpt.com/backend-api/codex",
+            "http://127.0.0.1:8080",
+            "http://localhost:8080/v1",
+            "https://api.rayline.ai.example.com",
+        ] {
+            assert!(
+                !endpoint_receives_session_headers(&real, &endpoint(other)),
+                "{other}"
+            );
+        }
+        // The test-only switch widens it to loopback, and nothing else.
+        let tests = LocalRouterOptions {
+            session_headers_to_loopback: true,
+            ..LocalRouterOptions::default()
+        };
+        assert!(endpoint_receives_session_headers(
+            &tests,
+            &endpoint("http://127.0.0.1:8080")
+        ));
+        assert!(endpoint_receives_session_headers(
+            &tests,
+            &endpoint("http://[::1]:8080")
+        ));
+        assert!(endpoint_receives_session_headers(
+            &tests,
+            &endpoint("http://localhost:8080")
+        ));
+        assert!(!endpoint_receives_session_headers(
+            &tests,
+            &endpoint("https://api.anthropic.com")
+        ));
     }
 
     #[test]

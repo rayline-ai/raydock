@@ -4069,3 +4069,203 @@ async fn inbound_chat_row_carries_the_upstream_request_id() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Client session headers reach the hosted router, and only the hosted router.
+// ---------------------------------------------------------------------------
+
+/// The session headers a client names its session with, and the value each
+/// test request sends.
+const SESSION_HEADER_VALUES: [(&str, &str); 4] = [
+    ("x-session-affinity", "affinity-1"),
+    ("x-claude-code-session-id", "claude-session-1"),
+    ("x-session-id", "session-1"),
+    ("x-conversation-id", "conversation-1"),
+];
+
+/// Start a router whose loopback upstreams stand in for the hosted router
+/// (`hosted`) or for any other provider (`!hosted`), and wait until healthy.
+async fn start_router_for_session_headers(port: u16, config_path: PathBuf, hosted: bool) {
+    let opts = LocalRouterOptions {
+        port,
+        config_path: Some(config_path),
+        session_headers_to_loopback: hosted,
+        ..LocalRouterOptions::default()
+    };
+    tokio::spawn(async move {
+        let _ = serve(opts).await;
+    });
+    let client = reqwest::Client::new();
+    for _ in 0..100 {
+        if client
+            .get(format!("http://127.0.0.1:{port}/healthz"))
+            .send()
+            .await
+            .is_ok_and(|r| r.status().is_success())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("router on port {port} did not become healthy");
+}
+
+/// Every value of `name` in a captured raw request's head.
+fn captured_header_values(raw: &str, name: &str) -> Vec<String> {
+    let head = raw.split("\r\n\r\n").next().unwrap_or_default();
+    head.lines()
+        .skip(1)
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim().to_owned())
+        .collect()
+}
+
+/// An upstream reply in `protocol`'s non-streaming shape.
+fn session_case_reply(protocol: &str) -> String {
+    match protocol {
+        "anthropic_messages" => http_json(&json!({
+            "id": "msg_mock", "type": "message", "role": "assistant", "model": "m",
+            "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 3, "output_tokens": 1}
+        })),
+        "openai_chat" => http_json(&json!({
+            "id": "chatcmpl-mock", "object": "chat.completion", "created": 1, "model": "m",
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+        })),
+        _ => http_json(&json!({
+            "id": "resp_mock", "object": "response", "status": "completed", "model": "m",
+            "output": [{"type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}]}],
+            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+        })),
+    }
+}
+
+/// Send one request carrying every session header plus client credentials to
+/// `inbound_path`, routed to a mock `protocol` endpoint, and return the raw
+/// request the upstream received.
+async fn session_case(
+    inbound_path: &str,
+    protocol: &str,
+    hosted: bool,
+    endpoint_headers: Value,
+) -> String {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(serve_once_capture(
+        upstream,
+        session_case_reply(protocol),
+        tx,
+    ));
+    let base_url = if protocol == "anthropic_messages" {
+        format!("http://127.0.0.1:{up_port}")
+    } else {
+        format!("http://127.0.0.1:{up_port}/v1")
+    };
+    let path = write_config(
+        "session-headers",
+        &json!({
+            "endpoints": [{"id": "up", "protocol": protocol, "base_url": base_url,
+                           "models": ["m"], "headers": endpoint_headers}],
+            "routes": {"main": {"endpoint": "up", "model": "m"},
+                       "default": {"endpoint": "up", "model": "m"}}
+        }),
+    );
+    let port = free_port();
+    start_router_for_session_headers(port, path.clone(), hosted).await;
+    let body = match inbound_path {
+        "/v1/messages" => json!({"model": "rayline-auto", "max_tokens": 16,
+                                 "messages": [{"role": "user", "content": "hi"}]}),
+        "/v1/chat/completions" => json!({"model": "rayline-auto",
+                                         "messages": [{"role": "user", "content": "hi"}]}),
+        _ => json!({"model": "rayline-auto", "stream": false, "input": "hi"}),
+    };
+    let mut request = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}{inbound_path}"))
+        .header("anthropic-version", "2023-06-01")
+        .header("authorization", "Bearer client-secret-must-not-leave")
+        .header("x-api-key", "client-secret-must-not-leave")
+        .json(&body);
+    for (name, value) in SESSION_HEADER_VALUES {
+        request = request.header(name, value);
+    }
+    let _ = request.send().await.expect("router request");
+    let _ = std::fs::remove_file(path);
+    rx.await.expect("upstream saw the request")
+}
+
+/// Every inbound surface and upstream protocol the router forwards on.
+const SESSION_HEADER_SURFACES: [(&str, &str); 9] = [
+    ("/v1/messages", "anthropic_messages"),
+    ("/v1/messages", "openai_chat"),
+    ("/v1/responses", "anthropic_messages"),
+    ("/v1/responses", "openai_chat"),
+    ("/v1/responses", "openai_responses"),
+    ("/v1/responses/compact", "anthropic_messages"),
+    ("/v1/responses/compact", "openai_chat"),
+    ("/v1/chat/completions", "anthropic_messages"),
+    ("/v1/chat/completions", "openai_chat"),
+];
+
+/// A client behind this router that names its session only in a header keeps
+/// that session on the hosted router: each session header reaches the
+/// upstream once, unchanged, on every surface. The client's own credentials
+/// never do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_headers_reach_the_hosted_router_on_every_surface() {
+    for (inbound_path, protocol) in SESSION_HEADER_SURFACES {
+        let raw = session_case(inbound_path, protocol, true, json!({})).await;
+        for (name, value) in SESSION_HEADER_VALUES {
+            assert_eq!(
+                captured_header_values(&raw, name),
+                [value],
+                "{inbound_path} -> {protocol}: {name}"
+            );
+        }
+        assert!(
+            !raw.contains("client-secret-must-not-leave"),
+            "{inbound_path} -> {protocol} forwarded client credentials"
+        );
+    }
+}
+
+/// Any upstream but the hosted router (a provider, OpenRouter, a custom
+/// endpoint) never sees the client's session ids.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_headers_never_reach_other_upstreams() {
+    for (inbound_path, protocol) in SESSION_HEADER_SURFACES {
+        let raw = session_case(inbound_path, protocol, false, json!({})).await;
+        for (name, _) in SESSION_HEADER_VALUES {
+            assert!(
+                captured_header_values(&raw, name).is_empty(),
+                "{inbound_path} -> {protocol} leaked {name}"
+            );
+        }
+        assert!(
+            !raw.contains("client-secret-must-not-leave"),
+            "{inbound_path} -> {protocol} forwarded client credentials"
+        );
+    }
+}
+
+/// A session header the endpoint config sets itself is the config's: the
+/// client's value is not appended next to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn endpoint_configured_session_header_wins_over_the_client() {
+    let raw = session_case(
+        "/v1/messages",
+        "anthropic_messages",
+        true,
+        json!({"X-Session-Id": "configured"}),
+    )
+    .await;
+    assert_eq!(captured_header_values(&raw, "x-session-id"), ["configured"]);
+    assert_eq!(
+        captured_header_values(&raw, "x-session-affinity"),
+        ["affinity-1"]
+    );
+}

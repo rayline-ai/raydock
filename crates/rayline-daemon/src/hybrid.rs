@@ -550,12 +550,25 @@ async fn send_classifier_to_cloud(
         .header("accept", "application/json, text/event-stream")
         .header("anthropic-version", "2023-06-01")
         .header("x-workshop-required-model", &pin.wire_model);
-    for name in ["anthropic-beta", "x-claude-code-session-id"] {
+    // The pin is the Rayline router itself (same origin as Decisions), so it
+    // gets every session header the client sent, keyed the same way as the
+    // turn it classifies. Claude Code names its session only in
+    // `x-claude-code-session-id`; that becomes the conversation id unless the
+    // client set one.
+    for name in [
+        "anthropic-beta",
+        "x-session-affinity",
+        "x-claude-code-session-id",
+        "x-session-id",
+        "x-conversation-id",
+    ] {
         if let Some(value) = parts.headers.get(name) {
             outgoing = outgoing.header(name, value);
         }
     }
-    if let Some(session) = parts.headers.get("x-claude-code-session-id") {
+    if !parts.headers.contains_key("x-conversation-id")
+        && let Some(session) = parts.headers.get("x-claude-code-session-id")
+    {
         outgoing = outgoing.header("x-conversation-id", session);
     }
     let mut observation = RequestObservation::start(state.metrics.clone(), body);

@@ -341,7 +341,8 @@ Native session headers are preserved. An explicit `x-rayline-session-id` takes
 priority; otherwise the gateway maps `x-conversation-id`, `x-parent-session-id`,
 `x-session-affinity`, `x-session-id`, or `x-claude-code-session-id`, in that order.
 The core extracts Claude metadata and Responses `prompt_cache_key` from the
-unchanged body. Requests without usable identity must fail in the core.
+unchanged body. Auto-mode classifier calls sent to the cloud carry the same
+session headers, so the router keys them with the turn they check. Requests without usable identity must fail in the core.
 
 Branch identity uses `x-rayline-branch-id`, then Codex `thread-id`, then
 `x-claude-code-agent-id`. An OpenCode request with `x-parent-session-id` uses its
