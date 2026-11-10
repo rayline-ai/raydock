@@ -60,8 +60,9 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   routing service refuses a hybrid turn (for example over a price or model it
   doesn't know), Claude Code now gets a final HTTP 400 that says why, instead
   of a 502 it resent about ten times. When the service is unavailable or busy,
-  `rld` resends the turn once, waiting as long as the service's `retry-after`
-  asks (up to 30 seconds), and then reports HTTP 503 or 429. Every such error
+  `rld` resends the turn once, after the service's `retry-after` (only if it
+  asks for 30 seconds or less, and never when it sends
+  `x-should-retry: false`), and then reports HTTP 503 or 429. Every such error
   carries `x-should-retry: false`, so the harness SDK doesn't resend it again,
   and a retryable one carries `retry-after`. A turn now reaches the routing
   service at most twice.
