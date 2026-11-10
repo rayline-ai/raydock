@@ -366,7 +366,11 @@ async fn top_source(
         .timeout(HEALTH_TIMEOUT)
         .build()
         .map_err(io::Error::other)?;
-    let legacy = first_reachable_metrics_port(&client, &candidates).await;
+    let legacy = if request.legacy {
+        first_reachable_metrics_port(&client, &candidates).await
+    } else {
+        first_legacy_snapshot_port(&client, &candidates).await
+    };
     let hybrid = if request.legacy {
         Err(io::Error::other("legacy metrics explicitly selected"))
     } else {
@@ -3576,11 +3580,13 @@ mod tests {
                 let (mut stream, _) = legacy.accept().await.unwrap();
                 let mut buffer = [0u8; 1024];
                 let _ = stream.read(&mut buffer).await;
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}",
-                    )
-                    .await;
+                let body = br#"{"ok":true,"active":[],"recent":[],"totals":{}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body).await;
             }
         });
         assert!(
@@ -3661,6 +3667,57 @@ mod tests {
             assert!(!error.contains("private-token"));
         }
         fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn automatic_top_ignores_unrelated_http_and_hybrid_at_legacy_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for body in [
+            "{}",
+            "hello",
+            r#"{"ok":true,"active":[],"recent":[],"totals":{},"runtime":"rayline-hybrid"}"#,
+        ] {
+            let home = unique_test_dir("top-unrelated-http");
+            let hybrid = hybrid_top_fixture(&home, serde_json::json!({})).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let meta = RouterPaths::new(&home).meta_file;
+            fs::create_dir_all(meta.parent().unwrap()).unwrap();
+            fs::write(
+                &meta,
+                format!("metrics_port={}\n", listener.local_addr().unwrap().port()),
+            )
+            .unwrap();
+            let unrelated = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                }
+            });
+            let request = RouterTopRequest {
+                json: true,
+                show_all: false,
+                hybrid: false,
+                legacy: false,
+                state_dir: None,
+                root_env_explicit: false,
+            };
+            let (client, url, identity) = top_source(&home, &request).await.unwrap();
+            assert!(identity.is_some(), "{body}");
+            assert_eq!(
+                fetch_top_snapshot(&client, &url).await.unwrap()["runtime"],
+                "rayline-hybrid"
+            );
+            unrelated.abort();
+            hybrid.abort();
+            fs::remove_dir_all(home).unwrap();
+        }
     }
 
     #[tokio::test]
@@ -5533,6 +5590,33 @@ fn metrics_port_candidates(
 async fn first_reachable_metrics_port(client: &reqwest::Client, candidates: &[u16]) -> Option<u16> {
     for &port in candidates {
         if metrics_port_is_serving(client, port).await {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Discovery for automatic top selection requires a legacy snapshot, not merely
+/// an HTTP responder. Keep the weaker liveness probe for metadata reconciliation.
+async fn first_legacy_snapshot_port(client: &reqwest::Client, candidates: &[u16]) -> Option<u16> {
+    for &port in candidates {
+        let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
+        let Ok(response) = client.get(url).send().await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(snapshot) = response.json::<Value>().await else {
+            continue;
+        };
+        if snapshot.is_object()
+            && snapshot.get("ok") == Some(&Value::Bool(true))
+            && snapshot.get("active").is_some_and(Value::is_array)
+            && snapshot.get("recent").is_some_and(Value::is_array)
+            && snapshot.get("totals").is_some_and(Value::is_object)
+            && snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-hybrid")
+        {
             return Some(port);
         }
     }

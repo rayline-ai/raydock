@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """External executable contract fixture. No provider calls or real credentials."""
 import argparse
+import gzip
 import http.server
 import json
 import os
@@ -89,6 +90,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 more = b""
             if not more:
                 pathlib.Path(config["cancelled"] + "-pending").write_text("cancelled before headers")
+            return
+        if self.path == "/v1/messages" and json.loads(body).get("fixture_gzip"):
+            # Fixed mtime makes the encoded wire bytes independently assertable.
+            encoded = bytearray(gzip.compress(b'{"usage":{"input_tokens":7,"output_tokens":3}}', mtime=0))
+            encoded[9] = 255  # Portable gzip OS marker.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Encoding", "gzip")
+            if json.loads(body).get("fixture_eof"):
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            else:
+                self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
             return
         if self.path == "/stream" or (self.path == "/v1/messages" and json.loads(body).get("stream")):
             self.send_response(200)

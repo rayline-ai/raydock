@@ -628,6 +628,35 @@ async fn send_to_core(
         .await
 }
 
+/// Encoded bodies are opaque; only decoded bytes can supply response telemetry.
+/// `Some(true)` selects SSE, `Some(false)` selects buffered JSON observation.
+fn observable_response(headers: &hyper::HeaderMap) -> Option<bool> {
+    for encoding in headers.get_all("content-encoding") {
+        let Ok(encoding) = encoding.to_str() else {
+            return None;
+        };
+        if !encoding
+            .split(',')
+            .all(|value| value.trim().eq_ignore_ascii_case("identity"))
+        {
+            return None;
+        }
+    }
+    Some(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            }),
+    )
+}
+
 /// Observe without changing the response bytes or pulling ahead of downstream demand.
 fn observed_response(
     upstream: reqwest::Response,
@@ -635,16 +664,13 @@ fn observed_response(
 ) -> Result<Response<Body>> {
     let status = upstream.status();
     let content_length = upstream.content_length();
-    let sse = upstream
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.starts_with("text/event-stream"));
-    let observer = rayline_metrics::response::ResponseObserver::new(
-        observation.metrics.clone(),
-        observation.id.clone(),
-        sse,
-    );
+    let observer = observable_response(upstream.headers()).map(|sse| {
+        rayline_metrics::response::ResponseObserver::new(
+            observation.metrics.clone(),
+            observation.id.clone(),
+            sse,
+        )
+    });
     let mut response = Response::builder().status(status);
     for (name, value) in upstream.headers() {
         if !hop_header(name.as_str()) {
@@ -657,13 +683,21 @@ fn observed_response(
             match upstream.next().await {
                 Some(Ok(bytes)) => {
                     received = received.saturating_add(bytes.len() as u64);
-                    observer.observe(&bytes);
+                    if let Some(observer) = &mut observer {
+                        observer.observe(&bytes);
+                    }
                     // Hyper can drop a body after its Content-Length or terminal SSE
                     // frame without polling EOF. Close the row at that observable boundary.
-                    if observer.is_terminal() || content_length == Some(received) {
-                        let failed = observer.finish()
-                            || observer.validity()
-                                == rayline_metrics::response::ResponseValidity::Invalid;
+                    if observer
+                        .as_ref()
+                        .is_some_and(|observer| observer.is_terminal())
+                        || content_length == Some(received)
+                    {
+                        let failed = observer.as_mut().is_some_and(|observer| {
+                            observer.finish()
+                                || observer.validity()
+                                    == rayline_metrics::response::ResponseValidity::Invalid
+                        });
                         observation.finish(
                             status.as_u16(),
                             if !status.is_success() {
@@ -689,9 +723,11 @@ fn observed_response(
                     ))
                 }
                 None => {
-                    let failed = observer.finish()
-                        || observer.validity()
-                            == rayline_metrics::response::ResponseValidity::Invalid;
+                    let failed = observer.as_mut().is_some_and(|observer| {
+                        observer.finish()
+                            || observer.validity()
+                                == rayline_metrics::response::ResponseValidity::Invalid
+                    });
                     observation.finish(
                         status.as_u16(),
                         if !status.is_success() {
@@ -1000,6 +1036,31 @@ async fn stop_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_observation_requires_identity_encoding_and_exact_sse_media_type() {
+        let mut headers = hyper::HeaderMap::new();
+        assert_eq!(observable_response(&headers), Some(false));
+        for (content_type, sse) in [
+            ("Text/Event-Stream; charset=utf-8", true),
+            (" text/event-stream ; charset=utf-8", true),
+            ("application/json", false),
+            ("text/event-streamx", false),
+        ] {
+            headers.insert("content-type", content_type.parse().unwrap());
+            assert_eq!(observable_response(&headers), Some(sse));
+            headers.insert("content-encoding", "Identity".parse().unwrap());
+            assert_eq!(observable_response(&headers), Some(sse));
+            for encoding in ["gzip", "br", "zstd", "identity, gzip"] {
+                headers.insert("content-encoding", encoding.parse().unwrap());
+                assert_eq!(observable_response(&headers), None);
+            }
+            headers.remove("content-encoding");
+        }
+        headers.append("content-encoding", "identity".parse().unwrap());
+        headers.append("content-encoding", "gzip".parse().unwrap());
+        assert_eq!(observable_response(&headers), None);
+    }
 
     fn anthropic(message: &str) -> Vec<u8> {
         json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}})

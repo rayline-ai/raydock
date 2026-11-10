@@ -356,6 +356,38 @@ async fn all_protocols_preserve_body_and_identity_then_stop_owned_core() {
 }
 
 #[tokio::test]
+async fn encoded_response_preserves_wire_bytes_and_completes_without_body_telemetry() {
+    let mut runtime = Runtime::start(1);
+    let (url, token) = runtime.ready().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let expected = [
+        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 86, 42, 45, 78, 76, 79, 85, 178, 170, 86, 202, 204,
+        43, 40, 45, 137, 47, 201, 207, 78, 205, 43, 86, 178, 50, 215, 81, 202, 47, 45, 65, 22, 49,
+        174, 173, 5, 0, 174, 189, 157, 210, 46, 0, 0, 0,
+    ];
+    for eof in [false, true] {
+        let response = client
+            .post(format!("{url}/v1/messages"))
+            .bearer_auth(&token)
+            .json(&json!({"fixture_gzip": true, "fixture_eof": eof}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        assert_eq!(response.bytes().await.unwrap().as_ref(), &expected);
+        let snapshot = top_snapshot(&client, &url, &token).await;
+        assert!(snapshot["active"].as_array().unwrap().is_empty());
+        let row = &snapshot["recent"][0];
+        assert_eq!(row["state"], "completed");
+        assert!(row["input_tokens"].is_null());
+        assert!(row["output_tokens"].is_null());
+        assert!(row["first_token_at_unix_ms"].is_null());
+        assert_eq!(snapshot["totals"]["errored_requests"], 0);
+    }
+}
+
+#[tokio::test]
 async fn derived_models_sharing_a_worker_attribute_the_executed_deployment() {
     // Derived action IDs are produced by the core, not enumerated in daemon config.
     // The shared worker alone is ambiguous; the executed model disambiguates it.

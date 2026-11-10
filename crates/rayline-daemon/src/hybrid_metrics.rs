@@ -17,8 +17,7 @@ struct Deployment {
 #[derive(Default)]
 pub(super) struct RoutingMetadata {
     deployments: HashMap<String, Deployment>,
-    workers: HashMap<String, Vec<String>>,
-    actions: HashMap<String, Vec<String>>,
+    actions: HashMap<String, Vec<(Option<String>, String)>>,
     derived: HashMap<(String, String), Vec<String>>,
     policy: Option<String>,
 }
@@ -54,19 +53,20 @@ impl RoutingMetadata {
                             .or_default()
                             .push(deployment.to_owned());
                     }
-                    if let Some(worker) = binding.get("worker").and_then(Value::as_str) {
-                        metadata
-                            .workers
-                            .entry(worker.to_owned())
-                            .or_default()
-                            .push(deployment.to_owned());
-                    }
-                    if let Some(action) = binding.get("action_id").and_then(Value::as_str) {
+                    if field == "bindings"
+                        && let Some(action) = binding.get("action_id").and_then(Value::as_str)
+                    {
                         metadata
                             .actions
                             .entry(action.to_owned())
                             .or_default()
-                            .push(deployment.to_owned());
+                            .push((
+                                binding
+                                    .get("worker")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                deployment.to_owned(),
+                            ));
                     }
                 }
             }
@@ -84,13 +84,20 @@ impl RoutingMetadata {
         action: Option<&str>,
         model: Option<&str>,
     ) -> Option<&Deployment> {
-        let derived = worker
-            .zip(model)
-            .and_then(|(worker, model)| self.derived.get(&(worker.to_owned(), model.to_owned())));
-        let candidates = action
-            .and_then(|id| self.actions.get(id))
-            .or(derived)
-            .or_else(|| worker.and_then(|id| self.workers.get(id)))?;
+        if let Some(bindings) = action.and_then(|id| self.actions.get(id)) {
+            let (_, deployment) = bindings.first()?;
+            // A known action must agree with every binding and the receipt's worker.
+            // Never fall through to derived attribution after contradictory evidence.
+            if bindings.iter().any(|(bound_worker, candidate)| {
+                candidate != deployment
+                    || worker.is_some_and(|worker| bound_worker.as_deref() != Some(worker))
+            }) {
+                return None;
+            }
+            return self.deployments.get(deployment);
+        }
+        let (worker, model) = worker.zip(model)?;
+        let candidates = self.derived.get(&(worker.to_owned(), model.to_owned()))?;
         let first = candidates.first()?;
         // Multiple controls on one deployment are fine; two deployments are ambiguous.
         if candidates.iter().any(|candidate| candidate != first) {
@@ -290,6 +297,65 @@ mod tests {
         assert!(snapshot.active.is_empty());
         assert_eq!(snapshot.recent[0].state, "error");
         assert_eq!(snapshot.totals.local_requests, 1);
+    }
+
+    #[test]
+    fn unknown_or_conflicting_receipts_stay_unattributed() {
+        for (config, worker, model, action) in [
+            (
+                json!({"derived_actions": [{"worker":"w","model":"m","deployment_id":"cloud"}]}),
+                "w",
+                "unknown-model",
+                "unknown-action",
+            ),
+            (
+                json!({"bindings": [{"worker":"w","action_id":"a1","deployment_id":"cloud"}]}),
+                "different-worker",
+                "m",
+                "a1",
+            ),
+            (
+                json!({"bindings": [{"worker":"w","action_id":"a1","deployment_id":"cloud"}, {"worker":"w","action_id":"a1","deployment_id":"local"}]}),
+                "w",
+                "m",
+                "a1",
+            ),
+            (
+                json!({"derived_actions": [{"worker":"w","model":"m","deployment_id":"cloud"}, {"worker":"w","model":"m","deployment_id":"local"}]}),
+                "w",
+                "m",
+                "dynamic-action",
+            ),
+        ] {
+            let mut config = config;
+            config["deployments"] = json!([
+                {"id":"cloud","kind":"cloud","wire_model":"cloud-wire"},
+                {"id":"local","kind":"local","wire_model":"local-wire"}
+            ]);
+            let metadata = RoutingMetadata::from_config(&config);
+            let metrics = RouterMetrics::new("hybrid");
+            let mut observation = RequestObservation::start(metrics.clone(), b"{}");
+            let mut headers = HeaderMap::new();
+            for (key, value) in [
+                ("x-rayline-instance-id", "instance"),
+                ("x-rayline-executed-worker", worker),
+                ("x-rayline-executed-model", model),
+                ("x-rayline-executed-action-id", action),
+            ] {
+                headers.insert(key, value.parse().unwrap());
+            }
+            metadata.record(&observation, &headers, "instance");
+            observation.finish(200, None);
+            let snapshot = metrics.snapshot();
+            assert_eq!(
+                snapshot.recent[0].target.as_deref(),
+                Some("unknown"),
+                "{config}"
+            );
+            assert!(snapshot.recent[0].endpoint_id.is_none());
+            assert_eq!(snapshot.totals.remote_requests, 0);
+            assert_eq!(snapshot.totals.local_requests, 0);
+        }
     }
 
     #[test]
