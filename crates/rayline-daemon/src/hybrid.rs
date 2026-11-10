@@ -612,6 +612,11 @@ enum DecisionsFailure {
     Auth,
     /// Decisions was unreachable or answered 502/503/504 (e.g. a cold cell).
     Unavailable,
+    /// Decisions answered 429: the caller is over its admission share.
+    Throttled,
+    /// Decisions answered another 4xx (e.g. 400 `unknown_price_model`, 422
+    /// `decide_refused`). Final: the same turn would be refused again.
+    Refused,
 }
 
 /// Classify the core's `decision_failed` error, in either wire format
@@ -626,6 +631,8 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
     match status.get(..3)? {
         "401" | "403" => Some(DecisionsFailure::Auth),
         "502" | "503" | "504" => Some(DecisionsFailure::Unavailable),
+        "429" => Some(DecisionsFailure::Throttled),
+        code if code.starts_with('4') => Some(DecisionsFailure::Refused),
         _ => None,
     }
 }
@@ -649,13 +656,10 @@ fn buffered_response(
     let (status, body, retry_after) = match failure.and_then(|failure| {
         explain_decisions_failure(&body, failure, &state.login_command).map(|body| (failure, body))
     }) {
-        Some((DecisionsFailure::Unavailable, body)) => {
-            (StatusCode::SERVICE_UNAVAILABLE, body, true)
+        Some((failure, body)) => {
+            let (status, retry_after) = harness_status(failure);
+            (status, body, retry_after)
         }
-        // Not 5xx: harness SDKs retry those with backoff, which would only
-        // repeat the refused call and hold back the fix. Not 401 either, which
-        // a harness reads as its own (gateway) credential being wrong.
-        Some((DecisionsFailure::Auth, body)) => (StatusCode::FORBIDDEN, body, false),
         None => (status, body, false),
     };
     let mut response = Response::builder().status(status);
@@ -668,6 +672,24 @@ fn buffered_response(
         response = response.header("retry-after", "30");
     }
     Ok(response.body(Full::new(body).map_err(|never| match never {}).boxed())?)
+}
+
+/// The status a harness gets for a Decisions failure, and whether it carries
+/// `retry-after`. Only an unavailable or throttled service is worth sending
+/// again: harness SDKs (Claude Code, the OpenAI and Anthropic SDKs) retry 5xx
+/// and 429 with backoff, up to about ten times, so passing a refusal through
+/// as the core's 502 turns one refused turn into a stream of identical
+/// refused lookups on the shared routing service.
+fn harness_status(failure: DecisionsFailure) -> (StatusCode, bool) {
+    match failure {
+        DecisionsFailure::Unavailable => (StatusCode::SERVICE_UNAVAILABLE, true),
+        DecisionsFailure::Throttled => (StatusCode::TOO_MANY_REQUESTS, true),
+        // Not 401, which a harness reads as its own (gateway) credential
+        // being wrong.
+        DecisionsFailure::Auth => (StatusCode::FORBIDDEN, false),
+        // A 4xx no SDK retries; the message says why the service refused.
+        DecisionsFailure::Refused => (StatusCode::BAD_REQUEST, false),
+    }
 }
 
 fn explain_decisions_failure(
@@ -683,6 +705,12 @@ fn explain_decisions_failure(
         ),
         DecisionsFailure::Unavailable => format!(
             "{message}: the Rayline routing service is unavailable or still starting (a development cell scales to zero and takes about a minute to start). This is retryable: send the turn again shortly."
+        ),
+        DecisionsFailure::Throttled => format!(
+            "{message}: the Rayline routing service is busy. Send the turn again after the retry-after interval."
+        ),
+        DecisionsFailure::Refused => format!(
+            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `hybrid.local_registry_model` in settings and run `raydock hybrid stop` and `raydock hybrid start`."
         ),
     };
     *value.pointer_mut("/error/message")? = serde_json::Value::String(explained);
@@ -886,8 +914,24 @@ mod tests {
                     "{message}"
                 );
             }
+            assert_eq!(
+                decisions_failure(&encode("Decisions request refused (HTTP 429)")),
+                Some(DecisionsFailure::Throttled)
+            );
             for message in [
                 "Decisions request refused (HTTP 400)",
+                "Decisions request refused (HTTP 400, unknown_price_model)",
+                "Decisions request refused (HTTP 422, code decide_refused)",
+                "Decisions request refused (HTTP 404)",
+            ] {
+                assert_eq!(
+                    decisions_failure(&encode(message)),
+                    Some(DecisionsFailure::Refused),
+                    "{message}"
+                );
+            }
+            for message in [
+                "Decisions request refused (HTTP 500)",
                 "selected endpoint request failed",
             ] {
                 assert_eq!(decisions_failure(&encode(message)), None, "{message}");
@@ -918,6 +962,42 @@ mod tests {
         assert_eq!(value["type"], "error");
         assert_eq!(value["error"]["type"], "invalid_request_error");
         assert_eq!(login_command(None), "raydock auth login");
+    }
+
+    #[test]
+    fn only_unavailable_or_throttled_decisions_reach_the_harness_as_retryable() {
+        assert_eq!(
+            harness_status(DecisionsFailure::Unavailable),
+            (StatusCode::SERVICE_UNAVAILABLE, true)
+        );
+        assert_eq!(
+            harness_status(DecisionsFailure::Throttled),
+            (StatusCode::TOO_MANY_REQUESTS, true)
+        );
+        for failure in [DecisionsFailure::Auth, DecisionsFailure::Refused] {
+            let (status, retry_after) = harness_status(failure);
+            assert!(!retry_after, "{failure:?}");
+            // Harness SDKs retry 408, 409, 429 and 5xx; none of those.
+            assert!(status.is_client_error(), "{failure:?}");
+            assert!(
+                ![408, 409, 429].contains(&status.as_u16()),
+                "{failure:?}: {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn refused_failure_says_not_to_resend() {
+        let explained = explain_decisions_failure(
+            &anthropic("Decisions request refused (HTTP 400, unknown_price_model)"),
+            DecisionsFailure::Refused,
+            "raydock auth login",
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&explained).unwrap();
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("unknown_price_model"), "{message}");
+        assert!(message.contains("will not change"), "{message}");
     }
 
     #[test]
