@@ -12,8 +12,6 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const DEFAULT_CLAUDE_SETTINGS_SUFFIX: &str = ".claude/settings.json";
-/// Claude Code's main-agent model when a hosted route-all launch names none.
-const DEFAULT_MODEL: &str = crate::ARC_SAGE_MODEL;
 /// The local static router's virtual model: "let `routes.main` decide". The
 /// default on the local and may-local planes, which stay as they were.
 const LOCAL_PLANE_DEFAULT_MODEL: &str = crate::VIRTUAL_ROUTER_MODEL;
@@ -161,14 +159,18 @@ fn isolated_needs_claude_login(mode: RoutingMode) -> bool {
 }
 
 /// The main-agent model when neither `--model` nor `ANTHROPIC_MODEL` names
-/// one. A hosted launch defaults to ARC Sage; a launch whose router runs on
-/// this machine (`--local`, a local-plane `--config`, account-local or
-/// may-local routing) keeps the router's virtual model.
-fn default_model_for_routing_mode(mode: RoutingMode, local_router: bool) -> &'static str {
+/// one. `None`: a hosted launch, which defaults to ARC Sage under the id
+/// `GET /v1/models` lists for the key ([`crate::harness::LaunchModels`]); a
+/// launch whose router runs on this machine (`--local`, a local-plane
+/// `--config`, account-local or may-local routing) keeps the router's virtual
+/// model.
+fn default_model_for_routing_mode(mode: RoutingMode, local_router: bool) -> Option<&'static str> {
     match mode {
-        RoutingMode::ProxySubagents => DEFAULT_PROXY_SUBAGENTS_MODEL,
-        RoutingMode::Override | RoutingMode::Proxy if local_router => LOCAL_PLANE_DEFAULT_MODEL,
-        RoutingMode::Override | RoutingMode::Proxy => DEFAULT_MODEL,
+        RoutingMode::ProxySubagents => Some(DEFAULT_PROXY_SUBAGENTS_MODEL),
+        RoutingMode::Override | RoutingMode::Proxy if local_router => {
+            Some(LOCAL_PLANE_DEFAULT_MODEL)
+        }
+        RoutingMode::Override | RoutingMode::Proxy => None,
     }
 }
 
@@ -177,11 +179,12 @@ fn default_model_for_routing_mode(mode: RoutingMode, local_router: bool) -> &'st
 #[derive(Clone, Copy, Debug)]
 struct RoleModelInputs<'a> {
     routing_mode: RoutingMode,
-    /// Hosted routing that Raydock configures: no local plane, no proxy
-    /// allowlist (`--router-config-path`), and no `--config` other than a
-    /// cloud-only one. Otherwise the local router or the allowlist decides and
-    /// no model is set.
-    hosted: bool,
+    /// Hosted routing that Raydock configures, with the models the router
+    /// lists for the key: no local plane, no proxy allowlist
+    /// (`--router-config-path`), and no `--config` other than a cloud-only
+    /// one. `None`: the local router or the allowlist decides and no model is
+    /// set.
+    hosted: Option<&'a crate::harness::LaunchModels>,
     /// A cloud-only `--config` is in play.
     cloud_only_config: bool,
     /// The main-agent model the user chose: Claude Code's own `--model` after
@@ -202,7 +205,7 @@ struct RoleModelInputs<'a> {
 /// subagents and background tasks run on a cloud-only `--config`'s
 /// `routes.subagent` model, else the main model the user chose (`--model X`
 /// puts everything on X), else the config's `routes.main` model, else ARC
-/// Swift. Under `--route subagents` they get ARC Swift, unless a cloud-only
+/// Swift (the key's id for it). Under `--route subagents` they get ARC Swift, unless a cloud-only
 /// config's `routes.subagents` allowlist decides what is routed; the main
 /// agent's own background turns go straight to Anthropic, so the haiku model
 /// is left alone.
@@ -224,19 +227,17 @@ fn role_model_env_switches(
             .map(|value| value.to_string_lossy().into_owned())
     };
     let route_all = inputs.routing_mode != RoutingMode::ProxySubagents;
-    let subagents = if !inputs.hosted {
-        None
-    } else if route_all {
-        Some(
+    let subagents = match inputs.hosted {
+        None => None,
+        Some(hosted) if route_all => Some(
             inputs
                 .config_subagent_model
                 .or(inputs.chosen_main_model)
                 .or(inputs.config_main_model)
-                .unwrap_or(crate::ARC_SWIFT_MODEL)
+                .unwrap_or(&hosted.background)
                 .to_owned(),
-        )
-    } else {
-        (!inputs.cloud_only_config).then(|| crate::ARC_SWIFT_MODEL.to_owned())
+        ),
+        Some(hosted) => (!inputs.cloud_only_config).then(|| hosted.background.clone()),
     };
     let haiku = subagents
         .clone()
@@ -995,28 +996,50 @@ async fn run_command_from_home(
         .or_else(|| request.model.clone())
         .or_else(|| env::var("ANTHROPIC_MODEL").ok())
         .filter(|model| !model.trim().is_empty());
+    // A hosted launch's ARC defaults are the ids the router lists for the
+    // key, which follow the account's data mode.
+    let hosted_models = if role_models_hosted(
+        effective_config.is_some(),
+        config_cloud_only,
+        local_start_request.is_some(),
+        request.router_config_path.is_some(),
+    ) {
+        Some(
+            crate::harness::fetch_hosted_models(&router_url, &key)
+                .await
+                .map_err(RunError::Router)?,
+        )
+    } else {
+        None
+    };
     let role_models = RoleModelInputs {
         routing_mode: request.routing_mode,
-        hosted: role_models_hosted(
-            effective_config.is_some(),
-            config_cloud_only,
-            local_start_request.is_some(),
-            request.router_config_path.is_some(),
-        ),
+        hosted: hosted_models.as_ref(),
         cloud_only_config: config_cloud_only,
         chosen_main_model: chosen_main_model.as_deref(),
         config_main_model: config_main_model.as_deref(),
         config_subagent_model: config_subagent_model.as_deref(),
     };
-    let model = request
+    let model = match request
         .model
         .clone()
         .or_else(|| env::var("ANTHROPIC_MODEL").ok())
         .or_else(|| config_main_model.clone())
-        .unwrap_or_else(|| {
+        .or_else(|| {
             default_model_for_routing_mode(request.routing_mode, local_start_request.is_some())
-                .to_owned()
-        });
+                .map(ToOwned::to_owned)
+        }) {
+        Some(model) => model,
+        None => match &hosted_models {
+            Some(models) => models.main.clone(),
+            None => {
+                crate::harness::fetch_hosted_models(&router_url, &key)
+                    .await
+                    .map_err(RunError::Router)?
+                    .main
+            }
+        },
+    };
     let set_model_env = should_set_model_env(
         request.routing_mode,
         request.model.is_some(),
@@ -3000,10 +3023,30 @@ mod refusal_recovery_env_tests {
         assert_eq!(threads(RoutingMode::Override, None), None);
     }
 
-    /// The real launcher, `--via env` against the hosted prod router: with a
-    /// stored key and an explicit compact window it needs no network and starts
-    /// no process, so the child command it builds can be read directly. Each
-    /// switch is driven independently through the inherited env.
+    /// A router answering every request with a standard key's `/v1/models`.
+    async fn listing_stub() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = crate::harness::tests::listing(None).to_string();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        base
+    }
+
+    /// The real launcher, `--via env` against a hosted router stub that lists
+    /// the key's models: with a stored key and an explicit compact window it
+    /// starts no process, so the child command it builds can be read directly.
+    /// Each switch is driven independently through the inherited env.
     #[tokio::test]
     async fn the_launcher_sets_the_switches_on_the_child_it_builds() {
         static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -3011,18 +3054,24 @@ mod refusal_recovery_env_tests {
         let home =
             std::env::temp_dir().join(format!("rayline-cli-refusal-launch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        let credentials = home
-            .join(".config")
-            .join(crate::CONFIG_DIR)
-            .join("credentials.json");
-        std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+        let config_dir = home.join(".config").join(crate::CONFIG_DIR);
+        std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
-            &credentials,
-            r#"{"router_keys":{"prod":{"apiKey":"rlk-test"}}}"#,
+            config_dir.join("credentials.json"),
+            r#"{"router_keys":{"stub":{"apiKey":"rlk-test"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            serde_json::json!({"environments": {"stub": {
+                "router_url": listing_stub().await,
+                "cli_auth_url": "http://127.0.0.1:9/cli-auth"
+            }}})
+            .to_string(),
         )
         .unwrap();
         let request = RunRequest {
-            env_name: Some("prod".to_owned()),
+            env_name: Some("stub".to_owned()),
             auth_token: None,
             args: Vec::new(),
             model: None,
@@ -3581,15 +3630,19 @@ mod arc_default_tests {
     #[test]
     fn hosted_route_all_defaults_to_arc_sage() {
         for mode in [RoutingMode::Override, RoutingMode::Proxy] {
-            assert_eq!(default_model_for_routing_mode(mode, false), "arc-sage-1.0");
+            // A hosted launch takes ARC Sage from the key's model listing.
+            assert_eq!(default_model_for_routing_mode(mode, false), None);
             // The local planes keep the local router's virtual model.
-            assert_eq!(default_model_for_routing_mode(mode, true), "rayline-auto");
+            assert_eq!(
+                default_model_for_routing_mode(mode, true),
+                Some("rayline-auto")
+            );
         }
         // `--route subagents`: the main agent stays on Claude.
         for local in [false, true] {
             assert_eq!(
                 default_model_for_routing_mode(RoutingMode::ProxySubagents, local),
-                DEFAULT_PROXY_SUBAGENTS_MODEL
+                Some(DEFAULT_PROXY_SUBAGENTS_MODEL)
             );
         }
     }
@@ -3598,6 +3651,8 @@ mod arc_default_tests {
     struct Launch<'a> {
         selective: bool,
         not_hosted: bool,
+        /// The key's data mode (`None`: standard).
+        mode: Option<&'a str>,
         cloud_only_config: bool,
         chosen: Option<&'a str>,
         config_main: Option<&'a str>,
@@ -3607,6 +3662,10 @@ mod arc_default_tests {
 
     /// `(subagent model, force, haiku model)` for a launch.
     fn roles(launch: Launch<'_>) -> (Option<String>, Option<String>, Option<String>) {
+        let models = crate::harness::LaunchModels::from_listing(&crate::harness::tests::listing(
+            launch.mode,
+        ))
+        .unwrap();
         let switches = role_model_env_switches(
             RoleModelInputs {
                 routing_mode: if launch.selective {
@@ -3614,7 +3673,7 @@ mod arc_default_tests {
                 } else {
                     RoutingMode::Proxy
                 },
-                hosted: !launch.not_hosted,
+                hosted: (!launch.not_hosted).then_some(&models),
                 cloud_only_config: launch.cloud_only_config,
                 chosen_main_model: launch.chosen,
                 config_main_model: launch.config_main,
@@ -3656,11 +3715,22 @@ mod arc_default_tests {
     #[test]
     fn default_launch_puts_subagents_and_background_on_arc_swift() {
         assert_eq!(roles(Launch::default()), all("arc-swift-1.0"));
+        // A contributor or ZDR key gets ARC Swift under its mode's id.
+        for mode in ["contributor", "zdr"] {
+            assert_eq!(
+                roles(Launch {
+                    mode: Some(mode),
+                    ..Launch::default()
+                }),
+                all(&format!("arc-swift-{mode}-1.0"))
+            );
+        }
+        let models = crate::harness::tests::hosted_models();
         for mode in [RoutingMode::Override, RoutingMode::Proxy] {
             let switches = role_model_env_switches(
                 RoleModelInputs {
                     routing_mode: mode,
-                    hosted: true,
+                    hosted: Some(&models),
                     cloud_only_config: false,
                     chosen_main_model: None,
                     config_main_model: None,
@@ -3735,6 +3805,8 @@ mod arc_default_tests {
             &path,
             serde_json::to_vec(&crate::router_config::default_config_json(
                 crate::ROUTER_PROD_URL,
+                "arc-sage-1.0",
+                "arc-swift-1.0",
             ))
             .unwrap(),
         )

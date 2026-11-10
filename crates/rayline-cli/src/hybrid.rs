@@ -926,6 +926,7 @@ fn harness_command(
                 allow_empty_signature: true,
                 capabilities: Some(capabilities),
                 harness_major_version: major_version,
+                models: crate::harness::LaunchModels::hybrid(capabilities),
             };
             let plan = harness.plan(&ctx).map_err(io::Error::other)?;
             crate::harness::write_files(&config_dir, &plan.files)?;

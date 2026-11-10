@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, RenderContext, model_display_name, yaml_file};
+use super::{CONV_ID_ENV, Plan, RenderContext, yaml_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 /// First omp that sends `X-Claude-Code-Session-Id` in `auth: apiKey` mode.
@@ -67,34 +67,30 @@ fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
 }
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
-    let launch = ctx.models();
+    let launch = &ctx.models;
     let entries: Vec<_> = launch
         .offered
         .iter()
         .map(|model| {
-            let hosted_arc = ctx.capabilities.is_none()
-                && matches!(*model, crate::ARC_SAGE_MODEL | crate::ARC_SWIFT_MODEL);
+            let hosted_arc = model.product.is_some();
             let mut entry = json!({
-                "id": model,
-                "name": model_display_name(model),
+                "id": model.id,
+                "name": model.display_name,
                 // ARC owns reasoning effort; do not expose omp thinking controls.
                 "reasoning": !hosted_arc,
                 "input": ctx.input_modalities(),
-                "contextWindow": ctx.context_window(),
-                "maxTokens": ctx.max_output_tokens(model)
+                "contextWindow": model.context_window,
+                "maxTokens": model.max_output_tokens
             });
-            if hosted_arc {
-                // USD / million tokens, effective card 26 (2026-10-27).
-                // https://docs.rayline.ai/arc/pricing
-                // No fixed card applies to hybrid's virtual model.
-                entry["cost"] = match *model {
-                    crate::ARC_SAGE_MODEL => json!({
-                        "input": 1.0, "output": 5.0, "cacheRead": 0.05, "cacheWrite": 1.25
-                    }),
-                    _ => json!({
-                        "input": 0.05, "output": 0.25, "cacheRead": 0.005, "cacheWrite": 0.0625
-                    }),
-                };
+            // USD / million tokens, from the router's price card. A model
+            // without a row there (hybrid's virtual model) shows no cost.
+            if let Some(price) = model.price {
+                entry["cost"] = json!({
+                    "input": price.input,
+                    "output": price.output,
+                    "cacheRead": price.cache_read,
+                    "cacheWrite": price.cache_write
+                });
             }
             entry
         })
@@ -126,7 +122,11 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             }
         })
     };
-    let config_file = yaml_file("config.yml", &config(launch.main, launch.background), false);
+    let config_file = yaml_file(
+        "config.yml",
+        &config(&launch.main, &launch.background),
+        false,
+    );
     Plan {
         files: vec![yaml_file("models.yml", &models, true), config_file],
         env_set: vec![("PI_CODING_AGENT_DIR", ctx.config_dir.as_os_str().to_owned())],
@@ -167,6 +167,7 @@ mod tests {
             input_modalities: vec!["text".into()],
         };
         ctx.capabilities = Some(&capabilities);
+        ctx.models = super::super::LaunchModels::hybrid(&capabilities);
         let hybrid = super::plan(&ctx);
         assert!(hybrid.files[0].contents.contains("id: \"rayline-auto\""));
         assert!(!hybrid.files[0].contents.contains("id: \"arc-sage-1.0\""));

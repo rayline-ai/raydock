@@ -1,8 +1,8 @@
 //! Effective router-config resolution and the default `~/.config/rayline/router.json`.
 //!
 //! Routing is config-file driven: an explicit `--router-config-path` wins, else the
-//! default file at [`default_config_path`] (auto-created on first cloud launch with
-//! everything through the hosted cloud router on ARC). The on-device router is engaged only when the effective config routes
+//! default file at [`default_config_path`] (written on cloud launches with
+//! everything through the hosted cloud router on the key's listed ARC models). The on-device router is engaged only when the effective config routes
 //! something *away* from the hosted cloud router (see [`config_needs_local_router`]);
 //! a pure default stays on today's hosted path with no local process.
 //!
@@ -38,9 +38,10 @@ pub fn default_config_path_for_env(home: &Path, env_name: &str) -> PathBuf {
 }
 
 /// Default content: route everything to the hosted cloud router at
-/// `router_url` on ARC — the main agent on ARC Sage, subagents on ARC Swift.
+/// `router_url` on ARC — the main agent on `main` (the key's listed ARC Sage),
+/// subagents on `background` (its listed ARC Swift).
 /// Users edit this to send subagents/main to local or custom endpoints.
-pub fn default_config_json(router_url: &str) -> Value {
+pub fn default_config_json(router_url: &str, main: &str, background: &str) -> Value {
     json!({
         "endpoints": [
             {
@@ -48,35 +49,67 @@ pub fn default_config_json(router_url: &str) -> Value {
                 "protocol": "anthropic_messages",
                 "base_url": router_url,
                 "api_key_env": "RAYLINE_ROUTER_API_KEY",
-                "models": [crate::ARC_SAGE_MODEL, crate::ARC_SWIFT_MODEL]
+                "models": [main, background]
             }
         ],
         "routes": {
-            "main": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
-            "subagent": { "endpoint": "rayline-cloud", "model": crate::ARC_SWIFT_MODEL },
-            "default": { "endpoint": "rayline-cloud", "model": crate::ARC_SAGE_MODEL },
+            "main": { "endpoint": "rayline-cloud", "model": main },
+            "subagent": { "endpoint": "rayline-cloud", "model": background },
+            "default": { "endpoint": "rayline-cloud", "model": main },
             "subagents": {}
         }
     })
 }
 
-/// Create the default config for `env_name` if absent, pointing its cloud
-/// endpoint at `router_url` (the environment's resolved router). Idempotent;
-/// never overwrites an existing file.
-pub fn ensure_default_config(home: &Path, env_name: &str, router_url: &str) -> io::Result<PathBuf> {
+/// Write the default config for `env_name`, pointing its cloud endpoint at
+/// `router_url` (the environment's resolved router) with the ids `models` read
+/// from that router's `/v1/models`. Runs on every default launch: an absent
+/// file, or one that is still exactly a Raydock default (for whatever ids and
+/// router it was written with), is (re)written with the current ids; a file the
+/// user edited is left untouched.
+pub(crate) fn ensure_default_config(
+    home: &Path,
+    env_name: &str,
+    router_url: &str,
+    models: &crate::harness::LaunchModels,
+) -> io::Result<PathBuf> {
     let path = default_config_path_for_env(home, env_name);
-    match std::fs::metadata(&path) {
-        Ok(_) => return Ok(path),
+    match std::fs::read(&path) {
+        Ok(raw) if !is_unedited_default(&raw) => return Ok(path),
+        Ok(_) => {}
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
     }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let body =
-        serde_json::to_vec_pretty(&default_config_json(router_url)).map_err(io::Error::other)?;
+    let body = serde_json::to_vec_pretty(&default_config_json(
+        router_url,
+        &models.main,
+        &models.background,
+    ))
+    .map_err(io::Error::other)?;
     std::fs::write(&path, body)?;
     Ok(path)
+}
+
+/// Whether `raw` is exactly what [`default_config_json`] writes for its own
+/// router and main/subagent ids, i.e. nothing in it was edited by the user.
+fn is_unedited_default(raw: &[u8]) -> bool {
+    let Ok(cfg) = serde_json::from_slice::<Value>(raw) else {
+        return false;
+    };
+    let text = |pointer: &str| cfg.pointer(pointer).and_then(Value::as_str);
+    match (
+        text("/endpoints/0/base_url"),
+        text("/routes/main/model"),
+        text("/routes/subagent/model"),
+    ) {
+        (Some(router_url), Some(main), Some(background)) => {
+            cfg == default_config_json(router_url, main, background)
+        }
+        _ => false,
+    }
 }
 
 /// Resolve the effective config path: explicit flag wins, else the default file if
@@ -808,7 +841,9 @@ mod tests {
     #[test]
     fn default_config_does_not_need_local_router() {
         assert!(!config_value_needs_local_router(&default_config_json(
-            crate::ROUTER_PROD_URL
+            crate::ROUTER_PROD_URL,
+            "arc-sage-1.0",
+            "arc-swift-1.0"
         )));
     }
 
@@ -940,7 +975,7 @@ mod tests {
     #[test]
     fn ensure_default_config_creates_non_engaging_file() {
         let home = tmp_home();
-        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
         assert!(path.exists());
         assert_eq!(path, default_config_path(&home));
         // The default file is all hosted cloud → no local router.
@@ -950,15 +985,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    fn hosted() -> crate::harness::LaunchModels {
+        crate::harness::tests::hosted_models()
+    }
+
+    fn contributor() -> crate::harness::LaunchModels {
+        crate::harness::LaunchModels::from_listing(&crate::harness::tests::listing(Some(
+            "contributor",
+        )))
+        .unwrap()
+    }
+
     #[test]
     fn default_config_routes_main_to_sage_and_subagents_to_swift() {
-        let cfg = default_config_json(crate::ROUTER_PROD_URL);
-        assert_eq!(cfg["routes"]["main"]["model"], "arc-sage-1.0");
-        assert_eq!(cfg["routes"]["subagent"]["model"], "arc-swift-1.0");
-        assert_eq!(cfg["routes"]["default"]["model"], "arc-sage-1.0");
+        let models = contributor();
+        let cfg = default_config_json(crate::ROUTER_PROD_URL, &models.main, &models.background);
+        assert_eq!(cfg["routes"]["main"]["model"], "arc-sage-contributor-1.0");
+        assert_eq!(
+            cfg["routes"]["subagent"]["model"],
+            "arc-swift-contributor-1.0"
+        );
+        assert_eq!(
+            cfg["routes"]["default"]["model"],
+            "arc-sage-contributor-1.0"
+        );
         assert_eq!(
             cfg["endpoints"][0]["models"],
-            json!(["arc-sage-1.0", "arc-swift-1.0"])
+            json!(["arc-sage-contributor-1.0", "arc-swift-contributor-1.0"])
         );
     }
 
@@ -966,7 +1019,7 @@ mod tests {
     fn default_codex_config_follows_routes_main() {
         // The Codex sentinel (no --model) follows routes.main (ARC Sage).
         let home = tmp_home();
-        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
         let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
         let routes = &cfg["routes"]["model_routes"];
@@ -979,18 +1032,38 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_config_keeps_an_existing_file() {
-        // A file naming a model the router no longer serves is kept as is, so
-        // the router's own "model not found" says what to fix.
+    fn ensure_default_config_keeps_a_user_edited_file() {
+        // A file the user changed is kept as is, even when it names a model the
+        // key no longer lists, so the router's own "model not found" says what to fix.
         let home = tmp_home();
         let path = default_config_path(&home);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let mut existing = default_config_json(crate::ROUTER_PROD_URL);
+        let mut existing =
+            default_config_json(crate::ROUTER_PROD_URL, "arc-sage-1.0", "arc-swift-1.0");
         existing["routes"]["main"]["model"] = json!("rayline-router");
         let body = serde_json::to_vec_pretty(&existing).unwrap();
         std::fs::write(&path, &body).unwrap();
-        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &contributor()).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_default_config_refreshes_an_unedited_default_with_the_listed_ids() {
+        // A default written with the old hardcoded ids takes the key's listed
+        // ids on the next launch.
+        let home = tmp_home();
+        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
+        assert_eq!(config_main_model(&path).as_deref(), Some("arc-sage-1.0"));
+        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &contributor()).unwrap();
+        assert_eq!(
+            config_main_model(&path).as_deref(),
+            Some("arc-sage-contributor-1.0")
+        );
+        assert_eq!(
+            config_subagent_model(&path).as_deref(),
+            Some("arc-swift-contributor-1.0")
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1003,7 +1076,8 @@ mod tests {
         let flag = PathBuf::from("/tmp/explicit.json");
         assert_eq!(resolve_config_path(Some(&flag), &home), Some(flag));
         // Default file is picked up once it exists.
-        let default = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL).unwrap();
+        let default =
+            ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
         assert_eq!(resolve_config_path(None, &home), Some(default));
         let _ = std::fs::remove_dir_all(&home);
     }
