@@ -56,6 +56,15 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   for more output than a cloud deployment's ceiling is lowered to it instead of
   refused, as the local deployment already did; the stated and sent figures are
   logged. A turn whose thinking budget reaches the ceiling is still refused.
+- **A failed routing decision is no longer retried many times.** When Rayline's
+  routing service refuses a hybrid turn (for example over a price or model it
+  doesn't know), Claude Code now gets a final HTTP 400 that says why, instead
+  of a 502 it resent about ten times. When the service is unavailable or busy,
+  `rld` resends the turn once, waiting as long as the service's `retry-after`
+  asks (up to 30 seconds), and then reports HTTP 503 or 429. Every such error
+  carries `x-should-retry: false`, so the harness SDK doesn't resend it again,
+  and a retryable one carries `retry-after`. A turn now reaches the routing
+  service at most twice.
 
 ### Note
 

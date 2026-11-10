@@ -78,6 +78,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                      "branch": self.headers.get("x-rayline-branch-id"),
                                      "credential_env_present": [name for name in credential_env if os.environ.get(name)],
                                      "core_authenticated": True}) + "\n")
+        if self.path.startswith("/decide-fail?"):
+            # The core's answer when Decisions refused or was unreachable:
+            # a 502 decision_failed naming the service's status, with the
+            # retry advice it forwards (query: refused=<HTTP status>|failed,
+            # retry_after=<s>, should_retry=true|false).
+            query = dict(item.split("=", 1) for item in self.path.split("?", 1)[1].split("&"))
+            refused = query.get("refused", "failed")
+            message = ("Decisions request failed" if refused == "failed"
+                       else f"Decisions request refused (HTTP {refused})")
+            reply = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
+                                                           "message": message}}).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            if "retry_after" in query:
+                self.send_header("Retry-After", query["retry_after"])
+            if "should_retry" in query:
+                self.send_header("x-should-retry", query["should_retry"])
+            self.end_headers()
+            self.wfile.write(reply)
+            return
         if self.path == "/crash":
             os._exit(23)
         if self.path == "/unready":

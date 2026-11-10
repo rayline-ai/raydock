@@ -33,8 +33,16 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// The execution core's own request body limit.
 const MAX_REQUEST_BYTES: usize = 64 << 20;
 /// Wait before the one retry of a turn whose Decisions call found the routing
-/// service unavailable (a scale-to-zero cell answers 502 while it starts).
+/// service unavailable or busy (a scale-to-zero cell answers 502 while it
+/// starts), when the service names no `retry-after`. Jittered by
+/// [`jittered`] so many sessions do not resend in step.
 const DECISIONS_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// The longest `retry-after` rld waits out itself. A longer one is passed to
+/// the harness without an rld retry.
+const DECISIONS_MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+/// `retry-after` the harness gets for a retryable failure when the service
+/// named none.
+const DEFAULT_HARNESS_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -444,15 +452,23 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         let headers = upstream.headers().clone();
         let error_body = upstream.bytes().await?;
         let failure = decisions_failure(&error_body);
-        if failure == Some(DecisionsFailure::Unavailable) && !retried {
+        let hint = RetryHint::from_headers(&headers);
+        if !retried
+            && let Some(failure) = failure
+            && let Some(delay) = rld_retry_delay(failure, hint)
+        {
             // Nothing ran: the core decides before it dispatches, and treats an
             // identical resend like the harness's own retry.
             retried = true;
-            tracing::info!("Decisions unavailable; retrying the turn once");
-            tokio::time::sleep(DECISIONS_RETRY_DELAY).await;
+            tracing::info!(
+                ?failure,
+                delay_ms = delay.as_millis() as u64,
+                "Decisions unavailable or busy; retrying the turn once"
+            );
+            tokio::time::sleep(delay).await;
             continue;
         }
-        return buffered_response(state, status, &headers, error_body, failure);
+        return buffered_response(state, status, &headers, error_body, failure, hint);
     }
 }
 
@@ -517,7 +533,15 @@ async fn send_classifier_to_cloud(
             })
             .unwrap_or_default();
         tracing::warn!(status = status.as_u16(), %error_type, "cloud pin refused the auto-mode classifier");
-        return buffered_response(state, status, &headers, error_body, None).map(Some);
+        return buffered_response(
+            state,
+            status,
+            &headers,
+            error_body,
+            None,
+            RetryHint::default(),
+        )
+        .map(Some);
     }
     stream_response(upstream).map(Some)
 }
@@ -640,6 +664,62 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
     }
 }
 
+/// The routing service's retry advice, as the core passes it on with its 502:
+/// `retry-after` (delta-seconds) and `x-should-retry` (`true`/`false`, the
+/// Anthropic and OpenAI SDKs' own header). Absent from a core that does not
+/// forward them, and then rld's defaults apply.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetryHint {
+    retry_after: Option<Duration>,
+    should_retry: Option<bool>,
+}
+
+impl RetryHint {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        let text = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+        };
+        Self {
+            // Only the delta-seconds form; an HTTP date is ignored.
+            retry_after: text("retry-after")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs),
+            should_retry: match text("x-should-retry") {
+                Some("true") => Some(true),
+                Some("false") => Some(false),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// How long rld waits before its one resend of a failed turn, or None when it
+/// does not resend: only an unavailable or busy service is worth another try,
+/// never when the service says not to, and never past
+/// [`DECISIONS_MAX_RETRY_WAIT`] (the harness gets that wait instead).
+fn rld_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Duration> {
+    if !matches!(
+        failure,
+        DecisionsFailure::Unavailable | DecisionsFailure::Throttled
+    ) || hint.should_retry == Some(false)
+    {
+        return None;
+    }
+    match hint.retry_after {
+        Some(wait) if wait > DECISIONS_MAX_RETRY_WAIT => None,
+        Some(wait) => Some(wait.max(Duration::from_secs(1))),
+        None => Some(jittered(DECISIONS_RETRY_DELAY, rand::random::<f64>())),
+    }
+}
+
+/// `base` scaled into [0.5, 1.5) by `unit` in [0, 1).
+fn jittered(base: Duration, unit: f64) -> Duration {
+    base.mul_f64(0.5 + unit.clamp(0.0, 1.0))
+}
+
 fn login_command(env_name: Option<&str>) -> String {
     match env_name {
         Some(env) if !env.is_empty() => format!("raydock --env {env} auth login"),
@@ -649,31 +729,56 @@ fn login_command(env_name: Option<&str>) -> String {
 
 /// The core's error response, with a Decisions failure explained: what to
 /// run for a refused key, and that an unavailable service is retryable.
+///
+/// An explained failure always carries `x-should-retry: false`: rld has
+/// already spent the turn's one resend (or the service ruled one out), and
+/// harness SDKs otherwise resend a 5xx or 429 up to about ten times, each a
+/// fresh lookup on the shared routing service. A retryable one also carries
+/// `retry-after` (the service's own, else 30 s) for a user or tool that
+/// sends the turn again by hand.
 fn buffered_response(
     state: &Gateway,
     status: StatusCode,
     headers: &reqwest::header::HeaderMap,
     body: Bytes,
     failure: Option<DecisionsFailure>,
+    hint: RetryHint,
 ) -> Result<Response<Body>> {
-    let (status, body, retry_after) = match failure.and_then(|failure| {
+    let explained = failure.and_then(|failure| {
         explain_decisions_failure(&body, failure, &state.login_command).map(|body| (failure, body))
-    }) {
+    });
+    let mut response;
+    let body = match explained {
         Some((failure, body)) => {
-            let (status, retry_after) = harness_status(failure);
-            (status, body, retry_after)
+            let (status, retryable) = harness_status(failure);
+            response = Response::builder().status(status);
+            for (name, value) in headers {
+                if !hop_header(name.as_str())
+                    && !matches!(
+                        name.as_str(),
+                        "content-length" | "retry-after" | "x-should-retry"
+                    )
+                {
+                    response = response.header(name, value);
+                }
+            }
+            response = response.header("x-should-retry", "false");
+            if retryable {
+                let wait = hint.retry_after.unwrap_or(DEFAULT_HARNESS_RETRY_AFTER);
+                response = response.header("retry-after", wait.as_secs().to_string());
+            }
+            body
         }
-        None => (status, body, false),
+        None => {
+            response = Response::builder().status(status);
+            for (name, value) in headers {
+                if !hop_header(name.as_str()) && name.as_str() != "content-length" {
+                    response = response.header(name, value);
+                }
+            }
+            body
+        }
     };
-    let mut response = Response::builder().status(status);
-    for (name, value) in headers {
-        if !hop_header(name.as_str()) && name.as_str() != "content-length" {
-            response = response.header(name, value);
-        }
-    }
-    if retry_after {
-        response = response.header("retry-after", "30");
-    }
     Ok(response.body(Full::new(body).map_err(|never| match never {}).boxed())?)
 }
 
@@ -989,6 +1094,81 @@ mod tests {
                 "{failure:?}: {status}"
             );
         }
+    }
+
+    #[test]
+    fn reads_the_services_retry_advice() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(RetryHint::from_headers(&headers), RetryHint::default());
+        headers.insert("retry-after", " 7 ".parse().unwrap());
+        headers.insert("x-should-retry", "false".parse().unwrap());
+        assert_eq!(
+            RetryHint::from_headers(&headers),
+            RetryHint {
+                retry_after: Some(Duration::from_secs(7)),
+                should_retry: Some(false)
+            }
+        );
+        // An HTTP date, a negative or fractional delay, and anything but
+        // true/false are ignored.
+        for (retry_after, should_retry) in [
+            ("Wed, 21 Oct 2026 07:28:00 GMT", "False"),
+            ("-1", "1"),
+            ("1.5", ""),
+        ] {
+            headers.insert("retry-after", retry_after.parse().unwrap());
+            headers.insert("x-should-retry", should_retry.parse().unwrap());
+            assert_eq!(RetryHint::from_headers(&headers), RetryHint::default());
+        }
+    }
+
+    #[test]
+    fn rld_resends_only_an_unavailable_or_busy_turn_the_service_allows() {
+        let hint = |retry_after: Option<u64>, should_retry: Option<bool>| RetryHint {
+            retry_after: retry_after.map(Duration::from_secs),
+            should_retry,
+        };
+        for failure in [DecisionsFailure::Unavailable, DecisionsFailure::Throttled] {
+            assert_eq!(
+                rld_retry_delay(failure, hint(Some(3), None)),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                rld_retry_delay(failure, hint(Some(3), Some(true))),
+                Some(Duration::from_secs(3))
+            );
+            // At least a second, at most the cap.
+            assert_eq!(
+                rld_retry_delay(failure, hint(Some(0), None)),
+                Some(Duration::from_secs(1))
+            );
+            assert_eq!(
+                rld_retry_delay(failure, hint(Some(30), None)),
+                Some(DECISIONS_MAX_RETRY_WAIT)
+            );
+            assert_eq!(rld_retry_delay(failure, hint(Some(31), None)), None);
+            assert_eq!(rld_retry_delay(failure, hint(Some(3), Some(false))), None);
+            assert_eq!(rld_retry_delay(failure, hint(None, Some(false))), None);
+            let default = rld_retry_delay(failure, hint(None, None)).unwrap();
+            assert!(
+                default >= DECISIONS_RETRY_DELAY / 2 && default < DECISIONS_RETRY_DELAY * 3 / 2,
+                "{default:?}"
+            );
+        }
+        for failure in [DecisionsFailure::Auth, DecisionsFailure::Refused] {
+            for advice in [hint(None, None), hint(Some(1), Some(true))] {
+                assert_eq!(rld_retry_delay(failure, advice), None, "{failure:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn jitter_spans_half_to_one_and_a_half_times_the_base() {
+        let base = Duration::from_secs(4);
+        assert_eq!(jittered(base, 0.0), Duration::from_secs(2));
+        assert_eq!(jittered(base, 0.5), Duration::from_secs(4));
+        assert!(jittered(base, 0.999_999) < Duration::from_secs(6));
+        assert_eq!(jittered(base, -3.0), Duration::from_secs(2));
     }
 
     #[test]
