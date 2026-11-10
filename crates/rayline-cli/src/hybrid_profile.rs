@@ -175,7 +175,7 @@ pub(crate) fn small_window_warning(registry_model: &str, window: u64) -> Option<
         return None;
     }
     Some(format!(
-        "Warning: the local window is {window} tokens. Claude Code's opening request alone is about {CLAUDE_CODE_OPENING_TOKENS} tokens for {registry_model}, so every Claude Code task starts on cloud. Load the local model with a 262144-token window (llama.cpp `--ctx-size 262144`, vLLM `--max-model-len 262144`) and set --local-context-window 262144 if you set one."
+        "Warning: the local window is {window} tokens. Claude Code's opening request alone is about {CLAUDE_CODE_OPENING_TOKENS} tokens for {registry_model}, so every Claude Code task starts on cloud. Load the local model with a 262144-token window (llama.cpp `--ctx-size 262144`, vLLM `--max-model-len 262144`) and set --local-context-window or settings hybrid.local_context_window to 262144 if you set one."
     ))
 }
 
