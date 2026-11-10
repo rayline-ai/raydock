@@ -23,7 +23,11 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 - **Auto-mode safety checks go to the cloud.** Claude Code's auto-mode
   classifier calls are sent to Claude Haiku 5.5 through the router instead of
   the local model. Change the model with `hybrid.classifier_model` or
-  `--classifier-model`.
+  `--classifier-model`. `raydock hybrid run claude` sets
+  `CLAUDE_CODE_AUTO_MODE_SERVER=0` (unless you set it), so Claude Code 2.1.321
+  and later keep using these classifier calls rather than the API's in-turn
+  checks, which a turn served by the local model can't answer. Without it,
+  every checked action in auto mode was denied.
 
 ### Fixed
 
