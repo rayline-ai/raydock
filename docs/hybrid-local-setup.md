@@ -207,8 +207,9 @@ pinned model:
 ```
 
 The core advertises the smallest of all the limits as the session's, so a long
-local answer has room to finish, and a prompt larger than about three quarters
-of the local window goes to cloud. Each limit is enforced against the
+local answer has room to finish, and a prompt larger than the local window
+minus its answer allowance (a quarter of the window, at most 32,000 tokens)
+goes to cloud. Each limit is enforced against the
 deployment the turn lands on, not against that smallest figure: a harness that
 asks for more than a deployment's ceiling has its turns on that deployment
 lowered to it rather than refused.
