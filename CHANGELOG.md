@@ -47,9 +47,9 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 - **`hybrid start` warns when the local window cannot hold Claude Code's
   opening request.** For a model other than Qwen3.8-27B, the core reserves
-  the opening request (at least about 75,000 tokens, more with MCP servers or
-  project instructions) plus up to 32,000 for the answer. A window under
-  about 100,000 tokens holds neither, so every task started on cloud with no
+  the opening request (about 73,000 tokens with no MCP servers or project
+  instructions, more with them) plus up to 32,000 for the answer. Below about
+  97,000 tokens no task start fits, so every task started on cloud with no
   sign why. `start` now says so and names the 262,144-token setting.
 - **rld logs why a turn failed before any output.** The resend and every
   final 502 from the core are logged with the routing service's HTTP status
