@@ -128,8 +128,8 @@ pub(crate) fn configured_local_context_window(
 /// cloud targets' window: the default exists to bound memory for a runtime
 /// whose window Raydock cannot see, and a runtime that reports one has
 /// already allocated it. Before 0.4.3 the default applied even then, so
-/// Claude Code on a non-Qwen model, whose opening request alone bounds above
-/// the default, never ran locally.
+/// Claude Code on a non-Qwen model barely fit: its opening request (about
+/// 73,000 tokens) plus the answer allowance nearly fills the default.
 pub(crate) fn resolve_local_window(
     configured: Option<u64>,
     loaded: Option<u64>,
