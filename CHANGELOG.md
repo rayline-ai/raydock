@@ -15,7 +15,7 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   doesn't know, and the error names the setting. It can't be combined with
   `--config`, since a profile file sets its own model.
 - **`prefer_local` works with any local model.** The bundled execution core
-  (`rayline-core`, now pinned to `dbde74c0`) counts Qwen3.8-27B prompts exactly
+  (`rayline-core`, now pinned to `44cd8f1b`) counts Qwen3.8-27B prompts exactly
   and bounds other models' text prompts by their byte size (`caller_bounded`),
   so ARC can keep a turn local only when it fits the window. It no longer needs
   a llama.cpp prompt counter. This needs the production router from
@@ -31,6 +31,17 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Fixed
 
+- **`hybrid start` warns when the local window cannot hold Claude Code's
+  opening request.** For a model other than Qwen3.8-27B, a window under about
+  142,000 tokens leaves too little room for the opening request (about
+  110,000 tokens) and the answer, so every task started on cloud with no
+  sign why. `start` now says so and names the 262,144-token setting.
+- **rld logs why a turn failed before any output.** The resend and every
+  final 502 from the core are logged with the routing service's HTTP status
+  and code (from the core's own Decisions message; any other message, which
+  may be a provider's text, is logged only as "other") and the route id, when
+  the core passes one on. Before, rld logged only "Decisions unavailable" on a
+  resend and nothing on the final failure.
 - **Hybrid uses the local runtime's own context window.** With no
   `--local-context-window` or `hybrid.local_context_window`, `hybrid start`
   now uses the window the runtime reports (llama.cpp `/props`, or
@@ -56,6 +67,17 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   for more output than a cloud deployment's ceiling is lowered to it instead of
   refused, as the local deployment already did; the stated and sent figures are
   logged. A turn whose thinking budget reaches the ceiling is still refused.
+- **A failed routing decision is no longer retried many times.** When Rayline's
+  routing service refuses a hybrid turn (for example over a price or model it
+  doesn't know), Claude Code now gets a final HTTP 400 that says why, instead
+  of a 502 it resent about ten times. When the service is unavailable or busy,
+  `rld` resends the turn once, after the service's `retry-after` (only if it
+  asks for 30 seconds or less, and never when it sends
+  `x-should-retry: false`; about 5 seconds, randomly varied, when it names no
+  wait), and then reports HTTP 503 or 429. Every such error carries
+  `x-should-retry: false`, so the harness SDK doesn't resend it again, and a
+  retryable one carries `retry-after`. A failed turn is now sent at most twice
+  instead of about ten times.
 
 ### Note
 
