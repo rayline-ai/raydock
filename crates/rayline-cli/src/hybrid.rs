@@ -692,6 +692,49 @@ fn ready(paths: &Paths) -> io::Result<Value> {
     Ok(state)
 }
 
+/// Read-only connection for top: never creates state or starts a runtime.
+/// The client's default credentials are safe only for this validated origin.
+pub(crate) async fn top_connection(
+    state_dir: &Path,
+) -> io::Result<(reqwest::Client, String, Value)> {
+    let paths = Paths {
+        dir: state_dir.to_owned(),
+    };
+    let state = ready(&paths)
+        .map_err(|_| io::Error::other("hybrid runtime readiness is unavailable or invalid"))?;
+    for key in ["pid", "core_pid"] {
+        state
+            .get(key)
+            .and_then(Value::as_i64)
+            .and_then(|pid| i32::try_from(pid).ok())
+            .filter(|pid| crate::router::process_exists(*pid))
+            .ok_or_else(|| io::Error::other("hybrid runtime process is not live"))?;
+    }
+    let token = fs::read_to_string(paths.token())
+        .map_err(|_| io::Error::other("hybrid gateway credential is unavailable"))?;
+    if token.trim().is_empty() {
+        return Err(io::Error::other("hybrid gateway credential is invalid"));
+    }
+    let mut authorization =
+        reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim()))
+            .map_err(|_| io::Error::other("hybrid gateway credential is invalid"))?;
+    authorization.set_sensitive(true);
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(reqwest::header::AUTHORIZATION, authorization);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(3))
+        .default_headers(headers)
+        .build()
+        .map_err(|_| io::Error::other("cannot initialize hybrid gateway connection"))?;
+    health(&client, &paths, &state).await.map_err(|_| {
+        io::Error::other("hybrid gateway health/authentication or process identity check failed")
+    })?;
+    let endpoint = url(&state)?.trim_end_matches('/');
+    Ok((client, format!("{endpoint}/v1/router/top/snapshot"), state))
+}
+
 fn credential_env_names(state: &Value) -> io::Result<Vec<&str>> {
     let values = state
         .get("credential_env")

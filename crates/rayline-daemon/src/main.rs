@@ -35,6 +35,7 @@ use tracing::{info, warn};
 
 mod hybrid;
 mod hybrid_classifier;
+mod hybrid_metrics;
 mod statusline;
 
 // Pinned llama.cpp release. Kept to the newest build that is >=7 days old

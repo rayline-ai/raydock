@@ -9,9 +9,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::hybrid_metrics::{RequestObservation, RoutingMetadata};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
@@ -20,6 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rand::RngCore;
 use rayline_local_router::{InboundGuard, ModelCapabilities};
+use rayline_metrics::RouterMetrics;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -111,6 +113,8 @@ struct Gateway {
     login_command: String,
     /// Where Claude Code's auto-mode classifier goes instead of the core.
     classifier_pin: Option<crate::hybrid_classifier::CloudPin>,
+    metrics: Arc<RouterMetrics>,
+    routing_metadata: RoutingMetadata,
 }
 
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
@@ -118,10 +122,9 @@ type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 pub async fn run(args: Args) -> Result<()> {
     check_decisions_url(&args.config, &args.router_urls)?;
     let credential_env = credential_env_names(&args.config)?;
-    let classifier_pin = crate::hybrid_classifier::cloud_pin(
-        &serde_json::from_slice(&std::fs::read(&args.config)?)?,
-        &args.classifier_model,
-    );
+    let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
+    let routing_metadata = RoutingMetadata::from_config(&config);
+    let classifier_pin = crate::hybrid_classifier::cloud_pin(&config, &args.classifier_model);
     let startup_timeout = Duration::from_secs(args.startup_timeout_secs);
     let startup_deadline = tokio::time::Instant::now() + startup_timeout;
     // Register before spawning so cancellation during startup also reaps the child.
@@ -189,6 +192,8 @@ pub async fn run(args: Args) -> Result<()> {
             shutdown: shutdown_tx,
             login_command: login_command(args.env_name.as_deref()),
             classifier_pin,
+            metrics: RouterMetrics::new("rayline-hybrid"),
+            routing_metadata,
         });
         let ready = Ready {
             contract_version: CONTRACT_VERSION,
@@ -334,6 +339,14 @@ async fn handle(state: Arc<Gateway>, request: Request<Incoming>) -> Response<Bod
     if let Err(error) = state.inbound.check(&Method::POST, "/", request.headers()) {
         return error_response(error.status, error.message);
     }
+    if request.method() == Method::GET && request.uri().path() == "/v1/router/top/snapshot" {
+        let mut snapshot =
+            serde_json::to_value(state.metrics.snapshot()).unwrap_or_else(|_| json!({"ok": false}));
+        snapshot["instance_id"] = json!(state.instance_id);
+        snapshot["pid"] = json!(std::process::id());
+        snapshot["core_pid"] = json!(state.core_pid);
+        return json_response(StatusCode::OK, snapshot);
+    }
     if request.method() == Method::GET && request.uri().path() == "/healthz" {
         // Check core health on demand; status cannot report a dead child as healthy.
         let health = async {
@@ -441,11 +454,25 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
     {
         return Ok(response);
     }
+    let mut observation = (parts.method == Method::POST
+        && matches!(
+            parts.uri.path(),
+            "/v1/messages" | "/v1/chat/completions" | "/v1/responses"
+        ))
+    .then(|| RequestObservation::start(state.metrics.clone(), &body));
     let mut retried = false;
     loop {
         let upstream = send_to_core(state, &parts, body.clone()).await?;
+        if let Some(observation) = &observation {
+            state
+                .routing_metadata
+                .record(observation, upstream.headers(), &state.instance_id);
+        }
         if upstream.status() != StatusCode::BAD_GATEWAY {
-            return stream_response(upstream);
+            return match observation {
+                Some(observation) => observed_response(upstream, observation, Upstream::Core),
+                None => stream_response(upstream),
+            };
         }
         // A refused decision arrives before any output, as one small JSON error.
         let status = upstream.status();
@@ -487,7 +514,14 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
             resent = retried,
             "the core failed the turn before any output; returning the error to the harness"
         );
-        return buffered_response(state, status, &headers, error_body, failure, hint);
+        let response = buffered_response(state, status, &headers, error_body, failure, hint)?;
+        if let Some(observation) = &mut observation {
+            observation.finish(
+                response.status().as_u16(),
+                Some("execution request refused"),
+            );
+        }
+        return Ok(response);
     }
 }
 
@@ -524,6 +558,8 @@ async fn send_classifier_to_cloud(
     if let Some(session) = parts.headers.get("x-claude-code-session-id") {
         outgoing = outgoing.header("x-conversation-id", session);
     }
+    let mut observation = RequestObservation::start(state.metrics.clone(), body);
+    observation.record_classifier(&pin.wire_model);
     let upstream = outgoing.bearer_auth(key).body(pinned).send().await?;
     let status = upstream.status();
     tracing::info!(
@@ -552,17 +588,18 @@ async fn send_classifier_to_cloud(
             })
             .unwrap_or_default();
         tracing::warn!(status = status.as_u16(), %error_type, "cloud pin refused the auto-mode classifier");
-        return buffered_response(
+        let response = buffered_response(
             state,
             status,
             &headers,
             error_body,
             None,
             RetryHint::default(),
-        )
-        .map(Some);
+        )?;
+        observation.finish(status.as_u16(), Some("classifier request refused"));
+        return Ok(Some(response));
     }
-    stream_response(upstream).map(Some)
+    observed_response(upstream, observation, Upstream::Classifier).map(Some)
 }
 
 async fn send_to_core(
@@ -631,6 +668,159 @@ async fn send_to_core(
         .body(body)
         .send()
         .await
+}
+
+/// Encoded bodies are opaque; only decoded bytes can supply response telemetry.
+/// `Some(true)` selects SSE, `Some(false)` selects buffered JSON observation.
+fn observable_response(headers: &hyper::HeaderMap) -> Option<bool> {
+    for encoding in headers.get_all("content-encoding") {
+        let Ok(encoding) = encoding.to_str() else {
+            return None;
+        };
+        if !encoding
+            .split(',')
+            .all(|value| value.trim().eq_ignore_ascii_case("identity"))
+        {
+            return None;
+        }
+    }
+    Some(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            }),
+    )
+}
+
+/// Who produced a response, which decides how much of its body can fail the request.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Upstream {
+    /// The execution core is trusted to emit well-formed bodies, and valid but
+    /// deeply nested tool output must not turn a successful inference into an
+    /// error. Only an HTTP error, a transport error or an in-band failure signal
+    /// ends the row as an error; `validity()` is ignored.
+    Core,
+    /// The cloud router answering an auto-mode classifier is not trusted: a
+    /// malformed HTTP 200 body (`ResponseValidity::Invalid`) is also an error.
+    Classifier,
+}
+
+/// Finalize `observer` and report whether the response failed, per `upstream`.
+fn response_failed(
+    observer: Option<&mut rayline_metrics::response::ResponseObserver>,
+    upstream: Upstream,
+) -> bool {
+    observer.is_some_and(|observer| {
+        observer.finish()
+            || (upstream == Upstream::Classifier
+                && observer.validity() == rayline_metrics::response::ResponseValidity::Invalid)
+    })
+}
+
+/// Close `observation` from the response's status and what `observer` saw. This
+/// is the ONE place a row's verdict is decided: the empty-body, Content-Length /
+/// terminal and EOF paths all call it, so none can apply a different policy. A
+/// non-success status is an error; otherwise a failed observer is; an
+/// observer-less (encoded) body completes on transport alone.
+fn finalize(
+    observation: &mut RequestObservation,
+    observer: Option<&mut rayline_metrics::response::ResponseObserver>,
+    status: StatusCode,
+    upstream: Upstream,
+) {
+    let failed = response_failed(observer, upstream);
+    observation.finish(
+        status.as_u16(),
+        if !status.is_success() {
+            Some("execution request refused")
+        } else if failed {
+            Some("execution response failed or incomplete")
+        } else {
+            None
+        },
+    );
+}
+
+/// Observe without changing the response bytes or pulling ahead of downstream demand.
+fn observed_response(
+    upstream: reqwest::Response,
+    mut observation: RequestObservation,
+    trust: Upstream,
+) -> Result<Response<Body>> {
+    let status = upstream.status();
+    let content_length = upstream.content_length();
+    let mut observer = observable_response(upstream.headers()).map(|sse| {
+        rayline_metrics::response::ResponseObserver::new(
+            observation.metrics.clone(),
+            observation.id.clone(),
+            sse,
+        )
+    });
+    let mut response = Response::builder().status(status);
+    for (name, value) in upstream.headers() {
+        if !hop_header(name.as_str()) {
+            response = response.header(name, value);
+        }
+    }
+    if content_length == Some(0) || matches!(status.as_u16(), 204 | 205 | 304) {
+        // Hyper may discard a known-empty body without polling it, so neither the
+        // byte-count nor the EOF branch below would run. Finalize now, with the
+        // same policy as those branches: an empty event-stream has no terminal, and
+        // an empty classifier body is not JSON, so both are errors; an empty core
+        // JSON body (a trusted upstream) completes.
+        finalize(&mut observation, observer.as_mut(), status, trust);
+        return Ok(response.body(
+            Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )?);
+    }
+    let stream = futures::stream::unfold(
+        (upstream.bytes_stream(), observation, observer, 0_u64),
+        move |(mut upstream, mut observation, mut observer, mut received)| async move {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    received = received.saturating_add(bytes.len() as u64);
+                    if let Some(observer) = &mut observer {
+                        observer.observe(&bytes);
+                    }
+                    // Hyper can drop a body after its Content-Length or terminal SSE
+                    // frame without polling EOF. Close the row at that observable boundary.
+                    if observer
+                        .as_ref()
+                        .is_some_and(|observer| observer.is_terminal())
+                        || content_length == Some(received)
+                    {
+                        finalize(&mut observation, observer.as_mut(), status, trust);
+                    }
+                    Some((
+                        Ok::<_, io::Error>(Frame::data(bytes)),
+                        (upstream, observation, observer, received),
+                    ))
+                }
+                Some(Err(error)) => {
+                    observation
+                        .finish(status.as_u16(), Some("execution response transport failed"));
+                    Some((
+                        Err(io::Error::other(error)),
+                        (upstream, observation, observer, received),
+                    ))
+                }
+                None => {
+                    finalize(&mut observation, observer.as_mut(), status, trust);
+                    None
+                }
+            }
+        },
+    );
+    Ok(response.body(BodyExt::boxed(StreamBody::new(stream)))?)
 }
 
 fn stream_response(upstream: reqwest::Response) -> Result<Response<Body>> {
@@ -1054,6 +1244,31 @@ async fn stop_child(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_observation_requires_identity_encoding_and_exact_sse_media_type() {
+        let mut headers = hyper::HeaderMap::new();
+        assert_eq!(observable_response(&headers), Some(false));
+        for (content_type, sse) in [
+            ("Text/Event-Stream; charset=utf-8", true),
+            (" text/event-stream ; charset=utf-8", true),
+            ("application/json", false),
+            ("text/event-streamx", false),
+        ] {
+            headers.insert("content-type", content_type.parse().unwrap());
+            assert_eq!(observable_response(&headers), Some(sse));
+            headers.insert("content-encoding", "Identity".parse().unwrap());
+            assert_eq!(observable_response(&headers), Some(sse));
+            for encoding in ["gzip", "br", "zstd", "identity, gzip"] {
+                headers.insert("content-encoding", encoding.parse().unwrap());
+                assert_eq!(observable_response(&headers), None);
+            }
+            headers.remove("content-encoding");
+        }
+        headers.append("content-encoding", "identity".parse().unwrap());
+        headers.append("content-encoding", "gzip".parse().unwrap());
+        assert_eq!(observable_response(&headers), None);
+    }
 
     fn anthropic(message: &str) -> Vec<u8> {
         json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}})
