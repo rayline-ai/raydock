@@ -682,6 +682,30 @@ fn response_failed(
     })
 }
 
+/// Close `observation` from the response's status and what `observer` saw. This
+/// is the ONE place a row's verdict is decided: the empty-body, Content-Length /
+/// terminal and EOF paths all call it, so none can apply a different policy. A
+/// non-success status is an error; otherwise a failed observer is; an
+/// observer-less (encoded) body completes on transport alone.
+fn finalize(
+    observation: &mut RequestObservation,
+    observer: Option<&mut rayline_metrics::response::ResponseObserver>,
+    status: StatusCode,
+    upstream: Upstream,
+) {
+    let failed = response_failed(observer, upstream);
+    observation.finish(
+        status.as_u16(),
+        if !status.is_success() {
+            Some("execution request refused")
+        } else if failed {
+            Some("execution response failed or incomplete")
+        } else {
+            None
+        },
+    );
+}
+
 /// Observe without changing the response bytes or pulling ahead of downstream demand.
 fn observed_response(
     upstream: reqwest::Response,
@@ -690,7 +714,7 @@ fn observed_response(
 ) -> Result<Response<Body>> {
     let status = upstream.status();
     let content_length = upstream.content_length();
-    let observer = observable_response(upstream.headers()).map(|sse| {
+    let mut observer = observable_response(upstream.headers()).map(|sse| {
         rayline_metrics::response::ResponseObserver::new(
             observation.metrics.clone(),
             observation.id.clone(),
@@ -705,12 +729,11 @@ fn observed_response(
     }
     if content_length == Some(0) || matches!(status.as_u16(), 204 | 205 | 304) {
         // Hyper may discard a known-empty body without polling it, so neither the
-        // byte-count nor the EOF branch below would run. Finalize with the real
-        // status now instead of letting the drop record a cancellation.
-        observation.finish(
-            status.as_u16(),
-            (!status.is_success()).then_some("execution request refused"),
-        );
+        // byte-count nor the EOF branch below would run. Finalize now, with the
+        // same policy as those branches: an empty event-stream has no terminal, and
+        // an empty classifier body is not JSON, so both are errors; an empty core
+        // JSON body (a trusted upstream) completes.
+        finalize(&mut observation, observer.as_mut(), status, trust);
         return Ok(response.body(
             Full::new(Bytes::new())
                 .map_err(|never| match never {})
@@ -733,17 +756,7 @@ fn observed_response(
                         .is_some_and(|observer| observer.is_terminal())
                         || content_length == Some(received)
                     {
-                        let failed = response_failed(observer.as_mut(), trust);
-                        observation.finish(
-                            status.as_u16(),
-                            if !status.is_success() {
-                                Some("execution request refused")
-                            } else if failed {
-                                Some("execution response failed or incomplete")
-                            } else {
-                                None
-                            },
-                        );
+                        finalize(&mut observation, observer.as_mut(), status, trust);
                     }
                     Some((
                         Ok::<_, io::Error>(Frame::data(bytes)),
@@ -759,17 +772,7 @@ fn observed_response(
                     ))
                 }
                 None => {
-                    let failed = response_failed(observer.as_mut(), trust);
-                    observation.finish(
-                        status.as_u16(),
-                        if !status.is_success() {
-                            Some("execution request refused")
-                        } else if failed {
-                            Some("execution response failed or incomplete")
-                        } else {
-                            None
-                        },
-                    );
+                    finalize(&mut observation, observer.as_mut(), status, trust);
                     None
                 }
             }

@@ -92,7 +92,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 pathlib.Path(config["cancelled"] + "-pending").write_text("cancelled before headers")
             return
         if self.path == "/v1/messages" and json.loads(body).get("fixture_empty_status"):
-            self.send_response(json.loads(body)["fixture_empty_status"])
+            parsed = json.loads(body)
+            self.send_response(parsed["fixture_empty_status"])
+            if parsed.get("fixture_empty_content_type"):
+                self.send_header("Content-Type", parsed["fixture_empty_content_type"])
             self.send_header("Content-Length", "0")
             self.end_headers()
             return

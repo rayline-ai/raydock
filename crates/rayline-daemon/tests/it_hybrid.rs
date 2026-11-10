@@ -416,11 +416,19 @@ async fn empty_responses_close_the_row_with_the_real_status() {
     let mut runtime = Runtime::start(1);
     let (url, token) = runtime.ready().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    for (index, (status, state)) in [(429, "error"), (200, "completed")].into_iter().enumerate() {
+    // The same policy as the Content-Length and EOF paths: a refusal is an error
+    // with its real status; an empty JSON body from the trusted core completes;
+    // an empty event-stream never reached a terminal, so it is an error.
+    let cases = [
+        (429, "application/json", "error"),
+        (200, "application/json", "completed"),
+        (200, "text/event-stream", "error"),
+    ];
+    for (index, (status, content_type, state)) in cases.into_iter().enumerate() {
         let response = client
             .post(format!("{url}/v1/messages"))
             .bearer_auth(&token)
-            .json(&json!({"fixture_empty_status": status}))
+            .json(&json!({"fixture_empty_status": status, "fixture_empty_content_type": content_type}))
             .send()
             .await
             .unwrap();
@@ -711,12 +719,17 @@ async fn session_and_branch_precedence_preserves_native_fork_identity() {
 type Recorded = (String, Vec<(String, String)>, Value);
 
 fn fake_router() -> (String, std::thread::JoinHandle<Vec<Recorded>>) {
+    fake_router_for(2)
+}
+
+/// A router stand-in that answers exactly `count` requests.
+fn fake_router_for(count: usize) -> (String, std::thread::JoinHandle<Vec<Recorded>>) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let handle = std::thread::spawn(move || {
         let mut recorded = Vec::new();
-        for _ in 0..2 {
+        for _ in 0..count {
             let (stream, _) = listener.accept().unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
@@ -742,6 +755,8 @@ fn fake_router() -> (String, std::thread::JoinHandle<Vec<Recorded>>) {
             let body: Value = serde_json::from_slice(&body).unwrap();
             let answer = if body["messages"][0]["content"] == "fixture-malformed-response" {
                 "{private-provider-response-do-not-log".to_owned()
+            } else if body["messages"][0]["content"] == "fixture-empty-response" {
+                String::new()
             } else {
                 json!({"id": "msg_cloud", "type": "message", "role": "assistant",
                 "content": [{"type": "text", "text": "<block>no</block>"}]})
@@ -759,6 +774,57 @@ fn fake_router() -> (String, std::thread::JoinHandle<Vec<Recorded>>) {
         recorded
     });
     (url, handle)
+}
+
+/// An auto-mode classifier request body whose first message is `content`.
+fn classifier_request(content: &str) -> Value {
+    json!({"model": "claude-sonnet-5", "max_tokens": 64,
+        "system": [{"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.319"},
+                   {"type": "text", "text": "You are a security monitor for autonomous AI coding agents.\n"}],
+        "messages": [{"role": "user", "content": content}]})
+}
+
+#[tokio::test]
+async fn an_empty_classifier_response_is_an_error_not_a_completed_request() {
+    // The cloud router is not trusted: an HTTP 200 with Content-Length 0 is not a
+    // JSON answer, and must not be recorded as a completed request just because
+    // hyper never polls a known-empty body.
+    let (router, recorded) = fake_router_for(1);
+    let deployments = format!(
+        r#","deployments":[{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"anthropic/claude-sonnet-5.5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
+    );
+    let mut runtime = Runtime::start_with_decisions(
+        1,
+        0,
+        120,
+        None,
+        &format!("{router}/v1/routes"),
+        &deployments,
+        Some("rlk-test-key"),
+    );
+    let (url, token) = runtime.ready().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = client
+        .post(format!("{url}/v1/messages"))
+        .bearer_auth(&token)
+        .header("anthropic-beta", "claude-code-20250219")
+        .json(&classifier_request("fixture-empty-response"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.bytes().await.unwrap().is_empty());
+    let snapshot = top_snapshot(&client, &url, &token).await;
+    assert!(snapshot["active"].as_array().unwrap().is_empty());
+    let row = &snapshot["recent"][0];
+    assert_eq!(row["state"], "error");
+    assert_eq!(row["status_code"], 200);
+    assert!(
+        !row["error"].as_str().unwrap_or_default().contains("cancel"),
+        "{row}"
+    );
+    assert_eq!(snapshot["totals"]["errored_requests"], 1);
+    recorded.join().unwrap();
 }
 
 #[tokio::test]
