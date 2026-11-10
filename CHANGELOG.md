@@ -15,7 +15,7 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   doesn't know, and the error names the setting. It can't be combined with
   `--config`, since a profile file sets its own model.
 - **`prefer_local` works with any local model.** The bundled execution core
-  (`rayline-core`, now pinned to `44cd8f1b`) counts Qwen3.8-27B prompts exactly
+  (`rayline-core`, now pinned to `0f84eba6`) counts Qwen3.8-27B prompts exactly
   and bounds other models' text prompts by their byte size (`caller_bounded`),
   so ARC can keep a turn local only when it fits the window. It no longer needs
   a llama.cpp prompt counter. This needs the production router from
@@ -35,6 +35,13 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `raydock hermes` writes into Hermes' `config.yaml` is now named `rayline`
   instead of `rayline-anth`. The next launch removes the old `rayline-anth`
   entry. The Responses provider is still `rayline-resp`.
+- **Hybrid's Claude pins use the router's own model ids.** The default
+  profile pins `claude-opus-5-5` and `claude-sonnet-5-5`, and the auto-mode
+  classifier defaults to `claude-haiku-5-5`, which the router serves directly
+  from Anthropic. Before, they pinned the `anthropic/claude-*-5.5` ids, which
+  the router sends through OpenRouter. Key `hybrid.cloud_output_tokens` by the
+  new ids: settings keyed by the old ones are refused, naming the key. The
+  bundled execution core accepts a router id as a pin's wire model.
 
 ### Fixed
 

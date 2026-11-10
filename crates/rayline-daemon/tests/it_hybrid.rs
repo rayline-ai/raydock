@@ -765,7 +765,7 @@ fn fake_router_for(count: usize) -> (String, std::thread::JoinHandle<Vec<Recorde
             let mut stream = stream;
             write!(
             stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-rayline-selected-model: anthropic/claude-sonnet-5.5\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-rayline-selected-model: claude-sonnet-5-5\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{answer}",
             answer.len()
         )
         .unwrap();
@@ -791,7 +791,7 @@ async fn an_empty_classifier_response_is_an_error_not_a_completed_request() {
     // hyper never polls a known-empty body.
     let (router, recorded) = fake_router_for(1);
     let deployments = format!(
-        r#","deployments":[{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"anthropic/claude-sonnet-5.5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
+        r#","deployments":[{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"claude-sonnet-5-5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
     );
     let mut runtime = Runtime::start_with_decisions(
         1,
@@ -831,7 +831,7 @@ async fn an_empty_classifier_response_is_an_error_not_a_completed_request() {
 async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_to_the_core() {
     let (router, recorded) = fake_router();
     let deployments = format!(
-        r#","deployments":[{{"id":"local","kind":"local","url":"http://127.0.0.1:9/v1/chat/completions","protocol":"openai.chat.v1","wire_model":"glm"}},{{"id":"cloud-opus","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"anthropic/claude-opus-5.5","auth_env":"RAYLINE_ROUTER_API_KEY"}},{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"anthropic/claude-sonnet-5.5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
+        r#","deployments":[{{"id":"local","kind":"local","url":"http://127.0.0.1:9/v1/chat/completions","protocol":"openai.chat.v1","wire_model":"glm"}},{{"id":"cloud-opus","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"claude-opus-5-5","auth_env":"RAYLINE_ROUTER_API_KEY"}},{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"claude-sonnet-5-5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
     );
     let mut runtime = Runtime::start_with_decisions(
         1,
@@ -903,12 +903,12 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
     // Claude Haiku 5.5 by default, through the cloud pins' router and key.
     assert_eq!(
         header("x-workshop-required-model"),
-        Some("anthropic/claude-haiku-5.5")
+        Some("claude-haiku-5-5")
     );
     assert_eq!(header("anthropic-beta"), Some("claude-code-20250219"));
     assert_eq!(header("x-conversation-id"), Some("session-one"));
     let mut expected = classifier.clone();
-    expected["model"] = json!("anthropic/claude-haiku-5.5");
+    expected["model"] = json!("claude-haiku-5-5");
     assert_eq!(body, expected);
 
     // A turn with tools is an ordinary turn: the core gets it unchanged.
