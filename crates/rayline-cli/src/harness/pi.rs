@@ -265,5 +265,13 @@ mod tests {
         std::fs::write(&settings, &listed).unwrap();
         super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), listed);
+        // Back on a standard key, the catalog names the contributor Swift's
+        // product, so the pick stays on Swift.
+        ctx.models = super::super::tests::hosted_models();
+        ctx.models.apply_arc_prices(&serde_json::json!({"catalog": {
+            "arc-swift-contributor-1.0": {"arc_mode": {"product": "arc-swift-1.0"}}
+        }}));
+        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+        assert_eq!(read()["defaultModel"], "arc-swift-1.0");
     }
 }

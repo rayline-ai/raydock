@@ -61,25 +61,30 @@ pub fn default_config_json(router_url: &str, main: &str, background: &str) -> Va
     })
 }
 
+/// The default config for `env_name` when the user edited it: kept as is,
+/// with no hosted models read. `None` when it is absent or still exactly a
+/// Raydock default (for whatever ids and router it was written with), which
+/// [`write_default_config`] then (re)writes.
+pub(crate) fn edited_default_config(home: &Path, env_name: &str) -> io::Result<Option<PathBuf>> {
+    let path = default_config_path_for_env(home, env_name);
+    match std::fs::read(&path) {
+        Ok(raw) => Ok((!is_unedited_default(&raw)).then_some(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Write the default config for `env_name`, pointing its cloud endpoint at
 /// `router_url` (the environment's resolved router) with the ids `models` read
-/// from that router's `/v1/models`. Runs on every default launch: an absent
-/// file, or one that is still exactly a Raydock default (for whatever ids and
-/// router it was written with), is (re)written with the current ids; a file the
-/// user edited is left untouched.
-pub(crate) fn ensure_default_config(
+/// from that router's `/v1/models`. Callers check [`edited_default_config`]
+/// first, so this only replaces an absent or unedited default.
+pub(crate) fn write_default_config(
     home: &Path,
     env_name: &str,
     router_url: &str,
     models: &crate::harness::LaunchModels,
 ) -> io::Result<PathBuf> {
     let path = default_config_path_for_env(home, env_name);
-    match std::fs::read(&path) {
-        Ok(raw) if !is_unedited_default(&raw) => return Ok(path),
-        Ok(_) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -973,9 +978,9 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_config_creates_non_engaging_file() {
+    fn default_config_creates_non_engaging_file() {
         let home = tmp_home();
-        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
+        let path = write_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
         assert!(path.exists());
         assert_eq!(path, default_config_path(&home));
         // The default file is all hosted cloud → no local router.
@@ -1019,7 +1024,7 @@ mod tests {
     fn default_codex_config_follows_routes_main() {
         // The Codex sentinel (no --model) follows routes.main (ARC Sage).
         let home = tmp_home();
-        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
+        let path = write_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
         let out = materialize_codex_config_for_local_router(&path, &home).unwrap();
         let cfg: Value = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
         let routes = &cfg["routes"]["model_routes"];
@@ -1032,7 +1037,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_default_config_keeps_a_user_edited_file() {
+    fn default_config_keeps_a_user_edited_file() {
         // A file the user changed is kept as is, even when it names a model the
         // key no longer lists, so the router's own "model not found" says what to fix.
         let home = tmp_home();
@@ -1043,19 +1048,24 @@ mod tests {
         existing["routes"]["main"]["model"] = json!("rayline-router");
         let body = serde_json::to_vec_pretty(&existing).unwrap();
         std::fs::write(&path, &body).unwrap();
-        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &contributor()).unwrap();
+        assert_eq!(
+            edited_default_config(&home, "prod").unwrap(),
+            Some(path.clone())
+        );
         assert_eq!(std::fs::read(&path).unwrap(), body);
         let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn ensure_default_config_refreshes_an_unedited_default_with_the_listed_ids() {
+    fn default_config_refreshes_an_unedited_default_with_the_listed_ids() {
         // A default written with the old hardcoded ids takes the key's listed
         // ids on the next launch.
         let home = tmp_home();
-        let path = ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
+        assert_eq!(edited_default_config(&home, "prod").unwrap(), None);
+        let path = write_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
         assert_eq!(config_main_model(&path).as_deref(), Some("arc-sage-1.0"));
-        ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &contributor()).unwrap();
+        assert_eq!(edited_default_config(&home, "prod").unwrap(), None);
+        write_default_config(&home, "prod", crate::ROUTER_PROD_URL, &contributor()).unwrap();
         assert_eq!(
             config_main_model(&path).as_deref(),
             Some("arc-sage-contributor-1.0")
@@ -1077,7 +1087,7 @@ mod tests {
         assert_eq!(resolve_config_path(Some(&flag), &home), Some(flag));
         // Default file is picked up once it exists.
         let default =
-            ensure_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
+            write_default_config(&home, "prod", crate::ROUTER_PROD_URL, &hosted()).unwrap();
         assert_eq!(resolve_config_path(None, &home), Some(default));
         let _ = std::fs::remove_dir_all(&home);
     }

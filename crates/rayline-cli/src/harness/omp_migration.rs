@@ -17,7 +17,7 @@ pub(super) fn migrate(
 ) -> io::Result<()> {
     let paths = session_paths(args, &std::env::current_dir()?);
     super::omp_roles::migrate(config_dir, models)?;
-    super::omp_sessions::migrate(config_dir, &paths)
+    super::omp_sessions::migrate(config_dir, &paths, models)
 }
 
 fn session_paths(args: &[OsString], launch_cwd: &Path) -> Vec<PathBuf> {

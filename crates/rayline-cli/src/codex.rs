@@ -158,7 +158,7 @@ fn explicit_router_key() -> Option<String> {
 /// — route main + subagents to the hosted cloud RCR (native OpenAI Responses),
 /// mirroring `raydock claude`'s route-all cloud default. We reuse the shared
 /// default config (`router_config::default_config_json`, materialized via
-/// `ensure_default_config`) and drive it through the ordinary `--config` codex
+/// `write_default_config`) and drive it through the ordinary `--config` codex
 /// path, so cloud-key provisioning ([`resolve_cloud_router_key`]) and the native
 /// materialization ([`crate::router_config::materialize_codex_config_for_local_router`])
 /// are shared, not re-implemented.
@@ -171,10 +171,10 @@ fn explicit_router_key() -> Option<String> {
 /// router is not a hosted Rayline router, is an error rather than a silent
 /// fallback to prod.
 ///
-/// The default's main and subagent ids come from `hosted_models(env, router_url)`,
-/// which on a real launch reads that router's `/v1/models` with the user's key;
-/// see [`crate::router_config::ensure_default_config`] for how an existing file
-/// is refreshed or, when the user edited it, kept.
+/// A default the user edited is used as is, with no key or models read (see
+/// [`crate::router_config::edited_default_config`]). Otherwise the default is
+/// (re)written with main and subagent ids from `hosted_models(env, router_url)`,
+/// which on a real launch reads that router's `/v1/models` with the user's key.
 ///
 /// Only the default `--auth auto` opts in. Explicit `--auth subscription` keeps
 /// the ChatGPT-subscription default, and `--auth none` keeps the local default —
@@ -205,10 +205,13 @@ where
             hosted.router_url
         )));
     }
+    if let Some(path) = crate::router_config::edited_default_config(home, &env)? {
+        return Ok(Some(path));
+    }
     let models = hosted_models(env.clone(), hosted.router_url.clone())
         .await
         .map_err(io::Error::other)?;
-    Ok(Some(crate::router_config::ensure_default_config(
+    Ok(Some(crate::router_config::write_default_config(
         home,
         &env,
         &hosted.router_url,
@@ -654,6 +657,31 @@ mod tests {
             crate::router_config::config_main_model(&path).as_deref(),
             Some(crate::ARC_SAGE_MODEL)
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[tokio::test]
+    async fn an_edited_default_is_used_without_reading_models() {
+        // A default the user edited (here, to a local-only route) launches
+        // without a key or a /v1/models read, so it works offline or logged out.
+        let home = temp_home();
+        let path = crate::router_config::default_config_path_for_env(&home, "prod");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#;
+        std::fs::write(&path, body).unwrap();
+        let resolved = resolve_codex_config_path(
+            &home,
+            None,
+            CodexAuthMode::Auto,
+            None,
+            |_env: String, _router_url: String| async {
+                Err::<crate::harness::LaunchModels, String>("models were read".to_owned())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, Some(path.clone()));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
         let _ = std::fs::remove_dir_all(&home);
     }
 

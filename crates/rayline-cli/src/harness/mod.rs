@@ -108,7 +108,7 @@ pub(crate) struct LaunchModel {
     /// same `arc-sage-1.0` for ARC Sage in every data mode. `None` for a
     /// model that is no ARC product (hybrid's virtual model).
     pub product: Option<String>,
-    /// Its row on the price card ([`LaunchModels::price_from`]), for a
+    /// Its row on the price card ([`LaunchModels::apply_arc_prices`]), for a
     /// harness that shows costs (omp); `None` when not read or not on it.
     pub price: Option<ModelPrice>,
 }
@@ -122,6 +122,10 @@ pub(crate) struct LaunchModels {
     pub background: String,
     /// Every model the provider entry lists, default first.
     pub offered: Vec<LaunchModel>,
+    /// The ARC product of each id the price card's catalog names
+    /// ([`LaunchModels::apply_arc_prices`]), mode ids included, so a saved
+    /// pick from another data mode finds its product's listed id.
+    pub products: std::collections::BTreeMap<String, String>,
 }
 
 impl LaunchModels {
@@ -180,6 +184,7 @@ impl LaunchModels {
             main,
             background,
             offered,
+            products: Default::default(),
         })
     }
 
@@ -197,13 +202,24 @@ impl LaunchModels {
                 product: None,
                 price: None,
             }],
+            products: Default::default(),
         }
     }
 
-    /// Price each offered model from a `GET /v1/arc/prices` answer, by its own
-    /// id: every data mode has its own row. A model without a complete row
-    /// gets no price.
-    pub(crate) fn price_from(&mut self, prices: &Value) {
+    /// Read a `GET /v1/arc/prices` answer: each id's product from its catalog
+    /// (`arc_mode.product`; a base id is its own product), and each offered
+    /// model's price by its own id, since every data mode has its own row. A
+    /// model without a complete row gets no price.
+    pub(crate) fn apply_arc_prices(&mut self, prices: &Value) {
+        if let Some(catalog) = prices["catalog"].as_object() {
+            self.products = catalog
+                .iter()
+                .map(|(id, entry)| {
+                    let product = entry.pointer("/arc_mode/product").and_then(Value::as_str);
+                    (id.clone(), product.unwrap_or(id).to_owned())
+                })
+                .collect();
+        }
         for model in &mut self.offered {
             let row = &prices["card"]["prices"][model.id.as_str()];
             let field = |name: &str| row.get(name).and_then(Value::as_f64);
@@ -232,17 +248,19 @@ impl LaunchModels {
     }
 
     /// What a harness's saved pick of `id` becomes: `None` while the key lists
-    /// `id`; otherwise the listed model of the product `id` names (a seeded
-    /// `arc-sage-1.0` on a contributor key is `arc-sage-contributor-1.0`),
+    /// `id`; otherwise the listed model of `id`'s product (a seeded
+    /// `arc-sage-1.0` on a contributor key is `arc-sage-contributor-1.0`, and
+    /// a saved `arc-swift-contributor-1.0` on a standard key `arc-swift-1.0`),
     /// else `default` (the retired Legacy `rayline-router`).
     pub(crate) fn stale_pick<'a>(&'a self, id: &str, default: &'a str) -> Option<&'a str> {
         if self.offered.iter().any(|model| model.id == id) {
             return None;
         }
+        let product = self.products.get(id).map_or(id, String::as_str);
         Some(
             self.offered
                 .iter()
-                .find(|model| model.product.as_deref() == Some(id))
+                .find(|model| model.product.as_deref() == Some(product))
                 .map_or(default, |model| model.id.as_str()),
         )
     }
@@ -562,11 +580,16 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
     }
 
     let mut models = fetch_hosted_models(&router_url, &key).await?;
-    if harness == Harness::Omp {
-        // omp shows each model's cost; without the card it shows none.
+    // omp shows each model's cost, and omp and pi move a saved pick from
+    // another data mode to its product's listed id: both from the price card.
+    if matches!(harness, Harness::Omp | Harness::Pi) {
         match fetch_arc_prices(&router_url).await {
-            Ok(prices) => models.price_from(&prices),
-            Err(error) => eprintln!("warning: {error}; omp shows no model costs"),
+            Ok(prices) => models.apply_arc_prices(&prices),
+            Err(error) => eprintln!(
+                "warning: {error}; {} shows no model costs, and a saved pick from another \
+                 data mode moves to its default model",
+                harness.name()
+            ),
         }
     }
     let config_dir = config_dir(&home, harness, &env_name);
@@ -1048,7 +1071,7 @@ pub(crate) mod tests {
     #[test]
     fn prices_come_from_each_ids_card_row() {
         let mut models = LaunchModels::from_listing(&listing(Some("contributor"))).unwrap();
-        models.price_from(&json!({"card": {"prices": {
+        models.apply_arc_prices(&json!({"card": {"prices": {
             "arc-sage-contributor-1.0": {
                 "input": 0.5, "output": 2.5, "cache_read": 0.025, "cache_write": 0.625
             },
