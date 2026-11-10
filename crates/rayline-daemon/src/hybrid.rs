@@ -632,6 +632,9 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
         "401" | "403" => Some(DecisionsFailure::Auth),
         "502" | "503" | "504" => Some(DecisionsFailure::Unavailable),
         "429" => Some(DecisionsFailure::Throttled),
+        // A timeout or a conflict may clear on a resend: pass the core's 502
+        // through as before.
+        "408" | "409" => None,
         code if code.starts_with('4') => Some(DecisionsFailure::Refused),
         _ => None,
     }
@@ -932,6 +935,8 @@ mod tests {
             }
             for message in [
                 "Decisions request refused (HTTP 500)",
+                "Decisions request refused (HTTP 408)",
+                "Decisions request refused (HTTP 409, code conflict)",
                 "selected endpoint request failed",
             ] {
                 assert_eq!(decisions_failure(&encode(message)), None, "{message}");
