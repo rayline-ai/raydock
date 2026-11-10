@@ -20,7 +20,7 @@
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, json_file, model_display_name};
+use super::{CONV_ID_ENV, Plan, ROUTER_MODEL, RenderContext, json_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 /// Runtime override for [`allow_empty_signature`]: `1` or `0`.
@@ -45,19 +45,19 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     if ctx.allow_empty_signature {
         compat["allowEmptySignature"] = json!(true);
     }
-    let launch = ctx.models();
+    let launch = &ctx.models;
     let entries: Vec<_> = launch
         .offered
         .iter()
         .map(|model| {
             json!({
-                "id": model,
-                "name": model_display_name(model),
+                "id": model.id,
+                "name": model.display_name,
                 // ARC selects thinking effort; clients must not expose controls.
                 "reasoning": ctx.capabilities.is_some(),
                 "input": ctx.input_modalities(),
-                "contextWindow": ctx.context_window(),
-                "maxTokens": ctx.max_output_tokens(model)
+                "contextWindow": model.context_window,
+                "maxTokens": model.max_output_tokens
             })
         })
         .collect();
@@ -80,17 +80,20 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             "defaultModel": model
         })
     };
-    let mut settings_file = json_file("settings.json", &settings(launch.main), false);
-    // Hosted catalogs no longer list Legacy. Move an existing Rayline Legacy
-    // selection to Sage, retaining every other Pi setting a user saved.
+    let mut settings_file = json_file("settings.json", &settings(&launch.main), false);
+    // Move a saved Rayline pick the key does not list (the retired Legacy, or
+    // an ARC id from before the key's data mode) to its listed model,
+    // retaining every other Pi setting a user saved.
     if launch.main != ROUTER_MODEL {
         let path = ctx.config_dir.join("settings.json");
         if let Ok(existing) = std::fs::read_to_string(&path)
             && let Ok(mut saved) = serde_json::from_str::<serde_json::Value>(&existing)
             && saved["defaultProvider"] == PROVIDER_ID
-            && saved["defaultModel"] == LEGACY_MODEL
+            && let Some(pick) = saved["defaultModel"]
+                .as_str()
+                .and_then(|id| launch.stale_pick(id, &launch.main))
         {
-            saved["defaultModel"] = json!(launch.main);
+            saved["defaultModel"] = json!(pick);
             settings_file = json_file("settings.json", &saved, true);
             settings_file.merged_from = Some(existing);
         } else {
@@ -121,6 +124,7 @@ mod tests {
             allow_empty_signature: allow,
             capabilities: None,
             harness_major_version: None,
+            models: super::super::tests::hosted_models(),
         };
         super::super::write_files(dir, &super::plan(&ctx).files).unwrap();
         serde_json::from_str(&std::fs::read_to_string(dir.join("models.json")).unwrap()).unwrap()
@@ -226,5 +230,48 @@ mod tests {
         std::fs::write(&settings, other).unwrap();
         super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), other);
+    }
+
+    #[test]
+    fn a_pick_the_key_does_not_list_moves_to_its_listed_model() {
+        let dir = super::super::tests::temp_dir("pi-contributor");
+        let mut ctx = super::super::tests::render_context(&dir);
+        ctx.models = super::super::LaunchModels::from_listing(&super::super::tests::listing(Some(
+            "contributor",
+        )))
+        .unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let settings = dir.join("settings.json");
+        let pick = |model: &str| {
+            format!(
+                "{{\n  \"defaultProvider\": \"rayline\",\n  \"defaultModel\": \"{model}\",\n  \"theme\": \"dark\"\n}}\n"
+            )
+        };
+        let read = || -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap()
+        };
+        for (saved, migrated) in [
+            ("arc-swift-1.0", "arc-swift-contributor-1.0"),
+            ("arc-sage-1.0", "arc-sage-contributor-1.0"),
+            ("rayline-router", "arc-sage-contributor-1.0"),
+        ] {
+            std::fs::write(&settings, pick(saved)).unwrap();
+            super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+            assert_eq!(read()["defaultModel"], migrated, "{saved}");
+            assert_eq!(read()["theme"], "dark");
+        }
+        // A listed pick stays the user's choice.
+        let listed = pick("arc-swift-contributor-1.0");
+        std::fs::write(&settings, &listed).unwrap();
+        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), listed);
+        // Back on a standard key, the catalog names the contributor Swift's
+        // product, so the pick stays on Swift.
+        ctx.models = super::super::tests::hosted_models();
+        ctx.models.apply_arc_prices(&serde_json::json!({"catalog": {
+            "arc-swift-contributor-1.0": {"arc_mode": {"product": "arc-swift-1.0"}}
+        }}));
+        super::super::write_files(&dir, &super::plan(&ctx).files).unwrap();
+        assert_eq!(read()["defaultModel"], "arc-swift-1.0");
     }
 }

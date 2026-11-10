@@ -35,7 +35,7 @@ use std::ffi::OsString;
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, json_file, model_display_name};
+use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, json_file};
 
 pub(crate) const CONFIG_FILE: &str = "openclaw.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -114,20 +114,20 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let conv_ref = format!("${{{CONV_ID_ENV}}}");
     // Both wires carry OpenClaw's session id (see the module docs).
     let headers = ctx.conversation_headers(&conv_ref);
-    let launch = ctx.models();
+    let launch = &ctx.models;
     let models = |compat: serde_json::Value| {
         launch
             .offered
             .iter()
             .map(|model| {
                 json!({
-                    "id": model,
-                    "name": model_display_name(model),
+                    "id": model.id,
+                    "name": model.display_name,
                     // ARC selects thinking effort; clients must not expose controls.
                     "reasoning": ctx.capabilities.is_some(),
                     "input": ctx.input_modalities(),
-                    "contextWindow": ctx.context_window(),
-                    "maxTokens": ctx.max_output_tokens(model),
+                    "contextWindow": model.context_window,
+                    "maxTokens": model.max_output_tokens,
                     "compat": compat
                 })
             })

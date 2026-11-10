@@ -10,10 +10,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// Only the hosted launcher calls this; hybrid owns a different provider contract.
-pub(super) fn migrate(config_dir: &Path, args: &[OsString]) -> io::Result<()> {
+pub(super) fn migrate(
+    config_dir: &Path,
+    args: &[OsString],
+    models: &super::LaunchModels,
+) -> io::Result<()> {
     let paths = session_paths(args, &std::env::current_dir()?);
-    super::omp_roles::migrate(config_dir)?;
-    super::omp_sessions::migrate(config_dir, &paths)
+    super::omp_roles::migrate(config_dir, models)?;
+    super::omp_sessions::migrate(config_dir, &paths, models)
 }
 
 fn session_paths(args: &[OsString], launch_cwd: &Path) -> Vec<PathBuf> {

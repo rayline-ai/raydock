@@ -1,5 +1,5 @@
 //! Hosted-only migration of persisted selections, never historical served models.
-use super::omp_migration;
+use super::{LaunchModels, omp_migration};
 use serde_json::{Value, json};
 #[cfg(any(windows, test))]
 use std::fs::OpenOptions;
@@ -11,8 +11,6 @@ use std::{
 };
 
 const LEGACY: &str = "rayline/rayline-router";
-const SAGE: &str = "rayline/arc-sage-1.0";
-const SWIFT: &str = "rayline/arc-swift-1.0";
 
 fn invalid(message: &str) -> io::Error {
     io::Error::other(format!(
@@ -20,12 +18,17 @@ fn invalid(message: &str) -> io::Error {
     ))
 }
 
-/// `extra_paths` are explicit CLI session files or session directories.
-pub(super) fn migrate(config_dir: &Path, extra_paths: &[PathBuf]) -> io::Result<()> {
+/// `extra_paths` are explicit CLI session files or session directories. A
+/// Legacy selection moves to the key's listed ARC Sage (`smol`: ARC Swift).
+pub(super) fn migrate(
+    config_dir: &Path,
+    extra_paths: &[PathBuf],
+    models: &LaunchModels,
+) -> io::Result<()> {
     #[cfg(unix)]
     {
         if let Some(root) = managed_root(config_dir)? {
-            visit(&directory(&root)?, &root)?;
+            visit(&directory(&root)?, &root, models)?;
         }
         for path in extra_paths {
             let metadata = match fs::symlink_metadata(path) {
@@ -35,7 +38,7 @@ pub(super) fn migrate(config_dir: &Path, extra_paths: &[PathBuf]) -> io::Result<
             };
             if metadata.is_dir() {
                 let root = fs::canonicalize(path)?;
-                visit(&directory(&root)?, &root)?;
+                visit(&directory(&root)?, &root, models)?;
                 continue;
             }
             let parent = path
@@ -46,14 +49,14 @@ pub(super) fn migrate(config_dir: &Path, extra_paths: &[PathBuf]) -> io::Result<
             let name = path
                 .file_name()
                 .ok_or_else(|| invalid("session path has no filename"))?;
-            migrate_file(&parent.join(name), &parent.join(name), &dir)?;
+            migrate_file(&parent.join(name), &parent.join(name), &dir, models)?;
         }
         Ok(())
     }
     #[cfg(windows)]
     {
         if let Some(root) = managed_root(config_dir)? {
-            visit_windows(&WindowsDirectory::open(&root)?)?;
+            visit_windows(&WindowsDirectory::open(&root)?, models)?;
         }
         for path in extra_paths {
             let metadata = match fs::symlink_metadata(path) {
@@ -62,7 +65,7 @@ pub(super) fn migrate(config_dir: &Path, extra_paths: &[PathBuf]) -> io::Result<
                 Err(error) => return Err(error),
             };
             if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                visit_windows(&WindowsDirectory::open(&fs::canonicalize(path)?)?)?;
+                visit_windows(&WindowsDirectory::open(&fs::canonicalize(path)?)?, models)?;
             } else {
                 let parent = fs::canonicalize(
                     path.parent()
@@ -73,7 +76,7 @@ pub(super) fn migrate(config_dir: &Path, extra_paths: &[PathBuf]) -> io::Result<
                     path.file_name()
                         .ok_or_else(|| invalid("session path has no filename"))?,
                 );
-                migrate_file(&leaf, &leaf)?;
+                migrate_file(&leaf, &leaf, models)?;
             }
         }
         Ok(())
@@ -210,7 +213,7 @@ impl WindowsDirectory {
 }
 
 #[cfg(windows)]
-fn visit_windows(dir: &WindowsDirectory) -> io::Result<()> {
+fn visit_windows(dir: &WindowsDirectory, models: &LaunchModels) -> io::Result<()> {
     use std::os::windows::fs::MetadataExt;
     for entry in fs::read_dir(&dir.path)? {
         let entry = entry?;
@@ -226,9 +229,9 @@ fn visit_windows(dir: &WindowsDirectory) -> io::Result<()> {
             if fs::symlink_metadata(dir.path.join(journal_name)).is_ok() {
                 continue;
             }
-            visit_windows(&WindowsDirectory::open(&entry.path())?)?;
+            visit_windows(&WindowsDirectory::open(&entry.path())?, models)?;
         } else if metadata.is_file() && entry.path().extension().is_some_and(|ext| ext == "jsonl") {
-            migrate_file(&entry.path(), &entry.path())?;
+            migrate_file(&entry.path(), &entry.path(), models)?;
         }
     }
     Ok(())
@@ -363,7 +366,7 @@ fn directory_names(dir: &File) -> io::Result<Vec<std::ffi::OsString>> {
 }
 
 #[cfg(unix)]
-fn visit(dir: &File, actual: &Path) -> io::Result<()> {
+fn visit(dir: &File, actual: &Path, models: &LaunchModels) -> io::Result<()> {
     for name in directory_names(dir)? {
         let kind = relative_kind(dir, &name)?;
         if kind == libc::S_IFLNK {
@@ -378,14 +381,14 @@ fn visit(dir: &File, actual: &Path) -> io::Result<()> {
                 Err(error) => return Err(error),
             }
             let child = open_relative(dir, &name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            visit(&child, &actual.join(&name))?;
+            visit(&child, &actual.join(&name), models)?;
         } else if kind == libc::S_IFREG
             && Path::new(&name)
                 .extension()
                 .is_some_and(|ext| ext == "jsonl")
         {
             let path = actual.join(&name);
-            migrate_file(&path, &path, dir)?;
+            migrate_file(&path, &path, dir, models)?;
         }
     }
     Ok(())
@@ -407,7 +410,9 @@ struct Plan {
     insertions: HashMap<usize, Value>,
 }
 
-fn plan(file: &File) -> io::Result<Plan> {
+fn plan(file: &File, models: &LaunchModels) -> io::Result<Plan> {
+    let sage = format!("rayline/{}", models.main);
+    let swift = format!("rayline/{}", models.background);
     let mut replacements = HashMap::new();
     let mut nodes: HashMap<String, Node> = HashMap::new();
     let mut parents = HashSet::new();
@@ -485,7 +490,7 @@ fn plan(file: &File) -> io::Result<Plan> {
             }
             if legacy {
                 target = true;
-                let model = if role == "smol" { SWIFT } else { SAGE };
+                let model = if role == "smol" { &swift } else { &sage };
                 value["model"] = json!(model);
                 if old_form {
                     value["modelId"] = json!(model.strip_prefix("rayline/").unwrap());
@@ -538,7 +543,7 @@ fn plan(file: &File) -> io::Result<Plan> {
     }
     if version < 2 && old_state.legacy {
         if let Some((line, timestamp)) = old_last {
-            insertions.insert(line, json!({"type":"model_change", "model":SAGE, "role":"default", "timestamp":timestamp}));
+            insertions.insert(line, json!({"type":"model_change", "model":sage, "role":"default", "timestamp":timestamp}));
         }
     } else {
         for (id, node) in &nodes {
@@ -550,7 +555,7 @@ fn plan(file: &File) -> io::Result<Plan> {
                 insertions.insert(
                     node.line,
                     json!({"type":"model_change", "id":new_id, "parentId":id,
-                    "timestamp":node.timestamp, "model":SAGE, "role":"default"}),
+                    "timestamp":node.timestamp, "model":sage, "role":"default"}),
                 );
             }
         }
@@ -563,7 +568,12 @@ fn plan(file: &File) -> io::Result<Plan> {
 }
 
 #[cfg(any(unix, windows))]
-fn migrate_file(path: &Path, actual: &Path, #[cfg(unix)] dir: &File) -> io::Result<()> {
+fn migrate_file(
+    path: &Path,
+    actual: &Path,
+    #[cfg(unix)] dir: &File,
+    models: &LaunchModels,
+) -> io::Result<()> {
     #[cfg(unix)]
     let name = path
         .file_name()
@@ -579,7 +589,7 @@ fn migrate_file(path: &Path, actual: &Path, #[cfg(unix)] dir: &File) -> io::Resu
         return Ok(());
     }
     source.file.rewind()?;
-    let plan = plan(&source.file)?;
+    let plan = plan(&source.file, models)?;
     if plan.replacements.is_empty() && plan.insertions.is_empty() {
         return Ok(());
     }
@@ -893,6 +903,9 @@ fn native_lock(path: &Path) -> io::Result<NativeLock> {
 mod tests {
     use super::*;
 
+    const SAGE: &str = "rayline/arc-sage-1.0";
+    const SWIFT: &str = "rayline/arc-swift-1.0";
+
     fn journal(entries: &[Value]) -> (PathBuf, PathBuf) {
         let root = fs::canonicalize(super::super::tests::temp_dir("omp-sessions")).unwrap();
         let sessions = root.join("sessions/project");
@@ -979,7 +992,7 @@ mod tests {
             .unwrap()
             .set_modified(recent_time)
             .unwrap();
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         assert_eq!(fs::metadata(&old).unwrap().modified().unwrap(), old_time);
         assert_eq!(
             fs::metadata(&recent).unwrap().modified().unwrap(),
@@ -1015,7 +1028,7 @@ mod tests {
             "content":[{"type":"text","text":"private prompt result"}], "usage":{"input":123}});
         entries.push(assistant.clone());
         let (root, path) = journal(&entries);
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         let migrated = read(&path);
         let models = resumed(&migrated, "f");
         assert_eq!(models["default"], SAGE);
@@ -1031,7 +1044,7 @@ mod tests {
         }
         assert_eq!(migrated[0]["parentSession"], "/old/session.jsonl");
         let once = fs::read(&path).unwrap();
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         assert_eq!(once, fs::read(&path).unwrap());
     }
 
@@ -1044,7 +1057,7 @@ mod tests {
         other["model"] = json!("other/model");
         let (root, path) = journal(&[assistant.clone(), other.clone()]);
         let before = fs::read_to_string(&path).unwrap();
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         let entries = read(&path);
         assert_eq!(&entries[1], &assistant);
         assert_eq!(&entries[3], &other);
@@ -1058,7 +1071,7 @@ mod tests {
         for line in before.lines() {
             assert!(after.lines().any(|new| new == line));
         }
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         assert_eq!(after, fs::read_to_string(&path).unwrap());
     }
 
@@ -1072,7 +1085,7 @@ mod tests {
         let (root, path) = journal(&[assistant]);
         let before = fs::read(&path).unwrap();
         let inode = fs::metadata(&path).unwrap().ino();
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         assert_eq!(before, fs::read(&path).unwrap());
         assert_eq!(inode, fs::metadata(&path).unwrap().ino());
     }
@@ -1091,7 +1104,9 @@ mod tests {
                 .write_all(suffix.as_bytes())
                 .unwrap();
             let before = fs::read(&path).unwrap();
-            let error = migrate(&root, &[]).unwrap_err().to_string();
+            let error = migrate(&root, &[], &super::super::tests::hosted_models())
+                .unwrap_err()
+                .to_string();
             assert!(!error.contains("private"));
             assert_eq!(before, fs::read(&path).unwrap());
         }
@@ -1105,11 +1120,11 @@ mod tests {
         let original = fs::read(&path).unwrap();
         let link = root.join("sessions/linked.jsonl");
         symlink(&path, &link).unwrap();
-        assert!(migrate(&root, &[]).is_err());
+        assert!(migrate(&root, &[], &super::super::tests::hosted_models()).is_err());
         assert_eq!(original, fs::read(&path).unwrap());
         fs::remove_file(link).unwrap();
         symlink(path.parent().unwrap(), root.join("sessions/linked-dir")).unwrap();
-        assert!(migrate(&root, &[]).is_err());
+        assert!(migrate(&root, &[], &super::super::tests::hosted_models()).is_err());
     }
 
     #[test]
@@ -1142,14 +1157,14 @@ mod tests {
             });
         let lease =
             native_lock(&std::path::absolute(owners.join(format!("{id}.lock"))).unwrap()).unwrap();
-        assert!(migrate(&root, &[]).is_err());
+        assert!(migrate(&root, &[], &super::super::tests::hosted_models()).is_err());
         assert_eq!(before, fs::read(&path).unwrap());
         drop(lease);
         let gate = native_lock(&path.with_file_name(".history.jsonl.lock.os")).unwrap();
-        assert!(migrate(&root, &[]).is_err());
+        assert!(migrate(&root, &[], &super::super::tests::hosted_models()).is_err());
         assert_eq!(before, fs::read(&path).unwrap());
         drop(gate);
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
     }
 
     #[test]
@@ -1161,10 +1176,38 @@ mod tests {
         let (root, path) = journal(&[selection]);
         let empty = root.join("different-config");
         fs::create_dir(&empty).unwrap();
-        migrate(&empty, &[path.clone()]).unwrap();
+        migrate(
+            &empty,
+            &[path.clone()],
+            &super::super::tests::hosted_models(),
+        )
+        .unwrap();
         assert_eq!(read(&path)[1]["model"], SWIFT);
         assert_eq!(read(&path)[1]["modelId"], "arc-swift-1.0");
-        migrate(&empty, &[path.parent().unwrap().to_owned()]).unwrap();
+        migrate(
+            &empty,
+            &[path.parent().unwrap().to_owned()],
+            &super::super::tests::hosted_models(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn legacy_selections_move_to_the_keys_listed_ids() {
+        let contributor = super::super::LaunchModels::from_listing(&super::super::tests::listing(
+            Some("contributor"),
+        ))
+        .unwrap();
+        let mut default = entry("a", None, "model_change");
+        default["model"] = json!(LEGACY);
+        let mut smol = entry("b", Some("a"), "model_change");
+        smol["model"] = json!(LEGACY);
+        smol["role"] = json!("smol");
+        let (root, path) = journal(&[default, smol]);
+        migrate(&root, &[], &contributor).unwrap();
+        let migrated = read(&path);
+        assert_eq!(migrated[1]["model"], "rayline/arc-sage-contributor-1.0");
+        assert_eq!(migrated[2]["model"], "rayline/arc-swift-contributor-1.0");
     }
 
     #[test]
@@ -1173,7 +1216,7 @@ mod tests {
         selection["model"] = json!(LEGACY);
         let (_root, path) = journal(&[selection]);
         let source = omp_migration::open(&path).unwrap().unwrap();
-        let planned = plan(&source.file).unwrap();
+        let planned = plan(&source.file, &super::super::tests::hosted_models()).unwrap();
         assert!(!planned.replacements.is_empty());
         let before = fs::read(&path).unwrap();
         let appended = b"{\"type\":\"custom\",\"id\":\"b\",\"parentId\":\"a\",\"timestamp\":\"now\",\"data\":\"private\"}\n";
@@ -1201,7 +1244,7 @@ mod tests {
             "not a session or even JSON",
         )
         .unwrap();
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
     }
 
     #[test]
@@ -1219,13 +1262,13 @@ mod tests {
             writeln!(out, "{record}").unwrap();
         }
         drop(out);
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         let migrated = read(&path);
         assert_eq!(&migrated[..2], &records);
         assert_eq!(migrated[2]["model"], SAGE);
         // omp's v1 migration assigns sequential ids/parents to every entry.
         let once = fs::read(&path).unwrap();
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         assert_eq!(once, fs::read(&path).unwrap());
     }
 
@@ -1244,7 +1287,7 @@ mod tests {
                 .write_all(suffix.as_bytes())
                 .unwrap();
             let before = fs::read(&path).unwrap();
-            migrate(&root, &[]).unwrap();
+            migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
             assert_eq!(before, fs::read(&path).unwrap());
         }
     }
@@ -1258,7 +1301,7 @@ mod tests {
             .unwrap()
             .replace("rayline-router", r"rayline\u002drouter");
         fs::write(&path, escaped).unwrap();
-        migrate(&root, &[]).unwrap();
+        migrate(&root, &[], &super::super::tests::hosted_models()).unwrap();
         assert_eq!(read(&path)[1]["model"], SAGE);
     }
 
@@ -1271,7 +1314,7 @@ mod tests {
         let outside = root.join("outside");
         fs::rename(root.join("sessions"), &outside).unwrap();
         symlink(&outside, root.join("sessions")).unwrap();
-        assert!(migrate(&root, &[]).is_err());
+        assert!(migrate(&root, &[], &super::super::tests::hosted_models()).is_err());
         assert_eq!(
             before,
             fs::read(outside.join("project/history.jsonl")).unwrap()

@@ -49,7 +49,11 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
         request.config_path.take(),
         request.auth_mode,
         request.env_name.as_deref(),
-    ) {
+        request.auth_token.as_deref(),
+        request.root_env_explicit,
+    )
+    .await
+    {
         Ok(path) => request.config_path = path,
         Err(error) => {
             eprintln!("Error: failed to prepare the default Raydock Codex config: {error}");
