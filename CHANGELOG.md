@@ -103,6 +103,17 @@ inference stays on your machine. For fully local use, run
 `raydock claude --local` with a fully local config. See
 `docs/hybrid-local-setup.md`, "What leaves your machine".
 
+### Known issue
+
+- **Claude Code turns on a local Qwen3.8-27B served by llama.cpp fail.**
+  When ARC keeps a Claude Code turn on local Qwen, llama.cpp's Qwen chat
+  template refuses the request (`System message must be at the beginning`),
+  and Claude Code stops after its retries. This doesn't depend on
+  `prefer_local`. Other harnesses, such as pi, are not affected. Until the
+  fix ([#196](https://github.com/rayline-ai/raydock/issues/196)), serve
+  another local model such as GLM-5.3-Flash for Claude Code, or run Claude
+  Code without hybrid mode.
+
 ## 0.4.2 (2026-11-07)
 
 ### New
