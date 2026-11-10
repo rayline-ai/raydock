@@ -100,7 +100,8 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
    Claude Code's opening request alone is about 110,000 tokens for a model
    other than Qwen3.8-27B, and the window must also hold the answer (up to
    32,000 tokens), so give such a model at least 262,144 tokens, or every
-   Claude Code turn goes to cloud.
+   Claude Code turn goes to cloud. `start` warns when the window is too
+   small for it.
 
    Set the window yourself with `"hybrid": {"local_context_window": 262144}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
