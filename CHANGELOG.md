@@ -62,10 +62,11 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   of a 502 it resent about ten times. When the service is unavailable or busy,
   `rld` resends the turn once, after the service's `retry-after` (only if it
   asks for 30 seconds or less, and never when it sends
-  `x-should-retry: false`), and then reports HTTP 503 or 429. Every such error
-  carries `x-should-retry: false`, so the harness SDK doesn't resend it again,
-  and a retryable one carries `retry-after`. A turn now reaches the routing
-  service at most twice.
+  `x-should-retry: false`; about 5 seconds, randomly varied, when it names no
+  wait), and then reports HTTP 503 or 429. Every such error carries
+  `x-should-retry: false`, so the harness SDK doesn't resend it again, and a
+  retryable one carries `retry-after`. A failed turn is now sent at most twice
+  instead of about ten times.
 
 ### Note
 
