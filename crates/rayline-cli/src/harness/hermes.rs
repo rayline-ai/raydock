@@ -33,7 +33,7 @@
 //! earlier launch sends the literal `${RAYLINE_CONV_ID}` instead, which the
 //! router then keys every such launch on. One Hermes call skips
 //! the affinity merge: the summary it requests on reaching its iteration cap,
-//! on Messages only. Under hybrid on `--provider rayline-anth` the core
+//! on Messages only. Under hybrid on `--provider rayline` the core
 //! refuses that call and Hermes reports the cap with no summary.
 //!
 //! The `rayline-resp` provider (`--provider rayline-resp`, the default under
@@ -62,7 +62,9 @@ use serde_json::json;
 use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, to_yaml, yaml_merge};
 
 pub(crate) const CONFIG_FILE: &str = "config.yaml";
-pub(crate) const MESSAGES_PROVIDER: &str = "rayline-anth";
+pub(crate) const MESSAGES_PROVIDER: &str = "rayline";
+/// The Messages provider's name before 0.4.3, removed from existing configs.
+const LEGACY_MESSAGES_PROVIDER: &str = "rayline-anth";
 pub(crate) const RESPONSES_PROVIDER: &str = "rayline-resp";
 /// Hermes' per-provider key naming the header its conversation id rides on.
 pub(crate) const SESSION_AFFINITY_KEY: &str = "session_affinity_header";
@@ -71,13 +73,15 @@ pub(crate) const PROMPT_CACHING_KEY: &str = "prompt_caching";
 
 /// The keys Rayline sets in `config.yaml`. `fallback_providers` stays empty
 /// and the legacy `fallback_model` is removed, so a failed turn never moves
-/// off the router.
+/// off the router. The Messages provider's old name is removed too, so an
+/// existing config lists it once, as `rayline`.
 const OWNED: &[&[&str]] = &[
     &["model", "provider"],
     &["model", "default"],
     &["model", "context_length"],
     &["providers", MESSAGES_PROVIDER],
     &["providers", RESPONSES_PROVIDER],
+    &["providers", LEGACY_MESSAGES_PROVIDER],
     &["fallback_providers"],
     &["fallback_model"],
 ];
@@ -313,6 +317,8 @@ mod tests {
         );
     }
 
+    /// The seed holds the Messages provider under its pre-0.4.3 name
+    /// (`rayline-anth`); the launch removes it and writes `rayline`.
     #[test]
     fn relaunch_keeps_user_settings_and_is_idempotent() {
         use super::super::tests::{TEST_URL, temp_dir};
@@ -369,11 +375,13 @@ fallback_model:
             first,
             "model:
   default: \"arc-sage-1.0\"
-  provider: \"custom:rayline-anth\"
+  provider: \"custom:rayline\"
   reasoning_effort: high
   context_length: 1000000
 providers:
-  rayline-anth:
+  mine:
+    base_url: https://mine.example
+  rayline:
     api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
     base_url: \"https://api-dev.rayline.ai\"
@@ -385,8 +393,6 @@ providers:
         context_length: 1000000
         prompt_caching: true
     session_affinity_header: \"x-session-affinity\"
-  mine:
-    base_url: https://mine.example
   rayline-resp:
     api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
@@ -446,9 +452,9 @@ fallback_providers: []
 model:
   context_length: 1000000
   default: \"arc-sage-1.0\"
-  provider: \"custom:rayline-anth\"
+  provider: \"custom:rayline\"
 providers:
-  rayline-anth:
+  rayline:
     api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
     base_url: \"https://api-dev.rayline.ai\"

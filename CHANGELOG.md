@@ -29,6 +29,13 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   checks, which a turn served by the local model can't answer. Without it,
   every checked action in auto mode was denied.
 
+### Changed
+
+- **Hermes lists Rayline as `custom:rayline`.** The Messages provider that
+  `raydock hermes` writes into Hermes' `config.yaml` is now named `rayline`
+  instead of `rayline-anth`. The next launch removes the old `rayline-anth`
+  entry. The Responses provider is still `rayline-resp`.
+
 ### Fixed
 
 - **`hybrid start` warns when the local window cannot hold Claude Code's
