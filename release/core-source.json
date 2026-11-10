@@ -1,6 +1,6 @@
 {
   "repository": "atlasfutures/semantic-router",
-  "commit": "dbde74c0250390dec071b60271b0f0a18a9ea11e",
+  "commit": "e71fa0aedcdd90a4f41dc15d14e479634f20b317",
   "go_version": "1.27.3",
   "contract_version": 1,
   "min_macos": "13.0"
