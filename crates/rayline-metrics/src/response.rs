@@ -1,17 +1,25 @@
 //! Bounded, passive response observation for Anthropic Messages, OpenAI Chat,
 //! and OpenAI Responses. Feed decoded HTTP body bytes (not compressed bytes).
-//! The caller owns request start/completion and transport errors. `finish`
-//! reports definite in-band failure or a stream without a terminal marker.
-//! Invalid/oversized data only makes telemetry unavailable, not inference failed.
-//! Buffered JSON never emits FirstToken: body completion is not token arrival.
-//! No error text, response models, or lifecycle updates are recorded.
+//! The caller owns request start/completion and transport errors. No error
+//! text, response models, or lifecycle updates are recorded, and buffered JSON
+//! never emits FirstToken: body completion is not token arrival.
 //!
-//! SSE is observed in two layers. The framing layer decides the stream verdict
-//! (terminal success, definite failure, `[DONE]`) from each frame's small
-//! `event:` name and `data: [DONE]` line, at every frame boundary, whether or
-//! not the frame's payload fit the bound or parsed. The payload layer extracts
-//! usage, first token and in-payload failure signals on a best-effort basis; a
-//! payload that is oversized, too deep or malformed only costs that telemetry.
+//! SSE is parsed to the `text/event-stream` spec by `SseParser`, whose events
+//! do not depend on chunking. The stream verdict has one authority: each
+//! dispatched event's type (`error`, `response.failed` and
+//! `response.incomplete` fail it; `message_stop` and `response.completed`
+//! succeed) or an exact `[DONE]` datum. The payload may only add a failure
+//! (`error` object, failed/incomplete status or failure `type`) and supply
+//! usage and first-token telemetry; it never signals success, and an
+//! oversized or unparseable payload costs only telemetry. A stream that ends
+//! without a terminal, or in a half-received event, is incomplete.
+//!
+//! A buffered body is parsed with plain serde_json when `finish` runs. An
+//! unparseable body, including valid JSON nested past serde_json's depth
+//! limit, is `Invalid`, which is not itself an inference failure: only a
+//! definite in-band failure makes `finish` report one. Callers that trust the
+//! producer to be well formed may ignore `Invalid`; callers that do not may
+//! treat it as an error.
 
 #[cfg(test)]
 #[path = "response_tests.rs"]
@@ -19,24 +27,21 @@ mod tests;
 
 use serde_json::Value;
 
+use crate::sse::SseParser;
 use crate::{MetricsUpdate, SharedMetricsSink};
 
-/// Maximum JSON body or SSE frame scratch size. Oversized SSE frames are
-/// discarded through their blank-line delimiter; subsequent frames still work.
+/// Maximum buffered JSON body or SSE event data size. Larger SSE events are
+/// still dispatched, with their data unavailable; larger JSON is unavailable.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
-
-/// Longest SSE `event:` name kept; a longer name cannot be a known event.
-const MAX_EVENT_NAME: usize = 64;
-/// Bytes of each SSE line kept to recognize `event:` / `data: [DONE]` lines
-/// (prefix, one optional space and the longest name or marker).
-const LINE_HEAD_MAX: usize = "event: ".len() + MAX_EVENT_NAME;
 
 /// Response classification independent of transport completion and telemetry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResponseValidity {
-    /// A recognized protocol response, or successful SSE terminal marker.
+    /// A recognized protocol response, or an SSE stream with a success terminal.
     Valid,
-    /// Malformed bounded JSON, definite failure, or finalized unterminated SSE.
+    /// A buffered body serde_json cannot parse (valid JSON nested too deeply
+    /// included), a definite in-band failure, or a finished SSE stream without
+    /// a success terminal.
     Invalid,
     /// Not yet finalized, oversized JSON, or an unrecognized JSON shape.
     Unavailable,
@@ -46,17 +51,10 @@ pub struct ResponseObserver {
     sink: SharedMetricsSink,
     request_id: String,
     sse: bool,
-    scratch: Vec<u8>,
-    skipping: bool,
-    line_nonempty: bool,
-    after_cr: bool,
-    // Framing layer: per-line head and per-frame event/[DONE] state, kept
-    // independently of the payload scratch bound.
-    line_head: Vec<u8>,
-    line_len: usize,
-    event: String,
-    data_lines: usize,
-    done_line: bool,
+    parser: SseParser,
+    /// Buffered JSON body; dropped (and `oversized` set) past the bound.
+    body: Vec<u8>,
+    oversized: bool,
     terminal: bool,
     failed: bool,
     first_token: bool,
@@ -73,15 +71,9 @@ impl ResponseObserver {
             sink,
             request_id,
             sse,
-            scratch: Vec::new(),
-            skipping: false,
-            line_nonempty: false,
-            after_cr: false,
-            line_head: Vec::new(),
-            line_len: 0,
-            event: String::new(),
-            data_lines: 0,
-            done_line: false,
+            parser: SseParser::new(),
+            body: Vec::new(),
+            oversized: false,
             terminal: false,
             failed: false,
             first_token: false,
@@ -99,52 +91,21 @@ impl ResponseObserver {
         if self.finished {
             return;
         }
-        if !self.sse {
-            if !self.skipping {
-                if bytes.len() > MAX_RESPONSE_BYTES.saturating_sub(self.scratch.len()) {
-                    self.scratch.clear();
-                    self.skipping = true;
-                } else {
-                    self.scratch.extend_from_slice(bytes);
-                }
+        if self.sse {
+            // The parser is moved out so its callback can borrow `self`.
+            let mut parser = std::mem::take(&mut self.parser);
+            let mut on_event = |event: &str, data: Option<&[u8]>| self.dispatch(event, data);
+            for &byte in bytes {
+                parser.push(byte, &mut on_event);
             }
-            return;
-        }
-        for &byte in bytes {
-            // SSE accepts CR, LF, and CRLF, including splits between CR and LF.
-            if byte == b'\n' && self.after_cr {
-                self.after_cr = false;
-                continue;
-            }
-            self.after_cr = byte == b'\r';
-            if byte == b'\r' || byte == b'\n' {
-                if self.line_nonempty {
-                    self.end_line();
-                    self.push(b'\n');
-                    self.line_nonempty = false;
-                } else {
-                    self.end_frame();
-                }
+            self.parser = parser;
+        } else if !self.oversized {
+            if bytes.len() > MAX_RESPONSE_BYTES.saturating_sub(self.body.len()) {
+                self.body.clear();
+                self.oversized = true;
             } else {
-                self.line_nonempty = true;
-                if self.line_head.len() < LINE_HEAD_MAX {
-                    self.line_head.push(byte);
-                }
-                self.line_len = self.line_len.saturating_add(1);
-                self.push(byte);
+                self.body.extend_from_slice(bytes);
             }
-        }
-    }
-
-    fn push(&mut self, byte: u8) {
-        if self.skipping {
-            return;
-        }
-        if self.scratch.len() == MAX_RESPONSE_BYTES {
-            self.scratch.clear();
-            self.skipping = true;
-        } else {
-            self.scratch.push(byte);
         }
     }
 
@@ -157,18 +118,19 @@ impl ResponseObserver {
     }
 
     /// Whether a definite in-band failure has been observed (or `finish` has
-    /// classified SSE without a terminal marker as incomplete).
-    /// Malformed/oversized data is not a known inference failure.
+    /// classified SSE without a terminal marker as incomplete). An unparseable
+    /// or oversized body is not a known inference failure.
     pub fn has_failed(&self) -> bool {
         self.failed
     }
 
     /// Classify the observed response. Call after `finish` for buffered JSON;
-    /// before finalization its validity is unavailable. SSE is valid after a
-    /// successful terminal and invalid after failure or finalized missing terminal.
-    /// Callers should treat `Invalid` as an error, including malformed HTTP 200
-    /// JSON, while `Unavailable` may be accepted when transport completed.
-    /// This does not establish transport completion itself.
+    /// before finalization its validity is unavailable. Buffered JSON that does
+    /// not parse is `Invalid` whatever the reason, including valid JSON deeper
+    /// than serde_json's recursion limit, so a caller that trusts the producer
+    /// should not fail a request on `Invalid` alone. SSE is valid after a
+    /// success terminal and invalid after a failure or a finished stream with
+    /// no terminal. This does not establish transport completion itself.
     pub fn validity(&self) -> ResponseValidity {
         if self.failed {
             ResponseValidity::Invalid
@@ -183,140 +145,83 @@ impl ResponseObserver {
         }
     }
 
-    /// Finalize once, returning `true` only for a definite in-band error or
-    /// SSE without a terminal `message_stop`, `response.completed`, or `[DONE]`.
-    /// Invalid/oversized JSON or frames mean missing telemetry, not failure.
-    /// Once a stream terminal is seen, an unfinished/skipped trailing frame
-    /// does not turn success into failure. Repeated calls return the same result.
-    /// A `false` result means no known failure, not validated inference success:
-    /// callers must still establish transport completion (for example, received
-    /// Content-Length bytes for JSON). No lifecycle event or buffered JSON
-    /// FirstToken is emitted.
+    /// Finalize once, returning `true` only for a definite in-band failure, or
+    /// for SSE that ended without a terminal (`message_stop`,
+    /// `response.completed` or `[DONE]`). An event half-received at the end is
+    /// discarded. An unparseable or oversized buffered body is never a failure.
+    /// Once a terminal has been seen nothing after it changes the verdict.
+    /// Repeated calls return the same result. A `false` result means no known
+    /// failure, not validated inference success: callers must still establish
+    /// transport completion (for example, received Content-Length bytes for
+    /// JSON). No lifecycle event or buffered JSON FirstToken is emitted.
     pub fn finish(&mut self) -> bool {
         if !self.finished {
             if self.sse {
                 self.failed |= !self.terminal;
-            } else if !self.skipping {
-                let body = std::mem::take(&mut self.scratch);
-                self.json(&body, "");
+            } else if !self.oversized {
+                match serde_json::from_slice::<Value>(&self.body) {
+                    Ok(value) => {
+                        if recognized_response(&value) {
+                            self.json_validity = ResponseValidity::Valid;
+                        }
+                        self.payload(&value, "");
+                    }
+                    Err(_) => self.json_validity = ResponseValidity::Invalid,
+                }
             }
-            self.scratch.clear();
+            self.body.clear();
             self.finished = true;
         }
         self.failed
     }
 
-    /// Framing layer: note a finished line's `event:` name or `data: [DONE]`.
-    fn end_line(&mut self) {
-        let truncated = self.line_len > LINE_HEAD_MAX;
-        if let Some(rest) = self.line_head.strip_prefix(b"event:") {
-            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
-            self.event = match std::str::from_utf8(rest) {
-                Ok(name) if !truncated && name.len() <= MAX_EVENT_NAME => name.to_owned(),
-                _ => String::new(),
-            };
-        } else if let Some(rest) = self.line_head.strip_prefix(b"data:") {
-            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
-            if truncated || !rest.is_empty() {
-                self.data_lines += 1;
-                self.done_line = !truncated && rest.trim_ascii() == b"[DONE]";
-            }
+    /// One SSE event. The verdict comes from framing alone; the payload, when
+    /// it fit the bound and parses, can add a failure and supply telemetry.
+    fn dispatch(&mut self, event: &str, data: Option<&[u8]>) {
+        if self.terminal {
+            return;
         }
-        self.line_head.clear();
-        self.line_len = 0;
-    }
-
-    /// Framing layer: the stream verdict comes from the event name and the
-    /// `[DONE]` marker alone, so a payload that was skipped as oversized or that
-    /// fails to parse can never erase it. Then the best-effort payload layer runs.
-    fn end_frame(&mut self) {
-        let event = std::mem::take(&mut self.event);
-        if is_error_type(&event) {
+        if is_error_type(event) {
             self.failed = true;
             self.terminal = true;
-        } else if matches!(event.as_str(), "message_stop" | "response.completed") {
+        } else if matches!(event, "message_stop" | "response.completed") {
             self.terminal = true;
         }
-        if self.data_lines == 1 && self.done_line {
-            self.terminal = true;
-        }
-        self.data_lines = 0;
-        self.done_line = false;
-        if !self.skipping {
-            let frame = std::mem::take(&mut self.scratch);
-            self.frame(&frame, &event);
-            self.scratch = frame;
-        }
-        self.scratch.clear();
-        self.skipping = false;
-    }
-
-    /// Payload layer for one bounded frame: telemetry and in-payload signals.
-    fn frame(&mut self, frame: &[u8], event: &str) {
-        let Ok(text) = std::str::from_utf8(frame) else {
-            return;
-        };
-        let mut data = String::new();
-        for line in text.lines() {
-            if let Some(value) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
+        match data {
+            Some(b"[DONE]") => self.terminal = true,
+            Some(data) => {
+                if let Ok(value) = serde_json::from_slice::<Value>(data) {
+                    self.payload(&value, event);
                 }
-                data.push_str(value.strip_prefix(' ').unwrap_or(value));
             }
-        }
-        if data.trim() != "[DONE]" && !data.is_empty() {
-            self.json(data.as_bytes(), event);
+            None => {}
         }
     }
 
-    fn json(&mut self, bytes: &[u8], event: &str) {
-        let value = match serde_json::from_slice::<Value>(bytes) {
-            Ok(value) => value,
-            Err(error) => {
-                if !self.sse {
-                    // serde_json bounds nesting depth (128) and reports that limit
-                    // before it reaches later syntax errors, so exhaustion proves
-                    // nothing about validity. It is not an inference failure when
-                    // the body is structurally complete (telemetry unavailable);
-                    // otherwise the body is malformed. serde_json exposes no
-                    // stable error code, so match its message.
-                    let depth_limit = error.to_string().starts_with("recursion limit exceeded");
-                    self.json_validity = if depth_limit && structurally_complete(bytes) {
-                        ResponseValidity::Unavailable
-                    } else {
-                        ResponseValidity::Invalid
-                    };
-                }
-                return;
-            }
-        };
-        if !self.sse && recognized_response(&value) {
-            self.json_validity = ResponseValidity::Valid;
-        }
-        let kind = value.get("type").and_then(Value::as_str).unwrap_or(event);
-        let response = value.get("response").unwrap_or(&value);
+    /// Telemetry and failure signals of one parsed payload. Its `type` selects
+    /// the usage shape and first-token rule; it can name a failure but never a success.
+    fn payload(&mut self, value: &Value, event: &str) {
+        let payload_type = value.get("type").and_then(Value::as_str);
+        let kind = payload_type.unwrap_or(event);
+        let response = value.get("response").unwrap_or(value);
         // Failed and incomplete responses still consumed the tokens they report.
         let document = value.get("message").unwrap_or(response);
-        let failure = is_error_type(kind)
-            || nonnull_error(&value)
+        if let Some(usage) = document.get("usage") {
+            self.usage(usage, kind);
+        }
+        if payload_type.is_some_and(is_error_type)
+            || nonnull_error(value)
             || nonnull_error(response)
             || matches!(
                 response.get("status").and_then(Value::as_str),
                 Some("failed" | "incomplete")
-            );
-        if let Some(usage) = document.get("usage") {
-            self.usage(usage, kind);
-        }
-        if failure {
+            )
+        {
             self.failed = true;
             self.terminal = true;
             return;
         }
-        if matches!(kind, "message_stop" | "response.completed") {
-            self.terminal = true;
-        }
-        if self.sse && !self.first_token && generated_output(&value, kind) {
+        if self.sse && !self.first_token && generated_output(value, kind) {
             self.first_token = true;
             self.sink.record(MetricsUpdate::FirstToken {
                 request_id: self.request_id.clone(),
@@ -380,52 +285,6 @@ impl ResponseObserver {
             });
         }
     }
-}
-
-/// Whether `bytes` is one balanced JSON object or array followed only by JSON
-/// whitespace. Deliberately a structural check, not a parser: it tracks string
-/// state and bracket kinds without recursion (a `Vec` stack bounded by the
-/// buffer length), so it cannot overflow the native stack and does not validate
-/// scalars, commas or colons. It is used only after serde_json hit its depth
-/// limit, to tell deep-but-complete bodies from truncated or garbled ones.
-fn structurally_complete(bytes: &[u8]) -> bool {
-    let mut stack: Vec<u8> = Vec::new();
-    let (mut in_string, mut escaped, mut root_closed) = (false, false, false);
-    for &byte in bytes {
-        if in_string {
-            match byte {
-                _ if escaped => escaped = false,
-                b'\\' => escaped = true,
-                b'"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        let whitespace = matches!(byte, b' ' | b'\t' | b'\n' | b'\r');
-        if root_closed || stack.is_empty() {
-            // Before the root only whitespace or an opener; after it only whitespace.
-            if whitespace || (!root_closed && matches!(byte, b'{' | b'[')) {
-                if !whitespace {
-                    stack.push(byte);
-                }
-                continue;
-            }
-            return false;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'{' | b'[' => stack.push(byte),
-            b'}' | b']' => {
-                let expected = if byte == b'}' { b'{' } else { b'[' };
-                if stack.pop() != Some(expected) {
-                    return false;
-                }
-                root_closed = stack.is_empty();
-            }
-            _ => {}
-        }
-    }
-    root_closed && !in_string
 }
 
 fn recognized_response(value: &Value) -> bool {

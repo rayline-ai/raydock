@@ -388,6 +388,30 @@ async fn encoded_response_preserves_wire_bytes_and_completes_without_body_teleme
 }
 
 #[tokio::test]
+async fn valid_deeply_nested_core_output_is_a_completed_request() {
+    // The core is trusted to be well formed: JSON the observer cannot parse (here,
+    // valid but nested past serde_json's limit) must not fail a successful turn.
+    let mut runtime = Runtime::start(1);
+    let (url, token) = runtime.ready().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let response = client
+        .post(format!("{url}/v1/messages"))
+        .bearer_auth(&token)
+        .json(&json!({"fixture_deep": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = response.text().await.unwrap();
+    assert_eq!(body.matches('[').count(), 201);
+    let snapshot = top_snapshot(&client, &url, &token).await;
+    assert!(snapshot["active"].as_array().unwrap().is_empty());
+    assert_eq!(snapshot["recent"][0]["state"], "completed");
+    assert_eq!(snapshot["recent"][0]["status_code"], 200);
+    assert_eq!(snapshot["totals"]["errored_requests"], 0);
+}
+
+#[tokio::test]
 async fn empty_responses_close_the_row_with_the_real_status() {
     let mut runtime = Runtime::start(1);
     let (url, token) = runtime.ready().await;

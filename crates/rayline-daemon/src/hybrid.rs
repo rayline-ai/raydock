@@ -462,7 +462,7 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         }
         if upstream.status() != StatusCode::BAD_GATEWAY {
             return match observation {
-                Some(observation) => observed_response(upstream, observation),
+                Some(observation) => observed_response(upstream, observation, Upstream::Core),
                 None => stream_response(upstream),
             };
         }
@@ -557,7 +557,7 @@ async fn send_classifier_to_cloud(
         observation.finish(status.as_u16(), Some("classifier request refused"));
         return Ok(Some(response));
     }
-    observed_response(upstream, observation).map(Some)
+    observed_response(upstream, observation, Upstream::Classifier).map(Some)
 }
 
 async fn send_to_core(
@@ -657,10 +657,36 @@ fn observable_response(headers: &hyper::HeaderMap) -> Option<bool> {
     )
 }
 
+/// Who produced a response, which decides how much of its body can fail the request.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Upstream {
+    /// The execution core is trusted to emit well-formed bodies, and valid but
+    /// deeply nested tool output must not turn a successful inference into an
+    /// error. Only an HTTP error, a transport error or an in-band failure signal
+    /// ends the row as an error; `validity()` is ignored.
+    Core,
+    /// The cloud router answering an auto-mode classifier is not trusted: a
+    /// malformed HTTP 200 body (`ResponseValidity::Invalid`) is also an error.
+    Classifier,
+}
+
+/// Finalize `observer` and report whether the response failed, per `upstream`.
+fn response_failed(
+    observer: Option<&mut rayline_metrics::response::ResponseObserver>,
+    upstream: Upstream,
+) -> bool {
+    observer.is_some_and(|observer| {
+        observer.finish()
+            || (upstream == Upstream::Classifier
+                && observer.validity() == rayline_metrics::response::ResponseValidity::Invalid)
+    })
+}
+
 /// Observe without changing the response bytes or pulling ahead of downstream demand.
 fn observed_response(
     upstream: reqwest::Response,
     mut observation: RequestObservation,
+    trust: Upstream,
 ) -> Result<Response<Body>> {
     let status = upstream.status();
     let content_length = upstream.content_length();
@@ -707,11 +733,7 @@ fn observed_response(
                         .is_some_and(|observer| observer.is_terminal())
                         || content_length == Some(received)
                     {
-                        let failed = observer.as_mut().is_some_and(|observer| {
-                            observer.finish()
-                                || observer.validity()
-                                    == rayline_metrics::response::ResponseValidity::Invalid
-                        });
+                        let failed = response_failed(observer.as_mut(), trust);
                         observation.finish(
                             status.as_u16(),
                             if !status.is_success() {
@@ -737,11 +759,7 @@ fn observed_response(
                     ))
                 }
                 None => {
-                    let failed = observer.as_mut().is_some_and(|observer| {
-                        observer.finish()
-                            || observer.validity()
-                                == rayline_metrics::response::ResponseValidity::Invalid
-                    });
+                    let failed = response_failed(observer.as_mut(), trust);
                     observation.finish(
                         status.as_u16(),
                         if !status.is_success() {

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::response::{ResponseObserver, ResponseValidity};
+use crate::response::{MAX_RESPONSE_BYTES, ResponseObserver, ResponseValidity};
 use crate::{MetricsSink, MetricsUpdate};
 
 #[derive(Default)]
@@ -12,12 +12,19 @@ impl MetricsSink for Capture {
 }
 
 fn observe(body: &[u8], sse: bool, chunk: usize) -> (bool, Vec<MetricsUpdate>, ResponseValidity) {
+    observe_chunks(body.chunks(chunk), sse)
+}
+
+fn observe_chunks<'a>(
+    chunks: impl IntoIterator<Item = &'a [u8]>,
+    sse: bool,
+) -> (bool, Vec<MetricsUpdate>, ResponseValidity) {
     let sink = Arc::new(Capture::default());
     let mut observer = ResponseObserver::new(sink.clone(), "r".into(), sse);
     assert!(!observer.is_terminal());
     assert!(!observer.has_failed());
     assert_eq!(observer.validity(), ResponseValidity::Unavailable);
-    for bytes in body.chunks(chunk) {
+    for bytes in chunks {
         observer.observe(bytes);
     }
     let known_failure = observer.has_failed();
@@ -43,7 +50,7 @@ fn each_protocol_reports_usage_and_cache_across_chunk_splits() {
     let cases = [
         (
             true,
-            "event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"virtual\",\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}\r\n\r\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"é\"}}\r\n\r\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\r\n\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
+            "event: message_start\r\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"virtual\",\"usage\":{\"input_tokens\":2,\"cache_creation_input_tokens\":10,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}\r\n\r\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"é\"}}\r\n\r\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}\r\n\r\nevent: message_stop\r\ndata: {\"type\":\"message_stop\"}\r\n\r\n",
             42,
             17,
             30,
@@ -57,7 +64,7 @@ fn each_protocol_reports_usage_and_cache_across_chunk_splits() {
         ),
         (
             true,
-            "event: response.function_call_arguments.delta\ndata: {\"delta\":\"{}\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":30}}}}\n\n",
+            "event: response.function_call_arguments.delta\ndata: {\"delta\":\"{}\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":30}}}}\n\n",
             42,
             17,
             30,
@@ -272,59 +279,23 @@ fn failure_terminals_still_report_the_usage_they_consumed() {
     }
 }
 
-fn deep_message(opening: usize, closing: usize) -> String {
-    format!(
-        "{{\"type\":\"message\",\"content\":[{{\"type\":\"tool_use\",\"input\":{}0{}}}]}}",
-        "[".repeat(opening),
-        "]".repeat(closing)
-    )
-}
-
-#[test]
-fn depth_limit_is_unavailable_only_when_the_body_is_structurally_complete() {
-    // Valid JSON, within the byte bound, deeper than serde_json's recursion limit.
-    let valid = deep_message(200, 200);
-    assert!(valid.len() < crate::response::MAX_RESPONSE_BYTES);
-    let with_brackets_in_string = valid.replace("tool_use", "tool_use\\\"]}[");
-    let trailing_garbage = format!("{valid} garbage");
-    let mismatched = valid.replacen("]]0", "]}0", 1).replace("0]]", "0}]");
-    let mut cases: Vec<(String, ResponseValidity)> = vec![
-        (valid.clone(), ResponseValidity::Unavailable),
-        (format!("  \r\n{valid}\n "), ResponseValidity::Unavailable),
-        (with_brackets_in_string, ResponseValidity::Unavailable),
-        // Depth is exhausted before the syntax error, so each of these needs
-        // the structural check to be told apart from a complete body.
-        (deep_message(200, 199), ResponseValidity::Invalid),
-        (
-            valid[..valid.len() - 3].to_owned(),
-            ResponseValidity::Invalid,
-        ),
-        (trailing_garbage, ResponseValidity::Invalid),
-        (format!("{valid}{valid}"), ResponseValidity::Invalid),
-        (mismatched, ResponseValidity::Invalid),
-    ];
-    // Shallow malformed bodies never reach the depth limit.
-    for body in [
-        "<html>502 Bad Gateway</html>",
-        "{\"type\":\"message\",\"content\":[",
-        "",
-    ] {
-        cases.push((body.to_owned(), ResponseValidity::Invalid));
-    }
-    for (body, expected) in cases {
-        for chunk in [64, body.len().max(1)] {
-            let (failed, updates, validity) = observe(body.as_bytes(), false, chunk);
-            assert!(!failed, "{body:.80}");
-            assert_eq!(validity, expected, "{body:.80}");
-            assert!(updates.is_empty());
+/// Feed `body` and report (terminal, failed) before `finish`, whole and byte by byte.
+fn verdict_before_finish(body: &[u8]) -> (bool, bool) {
+    let verdicts = [body.len().max(1), 1].map(|chunk| {
+        let mut observer = ResponseObserver::new(Arc::new(Capture::default()), "r".into(), true);
+        for bytes in body.chunks(chunk) {
+            observer.observe(bytes);
         }
-    }
+        (observer.is_terminal(), observer.has_failed())
+    });
+    assert_eq!(verdicts[0], verdicts[1], "chunking changed the verdict");
+    verdicts[0]
 }
 
-fn oversized_payload() -> String {
+fn big_payload() -> String {
     format!(
         "{{\"padding\":\"{}\"}}",
-        "x".repeat(crate::response::MAX_RESPONSE_BYTES + 1000)
+        "x".repeat(MAX_RESPONSE_BYTES + 1000)
     )
 }
 
@@ -336,84 +307,291 @@ fn deep_payload() -> String {
     )
 }
 
-/// Feed `body` and report (terminal, failed) before `finish`.
-fn verdict_before_finish(body: &[u8], chunk: usize) -> (bool, bool) {
-    let mut observer = ResponseObserver::new(Arc::new(Capture::default()), "r".into(), true);
-    for bytes in body.chunks(chunk) {
-        observer.observe(bytes);
+/// Streams in the shapes the three protocols use, with `nl` line endings.
+fn sample_streams(nl: &str) -> Vec<String> {
+    let anthropic = [
+        "event: message_start",
+        "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":2,\"cache_read_input_tokens\":30,\"output_tokens\":0}}}",
+        "",
+        ": keep-alive",
+        "",
+        "event: content_block_delta",
+        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"é\"}}",
+        "",
+        "event: message_delta",
+        "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":17}}",
+        "",
+        "event: message_stop",
+        "data: {\"type\":\"message_stop\"}",
+        "",
+        "",
+    ];
+    let responses = [
+        "event: response.created",
+        "data: {\"type\":\"response.created\",\"response\":{\"status\":\"in_progress\"}}",
+        "",
+        "event: response.output_text.delta",
+        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}",
+        "",
+        "event: response.completed",
+        "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":17,\"input_tokens_details\":{\"cached_tokens\":30}}}}",
+        "",
+        "",
+    ];
+    let chat = [
+        "data: {\"choices\":[{\"delta\":{\"content\":\"é\"}}]}",
+        "",
+        "data: {\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":17,\"prompt_tokens_details\":{\"cached_tokens\":30}}}",
+        "",
+        "data: [DONE]",
+        "",
+        "",
+    ];
+    let mut streams = Vec::new();
+    for lines in [&anthropic[..], &responses[..], &chat[..]] {
+        let body = lines.join(nl);
+        streams.push(body.clone());
+        streams.push(format!("\u{feff}{body}"));
     }
-    (observer.is_terminal(), observer.has_failed())
+    streams
 }
 
 #[test]
-fn sse_verdict_comes_from_the_event_name_whatever_the_payload_does() {
-    let big = oversized_payload();
-    let deep = deep_payload();
-    for newline in ["\n", "\r\n", "\r"] {
-        for chunk in [1, 5, 4096, usize::MAX] {
-            let frame = |event: &str, data: &str| {
-                format!("event: {event}{newline}data: {data}{newline}{newline}")
-            };
-            let feed = |body: String| {
-                let chunk = chunk.min(body.len());
-                (
-                    verdict_before_finish(body.as_bytes(), chunk),
-                    observe(body.as_bytes(), true, chunk),
-                )
-            };
-            // An oversized or too-deep terminal success frame, with no [DONE].
-            for payload in [&big, &deep] {
-                for event in ["response.completed", "message_stop"] {
-                    let (before, (failed, _, validity)) = feed(frame(event, payload));
-                    assert_eq!(before, (true, false), "{event} {newline:?} {chunk}");
-                    assert!(!failed);
-                    assert_eq!(validity, ResponseValidity::Valid);
-                }
+fn every_split_of_a_stream_gives_the_unsplit_result() {
+    for nl in ["\n", "\r\n", "\r"] {
+        for stream in sample_streams(nl) {
+            let bytes = stream.as_bytes();
+            let (failed, updates, validity) = observe_chunks([bytes], true);
+            assert!(!failed, "{nl:?} {stream:.60}");
+            assert_eq!(validity, ResponseValidity::Valid);
+            assert!(!updates.is_empty());
+            let expected = format!("{updates:?}");
+            for split in 0..=bytes.len() {
+                let (head, tail) = bytes.split_at(split);
+                let (failed, updates, validity) = observe_chunks([head, tail], true);
+                assert!(!failed, "split at {split}");
+                assert_eq!(validity, ResponseValidity::Valid);
+                assert_eq!(format!("{updates:?}"), expected, "split at {split}");
             }
-            // Success after earlier ordinary frames, event name split by chunking.
-            let stream = format!(
-                "event: response.created{newline}data: {{}}{newline}{newline}{}",
-                frame("response.completed", &big)
-            );
-            let (before, (failed, _, validity)) = feed(stream);
-            assert_eq!(before, (true, false));
+            let (failed, updates, validity) = observe_chunks(bytes.chunks(1), true);
             assert!(!failed);
             assert_eq!(validity, ResponseValidity::Valid);
-            // An oversized failure frame is a definite failure.
-            for event in ["response.failed", "response.incomplete", "error"] {
-                let (before, (failed, _, validity)) = feed(frame(event, &big));
-                assert_eq!(before, (true, true), "{event}");
-                assert!(failed);
-                assert_eq!(validity, ResponseValidity::Invalid);
-            }
-            // An oversized payload under a non-terminal event is no verdict at all:
-            // the stream still lacks a terminal and finishes incomplete as before.
-            let ordinary = frame("content_block_delta", &big);
-            let (before, (failed, _, validity)) = feed(ordinary.clone());
-            assert_eq!(before, (false, false));
-            assert!(failed);
-            assert_eq!(validity, ResponseValidity::Invalid);
-            // ... and a later terminal still completes it.
-            let (before, (failed, _, _)) =
-                feed(format!("{ordinary}data: [DONE]{newline}{newline}"));
-            assert_eq!(before, (true, false));
-            assert!(!failed);
+            assert_eq!(format!("{updates:?}"), expected, "byte at a time");
         }
     }
-    // The optional space after `event:` is optional; an over-long name is no event.
-    assert_eq!(
-        verdict_before_finish(b"event:message_stop\n\n", 3),
-        (true, false)
+}
+
+#[test]
+fn stream_verdict_follows_event_framing_not_payload() {
+    let big = big_payload();
+    let deep = deep_payload();
+    let long_name = "response.completed".repeat(10);
+    let neutral_completed =
+        "event: content_block_delta\ndata: {\"type\":\"response.completed\"}\n\n".to_owned();
+    let neutral_oversized = format!(
+        "event: content_block_delta\ndata: {}\n\n",
+        big.replacen("{", "{\"type\":\"message_stop\",", 1)
     );
-    let long_name = format!("event: {}\n\n", "response.completed".repeat(10));
-    assert_eq!(
-        verdict_before_finish(long_name.as_bytes(), 7),
-        (false, false)
+    let neutral_deep = format!(
+        "event: content_block_delta\ndata: {{\"type\":\"response.completed\",\"x\":{}0{}}}\n\n",
+        "[".repeat(200),
+        "]".repeat(200)
     );
-    // A fake terminal inside a skipped payload, with no event line, is still ignored.
-    let fake = format!(
-        "data: {{\"padding\":\"{}\",\"type\":\"message_stop\"}}\n\n",
-        "x".repeat(crate::response::MAX_RESPONSE_BYTES)
+    let table: Vec<(String, (bool, bool))> = vec![
+        // SSE framing: these dispatch no event, or a different one, so nothing ends.
+        (
+            "event: response.completed\nevent\ndata: {}\n\n".into(),
+            (false, false),
+        ),
+        ("event: response.completed\n\n".into(), (false, false)),
+        ("event: error\n\n".into(), (false, false)),
+        (
+            "event: response.completed\n\ndata: {}\n\n".into(),
+            (false, false),
+        ),
+        ("data: event: error\n\n".into(), (false, false)),
+        (
+            format!("event: {long_name}\ndata: {{}}\n\n"),
+            (false, false),
+        ),
+        ("event: message_stop\ndata: {}".into(), (false, false)),
+        ("data: [DONE]\n".into(), (false, false)),
+        ("data: [DONE]\ndata: x\n\n".into(), (false, false)),
+        ("data: [DONE] \n\n".into(), (false, false)),
+        // Terminal success is the event type or an exact [DONE] and nothing else.
+        ("event: message_stop\ndata: {}\n\n".into(), (true, false)),
+        (
+            "\u{feff}event: response.completed\r\ndata: {}\r\n\r\n".into(),
+            (true, false),
+        ),
+        ("data: [DONE]\n\n".into(), (true, false)),
+        (neutral_completed, (false, false)),
+        (neutral_oversized, (false, false)),
+        (neutral_deep, (false, false)),
+        (
+            "data: {\"type\":\"message_stop\"}\n\n".into(),
+            (false, false),
+        ),
+        // An oversized or too-deep payload under a terminal event cannot undo it.
+        (
+            format!("event: response.completed\ndata: {big}\n\n"),
+            (true, false),
+        ),
+        (
+            format!("event: response.completed\ndata: {deep}\n\n"),
+            (true, false),
+        ),
+        (
+            format!("event: message_stop\ndata: {deep}\n\n"),
+            (true, false),
+        ),
+        (
+            "event: response.completed\ndata: {\"truncated\n\n".to_owned(),
+            (true, false),
+        ),
+        // Oversized failure events are failures; the payload need not be read.
+        (
+            format!("event: response.failed\ndata: {big}\n\n"),
+            (true, true),
+        ),
+        (
+            format!("event: response.incomplete\ndata: {big}\n\n"),
+            (true, true),
+        ),
+        (format!("event: error\ndata: {big}\n\n"), (true, true)),
+        ("event: error\ndata: not-json\n\n".into(), (true, true)),
+        // A payload may add a failure, under any event name or none.
+        (
+            "data: {\"error\":{\"message\":\"x\"}}\n\n".into(),
+            (true, true),
+        ),
+        (
+            "event: message\ndata: {\"response\":{\"status\":\"incomplete\"}}\n\n".into(),
+            (true, true),
+        ),
+        (
+            "data: {\"response\":{\"status\":\"failed\"}}\n\n".into(),
+            (true, true),
+        ),
+        (
+            "data: {\"type\":\"response.failed\"}\n\n".into(),
+            (true, true),
+        ),
+        (
+            "event: response.completed\ndata: {\"response\":{\"status\":\"incomplete\"}}\n\n"
+                .into(),
+            (true, true),
+        ),
+        // A null error is not a failure.
+        (
+            "event: message\ndata: {\"error\":null}\n\n".into(),
+            (false, false),
+        ),
+        // Nothing after a terminal changes the verdict.
+        (
+            "event: message_stop\ndata: {}\n\nevent: error\ndata: {}\n\n".into(),
+            (true, false),
+        ),
+        (
+            "data: [DONE]\n\ndata: {\"error\":{}}\n\n".into(),
+            (true, false),
+        ),
+        (
+            "event: error\ndata: {}\n\nevent: message_stop\ndata: {}\n\n".into(),
+            (true, true),
+        ),
+        // An oversized payload under an ordinary event is no verdict at all.
+        (
+            format!("event: content_block_delta\ndata: {big}\n\n"),
+            (false, false),
+        ),
+    ];
+    for (body, expected) in table {
+        assert_eq!(
+            verdict_before_finish(body.as_bytes()),
+            expected,
+            "{body:.120}"
+        );
+        // `finish` agrees: only a stream with no terminal at all ends as a failure.
+        let (failed, _, validity) = observe(body.as_bytes(), true, 4096);
+        assert_eq!(failed, expected.1 || !expected.0, "{body:.120}");
+        assert_eq!(
+            validity == ResponseValidity::Valid,
+            expected.0 && !expected.1
+        );
+    }
+}
+
+fn deep_body(inner: &str) -> String {
+    format!(
+        "{{\"type\":\"message\",\"content\":[{{\"type\":\"tool_use\",\"input\":{}{inner}{}}}]}}",
+        "[".repeat(200),
+        "]".repeat(200)
+    )
+}
+
+#[test]
+fn buffered_json_is_parsed_whole_and_only_in_band_signals_fail() {
+    let valid = deep_body("0");
+    assert!(valid.len() < MAX_RESPONSE_BYTES);
+    let mut cases: Vec<(String, ResponseValidity)> = vec![
+        (
+            "{\"type\":\"message\",\"content\":[]}".to_owned(),
+            ResponseValidity::Valid,
+        ),
+        // Valid JSON nested past serde_json's recursion limit does not parse.
+        (valid.clone(), ResponseValidity::Invalid),
+        // So none of these balanced-but-malformed bodies can be told apart from it,
+        // and none may be taken for a valid or unavailable one.
+        (deep_body("0,"), ResponseValidity::Invalid),
+        (deep_body("nul"), ResponseValidity::Invalid),
+        (deep_body("01"), ResponseValidity::Invalid),
+        (deep_body("\"\\q\""), ResponseValidity::Invalid),
+        (deep_body("x"), ResponseValidity::Invalid),
+        (
+            valid[..valid.len() - 3].to_owned(),
+            ResponseValidity::Invalid,
+        ),
+        (format!("{valid} garbage"), ResponseValidity::Invalid),
+        // Shallow malformed bodies.
+        (
+            "<html>502 Bad Gateway</html>".to_owned(),
+            ResponseValidity::Invalid,
+        ),
+        (
+            "{\"type\":\"message\",\"content\":[".to_owned(),
+            ResponseValidity::Invalid,
+        ),
+        (String::new(), ResponseValidity::Invalid),
+        // Parsed but unrecognized.
+        (
+            "{\"unknown\":true}".to_owned(),
+            ResponseValidity::Unavailable,
+        ),
+        // Over the bound: unavailable, never a failure.
+        (
+            format!("{{\"padding\":\"{}\"}}", "x".repeat(MAX_RESPONSE_BYTES)),
+            ResponseValidity::Unavailable,
+        ),
+    ];
+    for (body, expected) in cases.drain(..) {
+        for chunk in [64, body.len().max(1)] {
+            let (failed, updates, validity) = observe(body.as_bytes(), false, chunk);
+            assert!(
+                !failed,
+                "an unparseable body is not an inference failure: {body:.80}"
+            );
+            assert_eq!(validity, expected, "{body:.80}");
+            assert!(updates.is_empty());
+        }
+    }
+    // A definite in-band failure still fails, and reports its usage.
+    let (failed, updates, validity) = observe(
+        b"{\"type\":\"message\",\"error\":{\"message\":\"x\"},\"usage\":{\"input_tokens\":1,\"output_tokens\":2}}",
+        false,
+        16,
     );
-    assert_eq!(verdict_before_finish(fake.as_bytes(), 4096), (false, false));
+    assert!(failed);
+    assert_eq!(validity, ResponseValidity::Invalid);
+    assert!(!updates.is_empty());
 }

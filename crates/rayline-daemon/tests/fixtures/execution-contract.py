@@ -96,6 +96,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
+        if self.path == "/v1/messages" and json.loads(body).get("fixture_deep"):
+            # Valid JSON nested past serde_json's default recursion limit (128).
+            deep = ('{"type":"message","content":[{"type":"tool_use","input":' + "[" * 200 + "0"
+                    + "]" * 200 + "}]}").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(deep)))
+            self.end_headers()
+            self.wfile.write(deep)
+            return
         if self.path == "/v1/messages" and json.loads(body).get("fixture_gzip"):
             # Fixed mtime makes the encoded wire bytes independently assertable.
             encoded = bytearray(gzip.compress(b'{"usage":{"input_tokens":7,"output_tokens":3}}', mtime=0))

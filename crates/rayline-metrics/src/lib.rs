@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
 pub mod response;
+mod sse;
 
 pub const REQUEST_ID_HEADER: &str = "x-rayline-request-id";
 /// The cloud router's own id for a forwarded request (`rt_…`). The gateway sets
