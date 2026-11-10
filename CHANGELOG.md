@@ -36,10 +36,12 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   142,000 tokens leaves too little room for the opening request (about
   110,000 tokens) and the answer, so every task started on cloud with no
   sign why. `start` now says so and names the 262,144-token setting.
-- **rld logs why Decisions failed a turn.** The resend and the final failure
-  are logged with the core's message (the routing service's HTTP status and
-  code) and the route id, when the core passes one on. Before, rld logged only
-  "Decisions unavailable" on a resend and nothing on the final failure.
+- **rld logs why a turn failed before any output.** The resend and every
+  final 502 from the core are logged with the routing service's HTTP status
+  and code (from the core's own Decisions message; any other message, which
+  may be a provider's text, is logged only as "other") and the route id, when
+  the core passes one on. Before, rld logged only "Decisions unavailable" on a
+  resend and nothing on the final failure.
 - **Hybrid uses the local runtime's own context window.** With no
   `--local-context-window` or `hybrid.local_context_window`, `hybrid start`
   now uses the window the runtime reports (llama.cpp `/props`, or
