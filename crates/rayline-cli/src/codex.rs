@@ -205,7 +205,8 @@ where
             hosted.router_url
         )));
     }
-    if let Some(path) = crate::router_config::edited_default_config(home, &env)? {
+    if let Some(path) = crate::router_config::edited_default_config(home, &env, &hosted.router_url)?
+    {
         return Ok(Some(path));
     }
     let models = hosted_models(env.clone(), hosted.router_url.clone())
