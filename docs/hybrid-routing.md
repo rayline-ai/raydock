@@ -140,7 +140,11 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     `--alias` or the configured model name is not evidence, since runtimes
     echo it back.
   - Claude Opus 5.5 and Sonnet 5.5 are exact model pins through the same
-    router, each with its 1,000,000-token window.
+    router, each with its 1,000,000-token window. Each pins the router's own
+    model id (`claude-opus-5-5`, `claude-sonnet-5-5`), which the router serves
+    directly from Anthropic; its `registry_model`
+    (`anthropic/claude-opus-5.5`, `anthropic/claude-sonnet-5.5`) names the
+    core's measured cell for that model.
   - `derived_actions` let the core derive ARC's actions from its embedded
     registry: Qwen's admitted controls, plus the default-base controls of Opus
     and Sonnet.
@@ -219,12 +223,12 @@ last turn to the local model; a local model that misses the format makes Claude
 Code ask the user to approve every action. Raydock's gateway recognizes the
 classifier (a Messages request with no tools whose system prompt opens with
 Claude Code's security-monitor prompt) and sends it, without consulting
-Decisions, to Claude Haiku 5.5 (`anthropic/claude-haiku-5.5`) through the
+Decisions, to Claude Haiku 5.5 (`claude-haiku-5-5`) through the
 router of the profile's cloud Messages pins, on the same router as Decisions,
 with that deployment's key. Choose another model the router serves with
-`"hybrid": {"classifier_model": "anthropic/claude-sonnet-5.5"}` in
+`"hybrid": {"classifier_model": "claude-sonnet-5-5"}` in
 `~/.config/rayline/settings.json` or `raydock hybrid start --classifier-model
-<provider/model>` (the flag wins); either applies with `--config` too. A
+<router model id>` (the flag wins); either applies with `--config` too. A
 profile with no cloud Messages pin, or a launch without its key, leaves the
 classifier to the core. Each classifier call is billed at that model's price.
 

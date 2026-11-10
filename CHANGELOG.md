@@ -35,6 +35,14 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `raydock hermes` writes into Hermes' `config.yaml` is now named `rayline`
   instead of `rayline-anth`. The next launch removes the old `rayline-anth`
   entry. The Responses provider is still `rayline-resp`.
+- **Hybrid's Claude pins use the router's own model ids.** The default
+  profile pins `claude-opus-5-5` and `claude-sonnet-5-5`, and the auto-mode
+  classifier defaults to `claude-haiku-5-5`, which the router serves directly
+  from Anthropic. Before, they pinned the `anthropic/claude-*-5.5` ids, which
+  the router sends through OpenRouter. Key `hybrid.cloud_output_tokens` by the
+  new ids: settings keyed by the old ones are refused, naming the key. This
+  needs an execution core that accepts a router id as a pin's wire model
+  (semantic-router#436).
 
 ### Fixed
 

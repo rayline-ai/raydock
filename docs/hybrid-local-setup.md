@@ -198,8 +198,8 @@ pinned model:
 {
   "hybrid": {
     "cloud_output_tokens": {
-      "anthropic/claude-opus-5.5": 128000,
-      "anthropic/claude-sonnet-5.5": 128000
+      "claude-opus-5-5": 128000,
+      "claude-sonnet-5-5": 128000
     }
   }
 }
@@ -250,7 +250,7 @@ The core infers what each request is from the harness's own wire traffic:
   auto-mode safety classifier is the exception: it always goes to cloud,
   because a local model's answer it cannot parse makes Claude Code ask you to
   approve every action. It uses Claude Haiku 5.5 through your router; set
-  `"hybrid": {"classifier_model": "<provider/model>"}` in `settings.json`, or
+  `"hybrid": {"classifier_model": "<router model id>"}` in `settings.json`, or
   pass `--classifier-model` to `start`, to use another model.
 - **Compaction:** detected by comparing each request with the previous one,
   including Pi's retained tail.

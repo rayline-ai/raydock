@@ -25,7 +25,7 @@ const CLASSIFIER_PROMPT: &str = "You are a security monitor for autonomous AI co
 const BILLING_PREAMBLE: &str = "x-anthropic-billing-header:";
 
 /// The classifier's model when the user names none.
-pub(crate) const DEFAULT_CLASSIFIER_MODEL: &str = "anthropic/claude-haiku-5.5";
+pub(crate) const DEFAULT_CLASSIFIER_MODEL: &str = "claude-haiku-5-5";
 
 /// Where the classifier is sent: a cloud Messages pin's router and
 /// credential, with the classifier's own model.
@@ -151,20 +151,20 @@ mod tests {
         let config = config(json!([
             {"id": "local", "kind": "local", "url": "http://127.0.0.1:8000/v1/chat/completions",
              "protocol": "openai.chat.v1", "wire_model": "glm"},
-            pin("cloud-opus", "https://api.rayline.ai/v1/messages", "anthropic/claude-opus-5.5"),
-            pin("cloud-sonnet", "https://api.rayline.ai/v1/messages", "anthropic/claude-sonnet-5.5"),
+            pin("cloud-opus", "https://api.rayline.ai/v1/messages", "claude-opus-5-5"),
+            pin("cloud-sonnet", "https://api.rayline.ai/v1/messages", "claude-sonnet-5-5"),
         ]));
         assert_eq!(
             cloud_pin(&config, DEFAULT_CLASSIFIER_MODEL),
             Some(CloudPin {
                 url: "https://api.rayline.ai/v1/messages".into(),
-                wire_model: "anthropic/claude-haiku-5.5".into(),
+                wire_model: "claude-haiku-5-5".into(),
                 auth_env: "RAYLINE_ROUTER_API_KEY".into(),
             })
         );
         assert_eq!(
-            cloud_pin(&config, "anthropic/claude-sonnet-5.5").map(|pin| pin.wire_model),
-            Some("anthropic/claude-sonnet-5.5".into())
+            cloud_pin(&config, "claude-sonnet-5-5").map(|pin| pin.wire_model),
+            Some("claude-sonnet-5-5".into())
         );
     }
 
@@ -173,7 +173,7 @@ mod tests {
         let elsewhere = config(json!([pin(
             "cloud-sonnet",
             "https://elsewhere.example/v1/messages",
-            "anthropic/claude-sonnet-5.5"
+            "claude-sonnet-5-5"
         )]));
         assert_eq!(cloud_pin(&elsewhere, DEFAULT_CLASSIFIER_MODEL), None);
         let local_only = config(json!([{"id": "local", "kind": "local",
@@ -224,16 +224,12 @@ mod tests {
         let body =
             json!({"model": "claude-sonnet-5", "max_tokens": 64, "stop_sequences": ["</block>"]});
         let pinned: Value = serde_json::from_slice(
-            &pinned_body(
-                &serde_json::to_vec(&body).unwrap(),
-                "anthropic/claude-sonnet-5.5",
-            )
-            .unwrap(),
+            &pinned_body(&serde_json::to_vec(&body).unwrap(), "claude-sonnet-5-5").unwrap(),
         )
         .unwrap();
         assert_eq!(
             pinned,
-            json!({"model": "anthropic/claude-sonnet-5.5", "max_tokens": 64, "stop_sequences": ["</block>"]})
+            json!({"model": "claude-sonnet-5-5", "max_tokens": 64, "stop_sequences": ["</block>"]})
         );
     }
 

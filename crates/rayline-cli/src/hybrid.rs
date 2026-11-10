@@ -47,7 +47,7 @@ enum Action {
         local_context_window: Option<u64>,
         /// Model for Claude Code's auto-mode safety classifier, sent through
         /// your cloud router (default: settings `hybrid.classifier_model`, else
-        /// anthropic/claude-haiku-5.5).
+        /// claude-haiku-5-5).
         #[arg(long)]
         classifier_model: Option<String>,
         /// Isolated Decisions cell tag (development only).
