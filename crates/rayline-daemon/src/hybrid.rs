@@ -687,12 +687,18 @@ fn decisions_detail(body: &[u8]) -> String {
         return other();
     };
     let status = rest.get(..3).unwrap_or_default();
-    // The code is the service's contract code: lowercase letters and '_'.
+    // The code is the service's contract code, `^[a-z][a-z0-9_]{0,63}$`.
     let code = rest
         .get(3..)
         .and_then(|rest| rest.strip_prefix(", "))
         .and_then(|rest| rest.split(')').next())
-        .filter(|code| code.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
+        .filter(|code| {
+            code.len() <= 64
+                && code.starts_with(|c: char| c.is_ascii_lowercase())
+                && code
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        });
     match (
         status.chars().all(|c| c.is_ascii_digit()) && status.len() == 3,
         code,
@@ -1077,6 +1083,16 @@ mod tests {
         assert_eq!(
             decisions_detail(&body("Decisions request refused (HTTP 504)")),
             "refused 504"
+        );
+        assert_eq!(
+            decisions_detail(&body(
+                "Decisions request refused (HTTP 422, policy_v2_refused)"
+            )),
+            "refused 422 policy_v2_refused"
+        );
+        assert_eq!(
+            decisions_detail(&body("Decisions request refused (HTTP 422, 2bad)")),
+            "refused 422"
         );
         assert_eq!(
             decisions_detail(&body("Decisions request failed")),
