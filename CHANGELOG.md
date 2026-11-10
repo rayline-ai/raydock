@@ -61,8 +61,10 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `--local-context-window` or `hybrid.local_context_window`, `hybrid start`
   now uses the window the runtime reports (llama.cpp `/props`, or
   `/v1/models` from vLLM or TensorFold, up to 1,000,000) instead of 98,304.
-  Before, Claude Code on a model other than Qwen3.8-27B never ran locally:
-  its opening request alone is about 110,000 tokens. Ollama and MLX, which
+  Before, Claude Code on a model other than Qwen3.8-27B barely fit: its
+  opening request (about 73,000 tokens) plus the 24,576-token answer
+  allowance nearly fills 98,304, so any tools or project instructions pushed
+  it to cloud. Ollama and MLX, which
   report no window, keep the 98,304 default; a configured window still wins,
   lowered to a smaller loaded one.
 - **Hybrid reads the context window from `/v1/models`.** When a server has no
