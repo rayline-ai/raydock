@@ -107,11 +107,12 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
      truncates a longer prompt. For MLX (`mlx_lm.server`), check that your
      build's KV-cache limit, if you set one, is at least that.
 
-   Claude Code's opening request alone is about 110,000 tokens for a model
-   other than Qwen3.8-27B, and the window must also hold the answer (up to
-   32,000 tokens), so give such a model at least 262,144 tokens, or every
-   Claude Code turn goes to cloud. `start` warns when the window is too
-   small for it.
+   For a model other than Qwen3.8-27B, Claude Code's opening request is at
+   least about 75,000 tokens (more with MCP servers or project
+   instructions), and the window must also hold the answer (up to 32,000
+   tokens). Below about 100,000 tokens every Claude Code turn goes to cloud,
+   and `start` warns. 131,072 holds a plain session's first turns; give such
+   a model 262,144 tokens to keep longer sessions local.
 
    Set the window yourself with `"hybrid": {"local_context_window": 262144}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
