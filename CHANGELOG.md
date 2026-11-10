@@ -46,9 +46,10 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 ### Fixed
 
 - **`hybrid start` warns when the local window cannot hold Claude Code's
-  opening request.** For a model other than Qwen3.8-27B, a window under about
-  142,000 tokens leaves too little room for the opening request (about
-  110,000 tokens) and the answer, so every task started on cloud with no
+  opening request.** For a model other than Qwen3.8-27B, the core reserves
+  the opening request (about 73,000 tokens with no MCP servers or project
+  instructions, more with them) plus up to 32,000 for the answer. Below about
+  97,000 tokens no task start fits, so every task started on cloud with no
   sign why. `start` now says so and names the 262,144-token setting.
 - **rld logs why a turn failed before any output.** The resend and every
   final 502 from the core are logged with the routing service's HTTP status
@@ -60,8 +61,10 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `--local-context-window` or `hybrid.local_context_window`, `hybrid start`
   now uses the window the runtime reports (llama.cpp `/props`, or
   `/v1/models` from vLLM or TensorFold, up to 1,000,000) instead of 98,304.
-  Before, Claude Code on a model other than Qwen3.8-27B never ran locally:
-  its opening request alone is about 110,000 tokens. Ollama and MLX, which
+  Before, Claude Code on a model other than Qwen3.8-27B barely fit: its
+  opening request (about 73,000 tokens) plus the 24,576-token answer
+  allowance nearly fills 98,304, so any tools or project instructions pushed
+  it to cloud. Ollama and MLX, which
   report no window, keep the 98,304 default; a configured window still wins,
   lowered to a smaller loaded one.
 - **Hybrid reads the context window from `/v1/models`.** When a server has no

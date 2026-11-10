@@ -128,8 +128,8 @@ pub(crate) fn configured_local_context_window(
 /// cloud targets' window: the default exists to bound memory for a runtime
 /// whose window Raydock cannot see, and a runtime that reports one has
 /// already allocated it. Before 0.4.3 the default applied even then, so
-/// Claude Code on a non-Qwen model, whose opening request alone bounds above
-/// the default, never ran locally.
+/// Claude Code on a non-Qwen model barely fit: its opening request (about
+/// 73,000 tokens) plus the answer allowance nearly fills the default.
 pub(crate) fn resolve_local_window(
     configured: Option<u64>,
     loaded: Option<u64>,
@@ -173,23 +173,29 @@ fn local_max_output(window: u64) -> u64 {
     (window / 4).clamp(1024, MAX_OUTPUT_TOKENS)
 }
 
-/// Claude Code's opening request, in the tokens the core bounds it at for a
-/// model whose tokenizer it does not have (bytes-bounded): about 107,000 on
-/// 2026-11-10 (dev hybrid run), so 110,000 with headroom. Qwen3.8-27B's is
-/// measured with its tokenizer and is far smaller (about 39,000).
-const CLAUDE_CODE_OPENING_TOKENS: u64 = 110_000;
+/// The smallest Claude Code opening request, as the core bounds it for a
+/// model whose tokenizer it does not have (bytes-bounded), with its capacity
+/// margin and without the output allowance: about 73,000 tokens with no MCP
+/// servers or project instructions (prod, 2026-11-10: 105,061 required at a
+/// 131,072 window, of which 32,000 is the answer: 73,061). Tools and
+/// instructions add to it, so below this every task start goes to cloud and
+/// a little above it most do. Qwen3.8-27B's is measured with its tokenizer and
+/// is far smaller (about 39,000).
+const CLAUDE_CODE_OPENING_TOKENS: u64 = 73_000;
 
-/// A warning when `window` cannot hold Claude Code's opening request and the
-/// answer, so every Claude Code task start would go to cloud. None for
-/// Qwen3.8-27B, whose prompts the core measures exactly.
+/// A warning when `window` cannot hold even the smallest Claude Code opening
+/// request plus the answer the core reserves for it (`capacity.go`: prompt +
+/// output allowance + margin), so every Claude Code task start goes to
+/// cloud. None for Qwen3.8-27B, whose prompts the core measures exactly.
 pub(crate) fn small_window_warning(registry_model: &str, window: u64) -> Option<String> {
     if registry_model == LOCAL_REGISTRY_MODEL
         || window.saturating_sub(local_max_output(window)) >= CLAUDE_CODE_OPENING_TOKENS
     {
         return None;
     }
+    let allowance = local_max_output(window);
     Some(format!(
-        "Warning: the local window is {window} tokens. Claude Code's opening request alone is about {CLAUDE_CODE_OPENING_TOKENS} tokens for {registry_model}, so every Claude Code task starts on cloud. Load the local model with a 262144-token window (llama.cpp `--ctx-size 262144`, vLLM `--max-model-len 262144`) and set --local-context-window or settings hybrid.local_context_window to 262144 if you set one."
+        "Warning: the local window is {window} tokens. Claude Code's opening request needs about {CLAUDE_CODE_OPENING_TOKENS} tokens or more for {registry_model} (more with MCP servers or project instructions), plus {allowance} for the answer, so Claude Code tasks are likely to start on cloud. Load the local model with a 262144-token window (llama.cpp `--ctx-size 262144`, vLLM `--max-model-len 262144`) and set --local-context-window or settings hybrid.local_context_window to 262144 if you set one."
     ))
 }
 
@@ -1383,7 +1389,8 @@ mod tests {
     #[test]
     fn an_unconfigured_window_follows_the_runtime_and_a_configured_one_is_capped_by_it() {
         // Unconfigured: the runtime's reported window, so Claude Code's
-        // ~110k opening request fits a 262k GLM server.
+        // opening request (about 73,000 tokens plus the answer allowance)
+        // fits a 262k GLM server with room to grow.
         assert_eq!(resolve_local_window(None, Some(262_144)), (262_144, None));
         assert_eq!(resolve_local_window(None, Some(32_768)), (32_768, None));
         let (window, note) = resolve_local_window(None, Some(1_048_576));
@@ -1410,14 +1417,20 @@ mod tests {
     fn a_window_too_small_for_claude_codes_opening_request_is_warned() {
         let glm = "z-ai/glm-5.3-flash";
         let warning =
-            small_window_warning(glm, 98_304).expect("98k cannot hold the opening request");
-        assert!(warning.contains("98304"), "{warning}");
+            small_window_warning(glm, 65_536).expect("64k cannot hold the opening request");
+        assert!(warning.contains("65536"), "{warning}");
+        assert!(warning.contains("plus 16384 for the answer"), "{warning}");
         assert!(warning.contains("--ctx-size 262144"), "{warning}");
-        assert!(small_window_warning(glm, 131_072).is_some());
-        assert_eq!(small_window_warning(glm, 142_000), None);
+        // The edge: 97,333 reserves 24,333 for the answer, leaving 73,000.
+        assert!(small_window_warning(glm, 97_332).is_some());
+        assert_eq!(small_window_warning(glm, 97_333), None);
+        // 98,304 holds the measured opening request (97,637 required), and
+        // 131,072 ran Claude Code locally on prod (105,061 required).
+        assert_eq!(small_window_warning(glm, 98_304), None);
+        assert_eq!(small_window_warning(glm, 131_072), None);
         assert_eq!(small_window_warning(glm, 262_144), None);
-        // Qwen's prompts are measured with its tokenizer: 98k holds them.
-        assert_eq!(small_window_warning(LOCAL_REGISTRY_MODEL, 98_304), None);
+        // Qwen's prompts are measured with its tokenizer.
+        assert_eq!(small_window_warning(LOCAL_REGISTRY_MODEL, 65_536), None);
     }
 
     #[test]
