@@ -599,3 +599,76 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
         "only the ordinary turn reaches the core"
     );
 }
+
+/// One harness turn whose Decisions call fails is sent to the core at most
+/// twice (rld's one resend), and the harness is told not to resend:
+/// `x-should-retry: false`, which Claude Code's SDK honours.
+#[tokio::test]
+async fn a_failed_decision_reaches_the_core_at_most_twice_and_stops_the_harness_retrying() {
+    let mut runtime = Runtime::start(1);
+    let (url, token) = runtime.ready().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    // (query, core calls, harness status, harness retry-after)
+    let cases = [
+        // Refused: final, never resent.
+        ("refused=400", 1, 400, None),
+        ("refused=422&should_retry=true", 1, 400, None),
+        // Unavailable: one resend after the service's retry-after.
+        ("refused=503&retry_after=1", 2, 503, Some("1")),
+        ("refused=failed&retry_after=1", 2, 503, Some("1")),
+        // Busy: the same.
+        ("refused=429&retry_after=1", 2, 429, Some("1")),
+        // The service says not to resend.
+        (
+            "refused=503&retry_after=1&should_retry=false",
+            1,
+            503,
+            Some("1"),
+        ),
+        // A wait longer than rld holds a turn goes to the harness instead.
+        ("refused=503&retry_after=120", 1, 503, Some("120")),
+        // A timeout, a conflict or another 5xx: one resend, then final.
+        ("refused=408&retry_after=1", 2, 503, Some("1")),
+        ("refused=500&retry_after=0", 2, 503, Some("1")),
+    ];
+    let events = runtime.dir.join("events.jsonl");
+    for (query, calls, status, retry_after) in cases {
+        let before = fs::read_to_string(&events)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        let response = client
+            .post(format!("{url}/decide-fail?{query}"))
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{query}");
+        assert_eq!(response.headers()["x-should-retry"], "false", "{query}");
+        assert_eq!(
+            response
+                .headers()
+                .get("retry-after")
+                .map(|value| value.to_str().unwrap()),
+            retry_after,
+            "{query}"
+        );
+        assert_eq!(
+            response.headers().get_all("retry-after").iter().count(),
+            usize::from(retry_after.is_some()),
+            "{query}"
+        );
+        let after = fs::read_to_string(&events).unwrap().lines().count();
+        assert_eq!(after - before, calls, "{query}");
+    }
+    client
+        .post(format!("{url}/_rayline/shutdown"))
+        .bearer_auth(&token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert!(runtime.exited().await.success());
+}

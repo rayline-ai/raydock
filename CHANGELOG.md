@@ -15,7 +15,7 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   doesn't know, and the error names the setting. It can't be combined with
   `--config`, since a profile file sets its own model.
 - **`prefer_local` works with any local model.** The bundled execution core
-  (`rayline-core`, now pinned to `dbde74c0`) counts Qwen3.8-27B prompts exactly
+  (`rayline-core`, now pinned to `e71fa0ae`) counts Qwen3.8-27B prompts exactly
   and bounds other models' text prompts by their byte size (`caller_bounded`),
   so ARC can keep a turn local only when it fits the window. It no longer needs
   a llama.cpp prompt counter. This needs the production router from
@@ -56,6 +56,17 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   for more output than a cloud deployment's ceiling is lowered to it instead of
   refused, as the local deployment already did; the stated and sent figures are
   logged. A turn whose thinking budget reaches the ceiling is still refused.
+- **A failed routing decision is no longer retried many times.** When Rayline's
+  routing service refuses a hybrid turn (for example over a price or model it
+  doesn't know), Claude Code now gets a final HTTP 400 that says why, instead
+  of a 502 it resent about ten times. When the service is unavailable or busy,
+  `rld` resends the turn once, after the service's `retry-after` (only if it
+  asks for 30 seconds or less, and never when it sends
+  `x-should-retry: false`; about 5 seconds, randomly varied, when it names no
+  wait), and then reports HTTP 503 or 429. Every such error carries
+  `x-should-retry: false`, so the harness SDK doesn't resend it again, and a
+  retryable one carries `retry-after`. A failed turn is now sent at most twice
+  instead of about ten times.
 
 ### Note
 
