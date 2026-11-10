@@ -305,7 +305,8 @@ raydock hybrid status
 raydock hybrid stop
 ```
 
-It needs macOS 13 or later or Linux, a release that includes `rayline-core`, and a
+It needs macOS 13 or later, Linux, or Windows 10/11 (x86_64, natively from 0.4.2), a
+release that includes `rayline-core`, and a
 local server running Qwen3.8-27B (`Qwen/Qwen3.8-27B`, or `qwen3.8:27b` on Ollama). Plan
 for at least 32 GB of memory: at 4-bit the weights alone are about 17 GB, before the
 cache for the 98,304-token window, so a 16 GB machine cannot run it. If the runtime
