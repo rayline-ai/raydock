@@ -600,11 +600,11 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
     );
 }
 
-/// One harness turn whose Decisions call fails reaches the routing service at
-/// most twice (rld's one resend), and the harness is told not to resend:
+/// One harness turn whose Decisions call fails is sent to the core at most
+/// twice (rld's one resend), and the harness is told not to resend:
 /// `x-should-retry: false`, which Claude Code's SDK honours.
 #[tokio::test]
-async fn a_failed_decision_costs_at_most_two_lookups_and_stops_the_harness_retrying() {
+async fn a_failed_decision_reaches_the_core_at_most_twice_and_stops_the_harness_retrying() {
     let mut runtime = Runtime::start(1);
     let (url, token) = runtime.ready().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
