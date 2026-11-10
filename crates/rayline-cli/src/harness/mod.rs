@@ -15,10 +15,12 @@
 //! last-written key.
 //!
 //! Every config uses Anthropic Messages, except OpenClaw, whose default
-//! provider speaks OpenAI Chat Completions, with `contextWindow` 1000000 and
-//! `maxTokens` 128000 for the hosted ARC tiers. The main agent defaults to ARC
-//! Sage (`arc-sage-1.0`) and, where the harness has a separate
-//! small/background model role, that role to ARC Swift (`arc-swift-1.0`).
+//! provider speaks OpenAI Chat Completions. The models, their names and their
+//! limits are the ones the router's `GET /v1/models` lists for the key, read
+//! once per launch ([`fetch_hosted_models`]): the main agent defaults to the
+//! listed ARC Sage (`product: arc-sage-1.0`) and, where the harness has a
+//! separate small/background model role, that role to the listed ARC Swift
+//! (`product: arc-swift-1.0`), so a contributor or ZDR key gets its own ids.
 //! Under `raydock hybrid run` every renderer keeps `rayline-auto` (the execution
 //! core's virtual model) and advertises the hybrid runtime's admitted limits
 //! instead ([`RenderContext::capabilities`]): a harness that asks for more
@@ -85,48 +87,231 @@ pub const SESSION_AFFINITY_HEADER: &str = "x-session-affinity";
 /// The execution core's virtual model under `raydock hybrid run`.
 pub const ROUTER_MODEL: &str = crate::VIRTUAL_ROUTER_MODEL;
 
+/// A model's price in USD per million tokens, from the router's
+/// `GET /v1/arc/prices` card.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ModelPrice {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+/// A model a rendered config offers, at the limits it advertises.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LaunchModel {
+    pub id: String,
+    pub display_name: String,
+    pub context_window: u64,
+    pub max_output_tokens: u64,
+    /// The ARC product the model runs (`product` in `GET /v1/models`): the
+    /// same `arc-sage-1.0` for ARC Sage in every data mode. `None` for a
+    /// model that is no ARC product (hybrid's virtual model).
+    pub product: Option<String>,
+    /// Its row on the price card ([`LaunchModels::apply_arc_prices`]), for a
+    /// harness that shows costs (omp); `None` when not read or not on it.
+    pub price: Option<ModelPrice>,
+}
+
 /// The models a rendered config selects and offers.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LaunchModels {
     /// The main agent's default.
-    pub main: &'static str,
+    pub main: String,
     /// The default for a harness's small/background or subagent model role.
-    pub background: &'static str,
+    pub background: String,
     /// Every model the provider entry lists, default first.
-    pub offered: &'static [&'static str],
+    pub offered: Vec<LaunchModel>,
+    /// The ARC product of each id the price card's catalog names
+    /// ([`LaunchModels::apply_arc_prices`]), mode ids included, so a saved
+    /// pick from another data mode finds its product's listed id.
+    pub products: std::collections::BTreeMap<String, String>,
 }
 
-/// A hosted launch offers the current ARC tiers only.
-pub(crate) const HOSTED_MODELS: LaunchModels = LaunchModels {
-    main: crate::ARC_SAGE_MODEL,
-    background: crate::ARC_SWIFT_MODEL,
-    offered: &[crate::ARC_SAGE_MODEL, crate::ARC_SWIFT_MODEL],
-};
+impl LaunchModels {
+    /// A hosted launch: every model the router's `GET /v1/models` lists for
+    /// the key, which are the standard, contributor or ZDR ids by the
+    /// account's data mode. The main agent runs the entry whose `product` is
+    /// ARC Sage, the background role the one whose `product` is ARC Swift;
+    /// a listing without either is an error.
+    pub(crate) fn from_listing(body: &Value) -> Result<Self, String> {
+        let data = body
+            .get("data")
+            .and_then(Value::as_array)
+            .ok_or("the response has no `data` list")?;
+        let mut offered = data
+            .iter()
+            .map(|entry| {
+                let id = entry
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or("a listed model has no id")?;
+                let limit = |field: &str| {
+                    entry
+                        .get(field)
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| format!("{id} has no {field}"))
+                };
+                Ok(LaunchModel {
+                    id: id.to_owned(),
+                    // An entry without a display name goes by its id.
+                    display_name: entry
+                        .get("display_name")
+                        .and_then(Value::as_str)
+                        .unwrap_or(id)
+                        .to_owned(),
+                    context_window: limit("context_length")?,
+                    max_output_tokens: limit("max_output_tokens")?,
+                    product: entry
+                        .get("product")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    price: None,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let product_model = |product: &str| {
+            offered
+                .iter()
+                .find(|model| model.product.as_deref() == Some(product))
+                .map(|model| model.id.clone())
+                .ok_or_else(|| format!("no listed model has \"product\": \"{product}\""))
+        };
+        let main = product_model(crate::ARC_SAGE_MODEL)?;
+        let background = product_model(crate::ARC_SWIFT_MODEL)?;
+        offered.sort_by_key(|model| model.id != main);
+        Ok(Self {
+            main,
+            background,
+            offered,
+            products: Default::default(),
+        })
+    }
 
-/// `raydock hybrid run`: the execution core serves one virtual model.
-pub(crate) const HYBRID_MODELS: LaunchModels = LaunchModels {
-    main: ROUTER_MODEL,
-    background: ROUTER_MODEL,
-    offered: &[ROUTER_MODEL],
-};
+    /// `raydock hybrid run`: the execution core serves one virtual model, at
+    /// the limits the hybrid runtime admits.
+    pub(crate) fn hybrid(capabilities: &rayline_local_router::ModelCapabilities) -> Self {
+        Self {
+            main: ROUTER_MODEL.to_owned(),
+            background: ROUTER_MODEL.to_owned(),
+            offered: vec![LaunchModel {
+                id: ROUTER_MODEL.to_owned(),
+                display_name: "Raydock router".to_owned(),
+                context_window: capabilities.context_window,
+                max_output_tokens: capabilities.max_output_tokens,
+                product: None,
+                price: None,
+            }],
+            products: Default::default(),
+        }
+    }
 
-/// Display name for a model a provider entry lists.
-pub(crate) fn model_display_name(model: &str) -> &'static str {
-    match model {
-        crate::ARC_SAGE_MODEL => "ARC Sage",
-        crate::ARC_SWIFT_MODEL => "ARC Swift",
-        ROUTER_MODEL => "Raydock router",
-        _ => "Raydock",
+    /// Read a `GET /v1/arc/prices` answer: each id's product from its catalog
+    /// (`arc_mode.product`; a base id is its own product), and each offered
+    /// model's price by its own id, since every data mode has its own row. A
+    /// model without a complete row gets no price.
+    pub(crate) fn apply_arc_prices(&mut self, prices: &Value) {
+        if let Some(catalog) = prices["catalog"].as_object() {
+            self.products = catalog
+                .iter()
+                .map(|(id, entry)| {
+                    let product = entry.pointer("/arc_mode/product").and_then(Value::as_str);
+                    (id.clone(), product.unwrap_or(id).to_owned())
+                })
+                .collect();
+        }
+        for model in &mut self.offered {
+            let row = &prices["card"]["prices"][model.id.as_str()];
+            let field = |name: &str| row.get(name).and_then(Value::as_f64);
+            model.price = match (
+                field("input"),
+                field("output"),
+                field("cache_read"),
+                field("cache_write"),
+            ) {
+                (Some(input), Some(output), Some(cache_read), Some(cache_write)) => {
+                    Some(ModelPrice {
+                        input,
+                        output,
+                        cache_read,
+                        cache_write,
+                    })
+                }
+                _ => None,
+            };
+        }
+    }
+
+    /// The main agent's model.
+    pub(crate) fn main_model(&self) -> &LaunchModel {
+        &self.offered[0]
+    }
+
+    /// What a harness's saved pick of `id` becomes: `None` while the key lists
+    /// `id`; otherwise the listed model of `id`'s product (a seeded
+    /// `arc-sage-1.0` on a contributor key is `arc-sage-contributor-1.0`, and
+    /// a saved `arc-swift-contributor-1.0` on a standard key `arc-swift-1.0`),
+    /// else `default` (the retired Legacy `rayline-router`).
+    pub(crate) fn stale_pick<'a>(&'a self, id: &str, default: &'a str) -> Option<&'a str> {
+        if self.offered.iter().any(|model| model.id == id) {
+            return None;
+        }
+        let product = self.products.get(id).map_or(id, String::as_str);
+        Some(
+            self.offered
+                .iter()
+                .find(|model| model.product.as_deref() == Some(product))
+                .map_or(default, |model| model.id.as_str()),
+        )
     }
 }
-/// Maximum input context ARC accepts on `arc-sage-1.0` and
-/// `arc-swift-1.0`.
-pub const ARC_CONTEXT_WINDOW: u64 = 1_000_000;
+
+/// `GET /v1/models` with the launch's key: the models a hosted launch offers
+/// ([`LaunchModels::from_listing`]). Fails the launch when the router cannot
+/// say, rather than guessing ids for a data mode it did not name.
+pub(crate) async fn fetch_hosted_models(
+    router_url: &str,
+    key: &str,
+) -> Result<LaunchModels, String> {
+    let url = format!("{router_url}/v1/models");
+    get_json(&url, Some(key))
+        .await
+        .and_then(|body| LaunchModels::from_listing(&body))
+        .map_err(|error| format!("couldn't read this key's models from {url}: {error}"))
+}
+
+/// The router's public ARC price card, `GET /v1/arc/prices`.
+pub(crate) async fn fetch_arc_prices(router_url: &str) -> Result<Value, String> {
+    let url = format!("{router_url}/v1/arc/prices");
+    get_json(&url, None)
+        .await
+        .map_err(|error| format!("couldn't read the ARC prices from {url}: {error}"))
+}
+
+async fn get_json(url: &str, bearer: Option<&str>) -> Result<Value, String> {
+    let mut request = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|error| error.to_string())?
+        .get(url);
+    if let Some(bearer) = bearer {
+        request = request.bearer_auth(bearer);
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
+    let status = response.status();
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| format!("HTTP {status}: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("HTTP {status}: {body}"));
+    }
+    Ok(body)
+}
+
 /// Output ceiling for models outside the hosted ARC tiers: the harness
 /// default the router admits.
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
-/// Maximum output ARC accepts on `arc-sage-1.0` and `arc-swift-1.0`.
-pub const ARC_MAX_OUTPUT_TOKENS: u64 = 128_000;
 /// Runtime override for [`ConversationIdFallback`]: `1` or `0`.
 pub const CONV_ID_FALLBACK_ENV: &str = "RAYLINE_HARNESS_CONV_ID_FALLBACK";
 
@@ -283,39 +468,12 @@ pub(crate) struct RenderContext<'a> {
     pub capabilities: Option<&'a rayline_local_router::ModelCapabilities>,
     /// The installed harness's major version ([`Harness::major_version`]).
     pub harness_major_version: Option<u64>,
+    /// The models this launch selects and offers: the router's listing for a
+    /// hosted launch, [`LaunchModels::hybrid`] under `raydock hybrid run`.
+    pub models: LaunchModels,
 }
 
 impl RenderContext<'_> {
-    /// The models this launch selects and offers: [`HYBRID_MODELS`] under
-    /// `raydock hybrid run` (which sets [`Self::capabilities`]), else
-    /// [`HOSTED_MODELS`].
-    pub fn models(&self) -> LaunchModels {
-        if self.capabilities.is_some() {
-            HYBRID_MODELS
-        } else {
-            HOSTED_MODELS
-        }
-    }
-
-    /// Context window to advertise for the router model.
-    pub fn context_window(&self) -> u64 {
-        self.capabilities
-            .map_or(ARC_CONTEXT_WINDOW, |caps| caps.context_window)
-    }
-
-    /// Output cap to advertise for `model`: the hybrid runtime's admitted
-    /// limit under `raydock hybrid run`, 128,000 for a hosted ARC tier, and the
-    /// harness default otherwise.
-    pub fn max_output_tokens(&self, model: &str) -> u64 {
-        match self.capabilities {
-            Some(caps) => caps.max_output_tokens,
-            None if matches!(model, crate::ARC_SAGE_MODEL | crate::ARC_SWIFT_MODEL) => {
-                ARC_MAX_OUTPUT_TOKENS
-            }
-            None => MAX_OUTPUT_TOKENS,
-        }
-    }
-
     /// Input modalities to advertise for the router model.
     pub fn input_modalities(&self) -> Value {
         match self.capabilities {
@@ -421,6 +579,19 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         omp::warn_if_old(&binary);
     }
 
+    let mut models = fetch_hosted_models(&router_url, &key).await?;
+    // omp shows each model's cost, and omp and pi move a saved pick from
+    // another data mode to its product's listed id: both from the price card.
+    if matches!(harness, Harness::Omp | Harness::Pi) {
+        match fetch_arc_prices(&router_url).await {
+            Ok(prices) => models.apply_arc_prices(&prices),
+            Err(error) => eprintln!(
+                "warning: {error}; {} shows no model costs, and a saved pick from another \
+                 data mode moves to its default model",
+                harness.name()
+            ),
+        }
+    }
     let config_dir = config_dir(&home, harness, &env_name);
     let ctx = RenderContext {
         key: &key,
@@ -435,10 +606,11 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         ),
         capabilities: None,
         harness_major_version: harness.major_version(Some(&binary)),
+        models,
     };
     let plan = harness.plan(&ctx)?;
     if harness == Harness::Omp {
-        omp_migration::migrate(&config_dir, &request.args)
+        omp_migration::migrate(&config_dir, &request.args, &ctx.models)
             .map_err(|error| format!("failed to migrate hosted omp state: {error}"))?;
     }
     write_files(&config_dir, &plan.files).map_err(|error| {
@@ -818,6 +990,106 @@ pub(crate) mod tests {
         dir
     }
 
+    /// A `GET /v1/models` answer for a key in `mode` (`None`: standard),
+    /// listing Swift before Sage as the router does.
+    pub(crate) fn listing(mode: Option<&str>) -> Value {
+        let entry = |product: &str, name: &str| {
+            let id = mode.map_or_else(
+                || product.to_owned(),
+                |mode| product.replace("-1.0", &format!("-{mode}-1.0")),
+            );
+            json!({
+                "id": id, "object": "model", "owned_by": "rayline",
+                "display_name": name, "product": product,
+                "context_length": 1_000_000, "max_output_tokens": 128_000
+            })
+        };
+        json!({
+            "object": "list",
+            "data": [
+                entry(crate::ARC_SWIFT_MODEL, "ARC Swift"),
+                entry(crate::ARC_SAGE_MODEL, "ARC Sage")
+            ]
+        })
+    }
+
+    /// The models a standard key's hosted launch offers.
+    pub(crate) fn hosted_models() -> LaunchModels {
+        LaunchModels::from_listing(&listing(None)).unwrap()
+    }
+
+    #[test]
+    fn a_listing_picks_sage_and_swift_by_product_and_keeps_its_limits() {
+        let mut body = listing(Some("contributor"));
+        body["data"][0]["context_length"] = json!(200_000);
+        body["data"].as_array_mut().unwrap().push(json!({
+            "id": "other/model", "object": "model", "owned_by": "other",
+            "context_length": 32_000, "max_output_tokens": 4_096
+        }));
+        let models = LaunchModels::from_listing(&body).unwrap();
+        assert_eq!(models.main, "arc-sage-contributor-1.0");
+        assert_eq!(models.background, "arc-swift-contributor-1.0");
+        let ids: Vec<_> = models
+            .offered
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "arc-sage-contributor-1.0",
+                "arc-swift-contributor-1.0",
+                "other/model"
+            ]
+        );
+        assert_eq!(models.offered[1].context_window, 200_000);
+        assert_eq!(models.offered[2].display_name, "other/model");
+        assert_eq!(models.offered[2].product, None);
+    }
+
+    #[test]
+    fn a_listing_without_products_or_limits_is_an_error() {
+        let mut body = listing(None);
+        for entry in body["data"].as_array_mut().unwrap() {
+            entry.as_object_mut().unwrap().remove("product");
+        }
+        assert_eq!(
+            LaunchModels::from_listing(&body).unwrap_err(),
+            "no listed model has \"product\": \"arc-sage-1.0\""
+        );
+        let mut body = listing(None);
+        body["data"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("max_output_tokens");
+        assert_eq!(
+            LaunchModels::from_listing(&body).unwrap_err(),
+            "arc-sage-1.0 has no max_output_tokens"
+        );
+    }
+
+    #[test]
+    fn prices_come_from_each_ids_card_row() {
+        let mut models = LaunchModels::from_listing(&listing(Some("contributor"))).unwrap();
+        models.apply_arc_prices(&json!({"card": {"prices": {
+            "arc-sage-contributor-1.0": {
+                "input": 0.5, "output": 2.5, "cache_read": 0.025, "cache_write": 0.625
+            },
+            "arc-sage-1.0": {"input": 9.0, "output": 9.0, "cache_read": 9.0, "cache_write": 9.0}
+        }}}));
+        assert_eq!(
+            models.main_model().price,
+            Some(ModelPrice {
+                input: 0.5,
+                output: 2.5,
+                cache_read: 0.025,
+                cache_write: 0.625
+            })
+        );
+        // No row for this id: no price, never another id's.
+        assert_eq!(models.offered[1].price, None);
+    }
+
     /// A hosted dev context writing into `dir`.
     pub(crate) fn render_context(dir: &Path) -> RenderContext<'_> {
         RenderContext {
@@ -828,6 +1100,7 @@ pub(crate) mod tests {
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
+            models: hosted_models(),
         }
     }
 
@@ -852,6 +1125,7 @@ pub(crate) mod tests {
             allow_empty_signature: pi::allow_empty_signature("dev", None),
             capabilities: None,
             harness_major_version: None,
+            models: hosted_models(),
         };
         let plan = harness.plan(&ctx).unwrap();
         write_files(&dir, &plan.files).unwrap();

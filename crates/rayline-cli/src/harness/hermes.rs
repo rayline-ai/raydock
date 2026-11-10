@@ -87,7 +87,7 @@ const OWNED: &[&[&str]] = &[
 ];
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
-    let launch = ctx.models();
+    let launch = &ctx.models;
     // `prompt_caching` makes Hermes place its Anthropic cache markers for a
     // model whose name does not look like Claude; without it the router sees
     // no `cache_control` and nothing upstream adds one for a Messages client.
@@ -96,11 +96,11 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
             .offered
             .iter()
             .map(|model| {
-                let mut entry = json!({ "context_length": ctx.context_window() });
+                let mut entry = json!({ "context_length": model.context_window });
                 if prompt_caching {
                     entry[PROMPT_CACHING_KEY] = json!(true);
                 }
-                ((*model).to_owned(), entry)
+                (model.id.clone(), entry)
             })
             .collect()
     };
@@ -142,7 +142,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
         "model": {
             "provider": format!("custom:{default_provider}"),
             "default": launch.main,
-            "context_length": ctx.context_window()
+            "context_length": launch.main_model().context_window
         },
         "providers": {
             MESSAGES_PROVIDER: messages,
@@ -240,6 +240,7 @@ mod tests {
             allow_empty_signature: true,
             capabilities: Some(&capabilities),
             harness_major_version: None,
+            models: super::super::LaunchModels::hybrid(&capabilities),
         };
         write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
         let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
@@ -273,6 +274,7 @@ mod tests {
                 allow_empty_signature: false,
                 capabilities: None,
                 harness_major_version: None,
+                models: super::super::tests::hosted_models(),
             };
             write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
             std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap()
@@ -302,6 +304,7 @@ mod tests {
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
+            models: super::super::tests::hosted_models(),
         };
         let plan = super::plan(&ctx).unwrap();
         // Hermes saves a setting after Rayline read the file.
@@ -366,6 +369,7 @@ fallback_model:
                 allow_empty_signature: false,
                 capabilities: None,
                 harness_major_version: None,
+                models: super::super::tests::hosted_models(),
             };
             write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
             std::fs::read_to_string(&path).unwrap()
@@ -433,6 +437,7 @@ fallback_providers: []
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
+            models: super::super::tests::hosted_models(),
         };
         let error = super::plan(&ctx).unwrap_err();
         assert!(error.contains("fix or remove the file"), "{error}");

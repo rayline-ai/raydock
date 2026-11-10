@@ -81,9 +81,9 @@ Commands:
   hermes     Run Hermes Agent on ARC through the Rayline router
   openclaw   Run OpenClaw on ARC through the Rayline router
 
-Harness launches default to ARC: arc-sage-1.0 for the main agent and
-arc-swift-1.0 for subagents and background tasks where the harness has a
-separate role for them.
+Harness launches default to ARC: the ARC Sage your key lists for the main
+agent and its ARC Swift for subagents and background tasks where the harness
+has a separate role for them.
   router     Start, inspect, or stop the local Rayline router runtime
   hybrid     Start the ARC execution core or connect a harness to it
   top        Show live router request metrics
@@ -141,13 +141,13 @@ Usage: raydock claude [OPTIONS] [--] [CLAUDE_ARGS]...
 Run Claude Code through Rayline hosted routing. Use --local for the
 local static router path.
 
-Hosted routing defaults to ARC: the main agent on arc-sage-1.0, subagents
-and background tasks on arc-swift-1.0 (CLAUDE_CODE_SUBAGENT_MODEL, forced on
+Hosted routing defaults to ARC: the main agent on the ARC Sage your key lists,
+subagents and background tasks on its ARC Swift (CLAUDE_CODE_SUBAGENT_MODEL, forced on
 every subagent, and ANTHROPIC_DEFAULT_HAIKU_MODEL, unless you set them). With
 --model X and --route all, subagents and background tasks run on X too.
 
 Options:
-  -m, --model <model>               Main-agent model (default: arc-sage-1.0)
+  -m, --model <model>               Main-agent model (default: your key's ARC Sage)
   --auto-compact-window <tokens>    Override Claude auto-compact threshold
   --local                           Use local static routing without hosted auth
                                     (no login; forces the proxy)
@@ -225,7 +225,7 @@ Options:
   --auth <mode>           Codex auth source: auto|subscription|none.
                           auto with no --config defaults to Rc-Rc (route
                           everything to the hosted cloud router on ARC:
-                          arc-sage-1.0 main, arc-swift-1.0 subagents, via
+                          your key's ARC Sage main, ARC Swift subagents, via
                           ~/.config/rayline/router.json);
                           with --config it follows the config. subscription
                           uses your ChatGPT subscription; none runs local.

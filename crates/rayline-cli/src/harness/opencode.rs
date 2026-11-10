@@ -24,26 +24,18 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, RenderContext, json_file, model_display_name};
+use super::{CONV_ID_ENV, Plan, RenderContext, json_file};
 
 pub(crate) const CONFIG_FILE: &str = "opencode.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
-    let models = ctx.models();
+    let models = &ctx.models;
     let mut entries = serde_json::Map::new();
-    for model in models.offered {
-        // Hosted OpenCode exposes ARC Sage and ARC Swift only. The hybrid
-        // launcher has one virtual router model supplied by its execution core.
-        if ctx.capabilities.is_none()
-            && *model != crate::ARC_SAGE_MODEL
-            && *model != crate::ARC_SWIFT_MODEL
-        {
-            continue;
-        }
+    for model in &models.offered {
         let mut entry = json!({
-            "name": model_display_name(model),
-            "limit": { "context": ctx.context_window(), "output": ctx.max_output_tokens(model) },
+            "name": model.display_name,
+            "limit": { "context": model.context_window, "output": model.max_output_tokens },
             "modalities": { "input": ctx.input_modalities(), "output": ["text"] },
             "tool_call": true
         });
@@ -55,7 +47,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             entry["attachment"] = json!(images);
             entry["reasoning"] = json!(true);
         }
-        entries.insert((*model).to_owned(), entry);
+        entries.insert(model.id.clone(), entry);
     }
     let config = json!({
         "$schema": "https://opencode.ai/config.json",
@@ -315,6 +307,7 @@ mod tests {
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: Some(1),
+            models: super::super::tests::hosted_models(),
         };
         let config: serde_json::Value =
             serde_json::from_str(&plan(&ctx).files[0].contents).unwrap();
