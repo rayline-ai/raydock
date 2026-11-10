@@ -5,6 +5,13 @@
 //! Invalid/oversized data only makes telemetry unavailable, not inference failed.
 //! Buffered JSON never emits FirstToken: body completion is not token arrival.
 //! No error text, response models, or lifecycle updates are recorded.
+//!
+//! SSE is observed in two layers. The framing layer decides the stream verdict
+//! (terminal success, definite failure, `[DONE]`) from each frame's small
+//! `event:` name and `data: [DONE]` line, at every frame boundary, whether or
+//! not the frame's payload fit the bound or parsed. The payload layer extracts
+//! usage, first token and in-payload failure signals on a best-effort basis; a
+//! payload that is oversized, too deep or malformed only costs that telemetry.
 
 #[cfg(test)]
 #[path = "response_tests.rs"]
@@ -17,6 +24,12 @@ use crate::{MetricsUpdate, SharedMetricsSink};
 /// Maximum JSON body or SSE frame scratch size. Oversized SSE frames are
 /// discarded through their blank-line delimiter; subsequent frames still work.
 pub const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+
+/// Longest SSE `event:` name kept; a longer name cannot be a known event.
+const MAX_EVENT_NAME: usize = 64;
+/// Bytes of each SSE line kept to recognize `event:` / `data: [DONE]` lines
+/// (prefix, one optional space and the longest name or marker).
+const LINE_HEAD_MAX: usize = "event: ".len() + MAX_EVENT_NAME;
 
 /// Response classification independent of transport completion and telemetry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +50,13 @@ pub struct ResponseObserver {
     skipping: bool,
     line_nonempty: bool,
     after_cr: bool,
+    // Framing layer: per-line head and per-frame event/[DONE] state, kept
+    // independently of the payload scratch bound.
+    line_head: Vec<u8>,
+    line_len: usize,
+    event: String,
+    data_lines: usize,
+    done_line: bool,
     terminal: bool,
     failed: bool,
     first_token: bool,
@@ -57,6 +77,11 @@ impl ResponseObserver {
             skipping: false,
             line_nonempty: false,
             after_cr: false,
+            line_head: Vec::new(),
+            line_len: 0,
+            event: String::new(),
+            data_lines: 0,
+            done_line: false,
             terminal: false,
             failed: false,
             first_token: false,
@@ -94,19 +119,18 @@ impl ResponseObserver {
             self.after_cr = byte == b'\r';
             if byte == b'\r' || byte == b'\n' {
                 if self.line_nonempty {
+                    self.end_line();
                     self.push(b'\n');
                     self.line_nonempty = false;
                 } else {
-                    if !self.skipping {
-                        let frame = std::mem::take(&mut self.scratch);
-                        self.frame(&frame);
-                        self.scratch = frame;
-                    }
-                    self.scratch.clear();
-                    self.skipping = false;
+                    self.end_frame();
                 }
             } else {
                 self.line_nonempty = true;
+                if self.line_head.len() < LINE_HEAD_MAX {
+                    self.line_head.push(byte);
+                }
+                self.line_len = self.line_len.saturating_add(1);
                 self.push(byte);
             }
         }
@@ -182,29 +206,66 @@ impl ResponseObserver {
         self.failed
     }
 
-    fn frame(&mut self, frame: &[u8]) {
+    /// Framing layer: note a finished line's `event:` name or `data: [DONE]`.
+    fn end_line(&mut self) {
+        let truncated = self.line_len > LINE_HEAD_MAX;
+        if let Some(rest) = self.line_head.strip_prefix(b"event:") {
+            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+            self.event = match std::str::from_utf8(rest) {
+                Ok(name) if !truncated && name.len() <= MAX_EVENT_NAME => name.to_owned(),
+                _ => String::new(),
+            };
+        } else if let Some(rest) = self.line_head.strip_prefix(b"data:") {
+            let rest = rest.strip_prefix(b" ").unwrap_or(rest);
+            if truncated || !rest.is_empty() {
+                self.data_lines += 1;
+                self.done_line = !truncated && rest.trim_ascii() == b"[DONE]";
+            }
+        }
+        self.line_head.clear();
+        self.line_len = 0;
+    }
+
+    /// Framing layer: the stream verdict comes from the event name and the
+    /// `[DONE]` marker alone, so a payload that was skipped as oversized or that
+    /// fails to parse can never erase it. Then the best-effort payload layer runs.
+    fn end_frame(&mut self) {
+        let event = std::mem::take(&mut self.event);
+        if is_error_type(&event) {
+            self.failed = true;
+            self.terminal = true;
+        } else if matches!(event.as_str(), "message_stop" | "response.completed") {
+            self.terminal = true;
+        }
+        if self.data_lines == 1 && self.done_line {
+            self.terminal = true;
+        }
+        self.data_lines = 0;
+        self.done_line = false;
+        if !self.skipping {
+            let frame = std::mem::take(&mut self.scratch);
+            self.frame(&frame, &event);
+            self.scratch = frame;
+        }
+        self.scratch.clear();
+        self.skipping = false;
+    }
+
+    /// Payload layer for one bounded frame: telemetry and in-payload signals.
+    fn frame(&mut self, frame: &[u8], event: &str) {
         let Ok(text) = std::str::from_utf8(frame) else {
             return;
         };
-        let mut event = "";
         let mut data = String::new();
         for line in text.lines() {
-            if let Some(value) = line.strip_prefix("event:") {
-                event = value.strip_prefix(' ').unwrap_or(value);
-            } else if let Some(value) = line.strip_prefix("data:") {
+            if let Some(value) = line.strip_prefix("data:") {
                 if !data.is_empty() {
                     data.push('\n');
                 }
                 data.push_str(value.strip_prefix(' ').unwrap_or(value));
             }
         }
-        if is_error_type(event) {
-            self.failed = true;
-            self.terminal = true;
-        }
-        if data.trim() == "[DONE]" {
-            self.terminal = true;
-        } else if !data.is_empty() {
+        if data.trim() != "[DONE]" && !data.is_empty() {
             self.json(data.as_bytes(), event);
         }
     }
@@ -213,13 +274,19 @@ impl ResponseObserver {
         let value = match serde_json::from_slice::<Value>(bytes) {
             Ok(value) => value,
             Err(error) => {
-                // serde_json bounds nesting depth (128). Valid but deeply nested
-                // output, such as a tool input, exhausts that resource limit; it
-                // is unavailable telemetry, not evidence the inference failed.
-                // serde_json exposes no stable error code, so match its message.
-                let depth_limit = error.to_string().starts_with("recursion limit exceeded");
-                if !self.sse && !depth_limit {
-                    self.json_validity = ResponseValidity::Invalid;
+                if !self.sse {
+                    // serde_json bounds nesting depth (128) and reports that limit
+                    // before it reaches later syntax errors, so exhaustion proves
+                    // nothing about validity. It is not an inference failure when
+                    // the body is structurally complete (telemetry unavailable);
+                    // otherwise the body is malformed. serde_json exposes no
+                    // stable error code, so match its message.
+                    let depth_limit = error.to_string().starts_with("recursion limit exceeded");
+                    self.json_validity = if depth_limit && structurally_complete(bytes) {
+                        ResponseValidity::Unavailable
+                    } else {
+                        ResponseValidity::Invalid
+                    };
                 }
                 return;
             }
@@ -313,6 +380,52 @@ impl ResponseObserver {
             });
         }
     }
+}
+
+/// Whether `bytes` is one balanced JSON object or array followed only by JSON
+/// whitespace. Deliberately a structural check, not a parser: it tracks string
+/// state and bracket kinds without recursion (a `Vec` stack bounded by the
+/// buffer length), so it cannot overflow the native stack and does not validate
+/// scalars, commas or colons. It is used only after serde_json hit its depth
+/// limit, to tell deep-but-complete bodies from truncated or garbled ones.
+fn structurally_complete(bytes: &[u8]) -> bool {
+    let mut stack: Vec<u8> = Vec::new();
+    let (mut in_string, mut escaped, mut root_closed) = (false, false, false);
+    for &byte in bytes {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        let whitespace = matches!(byte, b' ' | b'\t' | b'\n' | b'\r');
+        if root_closed || stack.is_empty() {
+            // Before the root only whitespace or an opener; after it only whitespace.
+            if whitespace || (!root_closed && matches!(byte, b'{' | b'[')) {
+                if !whitespace {
+                    stack.push(byte);
+                }
+                continue;
+            }
+            return false;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'{' | b'[' => stack.push(byte),
+            b'}' | b']' => {
+                let expected = if byte == b'}' { b'{' } else { b'[' };
+                if stack.pop() != Some(expected) {
+                    return false;
+                }
+                root_closed = stack.is_empty();
+            }
+            _ => {}
+        }
+    }
+    root_closed && !in_string
 }
 
 fn recognized_response(value: &Value) -> bool {

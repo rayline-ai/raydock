@@ -3705,6 +3705,7 @@ mod tests {
             "{}",
             "hello",
             r#"{"ok":true,"active":[],"recent":[],"totals":{},"runtime":"rayline-hybrid"}"#,
+            MALFORMED_ROWS_SNAPSHOT,
         ] {
             let home = unique_test_dir("top-unrelated-http");
             let hybrid = hybrid_top_fixture(&home, serde_json::json!({})).await;
@@ -3749,20 +3750,26 @@ mod tests {
         }
     }
 
+    const MALFORMED_ROWS_SNAPSHOT: &str = r#"{"ok":true,"active":[1],"recent":[],"totals":{}}"#;
     const GENUINE_SNAPSHOT: &str =
         r#"{"ok":true,"runtime":"legacy","active":[],"recent":[],"totals":{}}"#;
 
     /// A local HTTP responder answering every request with 200 and `body`.
     async fn fixed_body_server(body: impl Into<String>) -> (u16, tokio::task::JoinHandle<()>) {
-        let body: String = body.into();
+        sequence_server(vec![body.into()]).await
+    }
+
+    /// Answers successive requests with successive bodies, repeating the last.
+    async fn sequence_server(bodies: Vec<String>) -> (u16, tokio::task::JoinHandle<()>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let handle = tokio::spawn(async move {
-            loop {
+            for index in 0.. {
                 let Ok((mut stream, _)) = listener.accept().await else {
                     break;
                 };
+                let body = &bodies[index.min(bodies.len() - 1)];
                 let mut buffer = [0u8; 1024];
                 let _ = stream.read(&mut buffer).await;
                 let head = format!(
@@ -3795,16 +3802,19 @@ mod tests {
         drop(released);
         let (unrelated, unrelated_server) = fixed_body_server("{}").await;
         let (genuine, genuine_server) = fixed_body_server(GENUINE_SNAPSHOT).await;
+        // Looks like a router snapshot but its rows are unusable: discovery and
+        // consumption share one validator, so it is never selected.
+        let (malformed, malformed_server) = fixed_body_server(MALFORMED_ROWS_SNAPSHOT).await;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
         assert_eq!(
-            first_legacy_snapshot_port(&client, &[closed, unrelated, genuine]).await,
+            first_legacy_snapshot_port(&client, &[closed, unrelated, malformed, genuine]).await,
             Some(genuine)
         );
         assert_eq!(
-            first_legacy_snapshot_port(&client, &[closed, unrelated]).await,
+            first_legacy_snapshot_port(&client, &[closed, unrelated, malformed]).await,
             None
         );
 
@@ -3812,13 +3822,13 @@ mod tests {
         let home = unique_test_dir("top-legacy-validated");
         let paths = RouterPaths::new(&home);
         fs::create_dir_all(paths.meta_file.parent().unwrap()).unwrap();
-        fs::write(&paths.meta_file, format!("metrics_port={unrelated}\n")).unwrap();
+        fs::write(&paths.meta_file, format!("metrics_port={malformed}\n")).unwrap();
         fs::write(&paths.proxy_meta_file, format!("metrics_port={genuine}\n")).unwrap();
         let (_, url, identity) = top_source(&home, &top_request(true)).await.unwrap();
         assert!(identity.is_none());
         assert!(url.contains(&format!(":{genuine}/")), "{url}");
 
-        // With only unrelated responders, no path guesses a port.
+        // With only unusable responders, no path guesses a port.
         fs::remove_file(&paths.proxy_meta_file).unwrap();
         for legacy in [true, false] {
             let error = top_source(&home, &top_request(legacy))
@@ -3829,8 +3839,9 @@ mod tests {
                 error.contains("router metrics endpoint is not available"),
                 "{error}"
             );
-            assert!(!error.contains(&unrelated.to_string()), "{error}");
+            assert!(!error.contains(&malformed.to_string()), "{error}");
         }
+        malformed_server.abort();
         unrelated_server.abort();
         genuine_server.abort();
         fs::remove_dir_all(home).unwrap();
@@ -3869,9 +3880,13 @@ mod tests {
             server.abort();
             fs::remove_dir_all(&home).ok();
         }
-        // End to end through the json renderer: shape errors surface, not panic.
-        let (port, server) =
-            fixed_body_server(r#"{"ok":true,"active":[1],"recent":[],"totals":{}}"#).await;
+        // A snapshot that passes discovery but is malformed by fetch time (the
+        // endpoint changed between probe and fetch) is an error, not a panic.
+        let (port, server) = sequence_server(vec![
+            GENUINE_SNAPSHOT.to_owned(),
+            MALFORMED_ROWS_SNAPSHOT.to_owned(),
+        ])
+        .await;
         let home = unique_test_dir("top-malformed-render");
         let paths = RouterPaths::new(&home);
         fs::create_dir_all(paths.meta_file.parent().unwrap()).unwrap();
@@ -5697,6 +5712,19 @@ fn metrics_port_candidates(
     ports
 }
 
+/// A legacy router snapshot is a snapshot top can consume, plus the markers
+/// that identify it as a legacy router rather than another JSON service or the
+/// hybrid runtime. Shape rules live only in `validate_top_snapshot`: discovery
+/// and consumption cannot disagree about what a usable snapshot is.
+fn is_legacy_snapshot(snapshot: &Value) -> bool {
+    validate_top_snapshot(snapshot).is_ok()
+        && snapshot.get("ok") == Some(&Value::Bool(true))
+        && ["active", "recent", "totals"]
+            .iter()
+            .all(|key| snapshot.get(key).is_some())
+        && snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-hybrid")
+}
+
 /// The one legacy discovery for every top path: probe each candidate port in
 /// precedence order and return the first that serves a genuine router metrics
 /// snapshot, not merely an HTTP responder. Stale metadata and unrelated
@@ -5714,13 +5742,7 @@ async fn first_legacy_snapshot_port(client: &reqwest::Client, candidates: &[u16]
         let Ok(snapshot) = response.json::<Value>().await else {
             continue;
         };
-        if snapshot.is_object()
-            && snapshot.get("ok") == Some(&Value::Bool(true))
-            && snapshot.get("active").is_some_and(Value::is_array)
-            && snapshot.get("recent").is_some_and(Value::is_array)
-            && snapshot.get("totals").is_some_and(Value::is_object)
-            && snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-hybrid")
-        {
+        if is_legacy_snapshot(&snapshot) {
             return Some(port);
         }
     }
