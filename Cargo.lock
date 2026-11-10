@@ -1633,6 +1633,7 @@ name = "rayline-metrics"
 version = "0.4.3"
 dependencies = [
  "serde",
+ "serde_json",
  "tokio",
 ]
 

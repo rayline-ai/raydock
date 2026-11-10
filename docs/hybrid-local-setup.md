@@ -20,6 +20,16 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
   run it.
 - Nothing else. A profile file is optional (see [Advanced: a profile file](#advanced-a-profile-file)).
 
+## Watch requests
+
+After starting hybrid, run `raydock top --hybrid` to watch local/cloud execution,
+or `raydock top --hybrid --json` for a single snapshot. For a separate instance,
+add `--state-dir /path/to/instance`. No additional metrics port is needed.
+Plain `raydock top` discovers the default live hybrid instance only when legacy
+metrics are not also live; use `--hybrid` or `--legacy` to resolve that ambiguity.
+These flags are mutually exclusive; `--state-dir` requires `--hybrid`. Unknown
+execution models remain unknown rather than showing the harness's virtual model.
+
 ## What it costs
 
 Every turn of a hybrid session bills one ARC decision against your Rayline
@@ -97,10 +107,12 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
      truncates a longer prompt. For MLX (`mlx_lm.server`), check that your
      build's KV-cache limit, if you set one, is at least that.
 
-   Claude Code's opening request alone is about 110,000 tokens for a model
-   other than Qwen3.8-27B, and the window must also hold the answer (up to
-   32,000 tokens), so give such a model at least 262,144 tokens, or every
-   Claude Code turn goes to cloud.
+   For a model other than Qwen3.8-27B, Claude Code's opening request is
+   about 73,000 tokens with no MCP servers or project instructions (more
+   with them), and the window must also hold the answer (up to 32,000
+   tokens). Below about 97,000 tokens Claude Code turns go to cloud, and
+   `start` warns. 131,072 holds a plain session's first turns; give such
+   a model 262,144 tokens to keep longer sessions local.
 
    Set the window yourself with `"hybrid": {"local_context_window": 262144}` in
    `~/.config/rayline/settings.json`, or `--local-context-window <tokens>` on
@@ -188,17 +200,18 @@ yourself, keyed by the pinned model. The block names every pinned model or
 {
   "hybrid": {
     "cloud_output_tokens": {
-      "anthropic/claude-opus-5.5": 128000,
-      "anthropic/claude-sonnet-5.5": 128000,
-      "anthropic/claude-haiku-5.5": 128000
+      "claude-opus-5-5": 128000,
+      "claude-sonnet-5-5": 128000,
+      "claude-haiku-5-5": 128000
     }
   }
 }
 ```
 
 The core advertises the smallest of all the limits as the session's, so a long
-local answer has room to finish, and a prompt larger than about three quarters
-of the local window goes to cloud. Each limit is enforced against the
+local answer has room to finish, and a prompt larger than the local window
+minus its answer allowance (a quarter of the window, at most 32,000 tokens)
+goes to cloud. Each limit is enforced against the
 deployment the turn lands on, not against that smallest figure: a harness that
 asks for more than a deployment's ceiling has its turns on that deployment
 lowered to it rather than refused.
@@ -241,7 +254,7 @@ The core infers what each request is from the harness's own wire traffic:
   auto-mode safety classifier is the exception: it always goes to cloud,
   because a local model's answer it cannot parse makes Claude Code ask you to
   approve every action. It uses Claude Haiku 5.5 through your router; set
-  `"hybrid": {"classifier_model": "<provider/model>"}` in `settings.json`, or
+  `"hybrid": {"classifier_model": "<router model id>"}` in `settings.json`, or
   pass `--classifier-model` to `start`, to use another model.
 - **Compaction:** detected by comparing each request with the previous one,
   including Pi's retained tail.

@@ -62,7 +62,11 @@ const CLOUD_CONTEXT_WINDOW: u64 = 1_000_000;
 /// turns short before any edit landed (Mac hybrid test, 2026-10-27).
 const MAX_OUTPUT_TOKENS: u64 = crate::harness::MAX_OUTPUT_TOKENS;
 /// The default profile's cloud deployments, as `(id, wire_model,
-/// max_output_tokens)`.
+/// registry_model, max_output_tokens)`.
+///
+/// `wire_model` is the router's own catalog entry, served by Anthropic
+/// directly; `registry_model` is the same model as the core's thinking
+/// registry knows it, whose measured cell supplies the action's controls.
 ///
 /// The ceiling is each pinned model's own, not the harness default: a single
 /// constant for all of them capped every cloud answer at a fraction of what
@@ -76,10 +80,25 @@ const MAX_OUTPUT_TOKENS: u64 = crate::harness::MAX_OUTPUT_TOKENS;
 /// model (too large for its window, or one Swift expects it to fail) has a
 /// cloud target priced well below Sonnet. The core's registry qualifies it on
 /// the same cell as Sonnet (`openrouter`, Messages, `default` base).
-pub(crate) const CLOUD_MODELS: &[(&str, &str, u64)] = &[
-    ("cloud-opus", "anthropic/claude-opus-5.5", 128_000),
-    ("cloud-sonnet", "anthropic/claude-sonnet-5.5", 128_000),
-    ("cloud-haiku", "anthropic/claude-haiku-5.5", 128_000),
+pub(crate) const CLOUD_MODELS: &[(&str, &str, &str, u64)] = &[
+    (
+        "cloud-opus",
+        "claude-opus-5-5",
+        "anthropic/claude-opus-5.5",
+        128_000,
+    ),
+    (
+        "cloud-sonnet",
+        "claude-sonnet-5-5",
+        "anthropic/claude-sonnet-5.5",
+        128_000,
+    ),
+    (
+        "cloud-haiku",
+        "claude-haiku-5-5",
+        "anthropic/claude-haiku-5.5",
+        128_000,
+    ),
 ];
 /// Sanity bounds on a declared cloud output ceiling, not a check that the
 /// provider allows it: the lower bound leaves room for output beside
@@ -122,8 +141,8 @@ pub(crate) fn configured_local_context_window(
 /// cloud targets' window: the default exists to bound memory for a runtime
 /// whose window Raydock cannot see, and a runtime that reports one has
 /// already allocated it. Before 0.4.3 the default applied even then, so
-/// Claude Code on a non-Qwen model, whose opening request alone bounds above
-/// the default, never ran locally.
+/// Claude Code on a non-Qwen model barely fit: its opening request (about
+/// 73,000 tokens) plus the answer allowance nearly fills the default.
 pub(crate) fn resolve_local_window(
     configured: Option<u64>,
     loaded: Option<u64>,
@@ -162,6 +181,37 @@ pub(crate) fn resolve_local_window(
     }
 }
 
+/// The local deployment's output ceiling for a `window`-token window.
+fn local_max_output(window: u64) -> u64 {
+    (window / 4).clamp(1024, MAX_OUTPUT_TOKENS)
+}
+
+/// The smallest Claude Code opening request, as the core bounds it for a
+/// model whose tokenizer it does not have (bytes-bounded), with its capacity
+/// margin and without the output allowance: about 73,000 tokens with no MCP
+/// servers or project instructions (prod, 2026-11-10: 105,061 required at a
+/// 131,072 window, of which 32,000 is the answer: 73,061). Tools and
+/// instructions add to it, so below this every task start goes to cloud and
+/// a little above it most do. Qwen3.8-27B's is measured with its tokenizer and
+/// is far smaller (about 39,000).
+const CLAUDE_CODE_OPENING_TOKENS: u64 = 73_000;
+
+/// A warning when `window` cannot hold even the smallest Claude Code opening
+/// request plus the answer the core reserves for it (`capacity.go`: prompt +
+/// output allowance + margin), so every Claude Code task start goes to
+/// cloud. None for Qwen3.8-27B, whose prompts the core measures exactly.
+pub(crate) fn small_window_warning(registry_model: &str, window: u64) -> Option<String> {
+    if registry_model == LOCAL_REGISTRY_MODEL
+        || window.saturating_sub(local_max_output(window)) >= CLAUDE_CODE_OPENING_TOKENS
+    {
+        return None;
+    }
+    let allowance = local_max_output(window);
+    Some(format!(
+        "Warning: the local window is {window} tokens. Claude Code's opening request needs about {CLAUDE_CODE_OPENING_TOKENS} tokens or more for {registry_model} (more with MCP servers or project instructions), plus {allowance} for the answer, so Claude Code tasks are likely to start on cloud. Load the local model with a 262144-token window (llama.cpp `--ctx-size 262144`, vLLM `--max-model-len 262144`) and set --local-context-window or settings hybrid.local_context_window to 262144 if you set one."
+    ))
+}
+
 /// `hybrid.local_registry_model` from settings, or [`LOCAL_REGISTRY_MODEL`].
 /// Raydock has no copy of the core's registry, so it checks only the shape
 /// (`provider/model`); the core refuses a model its registry does not know.
@@ -184,18 +234,18 @@ pub(crate) fn local_registry_model(settings: Option<&Value>) -> Result<String, S
 /// The model Claude Code's auto-mode classifier goes to: `--classifier-model`,
 /// else `hybrid.classifier_model` from settings, else Claude Haiku 5.5. It is
 /// sent through the profile's cloud router, so any model that router serves
-/// on Messages works; Raydock checks only the `provider/model` shape. Applies
+/// on Messages works; Raydock checks only that it is a router model id. Applies
 /// with a profile file too, since the classifier is not a profile target.
 pub(crate) fn classifier_model(
     flag: Option<&str>,
     settings: Option<&Value>,
 ) -> Result<String, String> {
     if let Some(flag) = flag {
-        return if is_model_id(flag) {
+        return if is_router_model_id(flag) {
             Ok(flag.to_owned())
         } else {
             Err(format!(
-                "--classifier-model must be a router model id \"provider/model\", such as \"{CLASSIFIER_MODEL}\""
+                "--classifier-model must be a router model id, such as \"{CLASSIFIER_MODEL}\""
             ))
         };
     }
@@ -207,21 +257,27 @@ pub(crate) fn classifier_model(
     };
     value
         .as_str()
-        .filter(|id| is_model_id(id))
+        .filter(|id| is_router_model_id(id))
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
-            format!("settings hybrid.classifier_model must be a router model id \"provider/model\", such as \"{CLASSIFIER_MODEL}\"")
+            format!("settings hybrid.classifier_model must be a router model id, such as \"{CLASSIFIER_MODEL}\"")
         })
 }
 
 /// Claude Code's auto-mode classifier model when the user names none.
-pub(crate) const CLASSIFIER_MODEL: &str = "anthropic/claude-haiku-5.5";
+pub(crate) const CLASSIFIER_MODEL: &str = "claude-haiku-5-5";
 
 /// `provider/model`: one slash, both parts non-empty, no whitespace.
 fn is_model_id(id: &str) -> bool {
     id.split_once('/').is_some_and(|(provider, model)| {
         !provider.is_empty() && !model.is_empty() && !model.contains('/')
     }) && !id.chars().any(char::is_whitespace)
+}
+
+/// A router catalog id: `provider/model`, or a bare id such as
+/// `claude-haiku-5-5`. The router refuses one it does not serve.
+fn is_router_model_id(id: &str) -> bool {
+    is_model_id(id) || (!id.is_empty() && !id.contains('/') && !id.chars().any(char::is_whitespace))
 }
 
 /// The derived action's model and worker name for a registry id: the part
@@ -260,13 +316,10 @@ fn local_price(settings: Option<&Value>) -> Result<f64, String> {
 /// The settings block is keyed by `wire_model` and is all-or-nothing: a
 /// partial block is refused rather than mixed with the declared figures, so a
 /// profile's ceilings have one source.
-fn cloud_pins(settings: Option<&Value>) -> Result<Vec<(&'static str, &'static str, u64)>, String> {
-    let declared = || {
-        CLOUD_MODELS
-            .iter()
-            .map(|(id, wire, c)| (*id, *wire, *c))
-            .collect()
-    };
+fn cloud_pins(
+    settings: Option<&Value>,
+) -> Result<Vec<(&'static str, &'static str, &'static str, u64)>, String> {
+    let declared = || CLOUD_MODELS.to_vec();
     let Some(value) = settings
         .and_then(|settings| settings.get("hybrid"))
         .and_then(|hybrid| hybrid.get("cloud_output_tokens"))
@@ -277,19 +330,33 @@ fn cloud_pins(settings: Option<&Value>) -> Result<Vec<(&'static str, &'static st
         "settings hybrid.cloud_output_tokens must map each cloud model to its output ceiling"
             .to_owned()
     })?;
+    let pinned = || {
+        CLOUD_MODELS
+            .iter()
+            .map(|(_, wire, _, _)| *wire)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    // A key naming another model, such as an id an earlier release pinned,
+    // is named in the error rather than reported as a missing ceiling.
+    if let Some(other) = block
+        .keys()
+        .find(|key| !CLOUD_MODELS.iter().any(|(_, wire, _, _)| wire == key))
+    {
+        return Err(format!(
+            "settings hybrid.cloud_output_tokens names {other}, which the default profile does not pin; key each output ceiling by a pinned model: {}",
+            pinned()
+        ));
+    }
     if block.len() != CLOUD_MODELS.len() {
         return Err(format!(
             "settings hybrid.cloud_output_tokens needs an output ceiling for each model the default profile pins: {}",
-            CLOUD_MODELS
-                .iter()
-                .map(|(_, wire, _)| *wire)
-                .collect::<Vec<_>>()
-                .join(", ")
+            pinned()
         ));
     }
     CLOUD_MODELS
         .iter()
-        .map(|(id, wire, _)| {
+        .map(|(id, wire, registry, _)| {
             let ceiling = block
                 .get(*wire)
                 .and_then(Value::as_u64)
@@ -301,7 +368,7 @@ fn cloud_pins(settings: Option<&Value>) -> Result<Vec<(&'static str, &'static st
                         CLOUD_OUTPUT_RANGE.end()
                     )
                 })?;
-            Ok((*id, *wire, ceiling))
+            Ok((*id, *wire, *registry, ceiling))
         })
         .collect()
 }
@@ -708,10 +775,10 @@ pub(crate) fn default_profile(
         "{}/v1/chat/completions",
         crate::local_model::normalize_base_url(base_url)
     );
-    let max_output = (context_window / 4).clamp(1024, MAX_OUTPUT_TOKENS);
-    let cloud = |id: &str, wire: &str, max_output_tokens: u64| {
+    let max_output = local_max_output(context_window);
+    let cloud = |id: &str, wire: &str, registry: &str, max_output_tokens: u64| {
         json!({"id": id, "kind": "cloud", "cloud_transport": "model_pin", "url": format!("{router}/v1/messages"),
-               "protocol": "anthropic.messages.v1", "wire_model": wire, "registry_model": wire,
+               "protocol": "anthropic.messages.v1", "wire_model": wire, "registry_model": registry,
                "registry_provider": "openrouter", "runtime_identity": "rayline-catalog-model-pin-v1",
                "max_output_tokens": max_output_tokens, "context_window": CLOUD_CONTEXT_WINDOW, "input_modalities": ["text"],
                // As on the local deployment: the core serves harnesses over
@@ -759,12 +826,12 @@ pub(crate) fn default_profile(
     // a deployment and no action would be unroutable without any error.
     let mut derived_actions =
         vec![json!({"model": action_model, "worker": action_model, "deployment_id": "local"})];
-    for (id, wire, ceiling) in &cloud_pins {
-        deployments.push(cloud(id, wire, *ceiling));
-        // The action names the model as the core's registry knows it: the pin
-        // without the provider prefix its wire ref carries.
-        let registry_model = wire.rsplit('/').next().unwrap_or(wire);
-        derived_actions.push(json!({"model": registry_model, "worker": registry_model,
+    for (id, wire, registry, ceiling) in &cloud_pins {
+        deployments.push(cloud(id, wire, registry, *ceiling));
+        // The action names the model as the core's registry knows it, without
+        // the registry's provider prefix.
+        let action_model = registry_action_model(registry);
+        derived_actions.push(json!({"model": action_model, "worker": action_model,
                                     "deployment_id": id, "bases": ["default"]}));
     }
     Ok(json!({
@@ -1337,7 +1404,8 @@ mod tests {
     #[test]
     fn an_unconfigured_window_follows_the_runtime_and_a_configured_one_is_capped_by_it() {
         // Unconfigured: the runtime's reported window, so Claude Code's
-        // ~110k opening request fits a 262k GLM server.
+        // opening request (about 73,000 tokens plus the answer allowance)
+        // fits a 262k GLM server with room to grow.
         assert_eq!(resolve_local_window(None, Some(262_144)), (262_144, None));
         assert_eq!(resolve_local_window(None, Some(32_768)), (32_768, None));
         let (window, note) = resolve_local_window(None, Some(1_048_576));
@@ -1358,6 +1426,26 @@ mod tests {
         );
         assert_eq!(resolve_local_window(Some(131_072), Some(65_536)).0, 65_536);
         assert_eq!(resolve_local_window(Some(131_072), None).0, 131_072);
+    }
+
+    #[test]
+    fn a_window_too_small_for_claude_codes_opening_request_is_warned() {
+        let glm = "z-ai/glm-5.3-flash";
+        let warning =
+            small_window_warning(glm, 65_536).expect("64k cannot hold the opening request");
+        assert!(warning.contains("65536"), "{warning}");
+        assert!(warning.contains("plus 16384 for the answer"), "{warning}");
+        assert!(warning.contains("--ctx-size 262144"), "{warning}");
+        // The edge: 97,333 reserves 24,333 for the answer, leaving 73,000.
+        assert!(small_window_warning(glm, 97_332).is_some());
+        assert_eq!(small_window_warning(glm, 97_333), None);
+        // 98,304 holds the measured opening request (97,637 required), and
+        // 131,072 ran Claude Code locally on prod (105,061 required).
+        assert_eq!(small_window_warning(glm, 98_304), None);
+        assert_eq!(small_window_warning(glm, 131_072), None);
+        assert_eq!(small_window_warning(glm, 262_144), None);
+        // Qwen's prompts are measured with its tokenizer.
+        assert_eq!(small_window_warning(LOCAL_REGISTRY_MODEL, 65_536), None);
     }
 
     #[test]
@@ -1399,7 +1487,7 @@ mod tests {
         assert_eq!(local["clamp_output_allowance"], true);
         // Each cloud deployment declares the ceiling it was given, its own
         // model's, not one constant for all of them.
-        for (cloud, (_, _, ceiling)) in config["deployments"].as_array().unwrap()[1..]
+        for (cloud, (_, _, _, ceiling)) in config["deployments"].as_array().unwrap()[1..]
             .iter()
             .zip(CLOUD_MODELS)
         {
@@ -1463,7 +1551,7 @@ mod tests {
             )
         };
         // Each pin's declared ceiling.
-        let declared: Vec<_> = CLOUD_MODELS.iter().map(|(_, _, c)| *c).collect();
+        let declared: Vec<_> = CLOUD_MODELS.iter().map(|(_, _, _, c)| *c).collect();
         let (ceilings, local) = built(None);
         assert_eq!(ceilings, declared);
         // The local cap keeps its own rule, a quarter of the local window.
@@ -1471,9 +1559,9 @@ mod tests {
         // Settings replace them per model.
         let mut overridden = settings(None);
         overridden["hybrid"]["cloud_output_tokens"] = json!({
-            "anthropic/claude-opus-5.5": 96_000,
-            "anthropic/claude-sonnet-5.5": 64_000,
-            "anthropic/claude-haiku-5.5": 32_000
+            "claude-opus-5-5": 96_000,
+            "claude-sonnet-5-5": 64_000,
+            "claude-haiku-5-5": 32_000
         });
         assert_eq!(built(Some(&overridden)).0, vec![96_000, 64_000, 32_000]);
     }
@@ -1491,12 +1579,12 @@ mod tests {
         // The range's own bounds are accepted, so the error names a figure
         // genuinely outside it.
         let bounds = with(json!({
-            "anthropic/claude-opus-5.5": CLOUD_OUTPUT_RANGE.start(),
-            "anthropic/claude-sonnet-5.5": CLOUD_OUTPUT_RANGE.end(),
-            "anthropic/claude-haiku-5.5": CLOUD_OUTPUT_RANGE.start()
+            "claude-opus-5-5": CLOUD_OUTPUT_RANGE.start(),
+            "claude-sonnet-5-5": CLOUD_OUTPUT_RANGE.end(),
+            "claude-haiku-5-5": CLOUD_OUTPUT_RANGE.start()
         }));
         assert_eq!(
-            cloud_pins(Some(&bounds)).map(|pins| pins.iter().map(|(_, _, c)| *c).collect()),
+            cloud_pins(Some(&bounds)).map(|pins| pins.iter().map(|(_, _, _, c)| *c).collect()),
             Ok(vec![
                 *CLOUD_OUTPUT_RANGE.start(),
                 *CLOUD_OUTPUT_RANGE.end(),
@@ -1504,51 +1592,55 @@ mod tests {
             ])
         );
         let each = with(json!({
-            "anthropic/claude-opus-5.5": 96_000,
-            "anthropic/claude-sonnet-5.5": 64_000,
-            "anthropic/claude-haiku-5.5": 32_000
+            "claude-opus-5-5": 96_000,
+            "claude-sonnet-5-5": 64_000,
+            "claude-haiku-5-5": 32_000
         }));
         assert_eq!(
-            cloud_pins(Some(&each)).map(|pins| pins.iter().map(|(_, _, c)| *c).collect()),
+            cloud_pins(Some(&each)).map(|pins| pins.iter().map(|(_, _, _, c)| *c).collect()),
             Ok(vec![96_000, 64_000, 32_000])
         );
         // Absent: each pin's declared ceiling.
-        let declared = CLOUD_MODELS.iter().map(|(_, _, c)| *c).collect::<Vec<_>>();
+        let declared = CLOUD_MODELS
+            .iter()
+            .map(|(_, _, _, c)| *c)
+            .collect::<Vec<_>>();
         for absent in [Some(&settings(None)), None] {
             assert_eq!(
-                cloud_pins(absent).map(|pins| pins.iter().map(|(_, _, c)| *c).collect::<Vec<_>>()),
+                cloud_pins(absent)
+                    .map(|pins| pins.iter().map(|(_, _, _, c)| *c).collect::<Vec<_>>()),
                 Ok(declared.clone())
             );
         }
         for refused in [
             // One model named, so the others would have to come from elsewhere.
-            json!({"anthropic/claude-opus-5.5": 96_000}),
+            json!({"claude-opus-5-5": 96_000}),
             // The two pins of an earlier release: a block written before Haiku
             // was pinned needs its ceiling too, rather than mixing one
             // declared figure with two of the user's.
             json!({
-                "anthropic/claude-opus-5.5": 96_000,
-                "anthropic/claude-sonnet-5.5": 64_000
+                "claude-opus-5-5": 96_000,
+                "claude-sonnet-5-5": 64_000
             }),
             // A model this profile does not pin.
             json!({
-                "anthropic/claude-opus-5.5": 96_000,
-                "anthropic/claude-sonnet-5.5": 64_000,
-                "anthropic/claude-haiku-5.5": 32_000,
-                "anthropic/claude-fable-5.1": 64_000
+                "claude-opus-5-5": 96_000,
+                "claude-sonnet-5-5": 64_000,
+                "claude-haiku-5-5": 32_000,
+                "claude-fable-5-1": 64_000
             }),
             // The right number of models, one of them not pinned: the count
             // alone cannot catch this, so each pin is looked up by name.
             json!({
-                "anthropic/claude-opus-5.5": 96_000,
-                "anthropic/claude-sonnet-5.5": 64_000,
-                "anthropic/claude-fable-5.1": 64_000
+                "claude-opus-5-5": 96_000,
+                "claude-sonnet-5-5": 64_000,
+                "claude-fable-5-1": 64_000
             }),
             // Out of range, and not a whole number of tokens.
-            json!({"anthropic/claude-opus-5.5": 1024, "anthropic/claude-sonnet-5.5": 64_000, "anthropic/claude-haiku-5.5": 32_000}),
-            json!({"anthropic/claude-opus-5.5": 96_000, "anthropic/claude-sonnet-5.5": 0, "anthropic/claude-haiku-5.5": 32_000}),
-            json!({"anthropic/claude-opus-5.5": 96_000, "anthropic/claude-sonnet-5.5": 64_000, "anthropic/claude-haiku-5.5": "32000"}),
-            json!({"anthropic/claude-opus-5.5": 96_000, "anthropic/claude-sonnet-5.5": 64_000, "anthropic/claude-haiku-5.5": 1_000_001}),
+            json!({"claude-opus-5-5": 1024, "claude-sonnet-5-5": 64_000, "claude-haiku-5-5": 32_000}),
+            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": 0, "claude-haiku-5-5": 32_000}),
+            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": 64_000, "claude-haiku-5-5": "32000"}),
+            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": 64_000, "claude-haiku-5-5": 1_000_001}),
             json!([96_000, 64_000, 32_000]),
         ] {
             assert!(
@@ -1584,14 +1676,14 @@ mod tests {
         }
         // Each cloud action names the model the core's registry knows, not
         // the wire ref's full pin. Found by deployment, not by position.
-        for (id, wire, _) in CLOUD_MODELS {
+        for (id, _, registry, _) in CLOUD_MODELS {
             let action = profile["derived_actions"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .find(|action| action["deployment_id"] == *id)
                 .unwrap_or_else(|| panic!("{id} has no derived action"));
-            assert_eq!(action["model"], wire.rsplit('/').next().unwrap());
+            assert_eq!(action["model"], registry.rsplit('/').next().unwrap());
             assert_eq!(action["worker"], action["model"]);
         }
     }
@@ -1600,7 +1692,7 @@ mod tests {
     /// held to, so the built-in figures and an override are the same contract.
     #[test]
     fn every_pinned_model_declares_a_usable_ceiling() {
-        for (id, wire, ceiling) in CLOUD_MODELS {
+        for (id, wire, registry, ceiling) in CLOUD_MODELS {
             assert!(
                 CLOUD_OUTPUT_RANGE.contains(ceiling),
                 "{id} ({wire}) declares {ceiling}, outside {CLOUD_OUTPUT_RANGE:?}"
@@ -1609,11 +1701,13 @@ mod tests {
                 *ceiling <= CLOUD_CONTEXT_WINDOW,
                 "{id} ({wire}) declares an output ceiling over its context window"
             );
-            // The action's model name is the pin's last path component, so a
-            // pin ending in `/` would name an action nothing can route to.
+            // The router pin is a catalog id; the core needs the registry's
+            // `provider/model` for the cell, and the action's model name is
+            // its last component.
+            assert!(is_router_model_id(wire), "{id} pins {wire:?}");
             assert!(
-                !wire.rsplit('/').next().unwrap_or_default().is_empty(),
-                "{id} ({wire}) has no model name after its provider prefix"
+                is_model_id(registry),
+                "{id} ({registry}) is not a registry model id"
             );
         }
     }
@@ -2141,29 +2235,49 @@ mod tests {
 
     #[test]
     fn classifier_model_is_haiku_unless_settings_or_the_flag_name_another() {
-        assert_eq!(
-            classifier_model(None, None).unwrap(),
-            "anthropic/claude-haiku-5.5"
-        );
-        let settings = json!({"hybrid": {"classifier_model": "anthropic/claude-sonnet-5.5"}});
+        assert_eq!(classifier_model(None, None).unwrap(), "claude-haiku-5-5");
+        let settings = json!({"hybrid": {"classifier_model": "claude-sonnet-5-5"}});
         assert_eq!(
             classifier_model(None, Some(&settings)).unwrap(),
-            "anthropic/claude-sonnet-5.5"
+            "claude-sonnet-5-5"
         );
+        // A `provider/model` router id is accepted too.
         assert_eq!(
             classifier_model(Some("anthropic/claude-opus-5.5"), Some(&settings)).unwrap(),
             "anthropic/claude-opus-5.5"
         );
-        let bad = json!({"hybrid": {"classifier_model": "haiku"}});
+        for bad in ["", "claude haiku", "a/b/c", "/haiku", "anthropic/"] {
+            let settings = json!({"hybrid": {"classifier_model": bad}});
+            assert!(
+                classifier_model(None, Some(&settings))
+                    .unwrap_err()
+                    .starts_with("settings hybrid.classifier_model"),
+                "{bad:?} was accepted"
+            );
+            assert!(
+                classifier_model(Some(bad), None)
+                    .unwrap_err()
+                    .starts_with("--classifier-model"),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    /// Settings keyed by a model the profile no longer pins (the OpenRouter
+    /// ids earlier releases pinned) are refused, naming the key and the pins.
+    #[test]
+    fn cloud_output_tokens_keyed_by_an_unpinned_model_names_it() {
+        let mut settings = settings(None);
+        settings["hybrid"]["cloud_output_tokens"] = json!({
+            "anthropic/claude-opus-5.5": 96_000,
+            "anthropic/claude-sonnet-5.5": 64_000,
+            "anthropic/claude-haiku-5.5": 32_000
+        });
+        let error = cloud_pins(Some(&settings)).unwrap_err();
         assert!(
-            classifier_model(None, Some(&bad))
-                .unwrap_err()
-                .starts_with("settings hybrid.classifier_model")
-        );
-        assert!(
-            classifier_model(Some("claude haiku"), None)
-                .unwrap_err()
-                .starts_with("--classifier-model")
+            error.starts_with("settings hybrid.cloud_output_tokens names anthropic/claude-")
+                && error.ends_with("claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5"),
+            "{error}"
         );
     }
 

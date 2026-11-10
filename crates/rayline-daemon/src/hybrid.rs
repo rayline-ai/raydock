@@ -9,9 +9,10 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::hybrid_metrics::{RequestObservation, RoutingMetadata};
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
@@ -20,6 +21,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
 use rand::RngCore;
 use rayline_local_router::{InboundGuard, ModelCapabilities};
+use rayline_metrics::RouterMetrics;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -33,8 +35,16 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// The execution core's own request body limit.
 const MAX_REQUEST_BYTES: usize = 64 << 20;
 /// Wait before the one retry of a turn whose Decisions call found the routing
-/// service unavailable (a scale-to-zero cell answers 502 while it starts).
+/// service unavailable or busy (a scale-to-zero cell answers 502 while it
+/// starts), when the service names no `retry-after`. Jittered by
+/// [`jittered`] so many sessions do not resend in step.
 const DECISIONS_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// The longest `retry-after` rld waits out itself. A longer one is passed to
+/// the harness without an rld retry.
+const DECISIONS_MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
+/// `retry-after` the harness gets for a retryable failure when the service
+/// named none.
+const DEFAULT_HARNESS_RETRY_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(clap::Args, Debug)]
 pub struct Args {
@@ -103,6 +113,8 @@ struct Gateway {
     login_command: String,
     /// Where Claude Code's auto-mode classifier goes instead of the core.
     classifier_pin: Option<crate::hybrid_classifier::CloudPin>,
+    metrics: Arc<RouterMetrics>,
+    routing_metadata: RoutingMetadata,
 }
 
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
@@ -110,10 +122,9 @@ type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 pub async fn run(args: Args) -> Result<()> {
     check_decisions_url(&args.config, &args.router_urls)?;
     let credential_env = credential_env_names(&args.config)?;
-    let classifier_pin = crate::hybrid_classifier::cloud_pin(
-        &serde_json::from_slice(&std::fs::read(&args.config)?)?,
-        &args.classifier_model,
-    );
+    let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
+    let routing_metadata = RoutingMetadata::from_config(&config);
+    let classifier_pin = crate::hybrid_classifier::cloud_pin(&config, &args.classifier_model);
     let startup_timeout = Duration::from_secs(args.startup_timeout_secs);
     let startup_deadline = tokio::time::Instant::now() + startup_timeout;
     // Register before spawning so cancellation during startup also reaps the child.
@@ -181,6 +192,8 @@ pub async fn run(args: Args) -> Result<()> {
             shutdown: shutdown_tx,
             login_command: login_command(args.env_name.as_deref()),
             classifier_pin,
+            metrics: RouterMetrics::new("rayline-hybrid"),
+            routing_metadata,
         });
         let ready = Ready {
             contract_version: CONTRACT_VERSION,
@@ -326,6 +339,14 @@ async fn handle(state: Arc<Gateway>, request: Request<Incoming>) -> Response<Bod
     if let Err(error) = state.inbound.check(&Method::POST, "/", request.headers()) {
         return error_response(error.status, error.message);
     }
+    if request.method() == Method::GET && request.uri().path() == "/v1/router/top/snapshot" {
+        let mut snapshot =
+            serde_json::to_value(state.metrics.snapshot()).unwrap_or_else(|_| json!({"ok": false}));
+        snapshot["instance_id"] = json!(state.instance_id);
+        snapshot["pid"] = json!(std::process::id());
+        snapshot["core_pid"] = json!(state.core_pid);
+        return json_response(StatusCode::OK, snapshot);
+    }
     if request.method() == Method::GET && request.uri().path() == "/healthz" {
         // Check core health on demand; status cannot report a dead child as healthy.
         let health = async {
@@ -433,26 +454,74 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
     {
         return Ok(response);
     }
+    let mut observation = (parts.method == Method::POST
+        && matches!(
+            parts.uri.path(),
+            "/v1/messages" | "/v1/chat/completions" | "/v1/responses"
+        ))
+    .then(|| RequestObservation::start(state.metrics.clone(), &body));
     let mut retried = false;
     loop {
         let upstream = send_to_core(state, &parts, body.clone()).await?;
+        if let Some(observation) = &observation {
+            state
+                .routing_metadata
+                .record(observation, upstream.headers(), &state.instance_id);
+        }
         if upstream.status() != StatusCode::BAD_GATEWAY {
-            return stream_response(upstream);
+            return match observation {
+                Some(observation) => observed_response(upstream, observation, Upstream::Core),
+                None => stream_response(upstream),
+            };
         }
         // A refused decision arrives before any output, as one small JSON error.
         let status = upstream.status();
         let headers = upstream.headers().clone();
         let error_body = upstream.bytes().await?;
         let failure = decisions_failure(&error_body);
-        if failure == Some(DecisionsFailure::Unavailable) && !retried {
+        let hint = RetryHint::from_headers(&headers);
+        // Only the core's own Decisions status and code are logged (a
+        // provider's error text may quote the prompt); the route id is the
+        // service's, when it sent one.
+        let detail = decisions_detail(&error_body);
+        let route_id = headers
+            .get("x-rayline-route-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-");
+        if !retried
+            && let Some(failure) = failure
+            && let Some(delay) = rld_retry_delay(failure, hint)
+        {
             // Nothing ran: the core decides before it dispatches, and treats an
             // identical resend like the harness's own retry.
             retried = true;
-            tracing::info!("Decisions unavailable; retrying the turn once");
-            tokio::time::sleep(DECISIONS_RETRY_DELAY).await;
+            tracing::info!(
+                ?failure,
+                %detail,
+                route_id,
+                delay_ms = delay.as_millis() as u64,
+                "Decisions unavailable or busy; retrying the turn once"
+            );
+            tokio::time::sleep(delay).await;
             continue;
         }
-        return buffered_response(state, status, &headers, error_body, failure);
+        // Every 502 before any output is logged: the core's Decisions
+        // failures are not all classified, and a Messages error loses its code.
+        tracing::warn!(
+            ?failure,
+            %detail,
+            route_id,
+            resent = retried,
+            "the core failed the turn before any output; returning the error to the harness"
+        );
+        let response = buffered_response(state, status, &headers, error_body, failure, hint)?;
+        if let Some(observation) = &mut observation {
+            observation.finish(
+                response.status().as_u16(),
+                Some("execution request refused"),
+            );
+        }
+        return Ok(response);
     }
 }
 
@@ -489,6 +558,8 @@ async fn send_classifier_to_cloud(
     if let Some(session) = parts.headers.get("x-claude-code-session-id") {
         outgoing = outgoing.header("x-conversation-id", session);
     }
+    let mut observation = RequestObservation::start(state.metrics.clone(), body);
+    observation.record_classifier(&pin.wire_model);
     let upstream = outgoing.bearer_auth(key).body(pinned).send().await?;
     let status = upstream.status();
     tracing::info!(
@@ -517,9 +588,18 @@ async fn send_classifier_to_cloud(
             })
             .unwrap_or_default();
         tracing::warn!(status = status.as_u16(), %error_type, "cloud pin refused the auto-mode classifier");
-        return buffered_response(state, status, &headers, error_body, None).map(Some);
+        let response = buffered_response(
+            state,
+            status,
+            &headers,
+            error_body,
+            None,
+            RetryHint::default(),
+        )?;
+        observation.finish(status.as_u16(), Some("classifier request refused"));
+        return Ok(Some(response));
     }
-    stream_response(upstream).map(Some)
+    observed_response(upstream, observation, Upstream::Classifier).map(Some)
 }
 
 async fn send_to_core(
@@ -590,6 +670,159 @@ async fn send_to_core(
         .await
 }
 
+/// Encoded bodies are opaque; only decoded bytes can supply response telemetry.
+/// `Some(true)` selects SSE, `Some(false)` selects buffered JSON observation.
+fn observable_response(headers: &hyper::HeaderMap) -> Option<bool> {
+    for encoding in headers.get_all("content-encoding") {
+        let Ok(encoding) = encoding.to_str() else {
+            return None;
+        };
+        if !encoding
+            .split(',')
+            .all(|value| value.trim().eq_ignore_ascii_case("identity"))
+        {
+            return None;
+        }
+    }
+    Some(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .eq_ignore_ascii_case("text/event-stream")
+            }),
+    )
+}
+
+/// Who produced a response, which decides how much of its body can fail the request.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Upstream {
+    /// The execution core is trusted to emit well-formed bodies, and valid but
+    /// deeply nested tool output must not turn a successful inference into an
+    /// error. Only an HTTP error, a transport error or an in-band failure signal
+    /// ends the row as an error; `validity()` is ignored.
+    Core,
+    /// The cloud router answering an auto-mode classifier is not trusted: a
+    /// malformed HTTP 200 body (`ResponseValidity::Invalid`) is also an error.
+    Classifier,
+}
+
+/// Finalize `observer` and report whether the response failed, per `upstream`.
+fn response_failed(
+    observer: Option<&mut rayline_metrics::response::ResponseObserver>,
+    upstream: Upstream,
+) -> bool {
+    observer.is_some_and(|observer| {
+        observer.finish()
+            || (upstream == Upstream::Classifier
+                && observer.validity() == rayline_metrics::response::ResponseValidity::Invalid)
+    })
+}
+
+/// Close `observation` from the response's status and what `observer` saw. This
+/// is the ONE place a row's verdict is decided: the empty-body, Content-Length /
+/// terminal and EOF paths all call it, so none can apply a different policy. A
+/// non-success status is an error; otherwise a failed observer is; an
+/// observer-less (encoded) body completes on transport alone.
+fn finalize(
+    observation: &mut RequestObservation,
+    observer: Option<&mut rayline_metrics::response::ResponseObserver>,
+    status: StatusCode,
+    upstream: Upstream,
+) {
+    let failed = response_failed(observer, upstream);
+    observation.finish(
+        status.as_u16(),
+        if !status.is_success() {
+            Some("execution request refused")
+        } else if failed {
+            Some("execution response failed or incomplete")
+        } else {
+            None
+        },
+    );
+}
+
+/// Observe without changing the response bytes or pulling ahead of downstream demand.
+fn observed_response(
+    upstream: reqwest::Response,
+    mut observation: RequestObservation,
+    trust: Upstream,
+) -> Result<Response<Body>> {
+    let status = upstream.status();
+    let content_length = upstream.content_length();
+    let mut observer = observable_response(upstream.headers()).map(|sse| {
+        rayline_metrics::response::ResponseObserver::new(
+            observation.metrics.clone(),
+            observation.id.clone(),
+            sse,
+        )
+    });
+    let mut response = Response::builder().status(status);
+    for (name, value) in upstream.headers() {
+        if !hop_header(name.as_str()) {
+            response = response.header(name, value);
+        }
+    }
+    if content_length == Some(0) || matches!(status.as_u16(), 204 | 205 | 304) {
+        // Hyper may discard a known-empty body without polling it, so neither the
+        // byte-count nor the EOF branch below would run. Finalize now, with the
+        // same policy as those branches: an empty event-stream has no terminal, and
+        // an empty classifier body is not JSON, so both are errors; an empty core
+        // JSON body (a trusted upstream) completes.
+        finalize(&mut observation, observer.as_mut(), status, trust);
+        return Ok(response.body(
+            Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )?);
+    }
+    let stream = futures::stream::unfold(
+        (upstream.bytes_stream(), observation, observer, 0_u64),
+        move |(mut upstream, mut observation, mut observer, mut received)| async move {
+            match upstream.next().await {
+                Some(Ok(bytes)) => {
+                    received = received.saturating_add(bytes.len() as u64);
+                    if let Some(observer) = &mut observer {
+                        observer.observe(&bytes);
+                    }
+                    // Hyper can drop a body after its Content-Length or terminal SSE
+                    // frame without polling EOF. Close the row at that observable boundary.
+                    if observer
+                        .as_ref()
+                        .is_some_and(|observer| observer.is_terminal())
+                        || content_length == Some(received)
+                    {
+                        finalize(&mut observation, observer.as_mut(), status, trust);
+                    }
+                    Some((
+                        Ok::<_, io::Error>(Frame::data(bytes)),
+                        (upstream, observation, observer, received),
+                    ))
+                }
+                Some(Err(error)) => {
+                    observation
+                        .finish(status.as_u16(), Some("execution response transport failed"));
+                    Some((
+                        Err(io::Error::other(error)),
+                        (upstream, observation, observer, received),
+                    ))
+                }
+                None => {
+                    finalize(&mut observation, observer.as_mut(), status, trust);
+                    None
+                }
+            }
+        },
+    );
+    Ok(response.body(BodyExt::boxed(StreamBody::new(stream)))?)
+}
+
 fn stream_response(upstream: reqwest::Response) -> Result<Response<Body>> {
     let mut response = Response::builder().status(upstream.status());
     for (name, value) in upstream.headers() {
@@ -610,7 +843,8 @@ fn stream_response(upstream: reqwest::Response) -> Result<Response<Body>> {
 enum DecisionsFailure {
     /// Decisions refused the router key.
     Auth,
-    /// Decisions was unreachable or answered 502/503/504 (e.g. a cold cell).
+    /// Decisions was unreachable, timed out, or answered 408, 409 or 5xx
+    /// (e.g. a cold cell): it may clear on a resend.
     Unavailable,
     /// Decisions answered 429: the caller is over its admission share.
     Throttled,
@@ -619,25 +853,126 @@ enum DecisionsFailure {
     Refused,
 }
 
+/// The core's `decision_failed` message (`error.message`, either wire
+/// format), cut to a log-sized length. The messages are the core's own
+/// (`Decide`): a status and a code, never request content.
+fn decisions_message(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let message = value.pointer("/error/message")?.as_str()?;
+    Some(message.chars().take(160).collect())
+}
+
+/// The part of a core 502's message that is safe to log: the routing
+/// service's status and code from the core's own `Decide` messages, else
+/// `"other"`, since any other message may be a provider's text.
+fn decisions_detail(body: &[u8]) -> String {
+    let other = || "other".to_owned();
+    let Some(message) = decisions_message(body) else {
+        return other();
+    };
+    if message == "Decisions request failed" {
+        return "request failed".to_owned();
+    }
+    let Some(rest) = message.strip_prefix("Decisions request refused (HTTP ") else {
+        return other();
+    };
+    let status = rest.get(..3).unwrap_or_default();
+    // The code is the service's contract code, `^[a-z][a-z0-9_]{0,63}$`.
+    let code = rest
+        .get(3..)
+        .and_then(|rest| rest.strip_prefix(", "))
+        .and_then(|rest| rest.split(')').next())
+        .filter(|code| {
+            code.len() <= 64
+                && code.starts_with(|c: char| c.is_ascii_lowercase())
+                && code
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        });
+    match (
+        status.chars().all(|c| c.is_ascii_digit()) && status.len() == 3,
+        code,
+    ) {
+        (true, Some(code)) if !code.is_empty() => format!("refused {status} {code}"),
+        (true, _) => format!("refused {status}"),
+        _ => other(),
+    }
+}
+
 /// Classify the core's `decision_failed` error, in either wire format
 /// (`error.message`). The messages are the core's own (`Decide`).
 fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let message = value.pointer("/error/message")?.as_str()?;
+    let message = decisions_message(body)?;
+    let message = message.as_str();
     if message == "Decisions request failed" {
         return Some(DecisionsFailure::Unavailable);
     }
     let status = message.strip_prefix("Decisions request refused (HTTP ")?;
     match status.get(..3)? {
         "401" | "403" => Some(DecisionsFailure::Auth),
-        "502" | "503" | "504" => Some(DecisionsFailure::Unavailable),
         "429" => Some(DecisionsFailure::Throttled),
-        // A timeout or a conflict may clear on a resend: pass the core's 502
-        // through as before.
-        "408" | "409" => None,
+        // A timeout or a conflict may clear on a resend, like a 5xx.
+        "408" | "409" => Some(DecisionsFailure::Unavailable),
+        code if code.starts_with('5') => Some(DecisionsFailure::Unavailable),
         code if code.starts_with('4') => Some(DecisionsFailure::Refused),
         _ => None,
     }
+}
+
+/// The routing service's retry advice, as the core passes it on with its 502:
+/// `retry-after` (delta-seconds) and `x-should-retry` (`true`/`false`, the
+/// Anthropic and OpenAI SDKs' own header). Absent from a core that does not
+/// forward them, and then rld's defaults apply.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetryHint {
+    retry_after: Option<Duration>,
+    should_retry: Option<bool>,
+}
+
+impl RetryHint {
+    fn from_headers(headers: &reqwest::header::HeaderMap) -> Self {
+        let text = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+        };
+        Self {
+            // Only the delta-seconds form; an HTTP date is ignored.
+            retry_after: text("retry-after")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(Duration::from_secs),
+            should_retry: match text("x-should-retry") {
+                Some("true") => Some(true),
+                Some("false") => Some(false),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// How long rld waits before its one resend of a failed turn, or None when it
+/// does not resend: only an unavailable or busy service is worth another try,
+/// never when the service says not to, and never past
+/// [`DECISIONS_MAX_RETRY_WAIT`] (the harness gets that wait instead).
+fn rld_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Duration> {
+    if !matches!(
+        failure,
+        DecisionsFailure::Unavailable | DecisionsFailure::Throttled
+    ) || hint.should_retry == Some(false)
+    {
+        return None;
+    }
+    match hint.retry_after {
+        Some(wait) if wait > DECISIONS_MAX_RETRY_WAIT => None,
+        Some(wait) => Some(wait.max(Duration::from_secs(1))),
+        None => Some(jittered(DECISIONS_RETRY_DELAY, rand::random::<f64>())),
+    }
+}
+
+/// `base` scaled into [0.5, 1.5) by `unit` in [0, 1).
+fn jittered(base: Duration, unit: f64) -> Duration {
+    base.mul_f64(0.5 + unit.clamp(0.0, 1.0))
 }
 
 fn login_command(env_name: Option<&str>) -> String {
@@ -649,31 +984,60 @@ fn login_command(env_name: Option<&str>) -> String {
 
 /// The core's error response, with a Decisions failure explained: what to
 /// run for a refused key, and that an unavailable service is retryable.
+///
+/// An explained failure always carries `x-should-retry: false`: rld has
+/// already spent the turn's one resend (or the service ruled one out), and
+/// harness SDKs otherwise resend a 5xx or 429 up to about ten times, each a
+/// fresh lookup on the shared routing service. A retryable one also carries
+/// `retry-after` (the service's own, else 30 s) for a user or tool that
+/// sends the turn again by hand.
 fn buffered_response(
     state: &Gateway,
     status: StatusCode,
     headers: &reqwest::header::HeaderMap,
     body: Bytes,
     failure: Option<DecisionsFailure>,
+    hint: RetryHint,
 ) -> Result<Response<Body>> {
-    let (status, body, retry_after) = match failure.and_then(|failure| {
+    let explained = failure.and_then(|failure| {
         explain_decisions_failure(&body, failure, &state.login_command).map(|body| (failure, body))
-    }) {
+    });
+    let mut response;
+    let body = match explained {
         Some((failure, body)) => {
-            let (status, retry_after) = harness_status(failure);
-            (status, body, retry_after)
+            let (status, retryable) = harness_status(failure);
+            response = Response::builder().status(status);
+            for (name, value) in headers {
+                if !hop_header(name.as_str())
+                    && !matches!(
+                        name.as_str(),
+                        "content-length" | "retry-after" | "x-should-retry"
+                    )
+                {
+                    response = response.header(name, value);
+                }
+            }
+            response = response.header("x-should-retry", "false");
+            if retryable {
+                // At least the second rld itself waits.
+                let wait = hint
+                    .retry_after
+                    .unwrap_or(DEFAULT_HARNESS_RETRY_AFTER)
+                    .max(Duration::from_secs(1));
+                response = response.header("retry-after", wait.as_secs().to_string());
+            }
+            body
         }
-        None => (status, body, false),
+        None => {
+            response = Response::builder().status(status);
+            for (name, value) in headers {
+                if !hop_header(name.as_str()) && name.as_str() != "content-length" {
+                    response = response.header(name, value);
+                }
+            }
+            body
+        }
     };
-    let mut response = Response::builder().status(status);
-    for (name, value) in headers {
-        if !hop_header(name.as_str()) && name.as_str() != "content-length" {
-            response = response.header(name, value);
-        }
-    }
-    if retry_after {
-        response = response.header("retry-after", "30");
-    }
     Ok(response.body(Full::new(body).map_err(|never| match never {}).boxed())?)
 }
 
@@ -707,7 +1071,7 @@ fn explain_decisions_failure(
             "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `raydock hybrid stop` and `raydock hybrid start` so the runtime uses the new key."
         ),
         DecisionsFailure::Unavailable => format!(
-            "{message}: the Rayline routing service is unavailable or still starting (a development cell scales to zero and takes about a minute to start). This is retryable: send the turn again shortly."
+            "{message}: the Rayline routing service could not decide this turn right now (it may be unavailable, or a development cell may still be starting, which takes about a minute). This is retryable: send the turn again after the retry-after interval."
         ),
         DecisionsFailure::Throttled => format!(
             "{message}: the Rayline routing service is busy. Send the turn again after the retry-after interval."
@@ -881,6 +1245,31 @@ async fn stop_child(
 mod tests {
     use super::*;
 
+    #[test]
+    fn response_observation_requires_identity_encoding_and_exact_sse_media_type() {
+        let mut headers = hyper::HeaderMap::new();
+        assert_eq!(observable_response(&headers), Some(false));
+        for (content_type, sse) in [
+            ("Text/Event-Stream; charset=utf-8", true),
+            (" text/event-stream ; charset=utf-8", true),
+            ("application/json", false),
+            ("text/event-streamx", false),
+        ] {
+            headers.insert("content-type", content_type.parse().unwrap());
+            assert_eq!(observable_response(&headers), Some(sse));
+            headers.insert("content-encoding", "Identity".parse().unwrap());
+            assert_eq!(observable_response(&headers), Some(sse));
+            for encoding in ["gzip", "br", "zstd", "identity, gzip"] {
+                headers.insert("content-encoding", encoding.parse().unwrap());
+                assert_eq!(observable_response(&headers), None);
+            }
+            headers.remove("content-encoding");
+        }
+        headers.append("content-encoding", "identity".parse().unwrap());
+        headers.append("content-encoding", "gzip".parse().unwrap());
+        assert_eq!(observable_response(&headers), None);
+    }
+
     fn anthropic(message: &str) -> Vec<u8> {
         json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}})
             .to_string()
@@ -891,6 +1280,50 @@ mod tests {
         json!({"error": {"type": "invalid_request_error", "code": "decision_failed", "message": message}})
             .to_string()
             .into_bytes()
+    }
+
+    #[test]
+    fn only_the_cores_decisions_status_and_code_are_logged() {
+        let body = |message: &str| {
+            json!({"type": "error", "error": {"type": "invalid_request_error", "message": message}})
+                .to_string()
+                .into_bytes()
+        };
+        assert_eq!(
+            decisions_detail(&body(
+                "Decisions request refused (HTTP 422, projection_refused)"
+            )),
+            "refused 422 projection_refused"
+        );
+        assert_eq!(
+            decisions_detail(&body("Decisions request refused (HTTP 504)")),
+            "refused 504"
+        );
+        assert_eq!(
+            decisions_detail(&body(
+                "Decisions request refused (HTTP 422, policy_v2_refused)"
+            )),
+            "refused 422 policy_v2_refused"
+        );
+        assert_eq!(
+            decisions_detail(&body("Decisions request refused (HTTP 422, 2bad)")),
+            "refused 422"
+        );
+        assert_eq!(
+            decisions_detail(&body("Decisions request failed")),
+            "request failed"
+        );
+        // Anything else may be a provider's text, which can quote the prompt.
+        assert_eq!(
+            decisions_detail(&body("Rejected input: Decisions secret text")),
+            "other"
+        );
+        assert_eq!(
+            decisions_detail(&body("Decisions request refused (HTTP 422, Secret text)")),
+            "refused 422"
+        );
+        assert_eq!(decisions_detail(&body("unexpected EOF")), "other");
+        assert_eq!(decisions_detail(b"not json"), "other");
     }
 
     #[test]
@@ -907,8 +1340,12 @@ mod tests {
                 Some(DecisionsFailure::Auth)
             );
             for message in [
+                "Decisions request refused (HTTP 500)",
                 "Decisions request refused (HTTP 502)",
                 "Decisions request refused (HTTP 503)",
+                "Decisions request refused (HTTP 504)",
+                "Decisions request refused (HTTP 408)",
+                "Decisions request refused (HTTP 409, code conflict)",
                 "Decisions request failed",
             ] {
                 assert_eq!(
@@ -934,9 +1371,7 @@ mod tests {
                 );
             }
             for message in [
-                "Decisions request refused (HTTP 500)",
-                "Decisions request refused (HTTP 408)",
-                "Decisions request refused (HTTP 409, code conflict)",
+                "Decisions request refused (HTTP 302)",
                 "selected endpoint request failed",
             ] {
                 assert_eq!(decisions_failure(&encode(message)), None, "{message}");
@@ -989,6 +1424,81 @@ mod tests {
                 "{failure:?}: {status}"
             );
         }
+    }
+
+    #[test]
+    fn reads_the_services_retry_advice() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(RetryHint::from_headers(&headers), RetryHint::default());
+        headers.insert("retry-after", " 7 ".parse().unwrap());
+        headers.insert("x-should-retry", "false".parse().unwrap());
+        assert_eq!(
+            RetryHint::from_headers(&headers),
+            RetryHint {
+                retry_after: Some(Duration::from_secs(7)),
+                should_retry: Some(false)
+            }
+        );
+        // An HTTP date, a negative or fractional delay, and anything but
+        // true/false are ignored.
+        for (retry_after, should_retry) in [
+            ("Wed, 21 Oct 2026 07:28:00 GMT", "False"),
+            ("-1", "1"),
+            ("1.5", ""),
+        ] {
+            headers.insert("retry-after", retry_after.parse().unwrap());
+            headers.insert("x-should-retry", should_retry.parse().unwrap());
+            assert_eq!(RetryHint::from_headers(&headers), RetryHint::default());
+        }
+    }
+
+    #[test]
+    fn rld_resends_only_an_unavailable_or_busy_turn_the_service_allows() {
+        let hint = |retry_after: Option<u64>, should_retry: Option<bool>| RetryHint {
+            retry_after: retry_after.map(Duration::from_secs),
+            should_retry,
+        };
+        for failure in [DecisionsFailure::Unavailable, DecisionsFailure::Throttled] {
+            assert_eq!(
+                rld_retry_delay(failure, hint(Some(3), None)),
+                Some(Duration::from_secs(3))
+            );
+            assert_eq!(
+                rld_retry_delay(failure, hint(Some(3), Some(true))),
+                Some(Duration::from_secs(3))
+            );
+            // At least a second, at most the cap.
+            assert_eq!(
+                rld_retry_delay(failure, hint(Some(0), None)),
+                Some(Duration::from_secs(1))
+            );
+            assert_eq!(
+                rld_retry_delay(failure, hint(Some(30), None)),
+                Some(DECISIONS_MAX_RETRY_WAIT)
+            );
+            assert_eq!(rld_retry_delay(failure, hint(Some(31), None)), None);
+            assert_eq!(rld_retry_delay(failure, hint(Some(3), Some(false))), None);
+            assert_eq!(rld_retry_delay(failure, hint(None, Some(false))), None);
+            let default = rld_retry_delay(failure, hint(None, None)).unwrap();
+            assert!(
+                default >= DECISIONS_RETRY_DELAY / 2 && default < DECISIONS_RETRY_DELAY * 3 / 2,
+                "{default:?}"
+            );
+        }
+        for failure in [DecisionsFailure::Auth, DecisionsFailure::Refused] {
+            for advice in [hint(None, None), hint(Some(1), Some(true))] {
+                assert_eq!(rld_retry_delay(failure, advice), None, "{failure:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn jitter_spans_half_to_one_and_a_half_times_the_base() {
+        let base = Duration::from_secs(4);
+        assert_eq!(jittered(base, 0.0), Duration::from_secs(2));
+        assert_eq!(jittered(base, 0.5), Duration::from_secs(4));
+        assert!(jittered(base, 0.999_999) < Duration::from_secs(6));
+        assert_eq!(jittered(base, -3.0), Duration::from_secs(2));
     }
 
     #[test]

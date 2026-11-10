@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """External executable contract fixture. No provider calls or real credentials."""
 import argparse
+import gzip
 import http.server
 import json
 import os
@@ -78,11 +79,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                      "branch": self.headers.get("x-rayline-branch-id"),
                                      "credential_env_present": [name for name in credential_env if os.environ.get(name)],
                                      "core_authenticated": True}) + "\n")
+        if self.path.startswith("/decide-fail?"):
+            # The core's answer when Decisions refused or was unreachable:
+            # a 502 decision_failed naming the service's status, with the
+            # retry advice it forwards (query: refused=<HTTP status>|failed,
+            # retry_after=<s>, should_retry=true|false).
+            query = dict(item.split("=", 1) for item in self.path.split("?", 1)[1].split("&"))
+            refused = query.get("refused", "failed")
+            message = ("Decisions request failed" if refused == "failed"
+                       else f"Decisions request refused (HTTP {refused})")
+            reply = json.dumps({"type": "error", "error": {"type": "invalid_request_error",
+                                                           "message": message}}).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(reply)))
+            if "retry_after" in query:
+                self.send_header("Retry-After", query["retry_after"])
+            if "should_retry" in query:
+                self.send_header("x-should-retry", query["should_retry"])
+            self.end_headers()
+            self.wfile.write(reply)
+            return
         if self.path == "/crash":
             os._exit(23)
         if self.path == "/unready":
             Handler.ready = False
-        if self.path == "/pending":
+        if self.path == "/pending" or (self.path == "/v1/messages" and json.loads(body).get("fixture_pending")):
             try:
                 more = self.rfile.read(1)
             except (ConnectionResetError, ConnectionAbortedError):
@@ -90,7 +112,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not more:
                 pathlib.Path(config["cancelled"] + "-pending").write_text("cancelled before headers")
             return
-        if self.path == "/stream":
+        if self.path == "/v1/messages" and json.loads(body).get("fixture_empty_status"):
+            parsed = json.loads(body)
+            self.send_response(parsed["fixture_empty_status"])
+            if parsed.get("fixture_empty_content_type"):
+                self.send_header("Content-Type", parsed["fixture_empty_content_type"])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/v1/messages" and json.loads(body).get("fixture_deep"):
+            # Valid JSON nested past serde_json's default recursion limit (128).
+            deep = ('{"type":"message","content":[{"type":"tool_use","input":' + "[" * 200 + "0"
+                    + "]" * 200 + "}]}").encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(deep)))
+            self.end_headers()
+            self.wfile.write(deep)
+            return
+        if self.path == "/v1/messages" and json.loads(body).get("fixture_gzip"):
+            # Fixed mtime makes the encoded wire bytes independently assertable.
+            encoded = bytearray(gzip.compress(b'{"usage":{"input_tokens":7,"output_tokens":3}}', mtime=0))
+            encoded[9] = 255  # Portable gzip OS marker.
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Encoding", "gzip")
+            if json.loads(body).get("fixture_eof"):
+                self.send_header("Connection", "close")
+                self.close_connection = True
+            else:
+                self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+            return
+        if self.path == "/stream" or (self.path == "/v1/messages" and json.loads(body).get("stream")):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -106,6 +161,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("x-rayline-selected-model", "fixture-model")
+        if config.get("derived_actions"):
+            requested = json.loads(body)["model"]
+            entry = next(row for row in config["derived_actions"] if row["model"] == requested)
+            self.send_header("x-rayline-instance-id", f"fixture-{os.getpid()}")
+            self.send_header("x-rayline-executed-model", entry["model"])
+            self.send_header("x-rayline-executed-worker", entry["worker"])
+            self.send_header("x-rayline-executed-action-id", "dynamic-registry-action")
         self.end_headers()
         self.wfile.write(body)
 

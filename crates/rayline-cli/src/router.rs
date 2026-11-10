@@ -131,6 +131,9 @@ pub struct RouterLogsRequest {
 pub struct RouterTopRequest {
     pub json: bool,
     pub show_all: bool,
+    pub hybrid: bool,
+    pub legacy: bool,
+    pub state_dir: Option<PathBuf>,
     pub root_env_explicit: bool,
 }
 
@@ -314,20 +317,13 @@ pub async fn render_top(request: &RouterTopRequest) -> io::Result<String> {
 }
 
 async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Result<String> {
-    let serve_meta = read_meta(&RouterPaths::new(home).meta_file);
-    let proxy_meta = read_meta(&RouterPaths::new(home).proxy_meta_file);
-    let isolated_proxy_meta = read_meta(&RouterPaths::new_isolated(home).proxy_meta_file);
-    let candidates = metrics_port_candidates(&serve_meta, &proxy_meta, &isolated_proxy_meta);
-    let client = reqwest::Client::builder()
-        .timeout(HEALTH_TIMEOUT)
-        .build()
-        .map_err(io::Error::other)?;
-    let metrics_port = first_reachable_metrics_port(&client, &candidates).await;
-    let url = format!("http://127.0.0.1:{metrics_port}/v1/router/top/snapshot");
+    let (client, url, identity) = top_source(home, request).await?;
     let mut trace_cache = ClaudeTraceCache::new(home);
+    trace_cache.hybrid = identity.is_some();
+    trace_cache.hybrid_identity = identity;
 
     if request.json {
-        let mut snapshot = fetch_top_snapshot(&client, &url).await?;
+        let mut snapshot = trace_cache.fetch_snapshot(&client, &url).await?;
         trace_cache.enrich_snapshot(&mut snapshot);
         filter_top_snapshot(&mut snapshot, request.show_all);
         return serde_json::to_string_pretty(&snapshot)
@@ -339,13 +335,59 @@ async fn render_top_from_home(home: &Path, request: &RouterTopRequest) -> io::Re
     }
 
     if !io::stdout().is_terminal() {
-        let mut snapshot = fetch_top_snapshot(&client, &url).await?;
+        let mut snapshot = trace_cache.fetch_snapshot(&client, &url).await?;
         trace_cache.enrich_snapshot(&mut snapshot);
         return Ok(format_top_snapshot(&snapshot, request.show_all));
     }
 
     run_top_tui(&client, &url, trace_cache, request.show_all).await?;
     Ok(String::new())
+}
+
+async fn top_source(
+    home: &Path,
+    request: &RouterTopRequest,
+) -> io::Result<(reqwest::Client, String, Option<Value>)> {
+    let state_dir = request
+        .state_dir
+        .clone()
+        .unwrap_or_else(|| home.join(".rayline/hybrid"));
+    if request.hybrid {
+        let (client, url, identity) = crate::hybrid::top_connection(&state_dir).await?;
+        return Ok((client, url, Some(identity)));
+    }
+    let serve_meta = read_meta(&RouterPaths::new(home).meta_file);
+    let proxy_meta = read_meta(&RouterPaths::new(home).proxy_meta_file);
+    let isolated_proxy_meta = read_meta(&RouterPaths::new_isolated(home).proxy_meta_file);
+    let candidates = metrics_port_candidates(&serve_meta, &proxy_meta, &isolated_proxy_meta);
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(HEALTH_TIMEOUT)
+        .build()
+        .map_err(io::Error::other)?;
+    let legacy = first_legacy_snapshot_port(&client, &candidates).await;
+    let hybrid = if request.legacy {
+        Err(io::Error::other("legacy metrics explicitly selected"))
+    } else {
+        crate::hybrid::top_connection(&state_dir).await
+    };
+    match (legacy, hybrid) {
+        (Some(_), Ok(_)) => Err(io::Error::other(
+            "both hybrid and legacy router metrics are live; select `raydock top --hybrid` or `raydock top --legacy`",
+        )),
+        (None, Ok((client, url, identity))) => Ok((client, url, Some(identity))),
+        (Some(port), Err(_)) => Ok((
+            client,
+            format!("http://127.0.0.1:{port}/v1/router/top/snapshot"),
+            None,
+        )),
+        // Never guess a port: an unvalidated candidate may be an unrelated service.
+        (None, Err(_)) => Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "router metrics endpoint is not available: no live hybrid or legacy runtime found",
+        )),
+    }
 }
 
 async fn fetch_top_snapshot(client: &reqwest::Client, url: &str) -> io::Result<Value> {
@@ -364,6 +406,36 @@ async fn fetch_top_snapshot(client: &reqwest::Client, url: &str) -> io::Result<V
         .json::<Value>()
         .await
         .map_err(io::Error::other)
+        .and_then(|snapshot| {
+            validate_top_snapshot(&snapshot)?;
+            Ok(snapshot)
+        })
+}
+
+/// Reject a snapshot whose shape the renderers cannot safely mutate or index.
+/// Every top path fetches through `fetch_top_snapshot`, so this is the one gate.
+/// The diagnostic never echoes the endpoint's body.
+fn validate_top_snapshot(snapshot: &Value) -> io::Result<()> {
+    let invalid = |what: &str| {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("router metrics endpoint returned a malformed snapshot: {what}"),
+        ))
+    };
+    let Some(object) = snapshot.as_object() else {
+        return invalid("not a JSON object");
+    };
+    for key in ["active", "recent"] {
+        match object.get(key) {
+            None => {}
+            Some(Value::Array(rows)) if rows.iter().all(Value::is_object) => {}
+            Some(_) => return invalid(&format!("`{key}` is not an array of objects")),
+        }
+    }
+    match object.get("totals") {
+        None | Some(Value::Object(_)) => Ok(()),
+        Some(_) => invalid("`totals` is not an object"),
+    }
 }
 
 struct ClaudeTraceCache {
@@ -371,6 +443,8 @@ struct ClaudeTraceCache {
     cwd: Option<PathBuf>,
     last_refresh: Option<Instant>,
     usages: Vec<TraceUsage>,
+    hybrid: bool,
+    hybrid_identity: Option<Value>,
 }
 
 impl ClaudeTraceCache {
@@ -380,10 +454,50 @@ impl ClaudeTraceCache {
             cwd: std::env::current_dir().ok(),
             last_refresh: None,
             usages: Vec::new(),
+            hybrid: false,
+            hybrid_identity: None,
         }
     }
 
+    async fn fetch_snapshot(&self, client: &reqwest::Client, url: &str) -> io::Result<Value> {
+        let snapshot = fetch_top_snapshot(client, url).await?;
+        if let Some(identity) = &self.hybrid_identity {
+            if snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-hybrid")
+                || ["pid", "core_pid", "instance_id"]
+                    .iter()
+                    .any(|key| snapshot.get(key) != identity.get(key))
+            {
+                return Err(io::Error::other(
+                    "hybrid snapshot/process identity mismatch; reconnect top to the intended runtime",
+                ));
+            }
+        }
+        Ok(snapshot)
+    }
+
     fn enrich_snapshot(&mut self, snapshot: &mut Value) {
+        // Fetched snapshots are validated as objects; never index-assign anyway.
+        if let Some(object) = snapshot.as_object_mut() {
+            object.entry("runtime").or_insert_with(|| {
+                Value::from(if self.hybrid {
+                    "rayline-hybrid"
+                } else {
+                    "legacy"
+                })
+            });
+        }
+        if self.hybrid {
+            for key in ["active", "recent"] {
+                if let Some(rows) = snapshot.get_mut(key).and_then(Value::as_array_mut) {
+                    for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+                        row.insert("runtime".to_owned(), Value::from("hybrid"));
+                    }
+                }
+            }
+            // Hybrid execution identity and usage come only from the gateway.
+            // Harness traces name the virtual requested model, not execution.
+            return;
+        }
         self.refresh_if_stale();
         enrich_top_snapshot_with_trace_usages(snapshot, &self.usages);
     }
@@ -872,7 +986,7 @@ async fn run_top_tui(
                     .map(|last| last.elapsed() >= TOP_REFRESH_INTERVAL)
                     .unwrap_or(true));
         if should_refresh {
-            match fetch_top_snapshot(client, url).await {
+            match trace_cache.fetch_snapshot(client, url).await {
                 Ok(mut next_snapshot) => {
                     trace_cache.enrich_snapshot(&mut next_snapshot);
                     snapshot = next_snapshot;
@@ -1006,7 +1120,8 @@ fn draw_top_summary(
         y,
         width,
         &format!(
-            "current active={active}  recent={recent}  traffic={}{}  mode={}  sort={}  refresh={}ms",
+            "current runtime={}  active={active}  recent={recent}  traffic={}{}  mode={}  sort={}  refresh={}ms",
+            value_str(snapshot, "runtime"),
             if show_all { "all" } else { "llm" },
             if !show_all && hidden > 0 {
                 format!(" hidden-proxied={hidden}")
@@ -1255,7 +1370,8 @@ fn format_top_snapshot(snapshot: &Value, show_all: bool) -> String {
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let mut output = format!(
-        "Rayline router top snapshot\nactive: {active}  recent: {recent}  completed: {completed}  errors: {errored}  traffic: {}{}\n",
+        "Rayline router top snapshot (runtime: {})\nactive: {active}  recent: {recent}  completed: {completed}  errors: {errored}  traffic: {}{}\n",
+        value_str(snapshot, "runtime"),
         if show_all { "all" } else { "llm" },
         if !show_all && hidden > 0 {
             format!("  hidden-proxied: {hidden}")
@@ -1396,6 +1512,8 @@ fn is_proxied_traffic(row: &Value) -> bool {
 fn top_target_cell(row: &Value) -> String {
     if is_proxied_traffic(row) {
         "proxied".to_owned()
+    } else if value_str(row, "runtime") == "hybrid" && value_str(row, "target") == "remote" {
+        "cloud".to_owned()
     } else {
         value_str(row, "target").to_owned()
     }
@@ -1448,7 +1566,9 @@ fn format_compact_number(value: f64, plain_decimals: usize) -> String {
 }
 
 fn top_model_cell(row: &Value) -> String {
-    let model = if is_proxied_traffic(row) {
+    let model = if value_str(row, "runtime") == "hybrid" {
+        value_str(row, "selected_model")
+    } else if is_proxied_traffic(row) {
         value_str(row, "endpoint_id")
     } else {
         match value_str(row, "selected_model") {
@@ -1457,7 +1577,7 @@ fn top_model_cell(row: &Value) -> String {
         }
     };
     let model = match model {
-        "-" => value_str(row, "requested_model"),
+        "-" if value_str(row, "runtime") != "hybrid" => value_str(row, "requested_model"),
         selected => selected,
     };
     let policy = top_policy_cell(row);
@@ -3378,55 +3498,405 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[tokio::test]
-    async fn first_reachable_metrics_port_skips_unreachable_and_picks_live_server() {
+    async fn hybrid_top_fixture(
+        home: &Path,
+        health_override: Value,
+    ) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        // A port that is bound then released: probing it gets connection-refused.
-        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_port = released.local_addr().unwrap().port();
-        drop(released);
-
-        // A live responder that answers the snapshot probe with 200.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let live_port = listener.local_addr().unwrap().port();
+        let state_dir = home.join(".rayline/hybrid");
+        fs::create_dir_all(&state_dir).unwrap();
+        let mut state = serde_json::json!({
+            "contract_version": 1, "ready": true,
+            "pid": std::process::id(), "core_pid": std::process::id(),
+            "instance_id": "test-core", "credential_env": [],
+            "capabilities": {"context_window": 98304, "max_output_tokens": 4096, "input_modalities": ["text"]},
+            "listen_url": format!("http://{}", listener.local_addr().unwrap())
+        });
+        fs::write(
+            state_dir.join("ready.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+        fs::write(state_dir.join("gateway-token"), "test-private-token").unwrap();
+        for (key, value) in health_override.as_object().unwrap() {
+            state[key] = value.clone();
+        }
         tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf).await;
-                let body = b"{\"ok\":true}";
+            let mut snapshots = 0;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buffer = [0u8; 4096];
+                let size = stream.read(&mut buffer).await.unwrap();
+                let request = String::from_utf8_lossy(&buffer[..size]).to_lowercase();
+                let authenticated =
+                    request.contains("authorization: bearer test-private-token\r\n");
+                let health_request = request.starts_with("get /healthz ");
+                let body = if health_request {
+                    state.clone()
+                } else {
+                    serde_json::json!({"runtime": "rayline-hybrid", "instance_id": "test-core",
+                        "pid": std::process::id(), "core_pid": std::process::id(),
+                        "totals": {"completed_requests": 1, "output_tokens": 12}, "active": [],
+                        "recent": [{"request_id": "hybrid_1", "target": "remote", "state": "completed",
+                            "selected_model": null, "requested_model": "virtual-model", "output_tokens": 12}]})
+                };
+                let mut body = body;
+                if !health_request {
+                    snapshots += 1;
+                    if state.get("replace_snapshot_identity") == Some(&Value::Bool(true))
+                        && snapshots > 1
+                    {
+                        body["instance_id"] = Value::from("replacement-core");
+                    }
+                }
+                let body = serde_json::to_vec(&body).unwrap();
+                let status = if authenticated {
+                    "200 OK"
+                } else {
+                    "401 Unauthorized"
+                };
                 let head = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&body).await.unwrap();
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn hybrid_top_authenticates_preserves_unknown_execution_and_never_falls_back() {
+        let home = unique_test_dir("hybrid-top");
+        let server = hybrid_top_fixture(&home, serde_json::json!({})).await;
+        let request = RouterTopRequest {
+            json: true,
+            show_all: false,
+            hybrid: true,
+            legacy: false,
+            state_dir: None,
+            root_env_explicit: false,
+        };
+        let rendered = render_top_from_home(&home, &request).await.unwrap();
+        let snapshot: Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(snapshot["runtime"], "rayline-hybrid");
+        assert_eq!(snapshot["recent"][0]["selected_model"], Value::Null);
+        assert_eq!(snapshot["recent"][0]["output_tokens"], 12);
+        assert_eq!(top_target_cell(&snapshot["recent"][0]), "cloud");
+        assert!(!top_model_cell(&snapshot["recent"][0]).contains("virtual-model"));
+        let auto = RouterTopRequest {
+            hybrid: false,
+            ..request.clone()
+        };
+        // Exercise discovery at the real entry boundary, not just metadata parsing.
+        let (client, url, is_hybrid) = top_source(&home, &auto).await.unwrap();
+        assert!(is_hybrid.is_some());
+        assert!(fetch_top_snapshot(&client, &url).await.is_ok());
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let legacy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let meta = RouterPaths::new(&home).meta_file;
+        fs::create_dir_all(meta.parent().unwrap()).unwrap();
+        fs::write(
+            &meta,
+            format!("metrics_port={}\n", legacy.local_addr().unwrap().port()),
+        )
+        .unwrap();
+        let legacy_server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = legacy.accept().await.unwrap();
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                let body = br#"{"ok":true,"active":[],"recent":[],"totals":{}}"#;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
                 );
                 let _ = stream.write_all(head.as_bytes()).await;
                 let _ = stream.write_all(body).await;
-                let _ = stream.flush().await;
             }
         });
-
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .unwrap();
-
-        let port = first_reachable_metrics_port(&client, &[closed_port, live_port]).await;
-        assert_eq!(port, live_port);
+        assert!(
+            top_source(&home, &auto)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("both hybrid and legacy")
+        );
+        assert!(render_top_from_home(&home, &request).await.is_ok());
+        let explicit_legacy = RouterTopRequest {
+            legacy: true,
+            ..auto.clone()
+        };
+        let (_, legacy_url, identity) = top_source(&home, &explicit_legacy).await.unwrap();
+        assert!(identity.is_none());
+        assert_ne!(legacy_url, url);
+        fs::write(
+            home.join(".rayline/hybrid/gateway-token"),
+            "wrong-private-token",
+        )
+        .unwrap();
+        let error = render_top_from_home(&home, &request)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("health/authentication"));
+        assert!(!error.contains("private-token"));
+        server.abort();
+        let server =
+            hybrid_top_fixture(&home, serde_json::json!({"instance_id": "different-core"})).await;
+        assert!(
+            render_top_from_home(&home, &request)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("identity")
+        );
+        server.abort();
+        let server = hybrid_top_fixture(
+            &home,
+            serde_json::json!({"replace_snapshot_identity": true}),
+        )
+        .await;
+        let (client, url, identity) = top_source(&home, &request).await.unwrap();
+        let mut cache = ClaudeTraceCache::new(&home);
+        cache.hybrid_identity = identity;
+        assert!(cache.fetch_snapshot(&client, &url).await.is_ok());
+        assert!(
+            cache
+                .fetch_snapshot(&client, &url)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("snapshot/process identity mismatch")
+        );
+        server.abort();
+        legacy_server.abort();
+        let ready_path = home.join(".rayline/hybrid/ready.json");
+        let original: Value = serde_json::from_slice(&fs::read(&ready_path).unwrap()).unwrap();
+        for patch in [
+            serde_json::json!({"ready": false}),
+            serde_json::json!({"pid": 0}),
+            serde_json::json!({"core_pid": 0}),
+            serde_json::json!({"listen_url": "http://private-token@127.0.0.1:1234"}),
+            serde_json::json!({"listen_url": "http://example.com:1234"}),
+        ] {
+            let mut state = original.clone();
+            for (key, value) in patch.as_object().unwrap() {
+                state[key] = value.clone();
+            }
+            fs::write(&ready_path, serde_json::to_vec(&state).unwrap()).unwrap();
+            let error = render_top_from_home(&home, &request)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("readiness") || error.contains("not live"));
+            assert!(!error.contains("private-token"));
+        }
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[tokio::test]
-    async fn first_reachable_metrics_port_falls_back_to_first_when_none_reachable() {
-        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let closed_port = released.local_addr().unwrap().port();
-        drop(released);
+    async fn automatic_top_ignores_unrelated_http_and_hybrid_at_legacy_port() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for body in [
+            "{}",
+            "hello",
+            r#"{"ok":true,"active":[],"recent":[],"totals":{},"runtime":"rayline-hybrid"}"#,
+            MALFORMED_ROWS_SNAPSHOT,
+        ] {
+            let home = unique_test_dir("top-unrelated-http");
+            let hybrid = hybrid_top_fixture(&home, serde_json::json!({})).await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let meta = RouterPaths::new(&home).meta_file;
+            fs::create_dir_all(meta.parent().unwrap()).unwrap();
+            fs::write(
+                &meta,
+                format!("metrics_port={}\n", listener.local_addr().unwrap().port()),
+            )
+            .unwrap();
+            let unrelated = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let mut buffer = [0u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body.as_bytes()).await;
+                }
+            });
+            let request = RouterTopRequest {
+                json: true,
+                show_all: false,
+                hybrid: false,
+                legacy: false,
+                state_dir: None,
+                root_env_explicit: false,
+            };
+            let (client, url, identity) = top_source(&home, &request).await.unwrap();
+            assert!(identity.is_some(), "{body}");
+            assert_eq!(
+                fetch_top_snapshot(&client, &url).await.unwrap()["runtime"],
+                "rayline-hybrid"
+            );
+            unrelated.abort();
+            hybrid.abort();
+            fs::remove_dir_all(home).unwrap();
+        }
+    }
 
+    const MALFORMED_ROWS_SNAPSHOT: &str = r#"{"ok":true,"active":[1],"recent":[],"totals":{}}"#;
+    const GENUINE_SNAPSHOT: &str =
+        r#"{"ok":true,"runtime":"legacy","active":[],"recent":[],"totals":{}}"#;
+
+    /// A local HTTP responder answering every request with 200 and `body`.
+    async fn fixed_body_server(body: impl Into<String>) -> (u16, tokio::task::JoinHandle<()>) {
+        sequence_server(vec![body.into()]).await
+    }
+
+    /// Answers successive requests with successive bodies, repeating the last.
+    async fn sequence_server(bodies: Vec<String>) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            for index in 0.. {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let body = &bodies[index.min(bodies.len() - 1)];
+                let mut buffer = [0u8; 1024];
+                let _ = stream.read(&mut buffer).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(body.as_bytes()).await;
+            }
+        });
+        (port, handle)
+    }
+
+    fn top_request(legacy: bool) -> RouterTopRequest {
+        RouterTopRequest {
+            json: true,
+            show_all: false,
+            hybrid: false,
+            legacy,
+            state_dir: None,
+            root_env_explicit: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn every_legacy_selection_path_requires_a_genuine_snapshot() {
+        // A port that is bound then released: probing it gets connection-refused.
+        let released = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed = released.local_addr().unwrap().port();
+        drop(released);
+        let (unrelated, unrelated_server) = fixed_body_server("{}").await;
+        let (genuine, genuine_server) = fixed_body_server(GENUINE_SNAPSHOT).await;
+        // Looks like a router snapshot but its rows are unusable: discovery and
+        // consumption share one validator, so it is never selected.
+        let (malformed, malformed_server) = fixed_body_server(MALFORMED_ROWS_SNAPSHOT).await;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(1))
             .build()
             .unwrap();
+        assert_eq!(
+            first_legacy_snapshot_port(&client, &[closed, unrelated, malformed, genuine]).await,
+            Some(genuine)
+        );
+        assert_eq!(
+            first_legacy_snapshot_port(&client, &[closed, unrelated, malformed]).await,
+            None
+        );
 
-        let port = first_reachable_metrics_port(&client, &[closed_port]).await;
-        assert_eq!(port, closed_port);
+        // Explicit --legacy skips an earlier unrelated responder for the genuine one.
+        let home = unique_test_dir("top-legacy-validated");
+        let paths = RouterPaths::new(&home);
+        fs::create_dir_all(paths.meta_file.parent().unwrap()).unwrap();
+        fs::write(&paths.meta_file, format!("metrics_port={malformed}\n")).unwrap();
+        fs::write(&paths.proxy_meta_file, format!("metrics_port={genuine}\n")).unwrap();
+        let (_, url, identity) = top_source(&home, &top_request(true)).await.unwrap();
+        assert!(identity.is_none());
+        assert!(url.contains(&format!(":{genuine}/")), "{url}");
+
+        // With only unusable responders, no path guesses a port.
+        fs::remove_file(&paths.proxy_meta_file).unwrap();
+        for legacy in [true, false] {
+            let error = top_source(&home, &top_request(legacy))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("router metrics endpoint is not available"),
+                "{error}"
+            );
+            assert!(!error.contains(&malformed.to_string()), "{error}");
+        }
+        malformed_server.abort();
+        unrelated_server.abort();
+        genuine_server.abort();
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_snapshots_are_errors_never_panics_for_legacy_and_hybrid() {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let identity = serde_json::json!({"pid": 1, "core_pid": 2, "instance_id": "core"});
+        let hybrid_head = r#""runtime":"rayline-hybrid","pid":1,"core_pid":2,"instance_id":"core""#;
+        let hybrid_scalar_rows = format!(r#"{{{hybrid_head},"active":[],"recent":[1]}}"#);
+        let hybrid_bad_totals = format!(r#"{{{hybrid_head},"totals":3}}"#);
+        for (hybrid, body) in [
+            (false, "[]"),
+            (false, "0"),
+            (false, r#""secret-body-marker""#),
+            (false, r#"{"ok":true,"active":[1],"recent":[],"totals":{}}"#),
+            (false, r#"{"ok":true,"active":[],"recent":"x","totals":{}}"#),
+            (false, r#"{"ok":true,"active":[],"recent":[],"totals":[]}"#),
+            (true, hybrid_scalar_rows.as_str()),
+            (true, hybrid_bad_totals.as_str()),
+        ] {
+            let (port, server) = fixed_body_server(body).await;
+            let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
+            let home = unique_test_dir("top-malformed");
+            let mut cache = ClaudeTraceCache::new(&home);
+            cache.hybrid = hybrid;
+            cache.hybrid_identity = hybrid.then(|| identity.clone());
+            // The json, non-TTY text and TUI refresh paths all fetch, then enrich.
+            let error = cache.fetch_snapshot(&client, &url).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{body}");
+            assert!(!error.to_string().contains("secret-body-marker"));
+            // Mutation is non-panicking even for a value that skipped validation.
+            let mut raw: Value = serde_json::from_str(body).unwrap();
+            cache.enrich_snapshot(&mut raw);
+            server.abort();
+            fs::remove_dir_all(&home).ok();
+        }
+        // A snapshot that passes discovery but is malformed by fetch time (the
+        // endpoint changed between probe and fetch) is an error, not a panic.
+        let (port, server) = sequence_server(vec![
+            GENUINE_SNAPSHOT.to_owned(),
+            MALFORMED_ROWS_SNAPSHOT.to_owned(),
+        ])
+        .await;
+        let home = unique_test_dir("top-malformed-render");
+        let paths = RouterPaths::new(&home);
+        fs::create_dir_all(paths.meta_file.parent().unwrap()).unwrap();
+        fs::write(&paths.meta_file, format!("metrics_port={port}\n")).unwrap();
+        let error = render_top_from_home(&home, &top_request(true))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        server.abort();
+        fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -5242,23 +5712,41 @@ fn metrics_port_candidates(
     ports
 }
 
-/// Probe each candidate metrics port in precedence order and return the first
-/// whose snapshot endpoint answers. A stale meta entry (port recorded but the
-/// proxy gone) is skipped in favour of a live server. If none respond, fall back
-/// to the highest-precedence candidate so the downstream "not available" error
-/// names a sensible port. `candidates` is always non-empty in practice
-/// (`metrics_port_candidates` appends the default), but an empty slice degrades
-/// to the shared default rather than panicking.
-async fn first_reachable_metrics_port(client: &reqwest::Client, candidates: &[u16]) -> u16 {
+/// A legacy router snapshot is a snapshot top can consume, plus the markers
+/// that identify it as a legacy router rather than another JSON service or the
+/// hybrid runtime. Shape rules live only in `validate_top_snapshot`: discovery
+/// and consumption cannot disagree about what a usable snapshot is.
+fn is_legacy_snapshot(snapshot: &Value) -> bool {
+    validate_top_snapshot(snapshot).is_ok()
+        && snapshot.get("ok") == Some(&Value::Bool(true))
+        && ["active", "recent", "totals"]
+            .iter()
+            .all(|key| snapshot.get(key).is_some())
+        && snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-hybrid")
+}
+
+/// The one legacy discovery for every top path: probe each candidate port in
+/// precedence order and return the first that serves a genuine router metrics
+/// snapshot, not merely an HTTP responder. Stale metadata and unrelated
+/// services are skipped; nothing validating returns `None`. (The weaker
+/// `metrics_port_is_serving` remains only for serve/proxy meta reconciliation.)
+async fn first_legacy_snapshot_port(client: &reqwest::Client, candidates: &[u16]) -> Option<u16> {
     for &port in candidates {
-        if metrics_port_is_serving(client, port).await {
-            return port;
+        let url = format!("http://127.0.0.1:{port}/v1/router/top/snapshot");
+        let Ok(response) = client.get(url).send().await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(snapshot) = response.json::<Value>().await else {
+            continue;
+        };
+        if is_legacy_snapshot(&snapshot) {
+            return Some(port);
         }
     }
-    candidates
-        .first()
-        .copied()
-        .unwrap_or(rayline_metrics::DEFAULT_METRICS_PORT)
+    None
 }
 
 /// The pid of the process whose metrics-control server answers on `port`, as
