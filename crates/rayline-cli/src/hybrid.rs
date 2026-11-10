@@ -238,7 +238,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         eprintln!("{message}");
                     }
                     if registry_model != crate::hybrid_profile::LOCAL_REGISTRY_MODEL {
-                        declared_local = Some(registry_model);
+                        declared_local = Some(registry_model.clone());
                     }
                     let window = if local_refused {
                         configured.unwrap_or(crate::hybrid_profile::DEFAULT_LOCAL_CONTEXT_WINDOW)
@@ -247,6 +247,11 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                             crate::hybrid_profile::resolve_local_window(configured, runtime.window);
                         if let Some(note) = note {
                             eprintln!("{note}");
+                        }
+                        if let Some(warning) =
+                            crate::hybrid_profile::small_window_warning(&registry_model, window)
+                        {
+                            eprintln!("{warning}");
                         }
                         window
                     };

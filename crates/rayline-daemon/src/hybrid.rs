@@ -453,6 +453,14 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         let error_body = upstream.bytes().await?;
         let failure = decisions_failure(&error_body);
         let hint = RetryHint::from_headers(&headers);
+        // The core's message names the service's HTTP status and code; the
+        // route id is the service's, when it sent one. Neither carries the
+        // prompt or a credential.
+        let detail = decisions_message(&error_body).unwrap_or_default();
+        let route_id = headers
+            .get("x-rayline-route-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("-");
         if !retried
             && let Some(failure) = failure
             && let Some(delay) = rld_retry_delay(failure, hint)
@@ -462,11 +470,22 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
             retried = true;
             tracing::info!(
                 ?failure,
+                %detail,
+                route_id,
                 delay_ms = delay.as_millis() as u64,
                 "Decisions unavailable or busy; retrying the turn once"
             );
             tokio::time::sleep(delay).await;
             continue;
+        }
+        if failure.is_some() {
+            tracing::warn!(
+                ?failure,
+                %detail,
+                route_id,
+                resent = retried,
+                "Decisions failed the turn; returning the error to the harness"
+            );
         }
         return buffered_response(state, status, &headers, error_body, failure, hint);
     }
@@ -644,11 +663,20 @@ enum DecisionsFailure {
     Refused,
 }
 
+/// The core's `decision_failed` message (`error.message`, either wire
+/// format), cut to a log-sized length. The messages are the core's own
+/// (`Decide`): a status and a code, never request content.
+fn decisions_message(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let message = value.pointer("/error/message")?.as_str()?;
+    Some(message.chars().take(160).collect())
+}
+
 /// Classify the core's `decision_failed` error, in either wire format
 /// (`error.message`). The messages are the core's own (`Decide`).
 fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
-    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
-    let message = value.pointer("/error/message")?.as_str()?;
+    let message = decisions_message(body)?;
+    let message = message.as_str();
     if message == "Decisions request failed" {
         return Some(DecisionsFailure::Unavailable);
     }

@@ -154,6 +154,31 @@ pub(crate) fn resolve_local_window(
     }
 }
 
+/// The local deployment's output ceiling for a `window`-token window.
+fn local_max_output(window: u64) -> u64 {
+    (window / 4).clamp(1024, MAX_OUTPUT_TOKENS)
+}
+
+/// Claude Code's opening request, in the tokens the core bounds it at for a
+/// model whose tokenizer it does not have (bytes-bounded): about 107,000 on
+/// 2026-11-10 (dev hybrid run), so 110,000 with headroom. Qwen3.8-27B's is
+/// measured with its tokenizer and is far smaller (about 39,000).
+const CLAUDE_CODE_OPENING_TOKENS: u64 = 110_000;
+
+/// A warning when `window` cannot hold Claude Code's opening request and the
+/// answer, so every Claude Code task start would go to cloud. None for
+/// Qwen3.8-27B, whose prompts the core measures exactly.
+pub(crate) fn small_window_warning(registry_model: &str, window: u64) -> Option<String> {
+    if registry_model == LOCAL_REGISTRY_MODEL
+        || window.saturating_sub(local_max_output(window)) >= CLAUDE_CODE_OPENING_TOKENS
+    {
+        return None;
+    }
+    Some(format!(
+        "Warning: the local window is {window} tokens. Claude Code's opening request alone is about {CLAUDE_CODE_OPENING_TOKENS} tokens for {registry_model}, so every Claude Code task starts on cloud. Load the local model with a 262144-token window (llama.cpp `--ctx-size 262144`, vLLM `--max-model-len 262144`) and set --local-context-window 262144 if you set one."
+    ))
+}
+
 /// `hybrid.local_registry_model` from settings, or [`LOCAL_REGISTRY_MODEL`].
 /// Raydock has no copy of the core's registry, so it checks only the shape
 /// (`provider/model`); the core refuses a model its registry does not know.
@@ -699,7 +724,7 @@ pub(crate) fn default_profile(
         "{}/v1/chat/completions",
         crate::local_model::normalize_base_url(base_url)
     );
-    let max_output = (context_window / 4).clamp(1024, MAX_OUTPUT_TOKENS);
+    let max_output = local_max_output(context_window);
     let cloud = |id: &str, wire: &str, max_output_tokens: u64| {
         json!({"id": id, "kind": "cloud", "cloud_transport": "model_pin", "url": format!("{router}/v1/messages"),
                "protocol": "anthropic.messages.v1", "wire_model": wire, "registry_model": wire,
@@ -1348,6 +1373,20 @@ mod tests {
         );
         assert_eq!(resolve_local_window(Some(131_072), Some(65_536)).0, 65_536);
         assert_eq!(resolve_local_window(Some(131_072), None).0, 131_072);
+    }
+
+    #[test]
+    fn a_window_too_small_for_claude_codes_opening_request_is_warned() {
+        let glm = "z-ai/glm-5.3-flash";
+        let warning =
+            small_window_warning(glm, 98_304).expect("98k cannot hold the opening request");
+        assert!(warning.contains("98304"), "{warning}");
+        assert!(warning.contains("--ctx-size 262144"), "{warning}");
+        assert!(small_window_warning(glm, 131_072).is_some());
+        assert_eq!(small_window_warning(glm, 142_000), None);
+        assert_eq!(small_window_warning(glm, 262_144), None);
+        // Qwen's prompts are measured with its tokenizer: 98k holds them.
+        assert_eq!(small_window_warning(LOCAL_REGISTRY_MODEL, 98_304), None);
     }
 
     #[test]
