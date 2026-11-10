@@ -210,35 +210,44 @@ impl ResponseObserver {
     }
 
     fn json(&mut self, bytes: &[u8], event: &str) {
-        let Ok(value) = serde_json::from_slice::<Value>(bytes) else {
-            if !self.sse {
-                self.json_validity = ResponseValidity::Invalid;
+        let value = match serde_json::from_slice::<Value>(bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                // serde_json bounds nesting depth (128). Valid but deeply nested
+                // output, such as a tool input, exhausts that resource limit; it
+                // is unavailable telemetry, not evidence the inference failed.
+                // serde_json exposes no stable error code, so match its message.
+                let depth_limit = error.to_string().starts_with("recursion limit exceeded");
+                if !self.sse && !depth_limit {
+                    self.json_validity = ResponseValidity::Invalid;
+                }
+                return;
             }
-            return;
         };
         if !self.sse && recognized_response(&value) {
             self.json_validity = ResponseValidity::Valid;
         }
         let kind = value.get("type").and_then(Value::as_str).unwrap_or(event);
         let response = value.get("response").unwrap_or(&value);
-        if is_error_type(kind)
+        // Failed and incomplete responses still consumed the tokens they report.
+        let document = value.get("message").unwrap_or(response);
+        let failure = is_error_type(kind)
             || nonnull_error(&value)
             || nonnull_error(response)
             || matches!(
                 response.get("status").and_then(Value::as_str),
                 Some("failed" | "incomplete")
-            )
-        {
+            );
+        if let Some(usage) = document.get("usage") {
+            self.usage(usage, kind);
+        }
+        if failure {
             self.failed = true;
             self.terminal = true;
             return;
         }
         if matches!(kind, "message_stop" | "response.completed") {
             self.terminal = true;
-        }
-        let document = value.get("message").unwrap_or(response);
-        if let Some(usage) = document.get("usage") {
-            self.usage(usage, kind);
         }
         if self.sse && !self.first_token && generated_output(&value, kind) {
             self.first_token = true;

@@ -227,3 +227,72 @@ fn oversized_frame_skips_through_delimiter_then_resumes() {
         assert!(updates.is_empty());
     }
 }
+
+#[test]
+fn failure_terminals_still_report_the_usage_they_consumed() {
+    for (sse, body) in [
+        (
+            true,
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":40,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":5}}}}\n\n",
+        ),
+        (
+            true,
+            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"private\"},\"usage\":{\"input_tokens\":40,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":5}}}}\n\n",
+        ),
+        (
+            false,
+            "{\"object\":\"response\",\"status\":\"incomplete\",\"usage\":{\"input_tokens\":40,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":5}}}",
+        ),
+    ] {
+        let (failed, updates, validity) = observe(body.as_bytes(), sse, 7);
+        assert!(failed, "{body}");
+        assert_eq!(validity, ResponseValidity::Invalid);
+        assert!(
+            updates.iter().any(|update| matches!(
+                update,
+                MetricsUpdate::TokenUsage {
+                    input_tokens: Some(40),
+                    output_tokens: Some(9),
+                    ..
+                }
+            )),
+            "{body}"
+        );
+        assert!(
+            updates.iter().any(|update| matches!(
+                update,
+                MetricsUpdate::PromptCache {
+                    cache_tokens: Some(5),
+                    ..
+                }
+            )),
+            "{body}"
+        );
+        assert!(!format!("{updates:?}").contains("private"));
+    }
+}
+
+#[test]
+fn depth_limit_is_unavailable_telemetry_but_malformed_json_stays_invalid() {
+    // Valid JSON, within the byte bound, deeper than serde_json's recursion limit.
+    let depth = 200;
+    let nested = format!(
+        "{{\"type\":\"message\",\"content\":[{{\"type\":\"tool_use\",\"input\":{}0{}}}]}}",
+        "[".repeat(depth),
+        "]".repeat(depth)
+    );
+    assert!(nested.len() < crate::response::MAX_RESPONSE_BYTES);
+    let (failed, updates, validity) = observe(nested.as_bytes(), false, 64);
+    assert!(!failed);
+    assert_eq!(validity, ResponseValidity::Unavailable);
+    assert!(updates.is_empty());
+    for body in [
+        b"<html>502 Bad Gateway</html>".as_slice(),
+        b"{\"type\":\"message\",\"content\":[",
+        b"",
+    ] {
+        let (failed, _, validity) = observe(body, false, 64);
+        assert!(!failed);
+        assert_eq!(validity, ResponseValidity::Invalid);
+    }
+}

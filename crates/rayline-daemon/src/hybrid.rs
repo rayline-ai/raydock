@@ -660,7 +660,7 @@ fn observable_response(headers: &hyper::HeaderMap) -> Option<bool> {
 /// Observe without changing the response bytes or pulling ahead of downstream demand.
 fn observed_response(
     upstream: reqwest::Response,
-    observation: RequestObservation,
+    mut observation: RequestObservation,
 ) -> Result<Response<Body>> {
     let status = upstream.status();
     let content_length = upstream.content_length();
@@ -676,6 +676,20 @@ fn observed_response(
         if !hop_header(name.as_str()) {
             response = response.header(name, value);
         }
+    }
+    if content_length == Some(0) || matches!(status.as_u16(), 204 | 205 | 304) {
+        // Hyper may discard a known-empty body without polling it, so neither the
+        // byte-count nor the EOF branch below would run. Finalize with the real
+        // status now instead of letting the drop record a cancellation.
+        observation.finish(
+            status.as_u16(),
+            (!status.is_success()).then_some("execution request refused"),
+        );
+        return Ok(response.body(
+            Full::new(Bytes::new())
+                .map_err(|never| match never {})
+                .boxed(),
+        )?);
     }
     let stream = futures::stream::unfold(
         (upstream.bytes_stream(), observation, observer, 0_u64),

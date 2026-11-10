@@ -388,6 +388,32 @@ async fn encoded_response_preserves_wire_bytes_and_completes_without_body_teleme
 }
 
 #[tokio::test]
+async fn empty_responses_close_the_row_with_the_real_status() {
+    let mut runtime = Runtime::start(1);
+    let (url, token) = runtime.ready().await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (index, (status, state)) in [(429, "error"), (200, "completed")].into_iter().enumerate() {
+        let response = client
+            .post(format!("{url}/v1/messages"))
+            .bearer_auth(&token)
+            .json(&json!({"fixture_empty_status": status}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        assert!(response.bytes().await.unwrap().is_empty());
+        let snapshot = top_snapshot(&client, &url, &token).await;
+        assert!(snapshot["active"].as_array().unwrap().is_empty());
+        let row = &snapshot["recent"][0];
+        assert_eq!(snapshot["recent"].as_array().unwrap().len(), index + 1);
+        assert_eq!(row["state"], state);
+        assert_eq!(row["status_code"], status);
+        let error = row["error"].as_str().unwrap_or_default();
+        assert!(!error.contains("cancelled"), "{error}");
+    }
+}
+
+#[tokio::test]
 async fn derived_models_sharing_a_worker_attribute_the_executed_deployment() {
     // Derived action IDs are produced by the core, not enumerated in daemon config.
     // The shared worker alone is ambiguous; the executed model disambiguates it.

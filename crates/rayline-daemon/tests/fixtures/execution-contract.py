@@ -91,6 +91,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not more:
                 pathlib.Path(config["cancelled"] + "-pending").write_text("cancelled before headers")
             return
+        if self.path == "/v1/messages" and json.loads(body).get("fixture_empty_status"):
+            self.send_response(json.loads(body)["fixture_empty_status"])
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path == "/v1/messages" and json.loads(body).get("fixture_gzip"):
             # Fixed mtime makes the encoded wire bytes independently assertable.
             encoded = bytearray(gzip.compress(b'{"usage":{"input_tokens":7,"output_tokens":3}}', mtime=0))
