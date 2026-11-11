@@ -462,7 +462,8 @@ async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
                 "slug": "gpt-5.4",
                 "display_name": "GPT-5.4",
                 "supported_in_api": true,
-                "context_window": 272000
+                "context_window": 272000,
+                "max_context_window": 1000000
             }]
         })),
         tx,
@@ -518,7 +519,8 @@ async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
         .find(|model| model["slug"] == "rayline-local")
         .unwrap();
     assert_eq!(sentinel["context_window"], 272000);
-    assert_eq!(sentinel["max_context_window"], 272000);
+    // The subscription model's override cap is kept, not lowered to its default.
+    assert_eq!(sentinel["max_context_window"], 1000000);
 
     let captured = rx.await.expect("captured upstream request");
     assert!(captured.starts_with("GET /models?client_version=9.9.9 "));

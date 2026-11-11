@@ -918,7 +918,7 @@ struct CatalogModel {
 }
 
 impl CatalogModel {
-    fn window(&self, windows: &model_windows::Windows) -> Option<u64> {
+    fn window(&self, windows: &model_windows::Windows) -> Option<model_windows::ModelWindow> {
         let (endpoint, model) = self.target.as_ref()?;
         windows.get(endpoint)?.get(model).copied()
     }
@@ -1317,7 +1317,11 @@ const RAYLINE_MODEL_PRIORITY: u32 = 1000;
 /// `max_context_window`. A model whose window is unknown keeps the default
 /// entry. `truncation_policy` is not an output limit (Codex caps each history
 /// item it records with it), so it does not follow the window.
-fn codex_model_json(id: &str, display_name: &str, window: Option<u64>) -> Value {
+fn codex_model_json(
+    id: &str,
+    display_name: &str,
+    window: Option<model_windows::ModelWindow>,
+) -> Value {
     let mut entry = json!({
         "slug": id,
         "display_name": display_name,
@@ -1350,8 +1354,8 @@ fn codex_model_json(id: &str, display_name: &str, window: Option<u64>) -> Value 
         "supports_search_tool": false
     });
     if let Some(window) = window {
-        entry["context_window"] = json!(window);
-        entry["max_context_window"] = json!(window);
+        entry["context_window"] = json!(window.context);
+        entry["max_context_window"] = json!(window.max);
     }
     entry
 }
@@ -11234,9 +11238,20 @@ mod tests {
 
     #[test]
     fn codex_model_entry_takes_the_reported_window() {
-        let sized = codex_model_json("m", "M", Some(1_000_000));
+        let sized = codex_model_json("m", "M", Some(model_windows::ModelWindow::from(1_000_000)));
         assert_eq!(sized["context_window"], json!(1_000_000));
         assert_eq!(sized["max_context_window"], json!(1_000_000));
+        // A larger override cap (a subscription model's) is kept.
+        let capped = codex_model_json(
+            "m",
+            "M",
+            Some(model_windows::ModelWindow {
+                context: 272_000,
+                max: 872_000,
+            }),
+        );
+        assert_eq!(capped["context_window"], json!(272_000));
+        assert_eq!(capped["max_context_window"], json!(872_000));
         // The per-item history cap is not tied to the window.
         let unsized_entry = codex_model_json("m", "M", None);
         assert_eq!(
@@ -11306,7 +11321,7 @@ mod tests {
             endpoints: vec![runtime],
             routes: RoutesConfig::default(),
         });
-        let window = |windows: model_windows::Windows| windows["runtime"]["m"];
+        let window = |windows: model_windows::Windows| windows["runtime"]["m"].context;
 
         assert_eq!(window(state.model_windows.windows(&state).await), 32_768);
         // Not due yet: the cached answer, without asking again.
@@ -11321,16 +11336,84 @@ mod tests {
         assert!(answers.lock().unwrap().is_empty());
     }
 
+    /// A refresh where the listing answers but the runtime lookup fails keeps
+    /// the window the runtime reported before.
+    #[tokio::test]
+    async fn model_windows_keep_known_windows_when_a_refresh_lookup_fails() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ps_calls = Arc::new(AtomicU64::new(0));
+        let server_ps_calls = ps_calls.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if request.starts_with("GET /v1/models ") {
+                    Some(json!({"data": [{"id": "m"}]}))
+                } else if request.starts_with("GET /api/ps ")
+                    && server_ps_calls.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    Some(json!({"models": [{"name": "m", "context_length": 8_192}]}))
+                } else {
+                    None
+                };
+                let response = match body {
+                    Some(body) => {
+                        let body = body.to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None => "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\
+                             connection: close\r\n\r\n"
+                        .to_owned(),
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let mut runtime = endpoint("runtime", EndpointProtocol::OpenAIChat, &["m"]);
+        runtime.base_url = format!("http://127.0.0.1:{port}/v1");
+        let state = state(RouterConfig {
+            endpoints: vec![runtime],
+            routes: RoutesConfig::default(),
+        });
+
+        let windows = state.model_windows.windows(&state).await;
+        assert_eq!(windows["runtime"]["m"].context, 8_192);
+        state.model_windows.expire().await;
+        let windows = state.model_windows.windows(&state).await;
+        assert_eq!(windows["runtime"]["m"].context, 8_192);
+        assert!(
+            ps_calls.load(Ordering::SeqCst) >= 2,
+            "the refresh asked again"
+        );
+    }
+
     #[test]
     fn catalog_sentinel_takes_the_window_of_its_route() {
         let windows: model_windows::Windows = HashMap::from([
             (
                 "cloud".to_owned(),
-                HashMap::from([("big".to_owned(), 1_000_000), ("small".to_owned(), 200_000)]),
+                HashMap::from([
+                    (
+                        "big".to_owned(),
+                        model_windows::ModelWindow::from(1_000_000),
+                    ),
+                    (
+                        "small".to_owned(),
+                        model_windows::ModelWindow::from(200_000),
+                    ),
+                ]),
             ),
             (
                 "ollama".to_owned(),
-                HashMap::from([("q".to_owned(), 32_768)]),
+                HashMap::from([("q".to_owned(), model_windows::ModelWindow::from(32_768))]),
             ),
         ]);
         let endpoints = vec![
@@ -11426,7 +11509,10 @@ mod tests {
         };
         let windows: model_windows::Windows = HashMap::from([(
             "cloud".to_owned(),
-            HashMap::from([("big".to_owned(), 1_000_000)]),
+            HashMap::from([(
+                "big".to_owned(),
+                model_windows::ModelWindow::from(1_000_000),
+            )]),
         )]);
         let mut upstream = json!({"models": [{"slug": "native", "context_window": 272_000}]});
         merge_static_models(&mut upstream, &state(config), &windows);

@@ -20,7 +20,8 @@
 //! A model that no source sizes keeps the catalog's default entry. An answer
 //! is reused for [`REFRESH_AFTER`], then asked again, so a model loaded (or
 //! reloaded with another context) later is picked up. A failed lookup keeps the
-//! previous answer and is retried on the next `/v1/models` request.
+//! previous answer for the models it did not size, and a failed endpoint is
+//! retried on the next `/v1/models` request.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -44,8 +45,26 @@ const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(3);
 /// collapses bursts of requests into one lookup.
 const REFRESH_AFTER: Duration = Duration::from_secs(60);
 
+/// A model's context window as Codex's catalog describes it: the window it
+/// runs with by default, and the largest a user override may raise it to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ModelWindow {
+    pub(crate) context: u64,
+    pub(crate) max: u64,
+}
+
+impl From<u64> for ModelWindow {
+    /// A source that reports one window: it is both the default and the cap.
+    fn from(window: u64) -> Self {
+        Self {
+            context: window,
+            max: window,
+        }
+    }
+}
+
 /// Context windows by model id, for one endpoint.
-pub(crate) type EndpointWindows = HashMap<String, u64>;
+pub(crate) type EndpointWindows = HashMap<String, ModelWindow>;
 /// Context windows by endpoint id, then model id.
 pub(crate) type Windows = HashMap<String, EndpointWindows>;
 
@@ -90,8 +109,15 @@ impl ModelWindowCache {
             let now = Instant::now();
             let mut resolved = self.resolved.lock().await;
             for (id, windows) in fetched {
+                // A refresh updates the models it sized and keeps earlier
+                // answers for the rest: a runtime lookup that fails this time
+                // must not drop a window that was already known.
                 if let Some(windows) = windows {
-                    resolved.insert(id, (now, windows));
+                    let (fetched_at, known) = resolved
+                        .entry(id)
+                        .or_insert_with(|| (now, EndpointWindows::new()));
+                    *fetched_at = now;
+                    known.extend(windows);
                 }
             }
         }
@@ -160,7 +186,7 @@ async fn fetch_endpoint_windows(
                     {
                         reachable = true;
                         if let Some(window) = llama_props_window(&props) {
-                            windows.insert(model.clone(), window);
+                            windows.insert(model.clone(), window.into());
                         }
                     }
                 }
@@ -186,7 +212,7 @@ async fn ollama_windows(
     for model in missing {
         match ollama_loaded_window(ps, model) {
             Some(window) => {
-                windows.insert(model.clone(), window);
+                windows.insert(model.clone(), window.into());
             }
             None => unloaded.push(model),
         }
@@ -204,7 +230,7 @@ async fn ollama_windows(
     .await;
     for (model, window) in shown {
         if let Some(window) = window {
-            windows.insert(model.clone(), window);
+            windows.insert(model.clone(), window.into());
         }
     }
     windows
@@ -264,7 +290,8 @@ fn is_loopback(base_url: &str) -> bool {
 
 /// Windows from a model list: OpenAI-style `data[]` keyed by `id` (and by
 /// `product` when the entry names one), and Codex-style `models[]` keyed by
-/// `slug`. Entries that state no window are skipped.
+/// `slug`, keeping a Codex entry's `max_context_window`. Entries that state no
+/// window are skipped.
 pub(crate) fn listed_windows(value: &Value) -> EndpointWindows {
     let mut windows = EndpointWindows::new();
     for (list, key) in [("data", "id"), ("models", "slug")] {
@@ -272,11 +299,18 @@ pub(crate) fn listed_windows(value: &Value) -> EndpointWindows {
             continue;
         };
         for entry in entries {
-            let Some(window) = ["context_length", "context_window", "max_model_len"]
+            let Some(context) = ["context_length", "context_window", "max_model_len"]
                 .into_iter()
                 .find_map(|field| positive(entry.get(field)))
             else {
                 continue;
+            };
+            // A Codex catalog may allow overriding the window up to a larger
+            // `max_context_window`; keep that cap rather than lowering it.
+            let window = ModelWindow {
+                context,
+                max: positive(entry.get("max_context_window"))
+                    .map_or(context, |max| max.max(context)),
             };
             for name in [key, "product"] {
                 if let Some(name) = entry.get(name).and_then(Value::as_str) {
@@ -344,23 +378,38 @@ mod tests {
                 {"id": "no-window"}
             ]
         }));
-        assert_eq!(windows.get("arc-swift-contributor-1.0"), Some(&1_000_000));
-        assert_eq!(windows.get("arc-swift-1.0"), Some(&1_000_000));
-        assert_eq!(windows.get("arc-sage-1.0"), Some(&1_000_000));
+        assert_eq!(
+            windows.get("arc-swift-contributor-1.0"),
+            Some(&ModelWindow::from(1_000_000))
+        );
+        assert_eq!(
+            windows.get("arc-swift-1.0"),
+            Some(&ModelWindow::from(1_000_000))
+        );
+        assert_eq!(
+            windows.get("arc-sage-1.0"),
+            Some(&ModelWindow::from(1_000_000))
+        );
         assert!(!windows.contains_key("no-window"));
     }
 
     #[test]
     fn listed_windows_reads_vllm_and_codex_catalogs() {
         let vllm = listed_windows(&json!({"data": [{"id": "qwen", "max_model_len": 32_768}]}));
-        assert_eq!(vllm.get("qwen"), Some(&32_768));
+        assert_eq!(vllm.get("qwen"), Some(&ModelWindow::from(32_768)));
         let codex = listed_windows(&json!({
             "models": [
                 {"slug": "gpt-big", "context_window": 272_000, "max_context_window": 872_000},
                 {"slug": "zero", "context_window": 0}
             ]
         }));
-        assert_eq!(codex.get("gpt-big"), Some(&272_000));
+        assert_eq!(
+            codex.get("gpt-big"),
+            Some(&ModelWindow {
+                context: 272_000,
+                max: 872_000
+            })
+        );
         assert!(!codex.contains_key("zero"));
     }
 
