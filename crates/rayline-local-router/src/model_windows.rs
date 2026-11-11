@@ -168,20 +168,19 @@ fn sized_by_lookup(endpoint: &EndpointConfig) -> bool {
 /// Sizes `models` on one endpoint. The listing is asked first; a loopback
 /// runtime is then asked about the models the listing did not size, within
 /// what is left of `deadline`, so a slow runtime cannot discard the windows the
-/// listing already gave. `None` when nothing on the endpoint answered.
+/// listing (or the runtime's own earlier answers) already gave. `None` when
+/// nothing on the endpoint answered.
 async fn fetch_endpoint_windows(
     http: &reqwest::Client,
     endpoint: &EndpointConfig,
     models: &[String],
     deadline: tokio::time::Instant,
 ) -> Option<EndpointWindows> {
-    let listed = tokio::time::timeout_at(
+    let listed = by(
         deadline,
         get_json(http, endpoint, &models_url(&endpoint.base_url)),
     )
-    .await
-    .ok()
-    .flatten();
+    .await;
     let mut reachable = listed.is_some();
     let mut windows = listed.as_ref().map(listed_windows).unwrap_or_default();
     let missing = models
@@ -191,15 +190,24 @@ async fn fetch_endpoint_windows(
         .collect::<Vec<_>>();
     if is_loopback(&endpoint.base_url) && !missing.is_empty() {
         let root = runtime_root(&endpoint.base_url);
-        if let Ok(Some(runtime)) =
-            tokio::time::timeout_at(deadline, runtime_windows(http, endpoint, &root, &missing))
-                .await
-        {
+        if let Some(runtime) = runtime_windows(http, endpoint, &root, &missing, deadline).await {
             reachable = true;
             windows.extend(runtime);
         }
     }
     reachable.then_some(windows)
+}
+
+/// `lookup`'s answer, or `None` once `deadline` passes. Each lookup is bounded
+/// on its own, so the ones that finished in time keep their answers.
+async fn by<T>(
+    deadline: tokio::time::Instant,
+    lookup: impl Future<Output = Option<T>>,
+) -> Option<T> {
+    tokio::time::timeout_at(deadline, lookup)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Windows a local runtime reports for `missing`: Ollama (`/api/ps`, then
@@ -210,9 +218,15 @@ async fn runtime_windows(
     endpoint: &EndpointConfig,
     root: &str,
     missing: &[String],
+    deadline: tokio::time::Instant,
 ) -> Option<EndpointWindows> {
-    if let Some(ps) = get_json(http, endpoint, &format!("{root}/api/ps")).await {
-        return Some(ollama_windows(http, endpoint, root, &ps, missing).await);
+    if let Some(ps) = by(
+        deadline,
+        get_json(http, endpoint, &format!("{root}/api/ps")),
+    )
+    .await
+    {
+        return Some(ollama_windows(http, endpoint, root, &ps, missing, deadline).await);
     }
     let mut reachable = false;
     let mut windows = EndpointWindows::new();
@@ -220,7 +234,10 @@ async fn runtime_windows(
         let url =
             reqwest::Url::parse_with_params(&format!("{root}/props"), [("model", model.as_str())])
                 .ok()?;
-        Some((model, get_json(http, endpoint, url.as_str()).await?))
+        Some((
+            model,
+            by(deadline, get_json(http, endpoint, url.as_str())).await?,
+        ))
     }))
     .await
     .into_iter()
@@ -244,6 +261,7 @@ async fn ollama_windows(
     root: &str,
     ps: &Value,
     missing: &[String],
+    deadline: tokio::time::Instant,
 ) -> EndpointWindows {
     let mut windows = EndpointWindows::new();
     let mut unloaded = Vec::new();
@@ -259,7 +277,7 @@ async fn ollama_windows(
         let request = http
             .post(format!("{root}/api/show"))
             .json(&json!({ "model": model }));
-        let window = send_json(request, endpoint)
+        let window = by(deadline, send_json(request, endpoint))
             .await
             .as_ref()
             .and_then(ollama_num_ctx);
@@ -604,6 +622,32 @@ mod tests {
         let windows = windows.expect("the listing answered");
         assert_eq!(windows.get("sized"), Some(&ModelWindow::from(65_536)));
         assert!(!windows.contains_key("bare"));
+    }
+
+    /// A loaded model keeps its `/api/ps` window when `/api/show` for another
+    /// model stalls past the deadline.
+    #[tokio::test]
+    async fn a_stalled_show_keeps_the_loaded_windows() {
+        let base = runtime_stub(vec![
+            (
+                "GET /v1/models ",
+                Some(json!({"data": [{"id": "loaded"}, {"id": "cold"}]})),
+            ),
+            (
+                "GET /api/ps ",
+                Some(json!({"models": [{"name": "loaded", "context_length": 8_192}]})),
+            ),
+            ("POST /api/show ", None),
+        ])
+        .await;
+        let endpoint = runtime_endpoint(base, &["loaded", "cold"]);
+        let models = vec!["loaded".to_owned(), "cold".to_owned()];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let windows =
+            fetch_endpoint_windows(&reqwest::Client::new(), &endpoint, &models, deadline).await;
+        let windows = windows.expect("the runtime answered");
+        assert_eq!(windows.get("loaded"), Some(&ModelWindow::from(8_192)));
+        assert!(!windows.contains_key("cold"));
     }
 
     /// A model only a route names (the endpoint lists none) is still sized by
