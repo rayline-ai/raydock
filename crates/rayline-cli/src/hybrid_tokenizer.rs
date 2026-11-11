@@ -107,13 +107,29 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
     if !has_template {
         return Err(format!("{repo} publishes no chat template"));
     }
+    // Only now is this snapshot complete; `cached` falls back to it alone.
+    let marker = complete_marker(repo);
+    let _ = std::fs::write(&marker, &commit);
     Ok(dir)
+}
+
+/// Names the last snapshot `fetch` finished. `refs/main` moves as each file
+/// downloads, so it can name a snapshot still missing optional files.
+fn complete_marker(repo: &str) -> PathBuf {
+    rayline_hf::hf_cache_dir()
+        .join(rayline_hf::repo_to_folder_name(repo))
+        .join("rayline-counter-complete")
 }
 
 /// The cached snapshot, without the network: what `start` uses when the
 /// Hub does not answer in time.
 pub(crate) fn cached(repo: &str) -> Option<PathBuf> {
-    let dir = rayline_hf::hf_cache_snapshot_path(repo, "", &cached_commit(repo)?);
+    let commit = std::fs::read_to_string(complete_marker(repo)).ok()?;
+    let commit = commit.trim();
+    if commit.is_empty() || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let dir = rayline_hf::hf_cache_snapshot_path(repo, "", commit);
     let complete = dir.join(rayline_tokencount::TOKENIZER_FILE).is_file()
         && [
             rayline_tokencount::TEMPLATE_FILE,

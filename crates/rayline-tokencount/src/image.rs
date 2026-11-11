@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn charges_what_the_glm_server_charged() {
-        // GLM-5.3-Flash on TensorFold: a 2172x724 PNG added 2027 tokens to a
+        // A GLM-5.3-Flash server: a 2172x724 PNG added 2027 tokens to a
         // prompt beside its one placeholder, so the image is 2028 tokens.
         assert_eq!(
             glm().tokens(Source::Pixels {
