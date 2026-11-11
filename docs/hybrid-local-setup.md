@@ -169,7 +169,7 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 
 | Key | Meaning |
 | --- | --- |
-| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. It works with the default profile and any local model. `start` refuses `prefer_local` when the session has no local target. |
+| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection is used otherwise. In practice a turn stays on your local model when the router rates it likely to succeed, and otherwise the router makes its normal choice among all the offered models, which can be a paid cloud model (with the default profile, usually the low-cost Haiku). It works with the default profile and any local model. `start` refuses `prefer_local` when the session has no local target. |
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
 | `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). It must be 0 or between 1e-6 and 1e6. `start --config` refuses it, because a profile file sets its own prices. |
@@ -184,9 +184,10 @@ override block is refused for it.
 ## The capacity handoff
 
 The local window is the profile's `context_window`. Before each request, the
-core counts the exact prompt the local model would receive with the runtime's
-own tokenizer. The count covers tools, history and private instructions. The
-core adds the output limit, then tells ARC whether the request fits.
+core measures the prompt the local model would receive. The measure covers
+tools, history and private instructions; how exact it is depends on the model
+and the profile (see below). The core adds the output limit, then tells ARC
+whether the request fits.
 
 The default profile sets the local output limit to a quarter of the local
 window, at most 32,000 tokens (24,576 at the default 96k window). Each cloud

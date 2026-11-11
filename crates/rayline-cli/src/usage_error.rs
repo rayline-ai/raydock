@@ -162,7 +162,10 @@ pub(crate) fn rejected_argv(
     let after = previous_option.map_or(String::new(), |option| format!(" after `{option}`"));
     // Only these commands have no `--env` of their own; elsewhere a rejected
     // `--env` was read as another option's value (`codex --auth --env dev`).
-    let without_env = matches!(command[0], "top" | "router" | "local" | "update");
+    let without_env = matches!(
+        command[0],
+        "top" | "router" | "local" | "update" | "claude-desktop"
+    );
     if without_env && (bad == "--env" || bad.starts_with("--env=")) {
         // After another option `--env` may have been read as its value: say so too.
         let hint = misplaced_env(&command);
@@ -348,6 +351,10 @@ mod tests {
         assert_eq!(
             usage_message(&["router", "status", "--env=dev"]),
             "raydock: `--env` goes before the command: `raydock --env <name> router status`"
+        );
+        assert_eq!(
+            usage_message(&["claude-desktop", "status", "--env", "dev"]),
+            "raydock: `--env` goes before the command: `raydock --env <name> claude-desktop status`"
         );
         assert_eq!(
             usage_message(&["top", "--json", "--env"]),
