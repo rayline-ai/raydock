@@ -39,7 +39,9 @@
 //! client that reaches it through `rld`'s local router keeps its session
 //! headers too (`x-session-affinity`, `x-claude-code-session-id`,
 //! `x-session-id`, `x-conversation-id`), which that router forwards only to
-//! the hosted Rayline router.
+//! the hosted Rayline router. Where that router translates the request to
+//! another protocol, a body-only `session_id` or Responses `prompt_cache_key`
+//! reaches the hosted router as `x-session-affinity`.
 //!
 //! The per-launch conversation id ([`ConversationIdFallback`]) is off by
 //! default on every wire: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on,
