@@ -117,26 +117,23 @@ pub(crate) fn rejected_argv(
         };
         return RaylineDispatch::Usage(with_usage(message, &command));
     }
-    // A management word as an option's value (`--via login`) is a bad value.
-    let is_option_value = crate::is_value_option(args[stop - 1]) && !args[stop - 1].contains('=');
-    if command[0] == "claude" && !is_option_value && crate::is_claude_management_subcommand(bad) {
+    // A word after an option is taken as that option's value (`--via login`).
+    let previous = args[stop - 1];
+    let after_option = previous.starts_with('-') && !previous.contains('=');
+    if command[0] == "claude" && !after_option && crate::is_claude_management_subcommand(bad) {
         return RaylineDispatch::Unavailable(format!("claude {bad}"));
     }
     if bad == "--env" || bad.starts_with("--env=") {
         return RaylineDispatch::Usage(misplaced_env(&command));
     }
-    let message = if is_option_value {
-        // The value is not echoed: it may be a prompt or a key.
-        format!(
-            "raydock: invalid value for `{}` in `raydock {}`",
-            args[stop - 1],
-            command.join(" ")
-        )
+    // Only option names are echoed: a rejected word may be a prompt or a key.
+    let words = command.join(" ");
+    let message = if bad.starts_with('-') {
+        format!("raydock: `raydock {words}` does not accept `{shown}`")
+    } else if after_option {
+        format!("raydock: `raydock {words}` rejected the value after `{previous}`")
     } else {
-        format!(
-            "raydock: `raydock {}` does not accept `{shown}`",
-            command.join(" ")
-        )
+        format!("raydock: `raydock {words}` got an unexpected argument")
     };
     RaylineDispatch::Usage(with_usage(message, &command))
 }
@@ -250,7 +247,7 @@ mod tests {
     #[test]
     fn extra_argument_is_named_with_the_command_usage() {
         let message = usage_message(&["top", "extra"]);
-        assert!(message.starts_with("raydock: `raydock top` does not accept `extra`"));
+        assert!(message.starts_with("raydock: `raydock top` got an unexpected argument"));
         assert!(message.contains("\nUsage: raydock top "));
         assert!(message.ends_with("Run `raydock top --help` for details."));
     }
@@ -264,7 +261,8 @@ mod tests {
 
         let message = usage_message(&["router", "start", "--route", "bogus"]);
         assert!(
-            message.starts_with("raydock: invalid value for `--route` in `raydock router start`")
+            message
+                .starts_with("raydock: `raydock router start` rejected the value after `--route`")
         );
     }
 
@@ -345,6 +343,9 @@ mod tests {
             &["--env=--auth-token=secret-value", "status"][..],
             &["top", "--env", "secret-value"][..],
             &["claude", "--via", "secret-value"][..],
+            &["codex", "--auth", "secret-value"][..],
+            &["router", "logs", "-n", "secret-value"][..],
+            &["top", "secret-value"][..],
         ] {
             let message = usage_message(args);
             assert!(
@@ -380,7 +381,7 @@ mod tests {
     #[test]
     fn management_word_as_an_option_value_is_a_usage_error() {
         let message = usage_message(&["claude", "--via", "login"]);
-        assert!(message.starts_with("raydock: invalid value for `--via` in `raydock claude`"));
+        assert!(message.starts_with("raydock: `raydock claude` rejected the value after `--via`"));
     }
 
     #[test]
