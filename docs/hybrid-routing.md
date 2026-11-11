@@ -165,8 +165,9 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
 - **Hybrid routing works with no overrides.** For the default profile, a
   `derived_actions` profile, or a profile that sets `decisions.api_mode:
   "execution_context_v2"`, the core uses that mode
-  and sends `routing.policy: {"preset": "arc-policy.hybrid-default.v1"}`
-  explicitly. Raydock never relies on an absent policy, which the
+  and sends `routing.policy: {"preset": "arc-policy.prefer-local.v1"}`
+  explicitly when the session has a usable local deployment, else
+  `{"preset": "arc-policy.hybrid-default.v1"}`. Raydock never relies on an absent policy, which the
   Decisions API reads as today's package default.
 - **One optional override block,** `hybrid.routing` (every key optional):
 
@@ -175,9 +176,11 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
                           "schedule": {"model": ["cache_boundaries", "user_messages"]}}}}
   ```
 
-  `policy: "utility"` is the hybrid default preset; `"prefer_local"` selects
+  `policy: "utility"` is the hybrid default preset; `"prefer_local"` (the
+  default when a local deployment is usable) selects
   `arc-policy.prefer-local.v1` (local when Stage 1 predicts it passes, else
-  utility), whose threshold `min_p_pass` (in (0, 1)) may be set beside it.
+  utility), whose threshold `min_p_pass` (in (0, 1)) may be set beside it or
+  alone.
   `start` accepts `prefer_local` when the session has a local deployment:
   one with a llama.cpp prompt counter, or one the core sizes itself (the
   default profile). It refuses it when local routing is off.

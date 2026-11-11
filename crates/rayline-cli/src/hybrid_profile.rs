@@ -1,10 +1,12 @@
 //! Raydock's hybrid defaults, applied to a qualified execution-core
 //! profile before `rld` starts the Go core.
 //!
-//! With no override, Raydock sends the hybrid default policy explicitly
-//! (`routing.policy: {"preset": "arc-policy.hybrid-default.v1"}`) through the
-//! core's `execution_context_v2` Decisions contract; it never relies on an
-//! absent policy. The optional `hybrid.routing` block in settings.json maps
+//! With no override, Raydock sends a policy explicitly through the core's
+//! `execution_context_v2` Decisions contract; it never relies on an absent
+//! policy. A session with a usable local deployment gets prefer-local
+//! (`routing.policy: {"preset": "arc-policy.prefer-local.v1"}`, the service's
+//! 0.65 threshold); one without gets the hybrid default
+//! (`arc-policy.hybrid-default.v1`). The optional `hybrid.routing` block in settings.json maps
 //! onto `routing.policy`:
 //!
 //! ```json
@@ -462,6 +464,31 @@ pub(crate) fn compose(
     {
         return Err("settings hybrid.routing must be an object".to_owned());
     }
+    // Prefer-local excludes a local target whose capacity is unknown. A
+    // local deployment's capacity is counted by its llama.cpp
+    // prompt_counter, or else sized by the core itself: it counts
+    // Qwen3.8-27B with its embedded tokenizer and bounds any other model
+    // by bytes (`caller_bounded`). Only a profile with no local
+    // deployment, or a malformed counter, can never select local.
+    let locals: Vec<&Value> = root
+        .get("deployments")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|deployment| deployment.get("kind").and_then(Value::as_str) == Some("local"))
+        .collect();
+    let no_local = locals.is_empty();
+    let malformed_counter = locals.iter().any(|deployment| {
+        deployment
+            .get("prompt_counter")
+            .is_some_and(|counter| !counter.is_object())
+    });
+    // With no policy chosen, a session that can use its local model prefers it.
+    let default_preset = if !no_local && !malformed_counter {
+        PREFER_LOCAL_PRESET
+    } else {
+        HYBRID_DEFAULT_PRESET
+    };
     // A profile without api_mode keeps the core's own default (`current`), as
     // it did before v2, unless it is a package-less v2 profile.
     let derived = root.get("derived_actions").is_some();
@@ -498,37 +525,20 @@ pub(crate) fn compose(
         .as_object_mut()
         .ok_or("decisions.routing must be an object")?;
     let existing = routing.get("policy").cloned();
-    let (policy, source) = map_block(block, existing.as_ref())?;
+    let (policy, source) = map_block(block, existing.as_ref(), default_preset)?;
     let preset = policy
         .get("preset")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
     routing.insert("policy".to_owned(), Value::Object(policy));
     if preset.as_deref() == Some(PREFER_LOCAL_PRESET) {
-        // Prefer-local excludes a local target whose capacity is unknown. A
-        // local deployment's capacity is counted by its llama.cpp
-        // prompt_counter, or else sized by the core itself: it counts
-        // Qwen3.8-27B with its embedded tokenizer and bounds any other model
-        // by bytes (`caller_bounded`). Only a profile with no local
-        // deployment, or a malformed counter, can never select local.
-        let locals: Vec<&Value> = profile
-            .get("deployments")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter(|deployment| deployment.get("kind").and_then(Value::as_str) == Some("local"))
-            .collect();
-        if locals.is_empty() {
+        if no_local {
             return Err(
                 "settings hybrid.routing.policy \"prefer_local\" needs a local deployment, and this session has none (local routing is off); use \"utility\" or fix the local model"
                     .to_owned(),
             );
         }
-        if locals.iter().any(|deployment| {
-            deployment
-                .get("prompt_counter")
-                .is_some_and(|counter| !counter.is_object())
-        }) {
+        if malformed_counter {
             return Err(
                 "settings hybrid.routing.policy \"prefer_local\" needs each local deployment's prompt_counter to be an object; fix or remove it in the profile"
                     .to_owned(),
@@ -546,8 +556,13 @@ pub(crate) fn compose(
 /// The mapped `routing.policy` and its source.
 type MappedRouting = (Map<String, Value>, PolicySource);
 
-/// Map the override block onto `routing.policy`.
-fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRouting, String> {
+/// Map the override block onto `routing.policy`; `default_preset` applies
+/// when neither the block nor the profile names a preset.
+fn map_block(
+    block: Option<&Value>,
+    existing: Option<&Value>,
+    default_preset: &str,
+) -> Result<MappedRouting, String> {
     let block = block.and_then(Value::as_object);
     if let Some(block) = block {
         for key in block.keys() {
@@ -599,7 +614,7 @@ fn map_block(block: Option<&Value>, existing: Option<&Value>) -> Result<MappedRo
         policy.insert("preset".to_owned(), json!(preset));
     }
     if !policy.contains_key("preset") {
-        policy.insert("preset".to_owned(), json!(HYBRID_DEFAULT_PRESET));
+        policy.insert("preset".to_owned(), json!(default_preset));
     }
     if let Some(schedule) = block.and_then(|block| block.get("schedule")) {
         validate_schedule(schedule)?;
@@ -1302,7 +1317,7 @@ mod tests {
     }
 
     #[test]
-    fn no_override_sends_the_hybrid_default_preset_explicitly() {
+    fn no_override_prefers_the_local_model_explicitly() {
         let composed = compose(
             profile(),
             Some(&settings(None)),
@@ -1314,7 +1329,7 @@ mod tests {
         assert_eq!(decisions["api_mode"], "execution_context_v2");
         assert_eq!(
             decisions["routing"]["policy"],
-            json!({"preset": HYBRID_DEFAULT_PRESET})
+            json!({"preset": PREFER_LOCAL_PRESET})
         );
         assert_eq!(decisions["result"], "top");
         assert!(decisions["routing"].get("v_value").is_none());
@@ -1474,7 +1489,7 @@ mod tests {
         assert_eq!(config["decisions"]["model"], "arc-swift-1.0");
         assert_eq!(
             config["decisions"]["routing"]["policy"],
-            json!({"preset": HYBRID_DEFAULT_PRESET})
+            json!({"preset": PREFER_LOCAL_PRESET})
         );
         assert!(config.get("package_path").is_none() && config.get("bindings").is_none());
         let local = &config["deployments"][0];
@@ -1965,7 +1980,7 @@ mod tests {
     #[test]
     fn invalid_or_unserved_overrides_are_refused() {
         for block in [
-            json!({"min_p_pass": 0.5}),
+            json!({"policy": "utility", "min_p_pass": 0.5}),
             json!({"policy": "prefer_local", "min_p_pass": 1.0}),
             json!({"policy": "fastest"}),
             json!({"schedule": {"model": ["every_5"]}}),
@@ -2688,6 +2703,20 @@ mod tests {
         )
         .unwrap();
         without_local(&mut cloud_only);
+        // With no policy chosen, a session without a local model gets the
+        // hybrid default (utility), not prefer-local.
+        let composed = compose(
+            cloud_only.clone(),
+            Some(&settings(None)),
+            Path::new("/state"),
+            ProfileOrigin::Default,
+        )
+        .unwrap();
+        assert_eq!(
+            composed.config["decisions"]["routing"]["policy"],
+            json!({"preset": HYBRID_DEFAULT_PRESET})
+        );
+        assert_eq!(composed.policy, PolicySource::Default);
         let prefer_local = settings(Some(json!({"policy": "prefer_local"})));
         assert!(
             compose(
@@ -2697,6 +2726,53 @@ mod tests {
                 ProfileOrigin::Default
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn the_prefer_local_default_takes_a_threshold_and_yields_to_utility() {
+        // min_p_pass alone tunes the prefer-local default.
+        let composed = compose(
+            profile(),
+            Some(&settings(Some(json!({"min_p_pass": 0.5})))),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
+        assert_eq!(
+            composed.config["decisions"]["routing"]["policy"],
+            json!({"preset": PREFER_LOCAL_PRESET, "overrides": {"selection": {"min_p_pass": 0.5}}})
+        );
+        // "utility" still selects the hybrid default preset.
+        let composed = compose(
+            profile(),
+            Some(&settings(Some(json!({"policy": "utility"})))),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
+        assert_eq!(
+            composed.config["decisions"]["routing"]["policy"],
+            json!({"preset": HYBRID_DEFAULT_PRESET})
+        );
+        // A malformed local prompt counter keeps the default on utility
+        // rather than refusing a session that chose no policy.
+        let mut malformed = profile();
+        for deployment in malformed["deployments"].as_array_mut().unwrap() {
+            if deployment["kind"] == "local" {
+                deployment["prompt_counter"] = json!("llama.cpp");
+            }
+        }
+        let composed = compose(
+            malformed,
+            Some(&settings(None)),
+            Path::new("/p"),
+            ProfileOrigin::File,
+        )
+        .unwrap();
+        assert_eq!(
+            composed.config["decisions"]["routing"]["policy"],
+            json!({"preset": HYBRID_DEFAULT_PRESET})
         );
     }
 }
