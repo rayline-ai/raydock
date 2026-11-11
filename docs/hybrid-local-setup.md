@@ -33,10 +33,13 @@ execution models remain unknown rather than showing the harness's virtual model.
 ## What it costs
 
 Every turn of a hybrid session bills one ARC decision against your Rayline
-balance, including turns that run on your machine; a cloud turn additionally
-bills the provider's pass-through price. The local model's price in the profile
-(0 by default) steers which target ARC selects; it never changes what the
-decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
+balance at the Routes API rate, including turns that run on your machine. A
+cloud turn also bills the cloud model's list price through your Rayline
+balance, with no ARC fee on top. A local turn costs only the decision. The
+local model's price in the profile (0 by default) steers which target ARC
+selects; it never changes what you are charged. See
+[ARC pricing](https://docs.rayline.ai/arc/pricing#routes-api) and the current
+rates on [rayline.ai/pricing](https://rayline.ai/pricing).
 
 ## Three steps
 
@@ -140,8 +143,11 @@ what you are charged (see "What it costs" above). On-device inference costs
 you about nothing per token. The default profile
 therefore prices the local model at 0 per million tokens on every leg, sends
 those caller prices (the cloud models keep their catalog prices), and asks ARC
-Swift, which decides at its own fixed V and picks cheap. Under these defaults
-easy work stays on device and harder work goes to the cloud. Change the local
+Swift, which decides at Swift's fixed V (the value of a successful task, $0.10)
+and so weighs price heavily. With the default `prefer_local` policy, a turn
+stays on device when ARC predicts the local model will pass; otherwise ARC
+weighs predicted success against price, so a cheap cloud model such as Haiku
+can win, even on a short task (see [Routing policy](#routing-policy)). Change the local
 price in the override block with `local_price` (USD per million tokens, applied
 to every leg of the local model).
 
