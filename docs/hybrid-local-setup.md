@@ -229,9 +229,9 @@ Qwen3.8-27B with its embedded tokenizer (`local_measured`). For another model
 declared in `hybrid.local_registry_model`, the core bundled since 0.4.3
 bounds the request by its bytes (`caller_bounded`); an older core reports that
 target's capacity as unknown. When Raydock cannot read which model the runtime
-serves (LM Studio), it declares Qwen3.8-27B and counts as that model. Either way the core still hands off when the runtime
-refuses a request for context (llama.cpp reports this before any output). A
-profile with a qualified llama.cpp prompt counter (see below) counts every
+serves (LM Studio), it declares Qwen3.8-27B and counts as that model. Either
+way the core still hands off when the runtime refuses a request for context
+(llama.cpp reports this before any output). A profile with a qualified llama.cpp prompt counter (see below) counts every
 request with the runtime's own tokenizer, so the handoff happens before
 dispatch.
 
