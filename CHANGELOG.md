@@ -42,6 +42,12 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   launch (also under `raydock hybrid run hermes`) and skips it afterwards. If
   the repair fails, it prints the command to run by hand with the right
   `HERMES_HOME`.
+- **`raydock codex` finds Codex installed with npm on Windows.** npm installs
+  Codex as a `codex.cmd` launcher, and Windows does not apply PATHEXT when a
+  program starts another by bare name, so `raydock codex` failed with "failed
+  to run codex: program not found". It now looks Codex up on PATH the way
+  `raydock hybrid run codex` already did. This also fixes `raydock codex app`
+  and the Codex version check.
 - **Claude Code in hybrid mode works with llama.cpp chat templates that
   require the system message first** (such as Qwen3.8-27B). The bundled
   execution core (`rayline-core`, now pinned to `80ce3d26`) moves a system
