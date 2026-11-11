@@ -103,10 +103,10 @@ impl PromptCounter {
             .map_err(|error| anyhow!("clear tokenizer truncation: {error}"))?;
         tokenizer.with_padding(None);
         let mut env = environment();
-        env.add_template_owned("chat", templates.default.clone())
+        env.add_template_owned("chat", without_generation_tags(&templates.default))
             .context("compile the chat template")?;
         if let Some(tool_use) = &templates.tool_use {
-            env.add_template_owned("tool_use", tool_use.clone())
+            env.add_template_owned("tool_use", without_generation_tags(tool_use))
                 .context("compile the tool_use chat template")?;
         }
         let images = processor
@@ -218,6 +218,38 @@ impl PromptCounter {
             images: images.len(),
         })
     }
+}
+
+/// `transformers` adds `{% generation %}…{% endgeneration %}` to mark the
+/// assistant's tokens for training masks; it renders its body unchanged.
+/// minijinja has no such tag, so it becomes an always-true `if`, keeping the
+/// tags' whitespace control.
+fn without_generation_tags(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{%") {
+        out.push_str(&rest[..start]);
+        let tag = &rest[start..];
+        let Some(end) = tag.find("%}") else {
+            out.push_str(tag);
+            return out;
+        };
+        let inner = &tag[2..end];
+        let (open, body) = inner
+            .strip_prefix('-')
+            .map_or(("", inner), |body| ("-", body));
+        let (body, close) = body
+            .strip_suffix('-')
+            .map_or((body, ""), |body| (body, "-"));
+        match body.trim() {
+            "generation" => out.push_str(&format!("{{%{open} if true {close}%}}")),
+            "endgeneration" => out.push_str(&format!("{{%{open} endif {close}%}}")),
+            _ => out.push_str(&tag[..end + 2]),
+        }
+        rest = &tag[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 fn read_json(path: &Path) -> Result<Option<Value>> {

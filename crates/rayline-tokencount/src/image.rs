@@ -61,6 +61,12 @@ impl ImageSizing {
             .unwrap_or(1);
         let factor = patch * merge;
         let area = factor * factor;
+        // Qwen2-VL-style processors name their pixel limits
+        // `size.shortest_edge` (minimum) and `size.longest_edge` (maximum).
+        let edge = |pixels_key: &str| match pixels_key {
+            "min_pixels" => "shortest_edge",
+            _ => "longest_edge",
+        };
         let tokens = |tokens_key: &str, pixels_key: &str| {
             processor
                 .get(tokens_key)
@@ -74,6 +80,7 @@ impl ImageSizing {
                 .or_else(|| {
                     processor
                         .pointer(&format!("/size/{pixels_key}"))
+                        .or_else(|| processor.pointer(&format!("/size/{}", edge(pixels_key))))
                         .and_then(Value::as_u64)
                         .map(|pixels| pixels / area)
                 })
@@ -181,6 +188,18 @@ mod tests {
         assert_eq!(round_half_even(2.5), 2.0);
         assert_eq!(round_half_even(3.5), 4.0);
         assert_eq!(round_half_even(77.57), 78.0);
+    }
+
+    #[test]
+    fn reads_qwen_edge_limits_as_pixels() {
+        let config = json!({"size": {"longest_edge": 16777216, "shortest_edge": 65536}, "patch_size": 16, "merge_size": 2});
+        let sizing = ImageSizing::from_processor_config(&config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (sizing.factor, sizing.min_tokens, sizing.max_tokens),
+            (32, 64, 16384)
+        );
     }
 
     #[test]

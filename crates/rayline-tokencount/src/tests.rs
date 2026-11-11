@@ -163,3 +163,15 @@ fn a_template_error_never_quotes_the_prompt() {
         "{error:#}"
     );
 }
+
+#[test]
+fn generation_tags_render_their_body_unchanged() {
+    let template = "{%- for m in messages %}{%- generation -%} [{{ m.content }}] {%- endgeneration %}{% endfor %}";
+    assert_eq!(
+        without_generation_tags(template),
+        "{%- for m in messages %}{%- if true -%} [{{ m.content }}] {%- endif %}{% endfor %}"
+    );
+    let counter = PromptCounter::new(&tokenizer(), template, None).unwrap();
+    let body = json!({"messages": [{"role": "user", "content": "x"}]});
+    assert!(counter.count_chat(&body).is_ok());
+}
