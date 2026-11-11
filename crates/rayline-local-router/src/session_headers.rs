@@ -68,8 +68,8 @@ pub(crate) fn copy_session_headers(
 /// rank as a body `session_id`, and it is one of `SESSION_HEADERS`.
 const BODY_SESSION_ID_HEADER: &str = "x-session-affinity";
 
-/// The longest body id carried: the hosted router reads no longer body
-/// `session_id` either.
+/// The longest body `session_id` carried: the hosted router reads no longer
+/// one either.
 const BODY_SESSION_ID_LIMIT: usize = 1024;
 
 /// For a builder that rebuilds the client's body for another protocol (Chat to
@@ -127,23 +127,22 @@ pub(crate) fn copy_session_ids_for_rebuilt_body(
 /// A value is trimmed and must be non-empty printable ASCII; anything else is
 /// skipped, as a header could not carry it unchanged.
 fn body_session_id(inbound_headers: &HeaderMap, body: &Value) -> Option<String> {
-    let field = |name: &str| {
+    let field = |name: &str, limit: usize| {
         body.get(name)
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|id| {
-                !id.is_empty()
-                    && id.len() <= BODY_SESSION_ID_LIMIT
-                    && id.bytes().all(|b| (0x20..0x7f).contains(&b))
+                !id.is_empty() && id.len() <= limit && id.bytes().all(|b| (0x20..0x7f).contains(&b))
             })
             .map(str::to_owned)
     };
     let has_messages = body.get("messages").is_some_and(Value::is_array);
+    // The router reads a `prompt_cache_key` of any length.
     let prompt_cache_key = || {
         if has_messages {
             None
         } else {
-            field("prompt_cache_key")
+            field("prompt_cache_key", usize::MAX)
         }
     };
     let codex = inbound_headers
@@ -153,7 +152,7 @@ fn body_session_id(inbound_headers: &HeaderMap, body: &Value) -> Option<String> 
     if codex && let Some(id) = prompt_cache_key() {
         return Some(id);
     }
-    field("session_id").or_else(prompt_cache_key)
+    field("session_id", BODY_SESSION_ID_LIMIT).or_else(prompt_cache_key)
 }
 
 #[cfg(test)]
@@ -440,6 +439,8 @@ mod tests {
                                      "messages": [{"role": "user", "content": "hi"}]}),
             "/v1/chat/completions" => json!({"model": "rayline-auto",
                                              "messages": [{"role": "user", "content": "hi"}]}),
+            "/v1/memories/trace_summarize" => json!({"model": "rayline-auto",
+                                                     "traces": [{"id": "t1", "text": "hi"}]}),
             _ => json!({"model": "rayline-auto", "stream": false, "input": "hi"}),
         };
         if let (Some(body), Some(fields)) = (body.as_object_mut(), body_fields.as_object()) {
@@ -537,12 +538,14 @@ mod tests {
 
     /// Surfaces where the router rebuilds the client's body for another
     /// protocol, dropping its `session_id` and `prompt_cache_key`.
-    const REBUILT_BODY_SURFACES: [(&str, &str); 6] = [
+    const REBUILT_BODY_SURFACES: [(&str, &str); 8] = [
         ("/v1/chat/completions", "anthropic_messages"),
         ("/v1/responses", "anthropic_messages"),
         ("/v1/responses", "openai_chat"),
         ("/v1/responses/compact", "anthropic_messages"),
         ("/v1/responses/compact", "openai_chat"),
+        ("/v1/memories/trace_summarize", "anthropic_messages"),
+        ("/v1/memories/trace_summarize", "openai_chat"),
         ("/v1/messages", "openai_chat"),
     ];
 
@@ -553,8 +556,10 @@ mod tests {
         ("/v1/messages", "anthropic_messages"),
     ];
 
+    /// Whether the client's body on `inbound_path` has no `messages` array, so
+    /// the router reads its `prompt_cache_key`.
     fn is_responses(inbound_path: &str) -> bool {
-        inbound_path.starts_with("/v1/responses")
+        inbound_path.starts_with("/v1/responses") || inbound_path.starts_with("/v1/memories")
     }
 
     async fn body_id_case(
@@ -813,6 +818,23 @@ mod tests {
             Some(at_limit)
         );
         assert_eq!(picked(&[], json!({"session_id": "s\u{e9}"})), None);
+        // The limit is the router's for session_id only: a longer
+        // prompt_cache_key is still read, and still wins for Codex.
+        let long_key = "k".repeat(BODY_SESSION_ID_LIMIT + 1);
+        assert_eq!(
+            picked(
+                &[],
+                json!({"input": "hi", "prompt_cache_key": long_key.clone()})
+            ),
+            Some(long_key.clone())
+        );
+        assert_eq!(
+            picked(
+                &[("originator", "codex_exec")],
+                json!({"input": "hi", "session_id": "s", "prompt_cache_key": long_key.clone()})
+            ),
+            Some(long_key)
+        );
         assert_eq!(picked(&[], json!({"session_id": "a\nb"})), None);
         assert_eq!(picked(&[], json!({"session_id": 7})), None);
     }
