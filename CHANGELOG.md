@@ -3,6 +3,22 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
+## Unreleased
+
+### Fixed
+
+- **Claude Code in hybrid mode works with llama.cpp chat templates that
+  require the system message first** (such as Qwen3.8-27B). The bundled
+  execution core (`rayline-core`, now pinned to `80ce3d26`) folds a system
+  message that appears later in the conversation into the first one before
+  sending a turn to a local OpenAI-chat model, so the template no longer
+  rejects it with "System message must be at the beginning." Requests that
+  already put the system message first are sent unchanged.
+- **A turn whose local model fails now finishes on the cloud.** If the local
+  server returns a 5xx error or can't be reached, the core retries that turn
+  once on a cloud target and skips the failed local model for it, instead of
+  returning the error to the agent. ([#196](https://github.com/rayline-ai/raydock/issues/196))
+
 ## 0.4.3 (2026-11-09)
 
 ### New
