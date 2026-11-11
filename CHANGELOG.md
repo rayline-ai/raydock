@@ -3,6 +3,46 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
+## 0.4.4 (2026-11-11)
+
+### New
+
+- **Claude Haiku 5.5 is a third default cloud target in hybrid mode.** The
+  default profile pins Haiku 5.5 beside Opus 5.5 and Sonnet 5.5, so a turn
+  that leaves the local model (too large for its window, or one the router
+  expects it to fail) has a cloud target priced well below Sonnet. Like the
+  other two, it allows 128,000 output tokens. A `hybrid.cloud_output_tokens`
+  block must now name all three pins; one written for the two earlier pins
+  is refused until it has a Haiku line.
+
+### Fixed
+
+- **Claude Code in hybrid mode works with llama.cpp chat templates that
+  require the system message first** (such as Qwen3.8-27B). The bundled
+  execution core (`rayline-core`, now pinned to `80ce3d26`) moves a system
+  message that appears later in the conversation into the user or tool turn
+  it follows, as user content, before sending the turn to a local
+  OpenAI-chat model, so the template no longer rejects it with "System
+  message must be at the beginning." The leading system message is left as
+  is, and requests with no later system message are sent unchanged.
+  ([#196](https://github.com/rayline-ai/raydock/issues/196))
+- **A local model failure no longer ends the turn.** If the local server
+  returns a 5xx error or can't be reached before any output, the core asks
+  the router once more for that turn with the failed local model excluded,
+  which normally sends it to a cloud target. Errors from that second attempt
+  are still returned to the agent.
+- **Session headers reach the Rayline router through the local router.** A
+  client that sends its session id only in a header (`x-session-affinity`,
+  `x-claude-code-session-id`, `x-session-id` or `x-conversation-id`) and goes
+  through `rld`'s local router to the hosted router, such as Claude Code in
+  Claude Desktop (`raydock claude-desktop`), lost that header on the way, so
+  the router keyed its turns on an id it derived from the request instead.
+  The local router now forwards exactly these four headers, unchanged, on
+  Messages, Chat Completions and Responses, and only when the upstream is the
+  hosted Rayline router; Anthropic, OpenAI, OpenRouter and custom endpoints
+  never receive them. Hybrid's auto-mode classifier calls carry all four as
+  well.
+
 ## 0.4.3 (2026-11-09)
 
 ### New
@@ -20,12 +60,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   so ARC can keep a turn local only when it fits the window. It no longer needs
   a llama.cpp prompt counter. This needs the production router from
   2026-11-09 or later.
-- **Claude Haiku 5.5 is a third default cloud target in hybrid mode.** The
-  default profile pins Haiku 5.5 beside Opus 5.5 and Sonnet 5.5, so a turn
-  that leaves the local model (too large for its window, or one the router
-  expects it to fail) has a cloud target priced well below Sonnet. A
-  `hybrid.cloud_output_tokens` block must now name all three pins; one written
-  for the two earlier pins is refused until it has a Haiku line.
 - **Auto-mode safety checks go to the cloud.** Claude Code's auto-mode
   classifier calls are sent to Claude Haiku 5.5 through the router instead of
   the local model. Change the model with `hybrid.classifier_model` or
@@ -51,16 +85,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Fixed
 
-- **Session headers reach the Rayline router through the local router.** A
-  client that sends its session id only in a header (`x-session-affinity`,
-  `x-claude-code-session-id`, `x-session-id` or `x-conversation-id`) and goes
-  through `rld`'s local router to the hosted router, such as Claude Code in
-  Claude Desktop (`raydock claude-desktop`), lost that header on the way, so
-  the router keyed its turns on an id it derived from the request instead. The local router now
-  forwards exactly these four headers, unchanged, on Messages, Chat Completions
-  and Responses, and only when the upstream is the hosted Rayline router;
-  Anthropic, OpenAI, OpenRouter and custom endpoints never receive them. Hybrid's
-  auto-mode classifier calls carry all four as well.
 - **`hybrid start` warns when the local window cannot hold Claude Code's
   opening request.** For a model other than Qwen3.8-27B, the core reserves
   the opening request (about 73,000 tokens with no MCP servers or project
@@ -93,9 +117,9 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   as refusing over-window prompts, and the core asks ARC again after such a
   refusal and moves the turn to a model that fits. llama.cpp (which may
   truncate with `--context-shift`), Ollama and MLX keep the default.
-- **Each cloud target declares its own model's output ceiling.** All three
-  Claude 5.5 cloud deployments now allow 128,000 output tokens instead of a
-  shared 32,000. Override per model with `hybrid.cloud_output_tokens`.
+- **Each cloud target declares its own model's output ceiling.** Both Claude
+  5.5 cloud deployments now allow 128,000 output tokens instead of a shared
+  32,000. Override per model with `hybrid.cloud_output_tokens`.
 - **Every deployment lowers an over-cap output allowance.** A request asking
   for more output than a cloud deployment's ceiling is lowered to it instead of
   refused, as the local deployment already did; the stated and sent figures are
