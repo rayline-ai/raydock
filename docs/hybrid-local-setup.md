@@ -147,7 +147,7 @@ With no override and a local model in the session, Raydock sends the
 **prefer-local** preset, `arc-policy.prefer-local.v1`, on every decision. A
 session with no local model sends the **hybrid default** preset,
 `arc-policy.hybrid-default.v1`. How ARC applies each preset is described in
-the [ARC documentation](https://docs.rayline.ai/arc) and may change on the
+the [ARC hybrid routing policies](https://docs.rayline.ai/arc/routes/hybrid) and may change on the
 service side. Under either preset:
 
 - **The model** may change at cache boundaries: task start, a subagent start, a
