@@ -73,6 +73,9 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
         Ok(commit) => commit,
         Err(error) => cached_commit(repo).ok_or(error)?,
     };
+    // Complete only when every optional file is cached or confirmed absent
+    // (404); a rate limit or network failure leaves the snapshot unrecorded.
+    let mut complete = true;
     for (file, required) in REQUIRED
         .iter()
         .map(|file| (file, true))
@@ -92,9 +95,13 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
             0,
             0,
             None,
-        ) && required
-        {
-            return Err(format!("download {file} from {repo}: {error}"));
+        ) {
+            if required {
+                return Err(format!("download {file} from {repo}: {error}"));
+            }
+            if !is_absent(&error) {
+                complete = false;
+            }
         }
     }
     let dir = rayline_hf::hf_cache_snapshot_path(repo, "", &commit);
@@ -107,10 +114,16 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
     if !has_template {
         return Err(format!("{repo} publishes no chat template"));
     }
-    // Only now is this snapshot complete; `cached` falls back to it alone.
-    let marker = complete_marker(repo);
-    let _ = std::fs::write(&marker, &commit);
+    if complete {
+        // `cached` falls back to this snapshot alone.
+        let _ = std::fs::write(complete_marker(repo), &commit);
+    }
     Ok(dir)
+}
+
+/// The Hub answered that the file does not exist in the repo.
+fn is_absent(error: &str) -> bool {
+    error.contains("status 404")
 }
 
 /// Names the last snapshot `fetch` finished. `refs/main` moves as each file
@@ -154,6 +167,15 @@ fn cached_commit(repo: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_a_missing_file_counts_as_absent() {
+        assert!(is_absent("Download failed with status 404 Not Found"));
+        assert!(!is_absent(
+            "Download failed with status 429 Too Many Requests"
+        ));
+        assert!(!is_absent("error sending request: connection reset"));
+    }
 
     #[test]
     fn known_models_map_to_their_published_repo() {
