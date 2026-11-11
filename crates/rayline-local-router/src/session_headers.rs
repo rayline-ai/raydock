@@ -1,8 +1,12 @@
 //! The client session headers the hosted Rayline router keys episodes
 //! (conversations) on, and the one rule for carrying them upstream: copy them
-//! verbatim, and only to the hosted router.
+//! verbatim, and only to the hosted router. A session id the client sent only
+//! in its body (`session_id`, `prompt_cache_key`) is carried in
+//! `x-session-affinity` where the local router rebuilds that body for another
+//! protocol, under the same rule.
 
 use hyper::HeaderMap;
+use serde_json::Value;
 
 use crate::{EndpointConfig, endpoint_is_hosted_rcr};
 
@@ -57,6 +61,98 @@ pub(crate) fn copy_session_headers(
         }
     }
     outbound
+}
+
+/// The header a body-borne session id travels in once the local router has
+/// rebuilt the body: `x-session-affinity`, which the hosted router reads on
+/// every protocol at the same rank as a body `session_id`.
+const BODY_SESSION_ID_HEADER: &str = SESSION_HEADERS[0];
+
+/// The longest body `session_id` carried: the hosted router reads no longer
+/// one either.
+const BODY_SESSION_ID_LIMIT: usize = 1024;
+
+/// For a builder that rebuilds the client's body for another protocol (Chat to
+/// Messages, Responses to Messages or Chat, Messages to Chat): copy the
+/// client's session headers ([`copy_session_headers`]) and, when the client
+/// named its session only in the body, carry that id in `x-session-affinity`.
+/// The rebuilt body drops `session_id` and `prompt_cache_key`, so without this
+/// the hosted router would key the turn on an id it derives from the
+/// messages and separate sessions would merge. A builder that forwards the
+/// client's body as is keeps those fields and must use
+/// [`copy_session_headers`] alone.
+pub(crate) fn copy_session_headers_for_rebuilt_body(
+    outbound: reqwest::RequestBuilder,
+    inbound_headers: &HeaderMap,
+    inbound_body: &Value,
+    endpoint: &EndpointConfig,
+) -> reqwest::RequestBuilder {
+    let outbound = copy_session_headers(outbound, inbound_headers, endpoint);
+    if !endpoint_receives_session_headers(endpoint) {
+        return outbound;
+    }
+    // Any session header already on the request, from the client or the
+    // endpoint config, names the session: a body id never overrides it.
+    let header_names_session = SESSION_HEADERS.iter().any(|name| {
+        inbound_headers.contains_key(*name)
+            || endpoint
+                .headers
+                .keys()
+                .any(|configured| configured.eq_ignore_ascii_case(name))
+    });
+    if header_names_session {
+        return outbound;
+    }
+    match session_from_body(inbound_headers, inbound_body) {
+        Some(id) => outbound.header(BODY_SESSION_ID_HEADER, id),
+        None => outbound,
+    }
+}
+
+/// The session id the client's body names, picked the way the hosted router
+/// would pick it from that body on a direct connection, so going through the
+/// local router never changes which id keys the conversation:
+///
+/// - a client session header outranks every body id (the caller checks that
+///   first). On a direct connection the one body id ranked above those headers
+///   is Codex's `prompt_cache_key`, and Codex sends none of them;
+/// - Codex (an `originator` header starting with `codex`) on a body without
+///   `messages`: `prompt_cache_key`, which the router reads ahead of any
+///   `session_id` for Codex;
+/// - otherwise the body `session_id` (OpenRouter's field; Cline's OpenRouter
+///   provider sends its task id there), up to 1024 characters;
+/// - else `prompt_cache_key`, but only on a body without `messages` (a
+///   Responses body): the router ignores it on Chat and Messages bodies.
+///
+/// A value is trimmed and must be non-empty printable ASCII; anything else is
+/// skipped, as a header could not carry it unchanged.
+fn session_from_body(inbound_headers: &HeaderMap, body: &Value) -> Option<String> {
+    let field = |name: &str, limit: usize| {
+        body.get(name)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| {
+                !id.is_empty() && id.len() <= limit && id.bytes().all(|b| (0x20..0x7f).contains(&b))
+            })
+            .map(str::to_owned)
+    };
+    let has_messages = body.get("messages").is_some_and(Value::is_array);
+    // The router reads a `prompt_cache_key` of any length.
+    let prompt_cache_key = || {
+        if has_messages {
+            None
+        } else {
+            field("prompt_cache_key", usize::MAX)
+        }
+    };
+    let codex = inbound_headers
+        .get("originator")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().starts_with("codex"));
+    if codex && let Some(id) = prompt_cache_key() {
+        return Some(id);
+    }
+    field("session_id", BODY_SESSION_ID_LIMIT).or_else(prompt_cache_key)
 }
 
 #[cfg(test)]
@@ -170,9 +266,29 @@ mod tests {
         tx: oneshot::Sender<String>,
     ) {
         if let Ok((mut sock, _)) = listener.accept().await {
+            // Read the head and the whole body: tests assert on body fields.
+            let mut raw = Vec::new();
             let mut buf = [0u8; 16384];
-            let n = sock.read(&mut buf).await.unwrap_or(0);
-            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_string());
+            loop {
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&raw);
+                if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
+                        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if body.len() >= length {
+                        break;
+                    }
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&raw).to_string());
             let _ = sock.write_all(response.as_bytes()).await;
             let _ = sock.flush().await;
             let _ = sock.shutdown().await;
@@ -270,6 +386,27 @@ mod tests {
         hosted: bool,
         endpoint_headers: Value,
     ) -> String {
+        session_case_with(
+            inbound_path,
+            protocol,
+            hosted,
+            endpoint_headers,
+            &SESSION_HEADER_VALUES,
+            json!({}),
+        )
+        .await
+    }
+
+    /// `session_case` with the client's own headers and extra top-level body
+    /// fields.
+    async fn session_case_with(
+        inbound_path: &str,
+        protocol: &str,
+        hosted: bool,
+        endpoint_headers: Value,
+        client_headers: &[(&str, &str)],
+        body_fields: Value,
+    ) -> String {
         let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_port = upstream.local_addr().unwrap().port();
         if hosted {
@@ -297,21 +434,24 @@ mod tests {
         }));
         let port = free_port();
         start_router(port, path.clone()).await;
-        let body = match inbound_path {
+        let mut body = match inbound_path {
             "/v1/messages" => json!({"model": "rayline-auto", "max_tokens": 16,
                                      "messages": [{"role": "user", "content": "hi"}]}),
             "/v1/chat/completions" => json!({"model": "rayline-auto",
                                              "messages": [{"role": "user", "content": "hi"}]}),
             _ => json!({"model": "rayline-auto", "stream": false, "input": "hi"}),
         };
+        if let (Some(body), Some(fields)) = (body.as_object_mut(), body_fields.as_object()) {
+            body.extend(fields.clone());
+        }
         let mut request = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}{inbound_path}"))
             .header("anthropic-version", "2023-06-01")
             .header("authorization", "Bearer client-secret-must-not-leave")
             .header("x-api-key", "client-secret-must-not-leave")
             .json(&body);
-        for (name, value) in SESSION_HEADER_VALUES {
-            request = request.header(name, value);
+        for (name, value) in client_headers {
+            request = request.header(*name, *value);
         }
         let _ = request.send().await.expect("router request");
         let _ = std::fs::remove_file(path);
@@ -385,8 +525,324 @@ mod tests {
         .await;
         assert_eq!(captured_header_values(&raw, "x-session-id"), ["configured"]);
         assert_eq!(
-            captured_header_values(&raw, "x-session-affinity"),
+            captured_header_values(&raw, BODY_SESSION_ID_HEADER),
             ["affinity-1"]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Body-borne session ids, where the router rebuilds the body.
+    // -----------------------------------------------------------------------
+
+    /// Surfaces where the router rebuilds the client's body for another
+    /// protocol, dropping its `session_id` and `prompt_cache_key`.
+    const REBUILT_BODY_SURFACES: [(&str, &str); 6] = [
+        ("/v1/chat/completions", "anthropic_messages"),
+        ("/v1/responses", "anthropic_messages"),
+        ("/v1/responses", "openai_chat"),
+        ("/v1/responses/compact", "anthropic_messages"),
+        ("/v1/responses/compact", "openai_chat"),
+        ("/v1/messages", "openai_chat"),
+    ];
+
+    /// Surfaces where the router forwards the client's body as is.
+    const PASSTHROUGH_SURFACES: [(&str, &str); 3] = [
+        ("/v1/chat/completions", "openai_chat"),
+        ("/v1/responses", "openai_responses"),
+        ("/v1/messages", "anthropic_messages"),
+    ];
+
+    /// Whether the client's body on `inbound_path` is a Responses body (no
+    /// `messages` array), so the router reads its `prompt_cache_key`.
+    fn is_responses(inbound_path: &str) -> bool {
+        inbound_path.starts_with("/v1/responses")
+    }
+
+    async fn body_id_case(
+        inbound_path: &str,
+        protocol: &str,
+        hosted: bool,
+        client_headers: &[(&str, &str)],
+        body_fields: Value,
+    ) -> String {
+        session_case_with(
+            inbound_path,
+            protocol,
+            hosted,
+            json!({}),
+            client_headers,
+            body_fields,
+        )
+        .await
+    }
+
+    /// A client that names its session only in the body `session_id` (Cline's
+    /// OpenRouter provider) keeps it where the body is rebuilt: the hosted
+    /// router receives it as `x-session-affinity`, on every such surface.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_session_id_reaches_the_hosted_router_where_the_body_is_rebuilt() {
+        for (inbound_path, protocol) in REBUILT_BODY_SURFACES {
+            let raw = body_id_case(
+                inbound_path,
+                protocol,
+                true,
+                &[],
+                json!({"session_id": "task-1"}),
+            )
+            .await;
+            assert_eq!(
+                captured_header_values(&raw, BODY_SESSION_ID_HEADER),
+                ["task-1"],
+                "{inbound_path} -> {protocol}"
+            );
+            assert!(
+                !raw.contains("client-secret-must-not-leave"),
+                "{inbound_path} -> {protocol} forwarded client credentials"
+            );
+        }
+    }
+
+    /// A Responses `prompt_cache_key` (Codex, Hermes, pi) is carried the same
+    /// way. On a Chat or Messages body the router does not read it, so it is
+    /// not carried from those either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prompt_cache_key_is_carried_from_a_responses_body_only() {
+        for (inbound_path, protocol) in REBUILT_BODY_SURFACES {
+            let raw = body_id_case(
+                inbound_path,
+                protocol,
+                true,
+                &[],
+                json!({"prompt_cache_key": "pck-1"}),
+            )
+            .await;
+            let expected: &[&str] = if is_responses(inbound_path) {
+                &["pck-1"]
+            } else {
+                &[]
+            };
+            assert_eq!(
+                captured_header_values(&raw, BODY_SESSION_ID_HEADER),
+                expected,
+                "{inbound_path} -> {protocol}"
+            );
+        }
+    }
+
+    /// No body id, no header: the router derives its own id as before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_body_id_adds_no_session_header() {
+        for (inbound_path, protocol) in REBUILT_BODY_SURFACES {
+            let raw = body_id_case(inbound_path, protocol, true, &[], json!({})).await;
+            for name in SESSION_HEADERS {
+                assert!(
+                    captured_header_values(&raw, name).is_empty(),
+                    "{inbound_path} -> {protocol}: {name}"
+                );
+            }
+        }
+    }
+
+    /// Codex names its session in `prompt_cache_key`, which the router reads
+    /// ahead of a body `session_id` for Codex; any other client's
+    /// `session_id` wins over its `prompt_cache_key`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_ids_keep_the_hosted_router_precedence() {
+        let both = json!({"session_id": "task-1", "prompt_cache_key": "pck-1"});
+        let raw = body_id_case(
+            "/v1/responses",
+            "anthropic_messages",
+            true,
+            &[("originator", "codex_cli_rs")],
+            both.clone(),
+        )
+        .await;
+        assert_eq!(
+            captured_header_values(&raw, BODY_SESSION_ID_HEADER),
+            ["pck-1"]
+        );
+        let raw = body_id_case("/v1/responses", "anthropic_messages", true, &[], both).await;
+        assert_eq!(
+            captured_header_values(&raw, BODY_SESSION_ID_HEADER),
+            ["task-1"]
+        );
+    }
+
+    /// A session header the client sent keeps priority: the body id is not
+    /// added next to it, and the client's header reaches the router unchanged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_session_header_wins_over_a_body_id() {
+        let body = json!({"session_id": "task-1", "prompt_cache_key": "pck-1"});
+        // Every header on one surface, and one header on every surface: the
+        // check does not depend on the surface.
+        let cases = SESSION_HEADER_VALUES
+            .iter()
+            .map(|header| (REBUILT_BODY_SURFACES[0], *header))
+            .chain(
+                REBUILT_BODY_SURFACES
+                    .iter()
+                    .map(|surface| (*surface, SESSION_HEADER_VALUES[2])),
+            );
+        for ((inbound_path, protocol), (name, value)) in cases {
+            let raw =
+                body_id_case(inbound_path, protocol, true, &[(name, value)], body.clone()).await;
+            assert_eq!(
+                captured_header_values(&raw, name),
+                [value],
+                "{inbound_path} -> {protocol}: {name}"
+            );
+            if name != BODY_SESSION_ID_HEADER {
+                assert!(
+                    captured_header_values(&raw, BODY_SESSION_ID_HEADER).is_empty(),
+                    "{inbound_path} -> {protocol}: body id added next to {name}"
+                );
+            }
+        }
+    }
+
+    /// A session header the endpoint config sets wins over a body id too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_configured_session_header_wins_over_a_body_id() {
+        let raw = session_case_with(
+            "/v1/chat/completions",
+            "anthropic_messages",
+            true,
+            json!({"X-Session-Affinity": "configured"}),
+            &[],
+            json!({"session_id": "task-1"}),
+        )
+        .await;
+        assert_eq!(
+            captured_header_values(&raw, BODY_SESSION_ID_HEADER),
+            ["configured"]
+        );
+    }
+
+    /// Any upstream but the hosted router never receives a body id as a header.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn body_ids_never_reach_other_upstreams_as_headers() {
+        for (inbound_path, protocol) in REBUILT_BODY_SURFACES {
+            let raw = body_id_case(
+                inbound_path,
+                protocol,
+                false,
+                &[("originator", "codex_cli_rs")],
+                json!({"session_id": "task-1", "prompt_cache_key": "pck-1"}),
+            )
+            .await;
+            for name in SESSION_HEADERS {
+                assert!(
+                    captured_header_values(&raw, name).is_empty(),
+                    "{inbound_path} -> {protocol} leaked {name}"
+                );
+            }
+        }
+    }
+
+    /// Where the body is forwarded as is, it still carries the id and no
+    /// header is added: the router reads the body itself.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn passthrough_body_keeps_its_id_and_gets_no_header() {
+        for (inbound_path, protocol) in PASSTHROUGH_SURFACES {
+            let raw = body_id_case(
+                inbound_path,
+                protocol,
+                true,
+                &[],
+                json!({"session_id": "task-1", "prompt_cache_key": "pck-1"}),
+            )
+            .await;
+            assert!(
+                captured_header_values(&raw, BODY_SESSION_ID_HEADER).is_empty(),
+                "{inbound_path} -> {protocol}"
+            );
+            let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+            let body: Value = serde_json::from_str(body).expect("upstream body is JSON");
+            assert_eq!(body["session_id"], "task-1", "{inbound_path} -> {protocol}");
+            assert_eq!(
+                body["prompt_cache_key"], "pck-1",
+                "{inbound_path} -> {protocol}"
+            );
+        }
+    }
+
+    fn picked(headers: &[(&'static str, &'static str)], body: Value) -> Option<String> {
+        let mut map = HeaderMap::new();
+        for (name, value) in headers {
+            map.insert(
+                hyper::header::HeaderName::from_static(name),
+                hyper::header::HeaderValue::from_static(value),
+            );
+        }
+        session_from_body(&map, &body)
+    }
+
+    #[test]
+    fn session_from_body_follows_the_hosted_ladder() {
+        let codex = [("originator", "codex_exec")];
+        // Responses body: Codex prefers prompt_cache_key, anyone else session_id.
+        let both = json!({"input": "hi", "session_id": "s", "prompt_cache_key": "p"});
+        assert_eq!(picked(&codex, both.clone()).as_deref(), Some("p"));
+        assert_eq!(picked(&[], both).as_deref(), Some("s"));
+        assert_eq!(
+            picked(&[], json!({"input": "hi", "prompt_cache_key": "p"})).as_deref(),
+            Some("p")
+        );
+        // A body with messages (Chat, Messages): prompt_cache_key is not read,
+        // for Codex either.
+        let chat = json!({"messages": [], "prompt_cache_key": "p"});
+        assert_eq!(picked(&[], chat.clone()), None);
+        assert_eq!(picked(&codex, chat), None);
+        assert_eq!(
+            picked(
+                &codex,
+                json!({"messages": [], "session_id": "s", "prompt_cache_key": "p"})
+            )
+            .as_deref(),
+            Some("s")
+        );
+        assert_eq!(picked(&[], json!({"input": "hi"})), None);
+    }
+
+    #[test]
+    fn session_from_body_skips_values_a_header_cannot_carry_unchanged() {
+        // Trimmed; a blank value falls through to the next id.
+        assert_eq!(
+            picked(&[], json!({"session_id": "  s  "})).as_deref(),
+            Some("s")
+        );
+        assert_eq!(
+            picked(&[], json!({"session_id": "  ", "prompt_cache_key": "p"})).as_deref(),
+            Some("p")
+        );
+        // Longer than the router reads from a body, non-ASCII, control
+        // characters, or not a string: skipped.
+        let long = "a".repeat(BODY_SESSION_ID_LIMIT + 1);
+        assert_eq!(picked(&[], json!({"session_id": long})), None);
+        let at_limit = "a".repeat(BODY_SESSION_ID_LIMIT);
+        assert_eq!(
+            picked(&[], json!({"session_id": at_limit.clone()})),
+            Some(at_limit)
+        );
+        assert_eq!(picked(&[], json!({"session_id": "s\u{e9}"})), None);
+        // The limit is the router's for session_id only: a longer
+        // prompt_cache_key is still read, and still wins for Codex.
+        let long_key = "k".repeat(BODY_SESSION_ID_LIMIT + 1);
+        assert_eq!(
+            picked(
+                &[],
+                json!({"input": "hi", "prompt_cache_key": long_key.clone()})
+            ),
+            Some(long_key.clone())
+        );
+        assert_eq!(
+            picked(
+                &[("originator", "codex_exec")],
+                json!({"input": "hi", "session_id": "s", "prompt_cache_key": long_key.clone()})
+            ),
+            Some(long_key)
+        );
+        assert_eq!(picked(&[], json!({"session_id": "a\nb"})), None);
+        assert_eq!(picked(&[], json!({"session_id": 7})), None);
     }
 }
