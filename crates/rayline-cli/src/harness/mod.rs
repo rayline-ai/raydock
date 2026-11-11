@@ -57,7 +57,7 @@
 //! path exports [`CONV_ID_ENV`] only when a rendered config references it
 //! ([`conversation_id_for`]).
 
-mod hermes;
+pub(crate) mod hermes;
 mod omp;
 mod omp_migration;
 mod omp_roles;
@@ -638,6 +638,12 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         harness.name(),
         config_dir.display()
     );
+    if harness == Harness::Hermes && cfg!(windows) {
+        hermes::prepare_home(&config_dir, |args| {
+            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+            hermes::finish(build_command(&binary, &plan, None, &args))
+        })?;
+    }
     let args = match harness {
         Harness::OpenClaw => {
             let env_container =

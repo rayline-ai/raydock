@@ -404,6 +404,19 @@ its own routes. Any other model name the local router does not know, including
 `raydock claude-desktop` already runs on ARC, and `raydock codex --auth
 subscription` keeps your ChatGPT subscription for the main agent.
 
+## Hermes on Windows
+
+`raydock hermes` runs Hermes with its own Hermes home
+(`~/.config/rayline/harness/hermes/<env>`). Hermes on Windows keeps its Python
+dependencies per home and will not start in a home without them, so the first
+launch runs `hermes pm repair` for that home ("Setting up Hermes for Raydock"),
+which can take a few minutes; later launches skip it. If the repair fails,
+Raydock prints the exact command to run yourself, for example in PowerShell:
+
+```powershell
+$env:HERMES_HOME = 'C:\Users\you\.config\rayline\harness\hermes\prod'; hermes pm repair; Remove-Item Env:HERMES_HOME
+```
+
 ## OpenClaw
 
 `raydock openclaw` runs OpenClaw against the Rayline router with a generated

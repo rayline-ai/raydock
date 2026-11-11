@@ -54,10 +54,23 @@
 //! `config.yaml` also holds the user's Hermes settings (`hermes config set`,
 //! `hermes tools`), so each launch merges only Rayline's keys ([`OWNED`]) into
 //! the existing file and keeps every other line as written.
+//!
+//! Dependency environment (Windows): Hermes keeps the Python environment it
+//! runs on per home, under `HERMES_HOME\installs`, and on Windows it refuses
+//! to start in a home that has none ("no dependency environment is committed
+//! for this install; run `hermes pm repair`"). Raydock's home starts empty,
+//! and a plain `hermes pm repair` would repair the default home instead, so
+//! before a Windows launch [`prepare_home`] builds the environment once with
+//! `HERMES_HOME` set to Raydock's home. Later launches find it and skip the
+//! repair.
 
-use std::{fs, io};
+use std::{
+    fs, io,
+    path::Path,
+    process::{Command, Stdio},
+};
 
-use serde_json::json;
+use serde_json::{Value, json};
 
 use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, to_yaml, yaml_merge};
 
@@ -175,6 +188,113 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
         env_set: vec![("HERMES_HOME", ctx.config_dir.as_os_str().to_owned())],
         env_remove: Vec::new(),
     })
+}
+
+/// Hermes' per-home dependency state: one `installs/<install key>` directory per
+/// Hermes checkout, whose `facts.json` names the committed environment.
+const INSTALLS_DIR: &str = "installs";
+const FACTS_FILE: &str = "facts.json";
+/// What Hermes tells the user to run when its home has no environment.
+const REPAIR_COMMAND: &str = "hermes pm repair";
+/// The most lines of a failed repair's output repeated in the error.
+const FAILED_OUTPUT_LINES: usize = 12;
+
+/// A finished Hermes run: whether it exited 0, and its stdout then stderr.
+pub(crate) struct Finished {
+    pub success: bool,
+    pub output: String,
+}
+
+/// Runs a prepared Hermes command to completion with no stdin, capturing its
+/// output.
+pub(crate) fn finish(mut command: Command) -> io::Result<Finished> {
+    let output = command.stdin(Stdio::null()).output()?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(Finished {
+        success: output.status.success(),
+        output: text,
+    })
+}
+
+/// Makes sure Hermes can start in `home` (see the module docs). `run` runs
+/// Hermes with the given args and `HERMES_HOME=home`.
+///
+/// A home that records an environment is used as is, with no Hermes run.
+/// Otherwise a cheap `hermes --version` asks Hermes itself: only when it
+/// refuses and names `hermes pm repair` does the repair run, so an install
+/// that ships its own environment is left alone. A probe that cannot run is
+/// not an error here; the launch reports it.
+pub(crate) fn prepare_home(
+    home: &Path,
+    mut run: impl FnMut(&[&str]) -> io::Result<Finished>,
+) -> Result<(), String> {
+    if has_dependency_environment(home) {
+        return Ok(());
+    }
+    match run(&["--version"]) {
+        Ok(probe) if !probe.success && probe.output.contains(REPAIR_COMMAND) => {}
+        _ => return Ok(()),
+    }
+    eprintln!("  Setting up Hermes for Raydock (one time; this can take a few minutes)...");
+    match run(&["pm", "repair"]) {
+        Ok(repair) if repair.success => {
+            eprintln!("  Hermes is set up.");
+            Ok(())
+        }
+        Ok(repair) => Err(repair_failed(home, &last_lines(&repair.output))),
+        Err(error) => Err(repair_failed(home, &format!("    {error}"))),
+    }
+}
+
+/// Whether `home` records a Hermes dependency environment that still exists.
+fn has_dependency_environment(home: &Path) -> bool {
+    let Ok(installs) = fs::read_dir(home.join(INSTALLS_DIR)) else {
+        return false;
+    };
+    installs
+        .flatten()
+        .any(|install| records_environment(&install.path().join(FACTS_FILE)))
+}
+
+fn records_environment(facts: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(facts) else {
+        return false;
+    };
+    let Ok(facts) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) else {
+        return false;
+    };
+    facts
+        .pointer("/packages/venv/environment")
+        .and_then(Value::as_str)
+        .is_some_and(|environment| Path::new(environment).join("pyvenv.cfg").is_file())
+}
+
+fn last_lines(output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(FAILED_OUTPUT_LINES)..]
+        .iter()
+        .map(|line| format!("    {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The error for a failed repair: Hermes' last output, then the command to run
+/// by hand in PowerShell and in Command Prompt, each scoped to Raydock's home
+/// so the user's own Hermes home is untouched afterwards.
+fn repair_failed(home: &Path, output: &str) -> String {
+    let home = home.display().to_string();
+    let powershell = home.replace('\'', "''");
+    format!(
+        "Hermes setup failed: `{REPAIR_COMMAND}` did not finish for Raydock's Hermes home.\n\
+         {output}\n\
+         Run it yourself with that home, then launch again:\n\
+         \x20 PowerShell:     $env:HERMES_HOME = '{powershell}'; {REPAIR_COMMAND}; Remove-Item Env:HERMES_HOME\n\
+         \x20 Command Prompt: set \"HERMES_HOME={home}\" & {REPAIR_COMMAND} & set \"HERMES_HOME=\""
+    )
 }
 
 #[cfg(test)]
@@ -482,5 +602,150 @@ providers:
         context_length: 1000000
 "
         );
+    }
+
+    mod prepare_home {
+        use super::super::super::tests::temp_dir;
+        use super::super::{Finished, prepare_home};
+        use std::path::Path;
+
+        const REFUSAL: &str = "hermes: no dependency environment is committed for this \
+                               install; run `hermes pm repair`";
+
+        /// Lays out `installs/<key>/facts.json` the way `hermes pm repair`
+        /// leaves it, with the recorded venv present.
+        fn commit_environment(home: &Path) {
+            let install = home.join("installs").join("d74c6fbcc1df5714");
+            let venv = install.join("environments").join("e1").join("venv");
+            std::fs::create_dir_all(&venv).unwrap();
+            std::fs::write(venv.join("pyvenv.cfg"), "home = x\n").unwrap();
+            let facts = serde_json::json!({
+                "packages": { "venv": { "environment": venv.to_string_lossy() } },
+                "schema": 1
+            });
+            std::fs::write(install.join("facts.json"), facts.to_string()).unwrap();
+        }
+
+        fn finished(success: bool, output: &str) -> std::io::Result<Finished> {
+            Ok(Finished {
+                success,
+                output: output.to_owned(),
+            })
+        }
+
+        /// A clean home: Hermes refuses, so the repair runs once; the next
+        /// launch finds the environment and runs nothing.
+        #[test]
+        fn a_clean_home_is_repaired_once() {
+            let home = temp_dir("hermes-clean-home");
+            let mut calls = Vec::new();
+            prepare_home(&home, |args| {
+                calls.push(args.join(" "));
+                if args == ["pm", "repair"] {
+                    commit_environment(&home);
+                    finished(true, "hermes: dependency environment repaired")
+                } else {
+                    finished(false, REFUSAL)
+                }
+            })
+            .unwrap();
+            assert_eq!(calls, ["--version", "pm repair"]);
+
+            let mut again = Vec::new();
+            prepare_home(&home, |args| {
+                again.push(args.join(" "));
+                finished(true, "")
+            })
+            .unwrap();
+            assert!(again.is_empty(), "{again:?}");
+        }
+
+        /// Facts that name a missing venv do not count as an environment.
+        #[test]
+        fn a_recorded_but_missing_venv_is_repaired() {
+            let home = temp_dir("hermes-missing-venv");
+            commit_environment(&home);
+            let install = home.join("installs").join("d74c6fbcc1df5714");
+            std::fs::remove_dir_all(install.join("environments")).unwrap();
+            let mut calls = Vec::new();
+            prepare_home(&home, |args| {
+                calls.push(args.join(" "));
+                finished(args != ["--version"], REFUSAL)
+            })
+            .unwrap();
+            assert_eq!(calls, ["--version", "pm repair"]);
+        }
+
+        /// An install that starts without a per-home environment (or fails for
+        /// another reason) is not repaired; the launch goes ahead and Hermes
+        /// reports any other failure itself.
+        #[test]
+        fn no_repair_unless_hermes_asks_for_it() {
+            let home = temp_dir("hermes-no-ask");
+            for probe in [
+                (true, "Hermes Agent v0.23.1"),
+                (false, "some other failure"),
+            ] {
+                let mut calls = Vec::new();
+                prepare_home(&home, |args| {
+                    calls.push(args.join(" "));
+                    finished(probe.0, probe.1)
+                })
+                .unwrap();
+                assert_eq!(calls, ["--version"]);
+            }
+            let mut calls = Vec::new();
+            prepare_home(&home, |args| {
+                calls.push(args.join(" "));
+                Err(std::io::Error::other("not found"))
+            })
+            .unwrap();
+            assert_eq!(calls, ["--version"]);
+        }
+
+        /// A failed repair stops the launch and names the exact command, with
+        /// Raydock's home, for both Windows shells.
+        #[test]
+        fn a_failed_repair_prints_the_command_with_the_home() {
+            let home = temp_dir("hermes-repair-fails").join("it's");
+            let output = (1..=20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let error = prepare_home(&home, |args| {
+                if args == ["pm", "repair"] {
+                    finished(false, &output)
+                } else {
+                    finished(false, REFUSAL)
+                }
+            })
+            .unwrap_err();
+            let shown = home.display().to_string();
+            assert!(error.contains("    line 20"), "{error}");
+            assert!(!error.contains("line 8\n"), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "$env:HERMES_HOME = '{}'; hermes pm repair; Remove-Item Env:HERMES_HOME",
+                    shown.replace('\'', "''")
+                )),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!(
+                    "set \"HERMES_HOME={shown}\" & hermes pm repair & set \"HERMES_HOME=\""
+                )),
+                "{error}"
+            );
+
+            let error = prepare_home(&home, |args| {
+                if args == ["pm", "repair"] {
+                    Err(std::io::Error::other("cannot start"))
+                } else {
+                    finished(false, REFUSAL)
+                }
+            })
+            .unwrap_err();
+            assert!(error.contains("    cannot start"), "{error}");
+        }
     }
 }
