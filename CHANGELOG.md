@@ -45,6 +45,16 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Fixed
 
+- **Session headers reach the Rayline router through the local router.** A
+  client that sends its session id only in a header (`x-session-affinity`,
+  `x-claude-code-session-id`, `x-session-id` or `x-conversation-id`) and goes
+  through `rld`'s local router to the hosted router, such as Claude Code in
+  Claude Desktop (`raydock claude-desktop`), lost that header on the way, so
+  the router keyed its turns on an id it derived from the request instead. The local router now
+  forwards exactly these four headers, unchanged, on Messages, Chat Completions
+  and Responses, and only when the upstream is the hosted Rayline router;
+  Anthropic, OpenAI, OpenRouter and custom endpoints never receive them. Hybrid's
+  auto-mode classifier calls carry all four as well.
 - **`hybrid start` warns when the local window cannot hold Claude Code's
   opening request.** For a model other than Qwen3.8-27B, the core reserves
   the opening request (about 73,000 tokens with no MCP servers or project

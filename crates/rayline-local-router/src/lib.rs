@@ -39,6 +39,9 @@ pub mod inbound_guard;
 
 use anthropic_usage::AnthropicUsage;
 pub use inbound_guard::InboundGuard;
+mod session_headers;
+pub use session_headers::SESSION_HEADERS;
+use session_headers::copy_session_headers;
 mod upstream_request_id;
 #[cfg(windows)]
 pub mod windows_state;
@@ -1372,8 +1375,15 @@ async fn handle_messages(state: AppState, req: Request<Incoming>) -> Result<Resp
                     .await
                 }
                 EndpointProtocol::OpenAIChat => {
-                    forward_openai_chat_endpoint(&state, endpoint, &decision, parsed, &request_id)
-                        .await
+                    forward_openai_chat_endpoint(
+                        &state,
+                        endpoint,
+                        &decision,
+                        &headers,
+                        parsed,
+                        &request_id,
+                    )
+                    .await
                 }
                 EndpointProtocol::OpenAIResponses => Err(anyhow!(
                     "endpoint {:?} uses openai_responses, which is only supported for /v1/responses requests",
@@ -1500,6 +1510,7 @@ async fn handle_responses(state: AppState, req: Request<Incoming>) -> Result<Res
                         &state,
                         endpoint,
                         &decision,
+                        &headers,
                         &parsed,
                         &request_id,
                         output_kind,
@@ -1861,6 +1872,7 @@ async fn run_synthetic_unary_response(
                     if let Some(beta) = inbound_headers.get("anthropic-beta").and_then(header_str) {
                         outbound = outbound.header("anthropic-beta", beta);
                     }
+                    outbound = copy_session_headers(outbound, inbound_headers, endpoint);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
                     let resp = outbound.send().await?;
                     let upstream_request_id = upstream_request_id(resp.headers());
@@ -1889,6 +1901,7 @@ async fn run_synthetic_unary_response(
                         .post(url)
                         .header("content-type", "application/json")
                         .json(&request_body);
+                    outbound = copy_session_headers(outbound, inbound_headers, endpoint);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
                     let resp = outbound.send().await?;
                     let upstream_request_id = upstream_request_id(resp.headers());
@@ -2378,6 +2391,7 @@ async fn forward_openai_passthrough_endpoint(
         !passthrough.body.is_empty(),
         endpoint.auth == Some(AuthMode::ClientBearer),
     );
+    outbound = copy_session_headers(outbound, passthrough.inbound_headers, endpoint);
     // Codex may-local: advertise the on-device model on the native RCR forward
     // (the proxy-less analogue of the proxy's `x-rayline-local-*` headers), so the
     // RCR may 307-redirect an eligible subagent turn to the local adapter. Custom
@@ -2678,6 +2692,7 @@ async fn forward_responses_to_anthropic_endpoint(
     if let Some(beta) = inbound_headers.get("anthropic-beta").and_then(header_str) {
         outbound = outbound.header("anthropic-beta", beta);
     }
+    outbound = copy_session_headers(outbound, inbound_headers, endpoint);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
     let resp = outbound.send().await?;
     anthropic_response_to_responses(
@@ -2739,6 +2754,7 @@ async fn forward_responses_to_openai_chat_endpoint(
     state: &AppState,
     endpoint: &EndpointConfig,
     decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
     body: &Value,
     request_id: &str,
     output_kind: SyntheticOutputKind,
@@ -2755,6 +2771,7 @@ async fn forward_responses_to_openai_chat_endpoint(
         .post(url)
         .header("content-type", "application/json")
         .json(&request_body);
+    outbound = copy_session_headers(outbound, inbound_headers, endpoint);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
     let resp = outbound.send().await?;
     let status = resp.status();
@@ -2840,6 +2857,7 @@ async fn forward_anthropic_endpoint(
     {
         outbound = outbound.header("anthropic-beta", beta);
     }
+    outbound = copy_session_headers(outbound, inbound_headers, endpoint);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
     let resp = outbound.send().await?;
     let status = resp.status();
@@ -2939,6 +2957,7 @@ async fn forward_openai_chat_endpoint(
     state: &AppState,
     endpoint: &EndpointConfig,
     decision: &RouteDecision,
+    inbound_headers: &HeaderMap,
     body: Value,
     request_id: &str,
 ) -> Result<Response<BoxBody>> {
@@ -2954,6 +2973,7 @@ async fn forward_openai_chat_endpoint(
         .post(url)
         .header("content-type", "application/json")
         .json(&request_body);
+    outbound = copy_session_headers(outbound, inbound_headers, endpoint);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
     let resp = outbound.send().await?;
     let status = resp.status();
