@@ -10,9 +10,18 @@ use std::ffi::OsString;
 use crate::RaylineDispatch;
 
 /// Commands that exist only in non-public builds; only these report that they
-/// are not available here. The public parser has no other record of them; the
+/// are not available here. Release packaging checks rely on this message for
+/// these commands, so keep them listed. The public parser has no other record of them; the
 /// `claude` management words are `is_claude_management_subcommand`.
-const PRIVATE_COMMANDS: &[&str] = &["internal", "install-cli", "hook-send", "agent", "chat"];
+const PRIVATE_COMMANDS: &[&str] = &[
+    "internal",
+    "install-cli",
+    "hook-send",
+    "agent",
+    "chat",
+    "api",
+    "menubar",
+];
 
 pub(crate) const HYBRID_ROOT_OPTIONS: &str = "\
 raydock: `hybrid` reads `--env` after its subcommand (`raydock hybrid start --env dev`) \
@@ -81,7 +90,17 @@ pub(crate) fn rejected_argv(
     let command = command_path(&args, stop.unwrap_or(args.len()));
 
     let Some(stop) = stop else {
-        let message = if command.is_empty() {
+        let last = args.last().copied().unwrap_or_default();
+        let message = if last == "--env" {
+            let rest = if command.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", command.join(" "))
+            };
+            format!("raydock: `--env` needs a value: `raydock --env <name>{rest}`")
+        } else if crate::is_value_option(last) && !last.contains('=') {
+            format!("raydock: `{last}` needs a value")
+        } else if command.is_empty() {
             "raydock: missing command".to_owned()
         } else {
             format!(
@@ -382,6 +401,19 @@ mod tests {
     }
 
     #[test]
+    fn option_without_its_value_is_named() {
+        let message = usage_message(&["openclaw", "--env"]);
+        assert!(
+            message.starts_with("raydock: `--env` needs a value: `raydock --env <name> openclaw`"),
+            "{message}"
+        );
+        let message = usage_message(&["--env"]);
+        assert!(message.starts_with("raydock: `--env` needs a value: `raydock --env <name>`"));
+        let message = usage_message(&["status", "--auth-token"]);
+        assert!(message.starts_with("raydock: `--auth-token` needs a value"));
+    }
+
+    #[test]
     fn hybrid_with_root_options_says_where_env_goes() {
         for args in [
             &["--env", "dev", "hybrid", "status"][..],
@@ -472,6 +504,8 @@ mod tests {
             (&["internal", "status"][..], "internal"),
             (&["--env", "dev", "chat"][..], "chat"),
             (&["claude", "login"][..], "claude login"),
+            (&["api"][..], "api"),
+            (&["menubar"][..], "menubar"),
             (&["claude", "--local", "login"][..], "claude login"),
             (
                 &["claude", "--model", "x", "hooks", "status"][..],
