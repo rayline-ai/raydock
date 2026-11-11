@@ -92,9 +92,11 @@ pub(crate) fn rejected_argv(
         let message = "raydock: invalid `--auth-token` value".to_owned();
         return RaylineDispatch::Usage(with_usage(message, &command));
     }
-    // A rejected `--option=value` is named without its value, which may be a key.
+    // A rejected option is named without an attached value (`--option=value`,
+    // `-nVALUE`), which may be a key.
     let shown = match bad.split_once('=') {
         Some((option, _)) if bad.starts_with('-') => option,
+        _ if !bad.starts_with("--") => bad.get(..2).unwrap_or(bad),
         _ => bad,
     };
 
@@ -117,10 +119,11 @@ pub(crate) fn rejected_argv(
         };
         return RaylineDispatch::Usage(with_usage(message, &command));
     }
-    // A word after an option is taken as that option's value (`--via login`).
+    // A management word as the value of a claude option (`--via login`) is a
+    // bad value, not a management subcommand.
     let previous = args[stop - 1];
-    let after_option = previous.starts_with('-') && !previous.contains('=');
-    if command[0] == "claude" && !after_option && crate::is_claude_management_subcommand(bad) {
+    let is_claude_value = crate::is_value_option(previous) && !previous.contains('=');
+    if command[0] == "claude" && !is_claude_value && crate::is_claude_management_subcommand(bad) {
         return RaylineDispatch::Unavailable(format!("claude {bad}"));
     }
     if bad == "--env" || bad.starts_with("--env=") {
@@ -130,8 +133,8 @@ pub(crate) fn rejected_argv(
     let words = command.join(" ");
     let message = if bad.starts_with('-') {
         format!("raydock: `raydock {words}` does not accept `{shown}`")
-    } else if after_option {
-        format!("raydock: `raydock {words}` rejected the value after `{previous}`")
+    } else if previous.starts_with('-') && !previous.contains('=') {
+        format!("raydock: `raydock {words}` rejected the argument after `{previous}`")
     } else {
         format!("raydock: `raydock {words}` got an unexpected argument")
     };
@@ -261,8 +264,9 @@ mod tests {
 
         let message = usage_message(&["router", "start", "--route", "bogus"]);
         assert!(
-            message
-                .starts_with("raydock: `raydock router start` rejected the value after `--route`")
+            message.starts_with(
+                "raydock: `raydock router start` rejected the argument after `--route`"
+            )
         );
     }
 
@@ -346,6 +350,7 @@ mod tests {
             &["codex", "--auth", "secret-value"][..],
             &["router", "logs", "-n", "secret-value"][..],
             &["top", "secret-value"][..],
+            &["router", "logs", "-nsecret-value"][..],
         ] {
             let message = usage_message(args);
             assert!(
@@ -381,7 +386,9 @@ mod tests {
     #[test]
     fn management_word_as_an_option_value_is_a_usage_error() {
         let message = usage_message(&["claude", "--via", "login"]);
-        assert!(message.starts_with("raydock: `raydock claude` rejected the value after `--via`"));
+        assert!(
+            message.starts_with("raydock: `raydock claude` rejected the argument after `--via`")
+        );
     }
 
     #[test]
@@ -390,6 +397,7 @@ mod tests {
             (&["internal", "status"][..], "internal"),
             (&["--env", "dev", "chat"][..], "chat"),
             (&["claude", "login"][..], "claude login"),
+            (&["claude", "--local", "login"][..], "claude login"),
             (
                 &["claude", "--model", "x", "hooks", "status"][..],
                 "claude hooks",
