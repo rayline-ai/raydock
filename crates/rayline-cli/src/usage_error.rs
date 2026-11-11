@@ -87,6 +87,12 @@ pub(crate) fn rejected_argv(
         return RaylineDispatch::Usage(with_usage(message, &command));
     };
     let bad = args[stop];
+    // Never echo a token given inline.
+    let shown = if bad.starts_with("--auth-token=") {
+        "--auth-token"
+    } else {
+        bad
+    };
 
     if let Some(env) = env_value_at(&args, stop) {
         if !crate::status::is_valid_root_env(env) {
@@ -99,20 +105,22 @@ pub(crate) fn rejected_argv(
             return RaylineDispatch::Unavailable(bad.to_owned());
         }
         let message = if bad.starts_with('-') {
-            format!("raydock: unknown option `{bad}`")
+            format!("raydock: unknown option `{shown}`")
         } else {
             format!("raydock: unknown command `{bad}`")
         };
         return RaylineDispatch::Usage(with_usage(message, &command));
     }
-    if command[0] == "claude" && crate::is_claude_management_subcommand(bad) {
+    // A management word as an option's value (`--via login`) is a bad value.
+    let is_option_value = crate::is_value_option(args[stop - 1]) && !args[stop - 1].contains('=');
+    if command[0] == "claude" && !is_option_value && crate::is_claude_management_subcommand(bad) {
         return RaylineDispatch::Unavailable(format!("claude {bad}"));
     }
     if bad == "--env" || bad.starts_with("--env=") {
-        return RaylineDispatch::Usage(misplaced_env(&args, stop));
+        return RaylineDispatch::Usage(misplaced_env(&args, stop, &command));
     }
     let message = format!(
-        "raydock: `raydock {}` does not accept `{bad}`",
+        "raydock: `raydock {}` does not accept `{shown}`",
         command.join(" ")
     );
     RaylineDispatch::Usage(with_usage(message, &command))
@@ -149,21 +157,16 @@ fn env_value_at<'a>(args: &[&'a str], index: usize) -> Option<&'a str> {
 }
 
 /// `--env` after a command that does not read it: show the command with
-/// `--env` moved in front, where every command reads it.
-fn misplaced_env(args: &[&str], index: usize) -> String {
-    let (value, len) = match args[index].strip_prefix("--env=") {
-        Some(value) => (value, 1),
-        None => (args.get(index + 1).copied().unwrap_or("<name>"), 2),
+/// `--env` moved in front, where every command reads it. Only the command words
+/// are repeated, so no other argument (such as a token) is echoed.
+fn misplaced_env(args: &[&str], index: usize, command: &[&str]) -> String {
+    let value = match args[index].strip_prefix("--env=") {
+        Some(value) => value,
+        None => args.get(index + 1).copied().unwrap_or("<name>"),
     };
-    let rest = args
-        .iter()
-        .enumerate()
-        .filter(|(position, _)| *position < index || *position >= index + len)
-        .map(|(_, arg)| *arg)
-        .collect::<Vec<_>>();
     format!(
         "raydock: `--env` goes before the command: `raydock --env {value} {}`",
-        rest.join(" ")
+        command.join(" ")
     )
 }
 
@@ -255,8 +258,12 @@ mod tests {
         );
         assert_eq!(
             usage_message(&["top", "--json", "--env"]),
-            "raydock: `--env` goes before the command: `raydock --env <name> top --json`"
+            "raydock: `--env` goes before the command: `raydock --env <name> top`"
         );
+        let message = usage_message(&["--auth-token", "secret-value", "top", "--env", "dev"]);
+        assert!(!message.contains("secret-value"), "{message}");
+        let message = usage_message(&["top", "--auth-token=secret-value"]);
+        assert!(!message.contains("secret-value"), "{message}");
     }
 
     #[test]
@@ -297,6 +304,12 @@ mod tests {
         ] {
             assert_eq!(usage_message(args), super::HYBRID_ROOT_OPTIONS);
         }
+    }
+
+    #[test]
+    fn management_word_as_an_option_value_is_a_usage_error() {
+        let message = usage_message(&["claude", "--via", "login"]);
+        assert!(message.starts_with("raydock: `raydock claude` does not accept `login`"));
     }
 
     #[test]
