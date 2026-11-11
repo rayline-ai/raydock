@@ -354,9 +354,13 @@ pub(crate) fn withhold_router_key(command: &mut Command) {
 
 /// A `codex` child process with the router key withheld (#84). Every Codex
 /// spawn goes through here (the run, the version probe and the app launch),
-/// so none can inherit the key.
+/// so none can inherit the key, and each finds npm's `codex.cmd` on Windows.
 pub(crate) fn codex_command() -> Command {
-    let mut command = Command::new("codex");
+    codex_command_on(std::env::var_os("PATH"))
+}
+
+fn codex_command_on(path: Option<OsString>) -> Command {
+    let mut command = Command::new(crate::harness::launch_program("codex", path));
     withhold_router_key(&mut command);
     command
 }
@@ -539,8 +543,9 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 mod tests {
     use super::{
         CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, CodexAuthMode,
-        EffectiveCodexAuthMode, codex_command, parse_codex_version_text, resolve_cloud_router_key,
-        resolve_codex_config_path, subscription_router_config_json, withhold_router_key,
+        EffectiveCodexAuthMode, codex_command, codex_command_on, parse_codex_version_text,
+        resolve_cloud_router_key, resolve_codex_config_path, subscription_router_config_json,
+        withhold_router_key,
     };
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -1023,15 +1028,45 @@ mod tests {
             ("codex.rs", include_str!("codex.rs")),
             ("codex_app.rs", include_str!("codex_app.rs")),
         ];
-        let needle = concat!("Command::new(", "\"codex\")");
-        let total: usize = sources
-            .iter()
-            .map(|(_, text)| text.matches(needle).count())
-            .sum();
+        let count = |needle: &str| -> usize {
+            sources
+                .iter()
+                .map(|(_, text)| text.matches(needle).count())
+                .sum()
+        };
+        let bare = count(concat!("Command::new(", "\"codex\")"));
+        assert_eq!(
+            bare, 0,
+            "a Codex child is spawned by bare name, which misses codex.cmd on Windows"
+        );
+        let total = count(concat!("launch_program(", "\"codex\""));
         assert_eq!(
             total, 1,
             "a Codex child is spawned outside codex_command (found {total} spawn sites)"
         );
+    }
+
+    /// Windows process creation does not apply PATHEXT, so a bare `codex`
+    /// misses the `codex.cmd` launcher npm installs. The command resolves it
+    /// the way `raydock hybrid` does, and keeps withholding the router key.
+    #[test]
+    fn codex_command_finds_the_npm_launcher_on_windows() {
+        let dir = crate::harness::tests::temp_dir("codex-launcher");
+        // npm installs an extensionless sh shim beside the `.cmd` launcher.
+        std::fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        let command = codex_command_on(Some(std::env::join_paths([&dir]).unwrap()));
+        if cfg!(windows) {
+            assert_eq!(command.get_program(), dir.join("codex.cmd").as_os_str());
+        } else {
+            assert_eq!(command.get_program(), "codex");
+        }
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "RAYLINE_ROUTER_API_KEY" && value.is_none())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

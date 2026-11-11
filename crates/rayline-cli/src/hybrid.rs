@@ -821,21 +821,6 @@ async fn health(client: &reqwest::Client, paths: &Paths, state: &Value) -> io::R
     Ok(health)
 }
 
-/// The program to launch for harness `name`. Windows process creation does
-/// not apply PATHEXT, so npm's `.cmd` launchers (codex, pi) are resolved the
-/// way a shell would; Unix keeps the bare name and its usual PATH lookup.
-fn harness_program(name: &str, path: Option<std::ffi::OsString>) -> PathBuf {
-    if cfg!(windows) {
-        let names = crate::harness::executable_names(name, true);
-        if let Some(found) = path.and_then(|path| {
-            std::env::split_paths(&path).find_map(|dir| crate::harness::find_in_dir(&dir, &names))
-        }) {
-            return found;
-        }
-    }
-    PathBuf::from(name)
-}
-
 fn harness_command(
     paths: &Paths,
     name: &str,
@@ -845,7 +830,7 @@ fn harness_command(
     capabilities: &ModelCapabilities,
 ) -> io::Result<Command> {
     require_fresh_session(name, args)?;
-    let program = harness_program(name, std::env::var_os("PATH"));
+    let program = crate::harness::launch_program(name, std::env::var_os("PATH"));
     let mut command = Command::new(&program);
     crate::codex::withhold_router_key(&mut command);
     command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
@@ -1232,31 +1217,6 @@ mod tests {
             .map(|entry| entry.unwrap().file_name())
             .collect();
         assert_eq!(names.len(), 2, "{names:?}");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn harness_program_resolves_windows_launchers_only_on_windows() {
-        let dir = std::env::temp_dir().join(format!(
-            "rayline-hybrid-program-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        // npm installs an extensionless sh shim beside the `.cmd` launcher.
-        fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
-        fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
-        let path = Some(std::env::join_paths([&dir]).unwrap());
-        let program = harness_program("codex", path.clone());
-        if cfg!(windows) {
-            assert_eq!(program, dir.join("codex.cmd"));
-        } else {
-            assert_eq!(program, PathBuf::from("codex"));
-        }
-        assert_eq!(harness_program("pi", path), PathBuf::from("pi"));
         let _ = fs::remove_dir_all(&dir);
     }
 

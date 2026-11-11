@@ -960,6 +960,22 @@ pub(crate) fn executable_names(binary_name: &str, windows: bool) -> Vec<String> 
     }
 }
 
+/// The program to launch for harness `name`, given the `PATH` to search.
+/// Windows process creation does not apply PATHEXT, so npm's `.cmd` launchers
+/// (codex, pi) are resolved the way a shell would; Unix keeps the bare name
+/// and its usual PATH lookup.
+pub(crate) fn launch_program(name: &str, path: Option<std::ffi::OsString>) -> PathBuf {
+    if cfg!(windows) {
+        let names = executable_names(name, true);
+        if let Some(found) = path
+            .and_then(|path| std::env::split_paths(&path).find_map(|dir| find_in_dir(&dir, &names)))
+        {
+            return found;
+        }
+    }
+    PathBuf::from(name)
+}
+
 #[cfg(unix)]
 fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
     use std::os::unix::process::CommandExt as _;
@@ -1433,6 +1449,24 @@ pub(crate) mod tests {
             .find(|candidate| candidate.is_file());
         assert_eq!(found, Some(dir.join("pi.cmd")));
         assert_eq!(executable_names("pi", false), ["pi"]);
+    }
+
+    #[test]
+    fn launch_program_resolves_windows_launchers_only_on_windows() {
+        let dir = temp_dir("launch-program");
+        // npm installs an extensionless sh shim beside the `.cmd` launcher.
+        fs::write(dir.join("codex"), "#!/bin/sh\n").unwrap();
+        fs::write(dir.join("codex.cmd"), "@echo off\r\n").unwrap();
+        let path = Some(std::env::join_paths([&dir]).unwrap());
+        let program = launch_program("codex", path.clone());
+        if cfg!(windows) {
+            assert_eq!(program, dir.join("codex.cmd"));
+        } else {
+            assert_eq!(program, PathBuf::from("codex"));
+        }
+        assert_eq!(launch_program("pi", path), PathBuf::from("pi"));
+        assert_eq!(launch_program("codex", None), PathBuf::from("codex"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
