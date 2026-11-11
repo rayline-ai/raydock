@@ -1365,10 +1365,10 @@ mod tests {
                 .into_iter()
                 .map(OsString::from)
                 .collect();
-            assert_eq!(
+            assert!(matches!(
                 crate::rayline_dispatch_for_argv(&argv),
-                crate::RaylineDispatch::Unavailable
-            );
+                crate::RaylineDispatch::Usage(_)
+            ));
         }
         assert!(Cli::try_parse_from(["hybrid", "run", "claude", "--", "-p", "hello"]).is_ok());
     }

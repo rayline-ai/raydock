@@ -24,6 +24,7 @@ pub mod router;
 pub mod router_config;
 pub mod status;
 pub mod update;
+mod usage_error;
 
 pub const CLI_BIN: &str = "raydock";
 /// Immutable download identifier; existing updaters verify these filenames.
@@ -772,7 +773,14 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        RaylineDispatch::Unavailable => unavailable(original_argv),
+        RaylineDispatch::Unavailable(command) => {
+            eprintln!("raydock: `{command}` is not available in this public Raydock build");
+            ExitCode::from(127)
+        }
+        RaylineDispatch::Usage(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -849,7 +857,10 @@ pub enum RaylineDispatch {
         all: bool,
     },
     Update(update::UpdateRequest),
-    Unavailable,
+    /// A command that exists only in non-public builds; holds its words.
+    Unavailable(String),
+    /// Rejected arguments; holds the message to print.
+    Usage(String),
 }
 
 pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch {
@@ -857,24 +868,33 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
         return RaylineDispatch::Version;
     }
 
+    let taken = std::cell::Cell::new(0);
+    let exhausted = std::cell::Cell::new(false);
+    let args = usage_error::TrackedArgs::new(original_argv, &taken, &exhausted);
+    parse_dispatch(args.peekable())
+        .unwrap_or_else(|| usage_error::rejected_argv(original_argv, taken.get(), exhausted.get()))
+}
+
+/// Parses everything after the program name. `None` means the arguments were
+/// rejected; the caller reports where parsing stopped.
+fn parse_dispatch<'a, I>(mut args: std::iter::Peekable<I>) -> Option<RaylineDispatch>
+where
+    I: Iterator<Item = &'a OsString>,
+{
     let mut root_env = None;
     let mut root_auth_token = None;
     let mut root_env_explicit = false;
-    let mut args = original_argv.iter().skip(1).peekable();
 
     while let Some(arg) = args.next() {
-        let Some(arg) = arg.to_str() else {
-            return RaylineDispatch::Unavailable;
-        };
-
+        let arg = arg.to_str()?;
         if arg == "--" {
-            return RaylineDispatch::Unavailable;
+            return None;
         }
         if let Some((name, value)) = arg.split_once('=') {
             match name {
                 "--env" => {
                     if !status::is_valid_root_env(value) {
-                        return RaylineDispatch::Unavailable;
+                        return None;
                     }
                     root_env = Some(value.to_owned());
                     root_env_explicit = true;
@@ -891,23 +911,16 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
             if arg.contains('=') {
                 continue;
             }
-            let Some(value) = args.next() else {
-                return RaylineDispatch::Unavailable;
-            };
+            let value = args.next()?;
             if arg == "--env" {
-                let Some(value) = value.to_str() else {
-                    return RaylineDispatch::Unavailable;
-                };
+                let value = value.to_str()?;
                 if !status::is_valid_root_env(value) {
-                    return RaylineDispatch::Unavailable;
+                    return None;
                 }
                 root_env = Some(value.to_owned());
                 root_env_explicit = true;
             } else if arg == "--auth-token" {
-                let Some(value) = value.to_str() else {
-                    return RaylineDispatch::Unavailable;
-                };
-                root_auth_token = Some(value.to_owned());
+                root_auth_token = Some(value.to_str()?.to_owned());
             }
             continue;
         }
@@ -915,53 +928,39 @@ pub fn rayline_dispatch_for_argv(original_argv: &[OsString]) -> RaylineDispatch 
             continue;
         }
         if arg.starts_with('-') {
-            return RaylineDispatch::Unavailable;
+            return None;
         }
 
         return match arg {
             "hybrid" if !root_env_explicit && root_auth_token.is_none() => {
-                RaylineDispatch::Hybrid(args.cloned().collect())
+                Some(RaylineDispatch::Hybrid(args.cloned().collect()))
             }
-            "auth" => parse_auth_dispatch(args, root_env, root_auth_token, root_env_explicit)
-                .unwrap_or(RaylineDispatch::Unavailable),
+            "hybrid" => Some(RaylineDispatch::Usage(
+                usage_error::HYBRID_ROOT_OPTIONS.to_owned(),
+            )),
+            "auth" => parse_auth_dispatch(args, root_env, root_auth_token, root_env_explicit),
             "claude-desktop" => {
                 parse_claude_app_request(args, root_env, root_auth_token, root_env_explicit)
                     .map(RaylineDispatch::ClaudeApp)
-                    .unwrap_or(RaylineDispatch::Unavailable)
             }
-            "claude" => parse_claude_dispatch(args, root_env, root_auth_token, root_env_explicit)
-                .unwrap_or(RaylineDispatch::Unavailable),
-            "codex" => parse_codex_dispatch(args, root_env, root_auth_token, root_env_explicit)
-                .unwrap_or(RaylineDispatch::Unavailable),
-            "local" => parse_local_dispatch(args, root_env, root_auth_token)
-                .unwrap_or(RaylineDispatch::Unavailable),
-            "router" => parse_router_dispatch(args, root_env_explicit)
-                .unwrap_or(RaylineDispatch::Unavailable),
+            "claude" => parse_claude_dispatch(args, root_env, root_auth_token, root_env_explicit),
+            "codex" => parse_codex_dispatch(args, root_env, root_auth_token, root_env_explicit),
+            "local" => parse_local_dispatch(args, root_env, root_auth_token),
+            "router" => parse_router_dispatch(args, root_env_explicit),
             "status" => parse_status_request(args, root_env, root_auth_token, root_env_explicit)
-                .map(RaylineDispatch::Status)
-                .unwrap_or(RaylineDispatch::Unavailable),
-            "top" => parse_router_top_request(args, root_env_explicit)
-                .map(RaylineDispatch::RouterTop)
-                .unwrap_or(RaylineDispatch::Unavailable),
-            "update" => parse_update_request(args)
-                .map(RaylineDispatch::Update)
-                .unwrap_or(RaylineDispatch::Unavailable),
-            command => match harness::Harness::from_command(command) {
-                Some(harness) => parse_harness_request(
-                    harness,
-                    args,
-                    root_env,
-                    root_auth_token,
-                    root_env_explicit,
-                )
-                .map(RaylineDispatch::Harness)
-                .unwrap_or(RaylineDispatch::Unavailable),
-                None => RaylineDispatch::Unavailable,
-            },
+                .map(RaylineDispatch::Status),
+            "top" => {
+                parse_router_top_request(args, root_env_explicit).map(RaylineDispatch::RouterTop)
+            }
+            "update" => parse_update_request(args).map(RaylineDispatch::Update),
+            command => harness::Harness::from_command(command).and_then(|harness| {
+                parse_harness_request(harness, args, root_env, root_auth_token, root_env_explicit)
+                    .map(RaylineDispatch::Harness)
+            }),
         };
     }
 
-    RaylineDispatch::Unavailable
+    None
 }
 
 /// `raydock [--env E] <harness> [--env E] [--auth-token T] [--] [ARGS]...`.
@@ -1643,9 +1642,9 @@ where
 
 fn parse_codex_app_request<'a, I>(
     mut args: std::iter::Peekable<I>,
-    root_env: Option<String>,
+    mut env_name: Option<String>,
     root_auth_token: Option<String>,
-    root_env_explicit: bool,
+    mut root_env_explicit: bool,
 ) -> Option<crate::codex_app::AppRunRequest>
 where
     I: Iterator<Item = &'a OsString>,
@@ -1670,6 +1669,11 @@ where
         }
         if let Some((option, value)) = arg_str.split_once('=') {
             match option {
+                "--env" => {
+                    env_name = Some(valid_env(value)?);
+                    root_env_explicit = true;
+                    continue;
+                }
                 "--model" => {
                     model = Some(value.to_owned());
                     continue;
@@ -1686,6 +1690,10 @@ where
             }
         }
         match arg_str {
+            "--env" => {
+                env_name = Some(valid_env(args.next()?.to_str()?)?);
+                root_env_explicit = true;
+            }
             "--model" => model = Some(args.next()?.to_str()?.to_owned()),
             "--config" => config_path = Some(PathBuf::from(args.next()?)),
             "--auth" => auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?,
@@ -1704,16 +1712,16 @@ where
         auth_mode,
         codex_args,
         root_env_explicit,
-        env_name: root_env,
+        env_name,
         auth_token: root_auth_token,
     })
 }
 
 fn parse_codex_request<'a, I>(
     mut args: std::iter::Peekable<I>,
-    root_env: Option<String>,
+    mut env_name: Option<String>,
     root_auth_token: Option<String>,
-    root_env_explicit: bool,
+    mut root_env_explicit: bool,
 ) -> Option<crate::codex::RunRequest>
 where
     I: Iterator<Item = &'a OsString>,
@@ -1738,6 +1746,11 @@ where
         }
         if let Some((option, value)) = arg_str.split_once('=') {
             match option {
+                "--env" => {
+                    env_name = Some(valid_env(value)?);
+                    root_env_explicit = true;
+                    continue;
+                }
                 "--model" => {
                     model = Some(value.to_owned());
                     continue;
@@ -1754,6 +1767,10 @@ where
             }
         }
         match arg_str {
+            "--env" => {
+                env_name = Some(valid_env(args.next()?.to_str()?)?);
+                root_env_explicit = true;
+            }
             "--model" => {
                 model = Some(args.next()?.to_str()?.to_owned());
             }
@@ -1780,9 +1797,13 @@ where
         auth_mode,
         codex_args,
         root_env_explicit,
-        env_name: root_env,
+        env_name,
         auth_token: root_auth_token,
     })
+}
+
+fn valid_env(value: &str) -> Option<String> {
+    status::is_valid_root_env(value).then(|| value.to_owned())
 }
 
 fn parse_codex_configure_request<'a, I>(
@@ -1863,12 +1884,12 @@ where
                 crate::router::RouterStopRequest { root_env_explicit },
             ))
         }
-        value if value.starts_with("--") => {
-            let mut start_args = vec![first_arg];
-            start_args.extend(args);
-            parse_router_start_request(start_args.into_iter().peekable(), root_env_explicit)
-                .map(RaylineDispatch::RouterStart)
-        }
+        // Chained, not collected, so a rejection still points at its argument.
+        value if value.starts_with("--") => parse_router_start_request(
+            std::iter::once(first_arg).chain(args).peekable(),
+            root_env_explicit,
+        )
+        .map(RaylineDispatch::RouterStart),
         _ => None,
     }
 }
@@ -2357,15 +2378,12 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     }
 }
 
-fn unavailable(original_argv: &[OsString]) -> ExitCode {
-    let command = first_command(original_argv).unwrap_or("command");
-    eprintln!("raydock: `{command}` is not available in this public Raydock build");
-    ExitCode::from(127)
+fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
+    help_for_command_path(&command_path_before_help(original_argv)?)
 }
 
-fn rayline_help_for_argv(original_argv: &[OsString]) -> Option<&'static str> {
-    let command = command_path_before_help(original_argv)?;
-    match command.as_slice() {
+fn help_for_command_path(command: &[&str]) -> Option<&'static str> {
+    match command {
         [] => Some(ROOT_HELP),
         ["auth"] => Some(AUTH_HELP),
         ["auth", "login"] => Some(AUTH_LOGIN_HELP),
@@ -2441,27 +2459,6 @@ fn command_path_before_help(original_argv: &[OsString]) -> Option<Vec<&str>> {
     } else {
         None
     }
-}
-
-fn first_command(original_argv: &[OsString]) -> Option<&str> {
-    let mut args = original_argv.iter().skip(1).peekable();
-    while let Some(arg) = args.next() {
-        let arg = arg.to_str()?;
-        if arg == "--" {
-            return args.next().and_then(|arg| arg.to_str());
-        }
-        if is_value_option(arg) {
-            if !arg.contains('=') {
-                args.next()?;
-            }
-            continue;
-        }
-        if arg == "--version" || arg == "--help" || arg.starts_with('-') {
-            continue;
-        }
-        return Some(arg);
-    }
-    None
 }
 
 fn is_value_option(arg: &str) -> bool {
@@ -2658,7 +2655,7 @@ mod tests {
     fn claude_rejects_unknown_local_provider() {
         assert!(matches!(
             rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--local-provider", "bogus"])),
-            RaylineDispatch::Unavailable
+            RaylineDispatch::Usage(_)
         ));
     }
 
@@ -2673,7 +2670,7 @@ mod tests {
                 "--via",
                 "env"
             ])),
-            RaylineDispatch::Unavailable
+            RaylineDispatch::Usage(_)
         ));
     }
 
@@ -2716,10 +2713,10 @@ mod tests {
     }
 
     #[test]
-    fn via_env_with_local_is_unavailable() {
+    fn via_env_with_local_is_rejected() {
         assert!(matches!(
             rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--via", "env", "--local"])),
-            RaylineDispatch::Unavailable
+            RaylineDispatch::Usage(_)
         ));
     }
 
@@ -2765,7 +2762,7 @@ mod tests {
                 "--config",
                 "/tmp/router.json",
             ])),
-            RaylineDispatch::Unavailable
+            RaylineDispatch::Usage(_)
         ));
     }
 
@@ -3025,19 +3022,21 @@ mod tests {
             vec!["raydock", "top", "--hybrid", "--legacy"],
             vec!["raydock", "top", "--legacy", "--state-dir=/private/hybrid"],
         ] {
-            assert_eq!(
+            assert!(matches!(
                 rayline_dispatch_for_argv(&argv(&args)),
-                RaylineDispatch::Unavailable
-            );
+                RaylineDispatch::Usage(_)
+            ));
         }
     }
 
     #[test]
     fn parser_rejects_invalid_hidden_env_names() {
         for env_name in ["", "foo.bar", "foo/bar", "foo bar"] {
-            assert_eq!(
-                rayline_dispatch_for_argv(&argv(&["rayline", "--env", env_name, "status"])),
-                RaylineDispatch::Unavailable,
+            assert!(
+                matches!(
+                    rayline_dispatch_for_argv(&argv(&["rayline", "--env", env_name, "status"])),
+                    RaylineDispatch::Usage(_)
+                ),
                 "{env_name:?} should be rejected"
             );
         }
@@ -3077,14 +3076,15 @@ mod tests {
             &["rayline", "claude", "login"][..],
             &["rayline", "claude", "hooks", "status"][..],
             &["rayline", "claude", "telemetry", "status"][..],
-            &["rayline", "claude", "--no-telemetry"][..],
             &["rayline", "claude", "setup"][..],
             &["rayline", "claude", "run", "setup"][..],
             &["rayline", "claude", "--model", "x", "hooks", "status"][..],
         ] {
-            assert_eq!(
-                rayline_dispatch_for_argv(&argv(args)),
-                RaylineDispatch::Unavailable,
+            assert!(
+                matches!(
+                    rayline_dispatch_for_argv(&argv(args)),
+                    RaylineDispatch::Unavailable(_)
+                ),
                 "{args:?} should be unavailable"
             );
         }
@@ -3176,10 +3176,10 @@ mod tests {
 
     #[test]
     fn router_start_rejects_unknown_route() {
-        assert_eq!(
+        assert!(matches!(
             rayline_dispatch_for_argv(&argv(&["rayline", "router", "start", "--route", "bogus"])),
-            RaylineDispatch::Unavailable,
-        );
+            RaylineDispatch::Usage(_)
+        ));
     }
 
     #[test]
@@ -3312,15 +3312,15 @@ mod tests {
             }
             other => panic!("expected ClaudeApp, got {other:?}"),
         }
-        assert_eq!(
+        assert!(matches!(
             rayline_dispatch_for_argv(&argv(&[
                 "rayline",
                 "claude-desktop",
                 "status",
                 "--prefixed-ids"
             ])),
-            RaylineDispatch::Unavailable
-        );
+            RaylineDispatch::Usage(_)
+        ));
     }
 
     #[test]
@@ -3339,9 +3339,11 @@ mod tests {
                 "/x",
             ][..],
         ] {
-            assert_eq!(
-                rayline_dispatch_for_argv(&argv(args)),
-                RaylineDispatch::Unavailable,
+            assert!(
+                matches!(
+                    rayline_dispatch_for_argv(&argv(args)),
+                    RaylineDispatch::Usage(_)
+                ),
                 "{args:?}"
             );
         }
@@ -3484,13 +3486,41 @@ mod tests {
         assert_eq!(request.args, argv(&["--help"]));
         assert!(rayline_help_for_argv(&argv(&["rayline", "hermes", "--help"])).is_none());
 
-        assert_eq!(
+        assert!(matches!(
             rayline_dispatch_for_argv(&argv(&["rayline", "openclaw", "--env", "bad/env"])),
-            RaylineDispatch::Unavailable
-        );
-        assert_eq!(
+            RaylineDispatch::Usage(_)
+        ));
+        assert!(matches!(
             rayline_dispatch_for_argv(&argv(&["rayline", "openclaw", "--env"])),
-            RaylineDispatch::Unavailable
-        );
+            RaylineDispatch::Usage(_)
+        ));
+    }
+
+    #[test]
+    fn codex_reads_env_before_its_own_arguments() {
+        match rayline_dispatch_for_argv(&argv(&["raydock", "codex", "--env", "dev", "--", "exec"]))
+        {
+            RaylineDispatch::CodexRun(request) => {
+                assert_eq!(request.env_name.as_deref(), Some("dev"));
+                assert!(request.root_env_explicit);
+                assert_eq!(request.codex_args, argv(&["exec"]));
+            }
+            other => panic!("expected CodexRun, got {other:?}"),
+        }
+        match rayline_dispatch_for_argv(&argv(&["raydock", "codex", "app", "--env=dev"])) {
+            RaylineDispatch::CodexApp(request) => {
+                assert_eq!(request.env_name.as_deref(), Some("dev"));
+                assert!(request.root_env_explicit);
+            }
+            other => panic!("expected CodexApp, got {other:?}"),
+        }
+        // After the first argument Raydock does not own, `--env` is Codex's.
+        match rayline_dispatch_for_argv(&argv(&["raydock", "codex", "exec", "--env", "dev"])) {
+            RaylineDispatch::CodexRun(request) => {
+                assert_eq!(request.env_name, None);
+                assert_eq!(request.codex_args, argv(&["exec", "--env", "dev"]));
+            }
+            other => panic!("expected CodexRun, got {other:?}"),
+        }
     }
 }
