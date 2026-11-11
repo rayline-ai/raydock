@@ -173,7 +173,7 @@ pub(crate) fn rejected_argv(
         });
     }
     let message = match (bad.starts_with('-'), option_name(bad)) {
-        (true, Some(name)) if bad.contains('=') => {
+        (true, Some(name)) if bad.contains('=') && after.is_empty() => {
             format!("raydock: `raydock {words}` rejected the value of `{name}`")
         }
         (true, Some(name)) => format!("raydock: `raydock {words}` rejected `{name}`{after}"),
@@ -485,6 +485,8 @@ mod tests {
         let message = usage_message(&["claude", "--no-telemetry"]);
         assert!(message.starts_with("raydock: `raydock claude` rejected `--no-telemetry`"));
         let message = usage_message(&["codex", "--auth", "--env", "dev"]);
+        assert!(message.starts_with("raydock: `raydock codex` rejected `--env` after `--auth`"));
+        let message = usage_message(&["codex", "--auth", "--env=dev"]);
         assert!(message.starts_with("raydock: `raydock codex` rejected `--env` after `--auth`"));
         let message = usage_message(&["claude", "--via=bogus"]);
         assert!(message.starts_with("raydock: `raydock claude` rejected the value of `--via`"));
