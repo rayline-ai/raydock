@@ -55,6 +55,11 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   header cannot carry unchanged (non-ASCII) is skipped. Requests forwarded
   without translation are unchanged, and no other upstream receives the
   header.
+- **`raydock claude-desktop` says where `--env` goes.** `--env` placed after
+  `claude-desktop` or one of its subcommands (`raydock claude-desktop status
+  --env dev`) was only reported as rejected. As with `raydock top`, the error
+  now says `--env` goes before the command:
+  `raydock --env <name> claude-desktop status`.
 
 ## 0.4.3 (2026-11-09)
 
