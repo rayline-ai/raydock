@@ -461,7 +461,8 @@ async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
             "models": [{
                 "slug": "gpt-5.4",
                 "display_name": "GPT-5.4",
-                "supported_in_api": true
+                "supported_in_api": true,
+                "context_window": 272000
             }]
         })),
         tx,
@@ -478,7 +479,9 @@ async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
         }],
         "routes": {
             "main": {"endpoint": "codex-subscription", "model": "gpt-5.4"},
-            "default": {"endpoint": "codex-subscription", "model": "gpt-5.4"}
+            "default": {"endpoint": "codex-subscription", "model": "gpt-5.4"},
+            // As `raydock codex` writes it: the sentinel pinned to main.
+            "model_routes": {"rayline-local": {"endpoint": "codex-subscription", "model": "gpt-5.4"}}
         }
     });
     let path = write_config("models-client-bearer", &config);
@@ -507,6 +510,15 @@ async fn models_endpoint_client_bearer_proxies_and_merges_rayline_models() {
     assert!(!slugs.contains(&"rayline-auto"));
     assert!(!slugs.contains(&"rayline-codex"));
     assert!(!slugs.contains(&"rayline-subagent"));
+    // The sentinel routes to gpt-5.4, so it takes the window the backend lists.
+    let sentinel = body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "rayline-local")
+        .unwrap();
+    assert_eq!(sentinel["context_window"], 272000);
+    assert_eq!(sentinel["max_context_window"], 272000);
 
     let captured = rx.await.expect("captured upstream request");
     assert!(captured.starts_with("GET /models?client_version=9.9.9 "));
@@ -4068,4 +4080,274 @@ async fn inbound_chat_row_carries_the_upstream_request_id() {
             "{name}: {row:?}"
         );
     }
+}
+
+/// A loopback upstream that answers by request line (`"GET /v1/models"`,
+/// matched as a prefix) until the test ends, answering 404 for anything else.
+/// Every request line it sees is recorded, so a test can assert what the router
+/// asked for (and how often).
+async fn serve_paths(
+    listener: TcpListener,
+    routes: Vec<(&'static str, Value)>,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    while let Ok((mut sock, _)) = listener.accept().await {
+        let mut buf = [0u8; 16384];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+        let line = request.lines().next().unwrap_or_default().to_owned();
+        seen.lock().unwrap().push(line.clone());
+        let response = routes
+            .iter()
+            .find(|(prefix, _)| {
+                line.strip_prefix(prefix)
+                    .is_some_and(|rest| rest.starts_with([' ', '?']))
+            })
+            .map(|(_, body)| http_json(body))
+            .unwrap_or_else(|| {
+                "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                    .to_owned()
+            });
+        let _ = sock.write_all(response.as_bytes()).await;
+        let _ = sock.flush().await;
+        let _ = sock.shutdown().await;
+    }
+}
+
+async fn codex_catalog(port: u16) -> Vec<Value> {
+    let resp = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .send()
+        .await
+        .expect("router request");
+    assert_eq!(resp.status(), 200);
+    resp.json::<Value>().await.unwrap()["models"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+/// `(context_window, max_context_window)` of a Codex catalog entry.
+fn catalog_window(models: &[Value], slug: &str) -> (Value, Value) {
+    let entry = models
+        .iter()
+        .find(|model| model["slug"] == slug)
+        .unwrap_or_else(|| panic!("{slug} missing from catalog"));
+    (
+        entry["context_window"].clone(),
+        entry["max_context_window"].clone(),
+    )
+}
+
+/// The Codex catalog advertises the windows a hosted-style endpoint lists
+/// (`context_length`, matched by `product` too), the sentinel takes the window
+/// of the model it routes to, and the endpoint is asked only once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn models_endpoint_advertises_listed_context_windows() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    tokio::spawn(serve_paths(
+        upstream,
+        vec![(
+            "GET /v1/models",
+            json!({"object": "list", "data": [
+                {"id": "sage-contributor", "product": "sage", "context_length": 1000000,
+                 "max_output_tokens": 128000},
+                {"id": "swift", "product": "swift", "context_length": 400000}
+            ]}),
+        )],
+        seen.clone(),
+    ));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "cloud",
+            "protocol": "anthropic_messages",
+            "base_url": format!("http://127.0.0.1:{up_port}"),
+            "models": ["sage", "swift", "unlisted"]
+        }],
+        "routes": {
+            "main": {"endpoint": "cloud", "model": "sage"},
+            "subagent": {"endpoint": "cloud", "model": "swift"},
+            "model_routes": {"rayline-local": {"endpoint": "cloud", "model": "sage"}}
+        }
+    });
+    let path = write_config("models-windows-listed", &config);
+    start_router(port, path.clone()).await;
+
+    for _ in 0..2 {
+        let models = codex_catalog(port).await;
+        assert_eq!(
+            catalog_window(&models, "rayline-local"),
+            (json!(1000000), json!(1000000))
+        );
+        assert_eq!(
+            catalog_window(&models, "sage"),
+            (json!(1000000), json!(1000000))
+        );
+        assert_eq!(
+            catalog_window(&models, "swift"),
+            (json!(400000), json!(400000))
+        );
+        // Not listed: the default entry.
+        assert_eq!(
+            catalog_window(&models, "unlisted"),
+            (json!(128000), Value::Null)
+        );
+    }
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen.iter()
+            .filter(|line| line.starts_with("GET /v1/models "))
+            .count(),
+        1,
+        "the listing is cached: {seen:?}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Ollama: a loaded model's `/api/ps` context, else the tag's `num_ctx` from
+/// `/api/show`. The router never asks Ollama to load or run a model.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn models_endpoint_sizes_ollama_models_without_loading_them() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    tokio::spawn(serve_paths(
+        upstream,
+        vec![
+            (
+                "GET /v1/models",
+                json!({"object": "list", "data": [{"id": "loaded:9b"}, {"id": "tagged:7b-32k"}]}),
+            ),
+            (
+                "GET /api/ps",
+                json!({"models": [{"name": "loaded:9b", "model": "loaded:9b", "context_length": 98304}]}),
+            ),
+            (
+                "POST /api/show",
+                json!({"parameters": "stop \"<|im_end|>\"\nnum_ctx                        32768"}),
+            ),
+        ],
+        seen.clone(),
+    ));
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [{
+            "id": "ollama",
+            "protocol": "openai_chat",
+            "base_url": format!("http://127.0.0.1:{up_port}/v1"),
+            "models": ["loaded:9b", "tagged:7b-32k"]
+        }],
+        "routes": {
+            "main": {"endpoint": "ollama", "model": "tagged:7b-32k"},
+            "model_routes": {"rayline-local": {"endpoint": "ollama", "model": "tagged:7b-32k"}}
+        }
+    });
+    let path = write_config("models-windows-ollama", &config);
+    start_router(port, path.clone()).await;
+
+    let models = codex_catalog(port).await;
+    assert_eq!(
+        catalog_window(&models, "rayline-local"),
+        (json!(32768), json!(32768))
+    );
+    assert_eq!(
+        catalog_window(&models, "tagged:7b-32k"),
+        (json!(32768), json!(32768))
+    );
+    assert_eq!(
+        catalog_window(&models, "loaded:9b"),
+        (json!(98304), json!(98304))
+    );
+
+    let mut seen = seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            "GET /api/ps HTTP/1.1",
+            "GET /v1/models HTTP/1.1",
+            "POST /api/show HTTP/1.1",
+        ],
+        "only metadata calls, and /api/show only for the model that is not loaded"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// llama.cpp: `/props` (asked per model, for its multi-model router mode)
+/// reports the slot's `n_ctx`. An endpoint that does not answer keeps the
+/// default entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn models_endpoint_sizes_llama_cpp_models_from_props() {
+    let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let up_port = upstream.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    tokio::spawn(serve_paths(
+        upstream,
+        vec![
+            (
+                "GET /v1/models",
+                json!({"object": "list", "data": [{"id": "gguf"}]}),
+            ),
+            (
+                "GET /props",
+                json!({"default_generation_settings": {"n_ctx": 16384}, "total_slots": 1}),
+            ),
+        ],
+        seen.clone(),
+    ));
+    let down_port = free_port();
+
+    let port = free_port();
+    let config = json!({
+        "endpoints": [
+            {
+                "id": "llama",
+                "protocol": "openai_chat",
+                "base_url": format!("http://127.0.0.1:{up_port}/v1"),
+                "models": ["gguf"]
+            },
+            {
+                "id": "down",
+                "protocol": "openai_chat",
+                "base_url": format!("http://127.0.0.1:{down_port}/v1"),
+                "models": ["gone"]
+            }
+        ],
+        "routes": {
+            "main": {"endpoint": "llama", "model": "gguf"},
+            "model_routes": {"rayline-local": {"endpoint": "llama", "model": "gguf"}}
+        }
+    });
+    let path = write_config("models-windows-llama", &config);
+    start_router(port, path.clone()).await;
+
+    let models = codex_catalog(port).await;
+    assert_eq!(
+        catalog_window(&models, "rayline-local"),
+        (json!(16384), json!(16384))
+    );
+    assert_eq!(
+        catalog_window(&models, "gguf"),
+        (json!(16384), json!(16384))
+    );
+    assert_eq!(
+        catalog_window(&models, "gone"),
+        (json!(128000), Value::Null)
+    );
+    assert!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.starts_with("GET /props?model=gguf ")),
+        "props asked per model"
+    );
+
+    let _ = std::fs::remove_file(path);
 }
