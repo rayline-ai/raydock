@@ -5,14 +5,14 @@ any of these entry points (each is a column in the [Modes](#modes) table):
 
 - **interactive:** `raydock claude --config ./examples/routing-modes/Rc-L.json`
 - **headless / agents:** `raydock router start --config ./examples/routing-modes/Rc-L.json`
-  (then point an Anthropic SDK client at the proxy on `127.0.0.1:20810` — and see ⁷
+  (then point an Anthropic SDK client at the proxy on `127.0.0.1:20810` — and see ⁵
   for the router key it needs)
 - **Codex:** `raydock codex --config ./examples/routing-modes/Rc-Rc.json`, or
-  `--auth subscription` for the `S-*` modes (⁵)
+  `--auth subscription` for the `S-*` modes (³)
 
 `--config` drives **both** the main agent (`routes.main`) and subagents
-(`routes.subagent`) from one file — the thing the old `--router-config-path` /
-`settings.json` surfaces could not express (they are subagent-only).
+(`routes.subagent`) from one file. `--router-config-path` and `settings.json`
+configure subagents only.
 
 `routes.subagent` is **optional**: with only `routes.main`, subagents inherit the
 main route, so a one-model config needs a single entry — this ships as
@@ -20,14 +20,11 @@ main route, so a one-model config needs a single entry — this ships as
 and subagents differ — including [`K-K.json`](./K-K.json), the two-model form of
 `K.json` (one keyed endpoint, main `kimi-k2.6`, subagents `glm-4.6`).
 
-> **Scope.** The modes that ship a config file route end-to-end today — the
-> per-entry-point **Claude / Codex / Router** columns below say where each works —
-> including `Rl-Rl` (on-device LSR static routing). `Rcl-Rcl`/`S-Rcl` still load and
-> run, but they now behave exactly like `Rc-Rc`/`S-Rc` (§): the hosted router no
-> longer hands a turn back to a local model. To split work between cloud and local
-> turn by turn, use [hybrid mode](#hybrid-mode). The modes with no `.json` yet (the
-> fully-❌ rows) are listed for completeness. The full design lives in the
-> routing-modes design doc.
+> **Scope.** Every mode here ships a config file and routes end-to-end; the
+> per-entry-point **Claude / Codex / Router** columns below say where each works.
+> These configs route each class statically: a turn goes where its route says.
+> To split work between a local model and the cloud turn by turn, use
+> [hybrid mode](#hybrid-mode).
 
 ## Mode names
 
@@ -47,8 +44,8 @@ Each token is one of four provider classes:
   **API key** (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) rather than a
   subscription.
 - **R — Rayline**: rayline is a routing *system*, not a single destination, so this
-  class always carries an **engine** suffix glued onto the `R` — `Rc`, `Rcl`, or
-  `Rl` (below). `R` never appears bare.
+  class always carries an **engine** suffix glued onto the `R` — `Rc` or `Rl`
+  (below). `R` never appears bare.
 - **L — Local** on-device model (your ollama).
 
 **S and K are the same providers split by auth mechanism** — S is your subscription
@@ -60,18 +57,15 @@ cannot forward subscription OAuth, so a routed first-party subagent is always **
 ### The `R` engine suffix
 
 **S**, **K**, and **L** are fixed **destinations** — the provider *is* the endpoint,
-so there is nothing left to decide, and the `router` / `local-model` columns are
-`N/A` for them. **`raydock` is different: it is a routing *system*.** Choosing it
-opens two sub-axes that apply only to `raydock`, and they **nest** — `router`
-(`rayline-cloud` | `rayline-local`), then *only under `rayline-cloud`*,
-`local-model` (`on` | `off`). That gives three engine tokens, but only **two**
-behaviours today, because `Rcl` is retired and now matches `Rc` (§):
+so there is nothing left to decide, and the `router` column is `N/A` for them.
+**`raydock` is different: it is a routing *system*.** Choosing it opens one
+sub-axis that applies only to `raydock`, `router` (`rayline-cloud` |
+`rayline-local`), which gives two engine tokens:
 
-| token | `router` | `local-model` | a `raydock` class is then… |
-|---|---|---|---|
-| `Rc` | rayline-cloud | off | the hosted **RCR** (intelligent ML pick) serves a **cloud** model only |
-| `Rcl` | rayline-cloud | on | **retired (§)** — same as `Rc`: the RCR serves a **cloud** model and `local_models` has no effect |
-| `Rl` | rayline-local | — (N/A) | the on-device **LSR** routes it **statically per the JSON** and pins the route's `model`, even when the endpoint is `rayline-cloud` |
+| token | `router` | a `raydock` class is then… |
+|---|---|---|
+| `Rc` | rayline-cloud | the hosted **RCR** (intelligent ML pick) serves a **cloud** model |
+| `Rl` | rayline-local | the on-device **LSR** routes it **statically per the JSON** and pins the route's `model`, even when the endpoint is `rayline-cloud` |
 
 The `rayline-` prefix keeps the *engine* distinct from the *provider*:
 `router: rayline-local` is not the same thing as `subagent: local` (the `L` class).
@@ -88,34 +82,28 @@ requirement.
 
 - **✅** — works end-to-end.
 - **🟡** — routes correctly, but part of the run doesn't work end-to-end: the leg past
-  the main agent is unverified on the Codex local-main cells (⁴), and
-  `general-purpose` subagents fail on `K-K` under Claude Code (⁶).
-- **❌** — not supported (², ³).
+  the main agent is unverified on the Codex local-main cells (²), and
+  `general-purpose` subagents fail on `K-K` under Claude Code (⁴).
 
 Every shipped config's routing is exercised by the [hermetic tests](#tests)
 regardless of column status.
 
-| Mode | agent | subagent | router | local-model | Main agent → | Subagents → | Auth | Claude | Codex | Router | Config |
-|---|---|---|---|---|---|---|---|:--:|:--:|:--:|---|
-| **Rc-Rc** | `raydock` | `raydock` | rayline-cloud | off | cloud (RCR) | cloud (RCR) | rayline | ✅ | ✅ | ✅ | [`Rc-Rc.json`](./Rc-Rc.json) |
-| **Rcl-Rcl** § | `raydock` | `raydock` | rayline-cloud | on | cloud (RCR), same as `Rc-Rc` | cloud (RCR), same as `Rc-Rc` | rayline | ✅ | ✅ | ✅ ⁷ | [`Rcl-Rcl.json`](./Rcl-Rcl.json) |
-| **Rl-Rl** | `raydock` | `raydock` | rayline-local | N/A | cloud model (via local router) | cloud model (via local router) | rayline | ✅ | ✅ | ✅ | [`Rl-Rl.json`](./Rl-Rl.json) |
-| **Rc-K** † | `raydock` | `keyed` | rayline-cloud | off | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ | ✅ | ✅ | [`Rc-K.json`](./Rc-K.json) |
-| **Rcl-K** ² | `raydock` | `keyed` | rayline-cloud | on | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ❌ | ❌ | ❌ | — (use `Rc-K`) |
-| **Rl-K** † | `raydock` | `keyed` | rayline-local | N/A | cloud model (via local router) | Anthropic (API key) | rayline + Anthropic key | ✅ | ✅ | ✅ | [`Rl-K.json`](./Rl-K.json) |
-| **Rc-L** | `raydock` | `local` | rayline-cloud | off | cloud (RCR) | local model | rayline | ✅ | ✅ | ✅ | [`Rc-L.json`](./Rc-L.json) |
-| **Rcl-L** ² | `raydock` | `local` | rayline-cloud | on | cloud (RCR) | local model | rayline | ❌ | ❌ | ❌ | — (use `Rc-L`) |
-| **Rl-L** | `raydock` | `local` | rayline-local | N/A | cloud model (via local router) | local model | rayline | ✅ | ✅ | ✅ | [`Rl-L.json`](./Rl-L.json) |
-| **S-Rc** | `subscription` | `raydock` | rayline-cloud | off | subscription (Claude / ChatGPT) | cloud (RCR) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`S-Rc.json`](./S-Rc.json) |
-| **S-Rcl** § | `subscription` | `raydock` | rayline-cloud | on | subscription (Claude / ChatGPT) | cloud (RCR), same as `S-Rc` | subscription + rayline | ✅ | ✅ ⁵ | ✅ ⁷ | [`S-Rcl.json`](./S-Rcl.json) |
-| **S-Rl** | `subscription` | `raydock` | rayline-local | N/A | subscription (Claude / ChatGPT) | cloud model (via local router) | subscription + rayline | ✅ | ✅ ⁵ | ✅ | [`S-Rl.json`](./S-Rl.json) |
-| **S-L** | `subscription` | `local` | N/A | N/A | subscription (Claude / ChatGPT) | local model | subscription | ✅ | ✅ ⁵ | ✅ | [`S-L.json`](./S-L.json) |
-| **K-K** ⁶ | `keyed` | `keyed` | N/A | N/A | keyed provider (API key) | keyed provider (API key, distinct model) | provider API key | 🟡 ⁶ | ✅ ⁶ | 🟡 ⁶ | [`K-K.json`](./K-K.json) |
-| **L-Rc** ¹ | `local` | `raydock` | rayline-cloud | off | local model | cloud (RCR) | rayline | ✅ | 🟡 ⁴ | ✅ ⁷ | [`L-Rc.json`](./L-Rc.json) |
-| **L-Rcl** ³ | `local` | `raydock` | rayline-cloud | on | local model | cloud (RCR) | rayline | ❌ | ❌ | ❌ | — (use `L-Rc`) |
-| **L-Rl** ¹ | `local` | `raydock` | rayline-local | N/A | local model | cloud model (via local router) | rayline | ✅ | 🟡 ⁴ | ✅ ⁷ | [`L-Rl.json`](./L-Rl.json) |
-| **L-K** ¹ | `local` | `keyed` | N/A | N/A | local model | Anthropic (API key) | API key | ✅ | 🟡 ⁴ | ✅ | [`L-K.json`](./L-K.json) |
-| **L-L** ¹ | `local` | `local` | N/A | N/A | local model | local model | none | ✅ | 🟡 ⁴ | ✅ ⁷ | [`L-L.json`](./L-L.json) |
+| Mode | agent | subagent | router | Main agent → | Subagents → | Auth | Claude | Codex | Router | Config |
+|---|---|---|---|---|---|---|:--:|:--:|:--:|---|
+| **Rc-Rc** | `raydock` | `raydock` | rayline-cloud | cloud (RCR) | cloud (RCR) | rayline | ✅ | ✅ | ✅ | [`Rc-Rc.json`](./Rc-Rc.json) |
+| **Rl-Rl** | `raydock` | `raydock` | rayline-local | cloud model (via local router) | cloud model (via local router) | rayline | ✅ | ✅ | ✅ | [`Rl-Rl.json`](./Rl-Rl.json) |
+| **Rc-K** † | `raydock` | `keyed` | rayline-cloud | cloud (RCR) | Anthropic (API key) | rayline + Anthropic key | ✅ | ✅ | ✅ | [`Rc-K.json`](./Rc-K.json) |
+| **Rl-K** † | `raydock` | `keyed` | rayline-local | cloud model (via local router) | Anthropic (API key) | rayline + Anthropic key | ✅ | ✅ | ✅ | [`Rl-K.json`](./Rl-K.json) |
+| **Rc-L** | `raydock` | `local` | rayline-cloud | cloud (RCR) | local model | rayline | ✅ | ✅ | ✅ | [`Rc-L.json`](./Rc-L.json) |
+| **Rl-L** | `raydock` | `local` | rayline-local | cloud model (via local router) | local model | rayline | ✅ | ✅ | ✅ | [`Rl-L.json`](./Rl-L.json) |
+| **S-Rc** | `subscription` | `raydock` | rayline-cloud | subscription (Claude / ChatGPT) | cloud (RCR) | subscription + rayline | ✅ | ✅ ³ | ✅ | [`S-Rc.json`](./S-Rc.json) |
+| **S-Rl** | `subscription` | `raydock` | rayline-local | subscription (Claude / ChatGPT) | cloud model (via local router) | subscription + rayline | ✅ | ✅ ³ | ✅ | [`S-Rl.json`](./S-Rl.json) |
+| **S-L** | `subscription` | `local` | N/A | subscription (Claude / ChatGPT) | local model | subscription | ✅ | ✅ ³ | ✅ | [`S-L.json`](./S-L.json) |
+| **K-K** ⁴ | `keyed` | `keyed` | N/A | keyed provider (API key) | keyed provider (API key, distinct model) | provider API key | 🟡 ⁴ | ✅ ⁴ | 🟡 ⁴ | [`K-K.json`](./K-K.json) |
+| **L-Rc** ¹ | `local` | `raydock` | rayline-cloud | local model | cloud (RCR) | rayline | ✅ | 🟡 ² | ✅ ⁵ | [`L-Rc.json`](./L-Rc.json) |
+| **L-Rl** ¹ | `local` | `raydock` | rayline-local | local model | cloud model (via local router) | rayline | ✅ | 🟡 ² | ✅ ⁵ | [`L-Rl.json`](./L-Rl.json) |
+| **L-K** ¹ | `local` | `keyed` | N/A | local model | Anthropic (API key) | API key | ✅ | 🟡 ² | ✅ | [`L-K.json`](./L-K.json) |
+| **L-L** ¹ | `local` | `local` | N/A | local model | local model | none | ✅ | 🟡 ² | ✅ ⁵ | [`L-L.json`](./L-L.json) |
 
 Plus three granular **per-type** variants that split subagents by **type**
 instead of one blanket default — all three are ✅ on Claude, Codex and Router:
@@ -136,10 +124,10 @@ instead of one blanket default — all three are ✅ on Claude, Codex and Router
 **† there is no `-S` (subscription subagent) form.** Subagents are the *routed*
 class and the router cannot forward your Claude/ChatGPT subscription OAuth, so a
 routed first-party subagent authenticates by **API key** — the **`-K`** form
-(`Rc-K`/`Rl-K`, and `L-K`, all `ANTHROPIC_API_KEY`). Swap a subscription in on the
-subagent leg and only that leg breaks; use `-K` there instead. (`S` still works on
-the **main** leg, which passes through rather than being routed.) The intent columns
-show what the mode *means*.
+(`Rc-K`/`Rl-K`, and `L-K`, all `ANTHROPIC_API_KEY`). A subscription on the subagent
+leg breaks that leg; the subagent leg takes `-K`. (`S` works on the **main** leg,
+which passes through rather than being routed.) The intent columns show what the
+mode *means*.
 
 ---
 
@@ -205,34 +193,12 @@ Things to know when reading logs for these modes:
 
 The `Router` column needs the client pointed at the **proxy** (`:20810`), not the
 injector (`:20809`): attaching to the injector loses the subagent header and every
-request classifies as `task=main`. It also needs an `rlk-` key — see ⁷.
+request classifies as `task=main`. It also needs an `rlk-` key — see ⁵.
 
 The live e2e test (`it_local_main_e2e`, `#[ignore]`d) is the harness for pinning this
 down across more hosts and models.
 
-**² ❌ `Rcl-K`/`Rcl-L` never shipped.** may-local only ever applied to cloud-routed
-`Explore` subagents, and these modes have none (the subagent is Anthropic in `Rcl-K`
-and already local in `Rcl-L`), so they were never different from `Rc-K` and `Rc-L`.
-With `Rcl` retired (§), use those.
-
-**³ ❌ `L-Rcl` never shipped.** It would have needed the on-device LSR to defer each
-decision back to the hosted RCR through a 307 handoff. That handoff was never built,
-and the hosted side of may-local is now gone (§). Use `L-Rc`.
-
-**§ `Rcl` is retired.** The hosted router used to be able to answer a qualifying
-`Explore` subagent turn with a redirect to a local model (may-local). It no longer
-does, so no turn moves to local in `Rcl-Rcl` or `S-Rcl`, and they behave exactly like
-`Rc-Rc` and `S-Rc`. Both files stay so existing configs keep loading. `local_models`
-is still parsed and validated, and the client still sends `x-rayline-local-available`
-and `x-rayline-local-custom`, but the hosted router ignores them.
-
-To run work on a local model instead:
-
-- **Decided per turn:** [hybrid mode](#hybrid-mode).
-- **Fixed in the config:** a static local leg such as `Rc-L`, `Rc-L-per-type`, `S-L`
-  or `S-L-per-type`.
-
-**⁴ 🟡 Codex, local main (`L-Rc`/`L-Rl`/`L-K`/`L-L`) — no subagent tool to route.**
+**² 🟡 Codex, local main (`L-Rc`/`L-Rl`/`L-K`/`L-L`) — no subagent tool to route.**
 Codex sends a **sentinel `--model`** (`rayline-local` by default) on every turn; the
 `--config` codex materialization pins that sentinel to `routes.main` for **main**
 turns, while the router skips that model_route on **subagent** turns so subagent
@@ -257,7 +223,7 @@ identically (the main leg is the same sentinel → same local route in each). Tr
 `collab_spawn` as **version-dependent** throughout this document: confirm your codex
 build actually offers the tool before relying on a main≠subagent split.
 
-The **cloud-main (`Rc*`/`Rcl*`/`Rl*`) modes are plain ✅** — the codex `--config`
+The **cloud-main (`Rc*`/`Rl*`) modes are plain ✅** — the codex `--config`
 materialization flips the hosted RCR endpoint to `openai_responses` (bearer auth,
 `x-rayline-client: codex`), so a Codex `/v1/responses` main forwards natively (`POST
 /v1/responses`) and the RCR picks the model — no down-translation to Anthropic. The
@@ -267,18 +233,18 @@ left untouched (host-guarded to `api.rayline.ai` / `api-dev.rayline.ai`). Verifi
 end-to-end against prod and dev: `raydock codex --config Rc-Rc.json` drives a real
 Codex session through the RCR (trivial prompt → cheap tier, hard prompt → frontier).
 
-**⁵ ✅ Codex — subscription main via `--auth subscription`.** The `S-*` modes route
+**³ ✅ Codex — subscription main via `--auth subscription`.** The `S-*` modes route
 `routes.main` to the `subscription` sentinel, which `raydock codex --auth
 subscription` materializes into a Codex `client_bearer` endpoint
 (`chatgpt.com/backend-api/codex`) and pins the sentinel model to it for main turns.
 Subagent turns skip that pin and follow `routes.subagent`/`routes.subagents`, so
-`S-Rc`/`S-Rcl`/`S-Rl`/`S-L` diverge on the subagent leg (main → your ChatGPT
+`S-Rc`/`S-Rl`/`S-L` diverge on the subagent leg (main → your ChatGPT
 subscription, subagents per config). Verified on-device: `raydock codex --auth
 subscription --config S-L.json` (and `S-Rc.json`) → `codex route
 endpoint:codex-subscription requested=rayline-local selected=gpt-6-astra` → reply
 returned. Run it exactly as written — the default model routes correctly.
 
-**⁶ K-K — one keyed endpoint, two models (main ≠ subagent).** `K-K` declares one
+**⁴ K-K — one keyed endpoint, two models (main ≠ subagent).** `K-K` declares one
 **keyed** provider endpoint (the shipped config uses OpenRouter,
 `OPENROUTER_API_KEY`) whose `models` lists two entries, then splits them across legs:
 `routes.main` → `moonshotai/kimi-k2.6`, `routes.subagent` → `z-ai/glm-4.6`. Both legs
@@ -288,7 +254,7 @@ second model) and subagents fall back to **inheriting the main route** — the m
 one-model form. Swap the endpoint/`models` for any OpenAI-compatible or
 Anthropic-API-key provider. On **Codex**, a keyed `anthropic_messages` main is served
 via the standard down-translation path (Responses → Anthropic Messages → provider),
-not the RCR-native Responses path reserved for the hosted router (⁴).
+not the RCR-native Responses path reserved for the hosted router (²).
 
 On Claude Code 2.1.319, **`general-purpose` subagents fail on the shipped OpenRouter
 endpoint** (`K.json` and `K-K.json`). Claude Code sends them a mid-conversation
@@ -296,7 +262,7 @@ reasoning-effort update, and the endpoint rejects it with HTTP 400 (*"Mid-conver
 reasoning effort (configuration_update) is not supported"*) on every retry. The main
 agent and `Explore` subagents work.
 
-**⁷ Router column — `raydock router start` needs an `rlk-` router key.** `rayline
+**⁵ Router column — `raydock router start` needs an `rlk-` router key.** `rayline
 claude` attaches your credential automatically; `raydock router start` injects
 nothing. So any mode whose **subagent** leg is a cloud endpoint (`L-Rc`, `L-Rl`, and
 the `*-Rc*`/`*-Rl` family generally) routes correctly and then fails upstream on that
@@ -317,11 +283,6 @@ raydock router start --config examples/routing-modes/L-Rc.json
 The 403 is the same whichever model the route names (`arc-sage-1.0` or a pinned
 id), so it is never about the model.
 
-**`Rcl-Rcl` and `S-Rcl` are the exception.** A config with `local_models` takes a
-separate start path that ignores both `RAYLINE_ROUTER_API_KEY` and `--env`: it needs a
-router key stored for production, and without one it stops with *"No Raydock router
-key stored for prod"*. Use `Rc-Rc` or `S-Rc` with `raydock router start`.
-
 **Check the router log, not just the exit status.** On a local-main config the main
 answers regardless, so the run prints a plausible final message and exits 0 while the
 subagent leg silently retries and gives up. A printed answer is not evidence the
@@ -329,7 +290,8 @@ subagent leg worked — grep for 401/403 on `task=subagent` before scoring a cel
 
 ## Hybrid mode
 
-Hybrid mode replaces may-local (§). ARC decides each turn: easy work stays on a model
+Hybrid mode splits work between a local model and the cloud turn by turn. ARC
+decides each turn: easy work stays on a model
 running on your machine, and harder work, or work that no longer fits the local
 context window, goes to a cloud model. It is a separate command rather than a
 `--config` file, so no file in this directory selects it:
@@ -357,23 +319,20 @@ See [the setup guide](../../docs/hybrid-local-setup.md) and
 
 ## Files ↔ modes
 
-The supported modes ship as **19 config files** (the `❌` modes have none yet),
-plus one non-mode minimal config ([`K.json`](./K.json), below the table):
+The modes ship as **17 config files**, plus one non-mode minimal config ([`K.json`](./K.json), below the table):
 
 | File | `routes.main` → | `routes.subagent` → | Mode |
 |---|---|---|---|
 | [`Rc-Rc.json`](./Rc-Rc.json) | rayline-cloud | rayline-cloud | Rc-Rc |
-| [`Rcl-Rcl.json`](./Rcl-Rcl.json) | rayline-cloud (`local_models` unused) | rayline-cloud (`local_models` unused) | Rcl-Rcl § |
 | [`Rl-Rl.json`](./Rl-Rl.json) | rayline-cloud, `router: rayline-local` (model pinned) | rayline-cloud, `router: rayline-local` (default + `Explore` per-type) | Rl-Rl |
 | [`Rc-K.json`](./Rc-K.json) | rayline-cloud | anthropic (API key) | Rc-K |
 | [`Rl-K.json`](./Rl-K.json) | rayline-cloud, `router: rayline-local` (model pinned) | anthropic (API key) | Rl-K |
 | [`Rc-L.json`](./Rc-L.json) | rayline-cloud | ollama (local) | Rc-L |
 | [`Rl-L.json`](./Rl-L.json) | rayline-cloud, `router: rayline-local` (model pinned) | ollama (local) | Rl-L |
 | [`S-Rc.json`](./S-Rc.json) | subscription (passthrough) | rayline-cloud | S-Rc |
-| [`S-Rcl.json`](./S-Rcl.json) | subscription (passthrough) | rayline-cloud (`local_models` unused) | S-Rcl § |
 | [`S-Rl.json`](./S-Rl.json) | subscription (passthrough) | rayline-cloud, `router: rayline-local` (model pinned) | S-Rl |
 | [`S-L.json`](./S-L.json) | subscription (passthrough) | ollama (local) | S-L |
-| [`K-K.json`](./K-K.json) | openrouter (keyed, kimi-k2.6) | openrouter (keyed, glm-4.6) | K-K ⁶ |
+| [`K-K.json`](./K-K.json) | openrouter (keyed, kimi-k2.6) | openrouter (keyed, glm-4.6) | K-K ⁴ |
 | [`L-Rc.json`](./L-Rc.json) | ollama (local) | rayline-cloud | L-Rc |
 | [`L-Rl.json`](./L-Rl.json) | ollama (local) | rayline-cloud, `router: rayline-local` (model pinned) | L-Rl |
 | [`L-K.json`](./L-K.json) | ollama (local) | anthropic (API key) | L-K |
@@ -439,9 +398,8 @@ names `arc-sage-1.0` and `routes.subagent` names `arc-swift-1.0`.
 | `model` on the wire | RCR behaviour |
 |---|---|
 | `arc-sage-1.0` / `arc-swift-1.0` | **route on ARC** — the RCR picks the model; Sage is the main-agent tier, Swift the subagent tier |
-| `rayline-router` | **refused** (404) — the Legacy Rules Router is retired; use an ARC id |
 | any concrete id (`claude-opus-5`, `glm-5.3`, `gpt-5.5`, …) | **pin** — that exact model is served and no routing runs |
-| a deprecated or unlisted id (`z-ai/glm-5.2`, `deepseek/deepseek-v4-pro`, …) | **refused** (404) — pin a current id instead |
+| an id the catalog does not list (`z-ai/glm-5.2`, `deepseek/deepseek-v4-pro`, …) | **refused** (404) |
 
 The rule is the same for every provider. Asking to be routed is what the ARC ids are
 *for*; naming a model instead means you want that model.
@@ -471,16 +429,13 @@ A route targeting the `raydock` cloud endpoint accepts an optional `router` fiel
   it engages even when the endpoint is `rayline-cloud`, routing the class statically
   per the JSON and **pinning the route's `model`** (so the RCR doesn't pick). The
   `model` you set is sent as-is to the endpoint.
-- **`local_models`** — retired with `Rcl` (§). It is still accepted, and each id must
-  appear in a declared local endpoint's `models`, but it moves no turn to local. It is
-  ignored for `S`/`K`/`L` endpoints and does not change the local router's own routing.
 
 ## Auth
 
 - `rayline-cloud` reads `RAYLINE_ROUTER_API_KEY`, which must be an **`rlk-` router
   key**. For `raydock claude`, your `raydock auth login` credential is injected
   automatically, so the env var is optional in interactive use. `raydock router
-  start` injects nothing and always needs the key — see ⁷.
+  start` injects nothing and always needs the key — see ⁵.
 - `keyed` (`K`) reads the provider's API key from the endpoint's `api_key_env`
   (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) — the local router cannot use a
   subscription (see †).
@@ -526,18 +481,6 @@ Routing is regression-tested hermetically (no credentials, loopback-only):
 
 The selective-main-subscription passthrough (`S-Rc`/`S-L` main) is a proxy-layer
 behavior, covered in `crates/rayline-proxy`.
-
-**Leftover may-local client code (§).** The hosted side is gone, but the client half
-still ships and is still tested. The config→advertisement mapping is unit-tested in
-`rayline-cli` (`router_config::tests::may_local_*` and
-`rrcl_example_resolves_may_local`), and
-`config_mode_examples_route_main_and_subagents` asserts the `router`/`local_models`
-fields **do not** change the LSR's routing. Advertising `x-rayline-local-available`
-and following a `307` to the local adapter are tested against mocks in
-`crates/rayline-proxy` (`proxy_stashes_router_auth_for_local_307`,
-`local_proxy_redirect_uses_shared_router_auth_for_usage_update`, and the ignored
-`tests/it_claude_live.rs`). None of these show a hosted redirect, because the hosted
-router no longer sends one.
 
 The full **interactive** end-to-end for the `agent = local` modes (¹) is kept
 `#[ignore]`d in `crates/rayline-cli/tests/it_local_main_e2e.rs` — it needs a local

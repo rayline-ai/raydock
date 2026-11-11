@@ -98,11 +98,10 @@ Client-controlled thinking is disabled because ARC selects effort.
 Intelligence and speed columns may be empty: no benchmark scores are supplied,
 and speed measurements depend on omp and the requests actually served.
 
-The hosted omp picker lists only **ARC Sage** and **ARC Swift**. The hosted
-router no longer serves the old `rayline-router` Legacy model. Hybrid routing is
-separate: its execution core uses its own virtual model, `rayline-auto`.
+The hosted omp picker lists only **ARC Sage** and **ARC Swift**. Hybrid routing
+is separate: its execution core uses its own virtual model, `rayline-auto`.
 Hybrid has no single ARC tier rate; if omp displays it as free, use your
-upstream billing records instead. Hybrid runtime capabilities are unchanged.
+upstream billing records instead.
 
 ### Configuration and troubleshooting
 
@@ -111,10 +110,10 @@ Raydock keeps its isolated omp configuration and sessions under
 
 - `models.yml` is managed by Raydock and refreshed on every launch, including
   pricing corrections. Do not edit it for persistent customizations.
-- `config.yml` is seeded once. On hosted launches, retired
+- `config.yml` is seeded once. On hosted launches,
   `rayline/rayline-router` role choices migrate to Sage (`smol` to Swift);
   other saved choices, comments and settings are preserved.
-- Saved sessions migrate their Legacy model selections too, so noninteractive
+- Saved sessions migrate their `rayline-router` selections too, so noninteractive
   `--continue --print` and `--resume` still work. Historical messages, usage and
   served-model labels are not rewritten. Explicit `--session-dir`, `--resume`
   and `--restore` paths are included. Journal modification times are preserved
@@ -391,14 +390,14 @@ for Claude Code (subagents and background tasks then run on it too), a cloud-onl
 `routes.subagent`, subagents follow `routes.main`), a `--router-config-path`
 subagent allowlist (Raydock then sets no subagent model), your own `CLAUDE_CODE_SUBAGENT_MODEL` or
 `ANTHROPIC_DEFAULT_HAIKU_MODEL`, a `--config` route, and the model pi and omp
-saved, except that hosted omp replaces retired Legacy references with ARC in
+saved, except that hosted omp replaces `rayline-router` references with ARC in
 both saved roles and session selections. Pi's `settings.json` moves to ARC only
 while it still reads exactly as an 0.2.x release wrote it. Raydock rewrites its model
-keys in the Hermes and OpenClaw configs on every launch (as before).
+keys in the Hermes and OpenClaw configs on every launch.
 
 The local and hybrid paths (`--local`, a local-plane `--config`, account-local
 routing, `raydock hybrid run`) use the local router's virtual
-model, `rayline-auto` (`rayline-router` before 0.4.1), which tells it to apply
+model, `rayline-auto`, which tells it to apply
 its own routes. Any other model name the local router does not know, including
 `rayline-router`, also follows `routes.main`.
 `raydock claude-desktop` already runs on ARC, and `raydock codex --auth
@@ -661,11 +660,11 @@ entry, and subagents then follow that model. The generated default
 `--env <name>` and no `--config`, `raydock codex` generates and reads
 `~/.config/rayline/router.<name>.json` instead, pointed at that environment's
 router, so a non-prod key never reaches the prod router. The file is created
-once and never rewritten. The hosted router no longer serves `rayline-router`,
-so a file that still routes to it (including the default an 0.2.x release
-generated) fails visibly with the router's error until you change those routes
-to an ARC model. If you customized `router.json` for a
-non-prod environment before, copy those routes into `router.<name>.json`.
+once and never rewritten. A file that routes to a model the hosted router does
+not serve, such as `rayline-router` (the default an 0.2.x release generated),
+fails visibly with the router's error until you change those routes to an ARC
+model. To reuse customized routes for a non-prod environment, copy them into
+`router.<name>.json`.
 
 ## Connecting Provider Endpoints
 

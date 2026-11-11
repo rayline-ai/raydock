@@ -1,5 +1,5 @@
 //! Interactive end-to-end for the `agent = local` routing modes (`L-Rc`/`L-Rl`/`L-K`/`L-L`,
-//! marked ‡ in examples/routing-modes/README.md).
+//! footnote ¹ in examples/routing-modes/README.md).
 //!
 //! This is the harness for "drive a local **main** agent through `--config` and
 //! confirm it can actually spawn a subagent." It is `#[ignore]`d and gated on
@@ -19,7 +19,7 @@
 use std::process::Command;
 
 #[test]
-#[ignore = "live: set RAYLINE_LOCAL_MAIN_E2E=1 (+ CLAUDE_BIN). Expected-fail with current small local mains — they can't drive Claude Code tool calls, so the local main never spawns a subagent. See examples/routing-modes/README.md (‡)."]
+#[ignore = "live: set RAYLINE_LOCAL_MAIN_E2E=1 (+ CLAUDE_BIN). Expected-fail with current small local mains — they can't drive Claude Code tool calls, so the local main never spawns a subagent. See examples/routing-modes/README.md (footnote ¹)."]
 fn local_main_spawns_subagent_end_to_end() {
     if std::env::var_os("RAYLINE_LOCAL_MAIN_E2E").is_none() {
         eprintln!(

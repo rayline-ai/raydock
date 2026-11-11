@@ -78,6 +78,13 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   now says `--env` goes before the command:
   `raydock --env <name> claude-desktop status`.
 
+### Docs
+
+- The routing-modes examples and guides describe only the current modes. The
+  `Rcl-Rcl` and `S-Rcl` configs are removed (they route exactly like `Rc-Rc`
+  and `S-Rc`), and splitting work between a local model and the cloud turn by
+  turn is described as hybrid mode.
+
 ## 0.4.3 (2026-11-09)
 
 ### New

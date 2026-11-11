@@ -7742,9 +7742,26 @@ mod tests {
             )
         );
 
-        // Rcl-Rcl: `router`/`local_models` are may-local advertisement metadata; they do
-        // not change the LSR's routing — main + subagents still resolve to cloud.
-        let st = load_state(include_str!("../../../examples/routing-modes/Rcl-Rcl.json"));
+        // `router: rayline-cloud` and `local_models` on a route do not change the
+        // LSR's routing: main + subagents still resolve to cloud.
+        let st = load_state(
+            &json!({
+                "endpoints": [
+                    { "id": "rayline-cloud", "protocol": "anthropic_messages",
+                      "base_url": "https://api.rayline.ai",
+                      "models": ["arc-sage-1.0", "arc-swift-1.0"] },
+                    { "id": "ollama", "protocol": "openai_chat",
+                      "base_url": "http://127.0.0.1:11434/v1", "models": ["qwen2.5-coder:7b"] }
+                ],
+                "routes": {
+                    "main": { "endpoint": "rayline-cloud", "model": "arc-sage-1.0",
+                              "router": "rayline-cloud", "local_models": ["qwen2.5-coder:7b"] },
+                    "subagent": { "endpoint": "rayline-cloud", "model": "arc-swift-1.0",
+                                  "router": "rayline-cloud", "local_models": ["qwen2.5-coder:7b"] }
+                }
+            })
+            .to_string(),
+        );
         assert_eq!(main_route(&st), cloud_main());
         assert_eq!(sub_route(&st, "reviewer"), cloud_sub());
 
