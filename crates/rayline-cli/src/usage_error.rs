@@ -123,7 +123,7 @@ pub(crate) fn rejected_argv(
         return RaylineDispatch::Unavailable(format!("claude {bad}"));
     }
     if bad == "--env" || bad.starts_with("--env=") {
-        return RaylineDispatch::Usage(misplaced_env(&args, stop, &command));
+        return RaylineDispatch::Usage(misplaced_env(&command));
     }
     let message = format!(
         "raydock: `raydock {}` does not accept `{shown}`",
@@ -172,18 +172,11 @@ fn env_value_at<'a>(args: &[&'a str], index: usize) -> Option<&'a str> {
 
 /// `--env` after a command that does not read it: show the command with
 /// `--env` moved in front, where every command reads it. Only the command words
-/// are repeated, so no other argument (such as a token) is echoed.
-fn misplaced_env(args: &[&str], index: usize, command: &[&str]) -> String {
-    let value = match args[index].strip_prefix("--env=") {
-        Some(value) => value,
-        None => args
-            .get(index + 1)
-            .copied()
-            .filter(|value| !value.starts_with('-'))
-            .unwrap_or("<name>"),
-    };
+/// are repeated; the value is a placeholder, since a mistyped line can put a
+/// prompt or a key there.
+fn misplaced_env(command: &[&str]) -> String {
     format!(
-        "raydock: `--env` goes before the command: `raydock --env {value} {}`",
+        "raydock: `--env` goes before the command: `raydock --env <name> {}`",
         command.join(" ")
     )
 }
@@ -268,11 +261,11 @@ mod tests {
     fn env_after_a_command_that_does_not_read_it_shows_where_it_goes() {
         assert_eq!(
             usage_message(&["top", "--env", "dev"]),
-            "raydock: `--env` goes before the command: `raydock --env dev top`"
+            "raydock: `--env` goes before the command: `raydock --env <name> top`"
         );
         assert_eq!(
             usage_message(&["router", "status", "--env=dev"]),
-            "raydock: `--env` goes before the command: `raydock --env dev router status`"
+            "raydock: `--env` goes before the command: `raydock --env <name> router status`"
         );
         assert_eq!(
             usage_message(&["top", "--json", "--env"]),
@@ -339,6 +332,7 @@ mod tests {
             &["top", "--env", "--auth-token=secret-value"][..],
             &["--env", "--auth-token=secret-value", "status"][..],
             &["--env=--auth-token=secret-value", "status"][..],
+            &["top", "--env", "secret-value"][..],
         ] {
             let message = usage_message(args);
             assert!(
