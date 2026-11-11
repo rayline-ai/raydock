@@ -57,7 +57,7 @@
 //! path exports [`CONV_ID_ENV`] only when a rendered config references it
 //! ([`conversation_id_for`]).
 
-mod hermes;
+pub(crate) mod hermes;
 mod omp;
 mod omp_migration;
 mod omp_roles;
@@ -664,7 +664,11 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         Harness::OpenCode => opencode_args(&request.args, ctx.harness_major_version),
         _ => request.args,
     };
-    Ok(build_command(&binary, &plan, conv_id.as_deref(), &args))
+    let command = build_command(&binary, &plan, conv_id.as_deref(), &args);
+    if harness == Harness::Hermes && cfg!(windows) {
+        hermes::prepare_launch(&command)?;
+    }
+    Ok(command)
 }
 
 /// OpenCode's args with `--standalone` where OpenCode 2 would attach to its

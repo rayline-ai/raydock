@@ -496,6 +496,11 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     command.env_remove(name);
                 }
             }
+            // Here, not in harness_command: preparing may run Hermes, and the
+            // probe and repair must carry the launch's final environment.
+            if harness == "hermes" && cfg!(windows) {
+                crate::harness::hermes::prepare_launch(&command).map_err(io::Error::other)?;
+            }
             let status = command.status()?;
             return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
         }

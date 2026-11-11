@@ -34,6 +34,14 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   went straight to Anthropic instead of the routing you named. The launch
   now fails at once with `cannot read --config <path>: <reason>`, as
   `raydock codex` does.
+- **`raydock hermes` starts on a clean Windows install.** Hermes on Windows
+  keeps its Python dependencies per Hermes home and refused to start in
+  Raydock's own home ("no dependency environment is committed for this
+  install"), while a plain `hermes pm repair` fixed the default home instead.
+  Raydock now runs `hermes pm repair` once for its Hermes home before the first
+  launch (also under `raydock hybrid run hermes`) and skips it afterwards. If
+  the repair fails, it prints the command to run by hand with the right
+  `HERMES_HOME`.
 - **Claude Code in hybrid mode works with llama.cpp chat templates that
   require the system message first** (such as Qwen3.8-27B). The bundled
   execution core (`rayline-core`, now pinned to `80ce3d26`) moves a system
