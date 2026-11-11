@@ -1307,17 +1307,17 @@ mod tests {
         for (file, resolves, needs_local, fires) in cases {
             let path = &paths[file];
             assert_eq!(
-                config_may_local(&path).is_some(),
+                config_may_local(path).is_some(),
                 resolves,
                 "{file}: resolves"
             );
             assert_eq!(
-                config_needs_local_router(&path),
+                config_needs_local_router(path),
                 needs_local,
                 "{file}: needs_local"
             );
             let actually_fires =
-                !config_needs_local_router(&path) && config_may_local(&path).is_some();
+                !config_needs_local_router(path) && config_may_local(path).is_some();
             assert_eq!(actually_fires, fires, "{file}: may-local wired by CLI");
         }
         let _ = std::fs::remove_dir_all(&home);
