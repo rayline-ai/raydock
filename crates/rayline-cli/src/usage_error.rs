@@ -132,12 +132,6 @@ pub(crate) fn rejected_argv(
     if command[0] == "claude" && !is_claude_value && crate::is_claude_management_subcommand(bad) {
         return RaylineDispatch::Unavailable(format!("claude {bad}"));
     }
-    // Only these commands have no `--env` of their own; elsewhere a rejected
-    // `--env` was read as another option's value (`codex --auth --env dev`).
-    let without_env = matches!(command[0], "top" | "router" | "local" | "update");
-    if without_env && (bad == "--env" || bad.starts_with("--env=")) {
-        return RaylineDispatch::Usage(misplaced_env(&command));
-    }
     // Only option names are echoed: a rejected word may be a prompt or a key.
     let words = command.join(" ");
     let previous_is_value =
@@ -147,6 +141,18 @@ pub(crate) fn rejected_argv(
     // "Rejected" rather than "unknown": a known option can be rejected as the
     // value of the option before it, or for its own value.
     let after = previous_option.map_or(String::new(), |option| format!(" after `{option}`"));
+    // Only these commands have no `--env` of their own; elsewhere a rejected
+    // `--env` was read as another option's value (`codex --auth --env dev`).
+    let without_env = matches!(command[0], "top" | "router" | "local" | "update");
+    if without_env && (bad == "--env" || bad.starts_with("--env=")) {
+        // After another option `--env` may have been read as its value: say so too.
+        let hint = misplaced_env(&command);
+        return RaylineDispatch::Usage(if after.is_empty() {
+            hint
+        } else {
+            format!("raydock: `raydock {words}` rejected `--env`{after}\n{hint}")
+        });
+    }
     let message = match (bad.starts_with('-'), option_name(bad)) {
         (true, Some(name)) if bad.contains('=') => {
             format!("raydock: `raydock {words}` rejected the value of `{name}`")
@@ -325,7 +331,12 @@ mod tests {
         );
         assert_eq!(
             usage_message(&["top", "--json", "--env"]),
-            "raydock: `--env` goes before the command: `raydock --env <name> top`"
+            "raydock: `raydock top` rejected `--env` after `--json`\n\
+             raydock: `--env` goes before the command: `raydock --env <name> top`"
+        );
+        assert!(
+            usage_message(&["router", "start", "--route", "--env", "dev"])
+                .starts_with("raydock: `raydock router start` rejected `--env` after `--route`\n")
         );
         let message = usage_message(&["--auth-token", "secret-value", "top", "--env", "dev"]);
         assert!(!message.contains("secret-value"), "{message}");
