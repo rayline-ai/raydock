@@ -131,13 +131,19 @@ pub(crate) fn rejected_argv(
         stop >= 2 && crate::is_value_option(args[stop - 2]) && !args[stop - 2].contains('=');
     let previous_option =
         option_name(previous).filter(|name| *name == previous && !previous_is_value);
-    let message = match (bad.starts_with('-'), option_name(bad), previous_option) {
-        (true, Some(name), _) => format!("raydock: `raydock {words}` does not accept `{name}`"),
-        (true, None, _) => format!("raydock: `raydock {words}` got an unexpected option"),
-        (false, _, Some(option)) => {
-            format!("raydock: `raydock {words}` rejected the argument after `{option}`")
+    // "Rejected" rather than "unknown": a known option can be rejected as the
+    // value of the option before it, or for its own value.
+    let after = previous_option.map_or(String::new(), |option| format!(" after `{option}`"));
+    let message = match (bad.starts_with('-'), option_name(bad)) {
+        (true, Some(name)) if bad.contains('=') => {
+            format!("raydock: `raydock {words}` rejected the value of `{name}`")
         }
-        (false, _, None) => format!("raydock: `raydock {words}` got an unexpected argument"),
+        (true, Some(name)) => format!("raydock: `raydock {words}` rejected `{name}`{after}"),
+        (true, None) => format!("raydock: `raydock {words}` rejected an option{after}"),
+        (false, _) if previous_option.is_some() => {
+            format!("raydock: `raydock {words}` rejected the argument{after}")
+        }
+        (false, _) => format!("raydock: `raydock {words}` got an unexpected argument"),
     };
     RaylineDispatch::Usage(with_usage(message, &command))
 }
@@ -277,7 +283,7 @@ mod tests {
     #[test]
     fn unknown_subcommand_option_is_named_with_the_subcommand_usage() {
         let message = usage_message(&["router", "start", "--bogus"]);
-        assert!(message.starts_with("raydock: `raydock router start` does not accept `--bogus`"));
+        assert!(message.starts_with("raydock: `raydock router start` rejected `--bogus`"));
         assert!(message.contains("\nUsage: raydock router start "));
         assert!(message.ends_with("Run `raydock router start --help` for details."));
 
@@ -404,6 +410,17 @@ mod tests {
                 other => panic!("expected a usage error, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn known_option_rejected_as_a_value_is_named_with_its_owner() {
+        let message = usage_message(&["codex", "--auth", "--subscription"]);
+        assert!(
+            message
+                .starts_with("raydock: `raydock codex` rejected `--subscription` after `--auth`")
+        );
+        let message = usage_message(&["claude", "--via=bogus"]);
+        assert!(message.starts_with("raydock: `raydock claude` rejected the value of `--via`"));
     }
 
     #[test]
