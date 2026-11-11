@@ -937,6 +937,26 @@ fn catalog_sentinel_target(config: &RouterConfig) -> Option<(String, String)> {
         .or(config.routes.default.as_ref())
         .cloned()
         .unwrap_or_else(default_main_route);
+    route_window_target(route)
+}
+
+/// Where a main turn that names a listed model is routed: its `model_routes`
+/// override when there is one (as `select_route` checks that first), else the
+/// endpoint that lists it.
+fn catalog_model_target(
+    config: &RouterConfig,
+    endpoint: &EndpointConfig,
+    model: &str,
+) -> Option<(String, String)> {
+    match config.routes.model_routes.get(&normalize_model_name(model)) {
+        Some(route) => route_window_target(route.clone()),
+        None => Some((endpoint.id.clone(), model.to_owned())),
+    }
+}
+
+/// The endpoint and model whose window a route uses; `None` for the on-device
+/// adapter.
+fn route_window_target(route: RouteTarget) -> Option<(String, String)> {
     (route.endpoint != "local").then_some((route.endpoint, route.model))
 }
 
@@ -976,7 +996,7 @@ fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
             models.push(CatalogModel {
                 id: model.clone(),
                 display_name: catalog_display_name(endpoint, model),
-                target: Some((endpoint.id.clone(), model.clone())),
+                target: catalog_model_target(config, endpoint, model),
             });
         }
     }
@@ -11242,6 +11262,65 @@ mod tests {
             .collect()
     }
 
+    /// A cached answer is reused until it is due, then asked again, so a model
+    /// reloaded with another context is picked up; a failed refresh keeps the
+    /// previous answer.
+    #[tokio::test]
+    async fn model_windows_refresh_after_they_are_due() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let answers = Arc::new(std::sync::Mutex::new(vec![
+            None,
+            Some(65_536),
+            Some(32_768),
+        ]));
+        let server_answers = answers.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let answer = server_answers.lock().unwrap().pop().flatten();
+                let response = match answer {
+                    Some(window) => {
+                        let body =
+                            json!({"data": [{"id": "m", "context_length": window}]}).to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None => "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\
+                             connection: close\r\n\r\n"
+                        .to_owned(),
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let mut runtime = endpoint("runtime", EndpointProtocol::OpenAIChat, &["m"]);
+        runtime.base_url = format!("http://127.0.0.1:{port}/v1");
+        let state = state(RouterConfig {
+            endpoints: vec![runtime],
+            routes: RoutesConfig::default(),
+        });
+        let window = |windows: model_windows::Windows| windows["runtime"]["m"];
+
+        assert_eq!(window(state.model_windows.windows(&state).await), 32_768);
+        // Not due yet: the cached answer, without asking again.
+        assert_eq!(window(state.model_windows.windows(&state).await), 32_768);
+        assert_eq!(answers.lock().unwrap().len(), 2);
+
+        state.model_windows.expire().await;
+        assert_eq!(window(state.model_windows.windows(&state).await), 65_536);
+
+        state.model_windows.expire().await;
+        assert_eq!(window(state.model_windows.windows(&state).await), 65_536);
+        assert!(answers.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn catalog_sentinel_takes_the_window_of_its_route() {
         let windows: model_windows::Windows = HashMap::from([
@@ -11305,8 +11384,23 @@ mod tests {
             CATALOG_SENTINEL_MODEL.to_owned(),
             target("cloud", "unsized"),
         );
-        let entries = codex_windows(&state(config), &windows);
+        let entries = codex_windows(&state(config.clone()), &windows);
         assert_eq!(entries[CATALOG_SENTINEL_MODEL], json!(128_000));
+
+        // A listed model with its own model route takes that route's window,
+        // since select_route sends it there rather than to its endpoint.
+        config
+            .routes
+            .model_routes
+            .insert("big".to_owned(), target("ollama", "q"));
+        config
+            .routes
+            .model_routes
+            .insert("small".to_owned(), RouteTarget::local("local-model"));
+        let entries = codex_windows(&state(config), &windows);
+        assert_eq!(entries["big"], json!(32_768));
+        assert_eq!(entries["small"], json!(128_000));
+        assert_eq!(entries["q"], json!(32_768));
 
         // No endpoint answered: every entry is today's.
         let entries = codex_windows(&main_only, &model_windows::Windows::new());

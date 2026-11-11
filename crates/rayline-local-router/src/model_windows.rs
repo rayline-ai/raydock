@@ -17,11 +17,13 @@
 //! - subscription (`client_bearer`) endpoints: the upstream catalog the router
 //!   already proxies for `/v1/models` (see [`listed_windows`]).
 //!
-//! A model that no source sizes keeps the catalog's default entry. A failed
-//! endpoint is not cached, so the next `/v1/models` request tries it again.
+//! A model that no source sizes keeps the catalog's default entry. An answer
+//! is reused for [`REFRESH_AFTER`], then asked again, so a model loaded (or
+//! reloaded with another context) later is picked up. A failed lookup keeps the
+//! previous answer and is retried on the next `/v1/models` request.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -37,21 +39,26 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 /// Codex gives its whole `/v1/models` refresh a few seconds, and endpoints are
 /// sized concurrently, so one slow endpoint cannot hold the catalog for longer.
 const ENDPOINT_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long an endpoint's answer is reused before it is asked again. Codex
+/// itself refetches `/v1/models` only every few minutes, so this mainly
+/// collapses bursts of requests into one lookup.
+const REFRESH_AFTER: Duration = Duration::from_secs(60);
 
 /// Context windows by model id, for one endpoint.
 pub(crate) type EndpointWindows = HashMap<String, u64>;
 /// Context windows by endpoint id, then model id.
 pub(crate) type Windows = HashMap<String, EndpointWindows>;
 
-/// Endpoint windows resolved so far. Only successful lookups are kept.
+/// Endpoint windows resolved so far, with when each was fetched. Only
+/// successful lookups are kept.
 #[derive(Default)]
 pub(crate) struct ModelWindowCache {
-    resolved: Mutex<Windows>,
+    resolved: Mutex<HashMap<String, (Instant, EndpointWindows)>>,
 }
 
 impl ModelWindowCache {
     /// Windows for every endpoint that can be sized without the client's
-    /// credentials, fetching the endpoints not resolved yet concurrently.
+    /// credentials, fetching the endpoints not resolved recently concurrently.
     pub(crate) async fn windows(&self, state: &AppState) -> Windows {
         let pending = {
             let resolved = self.resolved.lock().await;
@@ -60,7 +67,10 @@ impl ModelWindowCache {
                 .endpoints
                 .iter()
                 .filter(|endpoint| {
-                    sized_by_lookup(endpoint) && !resolved.contains_key(&endpoint.id)
+                    sized_by_lookup(endpoint)
+                        && resolved
+                            .get(&endpoint.id)
+                            .is_none_or(|(fetched_at, _)| fetched_at.elapsed() >= REFRESH_AFTER)
                 })
                 .collect::<Vec<_>>()
         };
@@ -77,14 +87,30 @@ impl ModelWindowCache {
                     (endpoint.id.clone(), windows)
                 }))
                 .await;
+            let now = Instant::now();
             let mut resolved = self.resolved.lock().await;
             for (id, windows) in fetched {
                 if let Some(windows) = windows {
-                    resolved.insert(id, windows);
+                    resolved.insert(id, (now, windows));
                 }
             }
         }
-        self.resolved.lock().await.clone()
+        self.resolved
+            .lock()
+            .await
+            .iter()
+            .map(|(id, (_, windows))| (id.clone(), windows.clone()))
+            .collect()
+    }
+
+    /// Makes every cached answer due for a refresh.
+    #[cfg(test)]
+    pub(crate) async fn expire(&self) {
+        for (fetched_at, _) in self.resolved.lock().await.values_mut() {
+            *fetched_at = fetched_at
+                .checked_sub(REFRESH_AFTER)
+                .expect("an instant REFRESH_AFTER in the past");
+        }
     }
 }
 
