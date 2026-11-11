@@ -100,7 +100,9 @@ pub(crate) fn rejected_argv(
 
     if let Some(env) = env_value_at(&args, stop) {
         if !crate::status::is_valid_root_env(env) {
-            let message = format!("raydock: invalid environment name `{env}`");
+            // Not echoed: a mistyped command line can put a key here.
+            let message =
+                "raydock: invalid `--env` name (use letters, digits, `-` and `_`)".to_owned();
             return RaylineDispatch::Usage(with_usage(message, &command));
         }
     }
@@ -299,7 +301,8 @@ mod tests {
         ] {
             let message = usage_message(args);
             assert!(
-                message.starts_with("raydock: invalid environment name `bad/env`"),
+                message.starts_with("raydock: invalid `--env` name")
+                    && !message.contains("bad/env"),
                 "{args:?}: {message}"
             );
         }
@@ -335,6 +338,7 @@ mod tests {
             &["claude", "private prompt", "--local", "--via", "env"][..],
             &["top", "--env", "--auth-token=secret-value"][..],
             &["--env", "--auth-token=secret-value", "status"][..],
+            &["--env=--auth-token=secret-value", "status"][..],
         ] {
             let message = usage_message(args);
             assert!(
