@@ -147,6 +147,7 @@ async fn forward_chat_completions(
                         .header("content-type", "application/json")
                         .header("anthropic-version", "2023-06-01")
                         .json(&anthropic);
+                    outbound = copy_session_headers(outbound, headers, endpoint);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
                     let resp = outbound.send().await?;
                     anthropic_response_to_chat(
@@ -202,6 +203,7 @@ async fn forward_chat_completions(
                     let forwarded =
                         without_inbound_token(headers, state.opts.inbound_guard.as_ref());
                     copy_openai_passthrough_headers(&mut outbound, &forwarded, true, client_bearer);
+                    outbound = copy_session_headers(outbound, headers, endpoint);
                     outbound = outbound.json(&body);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
                     let mut request = outbound.build()?;

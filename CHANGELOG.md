@@ -15,7 +15,7 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   doesn't know, and the error names the setting. It can't be combined with
   `--config`, since a profile file sets its own model.
 - **`prefer_local` works with any local model.** The bundled execution core
-  (`rayline-core`, now pinned to `0f84eba6`) counts Qwen3.8-27B prompts exactly
+  (`rayline-core`, now pinned to `56e6d443`) counts Qwen3.8-27B prompts exactly
   and bounds other models' text prompts by their byte size (`caller_bounded`),
   so ARC can keep a turn local only when it fits the window. It no longer needs
   a llama.cpp prompt counter. This needs the production router from
@@ -51,6 +51,16 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Fixed
 
+- **Session headers reach the Rayline router through the local router.** A
+  client that sends its session id only in a header (`x-session-affinity`,
+  `x-claude-code-session-id`, `x-session-id` or `x-conversation-id`) and goes
+  through `rld`'s local router to the hosted router, such as Claude Code in
+  Claude Desktop (`raydock claude-desktop`), lost that header on the way, so
+  the router keyed its turns on an id it derived from the request instead. The local router now
+  forwards exactly these four headers, unchanged, on Messages, Chat Completions
+  and Responses, and only when the upstream is the hosted Rayline router;
+  Anthropic, OpenAI, OpenRouter and custom endpoints never receive them. Hybrid's
+  auto-mode classifier calls carry all four as well.
 - **`hybrid start` warns when the local window cannot hold Claude Code's
   opening request.** For a model other than Qwen3.8-27B, the core reserves
   the opening request (about 73,000 tokens with no MCP servers or project

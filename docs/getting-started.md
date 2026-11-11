@@ -294,6 +294,11 @@ model ids that look like Anthropic models. The launcher therefore:
   After every start or restart the launcher checks that the router refuses a
   request without the token. If it does not (for example an `rld` older than
   the CLI), the launcher stops it and exits with an error;
+- keeps Claude Code's session together: the router forwards the client's
+  session headers (`x-claude-code-session-id`, `x-session-affinity`,
+  `x-session-id`, `x-conversation-id`) unchanged to the hosted Rayline router,
+  which keys the routing episode on them. The local router sends these
+  headers to the hosted Rayline router only, never to another provider;
 - routes only to ARC: the router config replaces the built-in endpoints, so
   no model id can reach another provider, and it restarts the router when the
   key, token, config or `rld` changes. The login service pins the `rld` path

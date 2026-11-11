@@ -550,13 +550,15 @@ async fn send_classifier_to_cloud(
         .header("accept", "application/json, text/event-stream")
         .header("anthropic-version", "2023-06-01")
         .header("x-workshop-required-model", &pin.wire_model);
-    for name in ["anthropic-beta", "x-claude-code-session-id"] {
+    // The pin is the Rayline router itself (same origin as Decisions), so it
+    // gets every session header the client sent, unchanged (the same set the
+    // local router forwards to the hosted router). The router keys the call
+    // from those headers exactly as it keys the turn being classified;
+    // Claude Code's `x-claude-code-session-id` is one of its own rungs.
+    for name in std::iter::once("anthropic-beta").chain(rayline_local_router::SESSION_HEADERS) {
         if let Some(value) = parts.headers.get(name) {
             outgoing = outgoing.header(name, value);
         }
-    }
-    if let Some(session) = parts.headers.get("x-claude-code-session-id") {
-        outgoing = outgoing.header("x-conversation-id", session);
     }
     let mut observation = RequestObservation::start(state.metrics.clone(), body);
     observation.record_classifier(&pin.wire_model);
