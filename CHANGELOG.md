@@ -15,8 +15,25 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   block must now name all three pins; one written for the two earlier pins
   is refused until it has a Haiku line.
 
+### Changed
+
+- **Hybrid mode now prefers your local model by default.** With no
+  `hybrid.routing.policy` set and a local model available, Raydock asks for
+  `prefer_local`: the local model takes a turn whenever the router predicts
+  it will succeed (`min_p_pass`, default 0.65), and other turns are decided
+  on value and price as before, which may pick Haiku. Set
+  `"policy": "utility"` for the previous behaviour, which can pick a cheap
+  cloud model over the local one. Sessions without a local model still use
+  `utility`.
+
 ### Fixed
 
+- **`raydock claude --config` stops when it can't read the config file.**
+  A missing or malformed `--config` file used to be treated as a config
+  that leaves the main agent on your Claude subscription, so main traffic
+  went straight to Anthropic instead of the routing you named. The launch
+  now fails at once with `cannot read --config <path>: <reason>`, as
+  `raydock codex` does.
 - **Claude Code in hybrid mode works with llama.cpp chat templates that
   require the system message first** (such as Qwen3.8-27B). The bundled
   execution core (`rayline-core`, now pinned to `80ce3d26`) moves a system

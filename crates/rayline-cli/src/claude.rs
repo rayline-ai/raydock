@@ -676,6 +676,21 @@ async fn run_command_from_home(
     } else {
         request.config_path.clone()
     };
+    // Every reader below takes a config it cannot read or parse as "main stays on
+    // the subscription", so a mistyped `--config` path would quietly send main
+    // traffic to Anthropic instead of the routing it names. Stop here instead.
+    if let Some(path) = effective_config.as_deref() {
+        std::fs::read(path)
+            .map_err(|error| error.to_string())
+            .and_then(|raw| {
+                serde_json::from_slice::<serde_json::Value>(&raw)
+                    .map(drop)
+                    .map_err(|error| error.to_string())
+            })
+            .map_err(|error| {
+                RunError::Router(format!("cannot read --config {}: {error}", path.display()))
+            })?;
+    }
     let config_engages_local = request.routing_mode != RoutingMode::Override
         && effective_config
             .as_deref()
@@ -3149,6 +3164,53 @@ mod refusal_recovery_env_tests {
                 ),
             ]
         );
+    }
+
+    /// A `--config` that cannot be read or parsed stops the launch with an error
+    /// naming it, before any router starts, instead of leaving main traffic on
+    /// the subscription.
+    #[tokio::test]
+    async fn a_config_it_cannot_read_stops_the_launch() {
+        let home =
+            std::env::temp_dir().join(format!("rayline-cli-missing-config-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let malformed = home.join("malformed.json");
+        std::fs::write(&malformed, "{\"routes\":").unwrap();
+        for config in [home.join("DOES-NOT-EXIST.json"), malformed] {
+            let request = RunRequest {
+                env_name: None,
+                auth_token: None,
+                args: Vec::new(),
+                model: None,
+                local_provider: None,
+                local_provider_model: None,
+                auto_compact_window: None,
+                local_router: false,
+                isolated: true,
+                local_injector_port: None,
+                routing_mode: RoutingMode::Proxy,
+                route_scope_explicit: false,
+                route_statusline_enabled: false,
+                diagnose: false,
+                upstream_ca_path: None,
+                router_config_path: None,
+                config_path: Some(config.clone()),
+                root_env_explicit: false,
+            };
+            let error =
+                match run_command_from_home(&request, &home, PathBuf::from("/nonexistent/claude"))
+                    .await
+                {
+                    Ok(_) => panic!("{} launched", config.display()),
+                    Err(error) => error.to_string(),
+                };
+            assert!(
+                error.starts_with(&format!("cannot read --config {}: ", config.display())),
+                "{error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
