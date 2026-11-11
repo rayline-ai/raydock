@@ -28,6 +28,12 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Fixed
 
+- **`raydock claude --config` stops when it can't read the config file.**
+  A missing or malformed `--config` file used to be treated as a config
+  that leaves the main agent on your Claude subscription, so main traffic
+  went straight to Anthropic instead of the routing you named. The launch
+  now fails at once with `cannot read --config <path>: <reason>`, as
+  `raydock codex` does.
 - **Claude Code in hybrid mode works with llama.cpp chat templates that
   require the system message first** (such as Qwen3.8-27B). The bundled
   execution core (`rayline-core`, now pinned to `80ce3d26`) moves a system
