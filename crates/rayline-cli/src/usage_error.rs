@@ -357,6 +357,10 @@ mod tests {
             "raydock: `--env` goes before the command: `raydock --env <name> claude-desktop status`"
         );
         assert_eq!(
+            usage_message(&["claude-desktop", "--env=dev"]),
+            "raydock: `--env` goes before the command: `raydock --env <name> claude-desktop`"
+        );
+        assert_eq!(
             usage_message(&["top", "--json", "--env"]),
             "raydock: `raydock top` rejected `--env` after `--json`\n\
              raydock: `--env` goes before the command: `raydock --env <name> top`"
