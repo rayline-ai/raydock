@@ -92,8 +92,8 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
    With no profile file, `start` builds the default profile:
    - Decisions come from your signed-in router's `arc-swift-1.0` model.
    - Your `local_model` is the local target.
-   - Claude Opus 5.5 and Sonnet 5.5, through the same router, are the cloud
-     targets.
+   - Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5, through the same router, are
+     the cloud targets.
 
    Rayline uses the context window your runtime reports, so load it with the
    window you want:
@@ -190,17 +190,19 @@ core adds the output limit, then tells ARC whether the request fits.
 
 The default profile sets the local output limit to a quarter of the local
 window, at most 32,000 tokens (24,576 at the default 96k window). Each cloud
-target takes its own model's ceiling, 128,000 tokens on both Claude 5.5 pins,
-so a cloud answer is not capped at a fraction of what the model allows. Set
-`hybrid.cloud_output_tokens` to declare those ceilings yourself, keyed by the
-pinned model:
+target takes its own model's ceiling, 128,000 tokens on each of the three
+Claude 5.5 pins, so a cloud answer is not capped at a fraction of what the
+model allows. Set `hybrid.cloud_output_tokens` to declare those ceilings
+yourself, keyed by the pinned model. The block names every pinned model or
+`start` refuses it, so one written before Haiku was pinned needs a Haiku line:
 
 ```json
 {
   "hybrid": {
     "cloud_output_tokens": {
       "claude-opus-5-5": 128000,
-      "claude-sonnet-5-5": 128000
+      "claude-sonnet-5-5": 128000,
+      "claude-haiku-5-5": 128000
     }
   }
 }
