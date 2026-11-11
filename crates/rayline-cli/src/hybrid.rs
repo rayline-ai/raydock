@@ -496,6 +496,11 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     command.env_remove(name);
                 }
             }
+            // Here, not in harness_command: preparing may run Hermes, and the
+            // probe and repair must carry the launch's final environment.
+            if harness == "hermes" && cfg!(windows) {
+                crate::harness::hermes::prepare_launch(&command).map_err(io::Error::other)?;
+            }
             let status = command.status()?;
             return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
         }
@@ -930,15 +935,6 @@ fn harness_command(
             };
             let plan = harness.plan(&ctx).map_err(io::Error::other)?;
             crate::harness::write_files(&config_dir, &plan.files)?;
-            if harness == crate::harness::Harness::Hermes && cfg!(windows) {
-                crate::harness::hermes::prepare_home(&config_dir, |args| {
-                    let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-                    let mut command = crate::harness::build_command(&program, &plan, None, &args);
-                    command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
-                    crate::harness::hermes::finish(command)
-                })
-                .map_err(io::Error::other)?;
-            }
             // The per-launch id is opt-in here as on the hosted path, and is
             // exported only when a rendered config references it.
             let conversation_id =

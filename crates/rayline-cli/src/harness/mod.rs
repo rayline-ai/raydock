@@ -638,12 +638,6 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         harness.name(),
         config_dir.display()
     );
-    if harness == Harness::Hermes && cfg!(windows) {
-        hermes::prepare_home(&config_dir, |args| {
-            let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-            hermes::finish(build_command(&binary, &plan, None, &args))
-        })?;
-    }
     let args = match harness {
         Harness::OpenClaw => {
             let env_container =
@@ -670,7 +664,11 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         Harness::OpenCode => opencode_args(&request.args, ctx.harness_major_version),
         _ => request.args,
     };
-    Ok(build_command(&binary, &plan, conv_id.as_deref(), &args))
+    let command = build_command(&binary, &plan, conv_id.as_deref(), &args);
+    if harness == Harness::Hermes && cfg!(windows) {
+        hermes::prepare_launch(&command)?;
+    }
+    Ok(command)
 }
 
 /// OpenCode's args with `--standalone` where OpenCode 2 would attach to its
