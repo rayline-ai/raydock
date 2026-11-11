@@ -1967,7 +1967,7 @@ async fn parse_anthropic_unary_response(
 
 fn memory_summarize_to_responses_request(body: &Value, model: &str) -> Value {
     let traces = body.get("traces").cloned().unwrap_or_else(|| json!([]));
-    let mut request = json!({
+    json!({
         "model": model,
         "instructions": "Summarize the supplied memory traces. Return concise durable memory summaries. If possible, return JSON with an output array of objects containing trace_summary and memory_summary.",
         "input": [{
@@ -1980,14 +1980,7 @@ fn memory_summarize_to_responses_request(body: &Value, model: &str) -> Value {
         }],
         "stream": false,
         "max_output_tokens": 2048,
-    });
-    // Keep the client's session id, so the side call stays in its session.
-    for field in ["session_id", "prompt_cache_key"] {
-        if let Some(value) = body.get(field) {
-            request[field] = value.clone();
-        }
-    }
-    request
+    })
 }
 
 fn parse_memory_summarize_output(request_body: &Value, text: &str) -> Value {

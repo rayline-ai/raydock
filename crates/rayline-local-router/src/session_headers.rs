@@ -439,8 +439,6 @@ mod tests {
                                      "messages": [{"role": "user", "content": "hi"}]}),
             "/v1/chat/completions" => json!({"model": "rayline-auto",
                                              "messages": [{"role": "user", "content": "hi"}]}),
-            "/v1/memories/trace_summarize" => json!({"model": "rayline-auto",
-                                                     "traces": [{"id": "t1", "text": "hi"}]}),
             _ => json!({"model": "rayline-auto", "stream": false, "input": "hi"}),
         };
         if let (Some(body), Some(fields)) = (body.as_object_mut(), body_fields.as_object()) {
@@ -538,14 +536,12 @@ mod tests {
 
     /// Surfaces where the router rebuilds the client's body for another
     /// protocol, dropping its `session_id` and `prompt_cache_key`.
-    const REBUILT_BODY_SURFACES: [(&str, &str); 8] = [
+    const REBUILT_BODY_SURFACES: [(&str, &str); 6] = [
         ("/v1/chat/completions", "anthropic_messages"),
         ("/v1/responses", "anthropic_messages"),
         ("/v1/responses", "openai_chat"),
         ("/v1/responses/compact", "anthropic_messages"),
         ("/v1/responses/compact", "openai_chat"),
-        ("/v1/memories/trace_summarize", "anthropic_messages"),
-        ("/v1/memories/trace_summarize", "openai_chat"),
         ("/v1/messages", "openai_chat"),
     ];
 
@@ -556,10 +552,10 @@ mod tests {
         ("/v1/messages", "anthropic_messages"),
     ];
 
-    /// Whether the client's body on `inbound_path` has no `messages` array, so
-    /// the router reads its `prompt_cache_key`.
+    /// Whether the client's body on `inbound_path` is a Responses body (no
+    /// `messages` array), so the router reads its `prompt_cache_key`.
     fn is_responses(inbound_path: &str) -> bool {
-        inbound_path.starts_with("/v1/responses") || inbound_path.starts_with("/v1/memories")
+        inbound_path.starts_with("/v1/responses")
     }
 
     async fn body_id_case(
@@ -767,33 +763,6 @@ mod tests {
                 body["prompt_cache_key"], "pck-1",
                 "{inbound_path} -> {protocol}"
             );
-        }
-    }
-
-    /// The memory-summary side call keeps the client's ids in the Responses
-    /// request it builds, only so they can be read here: the translation to
-    /// the upstream protocol drops them, so neither field reaches the wire.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn memory_summary_body_ids_never_reach_the_upstream_body() {
-        for protocol in ["anthropic_messages", "openai_chat"] {
-            for hosted in [true, false] {
-                let raw = body_id_case(
-                    "/v1/memories/trace_summarize",
-                    protocol,
-                    hosted,
-                    &[],
-                    json!({"session_id": "task-1", "prompt_cache_key": "pck-1"}),
-                )
-                .await;
-                let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-                let body: Value = serde_json::from_str(body).expect("upstream body is JSON");
-                for field in ["session_id", "prompt_cache_key"] {
-                    assert!(
-                        body.get(field).is_none(),
-                        "{protocol} hosted={hosted}: {field}"
-                    );
-                }
-            }
         }
     }
 
