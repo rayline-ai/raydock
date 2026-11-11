@@ -173,8 +173,9 @@ pub(crate) fn rejected_argv(
         });
     }
     let message = match (bad.starts_with('-'), option_name(bad)) {
-        (true, Some(name)) if bad.contains('=') && after.is_empty() => {
-            format!("raydock: `raydock {words}` rejected the value of `{name}`")
+        // The value is not shown; `=…` marks that one was given.
+        (true, Some(name)) if bad.contains('=') => {
+            format!("raydock: `raydock {words}` rejected `{name}=…`{after}")
         }
         (true, Some(name)) => format!("raydock: `raydock {words}` rejected `{name}`{after}"),
         (true, None) => format!("raydock: `raydock {words}` rejected an option{after}"),
@@ -487,9 +488,13 @@ mod tests {
         let message = usage_message(&["codex", "--auth", "--env", "dev"]);
         assert!(message.starts_with("raydock: `raydock codex` rejected `--env` after `--auth`"));
         let message = usage_message(&["codex", "--auth", "--env=dev"]);
-        assert!(message.starts_with("raydock: `raydock codex` rejected `--env` after `--auth`"));
+        assert!(message.starts_with("raydock: `raydock codex` rejected `--env=…` after `--auth`"));
         let message = usage_message(&["claude", "--via=bogus"]);
-        assert!(message.starts_with("raydock: `raydock claude` rejected the value of `--via`"));
+        assert!(message.starts_with("raydock: `raydock claude` rejected `--via=…`"));
+        let message = usage_message(&["claude", "--local", "--via=bogus"]);
+        assert!(
+            message.starts_with("raydock: `raydock claude` rejected `--via=…` after `--local`")
+        );
     }
 
     #[test]
