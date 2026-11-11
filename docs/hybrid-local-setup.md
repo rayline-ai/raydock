@@ -10,8 +10,10 @@ reference and validation scripts, see [ARC hybrid execution](hybrid-routing.md).
 
 ## Requirements
 
-- macOS 13 or later, or Linux, with a Rayline release installed. The release
-  includes `raydock`, `rld` and `rayline-core`.
+- macOS 13 or later, Linux, or Windows 10/11 (x86_64), with a Rayline release
+  installed. The release includes `raydock`, `rld` and `rayline-core`. Windows
+  needs 0.4.2 or later and runs natively, without WSL; it has been tested with
+  Ollama.
 - A local inference server with your Qwen model: llama.cpp, Ollama or MLX.
   Rayline does not start, download or stop it.
 - Memory for Qwen3.8-27B: plan for at least 32 GB (unified memory on a Mac).
