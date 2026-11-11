@@ -148,7 +148,7 @@ async fn forward_chat_completions(
                         .header("anthropic-version", "2023-06-01")
                         .json(&anthropic);
                     outbound =
-                        copy_session_ids_for_rebuilt_body(outbound, headers, parsed, endpoint);
+                        copy_session_headers_for_rebuilt_body(outbound, headers, parsed, endpoint);
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
                     let resp = outbound.send().await?;
                     anthropic_response_to_chat(

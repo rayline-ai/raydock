@@ -41,7 +41,7 @@ use anthropic_usage::AnthropicUsage;
 pub use inbound_guard::InboundGuard;
 mod session_headers;
 pub use session_headers::SESSION_HEADERS;
-use session_headers::{copy_session_headers, copy_session_ids_for_rebuilt_body};
+use session_headers::{copy_session_headers, copy_session_headers_for_rebuilt_body};
 mod upstream_request_id;
 #[cfg(windows)]
 pub mod windows_state;
@@ -1889,7 +1889,7 @@ async fn run_synthetic_unary_response(
                     if let Some(beta) = inbound_headers.get("anthropic-beta").and_then(header_str) {
                         outbound = outbound.header("anthropic-beta", beta);
                     }
-                    outbound = copy_session_ids_for_rebuilt_body(
+                    outbound = copy_session_headers_for_rebuilt_body(
                         outbound,
                         inbound_headers,
                         client_body,
@@ -1923,7 +1923,7 @@ async fn run_synthetic_unary_response(
                         .post(url)
                         .header("content-type", "application/json")
                         .json(&request_body);
-                    outbound = copy_session_ids_for_rebuilt_body(
+                    outbound = copy_session_headers_for_rebuilt_body(
                         outbound,
                         inbound_headers,
                         client_body,
@@ -2719,7 +2719,7 @@ async fn forward_responses_to_anthropic_endpoint(
     if let Some(beta) = inbound_headers.get("anthropic-beta").and_then(header_str) {
         outbound = outbound.header("anthropic-beta", beta);
     }
-    outbound = copy_session_ids_for_rebuilt_body(outbound, inbound_headers, body, endpoint);
+    outbound = copy_session_headers_for_rebuilt_body(outbound, inbound_headers, body, endpoint);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
     let resp = outbound.send().await?;
     anthropic_response_to_responses(
@@ -2798,7 +2798,7 @@ async fn forward_responses_to_openai_chat_endpoint(
         .post(url)
         .header("content-type", "application/json")
         .json(&request_body);
-    outbound = copy_session_ids_for_rebuilt_body(outbound, inbound_headers, body, endpoint);
+    outbound = copy_session_headers_for_rebuilt_body(outbound, inbound_headers, body, endpoint);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
     let resp = outbound.send().await?;
     let status = resp.status();
@@ -3000,7 +3000,7 @@ async fn forward_openai_chat_endpoint(
         .post(url)
         .header("content-type", "application/json")
         .json(&request_body);
-    outbound = copy_session_ids_for_rebuilt_body(outbound, inbound_headers, &body, endpoint);
+    outbound = copy_session_headers_for_rebuilt_body(outbound, inbound_headers, &body, endpoint);
     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
     let resp = outbound.send().await?;
     let status = resp.status();

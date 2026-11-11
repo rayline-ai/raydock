@@ -81,7 +81,7 @@ const BODY_SESSION_ID_LIMIT: usize = 1024;
 /// messages and separate sessions would merge. A builder that forwards the
 /// client's body as is keeps those fields and must use
 /// [`copy_session_headers`] alone.
-pub(crate) fn copy_session_ids_for_rebuilt_body(
+pub(crate) fn copy_session_headers_for_rebuilt_body(
     outbound: reqwest::RequestBuilder,
     inbound_headers: &HeaderMap,
     inbound_body: &Value,
@@ -103,7 +103,7 @@ pub(crate) fn copy_session_ids_for_rebuilt_body(
     if header_names_session {
         return outbound;
     }
-    match body_session_id(inbound_headers, inbound_body) {
+    match session_from_body(inbound_headers, inbound_body) {
         Some(id) => outbound.header(BODY_SESSION_ID_HEADER, id),
         None => outbound,
     }
@@ -126,7 +126,7 @@ pub(crate) fn copy_session_ids_for_rebuilt_body(
 ///
 /// A value is trimmed and must be non-empty printable ASCII; anything else is
 /// skipped, as a header could not carry it unchanged.
-fn body_session_id(inbound_headers: &HeaderMap, body: &Value) -> Option<String> {
+fn session_from_body(inbound_headers: &HeaderMap, body: &Value) -> Option<String> {
     let field = |name: &str, limit: usize| {
         body.get(name)
             .and_then(Value::as_str)
@@ -767,11 +767,11 @@ mod tests {
                 hyper::header::HeaderValue::from_static(value),
             );
         }
-        body_session_id(&map, &body)
+        session_from_body(&map, &body)
     }
 
     #[test]
-    fn body_session_id_follows_the_hosted_ladder() {
+    fn session_from_body_follows_the_hosted_ladder() {
         let codex = [("originator", "codex_exec")];
         // Responses body: Codex prefers prompt_cache_key, anyone else session_id.
         let both = json!({"input": "hi", "session_id": "s", "prompt_cache_key": "p"});
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn body_session_id_skips_values_a_header_cannot_carry_unchanged() {
+    fn session_from_body_skips_values_a_header_cannot_carry_unchanged() {
         // Trimmed; a blank value falls through to the next id.
         assert_eq!(
             picked(&[], json!({"session_id": "  s  "})).as_deref(),
