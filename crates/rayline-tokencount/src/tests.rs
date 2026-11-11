@@ -175,3 +175,16 @@ fn generation_tags_render_their_body_unchanged() {
     let body = json!({"messages": [{"role": "user", "content": "x"}]});
     assert!(counter.count_chat(&body).is_ok());
 }
+
+#[test]
+fn templates_can_look_at_the_next_and_previous_message() {
+    // Qwen's template closes a run of tool results by peeking ahead.
+    let template = "{%- for m in messages %}{% if loop.previtem and loop.previtem.role != m.role %}|{% endif %}{{ m.role }}{% if not loop.last and loop.nextitem.role == 'tool' %}>{% endif %}{% endfor %}";
+    let counter = PromptCounter::new(&tokenizer(), template, None).unwrap();
+    let body = json!({"messages": [
+        {"role": "user", "content": "x"},
+        {"role": "assistant", "content": "y"},
+        {"role": "tool", "content": "z"}
+    ]});
+    assert!(counter.count_chat(&body).is_ok());
+}
