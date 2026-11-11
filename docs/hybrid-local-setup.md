@@ -32,11 +32,10 @@ execution models remain unknown rather than showing the harness's virtual model.
 
 ## What it costs
 
-Every turn of a hybrid session bills one ARC decision against your Rayline
-balance, including turns that run on your machine; a cloud turn additionally
-bills the provider's pass-through price. The local model's price in the profile
-(0 by default) steers which target ARC selects; it never changes what the
-decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
+Hybrid sessions are billed to your Rayline account, including turns that
+run on your machine. See [ARC pricing](https://docs.rayline.ai/arc/pricing)
+for how, and [rayline.ai/pricing](https://rayline.ai/pricing) for current
+rates.
 
 ## Three steps
 
@@ -136,30 +135,25 @@ decision costs. See [ARC pricing](https://docs.rayline.ai/arc/pricing).
 ## Pricing defaults
 
 These are the prices Raydock tells ARC, which steer selection; they are not
-what you are charged (see "What it costs" above). On-device inference costs
-you about nothing per token. The default profile
-therefore prices the local model at 0 per million tokens on every leg, sends
-those caller prices (the cloud models keep their catalog prices), and asks ARC
-Swift, which decides at its own fixed V and picks cheap. Under these defaults
-easy work stays on device and harder work goes to the cloud. Change the local
-price in the override block with `local_price` (USD per million tokens, applied
-to every leg of the local model).
+what you are charged (see "What it costs" above). The default profile prices
+the local model at 0 per million tokens on every leg, sends those caller
+prices (the cloud models keep their catalog prices), and asks ARC Swift for
+decisions. Change the local price in the override block with `local_price`
+(USD per million tokens, applied to every leg of the local model).
 
 ## Routing policy
 
 With no override and a local model in the session, Raydock sends the
-**prefer-local** preset, `arc-policy.prefer-local.v1`, on every decision: the
-local model takes a turn whenever ARC predicts it will pass (`p_pass >= 0.65`),
-and the hybrid default's value-and-price choice decides the rest. A session
-with no local model sends the **hybrid default** preset,
-`arc-policy.hybrid-default.v1`. Under either preset:
+**prefer-local** preset, `arc-policy.prefer-local.v1`, on every decision. A
+session with no local model sends the **hybrid default** preset,
+`arc-policy.hybrid-default.v1`. How ARC applies each preset is described in
+the [ARC hybrid routing policies](https://docs.rayline.ai/arc/routes/hybrid) and may change on the
+service side. Under either preset:
 
 - **The model** may change at cache boundaries: task start, a subagent start, a
   compaction, or a typed user turn whose cache is cold.
 - **The thinking level** may change on every turn.
 - **The capacity handoff** is always allowed (below).
-
-Easy work stays on device. Harder work and context spills go to the cloud.
 
 ### The optional override block
 
@@ -173,8 +167,8 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 
 | Key | Meaning |
 | --- | --- |
-| `policy` | `prefer_local` (the default when the session has a local model) selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and otherwise the default utility selection decides over every eligible target, so the local model can still win below the threshold. `utility` selects the hybrid default preset, which weighs each model's predicted success against its price and can pick a cheap cloud model such as Haiku over the local one. It works with the default profile and any local model. `start` refuses `prefer_local` when the session has no local target. |
-| `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65; lower keeps more turns local. It is refused with `utility`. |
+| `policy` | `prefer_local` (the default when the session has a local model) selects `arc-policy.prefer-local.v1`, which favours the local model when ARC predicts it will succeed. `utility` selects `arc-policy.hybrid-default.v1`. `start` refuses `prefer_local` when the session has no local target. |
+| `min_p_pass` | The prefer-local threshold, in (0, 1); lower keeps more turns local. Unset, the service's default applies. It is refused with `utility`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
 | `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). It must be 0 or between 1e-6 and 1e6. `start --config` refuses it, because a profile file sets its own prices. |
 
