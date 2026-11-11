@@ -132,7 +132,10 @@ pub(crate) fn rejected_argv(
     if command[0] == "claude" && !is_claude_value && crate::is_claude_management_subcommand(bad) {
         return RaylineDispatch::Unavailable(format!("claude {bad}"));
     }
-    if bad == "--env" || bad.starts_with("--env=") {
+    // Only these commands have no `--env` of their own; elsewhere a rejected
+    // `--env` was read as another option's value (`codex --auth --env dev`).
+    let without_env = matches!(command[0], "top" | "router" | "local" | "update");
+    if without_env && (bad == "--env" || bad.starts_with("--env=")) {
         return RaylineDispatch::Usage(misplaced_env(&command));
     }
     // Only option names are echoed: a rejected word may be a prompt or a key.
@@ -438,6 +441,8 @@ mod tests {
         // A private-build flag is an ordinary rejected option here.
         let message = usage_message(&["claude", "--no-telemetry"]);
         assert!(message.starts_with("raydock: `raydock claude` rejected `--no-telemetry`"));
+        let message = usage_message(&["codex", "--auth", "--env", "dev"]);
+        assert!(message.starts_with("raydock: `raydock codex` rejected `--env` after `--auth`"));
         let message = usage_message(&["claude", "--via=bogus"]);
         assert!(message.starts_with("raydock: `raydock claude` rejected the value of `--via`"));
     }
