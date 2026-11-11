@@ -55,6 +55,18 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   and Responses, and only when the upstream is the hosted Rayline router;
   Anthropic, OpenAI, OpenRouter and custom endpoints never receive them. Hybrid's
   auto-mode classifier calls carry all four as well.
+- **Session ids sent in the request body survive translation in the local
+  router.** When the local router turns a request into another protocol (Chat
+  Completions or Responses into Messages, Responses or Messages into Chat
+  Completions), the rebuilt body dropped the client's `session_id` and
+  `prompt_cache_key`, so separate sessions merged into one conversation. Seen
+  with Codex through a gateway with a Messages upstream and with Cline's
+  OpenRouter provider. The local router now sends that id to the hosted Rayline
+  router as `x-session-affinity`, picking it the way the router would from the
+  original body: Codex's `prompt_cache_key` first, then `session_id`, then a
+  Responses `prompt_cache_key`. A session header the client sent still wins,
+  requests forwarded without translation are unchanged, and no other upstream
+  receives the header.
 - **`hybrid start` warns when the local window cannot hold Claude Code's
   opening request.** For a model other than Qwen3.8-27B, the core reserves
   the opening request (about 73,000 tokens with no MCP servers or project
