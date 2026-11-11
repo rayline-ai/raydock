@@ -157,6 +157,21 @@ With no override, Raydock sends the **hybrid default** preset,
 
 Easy work stays on device. Harder work and context spills go to the cloud.
 
+> **Keeping turns on your local model.** The hybrid default weighs each
+> model's predicted chance of success against its price. Claude Haiku 5.5 is
+> cheap, so when ARC predicts it is clearly more likely to succeed than your
+> local model, the default picks Haiku even though local costs nothing. How
+> often that happens depends on the task and the local model. To use the
+> local model whenever ARC predicts it will pass, set:
+>
+> ```json
+> {"hybrid": {"routing": {"policy": "prefer_local"}}}
+> ```
+>
+> The threshold defaults to 0.65. Lower `min_p_pass` keeps more turns local.
+> Below the threshold, `prefer_local` falls back to the default choice, so
+> those turns can still go to Haiku.
+
 ### The optional override block
 
 Every key in this block, in `~/.config/rayline/settings.json`, is optional:
