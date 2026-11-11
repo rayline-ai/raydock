@@ -22,6 +22,7 @@ const OPTIONAL: &[&str] = &[
     rayline_tokencount::TEMPLATE_FILE,
     rayline_tokencount::TOKENIZER_CONFIG_FILE,
     rayline_tokencount::PROCESSOR_FILE,
+    rayline_tokencount::PREPROCESSOR_FILE,
 ];
 
 /// The repo to count `registry_model` with: `hybrid.local_tokenizer` (a repo
@@ -107,6 +108,20 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
         return Err(format!("{repo} publishes no chat template"));
     }
     Ok(dir)
+}
+
+/// The cached snapshot, without the network: what `start` uses when the
+/// Hub does not answer in time.
+pub(crate) fn cached(repo: &str) -> Option<PathBuf> {
+    let dir = rayline_hf::hf_cache_snapshot_path(repo, "", &cached_commit(repo)?);
+    let complete = dir.join(rayline_tokencount::TOKENIZER_FILE).is_file()
+        && [
+            rayline_tokencount::TEMPLATE_FILE,
+            rayline_tokencount::TOKENIZER_CONFIG_FILE,
+        ]
+        .iter()
+        .any(|file| dir.join(file).is_file());
+    complete.then_some(dir)
 }
 
 /// The commit `refs/main` names in the Hugging Face cache.

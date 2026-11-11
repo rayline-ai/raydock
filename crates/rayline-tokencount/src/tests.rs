@@ -113,3 +113,53 @@ fn units_name_the_tokenizer_and_template() {
     let other = PromptCounter::new(&tokenizer(), "{{ messages | length }}", None).unwrap();
     assert_ne!(first.units(), other.units());
 }
+
+#[test]
+fn a_saved_truncation_or_padding_does_not_change_the_count() {
+    let mut saved: Value = serde_json::from_slice(&tokenizer()).unwrap();
+    saved["truncation"] =
+        json!({"direction": "Right", "max_length": 2, "strategy": "LongestFirst", "stride": 0});
+    saved["padding"] = json!({"strategy": {"Fixed": 64}, "direction": "Right", "pad_to_multiple_of": null, "pad_id": 0, "pad_type_id": 0, "pad_token": "[UNK]"});
+    let saved = PromptCounter::new(&serde_json::to_vec(&saved).unwrap(), TEMPLATE, None).unwrap();
+    let body = json!({"messages": [{"role": "user", "content": "one two three four five six"}]});
+    assert_eq!(
+        saved.count_chat(&body).unwrap(),
+        counter(None).count_chat(&body).unwrap()
+    );
+}
+
+#[test]
+fn named_special_tokens_reach_the_template_and_tools_select_tool_use() {
+    let templates = ChatTemplates {
+        default: "{{ bos_token }} default".to_owned(),
+        tool_use: Some("{{ bos_token }} tool use with tools".to_owned()),
+    };
+    let special = special_tokens(
+        &json!({"bos_token": {"content": "<|user|>", "special": true}, "eos_token": "<|assistant|>", "model_max_length": 9}),
+    );
+    assert_eq!(special.get("bos_token"), Some(&json!("<|user|>")));
+    assert!(!special.contains_key("model_max_length"));
+    let counter = PromptCounter::build(&tokenizer(), &templates, None, special).unwrap();
+    let plain = json!({"messages": [{"role": "user", "content": "x"}]});
+    let tools =
+        json!({"messages": [{"role": "user", "content": "x"}], "tools": [{"type": "function"}]});
+    assert_eq!(counter.count_chat(&plain).unwrap().prompt_tokens, 2);
+    assert_eq!(counter.count_chat(&tools).unwrap().prompt_tokens, 5);
+}
+
+#[test]
+fn a_template_error_never_quotes_the_prompt() {
+    let counter = PromptCounter::new(
+        &tokenizer(),
+        "{{ raise_exception(messages[0].content) }}",
+        None,
+    )
+    .unwrap();
+    let error = counter
+        .count_chat(&json!({"messages": [{"role": "user", "content": "private-prompt-text"}]}))
+        .unwrap_err();
+    assert!(
+        !format!("{error:#}").contains("private-prompt-text"),
+        "{error:#}"
+    );
+}

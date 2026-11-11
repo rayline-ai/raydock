@@ -173,34 +173,48 @@ pub async fn run(args: Args) -> Result<()> {
             ),
         }
     }
-    let _counter_task = AbortOnDrop(counter_task);
-    let mut child = Command::new(&args.core)
-        .arg("--config")
-        .arg(&core_config)
-        .args(["--listen", "127.0.0.1:0"])
-        .env("RAYLINE_EXEC_AUTH_TOKEN", &core_token)
-        .env(crate::hybrid_counter::COUNTER_KEY_ENV, &counter_token)
-        .env("RAYLINE_EXEC_PARENT_PIPE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .context("start ARC execution core")?;
-    // Keep the pipe open even while Child::wait closes its own stdin handle.
-    // The core exits on EOF if rld is terminated without running cleanup.
-    let mut parent_pipe = Some(
-        child
-            .stdin
-            .take()
-            .context("execution core parent pipe unavailable")?,
-    );
-    let outcome = async {
-        let handshake = tokio::select! {
-            result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
-                result.context("execution core startup timed out")??
+    let mut counter_task = AbortOnDrop(counter_task);
+    let (mut child, mut parent_pipe) =
+        spawn_core(&args.core, &core_config, &core_token, &counter_token)?;
+    // An execution core older than the token_counter contract refuses the
+    // counted profile at startup; start it again on the plain one.
+    let first = tokio::select! {
+        result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
+            result.context("execution core startup timed out")?
+        }
+        result = &mut signals => {
+            result?;
+            stop_child(&mut child, &mut parent_pipe).await.context("stop execution core")?;
+            return Ok(());
+        }
+    };
+    let first = match first {
+        Err(error) if core_config != args.config => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "execution core refused the prompt counter; starting it without one"
+            );
+            stop_child(&mut child, &mut parent_pipe)
+                .await
+                .context("stop execution core")?;
+            if let Some(task) = counter_task.0.take() {
+                task.abort();
             }
-            result = &mut signals => { result?; return Ok(()); }
+            (child, parent_pipe) =
+                spawn_core(&args.core, &args.config, &core_token, &counter_token)?;
+            None
+        }
+        other => Some(other?),
+    };
+    let outcome = async {
+        let handshake = match first {
+            Some(handshake) => handshake,
+            None => tokio::select! {
+                result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
+                    result.context("execution core startup timed out")??
+                }
+                result = &mut signals => { result?; return Ok(()); }
+            },
         };
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -1162,6 +1176,36 @@ fn token() -> String {
     let mut bytes = [0u8; 32];
     rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn spawn_core(
+    core: &Path,
+    config: &Path,
+    core_token: &str,
+    counter_token: &str,
+) -> Result<(Child, Option<tokio::process::ChildStdin>)> {
+    let mut child = Command::new(core)
+        .arg("--config")
+        .arg(config)
+        .args(["--listen", "127.0.0.1:0"])
+        .env("RAYLINE_EXEC_AUTH_TOKEN", core_token)
+        .env(crate::hybrid_counter::COUNTER_KEY_ENV, counter_token)
+        .env("RAYLINE_EXEC_PARENT_PIPE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start ARC execution core")?;
+    // Keep the pipe open even while Child::wait closes its own stdin handle.
+    // The core exits on EOF if rld is terminated without running cleanup.
+    let parent_pipe = Some(
+        child
+            .stdin
+            .take()
+            .context("execution core parent pipe unavailable")?,
+    );
+    Ok((child, parent_pipe))
 }
 
 /// Aborts the counter's server when rld's run ends.

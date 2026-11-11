@@ -28,6 +28,8 @@ pub const TOKENIZER_FILE: &str = "tokenizer.json";
 pub const TEMPLATE_FILE: &str = "chat_template.jinja";
 pub const TOKENIZER_CONFIG_FILE: &str = "tokenizer_config.json";
 pub const PROCESSOR_FILE: &str = "processor_config.json";
+/// Where Qwen2-VL-style models publish their image sizing instead.
+pub const PREPROCESSOR_FILE: &str = "preprocessor_config.json";
 
 /// A prompt's size in the model's own tokens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,8 +42,21 @@ pub struct Count {
 pub struct PromptCounter {
     tokenizer: Tokenizer,
     env: Environment<'static>,
+    /// `transformers` renders with a `tool_use` template when the request has
+    /// tools and the model publishes one.
+    tool_template: bool,
+    /// `bos_token`, `eos_token` and the other named special tokens, which
+    /// `transformers` passes to every template.
+    special_tokens: Map<String, Value>,
     images: Option<ImageSizing>,
     units: String,
+}
+
+/// A model's chat templates: the default one and, when published, the one
+/// `transformers` selects for a request with tools.
+pub struct ChatTemplates {
+    pub default: String,
+    pub tool_use: Option<String>,
 }
 
 impl PromptCounter {
@@ -51,30 +66,59 @@ impl PromptCounter {
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let tokenizer_bytes = std::fs::read(dir.join(TOKENIZER_FILE))
             .with_context(|| format!("read {}", dir.join(TOKENIZER_FILE).display()))?;
-        let template = read_template(dir)?;
-        let processor = match std::fs::read(dir.join(PROCESSOR_FILE)) {
-            Ok(bytes) => Some(
-                serde_json::from_slice::<Value>(&bytes).context("parse processor_config.json")?,
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("read processor_config.json"),
+        let config = read_json(&dir.join(TOKENIZER_CONFIG_FILE))?;
+        let templates = read_templates(dir, config.as_ref())?;
+        let processor = match read_json(&dir.join(PROCESSOR_FILE))? {
+            Some(processor) => Some(processor),
+            None => read_json(&dir.join(PREPROCESSOR_FILE))?,
         };
-        Self::new(&tokenizer_bytes, &template, processor.as_ref())
+        let special_tokens = config.as_ref().map(special_tokens).unwrap_or_default();
+        Self::build(
+            &tokenizer_bytes,
+            &templates,
+            processor.as_ref(),
+            special_tokens,
+        )
     }
 
     pub fn new(tokenizer_json: &[u8], template: &str, processor: Option<&Value>) -> Result<Self> {
-        let tokenizer = Tokenizer::from_bytes(tokenizer_json)
+        let templates = ChatTemplates {
+            default: template.to_owned(),
+            tool_use: None,
+        };
+        Self::build(tokenizer_json, &templates, processor, Map::new())
+    }
+
+    pub fn build(
+        tokenizer_json: &[u8],
+        templates: &ChatTemplates,
+        processor: Option<&Value>,
+        special_tokens: Map<String, Value>,
+    ) -> Result<Self> {
+        let mut tokenizer = Tokenizer::from_bytes(tokenizer_json)
             .map_err(|error| anyhow!("load tokenizer.json: {error}"))?;
+        // A saved truncation or padding would change the count itself.
+        tokenizer
+            .with_truncation(None)
+            .map_err(|error| anyhow!("clear tokenizer truncation: {error}"))?;
+        tokenizer.with_padding(None);
         let mut env = environment();
-        env.add_template_owned("chat", template.to_owned())
+        env.add_template_owned("chat", templates.default.clone())
             .context("compile the chat template")?;
+        if let Some(tool_use) = &templates.tool_use {
+            env.add_template_owned("tool_use", tool_use.clone())
+                .context("compile the tool_use chat template")?;
+        }
         let images = processor
             .map(ImageSizing::from_processor_config)
             .transpose()?
             .flatten();
         let mut digest = Sha256::new();
         digest.update(Sha256::digest(tokenizer_json));
-        digest.update(Sha256::digest(template.as_bytes()));
+        digest.update(Sha256::digest(templates.default.as_bytes()));
+        if let Some(tool_use) = &templates.tool_use {
+            digest.update(Sha256::digest(tool_use.as_bytes()));
+        }
         let hex: String = digest
             .finalize()
             .iter()
@@ -84,6 +128,8 @@ impl PromptCounter {
         Ok(Self {
             tokenizer,
             env,
+            tool_template: templates.tool_use.is_some(),
+            special_tokens,
             images,
             units: format!("hf-tokenizer:{hex}"),
         })
@@ -115,7 +161,7 @@ impl PromptCounter {
         if !images.is_empty() && self.images.is_none() {
             bail!("the request has images and the model has no image processor");
         }
-        let mut context = Map::new();
+        let mut context = self.special_tokens.clone();
         context.insert("messages".into(), Value::Array(messages));
         context.insert("add_generation_prompt".into(), Value::Bool(true));
         if let Some(tools) = body
@@ -125,6 +171,11 @@ impl PromptCounter {
         {
             context.insert("tools".into(), Value::Array(tools.clone()));
         }
+        let template = if self.tool_template && context.contains_key("tools") {
+            "tool_use"
+        } else {
+            "chat"
+        };
         if let Some(effort) = body
             .get("reasoning_effort")
             .filter(|value| value.is_string())
@@ -138,11 +189,18 @@ impl PromptCounter {
         }
         let rendered = self
             .env
-            .get_template("chat")
+            .get_template(template)
             .and_then(|template| {
                 template.render(JinjaValue::from(minijinja::value::Serde(&context)))
             })
-            .map_err(|error| anyhow!("render the chat template: {error:#}"))?;
+            // Only the kind and line: a template's message can quote the prompt.
+            .map_err(|error| {
+                anyhow!(
+                    "render the chat template: {:?} at line {:?}",
+                    error.kind(),
+                    error.line()
+                )
+            })?;
         let encoding = self
             .tokenizer
             .encode(rendered, false)
@@ -162,28 +220,88 @@ impl PromptCounter {
     }
 }
 
-fn read_template(dir: &Path) -> Result<String> {
+fn read_json(path: &Path) -> Result<Option<Value>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+/// `chat_template.jinja` when published, else `tokenizer_config.json`'s
+/// `chat_template`: a string, or named templates (`default`, `tool_use`).
+fn read_templates(dir: &Path, config: Option<&Value>) -> Result<ChatTemplates> {
+    let named = |name: &str| -> Option<String> {
+        config?
+            .get("chat_template")?
+            .as_array()?
+            .iter()
+            .find(|entry| entry.get("name").and_then(Value::as_str) == Some(name))?
+            .get("template")?
+            .as_str()
+            .map(str::to_owned)
+    };
     match std::fs::read_to_string(dir.join(TEMPLATE_FILE)) {
-        Ok(template) => return Ok(template),
+        Ok(default) => {
+            return Ok(ChatTemplates {
+                default,
+                tool_use: named("tool_use"),
+            });
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error).context("read chat_template.jinja"),
     }
-    let config: Value = serde_json::from_slice(
-        &std::fs::read(dir.join(TOKENIZER_CONFIG_FILE))
-            .context("the model has no chat template")?,
-    )
-    .context("parse tokenizer_config.json")?;
-    match config.get("chat_template") {
-        Some(Value::String(template)) => Ok(template.clone()),
-        // A list of named templates: the default one renders chat.
-        Some(Value::Array(named)) => named
-            .iter()
-            .find(|entry| entry.get("name").and_then(Value::as_str) == Some("default"))
-            .and_then(|entry| entry.get("template")?.as_str())
-            .map(str::to_owned)
-            .ok_or_else(|| anyhow!("tokenizer_config.json has no default chat template")),
+    match config.and_then(|config| config.get("chat_template")) {
+        Some(Value::String(default)) => Ok(ChatTemplates {
+            default: default.clone(),
+            tool_use: None,
+        }),
+        Some(Value::Array(_)) => Ok(ChatTemplates {
+            default: named("default")
+                .ok_or_else(|| anyhow!("tokenizer_config.json has no default chat template"))?,
+            tool_use: named("tool_use"),
+        }),
         _ => bail!("the model has no chat template"),
     }
+}
+
+/// The `*_token` entries of `tokenizer_config.json` (a string or an added
+/// token's `content`) and `additional_special_tokens`, as `transformers`
+/// passes them to the template.
+fn special_tokens(config: &Value) -> Map<String, Value> {
+    let mut tokens = Map::new();
+    let Some(config) = config.as_object() else {
+        return tokens;
+    };
+    let content = |value: &Value| -> Option<Value> {
+        match value {
+            Value::String(_) => Some(value.clone()),
+            Value::Object(token) => token
+                .get("content")
+                .filter(|content| content.is_string())
+                .cloned(),
+            _ => None,
+        }
+    };
+    for (key, value) in config {
+        if key.ends_with("_token")
+            && let Some(token) = content(value)
+        {
+            tokens.insert(key.clone(), token);
+        }
+    }
+    if let Some(additional) = config
+        .get("additional_special_tokens")
+        .and_then(Value::as_array)
+    {
+        tokens.insert(
+            "additional_special_tokens".into(),
+            Value::Array(additional.iter().filter_map(content).collect()),
+        );
+    }
+    tokens
 }
 
 /// `transformers` renders tool-call arguments as objects: the template
@@ -247,14 +365,25 @@ fn tojson(value: JinjaValue, kwargs: minijinja::value::Kwargs) -> Result<JinjaVa
     let ensure_ascii: Option<bool> = kwargs.get("ensure_ascii")?;
     let indent: Option<usize> = kwargs.get("indent")?;
     let sort_keys: Option<bool> = kwargs.get("sort_keys")?;
-    let _: Option<JinjaValue> = kwargs.get("separators")?;
+    let separators: Option<Vec<String>> = kwargs.get("separators")?;
     kwargs.assert_all_used()?;
+    let separators = match separators.as_deref() {
+        None => None,
+        Some([item, key]) => Some((item.clone(), key.clone())),
+        Some(_) => {
+            return Err(Error::new(
+                ErrorKind::InvalidOperation,
+                "tojson separators must be (item, key)",
+            ));
+        }
+    };
     let json = serde_json::to_value(&value)
         .map_err(|error| Error::new(ErrorKind::BadSerialization, error.to_string()))?;
     let options = pyjson::Options {
         ensure_ascii: ensure_ascii.unwrap_or(false),
         indent,
         sort_keys: sort_keys.unwrap_or(false),
+        separators,
     };
     Ok(JinjaValue::from_safe_string(pyjson::dumps(&json, &options)))
 }

@@ -9,6 +9,9 @@ pub(crate) struct Options {
     pub ensure_ascii: bool,
     pub indent: Option<usize>,
     pub sort_keys: bool,
+    /// `(item, key)`; Python's default is `(", ", ": ")`, or `(",", ": ")`
+    /// when indented.
+    pub separators: Option<(String, String)>,
 }
 
 pub(crate) fn dumps(value: &Value, options: &Options) -> String {
@@ -44,7 +47,12 @@ fn write(value: &Value, options: &Options, depth: usize, out: &mut String) {
             for (index, (key, item)) in entries.into_iter().enumerate() {
                 separator(index, options, depth + 1, out);
                 string(key, options.ensure_ascii, out);
-                out.push_str(": ");
+                out.push_str(
+                    options
+                        .separators
+                        .as_ref()
+                        .map_or(": ", |(_, key)| key.as_str()),
+                );
                 write(item, options, depth + 1, out);
             }
             close(options, depth, out);
@@ -54,15 +62,16 @@ fn write(value: &Value, options: &Options, depth: usize, out: &mut String) {
 }
 
 fn separator(index: usize, options: &Options, depth: usize, out: &mut String) {
+    let item = options.separators.as_ref().map(|(item, _)| item.as_str());
     match options.indent {
         Some(width) => {
             if index > 0 {
-                out.push(',');
+                out.push_str(item.unwrap_or(","));
             }
             out.push('\n');
             out.extend(std::iter::repeat_n(' ', width * depth));
         }
-        None if index > 0 => out.push_str(", "),
+        None if index > 0 => out.push_str(item.unwrap_or(", ")),
         None => {}
     }
 }
@@ -109,6 +118,7 @@ mod tests {
                 ensure_ascii: false,
                 indent: None,
                 sort_keys: false,
+                separators: None,
             },
         )
     }
@@ -132,6 +142,7 @@ mod tests {
                 ensure_ascii: true,
                 indent: None,
                 sort_keys: false,
+                separators: None,
             },
         );
         assert_eq!(ascii, r#"{"k": ["\u00e9\ud83d\ude00", true]}"#);
@@ -141,8 +152,23 @@ mod tests {
                 ensure_ascii: false,
                 indent: Some(2),
                 sort_keys: false,
+                separators: None,
             },
         );
         assert_eq!(indented, "{\n  \"k\": [\n    \"é😀\",\n    true\n  ]\n}");
+    }
+
+    #[test]
+    fn honours_explicit_separators() {
+        let options = Options {
+            ensure_ascii: false,
+            indent: None,
+            sort_keys: false,
+            separators: Some((",".into(), ":".into())),
+        };
+        assert_eq!(
+            dumps(&json!({"a": [1, 2], "b": {}}), &options),
+            r#"{"a":[1,2],"b":{}}"#
+        );
     }
 }

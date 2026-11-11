@@ -10,6 +10,10 @@ use clap::{Parser, Subcommand};
 use rayline_local_router::ModelCapabilities;
 use serde_json::{Value, json};
 
+/// How long `start` waits for the local model's tokenizer files before it
+/// uses a cached copy or starts without a prompt counter.
+const TOKENIZER_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[derive(Parser)]
 #[command(
     name = "raydock hybrid",
@@ -248,12 +252,25 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         )
                         .map_err(settings_error)?
                     {
-                        let fetched = tokio::task::spawn_blocking({
+                        // The Hub gets a short deadline; past it the cached
+                        // snapshot, if any, is used and startup goes on.
+                        let fetching = tokio::task::spawn_blocking({
                             let repo = repo.clone();
                             move || crate::hybrid_tokenizer::fetch(&repo)
-                        })
-                        .await
-                        .map_err(|error| io::Error::other(error.to_string()))?;
+                        });
+                        let fetched = match tokio::time::timeout(TOKENIZER_FETCH_DEADLINE, fetching)
+                            .await
+                        {
+                            Ok(joined) => {
+                                joined.map_err(|error| io::Error::other(error.to_string()))?
+                            }
+                            Err(_) => crate::hybrid_tokenizer::cached(&repo).ok_or_else(|| {
+                                format!(
+                                    "Hugging Face did not answer within {}s and nothing is cached",
+                                    TOKENIZER_FETCH_DEADLINE.as_secs()
+                                )
+                            }),
+                        };
                         match fetched {
                             Ok(dir) => {
                                 println!(
