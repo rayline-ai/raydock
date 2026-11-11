@@ -125,10 +125,19 @@ pub(crate) fn rejected_argv(
     if bad == "--env" || bad.starts_with("--env=") {
         return RaylineDispatch::Usage(misplaced_env(&command));
     }
-    let message = format!(
-        "raydock: `raydock {}` does not accept `{shown}`",
-        command.join(" ")
-    );
+    let message = if is_option_value {
+        // The value is not echoed: it may be a prompt or a key.
+        format!(
+            "raydock: invalid value for `{}` in `raydock {}`",
+            args[stop - 1],
+            command.join(" ")
+        )
+    } else {
+        format!(
+            "raydock: `raydock {}` does not accept `{shown}`",
+            command.join(" ")
+        )
+    };
     RaylineDispatch::Usage(with_usage(message, &command))
 }
 
@@ -254,7 +263,9 @@ mod tests {
         assert!(message.ends_with("Run `raydock router start --help` for details."));
 
         let message = usage_message(&["router", "start", "--route", "bogus"]);
-        assert!(message.starts_with("raydock: `raydock router start` does not accept `bogus`"));
+        assert!(
+            message.starts_with("raydock: invalid value for `--route` in `raydock router start`")
+        );
     }
 
     #[test]
@@ -333,6 +344,7 @@ mod tests {
             &["--env", "--auth-token=secret-value", "status"][..],
             &["--env=--auth-token=secret-value", "status"][..],
             &["top", "--env", "secret-value"][..],
+            &["claude", "--via", "secret-value"][..],
         ] {
             let message = usage_message(args);
             assert!(
@@ -368,7 +380,7 @@ mod tests {
     #[test]
     fn management_word_as_an_option_value_is_a_usage_error() {
         let message = usage_message(&["claude", "--via", "login"]);
-        assert!(message.starts_with("raydock: `raydock claude` does not accept `login`"));
+        assert!(message.starts_with("raydock: invalid value for `--via` in `raydock claude`"));
     }
 
     #[test]
