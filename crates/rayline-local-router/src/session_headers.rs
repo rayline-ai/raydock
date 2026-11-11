@@ -64,9 +64,9 @@ pub(crate) fn copy_session_headers(
 }
 
 /// The header a body-borne session id travels in once the local router has
-/// rebuilt the body. The hosted router reads it on every protocol, at the same
-/// rank as a body `session_id`, and it is one of `SESSION_HEADERS`.
-const BODY_SESSION_ID_HEADER: &str = "x-session-affinity";
+/// rebuilt the body: `x-session-affinity`, which the hosted router reads on
+/// every protocol at the same rank as a body `session_id`.
+const BODY_SESSION_ID_HEADER: &str = SESSION_HEADERS[0];
 
 /// The longest body `session_id` carried: the hosted router reads no longer
 /// one either.
@@ -527,7 +527,7 @@ mod tests {
         .await;
         assert_eq!(captured_header_values(&raw, "x-session-id"), ["configured"]);
         assert_eq!(
-            captured_header_values(&raw, "x-session-affinity"),
+            captured_header_values(&raw, BODY_SESSION_ID_HEADER),
             ["affinity-1"]
         );
     }
@@ -595,7 +595,7 @@ mod tests {
             )
             .await;
             assert_eq!(
-                captured_header_values(&raw, "x-session-affinity"),
+                captured_header_values(&raw, BODY_SESSION_ID_HEADER),
                 ["task-1"],
                 "{inbound_path} -> {protocol}"
             );
@@ -626,7 +626,7 @@ mod tests {
                 &[]
             };
             assert_eq!(
-                captured_header_values(&raw, "x-session-affinity"),
+                captured_header_values(&raw, BODY_SESSION_ID_HEADER),
                 expected,
                 "{inbound_path} -> {protocol}"
             );
@@ -662,12 +662,12 @@ mod tests {
         )
         .await;
         assert_eq!(
-            captured_header_values(&raw, "x-session-affinity"),
+            captured_header_values(&raw, BODY_SESSION_ID_HEADER),
             ["pck-1"]
         );
         let raw = body_id_case("/v1/responses", "anthropic_messages", true, &[], both).await;
         assert_eq!(
-            captured_header_values(&raw, "x-session-affinity"),
+            captured_header_values(&raw, BODY_SESSION_ID_HEADER),
             ["task-1"]
         );
     }
@@ -677,22 +677,29 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn client_session_header_wins_over_a_body_id() {
         let body = json!({"session_id": "task-1", "prompt_cache_key": "pck-1"});
-        for (inbound_path, protocol) in REBUILT_BODY_SURFACES {
-            for (name, value) in SESSION_HEADER_VALUES {
-                let raw =
-                    body_id_case(inbound_path, protocol, true, &[(name, value)], body.clone())
-                        .await;
-                assert_eq!(
-                    captured_header_values(&raw, name),
-                    [value],
-                    "{inbound_path} -> {protocol}: {name}"
+        // Every header on one surface, and one header on every surface: the
+        // check does not depend on the surface.
+        let cases = SESSION_HEADER_VALUES
+            .iter()
+            .map(|header| (REBUILT_BODY_SURFACES[0], *header))
+            .chain(
+                REBUILT_BODY_SURFACES
+                    .iter()
+                    .map(|surface| (*surface, SESSION_HEADER_VALUES[2])),
+            );
+        for ((inbound_path, protocol), (name, value)) in cases {
+            let raw =
+                body_id_case(inbound_path, protocol, true, &[(name, value)], body.clone()).await;
+            assert_eq!(
+                captured_header_values(&raw, name),
+                [value],
+                "{inbound_path} -> {protocol}: {name}"
+            );
+            if name != BODY_SESSION_ID_HEADER {
+                assert!(
+                    captured_header_values(&raw, BODY_SESSION_ID_HEADER).is_empty(),
+                    "{inbound_path} -> {protocol}: body id added next to {name}"
                 );
-                if name != BODY_SESSION_ID_HEADER {
-                    assert!(
-                        captured_header_values(&raw, BODY_SESSION_ID_HEADER).is_empty(),
-                        "{inbound_path} -> {protocol}: body id added next to {name}"
-                    );
-                }
             }
         }
     }
@@ -710,7 +717,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            captured_header_values(&raw, "x-session-affinity"),
+            captured_header_values(&raw, BODY_SESSION_ID_HEADER),
             ["configured"]
         );
     }
@@ -746,16 +753,20 @@ mod tests {
                 protocol,
                 true,
                 &[],
-                json!({"session_id": "task-1"}),
+                json!({"session_id": "task-1", "prompt_cache_key": "pck-1"}),
             )
             .await;
             assert!(
-                captured_header_values(&raw, "x-session-affinity").is_empty(),
+                captured_header_values(&raw, BODY_SESSION_ID_HEADER).is_empty(),
                 "{inbound_path} -> {protocol}"
             );
             let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
             let body: Value = serde_json::from_str(body).expect("upstream body is JSON");
             assert_eq!(body["session_id"], "task-1", "{inbound_path} -> {protocol}");
+            assert_eq!(
+                body["prompt_cache_key"], "pck-1",
+                "{inbound_path} -> {protocol}"
+            );
         }
     }
 

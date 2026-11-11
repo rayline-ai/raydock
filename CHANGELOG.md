@@ -62,11 +62,12 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   `prompt_cache_key`, so separate sessions merged into one conversation. Seen
   with Codex through a gateway with a Messages upstream and with Cline's
   OpenRouter provider. The local router now sends that id to the hosted Rayline
-  router as `x-session-affinity`, picking it the way the router would from the
-  original body: Codex's `prompt_cache_key` first, then `session_id`, then a
-  Responses `prompt_cache_key`. A session header the client sent still wins,
-  requests forwarded without translation are unchanged, and no other upstream
-  receives the header.
+  router as `x-session-affinity`, in the router's own order for those fields:
+  Codex's `prompt_cache_key` first, then `session_id`, then a Responses
+  `prompt_cache_key`. A session header the client sent still wins, and an id a
+  header cannot carry unchanged (non-ASCII) is skipped. Requests forwarded
+  without translation are unchanged, and no other upstream receives the
+  header.
 - **`hybrid start` warns when the local window cannot hold Claude Code's
   opening request.** For a model other than Qwen3.8-27B, the core reserves
   the opening request (about 73,000 tokens with no MCP servers or project
