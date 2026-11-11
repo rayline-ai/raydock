@@ -160,11 +160,10 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     long"), which the harness's compaction recognises. An older core leaves
     local capacity unknown, and only a llama.cpp context refusal re-consults.
     The core counts Qwen3.8-27B with its embedded tokenizer
-    (`local_measured`); a core with `caller_bounded` support (not yet
-    released) labels any other local model's byte bound `caller_bounded`,
-    which ARC admits as a fit. `prefer_local` works
-    with this profile on such a core; an older core makes ARC exclude a
-    non-Qwen local target (`capacity_unknown_local`).
+    (`local_measured`); the core bundled since 0.4.3 labels any other
+    local model's byte bound `caller_bounded`, which ARC admits as a fit.
+    `prefer_local` works with this profile on such a core; an older core makes
+    ARC exclude a non-Qwen local target (`capacity_unknown_local`).
 - **`--config`:** names a qualified profile instead.
 
 - **Hybrid routing works with no overrides.** For the default profile, a
