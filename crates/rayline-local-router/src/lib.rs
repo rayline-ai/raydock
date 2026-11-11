@@ -1730,15 +1730,8 @@ async fn synthetic_compact_response(
         message: anthropic_message,
         estimated_input_tokens,
         upstream_request_id,
-    } = run_synthetic_unary_response(
-        state,
-        decision,
-        inbound_headers,
-        &request_body,
-        body,
-        request_id,
-    )
-    .await?;
+    } = run_synthetic_unary_response(state, decision, inbound_headers, &request_body, request_id)
+        .await?;
     let text = anthropic_message_text(&anthropic_message);
     let item = match output_kind {
         SyntheticOutputKind::Compaction => json!({
@@ -1786,15 +1779,8 @@ async fn synthetic_memory_summarize_response(
         message: anthropic_message,
         estimated_input_tokens,
         upstream_request_id,
-    } = run_synthetic_unary_response(
-        state,
-        decision,
-        inbound_headers,
-        &request_body,
-        body,
-        request_id,
-    )
-    .await?;
+    } = run_synthetic_unary_response(state, decision, inbound_headers, &request_body, request_id)
+        .await?;
     let text = anthropic_message_text(&anthropic_message);
     let output = parse_memory_summarize_output(body, &text);
     let output_tokens = anthropic_message
@@ -1827,14 +1813,11 @@ struct UpstreamAnswer {
     upstream_request_id: Option<String>,
 }
 
-/// `body` is the Responses request sent upstream; `client_body` is the body the
-/// client sent, which names its session (`session_id`, `prompt_cache_key`).
 async fn run_synthetic_unary_response(
     state: &AppState,
     decision: &RouteDecision,
     inbound_headers: &HeaderMap,
     body: &Value,
-    client_body: &Value,
     request_id: &str,
 ) -> Result<UpstreamAnswer> {
     // Text-only synthetic turns (title/memory summarization): no tool calls come
@@ -1892,7 +1875,7 @@ async fn run_synthetic_unary_response(
                     outbound = copy_session_headers_for_rebuilt_body(
                         outbound,
                         inbound_headers,
-                        client_body,
+                        body,
                         endpoint,
                     );
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Anthropic)?;
@@ -1926,7 +1909,7 @@ async fn run_synthetic_unary_response(
                     outbound = copy_session_headers_for_rebuilt_body(
                         outbound,
                         inbound_headers,
-                        client_body,
+                        body,
                         endpoint,
                     );
                     outbound = apply_endpoint_headers(outbound, endpoint, AuthStyle::Bearer)?;
@@ -1984,7 +1967,7 @@ async fn parse_anthropic_unary_response(
 
 fn memory_summarize_to_responses_request(body: &Value, model: &str) -> Value {
     let traces = body.get("traces").cloned().unwrap_or_else(|| json!([]));
-    json!({
+    let mut request = json!({
         "model": model,
         "instructions": "Summarize the supplied memory traces. Return concise durable memory summaries. If possible, return JSON with an output array of objects containing trace_summary and memory_summary.",
         "input": [{
@@ -1997,7 +1980,14 @@ fn memory_summarize_to_responses_request(body: &Value, model: &str) -> Value {
         }],
         "stream": false,
         "max_output_tokens": 2048,
-    })
+    });
+    // Keep the client's session id, so the side call stays in its session.
+    for field in ["session_id", "prompt_cache_key"] {
+        if let Some(value) = body.get(field) {
+            request[field] = value.clone();
+        }
+    }
+    request
 }
 
 fn parse_memory_summarize_output(request_body: &Value, text: &str) -> Value {

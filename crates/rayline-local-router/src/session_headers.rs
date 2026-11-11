@@ -770,6 +770,33 @@ mod tests {
         }
     }
 
+    /// The memory-summary side call keeps the client's ids in the Responses
+    /// request it builds, only so they can be read here: the translation to
+    /// the upstream protocol drops them, so neither field reaches the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_summary_body_ids_never_reach_the_upstream_body() {
+        for protocol in ["anthropic_messages", "openai_chat"] {
+            for hosted in [true, false] {
+                let raw = body_id_case(
+                    "/v1/memories/trace_summarize",
+                    protocol,
+                    hosted,
+                    &[],
+                    json!({"session_id": "task-1", "prompt_cache_key": "pck-1"}),
+                )
+                .await;
+                let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                let body: Value = serde_json::from_str(body).expect("upstream body is JSON");
+                for field in ["session_id", "prompt_cache_key"] {
+                    assert!(
+                        body.get(field).is_none(),
+                        "{protocol} hosted={hosted}: {field}"
+                    );
+                }
+            }
+        }
+    }
+
     fn picked(headers: &[(&'static str, &'static str)], body: Value) -> Option<String> {
         let mut map = HeaderMap::new();
         for (name, value) in headers {
