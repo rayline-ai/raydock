@@ -157,11 +157,11 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     prompt's size for the local model and hands a turn that does not fit the
     local window to cloud before the local runtime sees it. A prompt too large
     for every cloud window is refused by the cloud provider ("prompt is too
-    long"), which the harness's compaction recognises. An older core leaves
-    local capacity unknown, and only a llama.cpp context refusal re-consults.
-    The core counts Qwen3.8-27B with its embedded tokenizer
-    (`local_measured`); the core bundled since 0.4.3 labels any other
-    local model's byte bound `caller_bounded`, which ARC admits as a fit.
+    long"), which the harness's compaction recognises. A core older
+    than 0.4.3 leaves local capacity unknown, and only a llama.cpp context
+    refusal re-consults. The core counts Qwen3.8-27B with its embedded
+    tokenizer (`local_measured`); the core bundled with Raydock 0.4.3 and later
+    labels any other local model's byte bound `caller_bounded`, which ARC admits as a fit.
     `prefer_local` works with this profile on such a core; an older core makes
     ARC exclude a non-Qwen local target (`capacity_unknown_local`).
 - **`--config`:** names a qualified profile instead.

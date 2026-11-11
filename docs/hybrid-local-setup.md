@@ -169,7 +169,7 @@ Every key in this block, in `~/.config/rayline/settings.json`, is optional:
 
 | Key | Meaning |
 | --- | --- |
-| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs known local capacity. The default profile has it without a prompt counter: the core counts Qwen3.8-27B with its own tokenizer and bounds any other local model by bytes (`caller_bounded`). The core bundled since 0.4.3 does this, so `prefer_local` is accepted on the default profile, including with a runtime Raydock cannot identify (LM Studio) or a model set with `hybrid.local_registry_model`. A core older than 0.4.3 leaves a non-Qwen local target's capacity unknown, and ARC then never selects it (`capacity_unknown_local`). `start` refuses `prefer_local` only when the session has no local target. |
+| `policy` | `utility` selects the hybrid default preset. `prefer_local` selects `arc-policy.prefer-local.v1`: the local model is used whenever ARC predicts it will pass (`p_pass >= min_p_pass`), and utility selection over the cloud targets is used otherwise. Prefer-local needs known local capacity. The default profile has it without a prompt counter: the core counts Qwen3.8-27B with its own tokenizer and bounds any other local model by bytes (`caller_bounded`). The core bundled with Raydock 0.4.3 and later does this; a core older than that leaves a non-Qwen local target's capacity unknown, and ARC then never selects it (`capacity_unknown_local`). `start` refuses `prefer_local` only when the session has no local target. |
 | `min_p_pass` | The prefer-local threshold, in (0, 1). The service default is 0.65. It is valid only with `prefer_local`. |
 | `schedule` | When the model (`model`) and thinking level (`thinking`) may change. Each is a set of classes: `cache_boundaries`, `user_messages` (any typed user turn) or `all_turns`. The service refuses a class its package does not support (`policy_schedule_not_admitted`). |
 | `local_price` | Default profile only: the local model's price in USD per million tokens, applied to every leg (default 0). It must be 0 or between 1e-6 and 1e6. `start --config` refuses it, because a profile file sets its own prices. |
@@ -225,13 +225,14 @@ itself refuses a request for context before any output, the core re-consults
 ARC with that fact instead of truncating.
 
 With the default profile the core sizes each request itself. It counts
-Qwen3.8-27B with its embedded tokenizer (`local_measured`). For another model
-declared in `hybrid.local_registry_model`, the core bundled since 0.4.3
-bounds the request by its bytes (`caller_bounded`); an older core reports that
-target's capacity as unknown. When Raydock cannot read which model the runtime
-serves (LM Studio), it declares Qwen3.8-27B and counts as that model. Either
-way the core still hands off when the runtime refuses a request for context
-(llama.cpp reports this before any output). A profile with a qualified llama.cpp prompt counter (see below) counts every
+Qwen3.8-27B with its embedded tokenizer (`local_measured`); when Raydock
+cannot read which model the runtime serves (LM Studio), it declares
+Qwen3.8-27B, so the count is Qwen's even if another model runs. For another
+model declared in `hybrid.local_registry_model`, the core bundled with Raydock
+0.4.3 and later bounds the request by its bytes (`caller_bounded`); an older
+core reports that target's capacity as unknown. Either way the core still
+hands off when the runtime refuses a request for context (llama.cpp reports
+this before any output). A profile with a qualified llama.cpp prompt counter (see below) counts every
 request with the runtime's own tokenizer, so the handoff happens before
 dispatch.
 
