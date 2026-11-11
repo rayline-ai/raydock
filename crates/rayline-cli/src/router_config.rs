@@ -1144,9 +1144,6 @@ mod tests {
         // (file, main_is_passthrough, needs_local_router, uses_cloud_router)
         let cases = [
             ("Rc-Rc.json", false, false, true),
-            // Rcl-Rcl: may-local routes stay on the cloud router (the `ollama` endpoint
-            // is a redirect target, not a route) → no on-device router engaged.
-            ("Rcl-Rcl.json", false, false, true),
             // Rl-Rl: router rayline-local engages the on-device router even though
             // both routes target rayline-cloud (it pins the model on-device).
             ("Rl-Rl.json", false, true, true),
@@ -1218,8 +1215,8 @@ mod tests {
         //   needs_local = a route targets a non-cloud endpoint (engages the LSR)
         //   fires       = the CLI actually wires may-local advertisement, which is
         //                 gated on the cloud-only path (!needs_local) in claude.rs.
-        // Rcl-K, Rcl-L and L-Rcl are unsupported, so they aren't shipped as
-        // examples; their shapes stay here to keep may-local off for them.
+        // None of these shapes ships as an example config; they stay here as
+        // fixtures for the may-local client code.
         let home = tmp_home();
         let cloud = json!({
             "id": "rayline-cloud", "protocol": "anthropic_messages",
@@ -1242,6 +1239,26 @@ mod tests {
             })
         };
         let unshipped = [
+            (
+                "Rcl-Rcl.json",
+                json!({
+                    "endpoints": [cloud.clone(), ollama.clone()],
+                    "routes": {
+                        "main": may_local("arc-sage-1.0"),
+                        "subagent": may_local("arc-swift-1.0")
+                    }
+                }),
+            ),
+            (
+                "S-Rcl.json",
+                json!({
+                    "endpoints": [cloud.clone(), ollama.clone()],
+                    "routes": {
+                        "main": {"endpoint": "subscription"},
+                        "subagent": may_local("arc-swift-1.0")
+                    }
+                }),
+            ),
             (
                 "Rcl-K.json",
                 json!({
@@ -1288,11 +1305,7 @@ mod tests {
             ("L-Rcl.json", true, true, false),
         ];
         for (file, resolves, needs_local, fires) in cases {
-            let path = paths
-                .get(file)
-                .cloned()
-                .unwrap_or_else(|| examples_dir().join(file));
-            assert!(path.exists(), "missing {file}");
+            let path = &paths[file];
             assert_eq!(
                 config_may_local(&path).is_some(),
                 resolves,
@@ -1352,20 +1365,19 @@ mod tests {
     }
 
     #[test]
-    fn rrcl_example_resolves_may_local() {
-        // The shipped Rcl-Rcl config advertises a local model fronted by the `ollama`
-        // endpoint, and stays cloud-only for routing (no on-device router engaged).
-        let path = examples_dir().join("Rcl-Rcl.json");
-        assert!(path.exists(), "missing example config Rcl-Rcl.json");
-        assert_eq!(
-            config_may_local(&path),
-            Some(MayLocal {
-                model: "qwen2.5-coder:7b".to_owned(),
-                upstream_url: "http://127.0.0.1:11434".to_owned(),
-            })
-        );
-        // Rc-Rc (no may-local) must not resolve one.
-        assert_eq!(config_may_local(&examples_dir().join("Rc-Rc.json")), None);
+    fn no_example_config_resolves_may_local() {
+        // No shipped routing-mode config carries `local_models`, so none of them
+        // advertises a local model to the hosted router.
+        let mut checked = 0;
+        for entry in std::fs::read_dir(examples_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            assert_eq!(config_may_local(&path), None, "{}", path.display());
+            checked += 1;
+        }
+        assert!(checked > 0, "no example configs found");
     }
 
     #[test]

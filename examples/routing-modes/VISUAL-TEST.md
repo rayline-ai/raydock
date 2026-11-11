@@ -20,8 +20,8 @@ hang, and a per-mode loop lets you recover and continue.
 | 1 | `raydock`/`rld` built from the branch under test, installed, **all stale `rld` killed** | `raydock --version`; `pgrep -fl "rld serve\|rld proxy"` → none | rebuild + install (Apple Silicon: `codesign --force --sign -` after copying); `pkill -9 -f "rld serve\|rld proxy"` |
 | 2 | Signed in to rayline | `raydock auth status` (or `raydock local show` works) | `raydock auth login` |
 | 3 | `ANTHROPIC_API_KEY` exported | `[ -n "$ANTHROPIC_API_KEY" ]` | Rc-K/Rl-K/L-K subagent leg will **FAIL** — mark those rows accordingly, don't hide it |
-| 3b | `RAYLINE_ROUTER_API_KEY` is an **`rlk-`** key, for the Router column | `case $RAYLINE_ROUTER_API_KEY in rlk-*) ;; *) echo wrong;; esac` | cloud subagent legs 401 (unset) or **403** (session token) — see README ⁷. `raydock auth token` returns an `rls_` session token and is **not** usable here |
-| 4 | `claude` (Claude Code) on PATH + Claude **subscription** logged in | `command -v claude` | passthrough modes (S-Rc/S-Rcl/S-Rl/S-L main) can't run |
+| 3b | `RAYLINE_ROUTER_API_KEY` is an **`rlk-`** key, for the Router column | `case $RAYLINE_ROUTER_API_KEY in rlk-*) ;; *) echo wrong;; esac` | cloud subagent legs 401 (unset) or **403** (session token) — see README ⁵. `raydock auth token` returns an `rls_` session token and is **not** usable here |
+| 4 | `claude` (Claude Code) on PATH + Claude **subscription** logged in | `command -v claude` | passthrough modes (S-Rc/S-Rl/S-L main) can't run |
 | 5 | ollama up with both models | `curl -s localhost:11434/api/tags` shows `qwen3.5:9b` + `qwen2.5-coder:7b` | `ollama pull qwen3.5:9b && ollama pull qwen2.5-coder:7b` |
 | 6 | `python3` available | `python3 --version` | install python3 |
 | 7 | ports 20809–20813 free | script handles via killing `rld` | — |
@@ -40,8 +40,8 @@ RB="$(command -v rayline)"   # or the absolute path to the branch-under-test bin
 PROMPT='Launch TWO subagents with the Task tool, in parallel: (1) an Explore subagent and (2) a general-purpose subagent. Each must reply with exactly the word PONG. Do not use any other tool first. After both return, output DONE.'
 ```
 
-Then, **for each MODE in this order** — `Rc-Rc Rc-K Rc-L Rcl-Rcl Rl-Rl Rl-K Rc-L-per-type S-Rc
-S-Rcl S-L L-Rc L-Rl L-K L-L Rl-L S-Rl` (skip `Rcl-K Rcl-L L-Rcl`, see §5) — do exactly this:
+Then, **for each MODE in this order** — `Rc-Rc Rc-K Rc-L Rl-Rl Rl-K Rc-L-per-type S-Rc
+S-L L-Rc L-Rl L-K L-L Rl-L S-Rl` — do exactly this:
 
 ```bash
 # a) clean slate so `raydock top` reflects only this mode (each run restarts rld)
@@ -56,14 +56,14 @@ grep -i "local route endpoint" ~/.rayline/rld/rl-rld.log | tail -8   # endpoint-
 grep -i "DONE" /tmp/v-$MODE.out >/dev/null && echo "run finished" || echo "run did NOT finish (expected for local-main)"
 ```
 
-Judge that mode against §3 (signals) + §4 (criteria), record one line per §6, then
+Judge that mode against §3 (signals) + §4 (criteria), record one line per §5, then
 move to the next mode. Don't batch them; one at a time.
 
 ---
 
 ## 3. How to read `target` / `policy` (the signals)
 
-- `target=anthropic`, `policy=selective_main_passthrough` → **Claude subscription passthrough** (main of S-Rc/S-Rcl/S-Rl/S-L).
+- `target=anthropic`, `policy=selective_main_passthrough` → **Claude subscription passthrough** (main of S-Rc/S-Rl/S-L).
 - `target=anthropic`, `policy=selective_passthrough_path`, no model → **Claude Code's own startup requests** (bootstrap, MCP registry), in every proxy mode. Not model turns; ignore them.
 - `target=remote` → an upstream endpoint; use **`requested_model`** and **`selected_model`** to tell which:
   - `requested_model=arc-sage-1.0` (main) / `arc-swift-1.0` (subagents) → **cloud RCR routing on ARC**; `selected_model` is whatever the RCR reports back (non-deterministic).
@@ -83,12 +83,10 @@ move to the next mode. Don't batch them; one at a time.
 | **Rc-Rc** | cloud (ARC Sage) | cloud (ARC Swift) | main `target=remote` `arc-sage-1.0`; subagents remote `arc-swift-1.0` | REVIEW (cloud pick) |
 | **Rc-K** | cloud (ARC Sage) | anthropic (API key) | main remote; subagent `claude-sonnet-5` via anthropic | FAIL if `ANTHROPIC_API_KEY` unset |
 | **Rc-L** | cloud (ARC Sage) | **ollama** `qwen3.5:9b` | main remote; subagents `selected_model=qwen3.5:9b` | PASS (deterministic subagent) |
-| **Rcl-Rcl** § | cloud (ARC Sage) | cloud (ARC Swift) | same as Rc-Rc; no turn local | REVIEW (cloud pick) |
 | **Rl-Rl** | cloud **pinned `glm-5.3`** | cloud **pinned `deepseek/deepseek-v4-pro-0813`**; `Explore` **`deepseek/deepseek-v4.1-flash-1017`** | main `selected_model=glm-5.3`; subagents the pinned ids | **PASS (deterministic, exact models)** |
 | **Rl-K** | cloud **pinned `glm-5.3`** | anthropic (API key) | main `glm-5.3`; subagent anthropic `claude-sonnet-5` | main PASS; subagent FAIL if no key |
 | **Rc-L-per-type** | cloud (ARC Sage) | `Explore`→ollama `qwen2.5-coder:7b`, `Plan`→ollama `qwen3.5:9b`, other→cloud (ARC Swift) | Explore `qwen2.5-coder:7b`; general-purpose remote (cloud) | **PASS (deterministic per-type)** |
 | **S-Rc** | **subscription** (passthrough) | cloud (ARC Swift) | main `target=anthropic`/`selective_main_passthrough`; subagents remote `arc-swift-1.0` | REVIEW (cloud pick) |
-| **S-Rcl** § | subscription | cloud (ARC Swift) | same as S-Rc; no turn local | REVIEW (cloud pick) |
 | **S-L** | subscription | **ollama** `qwen…` | main passthrough; subagents `qwen*` (local) | **PASS** (passthrough + local) |
 | **L-Rc** ‡ | **ollama** `qwen3.5:9b` | cloud (ARC Swift) | main `selected_model=qwen3.5:9b`; subagents remote | REVIEW (local main; pin the window first) |
 | **L-Rl** ‡ | ollama `qwen3.5:9b` | cloud pinned `deepseek/deepseek-v4-pro-0813` | main `qwen3.5:9b`; subagents `deepseek/deepseek-v4-pro-0813` | REVIEW (local main; the pin can 403) |
@@ -96,10 +94,6 @@ move to the next mode. Don't batch them; one at a time.
 | **L-L** ‡ | ollama `qwen3.5:9b` | **ollama** | main `qwen3.5:9b`; subagents `qwen3.5:9b` | REVIEW (local main) |
 | **Rl-L** | cloud **pinned `glm-5.3`** | **ollama** `qwen2.5-coder:7b` | main `glm-5.3`; subagents `qwen2.5-coder:7b` | **PASS (deterministic)** |
 | **S-Rl** | subscription | cloud **pinned `deepseek/deepseek-v4-pro-0813`** | main passthrough; subagents `deepseek/deepseek-v4-pro-0813` | **PASS (deterministic subagent)** |
-
-**§ `Rcl` retired (Rcl-Rcl/S-Rcl):** the hosted router no longer redirects a turn to a
-local model, so these behave exactly like Rc-Rc/S-Rc. A subagent served by a local
-model here is a **FAIL**. See the README's §.
 
 **‡ local-main (L-Rc/L-Rl/L-K/L-L):** the main runs on a small local model. **Pin its
 context window first** — ollama's VRAM-derived default (often 4096; check `ollama ps`,
@@ -118,23 +112,13 @@ stops), so a single no-spawn run is not a failure; re-run before scoring. For th
 export an **`rlk-` router key** as `RAYLINE_ROUTER_API_KEY` first, or cloud subagent
 legs fail while the local main still prints a plausible answer and exits 0. A session
 token (`raydock auth token`, `rls_…`) is the wrong credential: it clears the 401 and
-returns 403 from the model data plane. See README ⁷.
+returns 403 from the model data plane. See README ⁵.
 
 ---
 
-## 5. NOT SUPPORTED (do not run; mark as not supported)
+## 5. What to report
 
-| Mode | Why |
-|---|---|
-| **Rcl-K** | never shipped: `Rcl` is retired (README §); use Rc-K. |
-| **Rcl-L** | never shipped: `Rcl` is retired (README §); use Rc-L. |
-| **L-Rcl** | never shipped: `Rcl` is retired (README §); use L-Rc. |
-
----
-
-## 6. What to report
-
-For each of the 16 supported modes, output one line:
+For each of the 14 modes, output one line:
 
 `MODE — <PASS|REVIEW|FAIL> — main: <target/model>, subagents: <observed> — <note>`
 
@@ -142,6 +126,6 @@ For each of the 16 supported modes, output one line:
 - **REVIEW**: hosted/non-deterministic (cloud pick) or local-main — state what was observed and whether it's consistent with the expected intent.
 - **FAIL**: a deterministic expectation was wrong, OR an env prereq blocked it (say which, e.g. "no ANTHROPIC_API_KEY").
 
-Then list Rcl-K/Rcl-L/L-Rcl as **NOT SUPPORTED**. Finish with a one-line summary
-(e.g. "6 PASS, 8 REVIEW, 2 FAIL-due-to-missing-key, 3 not supported") and call out
+Finish with a one-line summary
+(e.g. "6 PASS, 6 REVIEW, 2 FAIL-due-to-missing-key") and call out
 any genuine routing bug (a deterministic row that didn't match).
