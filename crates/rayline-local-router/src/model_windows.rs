@@ -30,8 +30,8 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::{
-    AppState, AuthMode, AuthStyle, EndpointConfig, EndpointProtocol, apply_endpoint_headers,
-    endpoint_hidden_from_catalog,
+    AppState, AuthMode, AuthStyle, EndpointConfig, EndpointProtocol, RouterConfig,
+    apply_endpoint_headers, endpoint_hidden_from_catalog,
 };
 
 /// Per-request timeout for every window lookup.
@@ -96,13 +96,10 @@ impl ModelWindowCache {
         if !pending.is_empty() {
             let fetched =
                 futures::future::join_all(pending.into_iter().map(|endpoint| async move {
-                    let windows = tokio::time::timeout(
-                        ENDPOINT_TIMEOUT,
-                        fetch_endpoint_windows(&state.http, endpoint),
-                    )
-                    .await
-                    .ok()
-                    .flatten();
+                    let models = models_to_size(&state.config, endpoint);
+                    let deadline = tokio::time::Instant::now() + ENDPOINT_TIMEOUT;
+                    let windows =
+                        fetch_endpoint_windows(&state.http, endpoint, &models, deadline).await;
                     (endpoint.id.clone(), windows)
                 }))
                 .await;
@@ -140,6 +137,27 @@ impl ModelWindowCache {
     }
 }
 
+/// The models to size on `endpoint`: the ones it lists in the config, plus any
+/// model a route sends to it (a route may name a model the endpoint does not
+/// list, and the catalog sentinel takes that route's window).
+fn models_to_size(config: &RouterConfig, endpoint: &EndpointConfig) -> Vec<String> {
+    let routes = &config.routes;
+    let routed = [&routes.main, &routes.subagent, &routes.default]
+        .into_iter()
+        .flatten()
+        .chain(routes.model_routes.values())
+        .chain(routes.subagents.values())
+        .filter(|route| route.endpoint == endpoint.id)
+        .map(|route| &route.model);
+    let mut models = Vec::new();
+    for model in endpoint.models.iter().chain(routed) {
+        if !models.contains(model) {
+            models.push(model.clone());
+        }
+    }
+    models
+}
+
 /// Endpoints the router sizes itself. Subscription endpoints need the inbound
 /// client's bearer, so they are sized from the catalog proxied for that client
 /// instead; endpoints hidden from the catalog (missing key) are skipped.
@@ -147,50 +165,70 @@ fn sized_by_lookup(endpoint: &EndpointConfig) -> bool {
     endpoint.auth != Some(AuthMode::ClientBearer) && !endpoint_hidden_from_catalog(endpoint)
 }
 
+/// Sizes `models` on one endpoint. The listing is asked first; a loopback
+/// runtime is then asked about the models the listing did not size, within
+/// what is left of `deadline`, so a slow runtime cannot discard the windows the
+/// listing already gave. `None` when nothing on the endpoint answered.
 async fn fetch_endpoint_windows(
     http: &reqwest::Client,
     endpoint: &EndpointConfig,
+    models: &[String],
+    deadline: tokio::time::Instant,
 ) -> Option<EndpointWindows> {
-    let listed = get_json(http, endpoint, &models_url(&endpoint.base_url)).await;
-    let loopback = is_loopback(&endpoint.base_url);
+    let listed = tokio::time::timeout_at(
+        deadline,
+        get_json(http, endpoint, &models_url(&endpoint.base_url)),
+    )
+    .await
+    .ok()
+    .flatten();
     let mut reachable = listed.is_some();
     let mut windows = listed.as_ref().map(listed_windows).unwrap_or_default();
-    if loopback {
-        let missing = endpoint
-            .models
-            .iter()
-            .filter(|model| !windows.contains_key(*model))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            let root = runtime_root(&endpoint.base_url);
-            let root = root.as_str();
-            match get_json(http, endpoint, &format!("{root}/api/ps")).await {
-                Some(ps) => {
-                    reachable = true;
-                    windows.extend(ollama_windows(http, endpoint, root, &ps, &missing).await);
-                }
-                None => {
-                    for (model, props) in
-                        futures::future::join_all(missing.iter().map(|model| async move {
-                            let url = reqwest::Url::parse_with_params(
-                                &format!("{root}/props"),
-                                [("model", model.as_str())],
-                            )
-                            .ok()?;
-                            Some((model, get_json(http, endpoint, url.as_str()).await?))
-                        }))
-                        .await
-                        .into_iter()
-                        .flatten()
-                    {
-                        reachable = true;
-                        if let Some(window) = llama_props_window(&props) {
-                            windows.insert(model.clone(), window.into());
-                        }
-                    }
-                }
-            }
+    let missing = models
+        .iter()
+        .filter(|model| !windows.contains_key(*model))
+        .cloned()
+        .collect::<Vec<_>>();
+    if is_loopback(&endpoint.base_url) && !missing.is_empty() {
+        let root = runtime_root(&endpoint.base_url);
+        if let Ok(Some(runtime)) =
+            tokio::time::timeout_at(deadline, runtime_windows(http, endpoint, &root, &missing))
+                .await
+        {
+            reachable = true;
+            windows.extend(runtime);
+        }
+    }
+    reachable.then_some(windows)
+}
+
+/// Windows a local runtime reports for `missing`: Ollama (`/api/ps`, then
+/// `/api/show`) when it answers `/api/ps`, else llama.cpp (`/props`). `None`
+/// when the runtime answered none of these.
+async fn runtime_windows(
+    http: &reqwest::Client,
+    endpoint: &EndpointConfig,
+    root: &str,
+    missing: &[String],
+) -> Option<EndpointWindows> {
+    if let Some(ps) = get_json(http, endpoint, &format!("{root}/api/ps")).await {
+        return Some(ollama_windows(http, endpoint, root, &ps, missing).await);
+    }
+    let mut reachable = false;
+    let mut windows = EndpointWindows::new();
+    for (model, props) in futures::future::join_all(missing.iter().map(|model| async move {
+        let url =
+            reqwest::Url::parse_with_params(&format!("{root}/props"), [("model", model.as_str())])
+                .ok()?;
+        Some((model, get_json(http, endpoint, url.as_str()).await?))
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    {
+        reachable = true;
+        if let Some(window) = llama_props_window(&props) {
+            windows.insert(model.clone(), window.into());
         }
     }
     reachable.then_some(windows)
@@ -468,5 +506,126 @@ mod tests {
         assert!(is_loopback("http://localhost:8080"));
         assert!(is_loopback("http://[::1]:8080"));
         assert!(!is_loopback("https://api.rayline.ai"));
+    }
+
+    /// A loopback runtime that answers by request-line prefix; a `None` body
+    /// never answers (a stalled runtime), and anything unknown gets a 404.
+    async fn runtime_stub(routes: Vec<(&'static str, Option<Value>)>) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let response = match routes
+                        .iter()
+                        .find(|(prefix, _)| request.starts_with(prefix))
+                    {
+                        Some((_, Some(body))) => {
+                            let body = body.to_string();
+                            format!(
+                                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        }
+                        Some((_, None)) => {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            return;
+                        }
+                        None => "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\
+                                 connection: close\r\n\r\n"
+                            .to_owned(),
+                    };
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://127.0.0.1:{port}/v1")
+    }
+
+    fn runtime_endpoint(base_url: String, models: &[&str]) -> EndpointConfig {
+        EndpointConfig {
+            id: "runtime".to_owned(),
+            kind: "provider".to_owned(),
+            protocol: EndpointProtocol::OpenAIChat,
+            base_url,
+            api_key_env: None,
+            models: models.iter().map(|m| (*m).to_owned()).collect(),
+            headers: HashMap::new(),
+            auth: None,
+        }
+    }
+
+    #[test]
+    fn models_to_size_include_routed_models() {
+        let endpoint = runtime_endpoint("http://127.0.0.1:1/v1".to_owned(), &["listed"]);
+        let route = |endpoint: &str, model: &str| crate::RouteTarget {
+            endpoint: endpoint.to_owned(),
+            model: model.to_owned(),
+            ..Default::default()
+        };
+        let mut config = RouterConfig {
+            endpoints: vec![endpoint.clone()],
+            routes: Default::default(),
+        };
+        config.routes.main = Some(route("runtime", "routed"));
+        config.routes.subagent = Some(route("elsewhere", "other"));
+        config
+            .routes
+            .model_routes
+            .insert("rayline-local".to_owned(), route("runtime", "listed"));
+        assert_eq!(models_to_size(&config, &endpoint), ["listed", "routed"]);
+    }
+
+    /// A runtime that stalls past the deadline does not discard the windows
+    /// the listing already gave.
+    #[tokio::test]
+    async fn a_stalled_runtime_keeps_the_listed_windows() {
+        let base = runtime_stub(vec![
+            (
+                "GET /v1/models ",
+                Some(json!({"data": [{"id": "sized", "context_length": 65_536}, {"id": "bare"}]})),
+            ),
+            ("GET /api/ps ", None),
+        ])
+        .await;
+        let endpoint = runtime_endpoint(base, &["sized", "bare"]);
+        let models = vec!["sized".to_owned(), "bare".to_owned()];
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        let windows =
+            fetch_endpoint_windows(&reqwest::Client::new(), &endpoint, &models, deadline).await;
+        let windows = windows.expect("the listing answered");
+        assert_eq!(windows.get("sized"), Some(&ModelWindow::from(65_536)));
+        assert!(!windows.contains_key("bare"));
+    }
+
+    /// A model only a route names (the endpoint lists none) is still sized by
+    /// the runtime.
+    #[tokio::test]
+    async fn a_routed_model_is_sized_by_the_runtime() {
+        let base = runtime_stub(vec![
+            ("GET /v1/models ", Some(json!({"data": [{"id": "routed"}]}))),
+            (
+                "GET /api/ps ",
+                Some(json!({"models": [{"name": "routed", "context_length": 8_192}]})),
+            ),
+        ])
+        .await;
+        let endpoint = runtime_endpoint(base, &[]);
+        let models = vec!["routed".to_owned()];
+        let deadline = tokio::time::Instant::now() + ENDPOINT_TIMEOUT;
+        let windows =
+            fetch_endpoint_windows(&reqwest::Client::new(), &endpoint, &models, deadline).await;
+        assert_eq!(
+            windows.expect("the runtime answered").get("routed"),
+            Some(&ModelWindow::from(8_192))
+        );
     }
 }
