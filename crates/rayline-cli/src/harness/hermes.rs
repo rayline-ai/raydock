@@ -195,7 +195,8 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
 const INSTALLS_DIR: &str = "installs";
 const FACTS_FILE: &str = "facts.json";
 /// Raydock's record, in its Hermes home, of the Hermes launcher that last
-/// started there (see [`prepare_home`]).
+/// started there and the environments the home held then (see
+/// [`prepare_home`]).
 const READY_MARKER: &str = ".raydock-hermes-ready";
 /// What Hermes tells the user to run when its home has no environment.
 const REPAIR_COMMAND: &str = "hermes pm repair";
@@ -277,8 +278,10 @@ fn launcher_identity(program: &Path) -> Option<String> {
 /// Hermes with the given args and `HERMES_HOME=home`; `launcher` is the
 /// launcher's identity ([`launcher_identity`]).
 ///
-/// The home is used as is, with no Hermes run, when it records an environment
-/// and the same launcher started there before. Otherwise a cheap
+/// The home is used as is, with no Hermes run, when the same launcher started
+/// there before and the home still holds exactly the environments it held
+/// then (so none of them, the launcher's own included, has gone or been
+/// replaced). Otherwise a cheap
 /// `hermes --version` asks Hermes itself: only when it refuses and names
 /// `hermes pm repair` does the repair run, so an install that ships its own
 /// environment is left alone. A probe that cannot run is not an error here;
@@ -289,15 +292,24 @@ pub(crate) fn prepare_home(
     mut run: impl FnMut(&[&str]) -> io::Result<Finished>,
 ) -> Result<(), String> {
     let marker = home.join(READY_MARKER);
-    let started_before = launcher
-        .is_some_and(|launcher| fs::read_to_string(&marker).is_ok_and(|seen| seen == launcher));
-    if started_before && has_dependency_environment(home) {
+    let record = |launcher: &str| {
+        let environments = environments(home);
+        (!environments.is_empty()).then(|| format!("{launcher}{}\n", environments.join("\n")))
+    };
+    if let Some(record) = launcher.and_then(record)
+        && fs::read_to_string(&marker).is_ok_and(|seen| seen == record)
+    {
         return Ok(());
     }
     let remember = || {
-        if let Some(launcher) = launcher {
-            // Best effort: without the record the next launch probes again.
-            let _ = fs::write(&marker, launcher);
+        // Best effort: without the record the next launch probes again.
+        match launcher.and_then(record) {
+            Some(record) => {
+                let _ = fs::write(&marker, record);
+            }
+            None => {
+                let _ = fs::remove_file(&marker);
+            }
         }
     };
     match run(&["--version"]) {
@@ -323,27 +335,28 @@ pub(crate) fn prepare_home(
     }
 }
 
-/// Whether `home` records a Hermes dependency environment that still exists.
-fn has_dependency_environment(home: &Path) -> bool {
+/// The Hermes dependency environments `home` records that still exist, one
+/// per install that has one, sorted.
+fn environments(home: &Path) -> Vec<String> {
     let Ok(installs) = fs::read_dir(home.join(INSTALLS_DIR)) else {
-        return false;
+        return Vec::new();
     };
-    installs
+    let mut environments: Vec<String> = installs
         .flatten()
-        .any(|install| records_environment(&install.path().join(FACTS_FILE)))
+        .filter_map(|install| recorded_environment(&install.path().join(FACTS_FILE)))
+        .collect();
+    environments.sort();
+    environments
 }
 
-fn records_environment(facts: &Path) -> bool {
-    let Ok(text) = fs::read_to_string(facts) else {
-        return false;
-    };
-    let Ok(facts) = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')) else {
-        return false;
-    };
-    facts
-        .pointer("/packages/venv/environment")
-        .and_then(Value::as_str)
-        .is_some_and(|environment| Path::new(environment).join("pyvenv.cfg").is_file())
+fn recorded_environment(facts: &Path) -> Option<String> {
+    let text = fs::read_to_string(facts).ok()?;
+    let facts = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()?;
+    let environment = facts.pointer("/packages/venv/environment")?.as_str()?;
+    Path::new(environment)
+        .join("pyvenv.cfg")
+        .is_file()
+        .then(|| environment.to_owned())
 }
 
 fn last_lines(output: &str) -> String {
@@ -765,6 +778,46 @@ providers:
             let mut unknown = Vec::new();
             prepare_home(&home, None, hermes(&home, &mut unknown)).unwrap();
             assert_eq!(unknown, ["--version"]);
+        }
+
+        /// With environments for two checkouts in the home, losing one is
+        /// noticed even though the other is still there: Hermes is asked.
+        #[test]
+        fn a_lost_environment_is_noticed_beside_another_one() {
+            let home = temp_dir("hermes-two-installs");
+            let mut calls = Vec::new();
+            prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap();
+            let other = home.join("installs").join("0123456789abcdef");
+            let venv = other.join("environments").join("e2").join("venv");
+            std::fs::create_dir_all(&venv).unwrap();
+            std::fs::write(venv.join("pyvenv.cfg"), "home = y\n").unwrap();
+            let facts = serde_json::json!({
+                "packages": { "venv": { "environment": venv.to_string_lossy() } }
+            });
+            std::fs::write(other.join("facts.json"), facts.to_string()).unwrap();
+            // A new environment changes the record: asked once, then skipped.
+            let mut probed = Vec::new();
+            prepare_home(&home, LAUNCHER, hermes(&home, &mut probed)).unwrap();
+            assert_eq!(probed, ["--version"]);
+            let mut again = Vec::new();
+            prepare_home(&home, LAUNCHER, hermes(&home, &mut again)).unwrap();
+            assert!(again.is_empty(), "{again:?}");
+
+            // The launcher's own environment goes; the other one stays.
+            let own = home.join("installs").join("d74c6fbcc1df5714");
+            std::fs::remove_dir_all(own.join("environments")).unwrap();
+            let mut lost = Vec::new();
+            prepare_home(&home, LAUNCHER, |args| {
+                lost.push(args.join(" "));
+                if args == ["pm", "repair"] {
+                    commit_environment(&home);
+                    finished(true, "repaired")
+                } else {
+                    finished(false, REFUSAL)
+                }
+            })
+            .unwrap();
+            assert_eq!(lost, ["--version", "pm repair"]);
         }
 
         /// Facts that name a missing venv do not count as an environment.
