@@ -906,7 +906,10 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
         Some("claude-haiku-5-5")
     );
     assert_eq!(header("anthropic-beta"), Some("claude-code-20250219"));
-    assert_eq!(header("x-conversation-id"), Some("session-one"));
+    // Forwarded as sent: the router keys on Claude Code's own header, so the
+    // gateway does not invent an `x-conversation-id` from it.
+    assert_eq!(header("x-claude-code-session-id"), Some("session-one"));
+    assert_eq!(header("x-conversation-id"), None);
     let mut expected = classifier.clone();
     expected["model"] = json!("claude-haiku-5-5");
     assert_eq!(body, expected);
@@ -940,8 +943,7 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
 /// The classifier pin is the Rayline router, so it is keyed like the turn it
 /// classifies: every session header the client sent reaches it unchanged (the
 /// local router's shared `SESSION_HEADERS`, so both gateways forward the same
-/// set), a client-set conversation id wins over the Claude Code session id, and
-/// the client's own credentials never do.
+/// set), each exactly once, and the client's own credentials never do.
 #[tokio::test]
 async fn classifier_pin_carries_every_client_session_header_and_no_client_auth() {
     let (router, recorded) = fake_router_for(1);
