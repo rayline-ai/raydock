@@ -127,7 +127,8 @@ pub(crate) fn rejected_argv(
 }
 
 /// The command words in `args[..end]`: the first word after the root options
-/// and the words that follow it up to the next option.
+/// and the known subcommand words after it. Other words (such as a prompt
+/// passed through to a harness) are left out, so they are never echoed.
 fn command_path<'a>(args: &[&'a str], end: usize) -> Vec<&'a str> {
     let mut command = Vec::new();
     let mut index = 0;
@@ -146,14 +147,21 @@ fn command_path<'a>(args: &[&'a str], end: usize) -> Vec<&'a str> {
             command.push(arg);
         }
     }
+    let known = (1..=command.len())
+        .rev()
+        .find(|len| crate::help_for_command_path(&command[..*len]).is_some())
+        .unwrap_or(command.len().min(1));
+    command.truncate(known);
     command
 }
 
 /// The `--env` value at `index`, as `--env=VALUE` or as the word after `--env`.
+/// An option after `--env` is not its value.
 fn env_value_at<'a>(args: &[&'a str], index: usize) -> Option<&'a str> {
-    args[index]
-        .strip_prefix("--env=")
-        .or_else(|| (index > 0 && args[index - 1] == "--env").then_some(args[index]))
+    args[index].strip_prefix("--env=").or_else(|| {
+        (index > 0 && args[index - 1] == "--env" && !args[index].starts_with('-'))
+            .then_some(args[index])
+    })
 }
 
 /// `--env` after a command that does not read it: show the command with
@@ -162,7 +170,11 @@ fn env_value_at<'a>(args: &[&'a str], index: usize) -> Option<&'a str> {
 fn misplaced_env(args: &[&str], index: usize, command: &[&str]) -> String {
     let value = match args[index].strip_prefix("--env=") {
         Some(value) => value,
-        None => args.get(index + 1).copied().unwrap_or("<name>"),
+        None => args
+            .get(index + 1)
+            .copied()
+            .filter(|value| !value.starts_with('-'))
+            .unwrap_or("<name>"),
     };
     format!(
         "raydock: `--env` goes before the command: `raydock --env {value} {}`",
@@ -303,6 +315,22 @@ mod tests {
             &["--auth-token", "t", "hybrid"][..],
         ] {
             assert_eq!(usage_message(args), super::HYBRID_ROOT_OPTIONS);
+        }
+    }
+
+    #[test]
+    fn messages_do_not_echo_passthrough_words_or_tokens() {
+        for args in [
+            &["claude", "private prompt", "--via", "bogus"][..],
+            &["claude", "private prompt", "--local", "--via", "env"][..],
+            &["top", "--env", "--auth-token=secret-value"][..],
+            &["--env", "--auth-token=secret-value", "status"][..],
+        ] {
+            let message = usage_message(args);
+            assert!(
+                !message.contains("private prompt") && !message.contains("secret-value"),
+                "{args:?}: {message}"
+            );
         }
     }
 
