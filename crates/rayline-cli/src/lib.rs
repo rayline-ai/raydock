@@ -1884,6 +1884,7 @@ where
                 crate::router::RouterStopRequest { root_env_explicit },
             ))
         }
+        // Chained, not collected, so a rejection still points at its argument.
         value if value.starts_with("--") => parse_router_start_request(
             std::iter::once(first_arg).chain(args).peekable(),
             root_env_explicit,
@@ -2712,7 +2713,7 @@ mod tests {
     }
 
     #[test]
-    fn via_env_with_local_is_unavailable() {
+    fn via_env_with_local_is_rejected() {
         assert!(matches!(
             rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--via", "env", "--local"])),
             RaylineDispatch::Usage(_)

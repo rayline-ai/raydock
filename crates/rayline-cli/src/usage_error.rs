@@ -10,7 +10,8 @@ use std::ffi::OsString;
 use crate::RaylineDispatch;
 
 /// Commands that exist only in non-public builds; only these report that they
-/// are not available here.
+/// are not available here. The public parser has no other record of them; the
+/// `claude` management words are `is_claude_management_subcommand`.
 const PRIVATE_COMMANDS: &[&str] = &["internal", "install-cli", "hook-send", "agent", "chat"];
 
 pub(crate) const HYBRID_ROOT_OPTIONS: &str = "\
@@ -20,6 +21,10 @@ Run `raydock hybrid --help` for details.";
 
 /// The arguments after the program name, counting how many a parser has
 /// taken and whether it asked for more than there were.
+///
+/// The count only locates a rejection if parsers pull arguments one at a time
+/// and reject at the last one pulled (a `peek` counts as pulled). A parser must
+/// not collect the remaining arguments before it has finished validating them.
 pub(crate) struct TrackedArgs<'a, 'c> {
     args: std::slice::Iter<'a, OsString>,
     taken: &'c Cell<usize>,
@@ -111,7 +116,12 @@ pub(crate) fn rejected_argv(
                 None => "raydock: unknown option".to_owned(),
             }
         } else {
-            format!("raydock: unknown command `{bad}`")
+            // Echoed only if it looks like a command: it may be a prompt or a key.
+            if is_word(bad) {
+                format!("raydock: unknown command `{bad}`")
+            } else {
+                "raydock: unknown command".to_owned()
+            }
         };
         return RaylineDispatch::Usage(with_usage(message, &command));
     }
@@ -148,18 +158,23 @@ pub(crate) fn rejected_argv(
     RaylineDispatch::Usage(with_usage(message, &command))
 }
 
-/// The name of the option `token` if it looks like one: `--name` (lowercase
-/// letters, digits and `-`) without any `=value`, or a short `-x` without an
-/// attached value. Anything else may be a prompt or a key and is not echoed.
+/// Whether `text` looks like a command or option word: lowercase letters,
+/// digits and `-`, and short (every Raydock word is under 32 characters).
+/// Anything else may be a prompt or a key and is not echoed.
+fn is_word(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 32
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// The name of the option `token` if it looks like one: a `--word` without
+/// any `=value`, or a short `-x` without an attached value (`-n40`).
 fn option_name(token: &str) -> Option<&str> {
     let name = token.split_once('=').map_or(token, |(name, _)| name);
     match name.strip_prefix("--") {
-        Some(long) => (!long.is_empty()
-            && long.len() <= 32
-            && long
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
-        .then_some(name),
+        Some(long) => is_word(long).then_some(name),
         None => token
             .get(..2)
             .filter(|short| short.starts_with('-') && short.as_bytes()[1].is_ascii_alphabetic()),
@@ -205,7 +220,8 @@ fn env_value_at<'a>(args: &[&'a str], index: usize) -> Option<&'a str> {
 }
 
 /// `--env` after a command that does not read it: show the command with
-/// `--env` moved in front, where every command reads it. Only the command words
+/// `--env` moved in front, where every command but `hybrid` reads it (`hybrid`
+/// never reaches here: its arguments are not parsed by this parser). Only the command words
 /// are repeated; the value is a placeholder, since a mistyped line can put a
 /// prompt or a key there.
 fn misplaced_env(command: &[&str]) -> String {
@@ -218,17 +234,16 @@ fn misplaced_env(command: &[&str]) -> String {
 /// Appends the usage line of the longest known prefix of `command` and where
 /// to read its help.
 fn with_usage(message: String, command: &[&str]) -> String {
-    let known = (0..=command.len())
-        .rev()
-        .find_map(|len| crate::help_for_command_path(&command[..len]).map(|help| (len, help)));
-    let Some((len, help)) = known else {
-        return message;
+    // A launcher (`raydock openclaw`) has no help of its own: show the root's.
+    let (command, help) = match crate::help_for_command_path(command) {
+        Some(help) => (command, help),
+        None => (&[][..], crate::ROOT_HELP),
     };
     let usage = help
         .lines()
         .find(|line| line.starts_with("Usage:"))
         .unwrap_or_default();
-    let help_command = command[..len]
+    let help_command = command
         .iter()
         .map(|word| format!(" {word}"))
         .collect::<String>();
@@ -380,6 +395,7 @@ mod tests {
             &["status", "--auth-token", "--secret-value", "unexpected"][..],
             &["codex", "--env", "--private prompt"][..],
             &["top", "--Secret-Value"][..],
+            &["private prompt"][..],
         ] {
             let message = usage_message(args);
             assert!(
@@ -419,6 +435,9 @@ mod tests {
             message
                 .starts_with("raydock: `raydock codex` rejected `--subscription` after `--auth`")
         );
+        // A private-build flag is an ordinary rejected option here.
+        let message = usage_message(&["claude", "--no-telemetry"]);
+        assert!(message.starts_with("raydock: `raydock claude` rejected `--no-telemetry`"));
         let message = usage_message(&["claude", "--via=bogus"]);
         assert!(message.starts_with("raydock: `raydock claude` rejected the value of `--via`"));
     }
