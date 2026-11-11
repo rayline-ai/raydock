@@ -35,6 +35,7 @@ use tracing::{info, warn};
 
 mod hybrid;
 mod hybrid_classifier;
+mod hybrid_counter;
 mod hybrid_metrics;
 mod statusline;
 

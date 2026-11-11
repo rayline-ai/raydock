@@ -78,6 +78,13 @@ pub struct Args {
     /// profile's cloud Messages router.
     #[arg(long, default_value = crate::hybrid_classifier::DEFAULT_CLASSIFIER_MODEL)]
     classifier_model: String,
+    /// Snapshot directory of the local model's tokenizer and chat template:
+    /// rld counts the local deployment's prompts with them for the core.
+    #[arg(long)]
+    token_counter_dir: Option<PathBuf>,
+    /// The local deployment the counter sizes.
+    #[arg(long, default_value = "local")]
+    token_counter_deployment: String,
 }
 
 #[derive(Deserialize)]
@@ -138,11 +145,41 @@ pub async fn run(args: Args) -> Result<()> {
         token: args.token_file.clone(),
         ready: None,
     };
+    // A counter that cannot load leaves the core sizing the local model
+    // itself; the session still starts.
+    let counter_token = token();
+    let mut counter_task = None;
+    let mut core_config = args.config.clone();
+    if let Some(dir) = &args.token_counter_dir {
+        match crate::hybrid_counter::prepare(
+            dir,
+            &args.config,
+            &args.token_counter_deployment,
+            counter_token.clone(),
+        )
+        .await
+        {
+            Ok(prepared) => {
+                tracing::info!(dir = %dir.display(), "local prompt counter ready");
+                core_config = prepared.config;
+                counter_task = Some(tokio::spawn(crate::hybrid_counter::serve(
+                    prepared.listener,
+                    prepared.counter,
+                )));
+            }
+            Err(error) => tracing::warn!(
+                error = format!("{error:#}"),
+                "local prompt counter unavailable; the core sizes the local model itself"
+            ),
+        }
+    }
+    let _counter_task = AbortOnDrop(counter_task);
     let mut child = Command::new(&args.core)
         .arg("--config")
-        .arg(&args.config)
+        .arg(&core_config)
         .args(["--listen", "127.0.0.1:0"])
         .env("RAYLINE_EXEC_AUTH_TOKEN", &core_token)
+        .env(crate::hybrid_counter::COUNTER_KEY_ENV, &counter_token)
         .env("RAYLINE_EXEC_PARENT_PIPE", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1127,7 +1164,16 @@ fn token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
+/// Aborts the counter's server when rld's run ends.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<Result<()>>>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+pub(crate) fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
     // Publish a fully written file atomically without replacing an existing instance.
     let pending = path.with_extension(format!("pending-{}", token()));
     let mut options = std::fs::OpenOptions::new();

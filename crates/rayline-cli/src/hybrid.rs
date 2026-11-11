@@ -187,6 +187,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             // A local model other than the default Qwen3.8-27B, declared in
             // settings: named in the error if the core refuses to start.
             let mut declared_local = None;
+            let mut token_counter_dir = None;
             let (profile, base_dir) = match config {
                 Some(config) => {
                     if env != "prod" || cell.is_some() || local_context_window.is_some() {
@@ -239,6 +240,31 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     }
                     if registry_model != crate::hybrid_profile::LOCAL_REGISTRY_MODEL {
                         declared_local = Some(registry_model.clone());
+                    }
+                    if !local_refused
+                        && let Some(repo) = crate::hybrid_tokenizer::tokenizer_repo(
+                            &registry_model,
+                            settings.as_ref(),
+                        )
+                        .map_err(settings_error)?
+                    {
+                        let fetched = tokio::task::spawn_blocking({
+                            let repo = repo.clone();
+                            move || crate::hybrid_tokenizer::fetch(&repo)
+                        })
+                        .await
+                        .map_err(|error| io::Error::other(error.to_string()))?;
+                        match fetched {
+                            Ok(dir) => {
+                                println!(
+                                    "Prompt counter: {repo} (the local model's tokenizer and chat template)"
+                                );
+                                token_counter_dir = Some(dir);
+                            }
+                            Err(error) => eprintln!(
+                                "Prompt counter unavailable ({error}); the core estimates the local model's prompt size, which can send turns to the cloud early"
+                            ),
+                        }
                     }
                     let window = if local_refused {
                         configured.unwrap_or(crate::hybrid_profile::DEFAULT_LOCAL_CONTEXT_WINDOW)
@@ -376,6 +402,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             }
             command.arg("--env-name").arg(&decisions_env);
             command.arg("--classifier-model").arg(&classifier_model);
+            if let Some(dir) = &token_counter_dir {
+                command.arg("--token-counter-dir").arg(dir);
+            }
             for (name, key) in &credentials {
                 command.env(name, key);
             }
