@@ -254,16 +254,21 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     {
                         // The Hub gets a short deadline; past it the cached
                         // snapshot, if any, is used and startup goes on.
-                        let fetching = tokio::task::spawn_blocking({
+                        // A detached thread, not a blocking task: the runtime
+                        // waits for blocking tasks at exit, and the downloader
+                        // retries for far longer than `start` should run.
+                        let (sender, fetching) = tokio::sync::oneshot::channel();
+                        std::thread::spawn({
                             let repo = repo.clone();
-                            move || crate::hybrid_tokenizer::fetch(&repo)
+                            move || {
+                                let _ = sender.send(crate::hybrid_tokenizer::fetch(&repo));
+                            }
                         });
                         let fetched = match tokio::time::timeout(TOKENIZER_FETCH_DEADLINE, fetching)
                             .await
                         {
-                            Ok(joined) => {
-                                joined.map_err(|error| io::Error::other(error.to_string()))?
-                            }
+                            Ok(Ok(fetched)) => fetched,
+                            Ok(Err(_)) => Err("the tokenizer download stopped".to_owned()),
                             Err(_) => crate::hybrid_tokenizer::cached(&repo).ok_or_else(|| {
                                 format!(
                                     "Hugging Face did not answer within {}s and nothing is cached",
