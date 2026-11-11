@@ -114,10 +114,14 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
     if !has_template {
         return Err(format!("{repo} publishes no chat template"));
     }
-    if complete {
-        // `cached` falls back to this snapshot alone.
-        let _ = std::fs::write(complete_marker(repo), &commit);
+    if !complete {
+        // A partial snapshot could miscount; use the last complete one, or
+        // start without a counter.
+        return cached(repo)
+            .ok_or_else(|| format!("could not fetch all of {repo}'s tokenizer files"));
     }
+    // `cached` falls back to this snapshot alone.
+    let _ = std::fs::write(complete_marker(repo), &commit);
     Ok(dir)
 }
 
