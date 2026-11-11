@@ -3,6 +3,59 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
+## 0.4.4 (2026-11-11)
+
+### New
+
+- **Claude Haiku 5.5 is a third default cloud target in hybrid mode.** The
+  default profile pins Haiku 5.5 beside Opus 5.5 and Sonnet 5.5, so a turn
+  that leaves the local model (too large for its window, or one the router
+  expects it to fail) has a cloud target priced well below Sonnet. Like the
+  other two, it allows 128,000 output tokens. A `hybrid.cloud_output_tokens`
+  block must now name all three pins; one written for the two earlier pins
+  is refused until it has a Haiku line.
+
+### Fixed
+
+- **Claude Code in hybrid mode works with llama.cpp chat templates that
+  require the system message first** (such as Qwen3.8-27B). The bundled
+  execution core (`rayline-core`, now pinned to `80ce3d26`) moves a system
+  message that appears later in the conversation into the user or tool turn
+  it follows, as user content, before sending the turn to a local
+  OpenAI-chat model, so the template no longer rejects it with "System
+  message must be at the beginning." The leading system message is left as
+  is, and requests with no later system message are sent unchanged.
+  ([#196](https://github.com/rayline-ai/raydock/issues/196))
+- **A local model failure no longer ends the turn.** If the local server
+  returns a 5xx error or can't be reached before any output, the core asks
+  the router once more for that turn with the failed local model excluded,
+  which normally sends it to a cloud target. Errors from that second attempt
+  are still returned to the agent.
+- **Session headers reach the Rayline router through the local router.** A
+  client that sends its session id only in a header (`x-session-affinity`,
+  `x-claude-code-session-id`, `x-session-id` or `x-conversation-id`) and goes
+  through `rld`'s local router to the hosted router, such as Claude Code in
+  Claude Desktop (`raydock claude-desktop`), lost that header on the way, so
+  the router keyed its turns on an id it derived from the request instead.
+  The local router now forwards exactly these four headers, unchanged, on
+  Messages, Chat Completions and Responses, and only when the upstream is the
+  hosted Rayline router; Anthropic, OpenAI, OpenRouter and custom endpoints
+  never receive them. Hybrid's auto-mode classifier calls carry all four as
+  well.
+- **Session ids sent in the request body survive translation in the local
+  router.** When the local router turns a request into another protocol (Chat
+  Completions or Responses into Messages, Responses or Messages into Chat
+  Completions), the rebuilt body dropped the client's `session_id` and
+  `prompt_cache_key`, so separate sessions merged into one conversation. Seen
+  with Codex through a gateway with a Messages upstream and with Cline's
+  OpenRouter provider. The local router now sends that id to the hosted Rayline
+  router as `x-session-affinity`, in the router's own order for those fields:
+  Codex's `prompt_cache_key` first, then `session_id`, then a Responses
+  `prompt_cache_key`. A session header the client sent still wins, and an id a
+  header cannot carry unchanged (non-ASCII) is skipped. Requests forwarded
+  without translation are unchanged, and no other upstream receives the
+  header.
+
 ## 0.4.3 (2026-11-09)
 
 ### New
@@ -45,29 +98,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Fixed
 
-- **Session headers reach the Rayline router through the local router.** A
-  client that sends its session id only in a header (`x-session-affinity`,
-  `x-claude-code-session-id`, `x-session-id` or `x-conversation-id`) and goes
-  through `rld`'s local router to the hosted router, such as Claude Code in
-  Claude Desktop (`raydock claude-desktop`), lost that header on the way, so
-  the router keyed its turns on an id it derived from the request instead. The local router now
-  forwards exactly these four headers, unchanged, on Messages, Chat Completions
-  and Responses, and only when the upstream is the hosted Rayline router;
-  Anthropic, OpenAI, OpenRouter and custom endpoints never receive them. Hybrid's
-  auto-mode classifier calls carry all four as well.
-- **Session ids sent in the request body survive translation in the local
-  router.** When the local router turns a request into another protocol (Chat
-  Completions or Responses into Messages, Responses or Messages into Chat
-  Completions), the rebuilt body dropped the client's `session_id` and
-  `prompt_cache_key`, so separate sessions merged into one conversation. Seen
-  with Codex through a gateway with a Messages upstream and with Cline's
-  OpenRouter provider. The local router now sends that id to the hosted Rayline
-  router as `x-session-affinity`, in the router's own order for those fields:
-  Codex's `prompt_cache_key` first, then `session_id`, then a Responses
-  `prompt_cache_key`. A session header the client sent still wins, and an id a
-  header cannot carry unchanged (non-ASCII) is skipped. Requests forwarded
-  without translation are unchanged, and no other upstream receives the
-  header.
 - **`hybrid start` warns when the local window cannot hold Claude Code's
   opening request.** For a model other than Qwen3.8-27B, the core reserves
   the opening request (about 73,000 tokens with no MCP servers or project
