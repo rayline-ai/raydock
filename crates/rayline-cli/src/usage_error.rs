@@ -92,13 +92,6 @@ pub(crate) fn rejected_argv(
         let message = "raydock: invalid `--auth-token` value".to_owned();
         return RaylineDispatch::Usage(with_usage(message, &command));
     }
-    // A rejected option is named without an attached value (`--option=value`,
-    // `-nVALUE`), which may be a key.
-    let shown = match bad.split_once('=') {
-        Some((option, _)) if bad.starts_with('-') => option,
-        _ if !bad.starts_with("--") => bad.get(..2).unwrap_or(bad),
-        _ => bad,
-    };
 
     if let Some(env) = env_value_at(&args, stop) {
         if !crate::status::is_valid_root_env(env) {
@@ -113,7 +106,10 @@ pub(crate) fn rejected_argv(
             return RaylineDispatch::Unavailable(bad.to_owned());
         }
         let message = if bad.starts_with('-') {
-            format!("raydock: unknown option `{shown}`")
+            match option_name(bad) {
+                Some(name) => format!("raydock: unknown option `{name}`"),
+                None => "raydock: unknown option".to_owned(),
+            }
         } else {
             format!("raydock: unknown command `{bad}`")
         };
@@ -131,14 +127,37 @@ pub(crate) fn rejected_argv(
     }
     // Only option names are echoed: a rejected word may be a prompt or a key.
     let words = command.join(" ");
-    let message = if bad.starts_with('-') {
-        format!("raydock: `raydock {words}` does not accept `{shown}`")
-    } else if previous.starts_with('-') && !previous.contains('=') {
-        format!("raydock: `raydock {words}` rejected the argument after `{previous}`")
-    } else {
-        format!("raydock: `raydock {words}` got an unexpected argument")
+    let previous_is_value =
+        stop >= 2 && crate::is_value_option(args[stop - 2]) && !args[stop - 2].contains('=');
+    let previous_option =
+        option_name(previous).filter(|name| *name == previous && !previous_is_value);
+    let message = match (bad.starts_with('-'), option_name(bad), previous_option) {
+        (true, Some(name), _) => format!("raydock: `raydock {words}` does not accept `{name}`"),
+        (true, None, _) => format!("raydock: `raydock {words}` got an unexpected option"),
+        (false, _, Some(option)) => {
+            format!("raydock: `raydock {words}` rejected the argument after `{option}`")
+        }
+        (false, _, None) => format!("raydock: `raydock {words}` got an unexpected argument"),
     };
     RaylineDispatch::Usage(with_usage(message, &command))
+}
+
+/// The name of the option `token` if it looks like one: `--name` (lowercase
+/// letters, digits and `-`) without any `=value`, or a short `-x` without an
+/// attached value. Anything else may be a prompt or a key and is not echoed.
+fn option_name(token: &str) -> Option<&str> {
+    let name = token.split_once('=').map_or(token, |(name, _)| name);
+    match name.strip_prefix("--") {
+        Some(long) => (!long.is_empty()
+            && long.len() <= 32
+            && long
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'))
+        .then_some(name),
+        None => token
+            .get(..2)
+            .filter(|short| short.starts_with('-') && short.as_bytes()[1].is_ascii_alphabetic()),
+    }
 }
 
 /// The command words in `args[..end]`: the first word after the root options
@@ -351,6 +370,10 @@ mod tests {
             &["router", "logs", "-n", "secret-value"][..],
             &["top", "secret-value"][..],
             &["router", "logs", "-nsecret-value"][..],
+            &["status", "--auth-token", "-secret-value", "unexpected"][..],
+            &["status", "--auth-token", "--secret-value", "unexpected"][..],
+            &["codex", "--env", "--private prompt"][..],
+            &["top", "--Secret-Value"][..],
         ] {
             let message = usage_message(args);
             assert!(
