@@ -92,10 +92,10 @@ pub(crate) fn rejected_argv(
         let message = "raydock: invalid `--auth-token` value".to_owned();
         return RaylineDispatch::Usage(with_usage(message, &command));
     }
-    let shown = if bad.starts_with("--auth-token=") {
-        "--auth-token"
-    } else {
-        bad
+    // A rejected `--option=value` is named without its value, which may be a key.
+    let shown = match bad.split_once('=') {
+        Some((option, _)) if bad.starts_with('-') => option,
+        _ => bad,
     };
 
     if let Some(env) = env_value_at(&args, stop) {
@@ -278,8 +278,14 @@ mod tests {
         );
         let message = usage_message(&["--auth-token", "secret-value", "top", "--env", "dev"]);
         assert!(!message.contains("secret-value"), "{message}");
-        let message = usage_message(&["top", "--auth-token=secret-value"]);
-        assert!(!message.contains("secret-value"), "{message}");
+        for args in [
+            &["top", "--auth-token=secret-value"][..],
+            &["top", "--api-key=secret-value"][..],
+            &["--api-key=secret-value", "top"][..],
+        ] {
+            let message = usage_message(args);
+            assert!(!message.contains("secret-value"), "{args:?}: {message}");
+        }
     }
 
     #[test]
