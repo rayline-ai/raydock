@@ -87,7 +87,11 @@ pub(crate) fn rejected_argv(
         return RaylineDispatch::Usage(with_usage(message, &command));
     };
     let bad = args[stop];
-    // Never echo a token given inline.
+    // Never echo a token.
+    if stop > 0 && args[stop - 1] == "--auth-token" {
+        let message = "raydock: invalid `--auth-token` value".to_owned();
+        return RaylineDispatch::Usage(with_usage(message, &command));
+    }
     let shown = if bad.starts_with("--auth-token=") {
         "--auth-token"
     } else {
@@ -331,6 +335,29 @@ mod tests {
                 !message.contains("private prompt") && !message.contains("secret-value"),
                 "{args:?}: {message}"
             );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_auth_token_is_not_echoed() {
+        use std::os::unix::ffi::OsStringExt;
+
+        for prefix in [&["status"][..], &[][..]] {
+            let mut argv = std::iter::once("raydock")
+                .chain(prefix.iter().copied())
+                .chain(["--auth-token"])
+                .map(OsString::from)
+                .collect::<Vec<_>>();
+            argv.push(OsString::from_vec(b"secret-value\xff".to_vec()));
+            argv.push(OsString::from("status"));
+            match rayline_dispatch_for_argv(&argv) {
+                RaylineDispatch::Usage(message) => {
+                    assert!(!message.contains("secret-value"), "{message}");
+                    assert!(message.starts_with("raydock: invalid `--auth-token` value"));
+                }
+                other => panic!("expected a usage error, got {other:?}"),
+            }
         }
     }
 
