@@ -139,18 +139,15 @@ in the state directory (owner-only). The user's setup is: a Rayline API key, a
     report none). A llama.cpp
     `--alias` or the configured model name is not evidence, since runtimes
     echo it back.
-  - Claude Opus 5.5, Sonnet 5.5 and Haiku 5.5 are exact model pins through
-    the same router, each with its 1,000,000-token window. Haiku is the
-    cheapest of the three, so a turn that leaves the local model has a cloud
-    target priced well below Sonnet. Each pins the router's own model id
-    (`claude-opus-5-5`, `claude-sonnet-5-5`, `claude-haiku-5-5`), which the
-    router serves directly from Anthropic; its `registry_model`
-    (`anthropic/claude-opus-5.5`, `anthropic/claude-sonnet-5.5`,
-    `anthropic/claude-haiku-5.5`) names the core's measured cell for that
-    model.
+  - Claude Opus 5.5 and Sonnet 5.5 are exact model pins through the same
+    router, each with its 1,000,000-token window. Each pins the router's own
+    model id (`claude-opus-5-5`, `claude-sonnet-5-5`), which the router serves
+    directly from Anthropic; its `registry_model`
+    (`anthropic/claude-opus-5.5`, `anthropic/claude-sonnet-5.5`) names the
+    core's measured cell for that model.
   - `derived_actions` let the core derive ARC's actions from its embedded
-    registry: Qwen's admitted controls, plus the default-base controls of Opus,
-    Sonnet and Haiku.
+    registry: Qwen's admitted controls, plus the default-base controls of Opus
+    and Sonnet.
   - `--cell` selects an isolated development cell.
   - This profile has no prompt counter. An execution core with estimated
     local capacity facts (semantic-router#357) conservatively estimates the
@@ -308,8 +305,8 @@ local window would starve that handoff. The ordinary hosted launchers keep
 their existing configuration.
 
 Each cloud target declares its own model's output ceiling: 128,000 tokens on
-each of the three Claude 5.5 pins, stated beside the pin, or
-`hybrid.cloud_output_tokens` when that is set. The default profile pins exact models, so their ceilings are
+both Claude 5.5 pins, stated beside the pin, or `hybrid.cloud_output_tokens`
+when that is set. The default profile pins exact models, so their ceilings are
 Raydock's to state and nothing is read over the network to discover them.
 
 A harness states one output allowance for the whole session, but the

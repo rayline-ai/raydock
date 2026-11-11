@@ -5,16 +5,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ## 0.4.4 (2026-11-11)
 
-### New
-
-- **Claude Haiku 5.5 is a third default cloud target in hybrid mode.** The
-  default profile pins Haiku 5.5 beside Opus 5.5 and Sonnet 5.5, so a turn
-  that leaves the local model (too large for its window, or one the router
-  expects it to fail) has a cloud target priced well below Sonnet. Like the
-  other two, it allows 128,000 output tokens. A `hybrid.cloud_output_tokens`
-  block must now name all three pins; one written for the two earlier pins
-  is refused until it has a Haiku line.
-
 ### Fixed
 
 - **Claude Code in hybrid mode works with llama.cpp chat templates that

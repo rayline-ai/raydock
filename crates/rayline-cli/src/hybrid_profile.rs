@@ -51,9 +51,8 @@ pub(crate) const LOCAL_REGISTRY_MODEL: &str = "qwen/qwen3.8-27b";
 pub(crate) const DEFAULT_LOCAL_CONTEXT_WINDOW: u64 = 98_304;
 /// The bounds of `hybrid.local_context_window` (the cloud targets' window).
 const LOCAL_CONTEXT_WINDOW_RANGE: std::ops::RangeInclusive<u64> = 2048..=1_000_000;
-/// Context window of the default cloud targets, Claude Opus 5.5, Sonnet 5.5
-/// and Haiku 5.5 (pricing snapshot 2026-10-16, `context_window_tokens`; Haiku
-/// read from the dev and prod catalogs 2026-11-09, `context_length`).
+/// Context window of the default cloud targets, Claude Opus 5.5 and Sonnet
+/// 5.5 (pricing snapshot 2026-10-16, `context_window_tokens`).
 const CLOUD_CONTEXT_WINDOW: u64 = 1_000_000;
 /// Output ceiling of every hybrid deployment: the harness default
 /// (`harness::MAX_OUTPUT_TOKENS`), not the larger hosted ARC ceiling. The core
@@ -69,17 +68,11 @@ const MAX_OUTPUT_TOKENS: u64 = crate::harness::MAX_OUTPUT_TOKENS;
 /// registry knows it, whose measured cell supplies the action's controls.
 ///
 /// The ceiling is each pinned model's own, not the harness default: a single
-/// constant for all of them capped every cloud answer at a fraction of what
-/// the model allows. These are the models this profile pins, so their
-/// ceilings are declared here beside them (catalog figures, 2026-11-06 for
-/// Opus and Sonnet and 2026-11-09 for Haiku, matching dev and prod), as
-/// [`CLOUD_CONTEXT_WINDOW`] is. Override them per model with
+/// constant for both capped every cloud answer at a fraction of what the model
+/// allows. These are the models this profile pins, so their ceilings are
+/// declared here beside them (catalog figures, 2026-11-06, matching dev and
+/// prod), as [`CLOUD_CONTEXT_WINDOW`] is. Override them per model with
 /// `hybrid.cloud_output_tokens`.
-///
-/// Haiku 5.5 is the cheapest Claude tier, so a turn that leaves the local
-/// model (too large for its window, or one Swift expects it to fail) has a
-/// cloud target priced well below Sonnet. The core's registry qualifies it on
-/// the same cell as Sonnet (`openrouter`, Messages, `default` base).
 pub(crate) const CLOUD_MODELS: &[(&str, &str, &str, u64)] = &[
     (
         "cloud-opus",
@@ -91,12 +84,6 @@ pub(crate) const CLOUD_MODELS: &[(&str, &str, &str, u64)] = &[
         "cloud-sonnet",
         "claude-sonnet-5-5",
         "anthropic/claude-sonnet-5.5",
-        128_000,
-    ),
-    (
-        "cloud-haiku",
-        "claude-haiku-5-5",
-        "anthropic/claude-haiku-5.5",
         128_000,
     ),
 ];
@@ -335,7 +322,7 @@ fn cloud_pins(
             .iter()
             .map(|(_, wire, _, _)| *wire)
             .collect::<Vec<_>>()
-            .join(", ")
+            .join(" and ")
     };
     // A key naming another model, such as an id an earlier release pinned,
     // is named in the error rather than reported as a missing ceiling.
@@ -739,9 +726,8 @@ pub(crate) fn custom_local_model(settings: Option<&Value>) -> Option<(String, St
 }
 
 /// The default package-less profile: the local model from `local_model`
-/// (Qwen3.8-27B unless `hybrid.local_registry_model` declares another), Opus,
-/// Sonnet and Haiku through the signed-in router (exact model pins), decisions
-/// from the
+/// (Qwen3.8-27B unless `hybrid.local_registry_model` declares another), Opus and
+/// Sonnet through the signed-in router (exact model pins), decisions from the
 /// router's [`DECISIONS_MODEL`] with the hybrid default preset applied by
 /// [`compose`]. The core derives each action's controls from its embedded
 /// registry.
@@ -817,7 +803,7 @@ pub(crate) fn default_profile(
          "registry_model": registry_model, "registry_provider": "openai",
          "runtime_identity": format!("local_model:{model}"), "max_output_tokens": max_output,
          "context_window": context_window, "input_modalities": ["text"], "token_units": "",
-         // The smallest cap of the four, so a caller asking for more is
+         // The smallest cap of the three, so a caller asking for more is
          // lowered to it here most often. Every deployment clamps; see the
          // cloud closure above for the trade that makes.
          "clamp_output_allowance": true})];
@@ -1395,8 +1381,7 @@ mod tests {
             [
                 (json!("local"), json!(98_304)),
                 (json!("cloud-opus"), json!(1_000_000)),
-                (json!("cloud-sonnet"), json!(1_000_000)),
-                (json!("cloud-haiku"), json!(1_000_000))
+                (json!("cloud-sonnet"), json!(1_000_000))
             ]
         );
     }
@@ -1486,7 +1471,7 @@ mod tests {
         // the harness that sent it could not state a smaller one.
         assert_eq!(local["clamp_output_allowance"], true);
         // Each cloud deployment declares the ceiling it was given, its own
-        // model's, not one constant for all of them.
+        // model's, not one constant for both.
         for (cloud, (_, _, _, ceiling)) in config["deployments"].as_array().unwrap()[1..]
             .iter()
             .zip(CLOUD_MODELS)
@@ -1494,11 +1479,7 @@ mod tests {
             assert_eq!(cloud["max_output_tokens"], *ceiling);
             assert_eq!(cloud["clamp_output_allowance"], true);
         }
-        // One action for the local model and one per cloud pin.
-        assert_eq!(
-            config["derived_actions"].as_array().unwrap().len(),
-            1 + CLOUD_MODELS.len()
-        );
+        assert_eq!(config["derived_actions"].as_array().unwrap().len(), 3);
         assert_eq!(
             config["deployments"][1]["url"],
             "https://api-dev.rayline.ai/v1/messages"
@@ -1527,8 +1508,8 @@ mod tests {
     }
 
     /// Each cloud deployment declares its own model's ceiling, and settings
-    /// may replace them per model. One constant for all of them capped every
-    /// cloud answer at the smallest arm's figure.
+    /// may replace them per model. One constant for both capped every cloud
+    /// answer at the smallest arm's figure.
     #[test]
     fn each_cloud_deployment_declares_its_own_output_ceiling() {
         let built = |settings: Option<&Value>| {
@@ -1560,10 +1541,9 @@ mod tests {
         let mut overridden = settings(None);
         overridden["hybrid"]["cloud_output_tokens"] = json!({
             "claude-opus-5-5": 96_000,
-            "claude-sonnet-5-5": 64_000,
-            "claude-haiku-5-5": 32_000
+            "claude-sonnet-5-5": 64_000
         });
-        assert_eq!(built(Some(&overridden)).0, vec![96_000, 64_000, 32_000]);
+        assert_eq!(built(Some(&overridden)).0, vec![96_000, 64_000]);
     }
 
     /// `hybrid.cloud_output_tokens` overrides the declared ceilings, keyed by
@@ -1580,25 +1560,19 @@ mod tests {
         // genuinely outside it.
         let bounds = with(json!({
             "claude-opus-5-5": CLOUD_OUTPUT_RANGE.start(),
-            "claude-sonnet-5-5": CLOUD_OUTPUT_RANGE.end(),
-            "claude-haiku-5-5": CLOUD_OUTPUT_RANGE.start()
+            "claude-sonnet-5-5": CLOUD_OUTPUT_RANGE.end()
         }));
         assert_eq!(
             cloud_pins(Some(&bounds)).map(|pins| pins.iter().map(|(_, _, _, c)| *c).collect()),
-            Ok(vec![
-                *CLOUD_OUTPUT_RANGE.start(),
-                *CLOUD_OUTPUT_RANGE.end(),
-                *CLOUD_OUTPUT_RANGE.start()
-            ])
+            Ok(vec![*CLOUD_OUTPUT_RANGE.start(), *CLOUD_OUTPUT_RANGE.end()])
         );
-        let each = with(json!({
+        let both = with(json!({
             "claude-opus-5-5": 96_000,
-            "claude-sonnet-5-5": 64_000,
-            "claude-haiku-5-5": 32_000
+            "claude-sonnet-5-5": 64_000
         }));
         assert_eq!(
-            cloud_pins(Some(&each)).map(|pins| pins.iter().map(|(_, _, _, c)| *c).collect()),
-            Ok(vec![96_000, 64_000, 32_000])
+            cloud_pins(Some(&both)).map(|pins| pins.iter().map(|(_, _, _, c)| *c).collect()),
+            Ok(vec![96_000, 64_000])
         );
         // Absent: each pin's declared ceiling.
         let declared = CLOUD_MODELS
@@ -1613,35 +1587,26 @@ mod tests {
             );
         }
         for refused in [
-            // One model named, so the others would have to come from elsewhere.
+            // One model named, so the other would have to come from elsewhere.
             json!({"claude-opus-5-5": 96_000}),
-            // The two pins of an earlier release: a block written before Haiku
-            // was pinned needs its ceiling too, rather than mixing one
-            // declared figure with two of the user's.
-            json!({
-                "claude-opus-5-5": 96_000,
-                "claude-sonnet-5-5": 64_000
-            }),
             // A model this profile does not pin.
             json!({
                 "claude-opus-5-5": 96_000,
                 "claude-sonnet-5-5": 64_000,
-                "claude-haiku-5-5": 32_000,
-                "claude-fable-5-1": 64_000
+                "claude-haiku-5-5": 64_000
             }),
             // The right number of models, one of them not pinned: the count
             // alone cannot catch this, so each pin is looked up by name.
             json!({
                 "claude-opus-5-5": 96_000,
-                "claude-sonnet-5-5": 64_000,
-                "claude-fable-5-1": 64_000
+                "claude-haiku-5-5": 64_000
             }),
             // Out of range, and not a whole number of tokens.
-            json!({"claude-opus-5-5": 1024, "claude-sonnet-5-5": 64_000, "claude-haiku-5-5": 32_000}),
-            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": 0, "claude-haiku-5-5": 32_000}),
-            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": 64_000, "claude-haiku-5-5": "32000"}),
-            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": 64_000, "claude-haiku-5-5": 1_000_001}),
-            json!([96_000, 64_000, 32_000]),
+            json!({"claude-opus-5-5": 1024, "claude-sonnet-5-5": 64_000}),
+            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": 0}),
+            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": "64000"}),
+            json!({"claude-opus-5-5": 96_000, "claude-sonnet-5-5": 1_000_001}),
+            json!([96_000, 64_000]),
         ] {
             assert!(
                 cloud_pins(Some(&with(refused.clone()))).is_err(),
@@ -2270,13 +2235,12 @@ mod tests {
         let mut settings = settings(None);
         settings["hybrid"]["cloud_output_tokens"] = json!({
             "anthropic/claude-opus-5.5": 96_000,
-            "anthropic/claude-sonnet-5.5": 64_000,
-            "anthropic/claude-haiku-5.5": 32_000
+            "anthropic/claude-sonnet-5.5": 64_000
         });
         let error = cloud_pins(Some(&settings)).unwrap_err();
         assert!(
             error.starts_with("settings hybrid.cloud_output_tokens names anthropic/claude-")
-                && error.ends_with("claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5"),
+                && error.ends_with("claude-opus-5-5 and claude-sonnet-5-5"),
             "{error}"
         );
     }
@@ -2663,14 +2627,14 @@ mod tests {
             .iter()
             .map(|deployment| deployment["kind"].as_str().unwrap())
             .collect();
-        assert_eq!(kinds, ["cloud", "cloud", "cloud"]);
+        assert_eq!(kinds, ["cloud", "cloud"]);
         let actions: Vec<_> = config["derived_actions"]
             .as_array()
             .unwrap()
             .iter()
             .map(|action| action["deployment_id"].as_str().unwrap())
             .collect();
-        assert_eq!(actions, ["cloud-opus", "cloud-sonnet", "cloud-haiku"]);
+        assert_eq!(actions, ["cloud-opus", "cloud-sonnet"]);
         // Every caller price is unchanged and no digest is pinned.
         assert!(config["decisions"].get("price_sha256").is_none());
         assert_eq!(
