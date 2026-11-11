@@ -28,6 +28,17 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Fixed
 
+- **Codex gets each model's real context window from the local router.**
+  The router's `/v1/models` catalog told Codex that every model had a
+  128,000-token window, so Codex compacted at about 115,000 tokens even on
+  the 1M-token ARC models, and a session whose requests stayed above that
+  compacted before every request. Each catalog entry now carries the window
+  its endpoint reports: `context_length` from the Rayline API's model list,
+  a ChatGPT subscription model's own window, and for local runtimes the
+  context of a loaded Ollama model, the tag's `num_ctx` (read without loading
+  the model) or llama.cpp's `n_ctx`. The default `rayline-local` entry takes
+  the window of the model it routes to. A model whose endpoint reports no
+  window keeps the 128,000 default.
 - **`raydock claude --config` stops when it can't read the config file.**
   A missing or malformed `--config` file used to be treated as a config
   that leaves the main agent on your Claude subscription, so main traffic

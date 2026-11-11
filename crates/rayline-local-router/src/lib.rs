@@ -34,6 +34,7 @@ mod anthropic_usage;
 mod capabilities;
 mod chat_inbound;
 pub mod decisions_url;
+mod model_windows;
 pub use capabilities::ModelCapabilities;
 pub mod inbound_guard;
 
@@ -211,6 +212,8 @@ struct AppState {
     http_ipv4: reqwest::Client,
     route_counter: Arc<AtomicU64>,
     started_at: String,
+    /// Context windows the endpoints report, for the Codex catalog.
+    model_windows: Arc<model_windows::ModelWindowCache>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -296,6 +299,7 @@ pub async fn serve(opts: LocalRouterOptions) -> Result<()> {
         http_ipv4: outbound_http_client(true)?,
         route_counter: Arc::new(AtomicU64::new(1)),
         started_at: chrono_like_now(),
+        model_windows: Arc::default(),
     };
     loop {
         let (stream, _) = listener.accept().await?;
@@ -876,17 +880,30 @@ async fn models_response(
     inbound_headers: &HeaderMap,
     path_and_query: &str,
 ) -> Response<BoxBody> {
-    if let Some(endpoint) = client_bearer_models_endpoint(&state.config) {
-        match proxy_client_bearer_models(state, endpoint, inbound_headers, path_and_query).await {
-            Ok(response) => return response,
-            Err(error) => warn!("local router client-bearer /models proxy failed: {error:#}"),
+    let client_bearer = client_bearer_models_endpoint(&state.config);
+    let upstream = async {
+        match client_bearer {
+            Some(endpoint) => Some(
+                fetch_client_bearer_models(state, endpoint, inbound_headers, path_and_query).await,
+            ),
+            None => None,
         }
+    };
+    // Size the models while the subscription catalog (if any) is fetched.
+    let (mut windows, upstream) = tokio::join!(state.model_windows.windows(state), upstream);
+    match (client_bearer, upstream) {
+        (Some(endpoint), Some(Ok(UpstreamModels::Catalog(mut value)))) => {
+            windows.insert(endpoint.id.clone(), model_windows::listed_windows(&value));
+            merge_static_models(&mut value, state, &windows);
+            return json_response(StatusCode::OK, value);
+        }
+        (_, Some(Ok(UpstreamModels::Passthrough(response)))) => return response,
+        (_, Some(Err(error))) => {
+            warn!("local router client-bearer /models proxy failed: {error:#}")
+        }
+        _ => {}
     }
-    static_models_response(state)
-}
-
-fn static_models_response(state: &AppState) -> Response<BoxBody> {
-    json_response(StatusCode::OK, static_models_value(state))
+    json_response(StatusCode::OK, static_models_value(state, &windows))
 }
 
 /// A `/v1/models` catalog entry: the wire id/slug plus the friendly label Codex
@@ -895,6 +912,52 @@ fn static_models_response(state: &AppState) -> Response<BoxBody> {
 struct CatalogModel {
     id: String,
     display_name: String,
+    /// The endpoint and model this entry reaches, used to look up its context
+    /// window. `None` when it reaches the on-device adapter.
+    target: Option<(String, String)>,
+}
+
+impl CatalogModel {
+    fn window(&self, windows: &model_windows::Windows) -> Option<model_windows::ModelWindow> {
+        let (endpoint, model) = self.target.as_ref()?;
+        windows.get(endpoint)?.get(model).copied()
+    }
+}
+
+/// Where a Codex main turn that sends the catalog sentinel is routed, mirroring
+/// `select_route`: the sentinel's `model_routes` entry, else `routes.main`, else
+/// `routes.default`. Codex keeps one set of metadata per slug, so the sentinel
+/// entry takes this route's window.
+fn catalog_sentinel_target(config: &RouterConfig) -> Option<(String, String)> {
+    let route = config
+        .routes
+        .model_routes
+        .get(CATALOG_SENTINEL_MODEL)
+        .or(config.routes.main.as_ref())
+        .or(config.routes.default.as_ref())
+        .cloned()
+        .unwrap_or_else(default_main_route);
+    route_window_target(route)
+}
+
+/// Where a main turn that names a listed model is routed: its `model_routes`
+/// override when there is one (as `select_route` checks that first), else the
+/// endpoint that lists it.
+fn catalog_model_target(
+    config: &RouterConfig,
+    endpoint: &EndpointConfig,
+    model: &str,
+) -> Option<(String, String)> {
+    match config.routes.model_routes.get(&normalize_model_name(model)) {
+        Some(route) => route_window_target(route.clone()),
+        None => Some((endpoint.id.clone(), model.to_owned())),
+    }
+}
+
+/// The endpoint and model whose window a route uses; `None` for the on-device
+/// adapter.
+fn route_window_target(route: RouteTarget) -> Option<(String, String)> {
+    (route.endpoint != "local").then_some((route.endpoint, route.model))
 }
 
 /// The one Codex sentinel advertised in `/v1/models`. The `rayline codex` CLI
@@ -915,6 +978,7 @@ fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
     let mut models = vec![CatalogModel {
         id: CATALOG_SENTINEL_MODEL.to_owned(),
         display_name: sentinel_display_name(CATALOG_SENTINEL_MODEL),
+        target: catalog_sentinel_target(config),
     }];
     for endpoint in &config.endpoints {
         if endpoint_hidden_from_catalog(endpoint) {
@@ -932,6 +996,7 @@ fn catalog_models(config: &RouterConfig) -> Vec<CatalogModel> {
             models.push(CatalogModel {
                 id: model.clone(),
                 display_name: catalog_display_name(endpoint, model),
+                target: catalog_model_target(config, endpoint, model),
             });
         }
     }
@@ -1039,7 +1104,7 @@ fn capitalize(value: &str) -> String {
     }
 }
 
-fn static_models_value(state: &AppState) -> Value {
+fn static_models_value(state: &AppState, windows: &model_windows::Windows) -> Value {
     let catalog = catalog_models(&state.config);
     let models = catalog
         .iter()
@@ -1047,7 +1112,7 @@ fn static_models_value(state: &AppState) -> Value {
         .collect::<Vec<_>>();
     let codex_models = catalog
         .iter()
-        .map(|model| codex_model_json(&model.id, &model.display_name))
+        .map(|model| codex_model_json(&model.id, &model.display_name, model.window(windows)))
         .collect::<Vec<_>>();
     json!({
         "object": "list",
@@ -1082,12 +1147,19 @@ fn endpoint_by_id<'a>(config: &'a RouterConfig, id: &str) -> Option<&'a Endpoint
     config.endpoints.iter().find(|endpoint| endpoint.id == id)
 }
 
-async fn proxy_client_bearer_models(
+/// The subscription backend's `/models` answer: its catalog when it is JSON
+/// (to merge the Rayline entries into), otherwise the response as received.
+enum UpstreamModels {
+    Catalog(Value),
+    Passthrough(Response<BoxBody>),
+}
+
+async fn fetch_client_bearer_models(
     state: &AppState,
     endpoint: &EndpointConfig,
     inbound_headers: &HeaderMap,
     path_and_query: &str,
-) -> Result<Response<BoxBody>> {
+) -> Result<UpstreamModels> {
     let upstream_path = path_and_query
         .strip_prefix("/v1/")
         .or_else(|| path_and_query.strip_prefix('/'))
@@ -1103,16 +1175,16 @@ async fn proxy_client_bearer_models(
     let resp = outbound.send().await?;
     let status = resp.status();
     if !status.is_success() {
-        return response_from_reqwest(resp, status, None, None, None, None).await;
+        return response_from_reqwest(resp, status, None, None, None, None)
+            .await
+            .map(UpstreamModels::Passthrough);
     }
     let headers = resp.headers().clone();
     let body = resp.bytes().await?;
-    let mut value = match serde_json::from_slice::<Value>(&body) {
-        Ok(value) => value,
-        Err(_) => return Ok(raw_response(status, &headers, body)),
-    };
-    merge_static_models(&mut value, state);
-    Ok(json_response(StatusCode::OK, value))
+    Ok(match serde_json::from_slice::<Value>(&body) {
+        Ok(value) => UpstreamModels::Catalog(value),
+        Err(_) => UpstreamModels::Passthrough(raw_response(status, &headers, body)),
+    })
 }
 
 fn raw_response(
@@ -1130,9 +1202,9 @@ fn raw_response(
     builder.body(full_body(body)).unwrap()
 }
 
-fn merge_static_models(value: &mut Value, state: &AppState) {
+fn merge_static_models(value: &mut Value, state: &AppState, windows: &model_windows::Windows) {
     let Some(object) = value.as_object_mut() else {
-        *value = static_models_value(state);
+        *value = static_models_value(state, windows);
         return;
     };
 
@@ -1160,7 +1232,11 @@ fn merge_static_models(value: &mut Value, state: &AppState) {
                 .iter()
                 .any(|existing| existing.get("slug").and_then(Value::as_str) == Some(&model.id))
             {
-                models.push(codex_model_json(&model.id, &model.display_name));
+                models.push(codex_model_json(
+                    &model.id,
+                    &model.display_name,
+                    model.window(windows),
+                ));
             }
         }
     }
@@ -1235,8 +1311,18 @@ fn model_json(id: &str, display_name: &str) -> Value {
 /// rather than interleaving with the Codex models.
 const RAYLINE_MODEL_PRIORITY: u32 = 1000;
 
-fn codex_model_json(id: &str, display_name: &str) -> Value {
-    json!({
+/// A Codex catalog entry. `window` is the context window the routed model
+/// reports (see [`model_windows`]): Codex derives its usable window and its
+/// auto-compaction threshold from `context_window`, and caps a user override at
+/// `max_context_window`. A model whose window is unknown keeps the default
+/// entry. `truncation_policy` is not an output limit (Codex caps each history
+/// item it records with it), so it does not follow the window.
+fn codex_model_json(
+    id: &str,
+    display_name: &str,
+    window: Option<model_windows::ModelWindow>,
+) -> Value {
+    let mut entry = json!({
         "slug": id,
         "display_name": display_name,
         "description": "Rayline-routed model",
@@ -1266,7 +1352,12 @@ fn codex_model_json(id: &str, display_name: &str) -> Value {
         "experimental_supported_tools": [],
         "input_modalities": ["text", "image"],
         "supports_search_tool": false
-    })
+    });
+    if let Some(window) = window {
+        entry["context_window"] = json!(window.context);
+        entry["max_context_window"] = json!(window.max);
+    }
+    entry
 }
 
 async fn count_tokens_response(req: Request<Incoming>) -> Response<BoxBody> {
@@ -7313,6 +7404,7 @@ mod tests {
             http_ipv4: reqwest::Client::new(),
             route_counter: Arc::new(AtomicU64::new(1)),
             started_at: chrono_like_now(),
+            model_windows: Arc::default(),
         };
         // No credential: the rejection happens before any auth is attached, and
         // this endpoint must never be reached over the network.
@@ -7475,6 +7567,7 @@ mod tests {
             http_ipv4: reqwest::Client::new(),
             route_counter: Arc::new(AtomicU64::new(1)),
             started_at: "0".to_owned(),
+            model_windows: Arc::default(),
         }
     }
 
@@ -10202,6 +10295,7 @@ mod tests {
             http_ipv4: reqwest::Client::new(),
             route_counter: Arc::new(AtomicU64::new(1)),
             started_at: "0".to_owned(),
+            model_windows: Arc::default(),
         };
 
         // agent_type header is set but NO agent_id header — this triggers
@@ -11136,10 +11230,302 @@ mod tests {
     fn codex_model_entries_sort_after_native_models() {
         // Native Codex models carry small ascending priorities; ours must be
         // larger so the picker clusters them at the bottom, not interleaved.
-        let value = codex_model_json(CATALOG_SENTINEL_MODEL, "Raydock Auto");
+        let value = codex_model_json(CATALOG_SENTINEL_MODEL, "Raydock Auto", None);
         assert_eq!(value["priority"], json!(RAYLINE_MODEL_PRIORITY));
         // Larger than the observed native ceiling (codex-auto-review == 43).
         const _: () = assert!(RAYLINE_MODEL_PRIORITY > 100);
+    }
+
+    #[test]
+    fn codex_model_entry_takes_the_reported_window() {
+        let sized = codex_model_json("m", "M", Some(model_windows::ModelWindow::from(1_000_000)));
+        assert_eq!(sized["context_window"], json!(1_000_000));
+        assert_eq!(sized["max_context_window"], json!(1_000_000));
+        // A larger override cap (a subscription model's) is kept.
+        let capped = codex_model_json(
+            "m",
+            "M",
+            Some(model_windows::ModelWindow {
+                context: 272_000,
+                max: 872_000,
+            }),
+        );
+        assert_eq!(capped["context_window"], json!(272_000));
+        assert_eq!(capped["max_context_window"], json!(872_000));
+        // The per-item history cap is not tied to the window.
+        let unsized_entry = codex_model_json("m", "M", None);
+        assert_eq!(
+            sized["truncation_policy"],
+            unsized_entry["truncation_policy"]
+        );
+        // Unknown window: today's entry, unchanged.
+        assert_eq!(unsized_entry["context_window"], json!(128_000));
+        assert!(unsized_entry.get("max_context_window").is_none());
+    }
+
+    fn codex_windows(state: &AppState, windows: &model_windows::Windows) -> HashMap<String, Value> {
+        static_models_value(state, windows)["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["slug"].as_str().unwrap().to_owned(),
+                    entry["context_window"].clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// A cached answer is reused until it is due, then asked again, so a model
+    /// reloaded with another context is picked up; a failed refresh keeps the
+    /// previous answer.
+    #[tokio::test]
+    async fn model_windows_refresh_after_they_are_due() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let answers = Arc::new(std::sync::Mutex::new(vec![
+            None,
+            Some(65_536),
+            Some(32_768),
+        ]));
+        let server_answers = answers.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let answer = server_answers.lock().unwrap().pop().flatten();
+                let response = match answer {
+                    Some(window) => {
+                        let body =
+                            json!({"data": [{"id": "m", "context_length": window}]}).to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None => "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\
+                             connection: close\r\n\r\n"
+                        .to_owned(),
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let mut runtime = endpoint("runtime", EndpointProtocol::OpenAIChat, &["m"]);
+        runtime.base_url = format!("http://127.0.0.1:{port}/v1");
+        let state = state(RouterConfig {
+            endpoints: vec![runtime],
+            routes: RoutesConfig::default(),
+        });
+        let window = |windows: model_windows::Windows| windows["runtime"]["m"].context;
+
+        assert_eq!(window(state.model_windows.windows(&state).await), 32_768);
+        // Not due yet: the cached answer, without asking again.
+        assert_eq!(window(state.model_windows.windows(&state).await), 32_768);
+        assert_eq!(answers.lock().unwrap().len(), 2);
+
+        state.model_windows.expire().await;
+        assert_eq!(window(state.model_windows.windows(&state).await), 65_536);
+
+        state.model_windows.expire().await;
+        assert_eq!(window(state.model_windows.windows(&state).await), 65_536);
+        assert!(answers.lock().unwrap().is_empty());
+    }
+
+    /// A refresh where the listing answers but the runtime lookup fails keeps
+    /// the window the runtime reported before.
+    #[tokio::test]
+    async fn model_windows_keep_known_windows_when_a_refresh_lookup_fails() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let ps_calls = Arc::new(AtomicU64::new(0));
+        let server_ps_calls = ps_calls.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body = if request.starts_with("GET /v1/models ") {
+                    Some(json!({"data": [{"id": "m"}]}))
+                } else if request.starts_with("GET /api/ps ")
+                    && server_ps_calls.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    Some(json!({"models": [{"name": "m", "context_length": 8_192}]}))
+                } else {
+                    None
+                };
+                let response = match body {
+                    Some(body) => {
+                        let body = body.to_string();
+                        format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    }
+                    None => "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\n\
+                             connection: close\r\n\r\n"
+                        .to_owned(),
+                };
+                let _ = sock.write_all(response.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let mut runtime = endpoint("runtime", EndpointProtocol::OpenAIChat, &["m"]);
+        runtime.base_url = format!("http://127.0.0.1:{port}/v1");
+        let state = state(RouterConfig {
+            endpoints: vec![runtime],
+            routes: RoutesConfig::default(),
+        });
+
+        let windows = state.model_windows.windows(&state).await;
+        assert_eq!(windows["runtime"]["m"].context, 8_192);
+        state.model_windows.expire().await;
+        let windows = state.model_windows.windows(&state).await;
+        assert_eq!(windows["runtime"]["m"].context, 8_192);
+        assert!(
+            ps_calls.load(Ordering::SeqCst) >= 2,
+            "the refresh asked again"
+        );
+    }
+
+    #[test]
+    fn catalog_sentinel_takes_the_window_of_its_route() {
+        let windows: model_windows::Windows = HashMap::from([
+            (
+                "cloud".to_owned(),
+                HashMap::from([
+                    (
+                        "big".to_owned(),
+                        model_windows::ModelWindow::from(1_000_000),
+                    ),
+                    (
+                        "small".to_owned(),
+                        model_windows::ModelWindow::from(200_000),
+                    ),
+                ]),
+            ),
+            (
+                "ollama".to_owned(),
+                HashMap::from([("q".to_owned(), model_windows::ModelWindow::from(32_768))]),
+            ),
+        ]);
+        let endpoints = vec![
+            endpoint(
+                "cloud",
+                EndpointProtocol::AnthropicMessages,
+                &["big", "small", "unsized"],
+            ),
+            endpoint("ollama", EndpointProtocol::OpenAIChat, &["q"]),
+        ];
+        let target = |endpoint: &str, model: &str| RouteTarget {
+            endpoint: endpoint.to_owned(),
+            model: model.to_owned(),
+            ..Default::default()
+        };
+
+        // routes.main decides when the sentinel has no model route.
+        let main_only = state(RouterConfig {
+            endpoints: endpoints.clone(),
+            routes: RoutesConfig {
+                main: Some(target("cloud", "big")),
+                subagent: Some(target("ollama", "q")),
+                ..RoutesConfig::default()
+            },
+        });
+        let entries = codex_windows(&main_only, &windows);
+        assert_eq!(entries[CATALOG_SENTINEL_MODEL], json!(1_000_000));
+        assert_eq!(entries["big"], json!(1_000_000));
+        assert_eq!(entries["small"], json!(200_000));
+        assert_eq!(entries["q"], json!(32_768));
+        // A model no source sizes keeps the default entry.
+        assert_eq!(entries["unsized"], json!(128_000));
+
+        // The sentinel's own model route wins over routes.main.
+        let mut config = (*main_only.config).clone();
+        config
+            .routes
+            .model_routes
+            .insert(CATALOG_SENTINEL_MODEL.to_owned(), target("ollama", "q"));
+        let entries = codex_windows(&state(config.clone()), &windows);
+        assert_eq!(entries[CATALOG_SENTINEL_MODEL], json!(32_768));
+
+        // On-device adapter routes and unsized routes keep the default entry.
+        config.routes.model_routes.insert(
+            CATALOG_SENTINEL_MODEL.to_owned(),
+            RouteTarget::local("local-model"),
+        );
+        let entries = codex_windows(&state(config.clone()), &windows);
+        assert_eq!(entries[CATALOG_SENTINEL_MODEL], json!(128_000));
+        config.routes.model_routes.insert(
+            CATALOG_SENTINEL_MODEL.to_owned(),
+            target("cloud", "unsized"),
+        );
+        let entries = codex_windows(&state(config.clone()), &windows);
+        assert_eq!(entries[CATALOG_SENTINEL_MODEL], json!(128_000));
+
+        // A listed model with its own model route takes that route's window,
+        // since select_route sends it there rather than to its endpoint.
+        config
+            .routes
+            .model_routes
+            .insert("big".to_owned(), target("ollama", "q"));
+        config
+            .routes
+            .model_routes
+            .insert("small".to_owned(), RouteTarget::local("local-model"));
+        let entries = codex_windows(&state(config), &windows);
+        assert_eq!(entries["big"], json!(32_768));
+        assert_eq!(entries["small"], json!(128_000));
+        assert_eq!(entries["q"], json!(32_768));
+
+        // No endpoint answered: every entry is today's.
+        let entries = codex_windows(&main_only, &model_windows::Windows::new());
+        assert!(entries.values().all(|window| *window == json!(128_000)));
+    }
+
+    #[test]
+    fn merged_subscription_catalog_sizes_only_the_added_entries() {
+        let config = RouterConfig {
+            endpoints: vec![endpoint(
+                "cloud",
+                EndpointProtocol::AnthropicMessages,
+                &["big"],
+            )],
+            routes: RoutesConfig {
+                main: Some(RouteTarget {
+                    endpoint: "cloud".to_owned(),
+                    model: "big".to_owned(),
+                    ..Default::default()
+                }),
+                ..RoutesConfig::default()
+            },
+        };
+        let windows: model_windows::Windows = HashMap::from([(
+            "cloud".to_owned(),
+            HashMap::from([(
+                "big".to_owned(),
+                model_windows::ModelWindow::from(1_000_000),
+            )]),
+        )]);
+        let mut upstream = json!({"models": [{"slug": "native", "context_window": 272_000}]});
+        merge_static_models(&mut upstream, &state(config), &windows);
+        let models = upstream["models"].as_array().unwrap();
+        let window = |slug: &str| {
+            models
+                .iter()
+                .find(|entry| entry["slug"] == slug)
+                .map(|entry| entry["context_window"].clone())
+        };
+        assert_eq!(window("native"), Some(json!(272_000)));
+        assert_eq!(window(CATALOG_SENTINEL_MODEL), Some(json!(1_000_000)));
+        assert_eq!(window("big"), Some(json!(1_000_000)));
     }
 
     #[test]
