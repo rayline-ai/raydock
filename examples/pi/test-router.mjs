@@ -345,9 +345,9 @@ const scenarios = {
 			const status = (pattern) => (records) =>
 				records.find((record) => record.type === "extension_ui_request" && record.method === "setStatus" && pattern.test(record.statusText ?? ""));
 			pi.prompt("First question.");
-			const looked = await pi.until("the lookup time", status(/^route: opus in \d+ ms \(router 5 ms\)$/));
-			await pi.until("the sticky continuation", status(/^route: kept opus, no lookup$/));
-			return `footer: "${looked.statusText}", then "route: kept opus, no lookup"`;
+			const looked = await pi.until("the lookup time", status(/^route: \d+ ms$/));
+			await pi.until("the sticky continuation", status(/^route: kept, no lookup$/));
+			return `footer: "${looked.statusText}", then "route: kept, no lookup"`;
 		} finally {
 			f.close();
 		}

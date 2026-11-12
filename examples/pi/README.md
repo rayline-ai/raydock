@@ -123,10 +123,9 @@ RAYLINE_PI_ROUTER_CONFIG=local.json \
 ### What you see
 
 - The footer shows `auto → <model>` for the model that answered.
-- With `--rayline-timing`, a second footer line shows each routing decision,
-  for example `route: gpt-6-luna in 1206 ms (router 529 ms)`: the full lookup
-  time from Pi, and the part spent inside the router. Tool follow-ups show
-  `route: kept gpt-6-luna, no lookup`.
+- With `--rayline-timing`, the footer also shows how long the routing
+  lookup took, for example `route: 1206 ms`. Tool follow-ups show
+  `route: kept, no lookup`.
 - `/rayline` shows how many lookups this session made, the tokens they were
   billed for, the mean lookup time and the last decision.
 

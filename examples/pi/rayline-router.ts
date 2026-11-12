@@ -35,7 +35,7 @@
  *
  * Usage: RAYLINE_PI_ROUTER_CONFIG=router.json pi -e ./rayline-router.ts --model rayline/auto
  * Add `--rayline-timing` (or `"show_decision_time": true`) to show each
- * lookup's time in the footer: wall time here, and the router's `latency_ms`.
+ * lookup's total time in the footer, next to the model Pi already shows.
  */
 
 import { createHash } from "node:crypto";
@@ -305,13 +305,13 @@ class Router {
 			// unless the provider is overloaded; then ask again without it.
 			const failure = (request.failed as { message?: { errorMessage?: string } }).message?.errorMessage ?? "";
 			if (!OVERLOADED.test(failure)) {
-				this.showDecision(ctx, `route: retry on ${request.failed.model.id}, no lookup`);
+				this.showDecision(ctx, "route: retry, no lookup");
 				return keep(request.failed);
 			}
 			excluded = this.byPi.get(`${request.failed.model.provider}/${request.failed.model.id}`);
 		}
 		if (request.reason === "continuation" && request.previous && !rewritten && !this.config.redecide_on_continuation) {
-			this.showDecision(ctx, `route: kept ${request.previous.model.id}, no lookup`);
+			this.showDecision(ctx, "route: kept, no lookup");
 			return keep(request.previous);
 		}
 		if (state.oversized) return this.unrouted(request, ctx, state, undefined);
@@ -321,15 +321,15 @@ class Router {
 			const body = this.decisionBody(request, ctx, { ...view, head, rewritten, sidecall }, excluded);
 			const decision = await this.decide(body, ctx, request.signal);
 			const route = this.resolve(decision, request, ctx);
-			const { elapsedMs, routerMs } = this.lastTiming;
+			const { elapsedMs } = this.lastTiming;
 			this.stats.last = `${decision.route_id ?? "route"} -> ${route.model.provider}/${route.model.id} in ${elapsedMs} ms`;
-			this.showDecision(ctx, `route: ${route.model.id} in ${elapsedMs} ms${routerMs === undefined ? "" : ` (router ${routerMs} ms)`}`);
+			this.showDecision(ctx, `route: ${elapsedMs} ms`);
 			return { ...route, state };
 		} catch (error) {
 			if (request.signal?.aborted) throw error;
 			if (error instanceof Refused && error.status === 413) state = { head, oversized: true };
 			else if (error instanceof Refused && error.fatal) throw error;
-			this.showDecision(ctx, `route: lookup failed after ${Math.round(performance.now() - started)} ms`);
+			this.showDecision(ctx, `route: failed after ${Math.round(performance.now() - started)} ms`);
 			if ((this.config.on_error ?? "previous") === "fail") throw error;
 			return this.unrouted(request, ctx, state, error);
 		}
