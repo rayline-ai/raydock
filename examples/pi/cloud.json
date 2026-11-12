@@ -1,0 +1,33 @@
+{
+  "decisions": {
+    "url": "https://api.rayline.ai/v1/routes",
+    "model": "arc-swift-1.0",
+    "api_mode": "current",
+    "result": "top",
+    "timeout_ms": 5000
+  },
+  "targets": [
+    {
+      "model": "anthropic/claude-opus-5.5",
+      "worker": "claude-opus-5.5",
+      "placement": "cloud",
+      "pi": "anthropic/claude-opus-5-5"
+    },
+    {
+      "model": "openai/gpt-6-luna",
+      "worker": "gpt-6-luna",
+      "placement": "cloud",
+      "pi": "openai/gpt-6-luna"
+    },
+    {
+      "model": "z-ai/glm-5.3-flash",
+      "worker": "glm-5.3-flash",
+      "placement": "cloud",
+      "pi": "openrouter/z-ai/glm-5.3-flash"
+    }
+  ],
+  "on_error": "previous",
+  "fallback": "openai/gpt-6-luna",
+  "context_window": 1000000,
+  "max_tokens": 32000
+}

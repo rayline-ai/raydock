@@ -1,0 +1,81 @@
+{
+  "decisions": {
+    "url": "https://api.rayline.ai/v1/routes",
+    "model": "arc-swift-1.0",
+    "api_mode": "execution_context_v2",
+    "result": "swift",
+    "timeout_ms": 8000,
+    "routing": {
+      "policy": {
+        "preset": "arc-policy.prefer-local.v1",
+        "overrides": {
+          "selection": {
+            "min_p_pass": 0.5
+          }
+        }
+      },
+      "prices": {
+        "z-ai/glm-5.3-flash": {
+          "input": 0,
+          "cache_read": 0,
+          "cache_write": 0,
+          "output": 0
+        }
+      }
+    }
+  },
+  "targets": [
+    {
+      "model": "z-ai/glm-5.3-flash",
+      "worker": "glm-5.3-flash",
+      "placement": "local",
+      "pi": "local/glm-5.3-flash",
+      "actions": [
+        {
+          "action_id": "bd202891c3ed5bf9af5250868da17cb3ad68a05184ec5fa757876880257a5b26",
+          "thinking_level": "medium"
+        }
+      ]
+    },
+    {
+      "model": "anthropic/claude-haiku-5.5",
+      "worker": "claude-haiku-5.5",
+      "placement": "cloud",
+      "pi": "anthropic/claude-haiku-5-5",
+      "actions": [
+        {
+          "action_id": "e8125a6d6e00df0bafbaf85796c433241de68d73b59af55c02c6a06ceae0bec2",
+          "thinking_level": "medium"
+        }
+      ]
+    },
+    {
+      "model": "anthropic/claude-opus-5.5",
+      "worker": "claude-opus-5.5",
+      "placement": "cloud",
+      "pi": "anthropic/claude-opus-5-5",
+      "actions": [
+        {
+          "action_id": "160b92a72c09743f353721b9fc50c13d655e2f231bda060d629e37ccc059851f",
+          "thinking_level": "medium"
+        }
+      ]
+    },
+    {
+      "model": "openai/gpt-6-luna",
+      "worker": "gpt-6-luna",
+      "placement": "cloud",
+      "pi": "openai/gpt-6-luna",
+      "actions": [
+        {
+          "action_id": "21324c14b079ebff6d402361a26511bf7991107fe920ded73607361c3a1eba44",
+          "thinking_level": "medium"
+        }
+      ]
+    }
+  ],
+  "on_error": "previous",
+  "fallback": "local/glm-5.3-flash",
+  "context_window": 1000000,
+  "max_tokens": 32000
+}
