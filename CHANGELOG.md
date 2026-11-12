@@ -17,6 +17,11 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   New setting `hybrid.local_tokenizer` names the repo for another model, or
   `false` turns counting off. The bundled execution core (`rayline-core`, now
   pinned to `1c89739c`) asks `rld` for these counts.
+- **A hybrid target that can't take a request is skipped, not chosen and
+  refused.** When the core can't prepare a request for a target (for example,
+  the output allowance the client asks for is above that target's limit), it
+  now reports the target as unavailable for that turn, so the router picks
+  another one instead of selecting it and returning an error.
 - **Codex gets each model's real context window from the local router.**
   The router's `/v1/models` catalog told Codex that every model had a
   128,000-token window, so Codex compacted at about 115,000 tokens even on
@@ -51,6 +56,10 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
 
 ### Docs
 
+- The hybrid guide points to the official Rayline docs for billing and ARC
+  routing-policy details instead of restating them.
+- The hybrid platform requirements list Windows 10 and 11, supported natively
+  since 0.4.2.
 - The routing-modes examples and guides describe only the current modes. The
   `Rcl-Rcl` and `S-Rcl` configs are removed (they route exactly like `Rc-Rc`
   and `S-Rc`), and splitting work between a local model and the cloud turn by
