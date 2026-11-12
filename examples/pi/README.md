@@ -156,6 +156,10 @@ Rayline (set up the `local` provider as in step 3).
 `-ns` turns off Pi's skills, which keeps prompts small; drop it if you want
 your skills.
 
+Pi needs `fd` and `rg`. If they aren't on your `PATH`, Pi downloads its own
+copy into each new `PI_CODING_AGENT_DIR` on first start; install them once
+(`brew install fd ripgrep`) to skip that.
+
 ## Configuration
 
 All four files have the same shape:
