@@ -3,7 +3,7 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
-## Unreleased
+## 0.4.5 (2026-11-12)
 
 ### Fixed
 
@@ -17,32 +17,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   New setting `hybrid.local_tokenizer` names the repo for another model, or
   `false` turns counting off. The bundled execution core (`rayline-core`, now
   pinned to `1c89739c`) asks `rld` for these counts.
-
-## 0.4.4 (2026-11-11)
-
-### New
-
-- **Claude Haiku 5.5 is a third default cloud target in hybrid mode.** The
-  default profile pins Haiku 5.5 beside Opus 5.5 and Sonnet 5.5, so a turn
-  that leaves the local model (too large for its window, or one the router
-  expects it to fail) has a cloud target priced well below Sonnet. Like the
-  other two, it allows 128,000 output tokens. A `hybrid.cloud_output_tokens`
-  block must now name all three pins; one written for the two earlier pins
-  is refused until it has a Haiku line.
-
-### Changed
-
-- **Hybrid mode now prefers your local model by default.** With no
-  `hybrid.routing.policy` set and a local model available, Raydock asks for
-  `prefer_local`: the local model takes a turn whenever the router predicts
-  it will succeed (`min_p_pass`, default 0.65), and other turns are decided
-  on value and price as before, which may pick Haiku. Set
-  `"policy": "utility"` for the previous behaviour, which can pick a cheap
-  cloud model over the local one. Sessions without a local model still use
-  `utility`.
-
-### Fixed
-
 - **Codex gets each model's real context window from the local router.**
   The router's `/v1/models` catalog told Codex that every model had a
   128,000-token window, so Codex compacted at about 115,000 tokens even on
@@ -74,6 +48,39 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   to run codex: program not found". It now looks Codex up on PATH the way
   `raydock hybrid run codex` already did. This also fixes `raydock codex app`
   and the Codex version check.
+
+### Docs
+
+- The routing-modes examples and guides describe only the current modes. The
+  `Rcl-Rcl` and `S-Rcl` configs are removed (they route exactly like `Rc-Rc`
+  and `S-Rc`), and splitting work between a local model and the cloud turn by
+  turn is described as hybrid mode.
+
+## 0.4.4 (2026-11-11)
+
+### New
+
+- **Claude Haiku 5.5 is a third default cloud target in hybrid mode.** The
+  default profile pins Haiku 5.5 beside Opus 5.5 and Sonnet 5.5, so a turn
+  that leaves the local model (too large for its window, or one the router
+  expects it to fail) has a cloud target priced well below Sonnet. Like the
+  other two, it allows 128,000 output tokens. A `hybrid.cloud_output_tokens`
+  block must now name all three pins; one written for the two earlier pins
+  is refused until it has a Haiku line.
+
+### Changed
+
+- **Hybrid mode now prefers your local model by default.** With no
+  `hybrid.routing.policy` set and a local model available, Raydock asks for
+  `prefer_local`: the local model takes a turn whenever the router predicts
+  it will succeed (`min_p_pass`, default 0.65), and other turns are decided
+  on value and price as before, which may pick Haiku. Set
+  `"policy": "utility"` for the previous behaviour, which can pick a cheap
+  cloud model over the local one. Sessions without a local model still use
+  `utility`.
+
+### Fixed
+
 - **Claude Code in hybrid mode works with llama.cpp chat templates that
   require the system message first** (such as Qwen3.8-27B). The bundled
   execution core (`rayline-core`, now pinned to `80ce3d26`) moves a system
@@ -117,13 +124,6 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   --env dev`) was only reported as rejected. As with `raydock top`, the error
   now says `--env` goes before the command:
   `raydock --env <name> claude-desktop status`.
-
-### Docs
-
-- The routing-modes examples and guides describe only the current modes. The
-  `Rcl-Rcl` and `S-Rcl` configs are removed (they route exactly like `Rc-Rc`
-  and `S-Rc`), and splitting work between a local model and the cloud turn by
-  turn is described as hybrid mode.
 
 ## 0.4.3 (2026-11-09)
 
