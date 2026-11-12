@@ -15,7 +15,8 @@ assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock
   published tokenizer and chat template and `rld` counts each prompt with
   them, images included; a model with an image processor also accepts images.
   New setting `hybrid.local_tokenizer` names the repo for another model, or
-  `false` turns counting off. Needs the matching execution core.
+  `false` turns counting off. The bundled execution core (`rayline-core`, now
+  pinned to `1c89739c`) asks `rld` for these counts.
 
 ## 0.4.4 (2026-11-11)
 
