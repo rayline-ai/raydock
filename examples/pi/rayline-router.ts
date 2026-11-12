@@ -71,7 +71,7 @@ interface Target {
 	actions?: TargetAction[];
 	/** USD per million tokens the user pays, sent as `routing.prices` when set. */
 	prices?: Prices;
-	/** v2, local targets: the window to size prompts against; default Pi's contextWindow for `pi`. */
+	/** The model's window: sizes local prompts (v2), and sets a `rayline/` gateway model's window. Default Pi's contextWindow for `pi`. */
 	context_window?: number;
 }
 
@@ -556,6 +556,25 @@ class Router {
 	}
 }
 
+/**
+ * Targets served through the Rayline gateway (`pi: "rayline/<gateway id>"`).
+ * Rayline bills these turns, so Pi's own cost for them is zero.
+ */
+function gatewayModels(config: Config) {
+	const prefix = `${PROVIDER}/`;
+	return config.targets
+		.filter((target) => target.pi.startsWith(prefix))
+		.map((target) => ({
+			id: target.pi.slice(prefix.length),
+			name: `${target.model} via Rayline`,
+			reasoning: true,
+			input: ["text", "image"] as ("text" | "image")[],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: target.context_window ?? config.context_window ?? 200_000,
+			maxTokens: config.max_tokens ?? 32_000,
+		}));
+}
+
 export default function (pi: ExtensionAPI) {
 	const config = loadConfig();
 	pi.registerFlag(TIMING_FLAG, {
@@ -565,11 +584,14 @@ export default function (pi: ExtensionAPI) {
 	});
 	const router = new Router(config, pi);
 	// The provider exists to hold the key: `/login rayline` stores it in auth.json.
+	// The provider holds the Rayline key (`/login rayline` stores it in auth.json)
+	// and serves any target whose Pi model is `rayline/<id>` through the Rayline
+	// gateway, pinned to that model: one key for routing and cloud turns.
 	pi.registerProvider(PROVIDER, {
 		name: "Rayline",
 		baseUrl: new URL(config.decisions.url).origin,
 		api: "anthropic-messages",
-		models: [],
+		models: gatewayModels(config),
 	});
 	pi.registerVirtualModel<RouterState>({
 		provider: PROVIDER,

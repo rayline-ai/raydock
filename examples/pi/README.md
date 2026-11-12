@@ -50,10 +50,21 @@ Local mode needs the extra information because a plain request has no way to
 say *where* a model runs, so ARC can't prefer a local one. Local mode sends
 the same request `raydock hybrid` sends (the `execution_context_v2` API mode).
 
+### Cloud turns through Rayline (one key)
+
+In `cloud.json` and `local.json`, Pi sends cloud turns straight to Anthropic,
+OpenAI or OpenRouter with your own keys. `gateway.json` and
+`local-gateway.json` send them through the Rayline gateway instead, pinned to
+the model ARC chose, so the Rayline key is the only key you need (plus your
+local server for local mode). Any target whose `pi` is `rayline/<model>` is
+served this way; the extension adds those models to Pi for you. Rayline bills
+these turns, so Pi's own cost display shows $0 for them.
+
 ## Setup
 
-You need Pi 1.1.0 or later, a Rayline router key, and keys for the providers
-you list as candidates.
+You need Pi 1.1.0 or later and a Rayline router key. For `cloud.json` and
+`local.json` you also need keys for the providers you list as candidates;
+`gateway.json` and `local-gateway.json` need only the Rayline key.
 
 ### 1. Keys
 
@@ -120,6 +131,19 @@ RAYLINE_PI_ROUTER_CONFIG=local.json \
   pi -ns -e rayline-router.ts --model rayline/auto --rayline-timing
 ```
 
+### 4. Everything through Rayline
+
+Only the `rayline` entry in `auth.json` is needed:
+
+```bash
+cd examples/pi
+RAYLINE_PI_ROUTER_CONFIG=gateway.json \
+  pi -ns -e rayline-router.ts --model rayline/auto --rayline-timing
+```
+
+Use `local-gateway.json` for the local model plus cloud models through
+Rayline (set up the `local` provider as in step 3).
+
 ### What you see
 
 - The footer shows `auto → <model>` for the model that answered.
@@ -134,7 +158,7 @@ your skills.
 
 ## Configuration
 
-Both files have the same shape:
+All four files have the same shape:
 
 - `decisions.url`: the Routes API, `https://api.rayline.ai/v1/routes`.
 - `decisions.api_mode`: `current` (cloud mode) or `execution_context_v2`
@@ -143,7 +167,8 @@ Both files have the same shape:
   and prices the local model at zero.
 - `targets`: each candidate as ARC names it (`model`, `worker`), whether it is
   `local` or `cloud`, and the Pi model that serves it (`pi`, as
-  `provider/id`). In local mode each target also lists its ARC `action_id`.
+  `provider/id`; `rayline/<model>` means through the Rayline gateway). In
+  local mode each target also lists its ARC `action_id`.
 - `fallback`: the Pi model to use when Rayline is unreachable before anything
   has answered.
 - `redecide_on_continuation`: ask again on every tool follow-up (off by
