@@ -3,6 +3,20 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
+## Unreleased
+
+### Fixed
+
+- **A declared local model (GLM-5.3-Flash) keeps its turns until its window
+  is really full, and after an image.** Hybrid mode counted such a model's
+  prompts by their bytes, several times the real number, and could not size
+  a history holding an image at all, so the prefer-local policy sent turns to
+  the cloud early and kept them there. `hybrid start` now fetches the model's
+  published tokenizer and chat template and `rld` counts each prompt with
+  them, images included; a model with an image processor also accepts images.
+  New setting `hybrid.local_tokenizer` names the repo for another model, or
+  `false` turns counting off. Needs the matching execution core.
+
 ## 0.4.4 (2026-11-11)
 
 ### New

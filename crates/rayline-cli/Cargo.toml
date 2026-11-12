@@ -31,6 +31,7 @@ tar = "0.4"
 tokio.workspace = true
 url = "2"
 rayline-hf = { path = "../rayline-hf" }
+rayline-tokencount = { path = "../rayline-tokencount" }
 rayline-llama = { path = "../rayline-llama" }
 rayline-local-router = { path = "../rayline-local-router" }
 rayline-metrics = { path = "../rayline-metrics" }

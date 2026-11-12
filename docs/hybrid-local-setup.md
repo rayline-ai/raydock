@@ -81,6 +81,21 @@ rates.
    serves, so declare the model it actually loads. The setting applies to the
    default profile only; `start --config` refuses it.
 
+   For a declared model, `start` downloads the model's published tokenizer
+   and chat template from Hugging Face (GLM-5.3-Flash: `zai-org/GLM-5.3-Flash`)
+   so the router counts each prompt in the model's own tokens, images
+   included, and turns image input on when the model takes images. It prints
+   `Prompt counter:` with the repo. Name the repo for another model, or turn
+   counting off, with `hybrid.local_tokenizer`:
+
+   ```json
+   {"hybrid": {"local_registry_model": "acme/model-1", "local_tokenizer": "acme/Model-1"}}
+   ```
+
+   Without a counter (`false`, offline with nothing cached, or an unknown
+   model) the router estimates a prompt's size from its bytes, which can send
+   turns to the cloud well before the local window is full.
+
 3. **Start and connect a harness.**
 
    ```bash

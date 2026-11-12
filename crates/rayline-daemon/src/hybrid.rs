@@ -78,6 +78,13 @@ pub struct Args {
     /// profile's cloud Messages router.
     #[arg(long, default_value = crate::hybrid_classifier::DEFAULT_CLASSIFIER_MODEL)]
     classifier_model: String,
+    /// Snapshot directory of the local model's tokenizer and chat template:
+    /// rld counts the local deployment's prompts with them for the core.
+    #[arg(long)]
+    token_counter_dir: Option<PathBuf>,
+    /// The local deployment the counter sizes.
+    #[arg(long, default_value = "local")]
+    token_counter_deployment: String,
 }
 
 #[derive(Deserialize)]
@@ -138,32 +145,76 @@ pub async fn run(args: Args) -> Result<()> {
         token: args.token_file.clone(),
         ready: None,
     };
-    let mut child = Command::new(&args.core)
-        .arg("--config")
-        .arg(&args.config)
-        .args(["--listen", "127.0.0.1:0"])
-        .env("RAYLINE_EXEC_AUTH_TOKEN", &core_token)
-        .env("RAYLINE_EXEC_PARENT_PIPE", "1")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
-        .context("start ARC execution core")?;
-    // Keep the pipe open even while Child::wait closes its own stdin handle.
-    // The core exits on EOF if rld is terminated without running cleanup.
-    let mut parent_pipe = Some(
-        child
-            .stdin
-            .take()
-            .context("execution core parent pipe unavailable")?,
-    );
-    let outcome = async {
-        let handshake = tokio::select! {
-            result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
-                result.context("execution core startup timed out")??
+    // A counter that cannot load leaves the core sizing the local model
+    // itself; the session still starts.
+    let counter_token = token();
+    let mut counter_task = None;
+    let mut core_config = args.config.clone();
+    if let Some(dir) = &args.token_counter_dir {
+        match crate::hybrid_counter::prepare(
+            dir,
+            &args.config,
+            &args.token_counter_deployment,
+            counter_token.clone(),
+        )
+        .await
+        {
+            Ok(prepared) => {
+                tracing::info!(dir = %dir.display(), "local prompt counter ready");
+                core_config = prepared.config;
+                counter_task = Some(tokio::spawn(crate::hybrid_counter::serve(
+                    prepared.listener,
+                    prepared.counter,
+                )));
             }
-            result = &mut signals => { result?; return Ok(()); }
+            Err(error) => tracing::warn!(
+                error = format!("{error:#}"),
+                "local prompt counter unavailable; the core sizes the local model itself"
+            ),
+        }
+    }
+    let mut counter_task = AbortOnDrop(counter_task);
+    let (mut child, mut parent_pipe) =
+        spawn_core(&args.core, &core_config, &core_token, &counter_token)?;
+    // An execution core older than the token_counter contract refuses the
+    // counted profile at startup; start it again on the plain one.
+    let first = tokio::select! {
+        result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
+            result.context("execution core startup timed out")?
+        }
+        result = &mut signals => {
+            result?;
+            stop_child(&mut child, &mut parent_pipe).await.context("stop execution core")?;
+            return Ok(());
+        }
+    };
+    let first = match first {
+        Err(error) if core_config != args.config => {
+            tracing::warn!(
+                error = format!("{error:#}"),
+                "execution core refused the prompt counter; starting it without one"
+            );
+            stop_child(&mut child, &mut parent_pipe)
+                .await
+                .context("stop execution core")?;
+            if let Some(task) = counter_task.0.take() {
+                task.abort();
+            }
+            (child, parent_pipe) =
+                spawn_core(&args.core, &args.config, &core_token, &counter_token)?;
+            None
+        }
+        other => Some(other?),
+    };
+    let outcome = async {
+        let handshake = match first {
+            Some(handshake) => handshake,
+            None => tokio::select! {
+                result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
+                    result.context("execution core startup timed out")??
+                }
+                result = &mut signals => { result?; return Ok(()); }
+            },
         };
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -1127,7 +1178,46 @@ fn token() -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
+fn spawn_core(
+    core: &Path,
+    config: &Path,
+    core_token: &str,
+    counter_token: &str,
+) -> Result<(Child, Option<tokio::process::ChildStdin>)> {
+    let mut child = Command::new(core)
+        .arg("--config")
+        .arg(config)
+        .args(["--listen", "127.0.0.1:0"])
+        .env("RAYLINE_EXEC_AUTH_TOKEN", core_token)
+        .env(crate::hybrid_counter::COUNTER_KEY_ENV, counter_token)
+        .env("RAYLINE_EXEC_PARENT_PIPE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .context("start ARC execution core")?;
+    // Keep the pipe open even while Child::wait closes its own stdin handle.
+    // The core exits on EOF if rld is terminated without running cleanup.
+    let parent_pipe = Some(
+        child
+            .stdin
+            .take()
+            .context("execution core parent pipe unavailable")?,
+    );
+    Ok((child, parent_pipe))
+}
+
+/// Aborts the counter's server when rld's run ends.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<Result<()>>>);
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+pub(crate) fn write_private_new(path: &Path, bytes: &[u8]) -> Result<()> {
     // Publish a fully written file atomically without replacing an existing instance.
     let pending = path.with_extension(format!("pending-{}", token()));
     let mut options = std::fs::OpenOptions::new();

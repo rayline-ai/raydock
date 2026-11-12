@@ -10,6 +10,10 @@ use clap::{Parser, Subcommand};
 use rayline_local_router::ModelCapabilities;
 use serde_json::{Value, json};
 
+/// How long `start` waits for the local model's tokenizer files before it
+/// uses a cached copy or starts without a prompt counter.
+const TOKENIZER_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[derive(Parser)]
 #[command(
     name = "raydock hybrid",
@@ -187,6 +191,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             // A local model other than the default Qwen3.8-27B, declared in
             // settings: named in the error if the core refuses to start.
             let mut declared_local = None;
+            let mut token_counter_dir = None;
             let (profile, base_dir) = match config {
                 Some(config) => {
                     if env != "prod" || cell.is_some() || local_context_window.is_some() {
@@ -239,6 +244,49 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     }
                     if registry_model != crate::hybrid_profile::LOCAL_REGISTRY_MODEL {
                         declared_local = Some(registry_model.clone());
+                    }
+                    if !local_refused
+                        && let Some(repo) = crate::hybrid_tokenizer::tokenizer_repo(
+                            &registry_model,
+                            settings.as_ref(),
+                        )
+                        .map_err(settings_error)?
+                    {
+                        // The Hub gets a short deadline; past it the cached
+                        // snapshot, if any, is used and startup goes on.
+                        // A detached thread, not a blocking task: the runtime
+                        // waits for blocking tasks at exit, and the downloader
+                        // retries for far longer than `start` should run.
+                        let (sender, fetching) = tokio::sync::oneshot::channel();
+                        std::thread::spawn({
+                            let repo = repo.clone();
+                            move || {
+                                let _ = sender.send(crate::hybrid_tokenizer::fetch(&repo));
+                            }
+                        });
+                        let fetched = match tokio::time::timeout(TOKENIZER_FETCH_DEADLINE, fetching)
+                            .await
+                        {
+                            Ok(Ok(fetched)) => fetched,
+                            Ok(Err(_)) => Err("the tokenizer download stopped".to_owned()),
+                            Err(_) => crate::hybrid_tokenizer::cached(&repo).ok_or_else(|| {
+                                format!(
+                                    "Hugging Face did not answer within {}s and nothing is cached",
+                                    TOKENIZER_FETCH_DEADLINE.as_secs()
+                                )
+                            }),
+                        };
+                        match fetched {
+                            Ok(dir) => {
+                                println!(
+                                    "Prompt counter: {repo} (the local model's tokenizer and chat template)"
+                                );
+                                token_counter_dir = Some(dir);
+                            }
+                            Err(error) => eprintln!(
+                                "Prompt counter unavailable ({error}); the core estimates the local model's prompt size, which can send turns to the cloud early"
+                            ),
+                        }
                     }
                     let window = if local_refused {
                         configured.unwrap_or(crate::hybrid_profile::DEFAULT_LOCAL_CONTEXT_WINDOW)
@@ -376,6 +424,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             }
             command.arg("--env-name").arg(&decisions_env);
             command.arg("--classifier-model").arg(&classifier_model);
+            if let Some(dir) = &token_counter_dir {
+                command.arg("--token-counter-dir").arg(dir);
+            }
             for (name, key) in &credentials {
                 command.env(name, key);
             }

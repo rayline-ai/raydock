@@ -44,3 +44,11 @@ allow-git = []
 github = []
 gitlab = []
 bitbucket = []
+
+[advisories]
+ignore = [
+    # `paste` is unmaintained (no vulnerability): a compile-time proc-macro
+    # pulled only by `tokenizers` (rayline-tokencount), which has no
+    # maintained alternative upstream yet. Revisit when tokenizers drops it.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained compile-time proc-macro via tokenizers; no vulnerability" },
+]

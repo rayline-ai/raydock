@@ -17,6 +17,7 @@ pub mod discover;
 pub mod harness;
 pub mod hybrid;
 pub(crate) mod hybrid_profile;
+pub(crate) mod hybrid_tokenizer;
 pub mod local_model;
 pub mod onboarding;
 pub mod providers;

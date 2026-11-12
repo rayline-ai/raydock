@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/rayline-authcache",
     "crates/rayline-hf",
+    "crates/rayline-tokencount",
     "crates/rayline-metrics",
     "crates/rayline-llama",
     "crates/rayline-local-router",
