@@ -137,8 +137,7 @@ your skills.
 
 Both files have the same shape:
 
-- `decisions.url`: the Routes API. For the dev router use
-  `https://api-dev.rayline.ai/v1/routes` with a dev key.
+- `decisions.url`: the Routes API, `https://api.rayline.ai/v1/routes`.
 - `decisions.api_mode`: `current` (cloud mode) or `execution_context_v2`
   (local mode).
 - `decisions.routing`: sent as is; local mode sets the `prefer-local` policy
@@ -164,7 +163,7 @@ Both files have the same shape:
   are re-read from scratch each time, so they get slower as a session grows.
 - **Thinking level in local mode** is fixed per model in `local.json`, not
   chosen by ARC.
-- Tested on the dev router with Pi 1.1.0 and 1.5.0 (2026-11-12).
+- Tested with Pi 1.1.0 and 1.5.0 (2026-11-12).
 
 ## Tests
 
