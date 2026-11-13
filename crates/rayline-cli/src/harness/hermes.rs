@@ -183,7 +183,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
             contents,
             overwrite: true,
             merged_from,
-            replaces_seed: None,
         }],
         env_set: vec![("HERMES_HOME", ctx.config_dir.as_os_str().to_owned())],
         env_remove: Vec::new(),

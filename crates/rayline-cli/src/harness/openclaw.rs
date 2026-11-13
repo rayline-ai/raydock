@@ -179,7 +179,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 contents: ctx.key.to_owned(),
                 overwrite: true,
                 merged_from: None,
-                replaces_seed: None,
             },
         ],
         env_set: vec![(

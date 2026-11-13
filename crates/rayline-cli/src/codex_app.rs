@@ -173,7 +173,6 @@ pub(crate) fn write_codex_home(home: &Path, config: &str) -> io::Result<()> {
             contents: merged,
             overwrite: true,
             merged_from: current,
-            replaces_seed: None,
         }],
     )
 }
