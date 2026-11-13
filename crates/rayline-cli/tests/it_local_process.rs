@@ -954,8 +954,9 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
 
 /// The classifier pin is the Rayline router, so it is keyed like the turn it
 /// classifies: every session header the client sent reaches it unchanged (the
-/// local router's shared `SESSION_HEADERS`, so both gateways forward the same
-/// set), each exactly once, and the client's own credentials never do.
+/// `rayline-local-router` crate's shared `SESSION_HEADERS`, so both gateways
+/// forward the same set), each exactly once, and the client's own credentials
+/// never do.
 #[tokio::test]
 async fn classifier_pin_carries_every_client_session_header_and_no_client_auth() {
     let (router, recorded) = fake_router_for(1);

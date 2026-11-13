@@ -559,7 +559,7 @@ async fn send_classifier_to_cloud(
         .header("x-workshop-required-model", &route.wire_model);
     // The route is the Rayline router itself (same origin as Decisions), so it
     // gets every session header the client sent, unchanged (the same set the
-    // local router forwards to the hosted router). The router keys the call
+    // local process forwards to the hosted router). The router keys the call
     // from those headers exactly as it keys the turn being classified;
     // Claude Code's `x-claude-code-session-id` is one of its own rungs.
     for name in std::iter::once("anthropic-beta").chain(rayline_local_router::SESSION_HEADERS) {

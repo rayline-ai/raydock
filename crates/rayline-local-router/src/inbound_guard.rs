@@ -1,7 +1,7 @@
-//! Optional per-instance token for a local router that a desktop app reaches
-//! over loopback (`rayline claude-desktop`).
+//! Optional per-instance token for the local process, which a desktop app
+//! reaches over loopback (`rayline claude-desktop`).
 //!
-//! Every local router already refuses browser-reachable traffic (non-loopback
+//! The local process already refuses browser-reachable traffic (non-loopback
 //! `Host` or `Origin`, CORS preflight, non-JSON POST) before routing. That
 //! keeps web pages out but not other local processes. With a guard configured,
 //! every request except `GET /healthz` must also present the per-instance
