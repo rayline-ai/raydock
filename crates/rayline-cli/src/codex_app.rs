@@ -155,21 +155,22 @@ pub(crate) fn write_codex_home(home: &Path, config: &str) -> io::Result<()> {
     //    there: [desktop], [projects], …),
     //  - on first creation, the tables of the user's main Codex config.toml,
     //  - otherwise nothing.
-    let current = fs::read_to_string(&config_path).ok();
+    // Only a missing file counts as absent; any other read or parse error fails
+    // with the path.
+    let current = read_if_present(&config_path)?;
     let existing = match &current {
         Some(text) => text.clone(),
-        None => user_codex_home()
-            .ok()
-            .and_then(|h| fs::read_to_string(h.join("config.toml")).ok())
-            .map(|seed| seed_tables(&seed))
-            .unwrap_or_default(),
+        None => {
+            let seed_path = user_codex_home()?.join("config.toml");
+            match read_if_present(&seed_path)? {
+                Some(seed) => seed_tables(&seed)
+                    .map_err(|error| toml_parse_error(&seed_path, &seed, &error))?,
+                None => String::new(),
+            }
+        }
     };
-    let merged = apply_rayline_settings(&existing, config).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: {error}", config_path.display()),
-        )
-    })?;
+    let merged = apply_rayline_settings(&existing, config)
+        .map_err(|error| toml_parse_error(&config_path, &existing, &error))?;
     crate::harness::write_files(
         home,
         &[crate::harness::ConfigFile {
@@ -180,6 +181,38 @@ pub(crate) fn write_codex_home(home: &Path, config: &str) -> io::Result<()> {
             replaces_seed: None,
         }],
     )
+}
+
+/// An `InvalidData` error naming `path`, the line of `text` that fails to
+/// parse and the parser's message. It never quotes `text`: a Codex config line
+/// can hold a credential.
+fn toml_parse_error(path: &Path, text: &str, error: &TomlError) -> io::Error {
+    let line = error
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| format!(" line {}", before.matches('\n').count() + 1))
+        .unwrap_or_default();
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}{line}: invalid TOML: {}",
+            path.display(),
+            error.message().trim_end()
+        ),
+    )
+}
+
+/// The contents of `path`, or `None` when it does not exist. Any other read
+/// error fails with the path.
+fn read_if_present(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        )),
+    }
 }
 
 /// Merge the Rayline-owned settings of the `generated` snippet into `existing`
@@ -281,14 +314,12 @@ fn canonical(table: &Table) -> String {
 /// dropped: the ones we own are overridden anyway, and the rest (`profile`,
 /// `notify`, …) can change routing or run commands and are not carried over
 /// silently. An unparsable or empty seed contributes nothing.
-fn seed_tables(seed: &str) -> String {
-    let Ok(mut doc) = seed.parse::<DocumentMut>() else {
-        return String::new();
-    };
+fn seed_tables(seed: &str) -> Result<String, TomlError> {
+    let mut doc = seed.parse::<DocumentMut>()?;
     doc.retain(|_, item| {
         item.is_array_of_tables() || item.as_table().is_some_and(|table| !table.is_dotted())
     });
-    doc.to_string()
+    Ok(doc.to_string())
 }
 
 /// Remove every `[model_providers.rayline]` table (its header through the line
@@ -740,6 +771,7 @@ mod tests {
         fs::write(dir.join("config.toml"), "[desktop\nx = 1\n").unwrap();
         let error = write_codex_home(&dir, &snippet("arc-sage-1.0")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("[desktop"), "{error}");
         assert_eq!(
             fs::read_to_string(dir.join("config.toml")).unwrap(),
             "[desktop\nx = 1\n"
@@ -752,21 +784,103 @@ mod tests {
         // User's main config.toml: root keys (incl. a dotted one) are dropped,
         // tables and arrays of tables kept.
         let main = "model = \"gpt-5\"\nprofile = \"work\"\nfeatures.x = true\n\n[mcp_servers.foo]\ncommand = \"x\"\n\n[[hooks]]\nname = \"h\"\n";
-        let seeded = seed_tables(main);
+        let seeded = seed_tables(main).unwrap();
         assert!(!seeded.contains("model = "));
         assert!(!seeded.contains("profile"));
         assert!(!seeded.contains("features"));
         assert!(seeded.contains("[mcp_servers.foo]\ncommand = \"x\""));
         assert!(seeded.contains("[[hooks]]"));
-        assert_eq!(seed_tables("model = \"gpt-5\"\n"), "");
-        assert_eq!(seed_tables("not toml ="), "");
+        assert_eq!(seed_tables("model = \"gpt-5\"\n").unwrap(), "");
+        assert!(seed_tables("not toml =").is_err());
+    }
+
+    #[test]
+    fn unreadable_home_config_fails_with_its_path() {
+        // config.toml exists but cannot be read as a file: not "absent".
+        let dir = unique_tmp_dir("unreadable");
+        fs::create_dir(dir.join("config.toml")).unwrap();
+        let error = write_codex_home(&dir, &snippet("arc-sage-1.0")).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        let path = dir.join("config.toml");
+        assert!(
+            error.to_string().contains(&path.display().to_string()),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_config_is_absent_only_when_missing() {
+        let dir = unique_tmp_dir("seed-errors");
+        let user_home = dir.join("user-codex");
+        fs::create_dir_all(&user_home).unwrap();
+        let seed_path = user_home.join("config.toml");
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+
+        // Missing seed: the home is written from the snippet alone.
+        let home = dir.join("missing");
+        let missing = write_codex_home(&home, &snippet("arc-sage-1.0"));
+
+        // Unreadable seed: fails with the seed path, writes nothing.
+        fs::create_dir(&seed_path).unwrap();
+        let unreadable_home = dir.join("unreadable");
+        let unreadable = write_codex_home(&unreadable_home, &snippet("arc-sage-1.0"));
+        fs::remove_dir(&seed_path).unwrap();
+
+        // Invalid seed TOML: fails with the seed path and line, writes nothing
+        // and never quotes the line (it can hold a credential).
+        fs::write(
+            &seed_path,
+            "[mcp_servers.foo.env]\nTOKEN = \"seed-secret-value\n",
+        )
+        .unwrap();
+        let invalid_home = dir.join("invalid");
+        let invalid = write_codex_home(&invalid_home, &snippet("arc-sage-1.0"));
+
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+
+        missing.unwrap();
+        assert!(
+            fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .contains("[model_providers.rayline]")
+        );
+        let seed_display = seed_path.display().to_string();
+        let unreadable = unreadable.unwrap_err();
+        assert_ne!(unreadable.kind(), io::ErrorKind::NotFound);
+        assert!(
+            unreadable.to_string().contains(&seed_display),
+            "{unreadable}"
+        );
+        assert!(!unreadable_home.join("config.toml").exists());
+        let invalid = invalid.unwrap_err();
+        assert_eq!(invalid.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            invalid
+                .to_string()
+                .starts_with(&format!("{seed_display} line 2: invalid TOML: ")),
+            "{invalid}"
+        );
+        assert!(
+            !invalid.to_string().contains("seed-secret-value"),
+            "{invalid}"
+        );
+        assert!(!invalid_home.join("config.toml").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn seed_with_existing_rayline_table_is_replaced_not_duplicated() {
         // A user who already configured Rayline in their main config.
         let main = "model = \"arc-sage-1.0\"\n\n[model_providers.rayline]\nname = \"User Rayline\"\nbase_url = \"https://router.example.test/v1\"\n\n[mcp_servers.foo]\ncommand = \"x\"\n";
-        let merged = apply_rayline_settings(&seed_tables(main), &snippet("arc-sage-1.0")).unwrap();
+        let merged =
+            apply_rayline_settings(&seed_tables(main).unwrap(), &snippet("arc-sage-1.0")).unwrap();
         assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
         assert!(!merged.contains("User Rayline"));
         assert!(merged.contains("[mcp_servers.foo]"));
