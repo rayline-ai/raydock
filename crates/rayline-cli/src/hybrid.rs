@@ -858,7 +858,6 @@ fn harness_command(
                 "model_providers.rayline-local.wire_api=\"responses\"".to_owned(),
                 "model_providers.rayline-local.env_key=\"RAYLINE_HYBRID_GATEWAY_TOKEN\"".to_owned(),
                 format!("model_context_window={}", capabilities.context_window),
-                format!("model_max_output_tokens={}", capabilities.max_output_tokens),
             ] {
                 command.arg("-c").arg(setting);
             }
@@ -1843,10 +1842,6 @@ mod tests {
         )
         .unwrap();
         let args: Vec<_> = codex.get_args().map(|arg| arg.to_string_lossy()).collect();
-        assert!(
-            args.iter().any(|arg| arg == "model_max_output_tokens=4096"),
-            "{args:?}"
-        );
         assert!(
             args.iter().any(|arg| arg == "model_context_window=1000000"),
             "{args:?}"
