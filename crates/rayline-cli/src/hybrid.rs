@@ -1,4 +1,6 @@
-//! Explicit ARC hybrid runtime, separate from auth-free `--local` static routing.
+//! The local process (spec 3.3): `rayline local start|status|stop`, and the
+//! connection a local-mode `rayline run` makes to it, starting it first when
+//! none is running.
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -6,53 +8,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use clap::{Parser, Subcommand};
 use rayline_local_router::ModelCapabilities;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::config::Settings;
 
 /// How long `start` waits for a model's tokenizer files before it uses the
 /// cached copy.
-const TOKENIZER_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+const TOKENIZER_FETCH_DEADLINE: Duration = Duration::from_secs(20);
 
-#[derive(Parser)]
-#[command(
-    name = "raydock hybrid",
-    about = "Run ARC hybrid routing with externally managed inference"
-)]
-struct Cli {
-    /// Separate runtime instance directory (contains private gateway credentials).
-    #[arg(long, global = true)]
-    state_dir: Option<PathBuf>,
-    #[command(subcommand)]
-    command: Action,
-}
-
-#[derive(Subcommand)]
-enum Action {
-    /// Start the Go execution core and authenticated loopback gateway.
-    Start {
-        /// Override the execution core installed beside rayline.
-        #[arg(long)]
-        core: Option<PathBuf>,
-        /// Environment whose router makes the decisions:
-        /// `environments.<name>` in settings.json. Without it, prod.
-        #[arg(long)]
-        env: Option<String>,
-        /// Isolated Decisions cell tag (development only).
-        #[arg(long)]
-        cell: Option<String>,
-        /// Loopback gateway port; 0 chooses a free port.
-        #[arg(long, default_value_t = 20815)]
-        port: u16,
-        /// Core initialization/readiness deadline, including runtime profile checks.
-        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
-        startup_timeout_secs: u64,
-    },
-    /// Show live gateway/core readiness and endpoint (never prints keys).
-    Status,
-    /// Stop gateway and execution core; external model servers remain running.
-    Stop,
-}
+/// The deadline for the core to initialize and report ready, including its
+/// runtime profile checks, and for the Decisions readiness check.
+const STARTUP_TIMEOUT_SECS: u64 = 120;
 
 struct Paths {
     dir: PathBuf,
@@ -73,19 +41,167 @@ impl Paths {
     fn core_config(&self) -> PathBuf {
         self.dir.join("core-config.json")
     }
+    fn lock(&self) -> PathBuf {
+        self.dir.join("runtime.lock")
+    }
 }
 
-pub async fn run(args: Vec<OsString>) -> ExitCode {
-    let cli =
-        match Cli::try_parse_from(std::iter::once(OsString::from("raydock hybrid")).chain(args)) {
-            Ok(cli) => cli,
-            Err(error) => {
-                let code = error.exit_code();
-                let _ = error.print();
-                return ExitCode::from(code as u8);
+/// `~/.rayline/local/`, the local process's state (spec 8.2).
+pub(crate) fn state_dir(home: &Path) -> PathBuf {
+    home.join(crate::DOT_CONFIG_DIR).join("local")
+}
+
+/// What `supervisor.json` records about the running local process.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Supervisor {
+    pid: u32,
+    /// The config file it was started from, canonical.
+    config: PathBuf,
+    /// The `--env` it was started with. `None` is prod.
+    env: Option<String>,
+}
+
+impl Supervisor {
+    /// Refuses a run whose config file or `--env` is not the running
+    /// process's (spec 3.3 item 3): it never runs on another config.
+    fn check_serves(&self, settings: &Settings) -> io::Result<()> {
+        let config = canonical_config(settings)?;
+        if self.config != config {
+            return Err(io::Error::other(format!(
+                "the local process (pid {}) runs from {}, not {}; stop it with `rayline local stop` first",
+                self.pid,
+                self.config.display(),
+                config.display()
+            )));
+        }
+        if self.env != settings.env {
+            return Err(io::Error::other(format!(
+                "the local process (pid {}) was started with {}, and this run has {}; stop it with `rayline local stop` first",
+                self.pid,
+                env_words(self.env.as_deref()),
+                env_words(settings.env.as_deref())
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// `--env <name>` as an error names it.
+fn env_words(env: Option<&str>) -> String {
+    match env {
+        Some(name) => format!("`--env {name}`"),
+        None => "no `--env`".to_owned(),
+    }
+}
+
+fn canonical_config(settings: &Settings) -> io::Result<PathBuf> {
+    fs::canonicalize(&settings.file).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("{}: {error}", settings.file.display()),
+        )
+    })
+}
+
+/// `rayline local start`: start the local process from `settings`.
+pub(crate) async fn start(settings: &Settings) -> ExitCode {
+    exit_code(
+        async {
+            let (home, paths) = local_paths()?;
+            let _lock = acquire_lock(&paths.lock())?;
+            if let Some(running) = running(&paths)? {
+                return Err(io::Error::other(format!(
+                    "the local process is already running (pid {}, config {}); stop it with `rayline local stop` first",
+                    running.pid,
+                    running.config.display()
+                )));
             }
-        };
-    match execute(cli).await {
+            launch(&home, &paths, settings, &|line| println!("{line}")).await
+        }
+        .await,
+    )
+}
+
+/// `rayline local status`.
+pub(crate) async fn status() -> ExitCode {
+    exit_code(
+        async {
+            let (_, paths) = local_paths()?;
+            let Some(running) = running(&paths)? else {
+                println!("Local process: not running");
+                return Ok(());
+            };
+            let state = ready(&paths)?;
+            health(&gateway_client()?, &paths, &state).await?;
+            println!(
+                "Local process: running (pid {})\nAddress: {}\nConfig: {}\nEnvironment: {}",
+                running.pid,
+                url(&state)?,
+                running.config.display(),
+                running.env.as_deref().unwrap_or("prod")
+            );
+            Ok(())
+        }
+        .await,
+    )
+}
+
+/// `rayline local stop`: stop the gateway and the execution core. External
+/// model servers keep running.
+pub(crate) async fn stop() -> ExitCode {
+    exit_code(
+        async {
+            let (_, paths) = local_paths()?;
+            let _lock = acquire_lock(&paths.lock())?;
+            if running(&paths)?.is_none() {
+                clear_state(&paths)?;
+                println!("Local process: not running");
+                return Ok(());
+            }
+            let state = ready(&paths)?;
+            // Shutdown remains available when core health fails. The private
+            // gateway token authenticates this command independently.
+            let shutdown: Value = gateway_client()?
+                .post(format!("{}/_rayline/shutdown", url(&state)?))
+                .bearer_auth(fs::read_to_string(paths.token())?)
+                .json(&json!({}))
+                .send()
+                .await
+                .map_err(io::Error::other)?
+                .error_for_status()
+                .map_err(io::Error::other)?
+                .json()
+                .await
+                .map_err(io::Error::other)?;
+            if shutdown.get("pid") != state.get("pid")
+                || shutdown.get("instance_id") != state.get("instance_id")
+                || shutdown.get("stopping") != Some(&json!(true))
+            {
+                return Err(io::Error::other("local process shutdown identity mismatch"));
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while paths.ready().exists() {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::other(format!(
+                        "the local process did not stop within 10s; see {}",
+                        paths.log().display()
+                    )));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            fs::remove_file(paths.supervisor())?;
+            println!("Local process stopped.");
+            Ok(())
+        }
+        .await,
+    )
+}
+
+/// A local-mode `rayline run <harness>`: connect `harness` to the local
+/// process running from `settings`, starting it if none is running.
+pub(crate) async fn run_local(settings: &Settings, harness: &str, args: &[OsString]) -> ExitCode {
+    match run_harness(settings, harness, args).await {
         Ok(code) => code,
         Err(error) => {
             eprintln!("Error: {error}");
@@ -94,11 +210,9 @@ pub async fn run(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-/// `rayline run <harness> --local`: connect `harness` to the running local
-/// process (`~/.rayline/hybrid`), as `rayline run <harness> --local` did.
-pub(crate) async fn run_local(harness: &str, args: &[OsString]) -> ExitCode {
-    match run_harness(harness, args).await {
-        Ok(code) => code,
+fn exit_code(result: io::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Error: {error}");
             ExitCode::FAILURE
@@ -106,19 +220,38 @@ pub(crate) async fn run_local(harness: &str, args: &[OsString]) -> ExitCode {
     }
 }
 
-async fn run_harness(harness: &str, args: &[OsString]) -> io::Result<ExitCode> {
+/// The home directory and the local process's state directory, created
+/// owner-only.
+fn local_paths() -> io::Result<(PathBuf, Paths)> {
     require_supported_os()?;
     let home = dirs::home_dir().ok_or_else(|| io::Error::other("cannot find home directory"))?;
     let paths = Paths {
-        dir: home.join(".rayline").join("hybrid"),
+        dir: state_dir(&home),
     };
     private_dir(&paths.dir)?;
+    Ok((home, paths))
+}
+
+async fn run_harness(
+    settings: &Settings,
+    harness: &str,
+    args: &[OsString],
+) -> io::Result<ExitCode> {
+    let (home, paths) = local_paths()?;
+    {
+        let _lock = acquire_lock(&paths.lock())?;
+        match running(&paths)? {
+            Some(running) => running.check_serves(settings)?,
+            // Progress goes to stderr: the harness owns stdout.
+            None => launch(&home, &paths, settings, &|line| eprintln!("{line}")).await?,
+        }
+    }
     let client = gateway_client()?;
     let state = ready(&paths)?;
     health(&client, &paths, &state).await?;
     let token = fs::read_to_string(paths.token())?;
     let mut command = harness_command(
-        &paths,
+        &home,
         harness,
         args,
         url(&state)?,
@@ -161,7 +294,7 @@ fn require_supported_os() -> io::Result<()> {
             .output()?;
         if !output.status.success() {
             return Err(io::Error::other(
-                "cannot determine macOS version for hybrid routing",
+                "cannot determine macOS version for the local process",
             ));
         }
         let version = String::from_utf8(output.stdout).map_err(io::Error::other)?;
@@ -170,242 +303,174 @@ fn require_supported_os() -> io::Result<()> {
             .split('.')
             .next()
             .and_then(|value| value.parse::<u32>().ok())
-            .ok_or_else(|| io::Error::other("invalid macOS version for hybrid routing"))?;
+            .ok_or_else(|| io::Error::other("invalid macOS version for the local process"))?;
         if major < 13 {
             return Err(io::Error::other(
-                "hybrid routing requires macOS 13 Ventura or later",
+                "the local process requires macOS 13 Ventura or later",
             ));
         }
     }
     Ok(())
 }
 
-async fn execute(cli: Cli) -> io::Result<ExitCode> {
-    require_supported_os()?;
-    let home = dirs::home_dir().ok_or_else(|| io::Error::other("cannot find home directory"))?;
-    let paths = Paths {
-        dir: cli
-            .state_dir
-            .unwrap_or_else(|| home.join(".rayline").join("hybrid")),
-    };
-    private_dir(&paths.dir)?;
-    let client = gateway_client()?;
-    match cli.command {
-        Action::Start {
-            core,
-            env,
-            cell,
-            port,
-            startup_timeout_secs,
-        } => {
-            let _lock = acquire_lock(&paths.dir.join("runtime.lock"))?;
-            clear_stopped_state(&paths)?;
-            let core = match core {
-                Some(path) => fs::canonicalize(path)?,
-                None => installed_binary("rayline-core")?,
-            };
-            let settings = crate::config::load(&crate::config::LoadOptions {
-                mode: crate::config::Mode::Local,
-                env: env.as_deref(),
-                harness_protocol: None,
-            })
-            .map_err(io::Error::other)?;
-            let routing = settings
-                .routing
-                .as_ref()
-                .expect("a local-mode load has routing");
-            let hosted = crate::status::hosted_environment(&settings);
-            let config =
-                crate::hybrid_profile::core_config(&settings, &hosted.base_url, cell.as_deref())
-                    .map_err(io::Error::other)?;
-            // One counter per tokenizer, named for each deployment of its model.
-            let mut token_counters = Vec::new();
-            for (id, model) in &settings.models {
-                let Some(repo) = &model.tokenizer else {
-                    continue;
-                };
-                let snapshot = tokenizer_snapshot(repo).await.map_err(|error| {
-                    io::Error::other(format!(
-                        "{}: cannot load the tokenizer {repo} of models entry {id}: {error}",
-                        settings.file.display()
-                    ))
-                })?;
-                if snapshot.cached {
-                    println!(
-                        "Prompt counter for {id}: {repo}, the cached copy (Hugging Face did not serve the current one)"
-                    );
-                } else {
-                    println!("Prompt counter for {id}: {repo}");
-                }
-                for &protocol in &settings.endpoints[&model.endpoint].protocols {
-                    token_counters.push((
-                        crate::hybrid_profile::deployment_id(id, protocol),
-                        snapshot.dir.clone(),
-                    ));
-                }
-            }
-            // The environment's saved router key, minted on first use after
-            // `raydock auth login`. It is the only key the core gets from
-            // Rayline; every endpoint's own key comes from its `api_key_env`.
-            let router_key = crate::status::router_key(&hosted, &home)
-                .await
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let router_urls = crate::hybrid_profile::configured_router_urls(&settings);
-            write_private_json(&paths.core_config(), &config, true)?;
-            println!(
-                "Decisions: {} via {}",
-                routing.decisions_model, hosted.base_url
-            );
-            println!("Routing policy: {}", routing.policy.preset);
-            for (id, model) in &settings.models {
-                println!(
-                    "Model {id}: {} at {}",
-                    model.model, settings.endpoints[&model.endpoint].base_url
-                );
-            }
-            println!(
-                "Auto-mode classifier: {} (Claude Code's safety checks)",
-                routing.classifier_model
-            );
-            println!("Rayline key: the saved key for {}", hosted.name());
-            // One Decisions call before reporting ready: a refused key or an
-            // unreachable router fails here, not on the harness's first turn.
-            probe_decisions(
-                &config,
-                &router_key,
-                settings.env.as_deref(),
-                startup_timeout_secs,
-            )
-            .await?;
-            let rld = installed_binary(crate::DAEMON_BIN)?;
-            let log = private_log(&paths.log())?;
-            let mut command = Command::new(rld);
-            command
-                .arg("hybrid")
-                .arg("--core")
-                .arg(core)
-                .arg("--config")
-                .arg(paths.core_config())
-                .arg("--port")
-                .arg(port.to_string())
-                .arg("--startup-timeout-secs")
-                .arg(startup_timeout_secs.to_string())
-                .arg("--token-file")
-                .arg(paths.token())
-                .arg("--ready-file")
-                .arg(paths.ready())
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(log.try_clone()?))
-                .stderr(Stdio::from(log));
-            for router_url in &router_urls {
-                command.arg("--router-url").arg(router_url);
-            }
-            if let Some(env_name) = &settings.env {
-                command.arg("--env-name").arg(env_name);
-            }
-            command
-                .arg("--classifier-model")
-                .arg(&routing.classifier_model);
-            for (deployment, dir) in &token_counters {
-                command.arg("--token-counter-dir").arg(deployment).arg(dir);
-            }
-            command.env(crate::hybrid_profile::ROUTER_KEY_ENV, &router_key);
-            let mut child = crate::detach::spawn_detached(&mut command)?;
-            let startup = async {
-                write_private_json(&paths.supervisor(), &json!({"pid":child.id()}), false)?;
-                let started = Instant::now();
-                loop {
-                    if let Some(status) = child.try_wait()? {
-                        return Err(io::Error::other(format!(
-                            "hybrid runtime exited ({status}); see {}",
-                            paths.log().display()
-                        )));
-                    }
-                    if paths.ready().exists() {
-                        let state = ready(&paths)?;
-                        if state.get("pid").and_then(Value::as_u64) != Some(u64::from(child.id())) {
-                            return Err(io::Error::other(
-                                "hybrid startup process identity mismatch",
-                            ));
-                        }
-                        health(&client, &paths, &state).await?;
-                        println!(
-                            "Hybrid routing ready at {}\nGateway credential: {}\nLogs: {}",
-                            url(&state)?,
-                            paths.token().display(),
-                            paths.log().display()
-                        );
-                        return Ok(());
-                    }
-                    if started.elapsed() > Duration::from_secs(startup_timeout_secs + 5) {
-                        return Err(io::Error::other(format!(
-                            "hybrid startup timed out; see {}",
-                            paths.log().display()
-                        )));
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-            }
-            .await;
-            if let Err(error) = startup {
-                stop_spawned(&mut child).await?;
-                clear_stopped_state(&paths)?;
-                return Err(error);
-            }
+/// Start the local process from `settings` and wait until it is ready.
+/// The caller holds the runtime lock and has checked that none is running.
+/// `say` reports progress.
+async fn launch(
+    home: &Path,
+    paths: &Paths,
+    settings: &Settings,
+    say: &dyn Fn(String),
+) -> io::Result<()> {
+    clear_state(paths)?;
+    let config_file = canonical_config(settings)?;
+    let core = installed_binary("rayline-core")?;
+    let routing = settings
+        .routing
+        .as_ref()
+        .expect("a local-mode load has routing");
+    let hosted = crate::status::hosted_environment(settings);
+    let config =
+        crate::hybrid_profile::core_config(settings, &hosted.base_url).map_err(io::Error::other)?;
+    // The local process refuses Decisions anywhere but this router or a
+    // loopback address; refuse a router it would refuse here, by name.
+    rayline_local_router::decisions_url::check_config(&config, [hosted.base_url.as_str()])
+        .map_err(|error| {
+            io::Error::other(format!(
+                "the router of environment {}: {error}",
+                hosted.name()
+            ))
+        })?;
+    // One counter per tokenizer, named for each deployment of its model.
+    let mut token_counters = Vec::new();
+    for (id, model) in &settings.models {
+        let Some(repo) = &model.tokenizer else {
+            continue;
+        };
+        let snapshot = tokenizer_snapshot(repo).await.map_err(|error| {
+            io::Error::other(format!(
+                "{}: cannot load the tokenizer {repo} of models entry {id}: {error}",
+                settings.file.display()
+            ))
+        })?;
+        if snapshot.cached {
+            say(format!(
+                "Prompt counter for {id}: {repo}, the cached copy (Hugging Face did not serve the current one)"
+            ));
+        } else {
+            say(format!("Prompt counter for {id}: {repo}"));
         }
-        Action::Status => {
-            let state = ready(&paths)?;
-            let health = health(&client, &paths, &state).await?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &json!({"listen_url": url(&state)?, "health": health})
-                )
-                .map_err(io::Error::other)?
-            );
-        }
-        Action::Stop => {
-            let _lock = acquire_lock(&paths.dir.join("runtime.lock"))?;
-            if stopped(&paths)? {
-                clear_stopped_state(&paths)?;
-                println!("Hybrid runtime is stopped; stale state removed.");
-                return Ok(ExitCode::SUCCESS);
-            }
-            let state = ready(&paths)?;
-            // Shutdown remains available when core health fails. The private
-            // gateway token authenticates this supervisor independently.
-            let shutdown: Value = client
-                .post(format!("{}/_rayline/shutdown", url(&state)?))
-                .bearer_auth(fs::read_to_string(paths.token())?)
-                .json(&json!({}))
-                .send()
-                .await
-                .map_err(io::Error::other)?
-                .error_for_status()
-                .map_err(io::Error::other)?
-                .json()
-                .await
-                .map_err(io::Error::other)?;
-            if shutdown.get("pid") != state.get("pid")
-                || shutdown.get("instance_id") != state.get("instance_id")
-                || shutdown.get("stopping") != Some(&json!(true))
-            {
-                return Err(io::Error::other("hybrid shutdown identity mismatch"));
-            }
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while paths.ready().exists() {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::other(
-                        "hybrid shutdown timed out; inspect runtime.log",
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            fs::remove_file(paths.supervisor())?;
-            println!("Hybrid gateway and execution core stopped.");
+        for &protocol in &settings.endpoints[&model.endpoint].protocols {
+            token_counters.push((
+                crate::hybrid_profile::deployment_id(id, protocol),
+                snapshot.dir.clone(),
+            ));
         }
     }
-    Ok(ExitCode::SUCCESS)
+    // The environment's saved router key, minted on first use after
+    // `rayline auth login`. It is the only key the core gets from Rayline;
+    // every endpoint's own key comes from its `api_key_env`.
+    let router_key = crate::status::router_key(&hosted, home)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    write_private_json(&paths.core_config(), &config, true)?;
+    say(format!(
+        "Decisions: {} via {}",
+        routing.decisions_model, hosted.base_url
+    ));
+    say(format!("Routing policy: {}", routing.policy.preset));
+    for (id, model) in &settings.models {
+        say(format!(
+            "Model {id}: {} at {}",
+            model.model, settings.endpoints[&model.endpoint].base_url
+        ));
+    }
+    say(format!(
+        "Auto-mode classifier: {} (Claude Code's safety checks)",
+        routing.classifier_model
+    ));
+    say(format!("Rayline key: the saved key for {}", hosted.name()));
+    // One Decisions call before reporting ready: a refused key or an
+    // unreachable router fails here, not on the harness's first turn.
+    probe_decisions(&config, &router_key, settings.env.as_deref(), say).await?;
+    let log = private_log(&paths.log())?;
+    let mut command = Command::new(current_exe()?);
+    command
+        .arg(crate::cli::LOCAL_PROCESS)
+        .arg("--core")
+        .arg(core)
+        .arg("--config")
+        .arg(paths.core_config())
+        .arg("--startup-timeout-secs")
+        .arg(STARTUP_TIMEOUT_SECS.to_string())
+        .arg("--token-file")
+        .arg(paths.token())
+        .arg("--ready-file")
+        .arg(paths.ready())
+        .arg("--router-url")
+        .arg(&hosted.base_url)
+        .arg("--classifier-model")
+        .arg(&routing.classifier_model)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log));
+    if let Some(env_name) = &settings.env {
+        command.arg("--env-name").arg(env_name);
+    }
+    for (deployment, dir) in &token_counters {
+        command.arg("--token-counter-dir").arg(deployment).arg(dir);
+    }
+    command.env(crate::hybrid_profile::ROUTER_KEY_ENV, &router_key);
+    let mut child = crate::detach::spawn_detached(&mut command)?;
+    let startup = async {
+        let supervisor = Supervisor {
+            pid: child.id(),
+            config: config_file,
+            env: settings.env.clone(),
+        };
+        write_private_json(
+            &paths.supervisor(),
+            &serde_json::to_value(&supervisor).map_err(io::Error::other)?,
+            false,
+        )?;
+        let client = gateway_client()?;
+        let started = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "the local process exited ({status}); see {}",
+                    paths.log().display()
+                )));
+            }
+            if paths.ready().exists() {
+                let state = ready(paths)?;
+                if state.get("pid").and_then(Value::as_u64) != Some(u64::from(child.id())) {
+                    return Err(io::Error::other("local process startup identity mismatch"));
+                }
+                health(&client, paths, &state).await?;
+                say(format!(
+                    "Local process ready at {}\nLogs: {}",
+                    url(&state)?,
+                    paths.log().display()
+                ));
+                return Ok(());
+            }
+            if started.elapsed() > Duration::from_secs(STARTUP_TIMEOUT_SECS + 5) {
+                return Err(io::Error::other(format!(
+                    "the local process did not start within {STARTUP_TIMEOUT_SECS}s; see {}",
+                    paths.log().display()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    .await;
+    if let Err(error) = startup {
+        stop_spawned(&mut child).await?;
+        clear_state(paths)?;
+        return Err(error);
+    }
+    Ok(())
 }
 
 /// The snapshot of `repo`'s tokenizer and chat template, fetched from Hugging
@@ -435,20 +500,16 @@ async fn tokenizer_snapshot(repo: &str) -> Result<crate::hybrid_tokenizer::Snaps
 }
 
 /// Send one Decisions request with the key the core will use and classify
-/// the answer. A development cell (`cell_tag`) gets a real routing request
-/// (the profile's model, and its V when it has one), which also starts a scale-to-zero cell; while it answers 502/503/504 the
-/// probe waits and retries within the startup deadline. Without a cell an
-/// empty body is enough: the router authenticates before it validates.
-/// Skipped for a loopback Decisions URL.
+/// the answer: an empty body is enough, as the router authenticates before it
+/// validates. Skipped for a loopback Decisions URL.
 async fn probe_decisions(
     config: &Value,
     key: &str,
     env: Option<&str>,
-    startup_timeout_secs: u64,
+    say: &dyn Fn(String),
 ) -> io::Result<()> {
     let env_flag = env_flag(env);
-    let decisions = &config["decisions"];
-    let url = decisions["url"]
+    let url = config["decisions"]["url"]
         .as_str()
         .expect("core_config always names the Decisions URL");
     // A loopback Decisions service is a local fixture or development
@@ -460,21 +521,21 @@ async fn probe_decisions(
     }) {
         return Ok(());
     }
-    let cell = decisions.get("cell_tag").and_then(Value::as_str);
-    let body = probe_body(decisions);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(io::Error::other)?;
-    let deadline = Instant::now() + Duration::from_secs(startup_timeout_secs);
+    let deadline = Instant::now() + Duration::from_secs(STARTUP_TIMEOUT_SECS);
     let mut announced = false;
     loop {
-        let mut request = client.post(url).bearer_auth(key).json(&body);
-        if let Some(cell) = cell {
-            request = request.header("X-Rayline-Cell", cell);
-        }
-        let outcome = match request.send().await {
+        let outcome = match client
+            .post(url)
+            .bearer_auth(key)
+            .json(&json!({}))
+            .send()
+            .await
+        {
             Ok(response) => Ok(response.status().as_u16()),
             Err(error) => Err(error),
         };
@@ -482,7 +543,7 @@ async fn probe_decisions(
             ProbeVerdict::Ready => return Ok(()),
             ProbeVerdict::KeyRefused(status) => {
                 return Err(io::Error::other(format!(
-                    "Decisions at {url} refused the Rayline key (HTTP {status}). Run `raydock {env_flag}auth login`, then `raydock hybrid start` again."
+                    "Decisions at {url} refused the Rayline key (HTTP {status}). Run `rayline {env_flag}auth login`, then try again."
                 )));
             }
             ProbeVerdict::RateLimited => {
@@ -492,7 +553,7 @@ async fn probe_decisions(
             }
             ProbeVerdict::Rejected(status) => {
                 return Err(io::Error::other(format!(
-                    "Decisions at {url} answered HTTP {status} to a readiness check; hybrid routing cannot start"
+                    "Decisions at {url} answered HTTP {status} to a readiness check; the local process cannot start"
                 )));
             }
             ProbeVerdict::Unavailable => {
@@ -502,17 +563,12 @@ async fn probe_decisions(
                         Err(error) => error.to_string(),
                     };
                     return Err(io::Error::other(format!(
-                        "Decisions at {url} is unreachable or not ready ({detail}); check your network and `raydock {env_flag}status`, then retry"
+                        "Decisions at {url} is unreachable or not ready ({detail}); check your network, then retry"
                     )));
                 }
                 if !announced {
                     announced = true;
-                    match cell {
-                        Some(cell) => println!(
-                            "Waiting for Decisions cell {cell} to start (it scales to zero)..."
-                        ),
-                        None => println!("Waiting for Decisions at {url}..."),
-                    }
+                    say(format!("Waiting for Decisions at {url}..."));
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
@@ -536,23 +592,6 @@ enum ProbeVerdict {
 }
 
 /// `Err(())`: no HTTP answer (connect error or timeout).
-/// The readiness body: empty without a cell, else a routing request with the
-/// profile's model, and its V when it has one.
-fn probe_body(decisions: &Value) -> Value {
-    if decisions.get("cell_tag").and_then(Value::as_str).is_none() {
-        return json!({});
-    }
-    let mut body = json!({
-        "model": decisions.get("model"),
-        "max_tokens": 1,
-        "messages": [{"role": "user", "content": "raydock hybrid start: readiness check"}]
-    });
-    if let Some(v_value) = decisions.pointer("/routing/v_value") {
-        body["routing"] = json!({"v_value": v_value});
-    }
-    body
-}
-
 fn probe_verdict(outcome: Result<u16, ()>) -> ProbeVerdict {
     match outcome {
         Err(()) => ProbeVerdict::Unavailable,
@@ -560,16 +599,22 @@ fn probe_verdict(outcome: Result<u16, ()>) -> ProbeVerdict {
         Ok(status @ (401 | 403)) => ProbeVerdict::KeyRefused(status),
         Ok(429) => ProbeVerdict::RateLimited,
         Ok(500 | 502 | 503 | 504) => ProbeVerdict::Unavailable,
-        // Authenticated, then refused the readiness body (an empty one, or a
-        // cell that wants an execution context): the key and router work.
+        // Authenticated, then refused the empty readiness body: the key and
+        // router work.
         // A 404/405 means the URL is not a Decisions route: rejected.
         Ok(400 | 409 | 422) => ProbeVerdict::Ready,
         Ok(status) => ProbeVerdict::Rejected(status),
     }
 }
 
+/// This `raydock`, with symlinks resolved: the local process runs from it.
+fn current_exe() -> io::Result<PathBuf> {
+    fs::canonicalize(std::env::current_exe()?)
+}
+
+/// `name`, installed beside [`current_exe`].
 fn installed_binary(name: &str) -> io::Result<PathBuf> {
-    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let executable = current_exe()?;
     let directory = executable
         .parent()
         .ok_or_else(|| io::Error::other("rayline executable has no parent directory"))?;
@@ -582,7 +627,7 @@ fn ready(paths: &Paths) -> io::Result<Value> {
         serde_json::from_slice(&fs::read(paths.ready())?).map_err(io::Error::other)?;
     if state.get("contract_version") != Some(&json!(1)) || state.get("ready") != Some(&json!(true))
     {
-        return Err(io::Error::other("incompatible hybrid runtime metadata"));
+        return Err(io::Error::other("incompatible local process metadata"));
     }
     credential_env_names(&state)?;
     model_capabilities(&state)?;
@@ -603,7 +648,7 @@ fn ready(paths: &Paths) -> io::Result<Value> {
         || !endpoint.username().is_empty()
         || endpoint.password().is_some()
     {
-        return Err(io::Error::other("invalid hybrid loopback endpoint"));
+        return Err(io::Error::other("invalid local process loopback endpoint"));
     }
     Ok(state)
 }
@@ -617,23 +662,23 @@ pub(crate) async fn top_connection(
         dir: state_dir.to_owned(),
     };
     let state = ready(&paths)
-        .map_err(|_| io::Error::other("hybrid runtime readiness is unavailable or invalid"))?;
+        .map_err(|_| io::Error::other("local process readiness is unavailable or invalid"))?;
     for key in ["pid", "core_pid"] {
         state
             .get(key)
             .and_then(Value::as_i64)
             .and_then(|pid| i32::try_from(pid).ok())
             .filter(|pid| process_exists(*pid))
-            .ok_or_else(|| io::Error::other("hybrid runtime process is not live"))?;
+            .ok_or_else(|| io::Error::other("the local process is not live"))?;
     }
     let token = fs::read_to_string(paths.token())
-        .map_err(|_| io::Error::other("hybrid gateway credential is unavailable"))?;
+        .map_err(|_| io::Error::other("local gateway credential is unavailable"))?;
     if token.trim().is_empty() {
-        return Err(io::Error::other("hybrid gateway credential is invalid"));
+        return Err(io::Error::other("local gateway credential is invalid"));
     }
     let mut authorization =
         reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token.trim()))
-            .map_err(|_| io::Error::other("hybrid gateway credential is invalid"))?;
+            .map_err(|_| io::Error::other("local gateway credential is invalid"))?;
     authorization.set_sensitive(true);
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(reqwest::header::AUTHORIZATION, authorization);
@@ -643,9 +688,9 @@ pub(crate) async fn top_connection(
         .timeout(Duration::from_secs(3))
         .default_headers(headers)
         .build()
-        .map_err(|_| io::Error::other("cannot initialize hybrid gateway connection"))?;
+        .map_err(|_| io::Error::other("cannot initialize the local gateway connection"))?;
     health(&client, &paths, &state).await.map_err(|_| {
-        io::Error::other("hybrid gateway health/authentication or process identity check failed")
+        io::Error::other("local gateway health/authentication or process identity check failed")
     })?;
     let endpoint = url(&state)?.trim_end_matches('/');
     Ok((client, format!("{endpoint}/v1/router/top/snapshot"), state))
@@ -655,14 +700,18 @@ fn credential_env_names(state: &Value) -> io::Result<Vec<&str>> {
     let values = state
         .get("credential_env")
         .and_then(Value::as_array)
-        .ok_or_else(|| io::Error::other("missing hybrid credential environment references"))?;
+        .ok_or_else(|| {
+            io::Error::other("missing local process credential environment references")
+        })?;
     values
         .iter()
         .map(|value| {
             value
                 .as_str()
                 .filter(|name| !name.is_empty() && !name.contains(['=', '\0']))
-                .ok_or_else(|| io::Error::other("invalid hybrid credential environment reference"))
+                .ok_or_else(|| {
+                    io::Error::other("invalid local process credential environment reference")
+                })
         })
         .collect()
 }
@@ -671,7 +720,7 @@ fn model_capabilities(state: &Value) -> io::Result<ModelCapabilities> {
     let capabilities: ModelCapabilities = serde_json::from_value(
         state
             .get("capabilities")
-            .ok_or_else(|| io::Error::other("missing hybrid model capabilities"))?
+            .ok_or_else(|| io::Error::other("missing local process model capabilities"))?
             .clone(),
     )
     .map_err(io::Error::other)?;
@@ -727,13 +776,13 @@ async fn health(client: &reqwest::Client, paths: &Paths, state: &Value) -> io::R
         || health.get("contract_version") != Some(&json!(1))
         || model_capabilities(&health)? != model_capabilities(state)?
     {
-        return Err(io::Error::other("hybrid health/process identity mismatch"));
+        return Err(io::Error::other("local process health/identity mismatch"));
     }
     Ok(health)
 }
 
 fn harness_command(
-    paths: &Paths,
+    home: &Path,
     name: &str,
     args: &[OsString],
     endpoint: &str,
@@ -791,13 +840,12 @@ fn harness_command(
         "codex" => {
             command.env("RAYLINE_HYBRID_GATEWAY_TOKEN", token);
             for setting in [
-                "model_provider=\"rayline-hybrid\"".to_owned(),
+                "model_provider=\"rayline-local\"".to_owned(),
                 "model=\"rayline-auto\"".to_owned(),
-                "model_providers.rayline-hybrid.name=\"Raydock Hybrid\"".to_owned(),
-                format!("model_providers.rayline-hybrid.base_url=\"{endpoint}/v1\""),
-                "model_providers.rayline-hybrid.wire_api=\"responses\"".to_owned(),
-                "model_providers.rayline-hybrid.env_key=\"RAYLINE_HYBRID_GATEWAY_TOKEN\""
-                    .to_owned(),
+                "model_providers.rayline-local.name=\"Rayline local\"".to_owned(),
+                format!("model_providers.rayline-local.base_url=\"{endpoint}/v1\""),
+                "model_providers.rayline-local.wire_api=\"responses\"".to_owned(),
+                "model_providers.rayline-local.env_key=\"RAYLINE_HYBRID_GATEWAY_TOKEN\"".to_owned(),
                 format!("model_context_window={}", capabilities.context_window),
                 format!("model_max_output_tokens={}", capabilities.max_output_tokens),
             ] {
@@ -805,12 +853,13 @@ fn harness_command(
             }
         }
         _ => {
-            let harness = crate::harness::Harness::from_command(name)
-                .ok_or_else(|| io::Error::other(format!("unsupported hybrid harness {name:?}")))?;
+            let harness = crate::harness::Harness::from_command(name).ok_or_else(|| {
+                io::Error::other(format!("unsupported local-mode harness {name:?}"))
+            })?;
             let major_version =
                 harness.major_version(crate::harness::find_on_path(harness.binary()).as_deref());
             let args = harness.hybrid_args(args, major_version)?;
-            let config_dir = paths.dir.join("harness").join(name);
+            let config_dir = crate::harness::config_dir(home, harness);
             private_dir(&config_dir)?;
             let ctx = crate::harness::RenderContext {
                 key: token,
@@ -879,38 +928,43 @@ fn require_fresh_session(harness: &str, args: &[OsString]) -> io::Result<()> {
         });
     if resuming {
         return Err(io::Error::other(
-            "hybrid execution requires a fresh harness session; saved sessions do not contain the core's private-append ledger",
+            "local mode requires a fresh harness session; saved sessions do not contain the core's private-append ledger",
         ));
     }
     Ok(())
 }
 
-fn stopped(paths: &Paths) -> io::Result<bool> {
-    if !paths.supervisor().exists() {
-        if paths.ready().exists() || paths.token().exists() {
-            return Err(io::Error::other(
-                "hybrid runtime state has no supervisor identity; inspect the state directory before removing it",
-            ));
+/// The running local process's record, or `None` when none is running: no
+/// record, or one whose process has exited.
+fn running(paths: &Paths) -> io::Result<Option<Supervisor>> {
+    let bytes = match fs::read(paths.supervisor()) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if paths.ready().exists() || paths.token().exists() {
+                return Err(io::Error::other(format!(
+                    "{} holds local process state without {}; inspect it before removing it",
+                    paths.dir.display(),
+                    paths.supervisor().display()
+                )));
+            }
+            return Ok(None);
         }
-        return Ok(true);
-    }
-    let state: Value =
-        serde_json::from_slice(&fs::read(paths.supervisor())?).map_err(io::Error::other)?;
-    let pid = state
-        .get("pid")
-        .and_then(Value::as_i64)
-        .and_then(|pid| i32::try_from(pid).ok())
-        .filter(|pid| *pid > 0)
-        .ok_or_else(|| io::Error::other("invalid hybrid supervisor identity"))?;
-    Ok(!process_exists(pid))
+        Err(error) => return Err(error),
+    };
+    let supervisor: Supervisor = serde_json::from_slice(&bytes)
+        .map_err(|error| io::Error::other(format!("{}: {error}", paths.supervisor().display())))?;
+    let pid = i32::try_from(supervisor.pid).map_err(|_| {
+        io::Error::other(format!(
+            "{}: invalid pid {}",
+            paths.supervisor().display(),
+            supervisor.pid
+        ))
+    })?;
+    Ok(process_exists(pid).then_some(supervisor))
 }
 
-fn clear_stopped_state(paths: &Paths) -> io::Result<()> {
-    if !stopped(paths)? {
-        return Err(io::Error::other(
-            "hybrid supervisor is running; use `raydock hybrid status` or `raydock hybrid stop` first",
-        ));
-    }
+/// Remove what a local process that is no longer running left behind.
+fn clear_state(paths: &Paths) -> io::Result<()> {
     for path in [paths.ready(), paths.token(), paths.supervisor()] {
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -944,7 +998,7 @@ async fn stop_spawned(child: &mut Child) -> io::Result<()> {
 }
 
 /// Ask a supervisor we spawned to stop and clean up after itself. Unix sends
-/// SIGTERM; Windows sets the stop event `rld` waits on. `NotFound` means it
+/// SIGTERM; Windows sets the stop event the local process waits on. `NotFound` means it
 /// is already gone.
 fn request_supervisor_stop(pid: i32) -> io::Result<()> {
     #[cfg(unix)]
@@ -1189,7 +1243,7 @@ mod tests {
             .map(|elapsed| elapsed.as_nanos())
             .unwrap_or_default();
         let dir = std::env::temp_dir().join(format!(
-            "rayline-hybrid-{name}-{}-{unique}",
+            "rayline-local-{name}-{}-{unique}",
             std::process::id()
         ));
         fs::create_dir_all(&dir).unwrap();
@@ -1315,41 +1369,10 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_start_takes_only_its_own_options() {
-        assert!(Cli::try_parse_from(["hybrid", "start"]).is_ok());
-        assert!(
-            Cli::try_parse_from([
-                "hybrid",
-                "start",
-                "--env",
-                "dev",
-                "--cell",
-                "cell-a",
-                "--core",
-                "/core",
-                "--port",
-                "0",
-                "--startup-timeout-secs",
-                "5",
-                "--state-dir",
-                "/state"
-            ])
-            .is_ok()
-        );
-        assert!(
-            Cli::try_parse_from(["hybrid", "start", "--core", "/core", "--config", "/config"])
-                .is_err()
-        );
-        assert!(Cli::try_parse_from(["hybrid", "run", "claude", "--", "-p", "hello"]).is_err());
-    }
-    #[test]
     fn cloud_credentials_are_not_exported_to_harnesses() {
-        let paths = Paths {
-            dir: PathBuf::from("/unused"),
-        };
         for name in ["claude", "codex"] {
             let command = harness_command(
-                &paths,
+                Path::new("/unused"),
                 name,
                 &[],
                 "http://127.0.0.1:20815",
@@ -1389,13 +1412,12 @@ mod tests {
         };
         let capabilities = harness_capabilities(core);
         assert_eq!(capabilities.context_window, 1_000_000);
-        let paths = Paths {
-            dir: temp_dir("limits"),
-        };
-        let read = |relative: &str| fs::read_to_string(paths.dir.join(relative)).unwrap();
+        let home = temp_dir("limits");
+        let read =
+            |relative: &str| fs::read_to_string(home.join(".rayline").join(relative)).unwrap();
         for name in ["pi", "opencode", "omp", "hermes", "openclaw"] {
             harness_command(
-                &paths,
+                &home,
                 name,
                 &[],
                 "http://127.0.0.1:20815",
@@ -1447,7 +1469,7 @@ mod tests {
             "{hermes}"
         );
         let claude = harness_command(
-            &paths,
+            &home,
             "claude",
             &[],
             "http://127.0.0.1:20815",
@@ -1481,7 +1503,7 @@ mod tests {
             );
         }
         let codex = harness_command(
-            &paths,
+            &home,
             "codex",
             &[],
             "http://127.0.0.1:20815",
@@ -1498,7 +1520,7 @@ mod tests {
             args.iter().any(|arg| arg == "model_context_window=1000000"),
             "{args:?}"
         );
-        let _ = fs::remove_dir_all(&paths.dir);
+        let _ = fs::remove_dir_all(&home);
     }
 
     /// Sets the fallback override for one scope and restores the prior value
@@ -1548,9 +1570,9 @@ mod tests {
             input_modalities: vec!["text".into()],
         });
         let conv_env = std::ffi::OsStr::new(crate::harness::CONV_ID_ENV);
-        let launch = |paths: &Paths, name: &str| {
+        let launch = |home: &Path, name: &str| {
             let command = harness_command(
-                paths,
+                home,
                 name,
                 &[],
                 "http://127.0.0.1:20815",
@@ -1560,7 +1582,7 @@ mod tests {
             .unwrap();
             // Every file the launch wrote for this harness, so the assertion
             // does not depend on which one carries the header.
-            let config: String = fs::read_dir(paths.dir.join("harness").join(name))
+            let config: String = fs::read_dir(home.join(".rayline/harness").join(name))
                 .unwrap()
                 .filter_map(|entry| fs::read_to_string(entry.unwrap().path()).ok())
                 .collect();
@@ -1576,17 +1598,15 @@ mod tests {
         for (forced, sends) in [(None, false), (Some("1"), true)] {
             let _override = FallbackOverride::set(forced);
             for name in ["hermes", "pi", "opencode", "omp", "openclaw"] {
-                let paths = Paths {
-                    dir: temp_dir(&format!("conv-{}-{name}", if sends { "on" } else { "off" })),
-                };
-                let (config, exported) = launch(&paths, name);
+                let home = temp_dir(&format!("conv-{}-{name}", if sends { "on" } else { "off" }));
+                let (config, exported) = launch(&home, name);
                 assert_eq!(
                     config.contains(crate::harness::CONV_HEADER),
                     sends,
                     "{name}: {config}"
                 );
                 assert_eq!(exported, Some(sends), "{name}");
-                let _ = fs::remove_dir_all(&paths.dir);
+                let _ = fs::remove_dir_all(&home);
             }
         }
     }

@@ -25,7 +25,7 @@ pub async fn render_top(request: &TopRequest) -> io::Result<String> {
 }
 
 async fn render_top_from_home(home: &Path, request: &TopRequest) -> io::Result<String> {
-    let source = TopSource::connect(&home.join(".rayline").join("hybrid")).await?;
+    let source = TopSource::connect(&crate::hybrid::state_dir(home)).await?;
 
     if request.json {
         let snapshot = source.fetch_snapshot().await?;
@@ -712,7 +712,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let state_dir = home.join(".rayline/hybrid");
+        let state_dir = crate::hybrid::state_dir(home);
         fs::create_dir_all(&state_dir).unwrap();
         let mut state = serde_json::json!({
             "contract_version": 1, "ready": true,
@@ -790,7 +790,7 @@ mod tests {
         assert!(!top_model_cell(&snapshot["recent"][0]).contains("virtual-model"));
 
         fs::write(
-            home.join(".rayline/hybrid/gateway-token"),
+            crate::hybrid::state_dir(&home).join("gateway-token"),
             "wrong-private-token",
         )
         .unwrap();
@@ -818,7 +818,7 @@ mod tests {
             serde_json::json!({"replace_snapshot_identity": true}),
         )
         .await;
-        let source = TopSource::connect(&home.join(".rayline/hybrid"))
+        let source = TopSource::connect(&crate::hybrid::state_dir(&home))
             .await
             .unwrap();
         assert!(source.fetch_snapshot().await.is_ok());
@@ -832,7 +832,7 @@ mod tests {
         );
         server.abort();
 
-        let ready_path = home.join(".rayline/hybrid/ready.json");
+        let ready_path = crate::hybrid::state_dir(&home).join("ready.json");
         let original: Value = serde_json::from_slice(&fs::read(&ready_path).unwrap()).unwrap();
         for patch in [
             serde_json::json!({"ready": false}),

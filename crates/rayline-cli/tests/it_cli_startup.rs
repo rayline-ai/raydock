@@ -89,27 +89,34 @@ fn a_usage_error_exits_2() {
 #[test]
 fn local_mode_without_routing_fails_before_anything_runs() {
     let home = Home::new();
-    assert_fails(
-        &home.run(&["run", "pi", "--local"]),
-        1,
-        "`routing` is required in local mode",
-    );
+    for args in [&["run", "pi", "--local"][..], &["local", "start"]] {
+        assert_fails(&home.run(args), 1, "`routing` is required in local mode");
+    }
 }
 
 #[test]
 fn a_missing_config_file_fails_before_anything_runs() {
     let home = Home::new();
     let missing = home.0.join("missing.json");
-    assert_fails(
-        &home.run(&[
-            "run",
-            "claude",
-            "--config",
-            missing.to_str().expect("utf-8"),
-        ]),
-        1,
-        "missing.json",
-    );
+    let missing = missing.to_str().expect("utf-8");
+    for args in [
+        &["run", "claude", "--config", missing][..],
+        &["local", "start", "--config", missing],
+    ] {
+        assert_fails(&home.run(args), 1, "missing.json");
+    }
+}
+
+#[test]
+fn a_config_file_starts_the_local_process_from_it() {
+    let home = Home::new();
+    fs::write(home.0.join(ROUTING_FILE), ROUTING).expect("routing file");
+    for args in [
+        &["run", "pi", "--config", ROUTING_FILE][..],
+        &["local", "start", "--config", ROUTING_FILE],
+    ] {
+        assert_fails(&home.run(args), 1, "installed rayline-core is unavailable");
+    }
 }
 
 #[test]
@@ -138,7 +145,6 @@ fn a_bad_update_channel_fails_before_update_runs() {
 fn local_mode_refuses_the_kept_options_it_does_not_run_yet() {
     let home = Home::new();
     home.settings(ROUTING);
-    fs::write(home.0.join(ROUTING_FILE), ROUTING).expect("routing file");
     for (args, option) in [
         (
             &["run", "claude", "--local", "--isolated"][..],
@@ -154,7 +160,6 @@ fn local_mode_refuses_the_kept_options_it_does_not_run_yet() {
             "`run codex configure`",
         ),
         (&["run", "codex", "--local", "--model", "m"], "`--model`"),
-        (&["run", "pi", "--config", ROUTING_FILE], "`--config`"),
     ] {
         assert_fails(
             &home.run(args),

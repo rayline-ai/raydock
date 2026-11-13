@@ -184,6 +184,7 @@ impl Runtime {
             .arg(dir.join("token"))
             .arg("--ready-file")
             .arg(dir.join("ready.json"))
+            .args(["--router-url", "https://api.rayline.ai"])
             .args(["--classifier-model", "claude-haiku-5-5"])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
