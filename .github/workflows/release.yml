@@ -23,7 +23,6 @@ concurrency:
 
 env:
   RUST_VERSION: "1.88.0"
-  RAYLINE_CHANNEL: "prod"
 
 jobs:
   build:

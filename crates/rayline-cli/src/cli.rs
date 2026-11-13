@@ -599,6 +599,7 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
                         Err(help) => return Ok(Parsed::Help(help)),
                     },
                     "top" => match parse_top(&mut args)? {
+                        Some(_) if env.is_some() => return Err(env_not_read(TOP)),
                         Some(json) => Command::Top { json },
                         None => return Ok(Parsed::Help(TOP_HELP)),
                     },
@@ -1348,7 +1349,10 @@ mod tests {
                 })
             )
         );
-        assert_eq!(command(&["--env=dev", "top"]).0, Some("dev".to_owned()));
+        assert_eq!(
+            command(&["--env=dev", "auth", "status"]).0,
+            Some("dev".to_owned())
+        );
         // After the harness it is the harness's own option.
         assert_eq!(
             run(&["run", "pi", "--env", "dev"]).launch,
@@ -1619,6 +1623,19 @@ mod tests {
         assert_eq!(command(&["top"]).1, Command::Top { json: false });
         assert_eq!(command(&["top", "--json"]).1, Command::Top { json: true });
         assert_error(&["top", "--watch"], "unexpected `--watch`");
+        assert_error(
+            &["top", "--env", "dev"],
+            "`--env` goes before the command: `rayline --env <name> top`",
+        );
+        for args in [
+            &["--env", "dev", "top"][..],
+            &["--env", "dev", "top", "--json"],
+        ] {
+            assert_error(
+                args,
+                "`--env` does not apply to `rayline top`: it acts on the one running local process",
+            );
+        }
     }
 
     /// An `--install-path` naming this platform's `raydock` binary.
