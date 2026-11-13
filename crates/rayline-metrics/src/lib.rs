@@ -66,10 +66,9 @@ pub struct RequestSnapshot {
     pub target: Option<String>,
     pub endpoint_id: Option<String>,
     pub requested_model: Option<String>,
-    pub selected_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The model the router's decision picked.
     pub decision_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The model that served the request.
     pub executed_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executed_worker: Option<String>,
@@ -117,18 +116,17 @@ pub enum MetricsUpdate {
         route_id: Option<String>,
         target: String,
         endpoint_id: Option<String>,
-        selected_model: Option<String>,
         requested_model: Option<String>,
         policy: Option<String>,
         task_class: Option<String>,
         agent_id: Option<String>,
         agent_type: Option<String>,
     },
-    /// Selection and execution are distinct: the legacy `selected_model` in
-    /// snapshots remains the executed model. Metadata strings are capped at 1 KiB.
+    /// The models a request was routed to and served by, the only update that
+    /// carries them. Metadata strings are capped at 1 KiB.
     ExecutionIdentity {
         request_id: String,
-        selected_model: Option<String>,
+        decision_model: Option<String>,
         executed_model: Option<String>,
         executed_worker: Option<String>,
         executed_action_id: Option<String>,
@@ -149,7 +147,6 @@ pub enum MetricsUpdate {
         request_id: String,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
-        selected_model: Option<String>,
     },
     PromptCache {
         request_id: String,
@@ -164,7 +161,6 @@ pub enum MetricsUpdate {
         status_code: Option<u16>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
-        selected_model: Option<String>,
     },
     RequestErrored {
         request_id: String,
@@ -259,7 +255,6 @@ impl RouterMetrics {
                 route_id,
                 target,
                 endpoint_id,
-                selected_model,
                 requested_model,
                 policy,
                 task_class,
@@ -274,9 +269,6 @@ impl RouterMetrics {
                 record.target = Some(target.clone());
                 merge_option(&mut record.route_id, route_id.clone());
                 merge_option(&mut record.endpoint_id, endpoint_id.clone());
-                if record.executed_model.is_none() {
-                    merge_option(&mut record.selected_model, selected_model.clone());
-                }
                 merge_option(&mut record.requested_model, requested_model.clone());
                 merge_option(&mut record.policy, policy.clone());
                 merge_option(&mut record.task_class, task_class.clone());
@@ -330,23 +322,14 @@ impl RouterMetrics {
                 request_id,
                 input_tokens,
                 output_tokens,
-                selected_model,
             } => {
                 let mut active = self.active.lock().expect("metrics active lock poisoned");
                 if let Some(record) = active.get_mut(request_id) {
                     merge_option(&mut record.input_tokens, *input_tokens);
                     merge_option(&mut record.output_tokens, *output_tokens);
-                    if record.executed_model.is_none() {
-                        merge_option(&mut record.selected_model, selected_model.clone());
-                    }
                 } else {
                     drop(active);
-                    self.merge_recent_token_usage(
-                        request_id,
-                        *input_tokens,
-                        *output_tokens,
-                        selected_model.clone(),
-                    );
+                    self.merge_recent_token_usage(request_id, *input_tokens, *output_tokens);
                 }
             }
             MetricsUpdate::PromptCache {
@@ -381,7 +364,6 @@ impl RouterMetrics {
                 status_code,
                 input_tokens,
                 output_tokens,
-                selected_model,
             } => {
                 // Hold `active` until the row is in `recent`: a late update for
                 // this request (its upstream id, usage) must find it in one
@@ -397,9 +379,6 @@ impl RouterMetrics {
                 record.status_code = *status_code;
                 merge_option(&mut record.input_tokens, *input_tokens);
                 merge_option(&mut record.output_tokens, *output_tokens);
-                if record.executed_model.is_none() {
-                    merge_option(&mut record.selected_model, selected_model.clone());
-                }
                 self.push_recent(record);
             }
             MetricsUpdate::RequestErrored {
@@ -431,7 +410,6 @@ impl RouterMetrics {
         request_id: &str,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
-        selected_model: Option<String>,
     ) {
         let delta = {
             let mut recent = self.recent.lock().expect("metrics recent lock poisoned");
@@ -446,9 +424,6 @@ impl RouterMetrics {
             let old_output = record.output_tokens.unwrap_or(0);
             merge_option(&mut record.input_tokens, input_tokens);
             merge_option(&mut record.output_tokens, output_tokens);
-            if record.executed_model.is_none() {
-                merge_option(&mut record.selected_model, selected_model);
-            }
             (
                 old_input,
                 record.input_tokens.unwrap_or(0),
@@ -552,7 +527,6 @@ struct RequestRecord {
     target: Option<String>,
     endpoint_id: Option<String>,
     requested_model: Option<String>,
-    selected_model: Option<String>,
     decision_model: Option<String>,
     executed_model: Option<String>,
     executed_worker: Option<String>,
@@ -581,7 +555,7 @@ struct RequestRecord {
 impl RequestRecord {
     fn merge_execution_identity(&mut self, update: &MetricsUpdate) {
         let MetricsUpdate::ExecutionIdentity {
-            selected_model,
+            decision_model,
             executed_model,
             executed_worker,
             executed_action_id,
@@ -593,16 +567,13 @@ impl RequestRecord {
         else {
             return;
         };
-        merge_bounded(&mut self.decision_model, selected_model);
+        merge_bounded(&mut self.decision_model, decision_model);
         merge_bounded(&mut self.executed_model, executed_model);
         merge_bounded(&mut self.executed_worker, executed_worker);
         merge_bounded(&mut self.executed_action_id, executed_action_id);
         merge_bounded(&mut self.selected_action_id, selected_action_id);
         merge_bounded(&mut self.executed_control_id, executed_control_id);
         merge_bounded(&mut self.wire_model, wire_model);
-        if self.executed_model.is_some() {
-            self.selected_model = self.executed_model.clone();
-        }
     }
 
     fn new(request_id: String, now: u64) -> Self {
@@ -615,7 +586,6 @@ impl RequestRecord {
             target: None,
             endpoint_id: None,
             requested_model: None,
-            selected_model: None,
             decision_model: None,
             executed_model: None,
             executed_worker: None,
@@ -677,7 +647,6 @@ impl RequestRecord {
             target: self.target.clone(),
             endpoint_id: self.endpoint_id.clone(),
             requested_model: self.requested_model.clone(),
-            selected_model: self.selected_model.clone(),
             decision_model: self.decision_model.clone(),
             executed_model: self.executed_model.clone(),
             executed_worker: self.executed_worker.clone(),
@@ -757,8 +726,58 @@ pub fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn identity(request_id: &str, decision: Option<&str>, executed: Option<&str>) -> MetricsUpdate {
+        MetricsUpdate::ExecutionIdentity {
+            request_id: request_id.into(),
+            decision_model: decision.map(Into::into),
+            executed_model: executed.map(Into::into),
+            executed_worker: None,
+            executed_action_id: None,
+            selected_action_id: None,
+            executed_control_id: None,
+            wire_model: None,
+        }
+    }
+
+    /// Each model keeps its own meaning whichever update arrives first.
     #[test]
-    fn execution_identity_survives_legacy_updates_and_merges_recent() {
+    fn decision_and_executed_models_stay_apart_in_any_order() {
+        for executed_first in [false, true] {
+            let metrics = RouterMetrics::new("test-router");
+            metrics.record(MetricsUpdate::RequestStarted {
+                request_id: "req".into(),
+                source: "hybrid".into(),
+                requested_model: Some("rayline-auto".into()),
+                agent_id: None,
+                agent_type: None,
+            });
+            let mut updates = [
+                identity("req", Some("decision"), None),
+                identity("req", None, Some("executed")),
+            ];
+            if executed_first {
+                updates.reverse();
+            }
+            let [first, second] = updates;
+            metrics.record(first);
+            let row = &metrics.snapshot().active[0];
+            let (decision, executed) = if executed_first {
+                (None, Some("executed"))
+            } else {
+                (Some("decision"), None)
+            };
+            assert_eq!(row.decision_model.as_deref(), decision);
+            assert_eq!(row.executed_model.as_deref(), executed);
+            metrics.record(second);
+            let row = &metrics.snapshot().active[0];
+            assert_eq!(row.decision_model.as_deref(), Some("decision"));
+            assert_eq!(row.executed_model.as_deref(), Some("executed"));
+            assert_eq!(row.requested_model.as_deref(), Some("rayline-auto"));
+        }
+    }
+
+    #[test]
+    fn execution_identity_merges_recent_and_is_capped() {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "identity".into(),
@@ -769,7 +788,7 @@ mod tests {
         });
         metrics.record(MetricsUpdate::ExecutionIdentity {
             request_id: "identity".into(),
-            selected_model: Some("decision".into()),
+            decision_model: Some("decision".into()),
             executed_model: Some("executed".into()),
             executed_worker: Some("worker".into()),
             executed_action_id: Some("action".into()),
@@ -777,38 +796,20 @@ mod tests {
             executed_control_id: Some("control".into()),
             wire_model: Some("virtual".into()),
         });
-        metrics.record(MetricsUpdate::RouteDecided {
-            request_id: "identity".into(),
-            route_id: None,
-            target: "remote".into(),
-            endpoint_id: None,
-            selected_model: Some("legacy-virtual".into()),
-            requested_model: None,
-            policy: None,
-            task_class: None,
-            agent_id: None,
-            agent_type: None,
-        });
         metrics.record(MetricsUpdate::TokenUsage {
             request_id: "identity".into(),
             input_tokens: Some(3),
             output_tokens: Some(7),
-            selected_model: Some("legacy-virtual".into()),
         });
-        let active = metrics.snapshot();
-        assert_eq!(active.active[0].selected_model.as_deref(), Some("executed"));
-        assert_eq!(active.active[0].decision_model.as_deref(), Some("decision"));
-        assert_eq!(active.active[0].wire_model.as_deref(), Some("virtual"));
         metrics.record(MetricsUpdate::RequestCompleted {
             request_id: "identity".into(),
             status_code: Some(200),
             input_tokens: None,
             output_tokens: None,
-            selected_model: Some("legacy-virtual".into()),
         });
         metrics.record(MetricsUpdate::ExecutionIdentity {
             request_id: "identity".into(),
-            selected_model: None,
+            decision_model: None,
             executed_model: None,
             executed_worker: Some("é".repeat(600)),
             executed_action_id: None,
@@ -819,7 +820,6 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert!(snapshot.active.is_empty());
         let row = &snapshot.recent[0];
-        assert_eq!(row.selected_model.as_deref(), Some("executed"));
         assert_eq!(row.executed_model.as_deref(), Some("executed"));
         assert_eq!(row.decision_model.as_deref(), Some("decision"));
         assert_eq!(row.executed_worker.as_ref().map(String::len), Some(1024));
@@ -845,7 +845,6 @@ mod tests {
             route_id: Some("local-1".to_owned()),
             target: "local".to_owned(),
             endpoint_id: Some("local".to_owned()),
-            selected_model: Some("qwen".to_owned()),
             requested_model: Some("rayline-auto".to_owned()),
             policy: Some("subagent:Explore".to_owned()),
             task_class: Some("subagent".to_owned()),
@@ -866,7 +865,6 @@ mod tests {
             status_code: Some(200),
             input_tokens: Some(10),
             output_tokens: Some(20),
-            selected_model: Some("qwen".to_owned()),
         });
 
         let completed = metrics.snapshot();
@@ -893,14 +891,12 @@ mod tests {
             status_code: Some(200),
             input_tokens: Some(10),
             output_tokens: Some(20),
-            selected_model: Some("claude".to_owned()),
         });
 
         metrics.record(MetricsUpdate::TokenUsage {
             request_id: "req-1".to_owned(),
             input_tokens: Some(12),
             output_tokens: Some(25),
-            selected_model: Some("claude-opus".to_owned()),
         });
         metrics.record(MetricsUpdate::PromptCache {
             request_id: "req-1".to_owned(),
@@ -916,10 +912,6 @@ mod tests {
         assert_eq!(snapshot.recent.len(), 1);
         assert_eq!(snapshot.recent[0].input_tokens, Some(12));
         assert_eq!(snapshot.recent[0].output_tokens, Some(25));
-        assert_eq!(
-            snapshot.recent[0].selected_model.as_deref(),
-            Some("claude-opus")
-        );
         assert_eq!(snapshot.recent[0].prompt_cache_tokens, Some(5));
         assert_eq!(snapshot.totals.input_tokens, 12);
         assert_eq!(snapshot.totals.output_tokens, 25);
@@ -928,7 +920,6 @@ mod tests {
             request_id: "req-1".to_owned(),
             input_tokens: Some(8),
             output_tokens: Some(18),
-            selected_model: None,
         });
 
         let corrected = metrics.snapshot();
@@ -963,7 +954,6 @@ mod tests {
             status_code: Some(200),
             input_tokens: None,
             output_tokens: None,
-            selected_model: None,
         });
         // A short response completes before its handler reads the header: the
         // id still lands on the finished row and nothing is reactivated.
@@ -1001,7 +991,6 @@ mod tests {
             status_code: Some(200),
             input_tokens: None,
             output_tokens: None,
-            selected_model: None,
         });
         let snapshot = metrics.snapshot();
         assert!(snapshot.active.is_empty());
@@ -1046,7 +1035,6 @@ mod tests {
                         status_code: Some(200),
                         input_tokens: None,
                         output_tokens: None,
-                        selected_model: None,
                     });
                     barrier.wait();
                 }
@@ -1090,7 +1078,6 @@ mod tests {
             request_id: "missing".to_owned(),
             input_tokens: Some(12),
             output_tokens: Some(25),
-            selected_model: Some("claude".to_owned()),
         });
         metrics.record(MetricsUpdate::PromptCache {
             request_id: "missing".to_owned(),

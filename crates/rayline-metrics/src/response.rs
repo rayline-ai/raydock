@@ -270,8 +270,6 @@ impl ResponseObserver {
                 request_id: self.request_id.clone(),
                 input_tokens: input,
                 output_tokens: output,
-                // A virtual response model must not overwrite executed identity.
-                selected_model: None,
             });
         }
         if input.is_some() || cache.is_some() {
