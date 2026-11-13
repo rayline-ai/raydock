@@ -354,7 +354,8 @@ async fn launch(
         let Some(repo) = &model.tokenizer else {
             continue;
         };
-        let snapshot = tokenizer_snapshot(repo).await.map_err(|error| {
+        let hub = rayline_hf::hf_cache_dir(home).map_err(io::Error::other)?;
+        let snapshot = tokenizer_snapshot(&hub, repo).await.map_err(|error| {
             io::Error::other(format!(
                 "{}: cannot load the tokenizer {repo} of models entry {id}: {error}",
                 settings.file.display()
@@ -482,21 +483,26 @@ async fn launch(
 
 /// The snapshot of `repo`'s tokenizer and chat template, fetched from Hugging
 /// Face within [`TOKENIZER_FETCH_DEADLINE`], else the cached copy.
-async fn tokenizer_snapshot(repo: &str) -> Result<crate::hybrid_tokenizer::Snapshot, String> {
+async fn tokenizer_snapshot(
+    hub: &Path,
+    repo: &str,
+) -> Result<crate::hybrid_tokenizer::Snapshot, String> {
     // A detached thread, not a blocking task: the runtime waits for blocking
     // tasks at exit, and the downloader retries for far longer than `start`
     // should run.
     let (sender, fetching) = tokio::sync::oneshot::channel();
     std::thread::spawn({
+        let hub = hub.to_owned();
         let repo = repo.to_owned();
         move || {
-            let _ = sender.send(crate::hybrid_tokenizer::fetch(&repo));
+            let _ = sender.send(crate::hybrid_tokenizer::fetch(&hub, &repo));
         }
     });
     match tokio::time::timeout(TOKENIZER_FETCH_DEADLINE, fetching).await {
         Ok(Ok(fetched)) => fetched,
         Ok(Err(_)) => Err("the tokenizer download stopped".to_owned()),
         Err(_) => crate::hybrid_tokenizer::cached_or(
+            hub,
             repo,
             format!(
                 "Hugging Face did not answer within {}s and nothing is cached",

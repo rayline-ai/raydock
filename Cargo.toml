@@ -40,7 +40,6 @@ http-body-util = "0.1"
 bytes = "1"
 futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
-dirs = "5"
 
 [profile.release-small]
 inherits = "release"

@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "latest",
+    [string]$Version,
     [string]$InstallDir = $(Join-Path $HOME ".rayline\bin")
 )
 
@@ -45,11 +45,12 @@ if (-not (Get-Command minisign -ErrorAction SilentlyContinue)) {
     Fail "required command not found: minisign, which verifies the release signature. Install it: https://jedisct1.github.io/minisign/"
 }
 
-if ($Version -eq "latest") {
+if (-not $PSBoundParameters.ContainsKey('Version')) {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
+} elseif ($Version.StartsWith('v')) {
+    Fail "-Version takes a bare version such as 0.2.0, not $Version"
 } else {
-    $Tag = "v$($Version.TrimStart('v'))"
-    $BaseUrl = "https://github.com/$Repo/releases/download/$Tag"
+    $BaseUrl = "https://github.com/$Repo/releases/download/v$Version"
 }
 
 $RaylineAsset = "rayline-$Platform"
@@ -79,12 +80,12 @@ try {
     Invoke-WebRequest -Uri "$BaseUrl/$CoreAsset" -OutFile $CorePath
     Invoke-WebRequest -Uri "$BaseUrl/rayline-core-LICENSE" -OutFile $LicensePath
 
-    # Each line is "<sha256>  <name>" or "<sha256> *<name>", as sha256sum writes.
+    # Each line is "<sha256>  <name>", as the release's sha256sum writes it.
     $Entries = foreach ($Line in Get-Content $SumsPath) {
-        if ($Line -notmatch '^([0-9a-fA-F]{64}) [ *](\S+)$') {
+        if ($Line -cnotmatch '^([0-9a-f]{64})  (\S+)$') {
             Fail "malformed line in release checksums: $Line"
         }
-        [pscustomobject]@{ Name = $Matches[2]; Hash = $Matches[1].ToLowerInvariant() }
+        [pscustomobject]@{ Name = $Matches[2]; Hash = $Matches[1] }
     }
     $Expected = @{}
     foreach ($Asset in @($RaylineAsset, $CoreAsset, "rayline-core-LICENSE")) {

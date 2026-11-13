@@ -2,7 +2,7 @@
 set -eu
 
 REPO="rayline-ai/raydock"
-VERSION="latest"
+VERSION=""
 VERSION_GIVEN=false
 INSTALL_DIR="$HOME/.rayline/bin"
 BASE_URL=""
@@ -15,7 +15,7 @@ Usage:
   install-rayline.sh [--version <version>] [--install-dir <path>]
 
 Options:
-  --version      Release version to install, for example 0.2.0 or v0.2.0.
+  --version      Release version to install, for example 0.2.0.
                  Defaults to the latest GitHub release.
   --install-dir  Directory for raydock, its rayline alias and rayline-core.
                  Defaults to ~/.rayline/bin.
@@ -29,6 +29,12 @@ while [ "$#" -gt 0 ]; do
         echo "missing value for --version" >&2
         exit 2
       }
+      case "$2" in
+        v*)
+          echo "--version takes a bare version such as 0.2.0, not $2" >&2
+          exit 2
+          ;;
+      esac
       VERSION="$2"
       VERSION_GIVEN=true
       shift 2
@@ -105,11 +111,10 @@ esac
 
 if [ -n "$BASE_URL" ]; then
   base_url="${BASE_URL%/}"
-elif [ "$VERSION" = "latest" ]; then
-  base_url="https://github.com/$REPO/releases/latest/download"
+elif $VERSION_GIVEN; then
+  base_url="https://github.com/$REPO/releases/download/v$VERSION"
 else
-  tag="v${VERSION#v}"
-  base_url="https://github.com/$REPO/releases/download/$tag"
+  base_url="https://github.com/$REPO/releases/latest/download"
 fi
 
 rayline_asset="rayline-$platform"
@@ -139,7 +144,7 @@ download "$base_url/$core_asset" "$tmp_dir/$core_asset"
 download "$base_url/rayline-core-LICENSE" "$tmp_dir/rayline-core-LICENSE"
 
 for asset in "$rayline_asset" "$core_asset" rayline-core-LICENSE; do
-  awk -v asset="$asset" '$2 == asset || $2 == "*" asset { print; count++ } END { if (count != 1) exit 1 }' \
+  awk -v asset="$asset" '$1 ~ /^[0-9a-f]+$/ && length($1) == 64 && $0 == $1 "  " asset { print; count++ } END { if (count != 1) exit 1 }' \
     "$tmp_dir/SHA256SUMS" >> "$tmp_dir/SHA256SUMS.selected" || {
       echo "release checksums must include exactly one entry for $asset" >&2
       exit 1

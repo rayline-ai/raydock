@@ -11,8 +11,7 @@ mod sse;
 
 pub const REQUEST_ID_HEADER: &str = "x-rayline-request-id";
 /// The cloud router's own id for a forwarded request (`rt_…`). The gateway sets
-/// this on every turn it routes; `x-workshop-route-id` carries the same value
-/// under a legacy name, so reading one name is enough.
+/// this on every turn it routes.
 ///
 /// Deliberately NOT `x-request-id`: the gateway sets that to the route id only
 /// on an ARC cell turn, and a direct-provider forward relays the *provider's*
@@ -662,13 +661,13 @@ impl RequestRecord {
             .prompt_cache_tokens
             .zip(self.prompt_tokens)
             .and_then(|(cache, total)| (total > 0).then(|| cache as f64 / total as f64));
-        let output_tps = self.output_tokens.and_then(|tokens| {
-            let generation_ms = self
-                .first_token_at_unix_ms
-                .map(|first| completed_or_now.saturating_sub(first))
-                .unwrap_or(duration_ms);
-            (generation_ms > 0).then(|| tokens as f64 / (generation_ms as f64 / 1000.0))
-        });
+        let output_tps = self
+            .output_tokens
+            .zip(self.first_token_at_unix_ms)
+            .and_then(|(tokens, first)| {
+                let generation_ms = completed_or_now.saturating_sub(first);
+                (generation_ms > 0).then(|| tokens as f64 / (generation_ms as f64 / 1000.0))
+            });
         RequestSnapshot {
             request_id: self.request_id.clone(),
             route_id: self.route_id.clone(),
@@ -1120,6 +1119,16 @@ mod tests {
         let snapshot = record.snapshot(5_000);
         assert_eq!(snapshot.prefill_tps, Some(500.0));
         assert_eq!(snapshot.output_tps, Some(100.0));
+    }
+
+    #[test]
+    fn output_rate_needs_a_first_token() {
+        let mut record = RequestRecord::new("req-1".to_owned(), 1_000);
+        record.target = Some("anthropic".to_owned());
+        record.output_tokens = Some(200);
+        record.completed_at_unix_ms = Some(3_000);
+
+        assert_eq!(record.snapshot(5_000).output_tps, None);
     }
 
     #[test]

@@ -77,6 +77,9 @@ def main():
         # --base-url names one release, so --version can't be combined with it.
         both = run_installer("--base-url", assets.as_uri(), "--version", "0.2.0", "--install-dir", str(installed))
         assert both.returncode == 2 and "--base-url" in both.stderr, both.stdout + both.stderr
+        # --version takes a bare version, the spelling `raydock update --version` takes.
+        prefixed = run_installer("--version", "v0.2.0", "--install-dir", str(installed))
+        assert prefixed.returncode == 2 and "--version" in prefixed.stderr, prefixed.stdout + prefixed.stderr
         # The real installer trusts only the pinned key; the old key override is gone.
         foreign = run_installer("--base-url", assets.as_uri(), "--install-dir", str(installed),
                                 script=real_installer, RAYLINE_MINISIGN_PUBKEY=test_key)
@@ -84,6 +87,9 @@ def main():
             foreign.stdout + foreign.stderr
         # An unsigned change to SHA256SUMS fails the signature check.
         write_sums(sums + f"{'0' * 64}  extra\n", sign=False)
+        install(False)
+        # Only "<sha256>  <name>" lines are entries; a binary-mode "*<name>" line is not.
+        write_sums(sums.replace(f"  rayline-{platform}\n", f" *rayline-{platform}\n"))
         install(False)
         write_sums(sums)
         assert not installed.exists(), "a refused install wrote files"
@@ -110,8 +116,8 @@ def main():
         (assets / "rayline-core-LICENSE").write_bytes(license_data)
         version = subprocess.check_output([str(installed / "rayline"), "--version"], text=True).split()[1]
         check = [str(installed / "rayline"), "update", "--check", "--version", version, "--install-path", str(installed / "rayline")]
-        check_env = dict(os.environ, HOME=str(root))
-        check_env.pop("RAYLINE_UPDATE_CHANNEL", None)
+        check_env = {key: value for key, value in os.environ.items() if not key.startswith("RAYLINE_")}
+        check_env["HOME"] = str(root)
         complete = subprocess.run(check, env=check_env, capture_output=True, text=True)
         assert complete.returncode == 0, complete.stdout + complete.stderr
         (assets / f"rayline-core-{platform}").write_bytes(b"tampered")
@@ -124,7 +130,7 @@ def main():
         for name, data in expected.items():
             assert (installed / name).read_bytes() == data
     print("Release installation passed: Raydock plus alias and core, required minisign and signature, "
-          "--base-url/--version refusal, tamper and missing-checksum refusal.")
+          "--base-url/--version and v-prefixed --version refusal, tamper, binary-mode and missing-checksum refusal.")
 
 
 if __name__ == "__main__":

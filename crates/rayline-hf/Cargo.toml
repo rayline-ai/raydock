@@ -19,5 +19,4 @@ reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls-native
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-dirs.workspace = true
 sha2 = "0.10"
