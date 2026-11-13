@@ -1533,16 +1533,16 @@ mod tests {
 
     #[test]
     fn rejected_arguments_are_not_echoed() {
-        let secret = "sk-rayline-SECRET";
+        let word = "sk-rayline-UNECHOED";
         for args in [
-            &[secret][..],
-            &["run", secret],
-            &["auth", secret],
-            &["top", secret],
-            &["run", "claude-desktop", "status", secret],
-            &[&format!("--{secret}")],
+            &[word][..],
+            &["run", word],
+            &["auth", word],
+            &["top", word],
+            &["run", "claude-desktop", "status", word],
+            &[&format!("--{word}")],
         ] {
-            assert!(!error(args).contains(secret), "{args:?}");
+            assert!(!error(args).contains(word), "{args:?}");
         }
     }
 
