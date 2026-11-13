@@ -1976,22 +1976,99 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    /// An env value that is not valid UTF-8 on this platform.
+    fn not_utf8() -> OsString {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            OsString::from_vec(vec![0xff])
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            OsString::from_wide(&[0xd800])
+        }
+    }
+
     #[test]
     fn non_utf8_env_override_is_a_load_error() {
-        use std::os::unix::ffi::OsStringExt as _;
         let home = temp_home();
         write_default(&home, &example());
-        let result = load_from(&home, &opts(Mode::Cloud), &|name| {
-            (name == "RAYLINE_ROUTING_POLICY_PRESET").then(|| OsString::from_vec(vec![0xff]))
-        });
+        for (var, _) in OVERRIDES {
+            let result = load_from(&home, &opts(Mode::Cloud), &|name| {
+                (name == var).then(not_utf8)
+            });
+            assert_eq!(
+                env_error(result),
+                (var, "must be valid UTF-8".to_owned()),
+                "{var}"
+            );
+        }
+    }
+
+    /// The section 5.7 table, in the order the loader reads it.
+    const OVERRIDES: [(&str, &str); 4] = [
+        ROUTING_DECISIONS_MODEL,
+        ROUTING_CLASSIFIER_MODEL,
+        ROUTING_POLICY_PRESET,
+        UPDATE_CHANNEL,
+    ];
+
+    #[test]
+    fn the_override_table_is_section_5_7() {
         assert_eq!(
-            env_error(result),
-            (
-                "RAYLINE_ROUTING_POLICY_PRESET",
-                "must be valid UTF-8".to_owned()
-            )
+            OVERRIDES,
+            [
+                ("RAYLINE_ROUTING_DECISIONS_MODEL", "routing.decisions_model"),
+                (
+                    "RAYLINE_ROUTING_CLASSIFIER_MODEL",
+                    "routing.classifier_model"
+                ),
+                ("RAYLINE_ROUTING_POLICY_PRESET", "routing.policy.preset"),
+                ("RAYLINE_UPDATE_CHANNEL", "update.channel"),
+            ]
         );
+    }
+
+    /// Section 5.7.3 and 5.7.4: loading reads no env var but the table's, in
+    /// every mode, so nothing else (`endpoints.*`, `models.*`,
+    /// `environments.*`, `policy.overrides`, any other `RAYLINE_*`) can be
+    /// overridden.
+    #[test]
+    fn loading_reads_only_the_override_table() {
+        let home = temp_home();
+        write_default(&home, &example());
+        let file = write_file(&home, "other.json", &example());
+        let table: Vec<&str> = OVERRIDES.iter().map(|(var, _)| *var).collect();
+        for mode in [
+            Mode::Cloud,
+            Mode::Local,
+            Mode::File(&file),
+            Mode::LocalFile(&file),
+        ] {
+            for env in [None, Some("dev")] {
+                for harness_protocol in [None, Some(Protocol::AnthropicMessages)] {
+                    let options = LoadOptions {
+                        mode,
+                        env,
+                        harness_protocol,
+                    };
+                    let read = RefCell::new(Vec::new());
+                    // Any other var the loader asked for would be set.
+                    let settings = load_from(&home, &options, &|name| {
+                        read.borrow_mut().push(name.to_owned());
+                        (!table.contains(&name)).then(|| OsString::from("other"))
+                    })
+                    .expect("load");
+                    assert_eq!(read.into_inner(), table, "{mode:?} {env:?}");
+                    assert_eq!(
+                        settings,
+                        load(&home, options).expect("load"),
+                        "{mode:?} {env:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
