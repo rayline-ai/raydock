@@ -78,12 +78,12 @@ Harness-specific options and subcommands are **kept for review** (section 9).
 | Command | Does |
 |---|---|
 | `rayline local start [--config <file>]` | Start the local process from the default config file, or from `<file>`. The config must have a `routing` section. |
-| `rayline local status` | Show whether the local process is running, its address and the config file it was started from. |
+| `rayline local status` | Show whether the local process is running, its address, the config file and the environment it was started from. |
 | `rayline local stop` | Stop the local process. External inference servers keep running. |
 
 1. One local process per machine, with its state in `~/.rayline/local/`.
 2. `start` while it is running is an error that names the running process and its config file.
-3. A `rayline run ... --local` or `--config` run whose config file differs from the one the running process was started from is an error. It never silently uses the running process's config.
+3. A `rayline run ... --local` or `--config` run whose config file differs from the one the running process was started from, or whose `--env` differs, is an error. It never silently uses the running process's config.
 
 ### 3.4 `rayline top`
 
@@ -322,7 +322,7 @@ Set by one Rayline process and read only by a child it starts. Never read from t
 
 ### 7.4 Build time only
 
-`RAYLINE_VERSION`, `RAYLINE_CHANNEL`, `RAYLINE_DAEMON_VERSION`, `RAYLINE_DAEMON_CHANNEL`. Not read at runtime.
+`RAYLINE_VERSION`, `RAYLINE_CHANNEL`. Not read at runtime.
 
 ### 7.5 Test builds only
 

@@ -57,7 +57,7 @@ pub struct Args {
     #[arg(long)]
     config: PathBuf,
     /// Shared deadline for core initialization and readiness, including profile checks.
-    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     startup_timeout_secs: u64,
     /// Private file receiving this instance's gateway token.
     #[arg(long)]
@@ -65,10 +65,10 @@ pub struct Args {
     /// Private directory file receiving non-secret startup metadata.
     #[arg(long)]
     ready_file: PathBuf,
-    /// Router URL of a configured Rayline environment that may receive
-    /// Decisions requests, in addition to the built-in routers and loopback.
-    #[arg(long = "router-url")]
-    router_urls: Vec<String>,
+    /// Router of the Rayline environment the process runs for: Decisions
+    /// may go to it, the built-in prod router or loopback.
+    #[arg(long)]
+    router_url: String,
     /// Rayline environment whose router key Decisions uses; named in the
     /// sign-in hint when Decisions refuses that key.
     #[arg(long)]
@@ -124,7 +124,7 @@ struct Gateway {
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 
 pub async fn run(args: Args) -> Result<()> {
-    check_decisions_url(&args.config, &args.router_urls)?;
+    check_decisions_url(&args.config, &args.router_url)?;
     let credential_env = credential_env_names(&args.config)?;
     let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
     let routing_metadata = RoutingMetadata::from_config(&config);
@@ -250,12 +250,9 @@ pub async fn run(args: Args) -> Result<()> {
 /// Decisions requests carry execution context and the router key, so the core
 /// is started only when `decisions.url` is a Rayline router or loopback. This
 /// repeats the launcher's check on the file the core will actually read.
-fn check_decisions_url(path: &Path, router_urls: &[String]) -> Result<()> {
-    rayline_local_router::decisions_url::check_config_bytes(
-        &std::fs::read(path)?,
-        router_urls.iter().map(String::as_str),
-    )
-    .map_err(anyhow::Error::msg)
+fn check_decisions_url(path: &Path, router_url: &str) -> Result<()> {
+    rayline_local_router::decisions_url::check_config_bytes(&std::fs::read(path)?, [router_url])
+        .map_err(anyhow::Error::msg)
 }
 
 fn credential_env_names(path: &Path) -> Result<Vec<String>> {
@@ -1528,7 +1525,10 @@ mod tests {
                 Some(DECISIONS_MAX_RETRY_WAIT)
             );
             assert_eq!(gateway_retry_delay(failure, hint(Some(31), None)), None);
-            assert_eq!(gateway_retry_delay(failure, hint(Some(3), Some(false))), None);
+            assert_eq!(
+                gateway_retry_delay(failure, hint(Some(3), Some(false))),
+                None
+            );
             assert_eq!(gateway_retry_delay(failure, hint(None, Some(false))), None);
             let default = gateway_retry_delay(failure, hint(None, None)).unwrap();
             assert!(

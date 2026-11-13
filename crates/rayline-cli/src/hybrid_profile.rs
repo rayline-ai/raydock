@@ -88,14 +88,10 @@ fn registry_action_model(id: &str) -> &str {
     id.split_once('/').map_or(id, |(_, model)| model)
 }
 
-/// The core config for `settings`, with Decisions on `router_url` and, for
-/// development, the Decisions cell `cell`. Refuses what the local process
-/// must refuse before it serves anything (spec 5.8 items 10 and 11).
-pub(crate) fn core_config(
-    settings: &Settings,
-    router_url: &str,
-    cell: Option<&str>,
-) -> Result<Value, ConfigError> {
+/// The core config for `settings`, with Decisions on `router_url`. Refuses
+/// what the local process must refuse before it serves anything (spec 5.8
+/// items 10 and 11).
+pub(crate) fn core_config(settings: &Settings, router_url: &str) -> Result<Value, ConfigError> {
     for (id, endpoint) in &settings.endpoints {
         if endpoint.api_key_env.as_deref() == Some(ROUTER_KEY_ENV) {
             return Err(ConfigError::Key {
@@ -183,12 +179,9 @@ pub(crate) fn core_config(
         decisions_routing["prices"] = Value::Object(prices);
     }
     // `top` is ARC's answer for the model asked, `routing.decisions_model`.
-    let mut decisions = json!({"api_mode": API_MODE_V2, "url": format!("{router}/v1/routes"),
-                               "auth_env": ROUTER_KEY_ENV, "model": routing.decisions_model,
-                               "result": "top", "routing": decisions_routing});
-    if let Some(cell) = cell {
-        decisions["cell_tag"] = json!(cell);
-    }
+    let decisions = json!({"api_mode": API_MODE_V2, "url": format!("{router}/v1/routes"),
+                           "auth_env": ROUTER_KEY_ENV, "model": routing.decisions_model,
+                           "result": "top", "routing": decisions_routing});
     Ok(json!({
         "contract_version": 1,
         "allow_experimental_controls": true,
@@ -196,23 +189,6 @@ pub(crate) fn core_config(
         "deployments": deployments,
         "derived_actions": actions
     }))
-}
-
-/// The HTTPS origin authority (host and effective port) of an endpoint.
-fn https_host(url: &str) -> Option<String> {
-    rayline_local_router::decisions_url::https_authority(url)
-}
-
-/// The `https://host:port` origin of every hosted Rayline environment of
-/// `settings`: the built-in prod plus each `environments` entry.
-pub(crate) fn configured_router_urls(settings: &Settings) -> Vec<String> {
-    crate::status::hosted_environments(settings)
-        .iter()
-        // Only the origin: a router URL's path, query or userinfo never
-        // reaches `rld`'s arguments, and one with credentials is dropped.
-        .filter_map(|hosted| https_host(&hosted.base_url))
-        .map(|authority| format!("https://{authority}"))
-        .collect()
 }
 
 #[cfg(test)]
@@ -364,14 +340,13 @@ mod tests {
         ];
         actions.extend(pin_actions);
         assert_eq!(
-            core_config(&settings, router, Some("cell-a")).unwrap(),
+            core_config(&settings, router).unwrap(),
             json!({
                 "contract_version": 1,
                 "allow_experimental_controls": true,
                 "decisions": {
                     "api_mode": "execution_context_v2", "url": "https://api.rayline.ai/v1/routes",
                     "auth_env": "RAYLINE_ROUTER_API_KEY", "model": "arc-sage-1.0", "result": "top",
-                    "cell_tag": "cell-a",
                     "routing": {
                         "policy": {"preset": "arc-policy.prefer-local.v1",
                                    "overrides": {"selection": {"min_p_pass": 0.5}}},
@@ -396,7 +371,7 @@ mod tests {
                 r#"{"endpoint": "box", "model": "glm", "context_window": 131072, "max_output_tokens": 8192}"#,
             ),
         );
-        let config = core_config(&settings, "https://api.rayline.ai", None).unwrap();
+        let config = core_config(&settings, "https://api.rayline.ai").unwrap();
         let providers: Vec<_> = config["deployments"]
             .as_array()
             .unwrap()
@@ -428,12 +403,11 @@ mod tests {
                 r#"{"endpoint": "box", "model": "glm", "context_window": 131072, "max_output_tokens": 8192}"#,
             ),
         );
-        let config = core_config(&settings, "https://api.rayline.ai/", None).unwrap();
+        let config = core_config(&settings, "https://api.rayline.ai/").unwrap();
         assert_eq!(
             config["decisions"]["routing"],
             json!({"policy": {"preset": "arc-policy.prefer-local.v1"}})
         );
-        assert!(config["decisions"].get("cell_tag").is_none());
         assert_eq!(
             config["decisions"]["url"],
             "https://api.rayline.ai/v1/routes"
@@ -451,7 +425,7 @@ mod tests {
                         "context_window": 200000, "max_output_tokens": 64000}}}}, {ROUTING}}}"#
             ),
         );
-        let config = core_config(&settings, "https://api.rayline.ai", None).unwrap();
+        let config = core_config(&settings, "https://api.rayline.ai").unwrap();
         let haiku: Vec<_> = config["deployments"]
             .as_array()
             .unwrap()
@@ -499,7 +473,7 @@ mod tests {
                 r#"{"endpoint": "box", "model": "glm", "context_window": 131072, "max_output_tokens": 8192}"#,
             ),
         );
-        let error = core_config(&settings, "https://api.rayline.ai", None)
+        let error = core_config(&settings, "https://api.rayline.ai")
             .unwrap_err()
             .to_string();
         assert!(
@@ -520,7 +494,7 @@ mod tests {
                 r#"{"endpoint": "box", "model": "glm", "context_window": 131072, "max_output_tokens": 8192}"#,
             ),
         );
-        let error = core_config(&settings, "https://api.rayline.ai", None)
+        let error = core_config(&settings, "https://api.rayline.ai")
             .unwrap_err()
             .to_string();
         assert!(
@@ -551,7 +525,7 @@ mod tests {
                     model,
                 ),
             );
-            let error = core_config(&settings, "https://api.rayline.ai", None)
+            let error = core_config(&settings, "https://api.rayline.ai")
                 .unwrap_err()
                 .to_string();
             assert!(
@@ -577,45 +551,42 @@ mod tests {
     }
 
     #[test]
-    fn an_environment_named_prod_is_not_the_built_in_prod() {
-        let settings = with_environments(
-            "configured-prod",
-            r#"{"prod": {"base_url": "https://router.other.example", "login_url": "https://other.example/cli-auth"}}"#,
-        );
-        assert_eq!(
-            configured_router_urls(&settings),
-            vec![
-                "https://api.rayline.ai:443".to_owned(),
-                "https://router.other.example:443".to_owned()
-            ]
-        );
-    }
-
-    #[test]
-    fn decisions_go_only_to_a_configured_router() {
+    fn decisions_go_only_to_the_router_of_the_environment() {
         let settings = with_environments(
             "decisions",
             r#"{"stage": {"base_url": "https://router.stage.example:8443", "login_url": "https://stage.example/cli-auth"}}"#,
         );
-        let routers = configured_router_urls(&settings);
-        assert_eq!(
-            routers,
-            vec![
-                "https://api.rayline.ai:443".to_owned(),
-                "https://router.stage.example:8443".to_owned()
-            ]
-        );
-        // rld holds the core config to the same allowlist.
-        for router in [
+        let check = |router: &str, allowed: &str| {
+            let config = core_config(&settings, router).unwrap();
+            rayline_local_router::decisions_url::check_config(&config, [allowed])
+        };
+        // The local process holds the core config to the router it was
+        // started for, or prod.
+        check(
+            "https://router.stage.example:8443",
+            "https://router.stage.example:8443",
+        )
+        .unwrap();
+        check(
             "https://api.rayline.ai",
             "https://router.stage.example:8443",
+        )
+        .unwrap();
+        for (router, allowed) in [
+            (
+                "https://router.other.example",
+                "https://router.stage.example:8443",
+            ),
+            (
+                "http://router.stage.example:8443",
+                "http://router.stage.example:8443",
+            ),
+            (
+                "https://api-dev.rayline.ai",
+                "https://router.stage.example:8443",
+            ),
         ] {
-            let config = core_config(&settings, router, None).unwrap();
-            rayline_local_router::decisions_url::check_config(
-                &config,
-                routers.iter().map(String::as_str),
-            )
-            .unwrap();
+            assert!(check(router, allowed).is_err(), "{router}");
         }
     }
 
@@ -632,7 +603,7 @@ mod tests {
                         "context_window": 98304, "max_output_tokens": 24576}}}}, {ROUTING}}}"#
             ),
         );
-        let config = core_config(&settings, "https://api.rayline.ai", None).unwrap();
+        let config = core_config(&settings, "https://api.rayline.ai").unwrap();
         let action = |deployment: &str| {
             config["derived_actions"]
                 .as_array()

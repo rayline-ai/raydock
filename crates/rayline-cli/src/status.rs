@@ -656,20 +656,6 @@ pub(crate) fn hosted_environment(settings: &config::Settings) -> HostedEnvironme
     }
 }
 
-/// Every hosted environment of loaded `settings`: the built-in prod, then
-/// each `environments` entry, which keeps its own credentials slot even when
-/// it is named `prod`.
-pub(crate) fn hosted_environments(settings: &config::Settings) -> Vec<HostedEnvironment> {
-    std::iter::once(prod_hosted_environment())
-        .chain(
-            settings
-                .environments
-                .iter()
-                .map(|(name, environment)| configured_hosted_environment(name, environment)),
-        )
-        .collect()
-}
-
 fn prod_hosted_environment() -> HostedEnvironment {
     HostedEnvironment {
         env: None,
