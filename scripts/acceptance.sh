@@ -54,7 +54,8 @@ skip=0
 manual=0
 
 # with_timeout <secs> <cmd...>: runs cmd in its own process group and kills
-# the whole group after <secs>, so no harness child outlives the turn.
+# the whole group after <secs> (TERM, then KILL 10s later), so no harness
+# child outlives the turn.
 with_timeout() {
   perl -e '
     my $secs = shift;
@@ -62,7 +63,14 @@ with_timeout() {
     if (!$pid) { setpgrp(0, 0); exec @ARGV or die "exec: $!\n" }
     setpgrp($pid, $pid);
     $SIG{INT} = $SIG{TERM} = sub { kill "TERM", -$pid; exit 130 };
-    $SIG{ALRM} = sub { kill "TERM", -$pid; print STDERR "timed out after ${secs}s\n"; exit 124 };
+    $SIG{ALRM} = sub {
+      kill "TERM", -$pid;
+      sleep 10;
+      kill "KILL", -$pid;
+      waitpid($pid, 0);
+      print STDERR "timed out after ${secs}s\n";
+      exit 124;
+    };
     alarm $secs;
     waitpid($pid, 0);
     exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
@@ -107,10 +115,11 @@ run_mode() {
 selected=("$@")
 [ ${#selected[@]} -gt 0 ] || selected=("${HARNESSES[@]}")
 for harness in "${selected[@]}"; do
-  case " ${HARNESSES[*]} " in
-    *" $harness "*) ;;
-    *) echo "unknown harness: $harness" >&2; usage ;;
-  esac
+  known=false
+  for name in "${HARNESSES[@]}"; do
+    [ "$harness" = "$name" ] && known=true
+  done
+  $known || { echo "unknown harness: $harness" >&2; usage; }
 done
 
 echo "== versions"
