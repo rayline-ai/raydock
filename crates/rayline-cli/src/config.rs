@@ -1068,7 +1068,58 @@ mod tests {
             .iter()
             .map(|(name, value)| (*name, OsString::from(value)))
             .collect();
-        load_from(home, &options, &|name| env.get(name).cloned())
+        let result = load_from(home, &options, &|name| env.get(name).cloned());
+        if let Err(error) = &result {
+            let file = match options.mode {
+                Mode::File(file) | Mode::LocalFile(file) => file.to_path_buf(),
+                Mode::Cloud | Mode::Local => settings_file(home),
+            };
+            assert_names_the_file(error, &file);
+        }
+        result
+    }
+
+    /// Asserts that a load error about the file names `expected` and renders
+    /// as `<file>: ...`, and that a key error renders as
+    /// ``<file>: `<key>` <problem>``. An env override error names the env var
+    /// and the key it overrides.
+    #[track_caller]
+    fn assert_names_the_file(error: &ConfigError, expected: &Path) {
+        let message = error.to_string();
+        match error {
+            ConfigError::Key { file, key, problem } => {
+                assert_eq!(file, expected, "{message}");
+                assert_eq!(
+                    message,
+                    format!("{}: `{key}` {problem}", expected.display())
+                );
+            }
+            ConfigError::Read { file, .. } | ConfigError::Parse { file, .. } => {
+                assert_eq!(file, expected, "{message}");
+                assert!(
+                    message.starts_with(&format!("{}: ", expected.display())),
+                    "{message}"
+                );
+            }
+            ConfigError::Env { var, key, .. } => assert!(
+                message.starts_with(&format!("`{var}` (overrides `{key}`) ")),
+                "{message}"
+            ),
+            ConfigError::NoHome(_) => panic!("expected an error about {}", expected.display()),
+        }
+    }
+
+    /// Runs the start check, asserting that an error names the loaded file.
+    fn check_start(
+        settings: &Settings,
+        env: &EnvLookup<'_>,
+        arc_knows: &dyn Fn(&str) -> bool,
+    ) -> Result<(), ConfigError> {
+        let result = check_local_start_with(settings, env, arc_knows);
+        if let Err(error) = &result {
+            assert_names_the_file(error, &settings.file);
+        }
+        result
     }
 
     fn load(home: &Path, options: LoadOptions<'_>) -> Result<Settings, ConfigError> {
@@ -1473,6 +1524,21 @@ mod tests {
                 json!("1"),
                 glm("price.output"),
             ),
+            (
+                &["models", GLM, "price", "cache_read"],
+                json!(null),
+                glm("price.cache_read"),
+            ),
+            (
+                &["models", GLM, "price", "cache_write"],
+                json!(-1),
+                glm("price.cache_write"),
+            ),
+            (
+                &["models", GLM],
+                json!("x"),
+                "models.\"z-ai/glm-5.3-flash\"".to_owned(),
+            ),
             (&["routing"], json!("local"), "routing".to_owned()),
             (
                 &["routing", "decisions_model"],
@@ -1511,9 +1577,24 @@ mod tests {
                 "environments.\"\"".to_owned(),
             ),
             (
+                &["environments", "dev"],
+                json!("x"),
+                "environments.dev".to_owned(),
+            ),
+            (
                 &["environments", "dev", "base_url"],
                 json!("dev"),
                 "environments.dev.base_url".to_owned(),
+            ),
+            (
+                &["environments", "dev", "base_url"],
+                json!(""),
+                "environments.dev.base_url".to_owned(),
+            ),
+            (
+                &["environments", "dev", "login_url"],
+                json!("ftp://platform.dev.example.com/cli-auth"),
+                "environments.dev.login_url".to_owned(),
             ),
             (
                 &["environments", "dev", "login_url"],
@@ -1533,6 +1614,11 @@ mod tests {
             ),
             (
                 &["update", "channel"],
+                json!(""),
+                "update.channel".to_owned(),
+            ),
+            (
+                &["update", "channel"],
                 json!(1),
                 "update.channel".to_owned(),
             ),
@@ -1541,6 +1627,70 @@ mod tests {
             let mut doc = example();
             set(&mut doc, path, value.clone());
             assert_eq!(key_error(load_doc(&doc)).0, key, "{path:?} = {value}");
+        }
+    }
+
+    #[test]
+    fn malformed_values_say_what_is_wrong() {
+        let cases: Vec<(&[&str], Value, &str, &str)> = vec![
+            (
+                &["endpoints", ""],
+                json!({}),
+                "endpoints.\"\"",
+                "has an empty id",
+            ),
+            (&["models", ""], json!({}), "models.\"\"", "has an empty id"),
+            (
+                &["environments", ""],
+                json!({}),
+                "environments.\"\"",
+                "has an empty id",
+            ),
+            (
+                &["endpoints", "gpu-box", "base_url"],
+                json!("gpu-box:8443"),
+                "endpoints.gpu-box.base_url",
+                "must be an http or https URL",
+            ),
+            (
+                &["environments", "dev", "login_url"],
+                json!("/cli-auth"),
+                "environments.dev.login_url",
+                "must be an http or https URL",
+            ),
+            (
+                &["endpoints", "gpu-box", "protocols"],
+                json!(["openai_chat", "anthropic_messages", "openai_chat"]),
+                "endpoints.gpu-box.protocols",
+                "lists `openai_chat` more than once",
+            ),
+            (
+                &["endpoints", "gpu-box", "api_key_env"],
+                json!(""),
+                "endpoints.gpu-box.api_key_env",
+                "must not be empty",
+            ),
+            (
+                &["models", GLM, "context_window"],
+                json!(0),
+                "models.\"z-ai/glm-5.3-flash\".context_window",
+                "must be an integer > 0",
+            ),
+            (
+                &["models", GLM, "price", "input"],
+                json!(-0.5),
+                "models.\"z-ai/glm-5.3-flash\".price.input",
+                "must be a number >= 0",
+            ),
+        ];
+        for (path, value, key, problem) in cases {
+            let mut doc = example();
+            set(&mut doc, path, value.clone());
+            assert_eq!(
+                key_error(load_doc(&doc)),
+                (key.to_owned(), problem.to_owned()),
+                "{path:?} = {value}"
+            );
         }
     }
 
@@ -1877,17 +2027,22 @@ mod tests {
 
     #[test]
     fn start_check_refuses_an_unset_api_key_env() {
-        let settings = load_doc(&example()).expect("load");
+        let home = temp_home();
+        write_default(&home, &example());
+        let file = write_file(&home, "local.json", &example());
         let arc_knows_all = |_: &str| true;
-        assert_eq!(
-            key_error(check_local_start_with(&settings, &|_| None, &arc_knows_all)),
-            (
-                "endpoints.gpu-box.api_key_env".to_owned(),
-                "names `GPU_BOX_API_KEY`, which is not set".to_owned()
-            )
-        );
-        let env = |name: &str| (name == "GPU_BOX_API_KEY").then(|| OsString::from("key"));
-        check_local_start_with(&settings, &env, &arc_knows_all).expect("key is set");
+        for mode in [Mode::Local, Mode::LocalFile(&file)] {
+            let settings = load(&home, opts(mode)).expect("load");
+            assert_eq!(
+                key_error(check_start(&settings, &|_| None, &arc_knows_all)),
+                (
+                    "endpoints.gpu-box.api_key_env".to_owned(),
+                    "names `GPU_BOX_API_KEY`, which is not set".to_owned()
+                )
+            );
+            let env = |name: &str| (name == "GPU_BOX_API_KEY").then(|| OsString::from("key"));
+            check_start(&settings, &env, &arc_knows_all).expect("key is set");
+        }
     }
 
     #[test]
@@ -1898,10 +2053,12 @@ mod tests {
         for key in ["context_window", "max_output_tokens"] {
             let mut doc = example();
             remove(&mut doc, &["models", GLM, key]);
-            let settings = load_doc(&doc).expect("load");
-            check_local_start_with(&settings, &env, &arc_knows_glm).expect("ARC knows the model");
+            let home = temp_home();
+            let file = write_file(&home, "local.json", &doc);
+            let settings = load(&home, opts(Mode::LocalFile(&file))).expect("load");
+            check_start(&settings, &env, &arc_knows_glm).expect("ARC knows the model");
             assert_eq!(
-                key_error(check_local_start_with(&settings, &env, &arc_knows_none)),
+                key_error(check_start(&settings, &env, &arc_knows_none)),
                 (
                     format!("models.\"z-ai/glm-5.3-flash\".{key}"),
                     "is required: ARC doesn't know this model".to_owned()
@@ -1909,7 +2066,7 @@ mod tests {
             );
         }
         let settings = load_doc(&example()).expect("load");
-        check_local_start_with(&settings, &env, &arc_knows_none).expect("limits are set");
+        check_start(&settings, &env, &arc_knows_none).expect("limits are set");
     }
 
     #[test]

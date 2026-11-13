@@ -398,23 +398,57 @@ mod tests {
         }
     }
 
-    /// Parse `value` and return the load error, asserting it names no secret.
+    /// Load `value` as the credentials file and return the reason it is
+    /// invalid, asserting that the error names the file and `auth login` and
+    /// names no secret.
+    #[track_caller]
     fn reason(value: &Value) -> String {
-        let reason = parse(&value.to_string()).expect_err("invalid credentials");
+        reason_for_text(&value.to_string())
+    }
+
+    #[track_caller]
+    fn reason_for_text(contents: &str) -> String {
+        let home = temp_home("invalid");
+        let path = credentials_file(&home);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, contents).expect("write");
+        let error = load(&home).expect_err("invalid credentials");
+        let _ = fs::remove_dir_all(&home);
+        let message = error.to_string();
+        let reason = match error {
+            CredentialsError::Invalid {
+                path: error_path,
+                reason,
+            } => {
+                assert_eq!(error_path, path);
+                reason
+            }
+            other => panic!("expected an invalid file, got {other:?}"),
+        };
+        assert_eq!(
+            message,
+            format!(
+                "{} is invalid: {reason}. Run: {} auth login",
+                path.display(),
+                crate::CLI_BIN
+            )
+        );
         for secret in [ACCESS_TOKEN, REFRESH_TOKEN, API_KEY] {
-            assert!(!reason.contains(secret), "{reason}");
+            assert!(!message.contains(secret), "{message}");
         }
         reason
     }
 
     fn temp_home(name: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "rayline-credentials-{name}-{}-{unique}",
-            std::process::id()
+            "rayline-credentials-{name}-{}-{unique}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
     }
 
@@ -495,10 +529,72 @@ mod tests {
     #[test]
     fn rejects_a_file_that_is_not_json() {
         assert_eq!(
-            parse("{\"session\": ").expect_err("not json"),
+            reason_for_text("{\"session\": "),
             "not valid JSON (line 1, column 12)"
         );
-        assert!(parse("").expect_err("empty").starts_with("not valid JSON"));
+        assert!(reason_for_text("").starts_with("not valid JSON"));
+    }
+
+    /// The shape before section 6: `version`, camelCase fields, `authKind`,
+    /// `router_keys.<env>` and `apiKey`.
+    fn old_shape_entry() -> Value {
+        serde_json::json!({
+            "authKind": "rayline_session",
+            "subject": "uid_abc123",
+            "email": "you@example.com",
+            "accessToken": ACCESS_TOKEN,
+            "accessTokenExpiresAtMs": 1_794_481_200_000_i64,
+            "refreshToken": REFRESH_TOKEN,
+            "refreshTokenExpiresAtMs": 1_797_069_600_000_i64,
+            "logged_in_at": "2026-11-12T10:00:00Z"
+        })
+    }
+
+    fn old_shape_router_key() -> Value {
+        serde_json::json!({
+            "apiKey": API_KEY,
+            "subject": "uid_abc123",
+            "saved_at": "2026-11-12T10:00:05Z"
+        })
+    }
+
+    #[test]
+    fn rejects_the_old_shape_without_migrating_it() {
+        let whole = serde_json::json!({
+            "version": 2,
+            "environments": { "prod": old_shape_entry(), "dev": old_shape_entry() },
+            "router_keys": { "prod": old_shape_router_key(), "dev": old_shape_router_key() }
+        });
+        let message = reason(&whole);
+        assert!(
+            ["unknown key `version`", "unknown key `router_keys`"].contains(&message.as_str()),
+            "{message}"
+        );
+
+        assert_eq!(
+            reason(&serde_json::json!({ "version": 1 })),
+            "unknown key `version`"
+        );
+        assert_eq!(
+            reason(&serde_json::json!({ "router_keys": { "prod": old_shape_router_key() } })),
+            "unknown key `router_keys`"
+        );
+        assert_eq!(
+            reason(&serde_json::json!({
+                "environments": { "prod": { "authKind": "rayline_session" } }
+            })),
+            "unknown key `environments.prod.authKind`"
+        );
+        for (object, key, value) in [
+            ("session", "accessToken", Value::from(ACCESS_TOKEN)),
+            ("session", "accessTokenExpiresAtMs", Value::from(1)),
+            ("session", "authKind", Value::from("rayline_session")),
+            ("router_key", "apiKey", Value::from(API_KEY)),
+        ] {
+            let mut file = valid_file();
+            file[object][key] = value;
+            assert_eq!(reason(&file), format!("unknown key `{object}.{key}`"));
+        }
     }
 
     #[test]
@@ -515,9 +611,10 @@ mod tests {
             (repeated_slot, "session"),
             (repeated_field, "environments.dev.router_key.api_key"),
         ] {
-            let reason = parse(&text).expect_err("a repeated key");
-            assert_eq!(reason, format!("`{key}` appears more than once"));
-            assert!(!reason.contains(API_KEY), "{reason}");
+            assert_eq!(
+                reason_for_text(&text),
+                format!("`{key}` appears more than once")
+            );
         }
     }
 
