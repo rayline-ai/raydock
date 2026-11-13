@@ -28,10 +28,8 @@ irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-ra
 ```
 
 The installers place `rayline`, `rayline-core` and `rayline-core-LICENSE` in
-`~/.rayline/bin`. They need
-[`minisign`](https://jedisct1.github.io/minisign/): they verify the release's
-`SHA256SUMS.minisig` against the pinned release key, then each file they
-download against `SHA256SUMS`.
+`~/.rayline/bin`. They check each file they download against the release's
+`SHA256SUMS`.
 
 ## Quick start
 
