@@ -11,6 +11,7 @@ pub(crate) mod claude_daemon;
 pub mod codex;
 pub mod codex_app;
 pub mod config;
+pub(crate) mod credentials;
 pub(crate) mod detach;
 pub mod harness;
 pub mod hybrid;
@@ -289,25 +290,17 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        RaylineDispatch::AuthToken(request) => {
-            let env_name =
-                status::resolve_env(request.env_name.as_deref(), dirs::home_dir().as_deref());
-            match status::resolve_auth_token(&request).await {
-                Ok(status::AuthTokenOutcome::Available(value)) => {
-                    let output = terminal_output_text(&value);
-                    println!("{output}");
-                    ExitCode::SUCCESS
-                }
-                Ok(status::AuthTokenOutcome::NotLoggedIn) => {
-                    eprintln!("Error: Not logged in to {env_name}. Run: raydock auth login");
-                    ExitCode::from(1)
-                }
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
+        RaylineDispatch::AuthToken(request) => match status::auth_token(&request).await {
+            Ok(value) => {
+                let output = terminal_output_text(&value);
+                println!("{output}");
+                ExitCode::SUCCESS
             }
-        }
+            Err(error) => {
+                eprintln!("Error: {error}");
+                ExitCode::from(1)
+            }
+        },
         RaylineDispatch::AuthLogout(request) => match status::logout(&request).await {
             Ok(message) => match status::write_auth_message(&message) {
                 Ok(()) => ExitCode::SUCCESS,
@@ -317,7 +310,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 }
             },
             Err(error) => {
-                eprintln!("Error: failed to update credentials: {error}");
+                eprintln!("Error: {error}");
                 ExitCode::from(1)
             }
         },
@@ -417,7 +410,6 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     let mut root_env = None;
-    let mut root_auth_token = None;
     let mut root_env_explicit = false;
 
     while let Some(arg) = args.next() {
@@ -425,22 +417,13 @@ where
         if arg == "--" {
             return None;
         }
-        if let Some((name, value)) = arg.split_once('=') {
-            match name {
-                "--env" => {
-                    if !status::is_valid_root_env(value) {
-                        return None;
-                    }
-                    root_env = Some(value.to_owned());
-                    root_env_explicit = true;
-                    continue;
-                }
-                "--auth-token" => {
-                    root_auth_token = Some(value.to_owned());
-                    continue;
-                }
-                _ => {}
+        if let Some(value) = arg.strip_prefix("--env=") {
+            if !status::is_valid_root_env(value) {
+                return None;
             }
+            root_env = Some(value.to_owned());
+            root_env_explicit = true;
+            continue;
         }
         if is_value_option(arg) {
             if arg.contains('=') {
@@ -454,8 +437,6 @@ where
                 }
                 root_env = Some(value.to_owned());
                 root_env_explicit = true;
-            } else if arg == "--auth-token" {
-                root_auth_token = Some(value.to_str()?.to_owned());
             }
             continue;
         }
@@ -467,22 +448,23 @@ where
         }
 
         return match arg {
-            "hybrid" if !root_env_explicit && root_auth_token.is_none() => {
+            "hybrid" if !root_env_explicit => {
                 Some(RaylineDispatch::Hybrid(args.cloned().collect()))
             }
             "hybrid" => Some(RaylineDispatch::Usage(
                 usage_error::HYBRID_ROOT_OPTIONS.to_owned(),
             )),
-            "auth" => parse_auth_dispatch(args, root_env, root_auth_token, root_env_explicit),
+            "auth" => parse_auth_dispatch(args, root_env, root_env_explicit),
             "claude-desktop" => parse_claude_app_request(args).map(RaylineDispatch::ClaudeApp),
-            "claude" => parse_claude_dispatch(args, root_env, root_auth_token, root_env_explicit),
-            "codex" => parse_codex_dispatch(args, root_env, root_auth_token, root_env_explicit),
-            "status" => parse_status_request(args, root_env, root_auth_token, root_env_explicit)
-                .map(RaylineDispatch::Status),
+            "claude" => parse_claude_dispatch(args, root_env, root_env_explicit),
+            "codex" => parse_codex_dispatch(args, root_env),
+            "status" => {
+                parse_status_request(args, root_env, root_env_explicit).map(RaylineDispatch::Status)
+            }
             "top" => parse_top_request(args).map(RaylineDispatch::Top),
             "update" => parse_update_request(args).map(RaylineDispatch::Update),
             command => harness::Harness::from_command(command).and_then(|harness| {
-                parse_harness_request(harness, args, root_env, root_auth_token, root_env_explicit)
+                parse_harness_request(harness, args, root_env, root_env_explicit)
                     .map(RaylineDispatch::Harness)
             }),
         };
@@ -491,21 +473,19 @@ where
     None
 }
 
-/// `raydock [--env E] <harness> [--env E] [--auth-token T] [--] [ARGS]...`.
+/// `raydock [--env E] <harness> [--env E] [--] [ARGS]...`.
 /// Rayline options are read only before the first other arg; everything from
 /// there (or after `--`) passes through to the harness, including `--help`.
 fn parse_harness_request<'a, I>(
     harness: harness::Harness,
     mut args: std::iter::Peekable<I>,
     root_env: Option<String>,
-    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<harness::RunRequest>
 where
     I: Iterator<Item = &'a OsString>,
 {
     let mut env_name = root_env;
-    let mut auth_token = root_auth_token;
     let mut root_env_explicit = root_env_explicit;
     let mut harness_args = Vec::new();
 
@@ -521,7 +501,7 @@ where
             Some((option, value)) => (option, Some(value)),
             None => (arg_str, None),
         };
-        if !matches!(option, "--env" | "--auth-token") {
+        if option != "--env" {
             harness_args.push(arg.clone());
             break;
         }
@@ -529,22 +509,17 @@ where
             Some(value) => value,
             None => args.next()?.to_str()?,
         };
-        if option == "--env" {
-            if !status::is_valid_root_env(value) {
-                return None;
-            }
-            env_name = Some(value.to_owned());
-            root_env_explicit = true;
-        } else {
-            auth_token = Some(value.to_owned());
+        if !status::is_valid_root_env(value) {
+            return None;
         }
+        env_name = Some(value.to_owned());
+        root_env_explicit = true;
     }
     harness_args.extend(args.cloned());
 
     Some(harness::RunRequest {
         harness,
         env_name,
-        auth_token,
         root_env_explicit,
         args: harness_args,
     })
@@ -553,7 +528,6 @@ where
 fn parse_auth_dispatch<'a, I>(
     mut args: std::iter::Peekable<I>,
     root_env: Option<String>,
-    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<RaylineDispatch>
 where
@@ -564,9 +538,10 @@ where
             .map(RaylineDispatch::AuthLogin),
         "logout" => parse_auth_logout_request(args, root_env, root_env_explicit)
             .map(RaylineDispatch::AuthLogout),
-        "status" => parse_status_request(args, root_env, root_auth_token, root_env_explicit)
-            .map(RaylineDispatch::Status),
-        "token" => parse_auth_token_request(args, root_env, root_auth_token, root_env_explicit)
+        "status" => {
+            parse_status_request(args, root_env, root_env_explicit).map(RaylineDispatch::Status)
+        }
+        "token" => parse_auth_token_request(args, root_env, root_env_explicit)
             .map(RaylineDispatch::AuthToken),
         _ => None,
     }
@@ -575,17 +550,15 @@ where
 fn parse_status_request<'a, I>(
     mut args: std::iter::Peekable<I>,
     root_env: Option<String>,
-    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<status::StatusRequest>
 where
     I: Iterator<Item = &'a OsString>,
 {
-    let (env_name, auth_token, root_env_explicit) =
-        parse_env_and_auth_options(args.by_ref(), root_env, root_auth_token, root_env_explicit)?;
+    let (env_name, root_env_explicit) =
+        parse_env_options(args.by_ref(), root_env, root_env_explicit)?;
     Some(status::StatusRequest {
         env_name,
-        auth_token,
         root_env_explicit,
     })
 }
@@ -593,17 +566,15 @@ where
 fn parse_auth_token_request<'a, I>(
     mut args: std::iter::Peekable<I>,
     root_env: Option<String>,
-    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<status::AuthTokenRequest>
 where
     I: Iterator<Item = &'a OsString>,
 {
-    let (env_name, auth_token, root_env_explicit) =
-        parse_env_and_auth_options(args.by_ref(), root_env, root_auth_token, root_env_explicit)?;
+    let (env_name, root_env_explicit) =
+        parse_env_options(args.by_ref(), root_env, root_env_explicit)?;
     Some(status::AuthTokenRequest {
         env_name,
-        auth_token,
         root_env_explicit,
     })
 }
@@ -616,8 +587,8 @@ fn parse_auth_logout_request<'a, I>(
 where
     I: Iterator<Item = &'a OsString>,
 {
-    let (env_name, _, root_env_explicit) =
-        parse_env_and_auth_options(args.by_ref(), root_env, None, root_env_explicit)?;
+    let (env_name, root_env_explicit) =
+        parse_env_options(args.by_ref(), root_env, root_env_explicit)?;
     Some(status::AuthLogoutRequest {
         env_name,
         root_env_explicit,
@@ -676,12 +647,11 @@ where
     })
 }
 
-fn parse_env_and_auth_options<'a, I>(
+fn parse_env_options<'a, I>(
     mut args: I,
     mut env_name: Option<String>,
-    mut auth_token: Option<String>,
     mut root_env_explicit: bool,
-) -> Option<(Option<String>, Option<String>, bool)>
+) -> Option<(Option<String>, bool)>
 where
     I: Iterator<Item = &'a OsString>,
 {
@@ -699,7 +669,6 @@ where
                     env_name = Some(value.to_owned());
                     root_env_explicit = true;
                 }
-                "--auth-token" => auth_token = Some(value.to_owned()),
                 _ => return None,
             }
             continue;
@@ -713,18 +682,16 @@ where
                 env_name = Some(value.to_owned());
                 root_env_explicit = true;
             }
-            "--auth-token" => auth_token = Some(args.next()?.to_str()?.to_owned()),
             _ => return None,
         }
     }
 
-    Some((env_name, auth_token, root_env_explicit))
+    Some((env_name, root_env_explicit))
 }
 
 fn parse_claude_request<'a, I>(
     mut args: std::iter::Peekable<I>,
     root_env: Option<String>,
-    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<crate::claude::RunRequest>
 where
@@ -785,7 +752,6 @@ where
 
     Some(crate::claude::RunRequest {
         env_name,
-        auth_token: root_auth_token,
         args: claude_args,
         isolated,
         root_env_explicit,
@@ -802,14 +768,12 @@ fn is_claude_management_subcommand(arg: &str) -> bool {
 fn parse_claude_dispatch<'a, I>(
     args: std::iter::Peekable<I>,
     root_env: Option<String>,
-    root_auth_token: Option<String>,
     root_env_explicit: bool,
 ) -> Option<RaylineDispatch>
 where
     I: Iterator<Item = &'a OsString>,
 {
-    parse_claude_request(args, root_env, root_auth_token, root_env_explicit)
-        .map(RaylineDispatch::ClaudeRun)
+    parse_claude_request(args, root_env, root_env_explicit).map(RaylineDispatch::ClaudeRun)
 }
 
 fn parse_claude_app_request<'a, I>(
@@ -831,8 +795,6 @@ where
 fn parse_codex_dispatch<'a, I>(
     mut args: std::iter::Peekable<I>,
     root_env: Option<String>,
-    root_auth_token: Option<String>,
-    root_env_explicit: bool,
 ) -> Option<RaylineDispatch>
 where
     I: Iterator<Item = &'a OsString>,
@@ -840,24 +802,19 @@ where
     match args.peek().and_then(|arg| arg.to_str()) {
         Some("configure") => {
             let _ = args.next();
-            parse_codex_configure_request(args, root_env, root_auth_token, root_env_explicit)
-                .map(RaylineDispatch::CodexConfigure)
+            parse_codex_configure_request(args, root_env).map(RaylineDispatch::CodexConfigure)
         }
         Some("app") => {
             let _ = args.next();
-            parse_codex_app_request(args, root_env, root_auth_token, root_env_explicit)
-                .map(RaylineDispatch::CodexApp)
+            parse_codex_app_request(args, root_env).map(RaylineDispatch::CodexApp)
         }
-        _ => parse_codex_request(args, root_env, root_auth_token, root_env_explicit)
-            .map(RaylineDispatch::CodexRun),
+        _ => parse_codex_request(args, root_env).map(RaylineDispatch::CodexRun),
     }
 }
 
 fn parse_codex_app_request<'a, I>(
     mut args: std::iter::Peekable<I>,
     mut env_name: Option<String>,
-    root_auth_token: Option<String>,
-    mut root_env_explicit: bool,
 ) -> Option<crate::codex_app::AppRunRequest>
 where
     I: Iterator<Item = &'a OsString>,
@@ -883,7 +840,6 @@ where
             match option {
                 "--env" => {
                     env_name = Some(valid_env(value)?);
-                    root_env_explicit = true;
                     continue;
                 }
                 "--model" => {
@@ -898,10 +854,7 @@ where
             }
         }
         match arg_str {
-            "--env" => {
-                env_name = Some(valid_env(args.next()?.to_str()?)?);
-                root_env_explicit = true;
-            }
+            "--env" => env_name = Some(valid_env(args.next()?.to_str()?)?),
             "--model" => model = Some(args.next()?.to_str()?.to_owned()),
             "--auth" => auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?,
             "--subscription" => auth_mode = crate::codex::CodexAuthMode::Subscription,
@@ -917,17 +870,13 @@ where
         model,
         auth_mode,
         codex_args,
-        root_env_explicit,
         env_name,
-        auth_token: root_auth_token,
     })
 }
 
 fn parse_codex_request<'a, I>(
     mut args: std::iter::Peekable<I>,
     mut env_name: Option<String>,
-    root_auth_token: Option<String>,
-    mut root_env_explicit: bool,
 ) -> Option<crate::codex::RunRequest>
 where
     I: Iterator<Item = &'a OsString>,
@@ -953,7 +902,6 @@ where
             match option {
                 "--env" => {
                     env_name = Some(valid_env(value)?);
-                    root_env_explicit = true;
                     continue;
                 }
                 "--model" => {
@@ -968,10 +916,7 @@ where
             }
         }
         match arg_str {
-            "--env" => {
-                env_name = Some(valid_env(args.next()?.to_str()?)?);
-                root_env_explicit = true;
-            }
+            "--env" => env_name = Some(valid_env(args.next()?.to_str()?)?),
             "--model" => {
                 model = Some(args.next()?.to_str()?.to_owned());
             }
@@ -993,9 +938,7 @@ where
         model,
         auth_mode,
         codex_args,
-        root_env_explicit,
         env_name,
-        auth_token: root_auth_token,
     })
 }
 
@@ -1006,8 +949,6 @@ fn valid_env(value: &str) -> Option<String> {
 fn parse_codex_configure_request<'a, I>(
     mut args: std::iter::Peekable<I>,
     env_name: Option<String>,
-    auth_token: Option<String>,
-    root_env_explicit: bool,
 ) -> Option<crate::codex::ConfigureRequest>
 where
     I: Iterator<Item = &'a OsString>,
@@ -1050,8 +991,6 @@ where
         base_url,
         auth_mode,
         env_name,
-        auth_token,
-        root_env_explicit,
     })
 }
 
@@ -1254,7 +1193,7 @@ fn command_path_before_help(original_argv: &[OsString]) -> Option<Vec<&str>> {
 fn is_value_option(arg: &str) -> bool {
     matches!(
         arg.split_once('=').map_or(arg, |(name, _)| name),
-        "--env" | "--auth-token" | "--model" | "--base-url" | "--install-path"
+        "--env" | "--model" | "--base-url" | "--install-path"
     )
 }
 
@@ -1748,17 +1687,8 @@ mod tests {
         assert!(request.root_env_explicit);
         assert_eq!(request.args, argv(&["-p", "--env", "x"]));
 
-        let request = harness_run(&[
-            "rayline",
-            "opencode",
-            "--env=dev",
-            "--auth-token",
-            "t",
-            "run",
-            "hi",
-        ]);
+        let request = harness_run(&["rayline", "opencode", "--env=dev", "run", "hi"]);
         assert_eq!(request.env_name.as_deref(), Some("dev"));
-        assert_eq!(request.auth_token.as_deref(), Some("t"));
         assert_eq!(request.args, argv(&["run", "hi"]));
 
         let request = harness_run(&["rayline", "omp", "--", "--env", "dev"]);
@@ -1785,7 +1715,6 @@ mod tests {
         {
             RaylineDispatch::CodexRun(request) => {
                 assert_eq!(request.env_name.as_deref(), Some("dev"));
-                assert!(request.root_env_explicit);
                 assert_eq!(request.codex_args, argv(&["exec"]));
             }
             other => panic!("expected CodexRun, got {other:?}"),
@@ -1793,7 +1722,6 @@ mod tests {
         match rayline_dispatch_for_argv(&argv(&["raydock", "codex", "app", "--env=dev"])) {
             RaylineDispatch::CodexApp(request) => {
                 assert_eq!(request.env_name.as_deref(), Some("dev"));
-                assert!(request.root_env_explicit);
             }
             other => panic!("expected CodexApp, got {other:?}"),
         }

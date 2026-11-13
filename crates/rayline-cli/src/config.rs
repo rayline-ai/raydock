@@ -241,7 +241,12 @@ const UPDATE_CHANNEL: (&str, &str) = ("RAYLINE_UPDATE_CHANNEL", "update.channel"
 /// file, env overrides.
 pub fn load(options: &LoadOptions<'_>) -> Result<Settings, ConfigError> {
     let home = dirs::home_dir().ok_or(ConfigError::NoHome)?;
-    load_from(&home, options, &|name| std::env::var_os(name))
+    load_in(&home, options)
+}
+
+/// [`load`] with the default file under `home`.
+pub(crate) fn load_in(home: &Path, options: &LoadOptions<'_>) -> Result<Settings, ConfigError> {
+    load_from(home, options, &|name| std::env::var_os(name))
 }
 
 /// Refuses what the local process must refuse before it serves anything:

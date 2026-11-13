@@ -210,10 +210,13 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     )
                 }
                 None => {
-                    let hosted = crate::status::resolve_hosted_environment(&env, Some(&home))
-                        .map_err(|error| {
-                            io::Error::other(format!("unknown environment {env:?}: {error:?}"))
-                        })?;
+                    let hosted = crate::status::resolve_hosted_environment(
+                        (env != crate::status::PROD_ENV).then_some(env.as_str()),
+                        &home,
+                    )
+                    .map_err(|error| {
+                        io::Error::other(format!("unknown environment {env:?}: {error}"))
+                    })?;
                     let (base_url, model) =
                         crate::hybrid_profile::custom_local_model(settings.as_ref()).ok_or_else(
                             || io::Error::other(
@@ -307,12 +310,12 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     if std::env::var_os("RAYLINE_ROUTER_API_KEY")
                         .is_none_or(|value| value.is_empty())
                     {
-                        crate::claude::ensure_router_key(&env, &home, None, false)
+                        crate::status::router_key(&hosted, &home)
                             .await
                             .map_err(|error| io::Error::other(error.to_string()))?;
                     }
                     let mut profile = crate::hybrid_profile::default_profile(
-                        &hosted.router_url,
+                        &hosted.base_url,
                         &base_url,
                         &model,
                         window,
@@ -327,13 +330,13 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                         crate::hybrid_profile::without_local(&mut profile);
                         println!(
                             "Default hybrid profile: decisions via {} (model {}), cloud only",
-                            hosted.router_url,
+                            hosted.base_url,
                             crate::hybrid_profile::DECISIONS_MODEL
                         );
                     } else {
                         println!(
                             "Default hybrid profile: decisions via {} (model {}), local window {window} tokens",
-                            hosted.router_url,
+                            hosted.base_url,
                             crate::hybrid_profile::DECISIONS_MODEL
                         );
                     }
@@ -345,7 +348,8 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     .map_err(settings_error)?;
             // Decisions carry execution context and the router key: only a
             // configured Rayline router or loopback may receive them.
-            let router_urls = crate::hybrid_profile::configured_router_urls(&home);
+            let router_urls =
+                crate::hybrid_profile::configured_router_urls(&home).map_err(io::Error::other)?;
             crate::hybrid_profile::check_decisions_url(&composed.config, &router_urls)
                 .map_err(io::Error::other)?;
             let credentials =
@@ -381,17 +385,19 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             // One Decisions call before reporting ready: a refused key or an
             // unreachable router fails here, not on the harness's first turn.
             // The environment whose router serves Decisions: a profile file may
-            // name another one than `--env`.
-            let decisions_env = composed
-                .config
-                .pointer("/decisions/url")
-                .and_then(Value::as_str)
-                .and_then(|url| crate::hybrid_profile::environment_for_url(&home, url))
-                .unwrap_or_else(|| env.clone());
+            // name another one than `--env`. `None` is the built-in prod, whose
+            // commands take no `--env`.
+            let decisions_env = match composed.config.pointer("/decisions/url") {
+                Some(Value::String(url)) => crate::hybrid_profile::environment_for_url(&home, url)
+                    .map_err(io::Error::other)?
+                    .map(|hosted| hosted.env),
+                _ => None,
+            }
+            .unwrap_or_else(|| (env != crate::status::PROD_ENV).then(|| env.clone()));
             probe_decisions(
                 &composed.config,
                 &credentials,
-                &decisions_env,
+                decisions_env.as_deref(),
                 startup_timeout_secs,
             )
             .await?;
@@ -418,7 +424,9 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             for router_url in &router_urls {
                 command.arg("--router-url").arg(router_url);
             }
-            command.arg("--env-name").arg(&decisions_env);
+            if let Some(env_name) = &decisions_env {
+                command.arg("--env-name").arg(env_name);
+            }
             command.arg("--classifier-model").arg(&classifier_model);
             if let Some(dir) = &token_counter_dir {
                 command.arg("--token-counter-dir").arg(dir);
@@ -564,9 +572,10 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
 async fn probe_decisions(
     config: &Value,
     credentials: &[(String, String)],
-    env: &str,
+    env: Option<&str>,
     startup_timeout_secs: u64,
 ) -> io::Result<()> {
+    let env_flag = env.map(|env| format!("--env {env} ")).unwrap_or_default();
     let Some(decisions) = config.get("decisions") else {
         return Ok(());
     };
@@ -594,7 +603,7 @@ async fn probe_decisions(
         .or_else(|| std::env::var(auth_env).ok().filter(|key| !key.is_empty()))
         .ok_or_else(|| {
             io::Error::other(format!(
-                "no Rayline key for Decisions ({auth_env}); run `raydock --env {env} auth login`"
+                "no Rayline key for Decisions ({auth_env}); run `raydock {env_flag}auth login`"
             ))
         })?;
     let cell = decisions.get("cell_tag").and_then(Value::as_str);
@@ -621,7 +630,7 @@ async fn probe_decisions(
                 let fix = if from_environment {
                     format!("Check or unset {auth_env}, which overrides the saved key")
                 } else {
-                    format!("Run `raydock --env {env} auth login`")
+                    format!("Run `raydock {env_flag}auth login`")
                 };
                 return Err(io::Error::other(format!(
                     "Decisions at {url} refused the Rayline key (HTTP {status}). {fix}, then `raydock hybrid start` again."
@@ -644,7 +653,7 @@ async fn probe_decisions(
                         Err(error) => error.to_string(),
                     };
                     return Err(io::Error::other(format!(
-                        "Decisions at {url} is unreachable or not ready ({detail}); check your network and `raydock --env {env} status`, then retry"
+                        "Decisions at {url} is unreachable or not ready ({detail}); check your network and `raydock {env_flag}status`, then retry"
                     )));
                 }
                 if !announced {
@@ -1330,6 +1339,30 @@ fn acquire_lock(lock_path: &Path) -> io::Result<std::fs::File> {
 mod tests {
     use super::*;
 
+    // The built-in prod takes no `--env`: `--env prod` selects a configured
+    // `environments.prod` instead.
+    #[test]
+    fn a_missing_decisions_key_names_the_login_for_its_environment() {
+        let config = serde_json::json!({"decisions": {
+            "url": "https://decisions.example.test/v1/decisions",
+            "auth_env": "RAYLINE_TEST_UNSET_DECISIONS_KEY",
+        }});
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for (env, login) in [
+            (None, "`raydock auth login`"),
+            (Some("dev"), "`raydock --env dev auth login`"),
+        ] {
+            let error = runtime
+                .block_on(probe_decisions(&config, &[], env, 1))
+                .unwrap_err()
+                .to_string();
+            assert!(error.ends_with(login), "{error}");
+        }
+    }
+
     /// Serializes the tests that set a process-wide env var.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1516,16 +1549,14 @@ mod tests {
             Cli::try_parse_from(["hybrid", "start", "--core", "/core", "--config", "/config"])
                 .is_ok()
         );
-        for option in ["--env=dev", "--auth-token=synthetic"] {
-            let argv: Vec<OsString> = ["rayline", option, "hybrid", "status"]
-                .into_iter()
-                .map(OsString::from)
-                .collect();
-            assert!(matches!(
-                crate::rayline_dispatch_for_argv(&argv),
-                crate::RaylineDispatch::Usage(_)
-            ));
-        }
+        let argv: Vec<OsString> = ["rayline", "--env=dev", "hybrid", "status"]
+            .into_iter()
+            .map(OsString::from)
+            .collect();
+        assert!(matches!(
+            crate::rayline_dispatch_for_argv(&argv),
+            crate::RaylineDispatch::Usage(_)
+        ));
         assert!(Cli::try_parse_from(["hybrid", "run", "claude", "--", "-p", "hello"]).is_ok());
     }
     #[test]

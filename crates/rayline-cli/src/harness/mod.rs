@@ -8,10 +8,10 @@
 //! args. The key lives only in that config (0600, in a 0700 dir), never in the
 //! harness's environment: every tool subprocess the harness spawns inherits its
 //! environment, so a key there would reach a model-visible `env` call. For the
-//! same reason the launch removes [`KEY_ENV`] and `RAYLINE_ROUTER_API_KEY`
-//! from the child's environment. The config dir is per harness (it holds the
-//! harness's sessions), so two concurrent launches of one harness with
-//! different keys share the last-written key.
+//! same reason the launch removes `RAYLINE_ROUTER_API_KEY` from the child's
+//! environment. The config dir is per harness (it holds the harness's
+//! sessions), so two concurrent launches of one harness with different keys
+//! share the last-written key.
 //!
 //! Every config uses Anthropic Messages, except OpenClaw, whose default
 //! provider speaks OpenAI Chat Completions. The models, their names and their
@@ -71,11 +71,8 @@ use std::process::{Command, ExitCode};
 
 use serde_json::Value;
 
-/// Env var that carried the router key to the harness before 0.2.11. Removed
-/// from the child's environment, with [`ROUTER_KEY_ENV`], so neither an
-/// exported key nor one from a parent launch reaches the harness's tools.
-pub const KEY_ENV: &str = "RAYLINE_KEY";
-/// The explicit router key the launcher reads ([`explicit_router_key`]).
+/// The router key a parent launch hands its child processes. Removed from the
+/// harness's environment so it never reaches the harness's tools.
 const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 /// Env var that carries the per-launch conversation id (fallback only).
 pub const CONV_ID_ENV: &str = "RAYLINE_CONV_ID";
@@ -445,7 +442,6 @@ impl Harness {
 pub struct RunRequest {
     pub harness: Harness,
     pub env_name: Option<String>,
-    pub auth_token: Option<String>,
     pub root_env_explicit: bool,
     /// Args passed through to the harness unchanged.
     pub args: Vec<OsString>,
@@ -557,25 +553,16 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    // Same env -> router URL resolution as `raydock claude`: `--env` (default
-    // prod), then settings.json `environments.<env>.router_url`.
-    let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(&home));
-    let hosted = crate::status::resolve_hosted_environment(&env_name, Some(&home))
+    // Same env -> router URL resolution as `raydock claude`: built-in prod, or
+    // settings.json `environments.<env>.base_url` for `--env`.
+    let hosted = crate::status::resolve_hosted_environment(request.env_name.as_deref(), &home)
         .map_err(|error| error.to_string())?;
-    let router_url = normalize_router_url(&hosted.router_url);
-    // An explicit RAYLINE_ROUTER_API_KEY wins, as on the codex path; otherwise
-    // the stored `rlk-` key, minted (and signed in) on demand like `raydock claude`.
-    let key = match explicit_router_key() {
-        Some(key) => key,
-        None => crate::claude::ensure_router_key(
-            &env_name,
-            &home,
-            request.auth_token.as_deref(),
-            request.root_env_explicit,
-        )
+    let env_name = hosted.name().to_owned();
+    let router_url = normalize_router_url(&hosted.base_url);
+    // The stored `rlk-` key, signing in first when signed out, like `raydock claude`.
+    let key = crate::status::router_key(&hosted, &home)
         .await
-        .map_err(|error| error.to_string())?,
-    };
+        .map_err(|error| error.to_string())?;
 
     if harness == Harness::Omp {
         omp::warn_if_old(&binary);
@@ -675,12 +662,6 @@ fn opencode_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString>
     launched
 }
 
-fn explicit_router_key() -> Option<String> {
-    std::env::var(ROUTER_KEY_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-}
-
 /// `~/.rayline/harness/<name>/`
 pub(crate) fn config_dir(home: &Path, harness: Harness) -> PathBuf {
     home.join(crate::DOT_CONFIG_DIR)
@@ -768,7 +749,6 @@ pub(crate) fn build_command(
     let mut command = Command::new(binary);
     command.args(args);
     // The key reaches the harness through its config only (see the module docs).
-    command.env_remove(KEY_ENV);
     command.env_remove(ROUTER_KEY_ENV);
     for name in &plan.env_remove {
         command.env_remove(name);
@@ -1322,7 +1302,6 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        assert!(envs.contains(&("RAYLINE_KEY".into(), None)));
         assert!(envs.contains(&("RAYLINE_ROUTER_API_KEY".into(), None)));
         assert!(
             !envs
@@ -1420,7 +1399,6 @@ pub(crate) mod tests {
                 let path = dir.join(file.name);
                 let text = fs::read_to_string(&path).unwrap();
                 holds_key |= text.contains(TEST_KEY);
-                assert!(!text.contains(KEY_ENV), "{}: {}", harness.name(), file.name);
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
@@ -1444,7 +1422,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn harness_child_never_inherits_a_router_key() {
-        let vars = [KEY_ENV, ROUTER_KEY_ENV];
+        let vars = [ROUTER_KEY_ENV];
         let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
         for var in vars {
             // SAFETY: tests run with --test-threads=1 (AGENTS.md), so no other
