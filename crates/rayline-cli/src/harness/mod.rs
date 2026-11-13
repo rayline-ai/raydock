@@ -529,8 +529,8 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         _ => request.args,
     };
     let command = build_command(&binary, &plan, &args);
-    if harness == Harness::Hermes && cfg!(windows) {
-        hermes::prepare_launch(&command)?;
+    if harness == Harness::Hermes {
+        hermes::prepare_cloud_launch(&command)?;
     }
     Ok(command)
 }
