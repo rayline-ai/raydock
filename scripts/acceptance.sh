@@ -13,13 +13,12 @@
 # `rayline local stop` once on exit, including on Ctrl-C, TERM and HUP. If
 # `rayline local start` fails, it stops nothing: a process it didn't start is
 # left alone.
-# claude-desktop has no path yet in either mode, so it is not covered.
 # See docs/acceptance-testing.md.
 set -uo pipefail
 
 RAYLINE=${RAYLINE:-rayline}
 CONFIG=${CONFIG:-}
-HARNESSES=(claude claude-desktop codex opencode pi omp hermes openclaw)
+HARNESSES=(claude codex opencode pi omp hermes openclaw)
 PROMPT="Reply with the word ACCEPT immediately followed by the sum of 17 and 25, with no space and nothing else."
 ANSWER=ACCEPT42
 TIMEOUT=600
@@ -97,7 +96,7 @@ run_turn() {
 run_mode() {
   local mode=$1 harness
   shift
-  for harness in ${turns[@]+"${turns[@]}"}; do
+  for harness in "${selected[@]}"; do
     if installed "$harness"; then
       run_turn "$harness" "$mode" "$@"
     else
@@ -128,13 +127,6 @@ for harness in "${selected[@]}"; do
   done
   $known || { echo "unknown harness: $harness" >&2; usage; }
 done
-# The harnesses that run a turn: every selected one but claude-desktop.
-# The loops over it use ${turns[@]+...}: bash 3.2 (macOS) treats an empty
-# array as unset under set -u.
-turns=()
-for harness in "${selected[@]}"; do
-  [ "$harness" = claude-desktop ] || turns+=("$harness")
-done
 
 # `rayline run --config <file>` is in local mode only when <file> has a
 # `routing` section, so a CONFIG without one would run no local turn.
@@ -154,14 +146,13 @@ fi
 
 echo "== versions"
 "$RAYLINE" --version || exit 1
-for harness in ${turns[@]+"${turns[@]}"}; do
+for harness in "${selected[@]}"; do
   if installed "$harness"; then
     echo "$harness: $("$harness" --version 2>&1 | head -n 1)"
   else
     echo "$harness: not installed"
   fi
 done
-[ ${#turns[@]} -eq ${#selected[@]} ] || echo "claude-desktop: not covered, no path yet"
 
 # The cleanup trap below stops the local process, so the script must not run
 # while one it didn't start is running, or when it can't tell.

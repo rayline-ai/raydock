@@ -1039,13 +1039,42 @@ fn private_dir(path: &Path) -> io::Result<()> {
 /// Replace `path` atomically with `value` as a 0600 file: a planted symlink
 /// or a loosened file at `path` is replaced, never followed or kept.
 fn write_private_json(path: &Path, value: &Value, pretty: bool) -> io::Result<()> {
+    use std::io::Write;
     let contents = if pretty {
         serde_json::to_vec_pretty(value)
     } else {
         serde_json::to_vec(value)
     }
     .map_err(io::Error::other)?;
-    crate::claude_app::write_private(path, &contents)?;
+    // Into a new 0600 file beside `path`, fsynced, then renamed over it and
+    // the directory fsynced.
+    let dir = path.parent().unwrap_or(Path::new("."));
+    private_dir(dir)?;
+    let name = path
+        .file_name()
+        .map(std::ffi::OsStr::to_string_lossy)
+        .unwrap_or_default();
+    let tmp = dir.join(format!(".{name}.tmp-{}", std::process::id()));
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&tmp)?;
+    let written = file.write_all(&contents).and_then(|()| file.sync_all());
+    if let Err(error) = written.and_then(|()| fs::rename(&tmp, path)) {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    #[cfg(unix)]
+    fs::File::open(dir)?.sync_all()?;
     #[cfg(windows)]
     rayline_local_router::windows_state::restrict_to_owner(path, false)?;
     Ok(())

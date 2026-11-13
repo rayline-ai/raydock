@@ -82,7 +82,3 @@ Each run prints one line:
 The script exits 0 when nothing failed, 1 on any `FAIL`, when a local process is already running or when `rayline local status` fails before any turn, and 2 on a usage error.
 
 A pass shows that the turn completed. It doesn't show which model served it. In local mode, `rayline top` and `~/.rayline/local/runtime.log` show each decision and the model that ran.
-
-## Claude Desktop
-
-Claude Desktop isn't covered: it has no path yet in either mode. For `claude-desktop` the script prints `claude-desktop: not covered, no path yet`, which counts as neither a pass nor a fail.

@@ -81,11 +81,13 @@ fn assert_fails(output: &Output, code: i32, stderr: &str) {
 #[test]
 fn a_usage_error_exits_2() {
     let home = Home::new();
-    assert_fails(
-        &home.run(&["run", "nope"]),
-        2,
-        "rayline: unknown harness `nope`",
-    );
+    for name in ["nope", "claude-desktop"] {
+        assert_fails(
+            &home.run(&["run", name]),
+            2,
+            &format!("rayline: unknown harness `{name}`"),
+        );
+    }
     assert_fails(
         &home.run(&["run", "pi", "--local", "--config", "x.json"]),
         2,
@@ -191,10 +193,6 @@ fn local_mode_refuses_the_kept_options_it_does_not_run() {
         (
             &["run", "claude", "--local", "--isolated"][..],
             "`--isolated`",
-        ),
-        (
-            &["run", "claude-desktop", "--local"],
-            "`run claude-desktop`",
         ),
         (&["run", "codex", "app", "--local"], "`run codex app`"),
         (

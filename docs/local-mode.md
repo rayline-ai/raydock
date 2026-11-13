@@ -80,7 +80,7 @@ Each harness speaks one protocol:
 
 | Harness | Protocol |
 |---|---|
-| `claude`, `claude-desktop`, `pi`, `omp`, `opencode` | `anthropic_messages` |
+| `claude`, `pi`, `omp`, `opencode` | `anthropic_messages` |
 | `codex`, `hermes` | `openai_responses` |
 | `openclaw` | `openai_chat` |
 

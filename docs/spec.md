@@ -37,7 +37,6 @@ Usage: rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...
 
 Harnesses:
   claude           Claude Code
-  claude-desktop   Claude Desktop's Code sessions
   codex            Codex CLI
   opencode         opencode
   pi               pi
@@ -70,7 +69,7 @@ rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...
 5. Rayline options come first, right after the harness name. The first argument that is not a Rayline option, or everything after `--`, goes to the harness unchanged, including `--help`.
 6. `rayline run --help` prints the usage above. `rayline run <HARNESS>` with an unknown harness is a usage error.
 7. Each harness keeps today's behaviour in both modes, apart from what this spec removes.
-8. Local mode refuses these kept options and commands (section 9) before anything starts: `rayline run claude --isolated`, `rayline run claude-desktop`, `rayline run codex app`, `rayline run codex configure`, and `rayline run codex` with `--model`. `app` and `configure` are Rayline commands only as the word right after `rayline run codex`. After Rayline's options they are codex arguments, so `rayline run codex --local app` passes `app` to codex.
+8. Local mode refuses these kept options and commands (section 9) before anything starts: `rayline run claude --isolated`, `rayline run codex app`, `rayline run codex configure`, and `rayline run codex` with `--model`. `app` and `configure` are Rayline commands only as the word right after `rayline run codex`. After Rayline's options they are codex arguments, so `rayline run codex --local app` passes `app` to codex.
 9. For `claude`, `codex`, `pi` and `opencode`, local mode refuses a command line that resumes or forks a saved session, before anything starts. It looks at the harness arguments before any `--`, in both the `--flag` and `--flag=value` forms, and refuses these:
    - `claude`: `-r`, `-c`, `--resume`, `--continue`, `--fork-session`, `--resume-session-at`;
    - `codex`: `resume` or `fork` as the first argument, or `exec resume` as the first two;
@@ -193,7 +192,7 @@ Your own inference servers, keyed by id.
 | `protocols` | list of `anthropic_messages`, `openai_chat`, `openai_responses` | yes, non-empty | The wire protocols it serves. |
 | `api_key_env` | string | no | Name of the env var holding its key. No secrets in the file. |
 
-In local mode each harness speaks one protocol, the only one its Rayline config sets up: `claude`, `claude-desktop`, `pi`, `omp` and `opencode` speak `anthropic_messages`; `codex` and `hermes` speak `openai_responses`; `openclaw` speaks `openai_chat`. When the endpoint lists the harness's protocol, requests pass straight through with no translation. When it doesn't, the config is wrong and Rayline refuses to run. In cloud mode the config Rayline writes for `hermes` defaults to `anthropic_messages`, with an `openai_responses` provider beside it, and the one for `openclaw` adds an `openai_responses` provider beside `openai_chat`. Every other harness uses the same protocol in both modes.
+In local mode each harness speaks one protocol, the only one its Rayline config sets up: `claude`, `pi`, `omp` and `opencode` speak `anthropic_messages`; `codex` and `hermes` speak `openai_responses`; `openclaw` speaks `openai_chat`. When the endpoint lists the harness's protocol, requests pass straight through with no translation. When it doesn't, the config is wrong and Rayline refuses to run. In cloud mode the config Rayline writes for `hermes` defaults to `anthropic_messages`, with an `openai_responses` provider beside it, and the one for `openclaw` adds an `openai_responses` provider beside `openai_chat`. Every other harness uses the same protocol in both modes.
 
 ### 5.3 `models`
 
@@ -369,7 +368,7 @@ Set by one Rayline process and read only by a child it starts. Never read from t
 
 ### 7.5 Test builds only
 
-`RAYDOCK_TEST_DETACH_HELPER`, `RAYLINE_CLAUDE_DESKTOP_NO_LAUNCHD`. Compiled only into test builds, not into the shipped binary.
+`RAYDOCK_TEST_DETACH_HELPER`. Compiled only into test builds, not into the shipped binary.
 
 Every other env var Rayline reads today is gone (section 10).
 
@@ -400,17 +399,15 @@ Only two files:
                                 pi, hermes, omp, opencode, openclaw
   harness/<name>/               files Rayline generates per harness in cloud mode: pi, hermes, omp,
                                 opencode, openclaw, codex, codex-app,
-                                claude-desktop, claude-code (only with --isolated)
+                                claude-code (only with --isolated)
   harness/claude-code/daemon-launches.json
                                 Claude Code daemons Rayline started
-  harness/claude-desktop/claude-desktop.lock
-                                one claude-desktop command changing Desktop at a time
 ```
 
 Each mode has its own harness folder because each writes its own endpoint, key and model list there.
 
 Rayline writes nothing else under `~/.rayline` or `~/.config/rayline`. Outside them it writes only:
-- the harness's own files named in 9.4 and 9.5;
+- the harness's own files named in 9.4;
 - tokenizer files in the Hugging Face cache: `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `<home>/.cache/huggingface/hub`;
 - with `rayline run codex configure` (9.4), `rayline.config.toml` in the user's Codex home (`CODEX_HOME`, else `~/.codex`, Codex's own default);
 - with `rayline run claude --isolated` (9.3), in the user's Claude config folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`): the folders `projects/`, `sessions/`, `plans/` and `paste-cache/` and an empty `history.jsonl`, each only if missing, which the isolated folder links to.
@@ -425,7 +422,6 @@ These keep today's behaviour for now, under the new command shape. Their aliases
 2. `rayline update`: `--check`, `--version <version>`, `--force`, `--dry-run`.
 3. `rayline run claude --isolated`: gives Claude Code its own config folder (`~/.rayline/harness/claude-code/`) so it can run beside other sessions.
 4. `rayline run codex`: `--model <model>`; the subcommands `rayline run codex app [WORKSPACE]` (launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`) and `rayline run codex configure` (writes a Codex profile, `rayline.config.toml`, to the user's Codex home: `CODEX_HOME`, else `~/.codex`, Codex's own default).
-5. `rayline run claude-desktop [COMMAND]`: `start` (default), `status`, `validate`, `stop`, `install-service`, `uninstall-service`, `off`, `uninstall`, and `--manual`, `--prefixed-ids`, `--desktop-config <path>`. Desktop runs on the shared local process; its own router copy is gone. Its model ids are unchanged.
 
 ## 10. Removed
 
@@ -443,6 +439,7 @@ Everything below is deleted outright: code, tests, docs and help text.
 8. `top` options `--legacy`, `--hybrid`, `--all`, `--state-dir`, and the `a` key on the live screen.
 9. `update --channel`. `update.channel` and `RAYLINE_UPDATE_CHANNEL` replace it.
 10. The `rl` alias.
+11. `rayline run claude-desktop` and all its commands and options (`start`, `status`, `validate`, `stop`, `install-service`, `uninstall-service`, `off`, `uninstall`, `--manual`, `--prefixed-ids`, `--desktop-config`), with its LaunchAgent and its state folder and lock. `rayline run claude-desktop` is an unknown harness.
 
 ### 10.2 The old local stack
 
@@ -455,7 +452,7 @@ Everything below is deleted outright: code, tests, docs and help text.
 ### 10.3 Settings and files
 
 1. Settings keys: `router_url`, `cli_auth_url`, `account_url`, `default_env`, `auth_kind`, `authKind`, `firebase_api_key`, `google_device_client_id`, `google_device_client_secret`, `local_model`, `hybrid` (all of it, including `local_registry_model`, `routing`, `local_tokenizer`, `routing.local_price`, `cloud_output_tokens`, `classifier_model`, `local_context_window`), `subagent_routes`, `onboarding`.
-2. Files: `~/.config/rayline/cli.toml`, `router.json`, `router.<env>.json`, `claude-daemon-launches.json` and harness homes under `~/.config/rayline`; `~/.rayline/rld/`, `~/.rayline/hybrid/`, `~/.rayline/cc/`, `~/.rayline/codex-app-home/`, `~/.rayline/claude-desktop/` and `~/.rayline/claude-desktop.lock`. Rayline neither reads nor moves them.
+2. Files: `~/.config/rayline/cli.toml`, `router.json`, `router.<env>.json`, `claude-daemon-launches.json` and harness homes under `~/.config/rayline`; `~/.rayline/rld/`, `~/.rayline/hybrid/`, `~/.rayline/cc/`, `~/.rayline/codex-app-home/`, `~/.rayline/claude-desktop/`, `~/.rayline/claude-desktop.lock` and `~/.rayline/harness/claude-desktop/`. Rayline neither reads nor moves them.
 3. The old settings file location and its migration.
 4. Today's `credentials.json` shape (`version`, camelCase fields, `authKind`, `router_keys.<env>`, `apiKey`).
 

@@ -77,7 +77,6 @@ rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...
 | Harness | Runs |
 |---|---|
 | `claude` | Claude Code |
-| `claude-desktop` | Claude Desktop's Code sessions |
 | `codex` | Codex CLI |
 | `opencode` | opencode |
 | `pi` | pi |
@@ -101,8 +100,8 @@ rayline run codex -- exec "summarize this repo"
   in cloud mode if it doesn't.
 - `--local` and `--config` together are a usage error.
 - Local mode refuses `rayline run claude --isolated`,
-  `rayline run claude-desktop`, `rayline run codex --model`,
-  `rayline run codex app` and `rayline run codex configure`. The error says the option isn't available in
+  `rayline run codex --model`, `rayline run codex app` and
+  `rayline run codex configure`. The error says the option isn't available in
   local mode.
 - Rayline options come right after the harness name. The first argument that
   isn't a Rayline option, and everything after `--`, goes to the harness
@@ -131,31 +130,6 @@ rayline run claude --isolated
 | `--model <model>` | The model Codex asks for. |
 | `rayline run codex app [WORKSPACE]` | Launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`, and opens `WORKSPACE` if you give one. |
 | `rayline run codex configure` | Writes a Codex profile to `$CODEX_HOME/rayline.config.toml`. |
-
-### Claude Desktop
-
-`rayline run claude-desktop [COMMAND]` connects Claude Code sessions in the
-Claude desktop app to ARC, through Desktop's third-party inference mode. That
-mode is macOS only, and it applies to the whole app: while it is on, Desktop
-doesn't use your claude.ai subscription. Desktop runs on the shared local
-process.
-
-| Command | Does |
-|---|---|
-| `start` | The default. Configures Desktop and opens it. |
-| `status` | Shows the state of the Desktop setup. |
-| `validate` | Checks Desktop's applied configuration. |
-| `stop` | Stops serving Desktop. |
-| `install-service` | Installs a macOS login service that keeps serving Desktop across logins. |
-| `uninstall-service` | Removes that login service. |
-| `off` | Switches Desktop back to the profile and mode it had before. |
-| `uninstall` | Switches Desktop back and removes Rayline's Desktop state. |
-
-| Option | Does |
-|---|---|
-| `--manual` | Prints the steps to import the configuration in Desktop yourself, and doesn't change Desktop. |
-| `--prefixed-ids` | Sends ARC's prefixed model ids upstream. |
-| `--desktop-config <path>` | With `validate`, checks this file instead of Desktop's applied configuration. |
 
 ### opencode, pi, oh-my-pi, Hermes Agent and OpenClaw
 

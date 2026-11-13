@@ -7,7 +7,6 @@ use std::process::{Command, ExitCode};
 
 pub(crate) mod auth_callback_page;
 pub mod claude;
-pub mod claude_app;
 pub(crate) mod claude_daemon;
 mod cli;
 pub mod codex;
@@ -263,9 +262,7 @@ async fn run_local(run: cli::Run, settings: &config::Settings) -> ExitCode {
         cli::Launch::Claude { args, .. } => ("claude", args),
         cli::Launch::Codex { args, .. } => ("codex", args),
         cli::Launch::Harness { harness, args } => (harness.name(), args),
-        cli::Launch::ClaudeDesktop(_)
-        | cli::Launch::CodexApp { .. }
-        | cli::Launch::CodexConfigure(_) => {
+        cli::Launch::CodexApp { .. } | cli::Launch::CodexConfigure(_) => {
             unreachable!("not_in_local_mode refuses these launches")
         }
     };
@@ -282,9 +279,6 @@ async fn run_cloud(launch: cli::Launch, hosted: status::HostedEnvironment) -> Ex
                 isolated,
             })
             .await
-        }
-        cli::Launch::ClaudeDesktop(action) => {
-            claude_app::run(claude_app::AppRequest { action }).await
         }
         cli::Launch::Codex { options, args } => {
             codex::run(codex::RunRequest {
