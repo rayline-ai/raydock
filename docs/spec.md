@@ -132,6 +132,24 @@ Its options are **kept for review** (section 9). The channel comes from `update.
 
 `rayline update` refuses Homebrew and Rayline.app installs: it replaces nothing and exits 0, with or without `--check`. When the binary it would replace is inside a `.app` bundle, it prints ``rayline is managed by Rayline.app. Update the app to update the CLI:`` and, on the next line, ``re-download from https://get.rayline.ai``. When that binary is under `brew --prefix` (with `brew` on `PATH`), it prints ``Installed via Homebrew. Run `brew upgrade rayline` to update.``
 
+### 3.6 Installers
+
+`scripts/install-rayline.sh` (macOS and Linux) and `scripts/install-rayline.ps1` (Windows) install `rayline`, `rayline-core` and `rayline-core-LICENSE`. Their public options:
+
+1. `install-rayline.sh`:
+   - `--version <version>`: the release to install, a bare version such as `0.5.0`. A version with a leading `v` is rejected. Without it, the installer takes the latest GitHub release.
+   - `--install-dir <path>`: the directory the files go into. Default `~/.rayline/bin`. It replaces `RAYLINE_INSTALL_DIR`, which is not read.
+2. `install-rayline.ps1`: `-Version <version>` and `-InstallDir <path>`, with the same rules.
+3. To pass options to a piped installer:
+
+```
+curl -fsSL https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.sh | sh -s -- --version 0.5.0 --install-dir ~/bin
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1))) -Version 0.5.0 -InstallDir C:\tools\rayline
+ayline
+```
+
+The hidden `--base-url` option is in section 4.4.
+
 ## 4. Internal CLI
 
 1. `--env <name>`, hidden, a global option placed before the command: `rayline --env dev run claude`. It selects `environments.<name>` from `settings.json` and from `credentials.json`. Without it, prod (built in). An unknown name is a load error. `rayline local status`, `rayline local stop` and `rayline top` act on the one running local process, so `--env` with them is a usage error.
