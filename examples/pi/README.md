@@ -1,7 +1,7 @@
 # Rayline routing inside Pi
 
 A [Pi](https://pi.dev) extension that lets Rayline's ARC router pick the model
-for each turn. You talk to one model, `rayline/auto`; behind it, ARC chooses
+for each turn. You talk to one model, `rayline/arc`; behind it, ARC chooses
 between the models you list (cloud models, and optionally a model you run
 locally), and Pi sends the turn to that model with your own provider keys.
 
@@ -98,7 +98,7 @@ environment variable, so the model's shell tool can't see it.
 ```bash
 cd examples/pi
 RAYLINE_PI_ROUTER_CONFIG=cloud.json \
-  pi -ns -e rayline-router.ts --model rayline/auto --rayline-timing
+  pi -ns -e rayline-router.ts --model rayline/arc --rayline-timing
 ```
 
 ### 3. Local mode
@@ -128,7 +128,7 @@ Use the model name your server reports as `id`, and the same `local/<id>` in
 ```bash
 cd examples/pi
 RAYLINE_PI_ROUTER_CONFIG=local.json \
-  pi -ns -e rayline-router.ts --model rayline/auto --rayline-timing
+  pi -ns -e rayline-router.ts --model rayline/arc --rayline-timing
 ```
 
 ### 4. Everything through Rayline
@@ -138,7 +138,7 @@ Only the `rayline` entry in `auth.json` is needed:
 ```bash
 cd examples/pi
 RAYLINE_PI_ROUTER_CONFIG=gateway.json \
-  pi -ns -e rayline-router.ts --model rayline/auto --rayline-timing
+  pi -ns -e rayline-router.ts --model rayline/arc --rayline-timing
 ```
 
 Use `local-gateway.json` for the local model plus cloud models through
@@ -146,7 +146,7 @@ Rayline (set up the `local` provider as in step 3).
 
 ### What you see
 
-- The footer shows `auto → <model>` for the model that answered.
+- The footer shows `arc → <model>` for the model that answered.
 - With `--rayline-timing`, the footer also shows how long the routing
   lookup took, for example `route: 1206 ms`. Tool follow-ups show
   `route: kept, no lookup`.

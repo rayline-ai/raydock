@@ -132,7 +132,7 @@ async function fixture({ mode = "current", config = {}, decide, local, cloud, re
 	const servers = [decisionsServer, localServer, cloudServer];
 	const children = [];
 	const start = (extra, stdin) => {
-		const args = ["-e", join(here, "rayline-router.ts"), "--model", "rayline/auto", "--no-session", "--offline", "--no-skills", "--no-prompt-templates", "--no-context-files", "--tools", "read", ...extra];
+		const args = ["-e", join(here, "rayline-router.ts"), "--model", "rayline/arc", "--no-session", "--offline", "--no-skills", "--no-prompt-templates", "--no-context-files", "--tools", "read", ...extra];
 		const child = spawn(PI, args, { cwd: root, env: { ...process.env, PI_CODING_AGENT_DIR: agentDir, RAYLINE_PI_ROUTER_CONFIG: configPath }, stdio: [stdin, "pipe", "pipe"] });
 		children.push(child);
 		return child;

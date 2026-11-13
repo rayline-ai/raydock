@@ -1,7 +1,7 @@
 /**
  * Rayline router for Pi (prototype): a virtual model whose router is ARC.
  *
- * Registers `rayline/auto`. Before every request Pi calls `route()`, which asks
+ * Registers `rayline/arc`. Before every request Pi calls `route()`, which asks
  * the Rayline Routes API (`POST /v1/routes`) which model should serve the turn
  * and returns that model to Pi. Pi dispatches the request itself, so the
  * footer, `/session` costs, context limits and compaction all follow the model
@@ -33,7 +33,7 @@
  * evidence, re-consults, private append, thinking controls beyond Pi's levels,
  * and receipt/price verification.
  *
- * Usage: RAYLINE_PI_ROUTER_CONFIG=router.json pi -e ./rayline-router.ts --model rayline/auto
+ * Usage: RAYLINE_PI_ROUTER_CONFIG=router.json pi -e ./rayline-router.ts --model rayline/arc
  * Add `--rayline-timing` (or `"show_decision_time": true`) to show each
  * lookup's total time in the footer, next to the model Pi already shows.
  */
@@ -595,8 +595,8 @@ export default function (pi: ExtensionAPI) {
 	});
 	pi.registerVirtualModel<RouterState>({
 		provider: PROVIDER,
-		id: "auto",
-		name: "Rayline Auto",
+		id: "arc",
+		name: "Rayline ARC",
 		// ARC selects the thinking level; the user's level is not an input.
 		thinkingLevels: ["off"],
 		contextWindow: config.context_window,
