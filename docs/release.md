@@ -123,12 +123,13 @@ RAYLINE_RELEASE_BASE_URL=file:///tmp/rayline-release/cli/v0.2.0 \
   scripts/install-rayline.sh --install-dir /tmp/rayline-bin
 ```
 
-For self-update validation without replacing the active binary, point the update
-base at a local or staged mirror:
+For self-update validation without replacing the active binary, point the
+hidden `--base-url` option at a local or staged mirror (`--install-path` picks
+the binary a real update replaces):
 
 ```bash
-RAYLINE_UPDATE_BASE_URL=file:///tmp/rayline-release \
-  /tmp/rayline-bin/raydock update --dry-run --version 0.2.0
+/tmp/rayline-bin/raydock update --dry-run --version 0.2.0 \
+  --base-url file:///tmp/rayline-release
 ```
 
 ## Execution core build
