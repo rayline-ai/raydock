@@ -210,7 +210,7 @@ The action ARC identifies is the model id after its provider prefix (`qwen/qwen3
 | `price` | object `input`, `output`, `cache_read`, `cache_write` (numbers >= 0) | no | Overrides ARC's price for this model only. |
 
 1. When ARC picks a model in `models`, the local process sends the request to its endpoint under its `model` name.
-2. The only models ARC can pick that are not in `models` are these three Rayline cloud models. When ARC picks one, it goes to Rayline cloud under its Rayline cloud id:
+2. The only models ARC can pick that are not in `models` are these three Rayline cloud models. When ARC picks one, it goes to Rayline cloud. A request over Messages carries its Rayline cloud id, and one over Chat Completions or Responses carries its id in the core's registry:
 
    | Rayline cloud id | Id in the core's registry | Context window | Output ceiling | Input modalities |
    |---|---|---|---|---|
