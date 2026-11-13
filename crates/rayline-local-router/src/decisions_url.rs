@@ -137,23 +137,57 @@ impl<'de> Visitor<'de> for StrictVisitor {
     }
 }
 
-/// The HTTPS origin authority (lowercase host and effective port) of a URL, or
-/// `None` for any other scheme, a URL with credentials, or no host.
-pub fn https_authority(url: &str) -> Option<String> {
-    let url = reqwest::Url::parse(url).ok()?;
-    if url.scheme() != "https" || !url.username().is_empty() || url.password().is_some() {
-        return None;
+/// What a Rayline router URL (an environment's `base_url`) must be: `https`,
+/// or `http` on a loopback host, with no `user:password@`. The problem, when
+/// it is not.
+pub fn router_url_problem(url: &reqwest::Url) -> Option<&'static str> {
+    if !url.username().is_empty() || url.password().is_some() {
+        return Some("must not contain user:password@");
     }
-    Some(format!(
-        "{}:{}",
-        url.host_str()?.to_ascii_lowercase(),
-        url.port_or_known_default()?
-    ))
+    let loopback = url
+        .host_str()
+        .is_some_and(|host| is_loopback(&host.to_ascii_lowercase()));
+    match url.scheme() {
+        "https" if url.host_str().is_some() => None,
+        "http" if loopback => None,
+        _ => Some("must be https, or http on a loopback host"),
+    }
+}
+
+/// `url` without its `user:password@`, for an error message.
+pub fn without_credentials(url: &reqwest::Url) -> String {
+    let mut url = url.clone();
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.to_string()
+}
+
+/// The `host:port` a router URL admits Decisions to over HTTPS, `None` for
+/// a loopback `http` router (loopback is always admitted), or an error
+/// naming an unusable router URL.
+fn router_authority(router: &str) -> Result<Option<String>, String> {
+    let url = reqwest::Url::parse(router)
+        .map_err(|_| format!("router URL {router} is not a valid absolute URL"))?;
+    if let Some(problem) = router_url_problem(&url) {
+        return Err(format!(
+            "router URL {} {problem}",
+            without_credentials(&url)
+        ));
+    }
+    if url.scheme() != "https" {
+        return Ok(None);
+    }
+    Ok(url
+        .host_str()
+        .zip(url.port_or_known_default())
+        .map(|(host, port)| format!("{}:{port}", host.to_ascii_lowercase())))
 }
 
 /// Accept `url` as a Decisions endpoint when it is HTTPS on the exact host and
 /// port of a built-in router or one of `router_urls`, or http(s) on a loopback
-/// address (`127.0.0.0/8`, `::1`, `localhost`).
+/// address (`127.0.0.0/8`, `::1`, `localhost`). A router URL that is not
+/// `https`, or `http` on a loopback host, without credentials is an error
+/// naming it.
 ///
 /// The URL must be written in canonical form, so the core's own URL parser
 /// cannot read a different host from it: ASCII only (an IDN must already be
@@ -202,6 +236,10 @@ pub fn check_decisions_url<'a>(
             "decisions URL host {host}:{port} is not written in canonical form"
         ));
     }
+    let mut routers = Vec::new();
+    for router in BUILTIN_ROUTER_URLS.iter().copied().chain(router_urls) {
+        routers.extend(router_authority(router)?);
+    }
     if is_loopback(&host) {
         return Ok(());
     }
@@ -214,13 +252,11 @@ pub fn check_decisions_url<'a>(
         return Err(refused());
     }
     let authority = format!("{host}:{port}");
-    let allowed = BUILTIN_ROUTER_URLS
-        .iter()
-        .copied()
-        .chain(router_urls)
-        .filter_map(https_authority)
-        .any(|router| router == authority);
-    if allowed { Ok(()) } else { Err(refused()) }
+    if routers.contains(&authority) {
+        Ok(())
+    } else {
+        Err(refused())
+    }
 }
 
 /// The text between `scheme://` and the first `/`, `?` or `#`.
@@ -377,18 +413,50 @@ mod tests {
     }
 
     #[test]
-    fn configured_router_urls_must_themselves_be_https() {
-        // An http router URL in settings does not admit its host over HTTPS.
-        let result = check_decisions_url(
-            "https://plain.example.test/v1/routes",
-            ["http://plain.example.test"],
+    fn an_unusable_router_url_is_an_error_naming_it() {
+        for (router, error) in [
+            (
+                "http://plain.example.test",
+                "router URL http://plain.example.test/ must be https, or http on a loopback host",
+            ),
+            (
+                "https://user:secret@router.example.test",
+                "router URL https://router.example.test/ must not contain user:password@",
+            ),
+            (
+                "http://user@127.0.0.1:9",
+                "router URL http://127.0.0.1:9/ must not contain user:password@",
+            ),
+            (
+                "ftp://router.example.test",
+                "router URL ftp://router.example.test/ must be https, or http on a loopback host",
+            ),
+            (
+                "router.example.test",
+                "router URL router.example.test is not a valid absolute URL",
+            ),
+        ] {
+            // Even when the Decisions URL itself is loopback: the router URL
+            // is never silently dropped.
+            for decisions in [
+                "https://router.example.test/v1/routes",
+                "http://127.0.0.1:9/decisions",
+            ] {
+                assert_eq!(
+                    check_decisions_url(decisions, [router]),
+                    Err(error.to_owned()),
+                    "{router}"
+                );
+            }
+        }
+        // A loopback http router admits only loopback, which is always admitted.
+        check_decisions_url("http://127.0.0.1:9/decisions", ["http://127.0.0.1:9"]).unwrap();
+        assert!(
+            check_decisions_url(
+                "https://router.example.test/v1/routes",
+                ["http://127.0.0.1:9"]
+            )
+            .is_err()
         );
-        assert!(result.is_err());
-        // Nor does a router URL with credentials.
-        let result = check_decisions_url(
-            "https://router.example.test/v1/routes",
-            ["https://user@router.example.test"],
-        );
-        assert!(result.is_err());
     }
 }

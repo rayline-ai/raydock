@@ -685,12 +685,14 @@ pub(crate) async fn top_connection(
     let state = ready(&paths)
         .map_err(|_| io::Error::other("local process readiness is unavailable or invalid"))?;
     for key in ["pid", "core_pid"] {
-        state
+        let pid = state
             .get(key)
             .and_then(Value::as_i64)
             .and_then(|pid| i32::try_from(pid).ok())
-            .filter(|pid| process_exists(*pid))
             .ok_or_else(|| io::Error::other("the local process is not live"))?;
+        if !process_exists(pid)? {
+            return Err(io::Error::other("the local process is not live"));
+        }
     }
     let token = fs::read_to_string(paths.token())
         .map_err(|_| io::Error::other("local gateway credential is unavailable"))?;
@@ -960,7 +962,7 @@ fn running(paths: &Paths) -> io::Result<Option<Supervisor>> {
             supervisor.pid
         ))
     })?;
-    Ok(process_exists(pid).then_some(supervisor))
+    Ok(process_exists(pid)?.then_some(supervisor))
 }
 
 /// Remove what a local process that is no longer running left behind.
@@ -1076,18 +1078,18 @@ fn private_log(path: &Path) -> io::Result<fs::File> {
 }
 
 #[cfg(unix)]
-fn process_exists(pid: i32) -> bool {
+fn process_exists(pid: i32) -> io::Result<bool> {
     if pid <= 0 {
-        return false;
+        return Ok(false);
     }
     // Mirrors POSIX kill(pid, 0): no signal is delivered; errno tells
     // us whether the process is absent or merely owned by another user.
     // SAFETY: kill with signal 0 only checks the pid; it touches no memory.
     let result = unsafe { libc::kill(pid, 0) };
     if result == 0 {
-        return !process_is_zombie(pid);
+        return Ok(!process_is_zombie(pid));
     }
-    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    Ok(std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM))
 }
 
 #[cfg(unix)]
@@ -1135,22 +1137,52 @@ fn signal_process(pid: i32, signal: i32) -> io::Result<()> {
     Err(error)
 }
 
+/// Whether `pid` is running. A probe that cannot run or that fails is an
+/// error, never an answer.
 #[cfg(windows)]
-fn process_exists(pid: i32) -> bool {
+fn process_exists(pid: i32) -> io::Result<bool> {
     if pid <= 0 {
-        return false;
+        return Ok(false);
     }
-    let query = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').ProcessId");
-    Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+    let mut probe = Command::new("powershell.exe");
+    probe.args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').ProcessId"),
+    ]);
+    process_probe(pid, probe)
+}
+
+/// Runs `probe`, which prints `pid` when the process is running and nothing
+/// when it is not.
+#[cfg(windows)]
+fn process_probe(pid: i32, mut probe: Command) -> io::Result<bool> {
+    let failed = |reason: String| {
+        io::Error::other(format!(
+            "could not check whether process {pid} is running: {reason}"
+        ))
+    };
+    let output = probe
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .output()
-        .is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout).trim() == pid.to_string()
-        })
+        .map_err(|error| {
+            failed(format!(
+                "{} did not start: {error}",
+                probe.get_program().to_string_lossy()
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(failed(format!(
+            "{} exited with {}: {}",
+            probe.get_program().to_string_lossy(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == pid.to_string())
 }
 
 #[cfg(windows)]
@@ -1690,6 +1722,34 @@ mod tests {
             harness_protocol: None,
         })
         .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_windows_process_probe_is_an_error_not_an_answer() {
+        let cmd = |script: &str| {
+            let mut command = Command::new("cmd.exe");
+            command.args(["/D", "/C", script]);
+            command
+        };
+        assert!(process_probe(42, cmd("echo 42")).unwrap());
+        assert!(!process_probe(42, cmd("rem")).unwrap());
+        let error = process_probe(42, cmd("echo denied 1>&2 & exit 3"))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "could not check whether process 42 is running: cmd.exe exited with exit code: 3: denied"
+        );
+        let error = process_probe(42, Command::new("no-such-probe.exe"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(
+                "could not check whether process 42 is running: no-such-probe.exe did not start: "
+            ),
+            "{error}"
+        );
     }
 
     #[test]

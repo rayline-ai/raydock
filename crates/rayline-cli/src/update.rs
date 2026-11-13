@@ -121,12 +121,7 @@ async fn run_on(
         .as_ref()
         .map_or(crate::UPDATE_BASE_URL, Url::as_str)
         .trim_end_matches('/');
-    let install_path = install_path(request.install_path.as_deref()).map_err(|error| {
-        UpdateError::Install(format!(
-            "failed to resolve {} install path: {error}",
-            crate::CLI_BIN
-        ))
-    })?;
+    let install_path = install_path(request.install_path.as_deref())?;
     if is_app_bundle_managed(&install_path) {
         return Ok(UpdateResult {
             message: format!(
@@ -518,21 +513,31 @@ fn sha256_file(path: &Path) -> Result<String, UpdateError> {
 /// The binary to replace: `--install-path` as given (the parser has checked
 /// it names `raydock`), else the running binary, whose `rayline` alias maps
 /// to the `raydock` beside it.
-fn install_path(option: Option<&Path>) -> io::Result<PathBuf> {
+fn install_path(option: Option<&Path>) -> Result<PathBuf, UpdateError> {
     match option {
-        Some(path) => Ok(resolve_install_path(path.to_path_buf())),
-        None => Ok(crate::command_alias::primary_path(&resolve_install_path(
-            std::env::current_exe()?,
-        ))),
+        Some(path) => resolve_install_path(path.to_path_buf()),
+        None => {
+            let running = std::env::current_exe().map_err(|error| {
+                UpdateError::Install(format!("failed to locate the running executable: {error}"))
+            })?;
+            Ok(crate::command_alias::primary_path(&resolve_install_path(
+                running,
+            )?))
+        }
     }
 }
 
 /// `current_exe()` may return the invoking symlink rather than its target on
 /// some platforms (macOS), for example the `rayline` alias. Self-update must
 /// replace the real binary, not the alias. A path that does not exist yet
-/// (an `--install-path` naming a file to create) passes through unchanged.
-fn resolve_install_path(path: PathBuf) -> PathBuf {
-    fs::canonicalize(&path).unwrap_or(path)
+/// (an `--install-path` naming a file to create) passes through unchanged;
+/// any other failure to resolve it is an error naming the path.
+fn resolve_install_path(path: PathBuf) -> Result<PathBuf, UpdateError> {
+    match fs::canonicalize(&path) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(io_failed("resolve", &path)(error)),
+    }
 }
 
 /// True when `install_path` is under Homebrew's prefix. Without `brew` on
@@ -1031,6 +1036,32 @@ mod tests {
     use super::*;
 
     type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    #[test]
+    fn a_missing_install_path_passes_through_and_other_resolve_failures_name_it() {
+        let root = std::env::temp_dir().join(format!("raydock-resolve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let missing = root.join("missing").join("raydock");
+        assert_eq!(resolve_install_path(missing.clone()).unwrap(), missing);
+        // A regular file used as a directory (unix) or a name the file system
+        // rejects (Windows) fails for a reason other than absence.
+        #[cfg(unix)]
+        let unusable = {
+            fs::write(root.join("file"), "").unwrap();
+            root.join("file").join("raydock")
+        };
+        #[cfg(windows)]
+        let unusable = root.join("bad<name").join("raydock");
+        let error = resolve_install_path(unusable.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!("failed to resolve {}: ", unusable.display())),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn a_failing_brew_prefix_is_an_error_naming_it() {
