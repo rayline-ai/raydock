@@ -1,4 +1,4 @@
-//! `raydock top`: live request metrics from the local hybrid process.
+//! `rayline top`: live request metrics from the local hybrid process.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
@@ -274,7 +274,7 @@ fn draw_top(
     queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))?;
 
     let mut y = 0;
-    y = draw_title(stdout, y, width, "Raydock Top")?;
+    y = draw_title(stdout, y, width, "Rayline CLI Top")?;
     y = draw_top_summary(stdout, y, width, snapshot, paused, sort)?;
     if let Some(error) = last_error {
         y = draw_colored_line(
@@ -532,7 +532,7 @@ fn format_top_snapshot(snapshot: &Value) -> String {
     let recent = row_count(snapshot, "recent");
     let totals = &snapshot["totals"];
     let mut output = format!(
-        "Raydock top snapshot\nactive: {active}  recent: {recent}  completed: {}  errors: {}\n",
+        "Rayline CLI top snapshot\nactive: {active}  recent: {recent}  completed: {}  errors: {}\n",
         totals_u64(totals, "completed_requests"),
         totals_u64(totals, "errored_requests"),
     );

@@ -15,7 +15,7 @@ Sections marked **Internal** are real but stay out of public docs and `--help`. 
 
 ## 2. Command name
 
-The installed binary is `raydock`. `rayline` is an alias for it (`~/.rayline/bin/rayline -> raydock`). Both work; this spec writes `rayline`. The alias code and its migration of old payloads stay until one name is picked (kept for review). The old `rl` alias is gone.
+The installed binary is `rayline` (`~/.rayline/bin/rayline`). It has no other name: no alias, symlink or link to it is installed.
 
 ## 3. Public CLI
 
@@ -131,11 +131,32 @@ rayline update --check
 
 Its options are **kept for review** (section 9). The channel comes from `update.channel` (section 5.6).
 
+`rayline update` refuses Homebrew and Rayline.app installs: with any of its options (`--check`, `--version`, `--force`, `--dry-run`), it replaces nothing and exits 0. When the binary it would replace is inside a `.app` bundle, it prints ``rayline is managed by Rayline.app. Update the app to update the CLI:`` and, on the next line, ``re-download from https://get.rayline.ai``. When that binary is under `brew --prefix` (with `brew` on `PATH`), it prints ``Installed via Homebrew. Run `brew upgrade rayline` to update.``
+
+When the binary is not inside a `.app` bundle and `brew` is on `PATH` but `brew --prefix` fails or prints nothing, `rayline update` fails: it replaces nothing, prints ``Error: `brew --prefix` (<brew>) failed: <reason>`` to stderr and exits 1. `<brew>` is the path of the `brew` it ran, and `<reason>` is the exit status, the error from starting it, ``it printed no prefix`` or ``it printed a prefix that is not UTF-8``.
+
+### 3.6 Installers
+
+`scripts/install-rayline.sh` (macOS and Linux) and `scripts/install-rayline.ps1` (Windows) install `rayline`, `rayline-core` and `rayline-core-LICENSE`. Their public options:
+
+1. `install-rayline.sh`:
+   - `--version <version>`: the release to install, a bare version such as `0.5.0`. A version with a leading `v` is rejected. Without it, the installer takes the latest GitHub release.
+   - `--install-dir <path>`: the directory the files go into. Default `~/.rayline/bin`. It replaces `RAYLINE_INSTALL_DIR`, which is not read.
+2. `install-rayline.ps1`: `-Version <version>` and `-InstallDir <path>`, with the same rules.
+3. To pass options to a piped installer:
+
+```
+curl -fsSL https://get.rayline.ai/install.sh | bash -s -- --version 0.5.0 --install-dir ~/bin
+& ([scriptblock]::Create((irm https://get.rayline.ai/install.ps1))) -Version 0.5.0 -InstallDir C:\tools\rayline
+```
+
+The hidden `--base-url` option is in section 4.4.
+
 ## 4. Internal CLI
 
 1. `--env <name>`, hidden, a global option placed before the command: `rayline --env dev run claude`. It selects `environments.<name>` from `settings.json` and from `credentials.json`. Without it, prod (built in). An unknown name is a load error. `rayline local status`, `rayline local stop` and `rayline top` act on the one running local process, so `--env` with them is a usage error.
 2. `rayline update` hidden release-testing options: `--base-url <url>` (where releases are read from) and `--install-path <path>` (which binary is replaced). They replace the env vars `RAYLINE_UPDATE_BASE_URL` and `RAYLINE_UPDATE_INSTALL_PATH`.
-3. The local process runs from the `raydock` binary itself, through an internal entry point that `rayline local start` uses. It is not a user command and is not in `--help`. There is no separate `rld` binary.
+3. The local process runs from the `rayline` binary itself, through an internal entry point that `rayline local start` uses. It is not a user command and is not in `--help`. There is no separate `rld` binary.
 4. `install-rayline.sh` hidden release-testing option `--base-url <url>`: where the release is read from. With `--version` it is a usage error. It replaces `RAYLINE_RELEASE_BASE_URL`.
 
 ## 5. `settings.json`
@@ -355,7 +376,7 @@ One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `ses
      ```
      To switch:
        1. Stop the current daemon:   <stop>
-       2. Re-run:                    raydock [--env <name> ]run claude [--isolated ]<args>
+       2. Re-run:                    rayline [--env <name> ]run claude [--isolated ]<args>
      ```
 
      `<args>` are the launch's Claude Code arguments, else `agents`, and `--env <name>` is there when the launch passed it. In the isolated folder, `<stop>` is `claude daemon stop --any (with CLAUDE_CONFIG_DIR=<folder>)`, naming the isolated folder, and the rerun keeps `--isolated`. Otherwise `<stop>` is `claude daemon stop --any`, the rerun has no `--isolated`, and the message ends with `Or run alongside it in an isolated config dir (~/.rayline/harness/claude-code):` and that rerun with `--isolated`.
@@ -387,7 +408,7 @@ Set by one Rayline process and read only by a child it starts. Never read from t
 
 ### 7.5 Test builds only
 
-`RAYDOCK_TEST_DETACH_HELPER`. Compiled only into test builds, not into the shipped binary.
+`RAYLINE_TEST_DETACH_HELPER`. Compiled only into test builds, not into the shipped binary.
 
 Every other env var Rayline reads today is gone (section 10).
 
@@ -404,8 +425,7 @@ Only two files:
 
 ```
 ~/.rayline/
-  bin/                          raydock, rayline -> raydock, rayline-core,
-                                rayline-core-LICENSE
+  bin/                          rayline, rayline-core, rayline-core-LICENSE
   local/                        local process state
     core-config.json            config handed to the core
     core-config.counted.json    the same config with Rayline's token counter added
@@ -448,13 +468,13 @@ Everything below is deleted outright: code, tests, docs and help text.
 
 ### 10.1 Commands and options
 
-1. `raydock router` and all its subcommands (`start`, `status`, `logs`, `top`, `stop`).
-2. `raydock hybrid` and all its subcommands and options (`start`, `status`, `stop`, `run`, `--core`, `--config`, `--env`, `--local-context-window`, `--classifier-model`, `--cell`, `--port`, `--startup-timeout-secs`, `--state-dir`). `rayline local` and `rayline run --local` replace it.
-3. Every subcommand of today's `raydock local`: `models`, `download`, `use`, `remove`, `custom`, `show`, `test`, `clear`, `on`, `off`, `onboard`, `subagents`, with `--url` and `--base-url`.
-4. Top-level harness commands (`raydock claude`, `raydock codex`, `raydock claude-desktop`, `raydock pi`, ...) and the `raydock claude run` form. `rayline run <HARNESS>` replaces them.
-5. `raydock claude` options: `-m, --model`, `--auto-compact-window`, `--local-provider`, `--route`, `--via`, `--local-injector-port`, `--statusline`, `--no-statusline`, `--diagnose`, `--upstream-ca-path`, `--router-config-path`, `--routing-mode`, `--no-proxy`, `--local-router`, `--no-telemetry`.
+1. `rayline router` and all its subcommands (`start`, `status`, `logs`, `top`, `stop`).
+2. `rayline hybrid` and all its subcommands and options (`start`, `status`, `stop`, `run`, `--core`, `--config`, `--env`, `--local-context-window`, `--classifier-model`, `--cell`, `--port`, `--startup-timeout-secs`, `--state-dir`). `rayline local` and `rayline run --local` replace it.
+3. Every subcommand of today's `rayline local`: `models`, `download`, `use`, `remove`, `custom`, `show`, `test`, `clear`, `on`, `off`, `onboard`, `subagents`, with `--url` and `--base-url`.
+4. Top-level harness commands (`rayline claude`, `rayline codex`, `rayline claude-desktop`, `rayline pi`, ...) and the `rayline claude run` form. `rayline run <HARNESS>` replaces them.
+5. `rayline claude` options: `-m, --model`, `--auto-compact-window`, `--local-provider`, `--route`, `--via`, `--local-injector-port`, `--statusline`, `--no-statusline`, `--diagnose`, `--upstream-ca-path`, `--router-config-path`, `--routing-mode`, `--no-proxy`, `--local-router`, `--no-telemetry`.
 6. `--auth-token`, at the top level and on every command.
-7. Top-level `raydock status`. `rayline auth status` is the only status command.
+7. Top-level `rayline status`. `rayline auth status` is the only status command.
 8. `top` options `--legacy`, `--hybrid`, `--all`, `--state-dir`, and the `a` key on the live screen.
 9. `update --channel`. `update.channel` and `RAYLINE_UPDATE_CHANNEL` replace it.
 10. The `rl` alias.
@@ -462,7 +482,7 @@ Everything below is deleted outright: code, tests, docs and help text.
 
 ### 10.2 The old local stack
 
-1. The old local router, transparent proxy, injector, adapter and the `rld` binary with its `serve`, `proxy`, `statusline` and `models` commands. The local process gateway moves into `raydock` (section 4.3).
+1. The old local router, transparent proxy, injector, adapter and the `rld` binary with its `serve`, `proxy`, `statusline` and `models` commands. The local process gateway moves into `rayline` (section 4.3).
 2. Proxy mode and its proxy CA (`HTTPS_PROXY` injection, `NODE_EXTRA_CA_CERTS`).
 3. The on-device model manager: downloads, hardware fit, llama.cpp management, Ollama/LM Studio discovery, account `enable_local` switching, subagent discovery and routes.
 4. claude-desktop's own router copy (its state folder, ports, pid file, LaunchAgent and `router.json`).

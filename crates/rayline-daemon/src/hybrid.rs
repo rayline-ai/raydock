@@ -45,12 +45,12 @@ const DECISIONS_MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 /// named none.
 const DEFAULT_HARNESS_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-/// The local process's options. Only `raydock local start` passes them; the
+/// The local process's options. Only `rayline local start` passes them; the
 /// gateway always binds a free loopback port and records it in the ready file.
 #[derive(clap::Parser, Debug)]
 #[command(no_binary_name = true)]
 pub struct Args {
-    /// Execution core binary. Built and versioned separately from raydock.
+    /// Execution core binary. Built and versioned separately from rayline.
     #[arg(long)]
     core: PathBuf,
     /// Credential-free execution-core configuration.
@@ -960,8 +960,8 @@ fn jittered(base: Duration, unit: f64) -> Duration {
 
 fn login_command(env_name: Option<&str>) -> String {
     match env_name {
-        Some(env) if !env.is_empty() => format!("raydock --env {env} auth login"),
-        _ => "raydock auth login".to_owned(),
+        Some(env) if !env.is_empty() => format!("rayline --env {env} auth login"),
+        _ => "rayline auth login".to_owned(),
     }
 }
 
@@ -1053,7 +1053,7 @@ fn explain_decisions_failure(
     let message = value.pointer("/error/message")?.as_str()?.to_owned();
     let explained = match failure {
         DecisionsFailure::Auth => format!(
-            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `raydock local stop`: the next run starts the local process with the new key."
+            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `rayline local stop`: the next run starts the local process with the new key."
         ),
         DecisionsFailure::Unavailable => format!(
             "{message}: the Rayline routing service could not decide this turn right now (it may be unavailable, or a development cell may still be starting, which takes about a minute). This is retryable: send the turn again after the retry-after interval."
@@ -1062,7 +1062,7 @@ fn explain_decisions_failure(
             "{message}: the Rayline routing service is busy. Send the turn again after the retry-after interval."
         ),
         DecisionsFailure::Refused => format!(
-            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `models` in settings.json and run `raydock local stop`: the next run starts the local process from the changed file."
+            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `models` in settings.json and run `rayline local stop`: the next run starts the local process from the changed file."
         ),
     };
     *value.pointer_mut("/error/message")? = serde_json::Value::String(explained);
@@ -1206,7 +1206,7 @@ fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
         let mut brk = ctrl_break()?;
         let mut close = ctrl_close()?;
         let mut shutdown = ctrl_shutdown()?;
-        // `raydock local start` runs the local process without a console it
+        // `rayline local start` runs the local process without a console it
         // can signal, so it asks for a stop through this event instead.
         let event = rayline_local_router::windows_state::StopEvent::create()
             .context("create hybrid stop event")?;
@@ -1419,13 +1419,13 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("`raydock --env dev auth login`, then `raydock local stop`"),
+            message.contains("`rayline --env dev auth login`, then `rayline local stop`"),
             "{message}"
         );
         // The wire shape is kept.
         assert_eq!(value["type"], "error");
         assert_eq!(value["error"]["type"], "invalid_request_error");
-        assert_eq!(login_command(None), "raydock auth login");
+        assert_eq!(login_command(None), "rayline auth login");
     }
 
     #[test]
@@ -1533,7 +1533,7 @@ mod tests {
         let explained = explain_decisions_failure(
             &anthropic("Decisions request refused (HTTP 400, unknown_price_model)"),
             DecisionsFailure::Refused,
-            "raydock auth login",
+            "rayline auth login",
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&explained).unwrap();
@@ -1547,7 +1547,7 @@ mod tests {
         let explained = explain_decisions_failure(
             &openai("Decisions request refused (HTTP 502)"),
             DecisionsFailure::Unavailable,
-            "raydock auth login",
+            "rayline auth login",
         )
         .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&explained).unwrap();

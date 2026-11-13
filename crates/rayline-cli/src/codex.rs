@@ -166,7 +166,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     use std::os::unix::process::CommandExt;
 
     let error = command.exec();
-    eprintln!("raydock: failed to exec codex: {error}");
+    eprintln!("rayline: failed to exec codex: {error}");
     ExitCode::from(127)
 }
 
@@ -175,7 +175,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     match command.status() {
         Ok(status) => crate::child_exit_code(status),
         Err(error) => {
-            eprintln!("raydock: failed to run codex: {error}");
+            eprintln!("rayline: failed to run codex: {error}");
             ExitCode::from(127)
         }
     }

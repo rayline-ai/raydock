@@ -46,7 +46,7 @@ reaches GitHub without a valid signature.
 The public key is pinned in three places, which must match. Set each to the
 base64 key from `prod.pub` (the single line after `untrusted comment:`):
 
-- `crates/rayline-cli/src/lib.rs`, read by `raydock update`:
+- `crates/rayline-cli/src/lib.rs`, read by `rayline update`:
 
   ```rust
   pub const MINISIGN_PUBLIC_KEYS: &[&str] = &[
@@ -69,7 +69,7 @@ base64 key from `prod.pub` (the single line after `untrusted comment:`):
 The installers trust only this pinned key. No env var overrides it.
 
 Commit the changes and ship. The new key takes effect for all subsequent
-`raydock update` calls and fresh installs.
+`rayline update` calls and fresh installs.
 
 ---
 
@@ -112,7 +112,7 @@ Signature and comment signature verified
 - The `sign` CI job is gated on the `release` GitHub environment (required
   reviewers). No automated process can sign without a human approving the run.
 - `verify_signature` in `update.rs` is fail-closed: a missing or invalid
-  `.minisig` causes `raydock update` to abort before any binary is installed.
+  `.minisig` causes `rayline update` to abort before any binary is installed.
 - Both installers require minisign and abort if the signature doesn't verify.
 - Private keys must never be committed to the repository. Only public keys
   (or their base64 strings) belong in source.

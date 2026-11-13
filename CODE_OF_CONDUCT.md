@@ -1,6 +1,6 @@
 # Code of Conduct
 
-Raydock's issue tracker is for reproducible bug reports, feature
+Rayline CLI's issue tracker is for reproducible bug reports, feature
 requests, security-safe discussion, and maintainer coordination.
 
 Be respectful, direct, and constructive. Do not harass other participants,

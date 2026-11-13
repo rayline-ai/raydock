@@ -1,6 +1,6 @@
-# Raydock
+# Rayline CLI
 
-Raydock is the open-source Rayline CLI from Atlas Futures, Inc. It launches
+Rayline CLI is an open-source command-line tool from Atlas Futures, Inc. It launches
 your coding harness on ARC, which picks the model for each request.
 
 A harness runs in one of two modes:
@@ -27,8 +27,8 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1 | iex
 ```
 
-The installers place `raydock`, its alias `rayline`, `rayline-core` and
-`rayline-core-LICENSE` in `~/.rayline/bin`. They need
+The installers place `rayline`, `rayline-core` and `rayline-core-LICENSE` in
+`~/.rayline/bin`. They need
 [`minisign`](https://jedisct1.github.io/minisign/): they verify the release's
 `SHA256SUMS.minisig` against the pinned release key, then each file they
 download against `SHA256SUMS`.
@@ -92,21 +92,21 @@ cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings
 
 ### Non-Affiliation
 
-Raydock is an independent, open-source project from Atlas Futures, Inc. It
+Rayline CLI is an independent, open-source project from Atlas Futures, Inc. It
 is not affiliated with, endorsed by, or sponsored by Anthropic PBC. "Claude",
 "Claude Code", and "Anthropic" are trademarks of Anthropic PBC, used here
 nominatively to describe interoperability.
 
 ### User Responsibility
 
-You are responsible for making sure your use of Raydock complies with the
+You are responsible for making sure your use of Rayline CLI complies with the
 terms of service of every provider whose API you route to. Install and use
-Raydock only on machines and accounts you control.
+Rayline CLI only on machines and accounts you control.
 
 ## License and Trademarks
 
-Raydock is licensed under the [Apache License 2.0](LICENSE). The Apache
-license does not grant rights to the Raydock name or logos. See
+Rayline CLI is licensed under the [Apache License 2.0](LICENSE). The Apache
+license does not grant rights to the Rayline name or logos. See
 [TRADEMARK.md](TRADEMARK.md).
 
 Copyright 2026 Atlas Futures, Inc.

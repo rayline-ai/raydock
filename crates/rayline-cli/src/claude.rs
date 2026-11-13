@@ -83,7 +83,7 @@ struct RoleModelInputs<'a> {
 /// runs with each `Some` and without each `None`, and a reused Claude Code
 /// daemon must hold the same.
 ///
-/// Raydock decides them: subagents and background tasks run on the main model
+/// Rayline CLI decides them: subagents and background tasks run on the main model
 /// the user chose (`--model X` puts everything on X), else ARC Swift (the key's
 /// id for it). `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` makes the model reach every
 /// subagent: Claude Code's built-in Explore and Plan agents (defined with

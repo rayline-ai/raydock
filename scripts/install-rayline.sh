@@ -9,15 +9,15 @@ BASE_URL=""
 
 usage() {
   cat <<'EOF'
-Install Raydock.
+Install Rayline CLI.
 
 Usage:
   install-rayline.sh [--version <version>] [--install-dir <path>]
 
 Options:
-  --version      Release version to install, for example 0.2.0.
+  --version      Release version to install, for example 0.5.0.
                  Defaults to the latest GitHub release.
-  --install-dir  Directory for raydock, its rayline alias and rayline-core.
+  --install-dir  Directory for rayline, rayline-core and rayline-core-LICENSE.
                  Defaults to ~/.rayline/bin.
 EOF
 }
@@ -31,7 +31,7 @@ while [ "$#" -gt 0 ]; do
       }
       case "$2" in
         v*)
-          echo "--version takes a bare version such as 0.2.0, not $2" >&2
+          echo "--version takes a bare version such as 0.5.0, not $2" >&2
           exit 2
           ;;
       esac
@@ -165,15 +165,14 @@ done
 
 mkdir -p "$INSTALL_DIR"
 install -m 0644 "$tmp_dir/rayline-core-LICENSE" "$INSTALL_DIR/rayline-core-LICENSE"
-install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/raydock"
-ln -sfn raydock "$INSTALL_DIR/rayline"
+install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/rayline"
 install -m 0755 "$tmp_dir/$core_asset" "$INSTALL_DIR/rayline-core"
 
-echo "Installed Raydock to $INSTALL_DIR"
-if ! command -v raydock >/dev/null 2>&1; then
+echo "Installed Rayline CLI to $INSTALL_DIR"
+if ! command -v rayline >/dev/null 2>&1; then
   cat <<EOF
 
-Add Raydock to your PATH:
+Add Rayline CLI to your PATH:
   export PATH="$INSTALL_DIR:\$PATH"
 EOF
 fi

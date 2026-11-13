@@ -68,7 +68,7 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
         ReconcileOutcome::AlreadyCurrent => {
             // Config already matches; don't rewrite. Still launch so `codex app`
             // focuses the window / opens the requested workspace.
-            eprintln!("The Codex app is already using Raydock. Bringing it to the front.");
+            eprintln!("The Codex app is already using Rayline CLI. Bringing it to the front.");
             false
         }
         ReconcileOutcome::Cancelled => {
@@ -92,7 +92,7 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
     match command.status() {
         Ok(status) => crate::child_exit_code(status),
         Err(error) => {
-            eprintln!("raydock: failed to launch codex app: {error}");
+            eprintln!("rayline: failed to launch codex app: {error}");
             ExitCode::from(127)
         }
     }
@@ -342,7 +342,7 @@ fn reconcile_running_app(home: &Path, config: &str) -> ReconcileOutcome {
         return ReconcileOutcome::AlreadyCurrent;
     }
     if same_home {
-        eprintln!("The Codex app is running with an out-of-date Raydock configuration.");
+        eprintln!("The Codex app is running with an out-of-date Rayline CLI configuration.");
     } else {
         eprintln!("The Codex app is already running with a different configuration.");
     }
@@ -497,7 +497,7 @@ fn confirm_restart() -> bool {
         eprintln!("Not an interactive terminal; leaving the running Codex app as-is.");
         return false;
     }
-    eprint!("Would you like to restart it to use Raydock? [y/N] ");
+    eprint!("Would you like to restart it to use Rayline CLI? [y/N] ");
     if io::stderr().flush().is_err() {
         return false;
     }
@@ -675,7 +675,7 @@ mod tests {
     // keys and tables of its own and has moved [tools] above our table.
     fn app_shaped_config(rayline_model: &str) -> String {
         format!(
-            "model = \"{rayline_model}\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = \"https://api.rayline.ai/v1\"\nwire_api = \"responses\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+            "model = \"{rayline_model}\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Rayline\"\nbase_url = \"https://api.rayline.ai/v1\"\nwire_api = \"responses\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
         )
     }
 
@@ -745,7 +745,7 @@ mod tests {
         let existing = format!(
             "{}
 [model_providers.rayline]
-name = \"Raydock\"
+name = \"Rayline\"
 ",
             snippet("arc-sage-1.0")
         );

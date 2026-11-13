@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible Raydock bug.
+description: Report a reproducible Rayline CLI bug.
 title: "[bug]: "
 labels: ["bug"]
 body:
@@ -36,7 +36,7 @@ body:
       description: Pick every affected area you can narrow this to.
       multiple: true
       options:
-        - CLI (raydock)
+        - CLI (rayline)
         - Harness launch (Claude Code, Codex, others)
         - Local mode (rayline local, rayline-core)
         - Installer or updater

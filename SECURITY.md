@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-Raydock, the command-line client in the broader Rayline ecosystem, is
+Rayline CLI, the command-line client in the broader Rayline ecosystem, is
 under active pre-release development. Only the latest release and `main` are
 supported; security fixes are applied there.
 

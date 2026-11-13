@@ -7,7 +7,7 @@ repo-specific.
 
 - `rayline-cli`: user commands and CLI UX.
 - `rayline-daemon`: the local process, the execution core supervisor and
-  loopback gateway. It is a library; `raydock` runs it through its internal
+  loopback gateway. It is a library; `rayline` runs it through its internal
   entry point.
 - `rayline-local-router`: shared helpers for the local process's gateway.
 - `rayline-hf`, `rayline-tokencount`, `rayline-metrics`: model cache, token

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise `raydock local` and `run --local` against the execution-contract fixture core.
+"""Exercise `rayline local` and `run --local` against the execution-contract fixture core.
 
 Run after `cargo build --locked -p rayline-cli`.
 This verifies supervision and harness wiring; the VSR core suite verifies routing.
@@ -15,7 +15,7 @@ import time
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
-CLI = ROOT / "target/debug/raydock"
+CLI = ROOT / "target/debug/rayline"
 # A core that speaks contract version 99. Like the fixture, it writes its pid
 # beside the config and exits when the local process closes its stdin.
 INCOMPATIBLE_CORE = """#!/usr/bin/env python3
@@ -36,11 +36,11 @@ def main():
         state = root / ".rayline" / "local"
         env = dict(os.environ, HOME=str(root))
         env.pop("OPENCLAW_CONTAINER", None)
-        # The local process runs from raydock and finds rayline-core beside it.
+        # The local process runs from rayline and finds rayline-core beside it.
         installed = root / "installed"
         installed.mkdir()
-        raydock = installed / "raydock"
-        shutil.copy(CLI, raydock)
+        rayline = installed / "rayline"
+        shutil.copy(CLI, rayline)
         # The endpoints' own keys come from the shell; the router key comes
         # only from the saved credentials, never from the shell.
         local_env = ["RAYLINE_TEST_LOCAL_ALIAS", "ANTHROPIC_AUTH_TOKEN"]
@@ -88,19 +88,19 @@ def main():
                         "policy": {"preset": "arc-policy.prefer-local.v1"}},
         }))
 
-        def raydock_cmd(*args, success=True):
-            result = subprocess.run([str(raydock), *args], env=env, capture_output=True, text=True, timeout=75)
+        def rayline_cmd(*args, success=True):
+            result = subprocess.run([str(rayline), *args], env=env, capture_output=True, text=True, timeout=75)
             assert (result.returncode == 0) == success, (args, result.stdout, result.stderr)
             return result.stdout if success else result.stderr
 
         def local(*args, success=True):
-            return raydock_cmd("local", *args, success=success)
+            return rayline_cmd("local", *args, success=success)
 
         def run(harness, *args, success=True):
-            return raydock_cmd("--env", "fixture", "run", harness, "--local", *args, success=success)
+            return rayline_cmd("--env", "fixture", "run", harness, "--local", *args, success=success)
 
         def start():
-            raydock_cmd("--env", "fixture", "local", "start")
+            rayline_cmd("--env", "fixture", "local", "start")
             return json.loads((state / "ready.json").read_text())
 
         def wait_dead(pid):
@@ -120,7 +120,7 @@ def main():
                 f"Config: {settings}",
                 "Environment: fixture",
             ]
-            refused = raydock_cmd("--env", "fixture", "local", "start", success=False)
+            refused = rayline_cmd("--env", "fixture", "local", "start", success=False)
             assert str(first["pid"]) in refused and str(settings) in refused, refused
             token = (state / "gateway-token").read_text()
             assert token not in json.dumps(first)
@@ -162,7 +162,7 @@ print('harness request reached execution core')
             # even when the contents match.
             other = root / "other-settings.json"
             shutil.copy(settings, other)
-            refused = raydock_cmd("--env", "fixture", "run", "claude", "--config", str(other), "--", "-p", "test",
+            refused = rayline_cmd("--env", "fixture", "run", "claude", "--config", str(other), "--", "-p", "test",
                                   success=False)
             assert str(settings) in refused and str(other) in refused, refused
             pi = harness_dir / "pi"
@@ -234,8 +234,8 @@ print(json.dumps(sys.argv[1:]))
             wait_dead(third["core_pid"])
             # An incompatible core fails startup and leaves no owned process/state.
             core.write_text(INCOMPATIBLE_CORE)
-            raydock_cmd("--env", "fixture", "local", "start", success=False)
-            # The core receives Raydock's composed configuration.
+            rayline_cmd("--env", "fixture", "local", "start", success=False)
+            # The core receives Rayline CLI's composed configuration.
             wait_dead(int((state / "core-config.pid").read_text()))
             assert not (state / "ready.json").exists()
             assert not (state / "gateway-token").exists()

@@ -15,7 +15,7 @@ impl Home {
             .expect("clock")
             .as_nanos();
         let path =
-            std::env::temp_dir().join(format!("raydock-startup-{}-{stamp}", std::process::id()));
+            std::env::temp_dir().join(format!("rayline-startup-{}-{stamp}", std::process::id()));
         fs::create_dir_all(&path).expect("temporary home");
         Self(path)
     }
@@ -26,10 +26,10 @@ impl Home {
         fs::write(dir.join("settings.json"), json).expect("settings file");
     }
 
-    /// Runs `raydock` in the home directory with `PATH` empty, so a run that got as far as starting
+    /// Runs `rayline` in the home directory with `PATH` empty, so a run that got as far as starting
     /// a harness would fail differently.
     fn run(&self, args: &[&str]) -> Output {
-        self.run_exe(Path::new(env!("CARGO_BIN_EXE_raydock")), args)
+        self.run_exe(Path::new(env!("CARGO_BIN_EXE_rayline")), args)
     }
 
     /// Like [`Home::run`], with the binary at `exe`. The Hugging Face cache is
@@ -50,7 +50,7 @@ impl Home {
             .env("HF_HOME", self.0.join("hf"))
             .env_remove("HF_HUB_CACHE")
             .output()
-            .expect("run raydock")
+            .expect("run rayline")
     }
 }
 
@@ -226,11 +226,11 @@ const LOCAL_WITH_TOKENIZER: &str = r#"{
 fn a_signed_out_local_start_fails_before_it_clears_state_or_downloads() {
     let home = Home::new();
     home.settings(LOCAL_WITH_TOKENIZER);
-    // An installed release: `raydock` with `rayline-core` beside it.
+    // An installed release: `rayline` with `rayline-core` beside it.
     let bin = home.0.join("bin");
     fs::create_dir_all(&bin).expect("bin dir");
-    let exe = bin.join(format!("raydock{}", std::env::consts::EXE_SUFFIX));
-    fs::copy(env!("CARGO_BIN_EXE_raydock"), &exe).expect("copy raydock");
+    let exe = bin.join(format!("rayline{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(env!("CARGO_BIN_EXE_rayline"), &exe).expect("copy rayline");
     fs::write(
         bin.join(format!("rayline-core{}", std::env::consts::EXE_SUFFIX)),
         "",
@@ -241,8 +241,8 @@ fn a_signed_out_local_start_fails_before_it_clears_state_or_downloads() {
         .arg("--version")
         .stdout(Stdio::null())
         .spawn()
-        .expect("run raydock");
-    exited.wait().expect("raydock exits");
+        .expect("run rayline");
+    exited.wait().expect("rayline exits");
     let state = home.0.join(".rayline").join("local");
     fs::create_dir_all(&state).expect("state dir");
     let supervisor = format!(

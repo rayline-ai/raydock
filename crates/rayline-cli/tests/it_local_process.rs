@@ -167,7 +167,7 @@ impl Runtime {
             text.push('}');
         }
         fs::write(dir.join("config.json"), text).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_raydock"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_rayline"));
         command.env_remove("RAYLINE_ROUTER_API_KEY");
         if let Some(key) = router_key {
             command.env("RAYLINE_ROUTER_API_KEY", key);

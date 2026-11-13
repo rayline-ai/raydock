@@ -25,7 +25,7 @@ function Remove-RetiredBackups {
     param([string]$Directory)
     # A dot .old name marks a committed replacement. .tmp files can still be
     # needed for recovery.
-    $pattern = '^\.(raydock\.exe|rayline\.exe|rayline-core\.exe|rayline-core-LICENSE)\.old-[0-9]+-[0-9a-f]+$'
+    $pattern = '^\.(rayline\.exe|rayline-core\.exe|rayline-core-LICENSE)\.old-[0-9]+-[0-9a-f]+$'
     try {
         Get-ChildItem -LiteralPath $Directory -File -Force | Where-Object { $_.Name -match $pattern } | ForEach-Object {
             Remove-RetiredBackup -Path $_.FullName
@@ -96,7 +96,7 @@ if (-not (Get-Command minisign -ErrorAction SilentlyContinue)) {
 if (-not $PSBoundParameters.ContainsKey('Version')) {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
 } elseif ($Version.StartsWith('v')) {
-    Fail "-Version takes a bare version such as 0.2.0, not $Version"
+    Fail "-Version takes a bare version such as 0.5.0, not $Version"
 } else {
     $BaseUrl = "https://github.com/$Repo/releases/download/v$Version"
 }
@@ -154,24 +154,14 @@ try {
     $InstallDir = (New-Item -ItemType Directory -Force -Path $InstallDir).FullName
     Remove-RetiredBackups $InstallDir
     Install-File -Source $LicensePath -Dest (Join-Path $InstallDir "rayline-core-LICENSE")
-    Install-File -Source $RaylinePath -Dest (Join-Path $InstallDir "raydock.exe")
-    $alias = Join-Path $InstallDir 'rayline.exe'
-    $AliasStaged = Join-Path $InstallDir ".rayline.exe.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
-    try {
-        # Hard links need no administrator or Developer Mode privileges. The new
-        # launcher turns this initial alias into a forwarding EXE on first use.
-        New-Item -ItemType HardLink -Path $AliasStaged -Target (Join-Path $InstallDir 'raydock.exe') | Out-Null
-        Install-StagedFile -Staged $AliasStaged -Dest $alias
-    } finally {
-        if (Test-Path -LiteralPath $AliasStaged) { Remove-Item -LiteralPath $AliasStaged -Force }
-    }
+    Install-File -Source $RaylinePath -Dest (Join-Path $InstallDir "rayline.exe")
     Install-File -Source $CorePath -Dest (Join-Path $InstallDir "rayline-core.exe")
 
-    Write-Host "Installed Raydock to $InstallDir"
+    Write-Host "Installed Rayline CLI to $InstallDir"
     $PathEntries = $env:PATH -split [System.IO.Path]::PathSeparator
     if ($PathEntries -notcontains $InstallDir) {
         Write-Host ""
-        Write-Host "Add Raydock to your PATH:"
+        Write-Host "Add Rayline CLI to your PATH:"
         Write-Host "  `$env:PATH = `"$InstallDir;$env:PATH`""
     }
 } finally {
