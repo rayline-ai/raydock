@@ -10,7 +10,7 @@ Sections marked **Internal** are real but stay out of public docs and `--help`. 
 2. **No silent fallback.** A missing or invalid value is an error. It is never skipped, guessed or replaced by another source.
 3. **One spelling, one value.** Each key, flag and env var has one name and each meaning has one value. No aliases, no alternative spellings, no deprecated names.
 4. **No compatibility code.** No migration of old files, keys, names or install layouts. Old files are ignored, not read and not moved.
-5. **No hard-coded models in the local process.** The candidates ARC picks from, their context windows, output limits and prices come from ARC or from `settings.json`, never from constants in code. The model a harness asks for in cloud mode is today's default and is unchanged.
+5. **No hard-coded models in the local process.** The candidates ARC picks from, their context windows, output limits and prices come from ARC or from `settings.json`, never from constants in code, except the three cloud models in section 5.3 item 2, which stay until the Rayline router publishes ARC's model set. The model a harness asks for in cloud mode is today's default and is unchanged.
 6. **No new surface.** Nothing is added that this spec does not list.
 
 ## 2. Command name
@@ -212,11 +212,11 @@ The action ARC identifies is the model id after its provider prefix (`qwen/qwen3
 1. When ARC picks a model in `models`, the local process sends the request to its endpoint under its `model` name.
 2. The only models ARC can pick that are not in `models` are these three Rayline cloud models. When ARC picks one, it goes to Rayline cloud under its Rayline cloud id:
 
-   | Rayline cloud id | Id in the core's registry | Context window | Output ceiling |
-   |---|---|---|---|
-   | `claude-opus-5-5` | `anthropic/claude-opus-5.5` | 1,000,000 | 128,000 |
-   | `claude-sonnet-5-5` | `anthropic/claude-sonnet-5.5` | 1,000,000 | 128,000 |
-   | `claude-haiku-5-5` | `anthropic/claude-haiku-5.5` | 1,000,000 | 128,000 |
+   | Rayline cloud id | Id in the core's registry | Context window | Output ceiling | Input modalities |
+   |---|---|---|---|---|
+   | `claude-opus-5-5` | `anthropic/claude-opus-5.5` | 1,000,000 | 128,000 | `["text"]` |
+   | `claude-sonnet-5-5` | `anthropic/claude-sonnet-5.5` | 1,000,000 | 128,000 | `["text"]` |
+   | `claude-haiku-5-5` | `anthropic/claude-haiku-5.5` | 1,000,000 | 128,000 | `["text"]` |
 
    A `models` entry keyed by one of the registry ids replaces that cloud model. ARC prices the cloud models. This list goes when the Rayline router publishes ARC's model set (section 10.4 item 14).
 3. Nothing marks a model as "local". Every entry works the same way.
