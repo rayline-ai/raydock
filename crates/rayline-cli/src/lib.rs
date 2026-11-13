@@ -12,6 +12,7 @@ pub mod claude_app;
 pub(crate) mod claude_daemon;
 pub mod codex;
 pub mod codex_app;
+pub mod config;
 pub(crate) mod detach;
 pub mod discover;
 pub mod harness;
