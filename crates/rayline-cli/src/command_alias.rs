@@ -81,11 +81,14 @@ pub(crate) fn migrate_legacy_payload() -> Result<Option<PathBuf>, UpdateError> {
     };
     update::replace_binary(&executable, &primary)
         .and_then(|()| install_alias(&primary))
-        .map_err(|error| {
-            UpdateError::Install(format!(
+        .map_err(|error| match error {
+            UpdateError::InUse(message) => UpdateError::InUse(format!(
+                "{message}. Another process holds the file; run the command again once it has closed it."
+            )),
+            error => UpdateError::Install(format!(
                 "{error}. Re-run the Raydock installer with write access to the directory containing {}, or install into a user-writable directory and update PATH.",
                 executable.display()
-            ))
+            )),
         })?;
     eprintln!("Use `raydock`; `rayline` remains an alias.");
     Ok(Some(primary))
