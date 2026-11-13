@@ -211,7 +211,7 @@ pub async fn run(args: Args) -> Result<()> {
             shutdown: shutdown_tx,
             login_command: login_command(args.env_name.as_deref()),
             classifier,
-            metrics: RouterMetrics::new("rayline-hybrid"),
+            metrics: RouterMetrics::new("rayline-local"),
             routing_metadata,
         });
         let ready = Ready {

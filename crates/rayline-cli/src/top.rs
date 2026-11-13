@@ -73,7 +73,7 @@ impl TopSource {
 
     async fn fetch_snapshot(&self) -> io::Result<Value> {
         let snapshot = fetch_top_snapshot(&self.client, &self.url).await?;
-        if snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-hybrid")
+        if snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-local")
             || ["pid", "core_pid", "instance_id"]
                 .iter()
                 .any(|key| snapshot.get(key) != self.identity.get(key))
@@ -746,7 +746,7 @@ mod tests {
                 } else if let Some(body) = state.get("snapshot_body") {
                     body.clone()
                 } else {
-                    serde_json::json!({"runtime": "rayline-hybrid", "instance_id": "test-core",
+                    serde_json::json!({"runtime": "rayline-local", "instance_id": "test-core",
                         "pid": std::process::id(), "core_pid": std::process::id(),
                         "totals": {"completed_requests": 1, "output_tokens": 12}, "active": [],
                         "recent": [{"request_id": "hybrid_1", "target": "remote", "state": "completed",
@@ -782,7 +782,7 @@ mod tests {
         let server = hybrid_top_fixture(&home, serde_json::json!({})).await;
         let rendered = render_top_from_home(&home, &JSON).await.unwrap();
         let snapshot: Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(snapshot["runtime"], "rayline-hybrid");
+        assert_eq!(snapshot["runtime"], "rayline-local");
         assert_eq!(snapshot["recent"][0]["selected_model"], Value::Null);
         assert_eq!(snapshot["recent"][0]["output_tokens"], 12);
         assert_eq!(top_target_cell(&snapshot["recent"][0]), "cloud");
@@ -866,7 +866,7 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_snapshots_are_errors_never_panics() {
-        let head = serde_json::json!({"runtime": "rayline-hybrid", "pid": std::process::id(),
+        let head = serde_json::json!({"runtime": "rayline-local", "pid": std::process::id(),
             "core_pid": std::process::id(), "instance_id": "test-core"});
         let with = |key: &str, value: Value| {
             let mut body = head.clone();
