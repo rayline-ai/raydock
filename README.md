@@ -27,9 +27,11 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1 | iex
 ```
 
-The installers place `raydock`, its alias `rayline` and `rayline-core` in
-`~/.rayline/bin`, and they check every binary they download against the
-release's `SHA256SUMS` file.
+The installers place `raydock`, its alias `rayline`, `rayline-core` and
+`rayline-core-LICENSE` in `~/.rayline/bin`. They need
+[`minisign`](https://jedisct1.github.io/minisign/): they verify the release's
+`SHA256SUMS.minisig` against the pinned release key, then each file they
+download against `SHA256SUMS`.
 
 ## Quick start
 

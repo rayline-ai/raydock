@@ -25,7 +25,7 @@ Options:
 Commands:
   auth             Sign in, sign out, show status, print a token
   run              Launch a coding harness on ARC
-  local            Start, stop or inspect the local Rayline process (supports hybrid mode)
+  local            Start, stop or inspect the local Rayline process
   top              Show live request metrics
   update           Check for or install a Rayline update
 ";

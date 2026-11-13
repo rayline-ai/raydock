@@ -32,10 +32,12 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1 | iex
 ```
 
-The installer places `raydock`, its alias `rayline` and `rayline-core` in
-`~/.rayline/bin`. It checks every binary it downloads against the release's
-`SHA256SUMS` file. Both `raydock` and `rayline` run the same CLI, and this
-guide writes `rayline`.
+The installer places `raydock`, its alias `rayline`, `rayline-core` and
+`rayline-core-LICENSE` in `~/.rayline/bin`. It needs
+[`minisign`](https://jedisct1.github.io/minisign/): it verifies the release's
+`SHA256SUMS.minisig` against the pinned release key, then each file it
+downloads against `SHA256SUMS`. Both `raydock` and `rayline` run the same
+CLI, and this guide writes `rayline`.
 
 ## Sign in
 
@@ -98,13 +100,20 @@ rayline run codex -- exec "summarize this repo"
   the two. The run is in local mode if `<file>` has a `routing` section, and
   in cloud mode if it doesn't.
 - `--local` and `--config` together are a usage error.
+- Local mode refuses `rayline run claude --isolated`,
+  `rayline run claude-desktop`, `rayline run codex --model`,
+  `rayline run codex --auth subscription`, `rayline run codex app` and
+  `rayline run codex configure`. The error says the option isn't available in
+  local mode.
 - Rayline options come right after the harness name. The first argument that
   isn't a Rayline option, and everything after `--`, goes to the harness
   unchanged, including `--help`.
 - `rayline run --help` prints the usage. An unknown harness is a usage error.
 
 Rayline writes the files it generates for a harness under
-`~/.rayline/harness/<name>/`.
+`~/.rayline/harness/<name>/` in cloud mode and under
+`~/.rayline/local/harness/<name>/` in local mode. Each mode writes its own
+endpoint, key and model list there.
 
 ### Claude Code
 
@@ -121,7 +130,7 @@ rayline run claude --isolated
 | Option or subcommand | Does |
 |---|---|
 | `--model <model>` | The model Codex asks for. |
-| `--auth auto\|subscription\|none` | How Codex authenticates. `auto` uses Rayline cloud with your Rayline router key, `subscription` uses your existing ChatGPT login, and `none` uses no Codex login. |
+| `--auth auto\|subscription\|none` | How Codex authenticates. `auto` works in both modes: in cloud mode Codex uses your Rayline router key, and in local mode it sends only the local process's token. In local mode `none` does the same as `auto`, and `subscription` is refused. In cloud mode `subscription` and `none` aren't available yet, and Rayline refuses them. |
 | `rayline run codex app [WORKSPACE]` | Launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`, and opens `WORKSPACE` if you give one. |
 | `rayline run codex configure` | Writes a Codex profile to `$CODEX_HOME/rayline.config.toml`. |
 
@@ -184,6 +193,10 @@ rayline update --check
 | `--force` | Installs even when the target version isn't newer. |
 | `--dry-run` | Downloads and verifies the update, then reports what it would install, without installing it. |
 
+If Rayline was installed with Homebrew or comes with Rayline.app,
+`rayline update` installs nothing and tells you to update through Homebrew or
+the app instead.
+
 ## Files
 
 `~/.config/rayline/` holds only two files:
@@ -196,9 +209,11 @@ rayline update --check
 
 ```
 ~/.rayline/
-  bin/                          raydock, rayline -> raydock, rayline-core
+  bin/                          raydock, rayline -> raydock, rayline-core,
+                                rayline-core-LICENSE
   local/                        local process state
-  harness/<name>/               files Rayline generates per harness
+    harness/<name>/             files Rayline generates per harness in local mode
+  harness/<name>/               files Rayline generates per harness in cloud mode
 ```
 
 ## Config errors

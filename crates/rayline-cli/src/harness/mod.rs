@@ -13,8 +13,11 @@
 //! sessions), so two concurrent launches of one harness with different keys
 //! share the last-written key.
 //!
-//! Every config uses Anthropic Messages, except OpenClaw, whose default
-//! provider speaks OpenAI Chat Completions. The models, their names and their
+//! In cloud mode every config defaults to Anthropic Messages, except OpenClaw,
+//! whose default provider speaks OpenAI Chat Completions; Hermes and OpenClaw
+//! also get an OpenAI Responses provider beside the default. In local mode each
+//! config sets up only its harness's one protocol (spec section 5.2): Hermes
+//! Responses, OpenClaw Chat Completions. The models, their names and their
 //! limits are the ones the router's `GET /v1/models` lists for the key, read
 //! once per launch ([`fetch_hosted_models`]): the main agent defaults to the
 //! listed ARC Sage (`product: arc-sage-1.0`) and, where the harness has a
