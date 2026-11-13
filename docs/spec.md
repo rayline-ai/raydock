@@ -348,8 +348,8 @@ Only two files:
     runtime.lock                one local process at a time
     runtime.log                 its log
   harness/<name>/               files Rayline generates per harness: pi, hermes, omp,
-                                opencode, openclaw, codex-app, claude-desktop,
-                                claude-code (only with --isolated)
+                                opencode, openclaw, codex, codex-app,
+                                claude-desktop, claude-code (only with --isolated)
   harness/claude-code/daemon-launches.json
                                 Claude Code daemons Rayline started
   harness/claude-desktop/claude-desktop.lock
