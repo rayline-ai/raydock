@@ -69,8 +69,12 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
-            echo "Release tag must start with v followed by a version: $RELEASE_TAG" >&2
+          # The version grammar `raydock update` parses: X.Y.Z, optionally
+          # -<main|dev|rc>.<N> and +<build>, numbers without leading zeros.
+          number='(0|[1-9][0-9]*)'
+          version_re="^v${number}\.${number}\.${number}(-(main|dev|rc)\.${number})?(\+[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*)?$"
+          if [[ ! "$RELEASE_TAG" =~ $version_re ]]; then
+            echo "Release tag $RELEASE_TAG is not v<X.Y.Z>[-<main|dev|rc>.<N>][+<build>] with numbers without leading zeros" >&2
             exit 1
           fi
           echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
@@ -251,8 +255,12 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
-            echo "Release tag must start with v followed by a version: $RELEASE_TAG" >&2
+          # The version grammar `raydock update` parses: X.Y.Z, optionally
+          # -<main|dev|rc>.<N> and +<build>, numbers without leading zeros.
+          number='(0|[1-9][0-9]*)'
+          version_re="^v${number}\.${number}\.${number}(-(main|dev|rc)\.${number})?(\+[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*)?$"
+          if [[ ! "$RELEASE_TAG" =~ $version_re ]]; then
+            echo "Release tag $RELEASE_TAG is not v<X.Y.Z>[-<main|dev|rc>.<N>][+<build>] with numbers without leading zeros" >&2
             exit 1
           fi
           version="${RELEASE_TAG#v}"

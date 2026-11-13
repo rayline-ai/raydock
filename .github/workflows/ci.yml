@@ -12,7 +12,7 @@ permissions:
 
 env:
   RUST_VERSION: "1.88.0"
-  RAYLINE_VERSION: "0.2.0-ci"
+  RAYLINE_VERSION: "0.2.0-dev.0"
   RAYLINE_CHANNEL: "main"
 
 jobs:

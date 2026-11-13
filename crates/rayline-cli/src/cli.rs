@@ -712,7 +712,9 @@ fn parse_update(args: &mut Args<'_>) -> Result<Option<UpdateRequest>, UsageError
             "--version" => {
                 let value = args.value(name, inline, UPDATE)?;
                 let version = Version::parse(value).map_err(|_| {
-                    UPDATE.error("invalid `--version` (use a release version such as `1.2.3`)")
+                    UPDATE.error(
+                        "invalid `--version` (use a release version such as `1.2.3` or `1.2.3-rc.1`)",
+                    )
                 })?;
                 set_once(&mut pinned_version, version, name, UPDATE)?;
             }
@@ -729,8 +731,12 @@ fn parse_update(args: &mut Args<'_>) -> Result<Option<UpdateRequest>, UsageError
                 set_once(&mut base_url, url, name, UPDATE)?;
             }
             "--install-path" => {
-                let value = args.value(name, inline, UPDATE)?;
-                set_once(&mut install_path, PathBuf::from(value), name, UPDATE)?;
+                let value = PathBuf::from(args.value(name, inline, UPDATE)?);
+                let binary = format!("{}{}", crate::CLI_BIN, std::env::consts::EXE_SUFFIX);
+                if value.file_name() != Some(binary.as_ref()) {
+                    return Err(UPDATE.error(format!("`--install-path` must name `{binary}`")));
+                }
+                set_once(&mut install_path, value, name, UPDATE)?;
             }
             "--force" if inline.is_none() => force = true,
             "--check" if inline.is_none() => check_only = true,
@@ -1615,6 +1621,11 @@ mod tests {
         assert_error(&["top", "--watch"], "unexpected `--watch`");
     }
 
+    /// An `--install-path` naming this platform's `raydock` binary.
+    fn raydock_path() -> String {
+        format!("/tmp/raydock{}", std::env::consts::EXE_SUFFIX)
+    }
+
     #[test]
     fn update_takes_its_options_and_the_hidden_release_testing_ones() {
         assert_eq!(
@@ -1625,7 +1636,7 @@ mod tests {
                 "1.2.3",
                 "--base-url=http://127.0.0.1:1",
                 "--install-path",
-                "/tmp/raydock",
+                &raydock_path(),
             ])
             .1,
             Command::Update(Box::new(UpdateRequest {
@@ -1634,18 +1645,45 @@ mod tests {
                 check_only: true,
                 dry_run: false,
                 base_url: Some(Url::parse("http://127.0.0.1:1").unwrap()),
-                install_path: Some(PathBuf::from("/tmp/raydock")),
+                install_path: Some(PathBuf::from(raydock_path())),
             }))
         );
         assert_error(&["update", "--channel", "dev"], "unexpected `--channel`");
     }
 
     #[test]
+    fn update_install_path_must_name_the_raydock_binary() {
+        let binary = format!("raydock{}", std::env::consts::EXE_SUFFIX);
+        for path in [
+            "/tmp/rayline",
+            "/tmp/foo",
+            "/tmp/raydock-old",
+            "/tmp/",
+            "/tmp/raydock/..",
+        ] {
+            assert_error(
+                &["update", "--install-path", path],
+                &format!("`--install-path` must name `{binary}`"),
+            );
+        }
+    }
+
+    #[test]
     fn update_refuses_a_bad_version_or_base_url_at_parse() {
-        for version in ["latest", "1.2.3+", "v1..2"] {
+        for version in [
+            "latest",
+            "1.2.3+",
+            "v1..2",
+            "1.2.3-beta.1",
+            "1.2.3-RC.1",
+            "1.2.3-rc1",
+            "1.2.3-rc.01",
+            "0.0.0-sigtest1",
+            "1.2.3-rc.18446744073709551616",
+        ] {
             assert_error(
                 &["update", "--version", version],
-                "invalid `--version` (use a release version such as `1.2.3`)",
+                "invalid `--version` (use a release version such as `1.2.3` or `1.2.3-rc.1`)",
             );
         }
         for url in [
@@ -1663,10 +1701,11 @@ mod tests {
 
     #[test]
     fn update_options_need_a_value_and_are_given_once() {
+        let install_path = raydock_path();
         for (name, value) in [
             ("--version", "1.2.3"),
             ("--base-url", "http://127.0.0.1:1"),
-            ("--install-path", "/tmp/raydock"),
+            ("--install-path", install_path.as_str()),
         ] {
             let needs = format!("`{name}` needs a value");
             assert_error(&["update", name], &needs);
@@ -1956,6 +1995,8 @@ mod tests {
             &["auth", word],
             &["top", word],
             &["run", "claude-desktop", "status", word],
+            &["update", "--version", word],
+            &["update", "--install-path", word],
             &[&format!("--{word}")],
         ] {
             assert!(!error(args).contains(word), "{args:?}");
