@@ -251,7 +251,7 @@ async fn top_snapshot(client: &reqwest::Client, url: &str, token: &str) -> Value
         "snapshot exposed its gateway credential"
     );
     let snapshot: Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(snapshot["runtime"], "rayline-hybrid");
+    assert_eq!(snapshot["runtime"], "rayline-local");
     snapshot
 }
 
