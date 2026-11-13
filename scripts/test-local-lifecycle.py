@@ -197,6 +197,10 @@ print(json.dumps(sys.argv[1:]))
             env["OPENCLAW_CONTAINER"] = "box"
             run("openclaw", "--", "agent", "-m", "hello", success=False)
             env.pop("OPENCLAW_CONTAINER")
+            # Local mode writes its harness files apart from cloud mode's.
+            for name in ("pi", "openclaw"):
+                assert (state / "harness" / name).is_dir(), name
+            assert not (root / ".rayline" / "harness").exists()
             # A running process whose health check fails makes status exit 1.
             request = urllib.request.Request(first["listen_url"] + "/unready", data=b"{}",
                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
