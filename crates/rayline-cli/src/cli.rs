@@ -252,15 +252,19 @@ impl Run {
 }
 
 impl Launch {
-    /// The protocol the harness speaks, checked against `endpoints` in a
-    /// local-mode run.
+    /// The one protocol the harness speaks, the one its Rayline config sets
+    /// up (spec section 5.2), checked against `endpoints` in a local-mode run.
     pub(crate) fn protocol(&self) -> Protocol {
         match self {
             Launch::Claude { .. } | Launch::ClaudeDesktop(_) => Protocol::AnthropicMessages,
             Launch::Codex { .. } | Launch::CodexApp { .. } | Launch::CodexConfigure(_) => {
                 Protocol::OpenaiResponses
             }
-            Launch::Harness { .. } => Protocol::OpenaiChat,
+            Launch::Harness { harness, .. } => match harness {
+                Harness::OpenCode | Harness::Pi | Harness::Omp => Protocol::AnthropicMessages,
+                Harness::Hermes => Protocol::OpenaiResponses,
+                Harness::OpenClaw => Protocol::OpenaiChat,
+            },
         }
     }
 
@@ -1431,9 +1435,15 @@ mod tests {
         for codex in [&["run", "codex"][..], &["run", "codex", "app"]] {
             assert_eq!(protocol(codex), Protocol::OpenaiResponses);
         }
-        for name in ["opencode", "pi", "omp", "hermes", "openclaw"] {
-            assert_eq!(protocol(&["run", name]), Protocol::OpenaiChat, "{name}");
+        for name in ["opencode", "pi", "omp"] {
+            assert_eq!(
+                protocol(&["run", name]),
+                Protocol::AnthropicMessages,
+                "{name}"
+            );
         }
+        assert_eq!(protocol(&["run", "hermes"]), Protocol::OpenaiResponses);
+        assert_eq!(protocol(&["run", "openclaw"]), Protocol::OpenaiChat);
     }
 
     // ── auth, top, update ────────────────────────────────────────────────

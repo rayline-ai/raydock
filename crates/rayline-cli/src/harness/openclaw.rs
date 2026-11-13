@@ -23,7 +23,9 @@
 //!   Responses, where `compat.supportsPromptCacheKey` sends the session as
 //!   `prompt_cache_key`; without it OpenClaw sends no key on a custom
 //!   endpoint. ARC is not served on Responses yet, so Chat Completions stays
-//!   the default.
+//!   the default. Under `rayline run openclaw --local` OpenClaw speaks only Chat
+//!   Completions, its one protocol (spec section 5.2), so this provider is not
+//!   written there.
 //! - Both providers take the per-launch `x-conversation-id` only when
 //!   `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` forces it
 //!   ([`super::ConversationIdFallback`]).
@@ -133,6 +135,24 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             })
             .collect::<Vec<_>>()
     };
+    let mut providers = json!({
+        PROVIDER_ID: {
+            "baseUrl": ctx.v1_base(),
+            "apiKey": api_key,
+            "api": "openai-completions",
+            "headers": headers,
+            "models": models(json!({ "sendSessionAffinityHeaders": true }))
+        }
+    });
+    if ctx.capabilities.is_none() {
+        providers[RESPONSES_PROVIDER_ID] = json!({
+            "baseUrl": ctx.v1_base(),
+            "apiKey": api_key,
+            "api": "openai-responses",
+            "headers": headers,
+            "models": models(json!({ "supportsPromptCacheKey": true }))
+        });
+    }
     let config = json!({
         "secrets": {
             "providers": {
@@ -153,22 +173,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         },
         "models": {
             "mode": "merge",
-            "providers": {
-                PROVIDER_ID: {
-                    "baseUrl": ctx.v1_base(),
-                    "apiKey": api_key,
-                    "api": "openai-completions",
-                    "headers": headers,
-                    "models": models(json!({ "sendSessionAffinityHeaders": true }))
-                },
-                RESPONSES_PROVIDER_ID: {
-                    "baseUrl": ctx.v1_base(),
-                    "apiKey": api_key,
-                    "api": "openai-responses",
-                    "headers": headers,
-                    "models": models(json!({ "supportsPromptCacheKey": true }))
-                }
-            }
+            "providers": providers
         }
     });
     Plan {
@@ -261,6 +266,38 @@ mod tests {
             responses["models"][0]["compat"]["supportsPromptCacheKey"],
             true
         );
+    }
+
+    #[test]
+    fn local_mode_writes_only_the_chat_completions_provider() {
+        use super::super::tests::temp_dir;
+        use super::super::{ConversationIdFallback, LaunchModels, RenderContext};
+        let dir = temp_dir("openclaw-hybrid");
+        let capabilities = rayline_local_router::ModelCapabilities {
+            context_window: 16384,
+            max_output_tokens: 8192,
+            input_modalities: vec!["text".into()],
+        };
+        let ctx = RenderContext {
+            key: TEST_KEY,
+            router_url: TEST_URL,
+            config_dir: &dir,
+            conversation_id: ConversationIdFallback::new(None),
+            allow_empty_signature: true,
+            capabilities: Some(&capabilities),
+            harness_major_version: None,
+            models: LaunchModels::hybrid(&capabilities),
+        };
+        let plan = super::plan(&ctx);
+        let file = plan
+            .files
+            .iter()
+            .find(|file| file.name == CONFIG_FILE)
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&file.contents).unwrap();
+        let providers = config["models"]["providers"].as_object().unwrap();
+        assert_eq!(providers.keys().collect::<Vec<_>>(), ["rayline"]);
+        assert_eq!(providers["rayline"]["api"], "openai-completions");
     }
 
     #[test]

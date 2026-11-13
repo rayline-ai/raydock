@@ -25,45 +25,74 @@ def main():
         # `rayline run <harness> --local` connects to the process in ~/.rayline/hybrid.
         state = root / ".rayline" / "hybrid"
         env = dict(os.environ, HOME=str(root))
-        settings = root / ".config" / "rayline" / "settings.json"
-        settings.parent.mkdir(parents=True)
-        settings.write_text(json.dumps({"routing": {
-            "decisions_model": "arc-swift-1.0",
-            "classifier_model": "anthropic/claude-haiku-5.5",
-            "policy": {"preset": "arc-policy.hybrid-default.v1"}}}))
         env.pop("OPENCLAW_CONTAINER", None)
         installed = root / "installed"
         installed.mkdir()
         shutil.copy(CLI, installed / "rayline")
         shutil.copy(RLD, installed / "rld")
-        credential_env = ["RAYLINE_TEST_HOSTED_ALIAS", "RAYLINE_TEST_LOCAL_ALIAS", "ANTHROPIC_AUTH_TOKEN"]
-        for name in credential_env:
+        # The endpoints' own keys come from the shell; the router key comes
+        # only from the saved credentials, never from the shell.
+        local_env = ["RAYLINE_TEST_LOCAL_ALIAS", "ANTHROPIC_AUTH_TOKEN"]
+        credential_env = sorted(local_env + ["RAYLINE_ROUTER_API_KEY"])
+        for name in local_env:
             env[name] = "synthetic-runtime-only-" + name
         for name in ("RAYLINE_ROUTER_API_KEY", "RAYLINE_EXEC_AUTH_TOKEN", "RAYLINE_API_KEY"):
             env.pop(name, None)
+        # The fixture core writes its requests here.
+        env["RAYLINE_FIXTURE_EVENTS"] = str(root / "events.jsonl")
         core = installed / "rayline-core"
         shutil.copy(ROOT / "crates/rayline-daemon/tests/fixtures/execution-contract.py", core)
         core.chmod(0o700)
-        config = root / "core.json"
-        config.write_text(json.dumps({"events": str(root / "events.jsonl"),
-            "cancelled": str(root / "cancelled"),
-            "decisions": {"url": "http://127.0.0.1:9/decisions", "auth_env": credential_env[0]},
-            "deployments": [{"auth_env": name} for name in credential_env[1:]]}))
+        # Decisions go to the loopback `fixture` router, which start does not probe.
+        settings = root / ".config/rayline/settings.json"
+        settings.parent.mkdir(parents=True)
+        credentials = settings.parent / "credentials.json"
+        credentials.write_text(json.dumps({"environments": {"fixture": {
+            "session": {"email": "fixture@example.com", "subject": "fixture",
+                        "access_token": "synthetic-access", "access_token_expires_at": "2100-01-01T00:00:00Z",
+                        "refresh_token": "synthetic-refresh", "refresh_token_expires_at": "2100-01-01T00:00:00Z",
+                        "signed_in_at": "2023-11-14T22:13:20Z"},
+            "router_key": {"api_key": "synthetic-saved-router-key", "subject": "fixture",
+                           "saved_at": "2023-11-14T22:13:20Z"}}}}))
+        credentials.chmod(0o600)
+        # Both endpoints list the protocols of the harnesses run below: claude
+        # and pi speak anthropic_messages, openclaw speaks openai_chat.
+        settings.write_text(json.dumps({
+            "environments": {"fixture": {"base_url": "http://127.0.0.1:9",
+                                         "login_url": "http://127.0.0.1:9/cli-auth"}},
+            "endpoints": {
+                "box": {"base_url": "http://127.0.0.1:9",
+                        "protocols": ["openai_chat", "anthropic_messages"],
+                        "api_key_env": "RAYLINE_TEST_LOCAL_ALIAS"},
+                "gateway": {"base_url": "http://127.0.0.1:9",
+                            "protocols": ["anthropic_messages", "openai_chat"],
+                            "api_key_env": "ANTHROPIC_AUTH_TOKEN"},
+            },
+            "models": {
+                "z-ai/glm-5.3-flash": {"endpoint": "box", "model": "glm",
+                                       "context_window": 131072, "max_output_tokens": 8192},
+                "qwen/qwen3.8-27b": {"endpoint": "gateway", "model": "qwen",
+                                     "context_window": 98304, "max_output_tokens": 8192},
+            },
+            "routing": {"decisions_model": "arc-swift-1.0",
+                        "classifier_model": "anthropic/claude-haiku-5.5",
+                        "policy": {"preset": "arc-policy.prefer-local.v1"}},
+        }))
 
         def cli(*args, success=True):
             result = subprocess.run([str(installed / "rayline"), "hybrid", "--state-dir", str(state), *args],
                                     env=env, capture_output=True, text=True, timeout=75)
             assert (result.returncode == 0) == success, (args, result.stdout, result.stderr)
-            return result.stdout
+            return result.stdout if success else result.stderr
 
         def run(harness, *args, success=True):
             result = subprocess.run([str(installed / "rayline"), "run", harness, "--local", *args],
                                     env=env, capture_output=True, text=True, timeout=75)
             assert (result.returncode == 0) == success, (harness, args, result.stdout, result.stderr)
-            return result.stdout
+            return result.stdout if success else result.stderr
 
         def start():
-            cli("start", "--config", str(config), "--port", "0")
+            cli("start", "--env", "fixture", "--port", "0")
             return json.loads((state / "ready.json").read_text())
 
         def wait_dead(pid):
@@ -79,12 +108,13 @@ def main():
         try:
             status = json.loads(cli("status"))
             assert status["health"]["instance_id"] == first["instance_id"]
-            cli("start", "--core", str(core), "--config", str(config), "--port", "0", success=False)
+            cli("start", "--core", str(core), "--env", "fixture", "--port", "0", success=False)
             token = (state / "gateway-token").read_text()
             assert token not in json.dumps(first)
             assert token not in (state / "runtime.log").read_text()
-            assert first["credential_env"] == sorted(credential_env)
-            assert all(env[name] not in json.dumps(first) for name in credential_env)
+            assert first["credential_env"] == credential_env
+            assert all(env[name] not in json.dumps(first) for name in local_env)
+            assert "synthetic-saved-router-key" not in json.dumps(first)
 
             # A real child executable uses the Claude launch environment to send HTTP.
             harness_dir = root / "bin"
@@ -94,7 +124,6 @@ def main():
 import json, os, urllib.request
 assert 'RAYLINE_ROUTER_API_KEY' not in os.environ
 assert 'RAYLINE_EXEC_AUTH_TOKEN' not in os.environ
-assert 'RAYLINE_TEST_HOSTED_ALIAS' not in os.environ
 assert 'RAYLINE_TEST_LOCAL_ALIAS' not in os.environ
 assert not os.environ['ANTHROPIC_AUTH_TOKEN'].startswith('synthetic-runtime-only-')
 assert os.environ['CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK'] == '1'
@@ -111,12 +140,14 @@ print('harness request reached execution core')
             assert "harness request reached execution core" in run("claude", "--", "-p", "test")
             event = json.loads((root / "events.jsonl").read_text().splitlines()[-1])
             assert event["path"] == "/v1/messages"
-            assert sorted(event["credential_env_present"]) == sorted(credential_env)
+            # rld hands the core the saved router key (Decisions and the cloud
+            # pins) and the endpoints' keys. The fixture lists a name once per
+            # config entry that references it.
+            assert sorted(set(event["credential_env_present"])) == credential_env
             assert json.loads(event["body"])["metadata"]["user_id"] == "session_fixture"
             pi = harness_dir / "pi"
             pi.write_text("""#!/usr/bin/env python3
 import json, os, pathlib
-assert 'RAYLINE_TEST_HOSTED_ALIAS' not in os.environ
 assert 'RAYLINE_TEST_LOCAL_ALIAS' not in os.environ
 provider = json.loads((pathlib.Path(os.environ['PI_CODING_AGENT_DIR']) / 'models.json').read_text())['providers']['rayline']
 model = provider['models'][0]
@@ -128,6 +159,10 @@ print('qualified Pi profile loaded')
 """)
             pi.chmod(0o700)
             assert "qualified Pi profile loaded" in run("pi", "--", "--no-session")
+            # Codex speaks openai_responses, which neither endpoint lists, so
+            # run refuses it before launching anything.
+            refused = run("codex", "--", "exec", "hello", success=False)
+            assert "openai_responses" in refused and ".protocols" in refused, refused
             run("pi", "--", "--resume", success=False)
             # Capture the actual spawned args: an agent must use the config in
             # this process, never an already-running OpenClaw Gateway.
@@ -171,10 +206,9 @@ print(json.dumps(sys.argv[1:]))
             cli("stop")
             wait_dead(third["core_pid"])
             # An incompatible executable fails startup and leaves no owned process/state.
-            bad = json.loads(config.read_text())
-            bad["contract_version"] = 99
-            config.write_text(json.dumps(bad))
-            cli("start", "--core", str(core), "--config", str(config), "--port", "0", success=False)
+            env["RAYLINE_FIXTURE_CONTRACT_VERSION"] = "99"
+            cli("start", "--core", str(core), "--env", "fixture", "--port", "0", success=False)
+            env.pop("RAYLINE_FIXTURE_CONTRACT_VERSION")
             # The core receives Raydock's composed configuration.
             wait_dead(int((state / "core-config.pid").read_text()))
             assert not (state / "ready.json").exists()

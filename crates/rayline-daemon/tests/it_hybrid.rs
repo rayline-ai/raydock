@@ -6,6 +6,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+/// The router key the launcher hands rld; a synthetic stand-in.
+const ROUTER_KEY: &str = "rlk-test-key";
+
 struct Runtime {
     dir: PathBuf,
     child: Child,
@@ -126,9 +129,9 @@ impl Runtime {
             delay,
             deadline,
             capabilities,
-            "http://127.0.0.1:9/decisions",
+            "http://127.0.0.1:9/v1/routes",
             "",
-            None,
+            Some(ROUTER_KEY),
         )
     }
     fn start_with_decisions(
@@ -149,7 +152,7 @@ impl Runtime {
         let script = install_core(&dir);
         let mut config = json!({"events":dir.join("events.jsonl"),
             "cancelled":dir.join("cancelled"), "contract_version":version,
-            "handshake_delay":delay, "decisions": {"url": decisions_url},
+            "handshake_delay":delay, "decisions": {"url": decisions_url, "auth_env": "RAYLINE_ROUTER_API_KEY"},
             "launcher": cfg!(windows)});
         if let Some(capabilities) = capabilities {
             config["capabilities"] = capabilities;
@@ -180,6 +183,7 @@ impl Runtime {
             .arg(dir.join("token"))
             .arg("--ready-file")
             .arg(dir.join("ready.json"))
+            .args(["--classifier-model", "claude-haiku-5-5"])
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
@@ -455,9 +459,9 @@ async fn derived_models_sharing_a_worker_attribute_the_executed_deployment() {
         0,
         120,
         None,
-        "http://127.0.0.1:9/decisions",
+        "http://127.0.0.1:9/v1/routes",
         members,
-        None,
+        Some(ROUTER_KEY),
     );
     let (url, token) = runtime.ready().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -559,7 +563,7 @@ async fn non_router_decisions_url_never_starts_the_core() {
         "https://evil.test@api.rayline.ai/v1/routes",
         "http://api.rayline.ai/v1/routes",
     ] {
-        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, "", None);
+        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, "", Some(ROUTER_KEY));
         assert!(!runtime.exited().await.success(), "{url}");
         assert!(!runtime.dir.join("config.pid").exists(), "{url}");
         assert!(!runtime.dir.join("ready.json").exists());
@@ -577,7 +581,8 @@ async fn non_router_decisions_url_never_starts_the_core() {
             r#","decisions":{"url":"https://api.rayline.ai/v1/routes"}"#,
         ),
     ] {
-        let mut runtime = Runtime::start_with_decisions(1, 0, 120, None, url, raw, None);
+        let mut runtime =
+            Runtime::start_with_decisions(1, 0, 120, None, url, raw, Some(ROUTER_KEY));
         assert!(!runtime.exited().await.success(), "{raw}");
         assert!(!runtime.dir.join("config.pid").exists(), "{raw}");
     }
@@ -790,17 +795,14 @@ async fn an_empty_classifier_response_is_an_error_not_a_completed_request() {
     // JSON answer, and must not be recorded as a completed request just because
     // hyper never polls a known-empty body.
     let (router, recorded) = fake_router_for(1);
-    let deployments = format!(
-        r#","deployments":[{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"claude-sonnet-5-5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
-    );
     let mut runtime = Runtime::start_with_decisions(
         1,
         0,
         120,
         None,
         &format!("{router}/v1/routes"),
-        &deployments,
-        Some("rlk-test-key"),
+        "",
+        Some(ROUTER_KEY),
     );
     let (url, token) = runtime.ready().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -828,19 +830,25 @@ async fn an_empty_classifier_response_is_an_error_not_a_completed_request() {
 }
 
 #[tokio::test]
+async fn without_the_router_key_rld_does_not_start() {
+    let mut runtime =
+        Runtime::start_with_decisions(1, 0, 120, None, "http://127.0.0.1:9/v1/routes", "", None);
+    assert!(!runtime.exited().await.success());
+    assert!(!runtime.dir.join("config.pid").exists());
+    assert!(!runtime.dir.join("ready.json").exists());
+}
+
+#[tokio::test]
 async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_to_the_core() {
     let (router, recorded) = fake_router();
-    let deployments = format!(
-        r#","deployments":[{{"id":"local","kind":"local","url":"http://127.0.0.1:9/v1/chat/completions","protocol":"openai.chat.v1","wire_model":"glm"}},{{"id":"cloud-opus","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"claude-opus-5-5","auth_env":"RAYLINE_ROUTER_API_KEY"}},{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"claude-sonnet-5-5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
-    );
     let mut runtime = Runtime::start_with_decisions(
         1,
         0,
         120,
         None,
         &format!("{router}/v1/routes"),
-        &deployments,
-        Some("rlk-test-key"),
+        "",
+        Some(ROUTER_KEY),
     );
     let (url, token) = runtime.ready().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
@@ -899,7 +907,10 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
             .map(|(_, value)| value.as_str())
     };
     assert!(line.starts_with("POST /v1/messages "), "{line}");
-    assert_eq!(header("authorization"), Some("Bearer rlk-test-key"));
+    assert_eq!(
+        header("authorization"),
+        Some(format!("Bearer {ROUTER_KEY}").as_str())
+    );
     // Claude Haiku 5.5 by default, through the cloud pins' router and key.
     assert_eq!(
         header("x-workshop-required-model"),
@@ -947,17 +958,14 @@ async fn auto_mode_classifier_goes_to_haiku_on_the_cloud_router_and_other_turns_
 #[tokio::test]
 async fn classifier_pin_carries_every_client_session_header_and_no_client_auth() {
     let (router, recorded) = fake_router_for(1);
-    let deployments = format!(
-        r#","deployments":[{{"id":"cloud-sonnet","kind":"cloud","cloud_transport":"model_pin","url":"{router}/v1/messages","protocol":"anthropic.messages.v1","wire_model":"claude-sonnet-5-5","auth_env":"RAYLINE_ROUTER_API_KEY"}}]"#
-    );
     let mut runtime = Runtime::start_with_decisions(
         1,
         0,
         120,
         None,
         &format!("{router}/v1/routes"),
-        &deployments,
-        Some("rlk-test-key"),
+        "",
+        Some(ROUTER_KEY),
     );
     let (url, token) = runtime.ready().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();

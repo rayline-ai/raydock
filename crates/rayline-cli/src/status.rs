@@ -646,26 +646,18 @@ pub(crate) fn hosted_environment(settings: &config::Settings) -> HostedEnvironme
     }
 }
 
-/// Every hosted environment: the built-in prod, then each `environments`
-/// entry of the config, which keeps its own credentials slot even when it is
-/// named `prod`.
-pub(crate) fn hosted_environments(home: &Path) -> Result<Vec<HostedEnvironment>, ConfigError> {
-    let settings = config::load_in(
-        home,
-        &config::LoadOptions {
-            mode: config::Mode::Cloud,
-            env: None,
-            harness_protocol: None,
-        },
-    )?;
-    Ok(std::iter::once(prod_hosted_environment())
+/// Every hosted environment of loaded `settings`: the built-in prod, then
+/// each `environments` entry, which keeps its own credentials slot even when
+/// it is named `prod`.
+pub(crate) fn hosted_environments(settings: &config::Settings) -> Vec<HostedEnvironment> {
+    std::iter::once(prod_hosted_environment())
         .chain(
             settings
                 .environments
                 .iter()
                 .map(|(name, environment)| configured_hosted_environment(name, environment)),
         )
-        .collect())
+        .collect()
 }
 
 fn prod_hosted_environment() -> HostedEnvironment {
@@ -1142,30 +1134,6 @@ async fn mint_router_key(base_url: &str, access_token: &str) -> Result<String, A
         })
 }
 
-/// The settings file as JSON, or `None` when it does not exist. A file that
-/// cannot be read or parsed is an error naming the file. The error carries
-/// only the path and the parser's position, never the file's contents.
-pub(crate) fn read_settings_checked(home: &Path) -> io::Result<Option<(PathBuf, Value)>> {
-    let path = settings_file(home);
-    let contents = match fs::read_to_string(&path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(io::Error::new(
-                error.kind(),
-                format!("cannot read {}: {error}", path.display()),
-            ));
-        }
-    };
-    let value = serde_json::from_str(&contents).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{} is not valid JSON: {error}", path.display()),
-        )
-    })?;
-    Ok(Some((path, value)))
-}
-
 pub(crate) fn write_json_atomic(path: &Path, value: &Value) -> io::Result<()> {
     let parent = path
         .parent()
@@ -1221,12 +1189,6 @@ fn json_value_for_message(value: &Value) -> String {
         Value::String(message) => message.clone(),
         _ => value.to_string(),
     }
-}
-
-fn settings_file(home: &Path) -> PathBuf {
-    home.join(".config")
-        .join(crate::CONFIG_DIR)
-        .join("settings.json")
 }
 
 fn auth_command() -> String {
@@ -1409,6 +1371,12 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
         fs::create_dir_all(home.join(".config").join(crate::CONFIG_DIR)).unwrap();
         home
+    }
+
+    fn settings_file(home: &Path) -> PathBuf {
+        home.join(".config")
+            .join(crate::CONFIG_DIR)
+            .join("settings.json")
     }
 
     fn write_settings_json(home: &Path, settings: &Value) {
@@ -2052,24 +2020,5 @@ mod tests {
             parse_callback_query("/?code=one-time&state=other", "s1"),
             Err(CallbackQueryError::StateMismatch)
         );
-    }
-
-    #[test]
-    fn unreadable_settings_name_the_file_but_not_its_contents() {
-        let home = temp_home("settings-checked");
-        assert!(read_settings_checked(&home).unwrap().is_none());
-        fs::write(settings_file(&home), "{\"secret-value\"").unwrap();
-        let error = read_settings_checked(&home).unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let message = error.to_string();
-        assert!(
-            message.contains("settings.json") && !message.contains("secret-value"),
-            "{message}"
-        );
-        write_settings_json(&home, &json!({ "environments": {} }));
-        let (path, settings) = read_settings_checked(&home).unwrap().unwrap();
-        assert_eq!(path, settings_file(&home));
-        assert_eq!(settings, json!({ "environments": {} }));
-        let _ = fs::remove_dir_all(&home);
     }
 }

@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
 use rayline_local_router::ModelCapabilities;
 use serde_json::{Value, json};
 
-/// How long `start` waits for the local model's tokenizer files before it
-/// uses a cached copy or starts without a prompt counter.
+/// How long `start` waits for a model's tokenizer files before it uses the
+/// cached copy.
 const TOKENIZER_FETCH_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Parser)]
@@ -34,26 +34,10 @@ enum Action {
         /// Override the execution core installed beside rayline.
         #[arg(long)]
         core: Option<PathBuf>,
-        /// Optional qualified execution-core profile. Without it, Raydock
-        /// builds the default profile from your signed-in environment and
-        /// `local_model`. Either way it applies `hybrid.routing` overrides.
+        /// Environment whose router makes the decisions:
+        /// `environments.<name>` in settings.json. Without it, prod.
         #[arg(long)]
-        config: Option<PathBuf>,
-        /// Signed-in environment whose router makes the decisions (default: prod).
-        #[arg(long, default_value = "prod")]
-        env: String,
-        /// Local model context window in tokens (default: settings
-        /// `hybrid.local_context_window`, else the window the runtime reports
-        /// through llama.cpp `/props` or `/v1/models` from vLLM or TensorFold,
-        /// else 98304). A turn whose prompt does not fit hands off to cloud.
-        /// The runtime's loaded window caps it.
-        #[arg(long, value_parser = clap::value_parser!(u64).range(2048..=1_000_000))]
-        local_context_window: Option<u64>,
-        /// Model for Claude Code's auto-mode safety classifier, sent through
-        /// your cloud router (default: settings `hybrid.classifier_model`, else
-        /// claude-haiku-5-5).
-        #[arg(long)]
-        classifier_model: Option<String>,
+        env: Option<String>,
         /// Isolated Decisions cell tag (development only).
         #[arg(long)]
         cell: Option<String>,
@@ -209,10 +193,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
     match cli.command {
         Action::Start {
             core,
-            config,
             env,
-            local_context_window,
-            classifier_model,
             cell,
             port,
             startup_timeout_secs,
@@ -223,238 +204,76 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 Some(path) => fs::canonicalize(path)?,
                 None => installed_binary("rayline-core")?,
             };
-            // A missing settings file is fine; an unreadable or malformed one
-            // must not silently drop `local_model` or `hybrid.routing`.
-            let (settings_path, settings) = match crate::status::read_settings_checked(&home)? {
-                Some((path, value)) => (Some(path), Some(value)),
-                None => (None, None),
-            };
-            let settings_error = |error| settings_error(settings_path.as_deref(), error);
-            let classifier_model = crate::hybrid_profile::classifier_model(
-                classifier_model.as_deref(),
-                settings.as_ref(),
-            )
-            .map_err(settings_error)?;
-            let origin = if config.is_some() {
-                crate::hybrid_profile::ProfileOrigin::File
-            } else {
-                crate::hybrid_profile::ProfileOrigin::Default
-            };
-            // A local model other than the default Qwen3.8-27B, declared in
-            // settings: named in the error if the core refuses to start.
-            let mut declared_local = None;
-            let mut token_counter_dir = None;
-            let (profile, base_dir) = match config {
-                Some(config) => {
-                    if env != "prod" || cell.is_some() || local_context_window.is_some() {
-                        eprintln!(
-                            "Note: --env, --cell and --local-context-window apply to the default profile; the profile file at --config sets these itself"
-                        );
-                    }
-                    let profile_path = fs::canonicalize(config)?;
-                    let profile: Value = serde_json::from_slice(&fs::read(&profile_path)?)
-                        .map_err(|error| {
-                            io::Error::other(format!("invalid hybrid configuration: {error}"))
-                        })?;
-                    (
-                        profile,
-                        profile_path.parent().unwrap_or(Path::new("/")).to_owned(),
-                    )
-                }
-                None => {
-                    let hosted = crate::config::load_in(
-                        &home,
-                        &crate::config::LoadOptions {
-                            mode: crate::config::Mode::Cloud,
-                            env: (env != crate::status::PROD_ENV).then_some(env.as_str()),
-                            harness_protocol: None,
-                        },
-                    )
-                    .map(|settings| crate::status::hosted_environment(&settings))
-                    .map_err(|error| {
-                        io::Error::other(format!("unknown environment {env:?}: {error}"))
-                    })?;
-                    let (base_url, model) =
-                        crate::hybrid_profile::custom_local_model(settings.as_ref()).ok_or_else(
-                            || io::Error::other(
-                                "hybrid routing needs your local model: set local_model.base_url and local_model.model in settings.json",
-                            ),
-                        )?;
-                    let configured = match local_context_window {
-                        Some(window) => Some(window),
-                        None => crate::hybrid_profile::configured_local_context_window(
-                            settings.as_ref(),
-                        )
-                        .map_err(settings_error)?,
-                    };
-                    let registry_model =
-                        crate::hybrid_profile::local_registry_model(settings.as_ref())
-                            .map_err(settings_error)?;
-                    let runtime =
-                        crate::hybrid_profile::read_local_runtime(&client, &base_url, &model).await;
-                    // The identity check knows only Qwen3.8-27B; a declared
-                    // model is the user's statement and is not checked.
-                    let (local_refused, message) = crate::hybrid_profile::local_verdict(
-                        &registry_model,
-                        &runtime.identity,
-                        &base_url,
+            let settings = crate::config::load(&crate::config::LoadOptions {
+                mode: crate::config::Mode::Local,
+                env: env.as_deref(),
+                harness_protocol: None,
+            })
+            .map_err(io::Error::other)?;
+            let routing = settings
+                .routing
+                .as_ref()
+                .expect("a local-mode load has routing");
+            let hosted = crate::status::hosted_environment(&settings);
+            let config =
+                crate::hybrid_profile::core_config(&settings, &hosted.base_url, cell.as_deref())
+                    .map_err(io::Error::other)?;
+            // One counter per tokenizer, named for each deployment of its model.
+            let mut token_counters = Vec::new();
+            for (id, model) in &settings.models {
+                let Some(repo) = &model.tokenizer else {
+                    continue;
+                };
+                let snapshot = tokenizer_snapshot(repo).await.map_err(|error| {
+                    io::Error::other(format!(
+                        "{}: cannot load the tokenizer {repo} of models entry {id}: {error}",
+                        settings.file.display()
+                    ))
+                })?;
+                if snapshot.cached {
+                    println!(
+                        "Prompt counter for {id}: {repo}, the cached copy (Hugging Face did not serve the current one)"
                     );
-                    if let Some(message) = message {
-                        eprintln!("{message}");
-                    }
-                    if registry_model != crate::hybrid_profile::LOCAL_REGISTRY_MODEL {
-                        declared_local = Some(registry_model.clone());
-                    }
-                    if !local_refused
-                        && let Some(repo) = crate::hybrid_tokenizer::tokenizer_repo(
-                            &registry_model,
-                            settings.as_ref(),
-                        )
-                        .map_err(settings_error)?
-                    {
-                        // The Hub gets a short deadline; past it the cached
-                        // snapshot, if any, is used and startup goes on.
-                        // A detached thread, not a blocking task: the runtime
-                        // waits for blocking tasks at exit, and the downloader
-                        // retries for far longer than `start` should run.
-                        let (sender, fetching) = tokio::sync::oneshot::channel();
-                        std::thread::spawn({
-                            let repo = repo.clone();
-                            move || {
-                                let _ = sender.send(crate::hybrid_tokenizer::fetch(&repo));
-                            }
-                        });
-                        let fetched = match tokio::time::timeout(TOKENIZER_FETCH_DEADLINE, fetching)
-                            .await
-                        {
-                            Ok(Ok(fetched)) => fetched,
-                            Ok(Err(_)) => Err("the tokenizer download stopped".to_owned()),
-                            Err(_) => crate::hybrid_tokenizer::cached(&repo).ok_or_else(|| {
-                                format!(
-                                    "Hugging Face did not answer within {}s and nothing is cached",
-                                    TOKENIZER_FETCH_DEADLINE.as_secs()
-                                )
-                            }),
-                        };
-                        match fetched {
-                            Ok(dir) => {
-                                println!(
-                                    "Prompt counter: {repo} (the local model's tokenizer and chat template)"
-                                );
-                                token_counter_dir = Some(dir);
-                            }
-                            Err(error) => eprintln!(
-                                "Prompt counter unavailable ({error}); the core estimates the local model's prompt size, which can send turns to the cloud early"
-                            ),
-                        }
-                    }
-                    let window = if local_refused {
-                        configured.unwrap_or(crate::hybrid_profile::DEFAULT_LOCAL_CONTEXT_WINDOW)
-                    } else {
-                        let (window, note) =
-                            crate::hybrid_profile::resolve_local_window(configured, runtime.window);
-                        if let Some(note) = note {
-                            eprintln!("{note}");
-                        }
-                        if let Some(warning) =
-                            crate::hybrid_profile::small_window_warning(&registry_model, window)
-                        {
-                            eprintln!("{warning}");
-                        }
-                        window
-                    };
-                    // `raydock auth login` is enough: mint the router key on first use.
-                    if std::env::var_os("RAYLINE_ROUTER_API_KEY")
-                        .is_none_or(|value| value.is_empty())
-                    {
-                        crate::status::router_key(&hosted, &home)
-                            .await
-                            .map_err(|error| io::Error::other(error.to_string()))?;
-                    }
-                    let mut profile = crate::hybrid_profile::default_profile(
-                        &hosted.base_url,
-                        &base_url,
-                        &model,
-                        window,
-                        cell.as_deref(),
-                        settings.as_ref(),
-                    )
-                    .map_err(settings_error)?;
-                    if !local_refused && runtime.refuses_over_window {
-                        crate::hybrid_profile::mark_local_refuses_over_window(&mut profile);
-                    }
-                    if local_refused {
-                        crate::hybrid_profile::without_local(&mut profile);
-                        println!(
-                            "Default hybrid profile: decisions via {} (model {}), cloud only",
-                            hosted.base_url,
-                            crate::hybrid_profile::DECISIONS_MODEL
-                        );
-                    } else {
-                        println!(
-                            "Default hybrid profile: decisions via {} (model {}), local window {window} tokens",
-                            hosted.base_url,
-                            crate::hybrid_profile::DECISIONS_MODEL
-                        );
-                    }
-                    (profile, paths.dir.clone())
+                } else {
+                    println!("Prompt counter for {id}: {repo}");
                 }
-            };
-            let composed =
-                crate::hybrid_profile::compose(profile, settings.as_ref(), &base_dir, origin)
-                    .map_err(settings_error)?;
-            // Decisions carry execution context and the router key: only a
-            // configured Rayline router or loopback may receive them.
-            let router_urls =
-                crate::hybrid_profile::configured_router_urls(&home).map_err(io::Error::other)?;
-            crate::hybrid_profile::check_decisions_url(&composed.config, &router_urls)
-                .map_err(io::Error::other)?;
-            let credentials =
-                crate::hybrid_profile::saved_credentials(&composed.config, &home, |name| {
-                    std::env::var(name).ok()
-                })
-                .map_err(io::Error::other)?;
-            write_private_json(&paths.core_config(), &composed.config, true)?;
-            let config = paths.core_config();
-            match (&composed.policy, &composed.preset) {
-                (crate::hybrid_profile::PolicySource::LegacyMode(mode), _) => {
-                    println!("Routing policy: none (profile pins Decisions api_mode {mode})")
+                for &protocol in &settings.endpoints[&model.endpoint].protocols {
+                    token_counters.push((
+                        crate::hybrid_profile::deployment_id(id, protocol),
+                        snapshot.dir.clone(),
+                    ));
                 }
-                (source, Some(preset)) => println!(
-                    "Routing policy: {preset} ({})",
-                    match source {
-                        crate::hybrid_profile::PolicySource::Default => "Raydock default",
-                        crate::hybrid_profile::PolicySource::Settings => "settings hybrid.routing",
-                        _ => "profile",
-                    }
-                ),
-                _ => {}
             }
-            if let Some((id, url, model)) = &composed.local_model {
-                println!("Local model: {model} at {url} (deployment {id}, from local_model)");
+            // The environment's saved router key, minted on first use after
+            // `raydock auth login`. It is the only key the core gets from
+            // Rayline; every endpoint's own key comes from its `api_key_env`.
+            let router_key = crate::status::router_key(&hosted, &home)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let router_urls = crate::hybrid_profile::configured_router_urls(&settings);
+            write_private_json(&paths.core_config(), &config, true)?;
+            println!(
+                "Decisions: {} via {}",
+                routing.decisions_model, hosted.base_url
+            );
+            println!("Routing policy: {}", routing.policy.preset);
+            for (id, model) in &settings.models {
+                println!(
+                    "Model {id}: {} at {}",
+                    model.model, settings.endpoints[&model.endpoint].base_url
+                );
             }
             println!(
-                "Auto-mode classifier: {classifier_model} (Claude Code's safety checks; change with settings hybrid.classifier_model or --classifier-model)"
+                "Auto-mode classifier: {} (Claude Code's safety checks)",
+                routing.classifier_model
             );
-            for (name, _) in &credentials {
-                println!("Using the saved Rayline key for {name}");
-            }
+            println!("Rayline key: the saved key for {}", hosted.name());
             // One Decisions call before reporting ready: a refused key or an
             // unreachable router fails here, not on the harness's first turn.
-            // The environment whose router serves Decisions: a profile file may
-            // name another one than `--env`. `None` is the built-in prod, whose
-            // commands take no `--env`.
-            let decisions_env = match composed.config.pointer("/decisions/url") {
-                Some(Value::String(url)) => crate::hybrid_profile::environment_for_url(&home, url)
-                    .map_err(io::Error::other)?
-                    .map(|hosted| hosted.env),
-                _ => None,
-            }
-            .unwrap_or_else(|| (env != crate::status::PROD_ENV).then(|| env.clone()));
             probe_decisions(
-                &composed.config,
-                &credentials,
-                decisions_env.as_deref(),
+                &config,
+                &router_key,
+                settings.env.as_deref(),
                 startup_timeout_secs,
             )
             .await?;
@@ -466,7 +285,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 .arg("--core")
                 .arg(core)
                 .arg("--config")
-                .arg(config)
+                .arg(paths.core_config())
                 .arg("--port")
                 .arg(port.to_string())
                 .arg("--startup-timeout-secs")
@@ -481,26 +300,25 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             for router_url in &router_urls {
                 command.arg("--router-url").arg(router_url);
             }
-            if let Some(env_name) = &decisions_env {
+            if let Some(env_name) = &settings.env {
                 command.arg("--env-name").arg(env_name);
             }
-            command.arg("--classifier-model").arg(&classifier_model);
-            if let Some(dir) = &token_counter_dir {
-                command.arg("--token-counter-dir").arg(dir);
+            command
+                .arg("--classifier-model")
+                .arg(&routing.classifier_model);
+            for (deployment, dir) in &token_counters {
+                command.arg("--token-counter-dir").arg(deployment).arg(dir);
             }
-            for (name, key) in &credentials {
-                command.env(name, key);
-            }
+            command.env(crate::hybrid_profile::ROUTER_KEY_ENV, &router_key);
             let mut child = crate::detach::spawn_detached(&mut command)?;
             let startup = async {
                 write_private_json(&paths.supervisor(), &json!({"pid":child.id()}), false)?;
                 let started = Instant::now();
                 loop {
                     if let Some(status) = child.try_wait()? {
-                        return Err(io::Error::other(exit_message(
-                            &status.to_string(),
-                            &paths.log(),
-                            declared_local.as_deref(),
+                        return Err(io::Error::other(format!(
+                            "hybrid runtime exited ({status}); see {}",
+                            paths.log().display()
                         )));
                     }
                     if paths.ready().exists() {
@@ -590,6 +408,32 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// The snapshot of `repo`'s tokenizer and chat template, fetched from Hugging
+/// Face within [`TOKENIZER_FETCH_DEADLINE`], else the cached copy.
+async fn tokenizer_snapshot(repo: &str) -> Result<crate::hybrid_tokenizer::Snapshot, String> {
+    // A detached thread, not a blocking task: the runtime waits for blocking
+    // tasks at exit, and the downloader retries for far longer than `start`
+    // should run.
+    let (sender, fetching) = tokio::sync::oneshot::channel();
+    std::thread::spawn({
+        let repo = repo.to_owned();
+        move || {
+            let _ = sender.send(crate::hybrid_tokenizer::fetch(&repo));
+        }
+    });
+    match tokio::time::timeout(TOKENIZER_FETCH_DEADLINE, fetching).await {
+        Ok(Ok(fetched)) => fetched,
+        Ok(Err(_)) => Err("the tokenizer download stopped".to_owned()),
+        Err(_) => crate::hybrid_tokenizer::cached_or(
+            repo,
+            format!(
+                "Hugging Face did not answer within {}s and nothing is cached",
+                TOKENIZER_FETCH_DEADLINE.as_secs()
+            ),
+        ),
+    }
+}
+
 /// Send one Decisions request with the key the core will use and classify
 /// the answer. A development cell (`cell_tag`) gets a real routing request
 /// (the profile's model, and its V when it has one), which also starts a scale-to-zero cell; while it answers 502/503/504 the
@@ -598,20 +442,15 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
 /// Skipped for a loopback Decisions URL.
 async fn probe_decisions(
     config: &Value,
-    credentials: &[(String, String)],
+    key: &str,
     env: Option<&str>,
     startup_timeout_secs: u64,
 ) -> io::Result<()> {
-    let env_flag = env.map(|env| format!("--env {env} ")).unwrap_or_default();
-    let Some(decisions) = config.get("decisions") else {
-        return Ok(());
-    };
-    let (Some(url), Some(auth_env)) = (
-        decisions.get("url").and_then(Value::as_str),
-        decisions.get("auth_env").and_then(Value::as_str),
-    ) else {
-        return Ok(());
-    };
+    let env_flag = env_flag(env);
+    let decisions = &config["decisions"];
+    let url = decisions["url"]
+        .as_str()
+        .expect("core_config always names the Decisions URL");
     // A loopback Decisions service is a local fixture or development
     // service, not a router this check can describe.
     if reqwest::Url::parse(url).is_ok_and(|url| {
@@ -621,18 +460,6 @@ async fn probe_decisions(
     }) {
         return Ok(());
     }
-    let saved = credentials
-        .iter()
-        .find(|(name, _)| name == auth_env)
-        .map(|(_, key)| key.clone());
-    let from_environment = saved.is_none();
-    let key = saved
-        .or_else(|| std::env::var(auth_env).ok().filter(|key| !key.is_empty()))
-        .ok_or_else(|| {
-            io::Error::other(format!(
-                "no Rayline key for Decisions ({auth_env}); run `raydock {env_flag}auth login`"
-            ))
-        })?;
     let cell = decisions.get("cell_tag").and_then(Value::as_str);
     let body = probe_body(decisions);
     let client = reqwest::Client::builder()
@@ -643,7 +470,7 @@ async fn probe_decisions(
     let deadline = Instant::now() + Duration::from_secs(startup_timeout_secs);
     let mut announced = false;
     loop {
-        let mut request = client.post(url).bearer_auth(&key).json(&body);
+        let mut request = client.post(url).bearer_auth(key).json(&body);
         if let Some(cell) = cell {
             request = request.header("X-Rayline-Cell", cell);
         }
@@ -654,13 +481,8 @@ async fn probe_decisions(
         match probe_verdict(outcome.as_ref().copied().map_err(|_| ())) {
             ProbeVerdict::Ready => return Ok(()),
             ProbeVerdict::KeyRefused(status) => {
-                let fix = if from_environment {
-                    format!("Check or unset {auth_env}, which overrides the saved key")
-                } else {
-                    format!("Run `raydock {env_flag}auth login`")
-                };
                 return Err(io::Error::other(format!(
-                    "Decisions at {url} refused the Rayline key (HTTP {status}). {fix}, then `raydock hybrid start` again."
+                    "Decisions at {url} refused the Rayline key (HTTP {status}). Run `raydock {env_flag}auth login`, then `raydock hybrid start` again."
                 )));
             }
             ProbeVerdict::RateLimited => {
@@ -696,6 +518,12 @@ async fn probe_decisions(
             }
         }
     }
+}
+
+/// The `--env` a command for `env` takes, with its trailing space: none for
+/// the built-in prod.
+fn env_flag(env: Option<&str>) -> String {
+    env.map(|env| format!("--env {env} ")).unwrap_or_default()
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -1144,28 +972,6 @@ fn private_dir(path: &Path) -> io::Result<()> {
 }
 
 /// A composition error, naming the settings file when the settings caused it.
-/// The error for a runtime that exits during startup. With a declared local
-/// model it names the setting: a core whose embedded registry does not know
-/// the model refuses the profile and exits.
-fn exit_message(status: &str, log: &Path, declared_local: Option<&str>) -> String {
-    let mut message = format!("hybrid runtime exited ({status}); see {}", log.display());
-    if let Some(model) = declared_local {
-        message.push_str(&format!(
-            ". If the log says the core does not know {model}, it is not in this core's model registry: correct settings hybrid.local_registry_model, or remove it to use Qwen3.8-27B"
-        ));
-    }
-    message
-}
-
-fn settings_error(settings_path: Option<&Path>, error: String) -> io::Error {
-    match settings_path {
-        Some(path) if error.starts_with("settings ") => {
-            io::Error::other(format!("{}: {error}", path.display()))
-        }
-        _ => io::Error::other(error),
-    }
-}
-
 /// Replace `path` atomically with `value` as a 0600 file: a planted symlink
 /// or a loosened file at `path` is replaced, never followed or kept.
 fn write_private_json(path: &Path, value: &Value, pretty: bool) -> io::Result<()> {
@@ -1369,25 +1175,9 @@ mod tests {
     // The built-in prod takes no `--env`: `--env prod` selects a configured
     // `environments.prod` instead.
     #[test]
-    fn a_missing_decisions_key_names_the_login_for_its_environment() {
-        let config = serde_json::json!({"decisions": {
-            "url": "https://decisions.example.test/v1/decisions",
-            "auth_env": "RAYLINE_TEST_UNSET_DECISIONS_KEY",
-        }});
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        for (env, login) in [
-            (None, "`raydock auth login`"),
-            (Some("dev"), "`raydock --env dev auth login`"),
-        ] {
-            let error = runtime
-                .block_on(probe_decisions(&config, &[], env, 1))
-                .unwrap_err()
-                .to_string();
-            assert!(error.ends_with(login), "{error}");
-        }
+    fn commands_for_an_environment_name_its_env() {
+        assert_eq!(env_flag(None), "");
+        assert_eq!(env_flag(Some("dev")), "--env dev ");
     }
 
     /// Serializes the tests that set a process-wide env var.
@@ -1525,41 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn a_runtime_exit_names_a_declared_local_model() {
-        let log = Path::new("/state/runtime.log");
-        let plain = exit_message("exit status: 1", log, None);
-        assert_eq!(
-            plain,
-            "hybrid runtime exited (exit status: 1); see /state/runtime.log"
-        );
-        let declared = exit_message("exit status: 1", log, Some("z-ai/glm-5.3-flash"));
-        assert!(declared.starts_with(&plain));
-        assert!(
-            declared.contains("z-ai/glm-5.3-flash")
-                && declared.contains("hybrid.local_registry_model")
-        );
-    }
-
-    #[test]
-    fn settings_errors_name_the_settings_file() {
-        let path = Path::new("/home/user/.config/rayline/settings.json");
-        let error = settings_error(
-            Some(path),
-            "settings hybrid.routing.min_p_pass must be a number in (0, 1)".to_owned(),
-        );
-        assert_eq!(
-            error.to_string(),
-            "/home/user/.config/rayline/settings.json: settings hybrid.routing.min_p_pass must be a number in (0, 1)"
-        );
-        let other = settings_error(
-            Some(path),
-            "local deployment protocol is missing".to_owned(),
-        );
-        assert_eq!(other.to_string(), "local deployment protocol is missing");
-    }
-    #[test]
-    fn hybrid_is_explicit_and_requires_core_and_config() {
-        // A profile file is optional: the default profile needs only a key and local_model.
+    fn hybrid_start_takes_only_its_own_options() {
         assert!(Cli::try_parse_from(["hybrid", "start"]).is_ok());
         assert!(
             Cli::try_parse_from([
@@ -1567,14 +1323,22 @@ mod tests {
                 "start",
                 "--env",
                 "dev",
-                "--local-context-window",
-                "16384"
+                "--cell",
+                "cell-a",
+                "--core",
+                "/core",
+                "--port",
+                "0",
+                "--startup-timeout-secs",
+                "5",
+                "--state-dir",
+                "/state"
             ])
             .is_ok()
         );
         assert!(
             Cli::try_parse_from(["hybrid", "start", "--core", "/core", "--config", "/config"])
-                .is_ok()
+                .is_err()
         );
         assert!(Cli::try_parse_from(["hybrid", "run", "claude", "--", "-p", "hello"]).is_err());
     }

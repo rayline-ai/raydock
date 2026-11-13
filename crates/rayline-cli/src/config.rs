@@ -809,7 +809,7 @@ impl<'a> Doc<'a> {
 
 /// The key of `name` inside `key`, e.g. `endpoints.gpu-box`. A name that is
 /// not a plain word is quoted: `models."z-ai/glm-5.3-flash"`.
-fn child(key: &str, name: &str) -> String {
+pub(crate) fn child(key: &str, name: &str) -> String {
     let plain = !name.is_empty()
         && name
             .chars()

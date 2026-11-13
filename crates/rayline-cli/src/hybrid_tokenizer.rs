@@ -1,19 +1,9 @@
-//! Fetches the local model's published tokenizer and chat template from
-//! Hugging Face for rld's prompt counter (`rld hybrid --token-counter-dir`).
-//!
-//! The core counts Qwen3.8-27B itself. For another declared model it can
-//! only bound a prompt by its bytes, several times the real count, and an
-//! image in the history makes that bound unknown; with the model's own files
-//! rld counts exactly. Without them (offline, or a model with no known repo)
-//! the session starts as before.
+//! Fetches a model's tokenizer and chat template from Hugging Face, the repo
+//! its `models.*.tokenizer` names, for rld's prompt counter
+//! (`rld hybrid --token-counter-dir`). A model with no `tokenizer` is counted
+//! by the core.
 
-use std::path::PathBuf;
-
-use serde_json::Value;
-
-/// Hugging Face repos publishing the tokenizer and chat template of a
-/// registry model the core has no counter for.
-const KNOWN_REPOS: &[(&str, &str)] = &[("z-ai/glm-5.3-flash", "zai-org/GLM-5.3-Flash")];
+use std::path::{Path, PathBuf};
 
 const REQUIRED: &[&str] = &[rayline_tokencount::TOKENIZER_FILE];
 /// A template ships as its own file or inside `tokenizer_config.json`; a
@@ -25,53 +15,20 @@ const OPTIONAL: &[&str] = &[
     rayline_tokencount::PREPROCESSOR_FILE,
 ];
 
-/// The repo to count `registry_model` with: `hybrid.local_tokenizer` (a repo
-/// id, or `false` to turn counting off), else a known repo. `None` for the
-/// core's own model and for an unknown one.
-pub(crate) fn tokenizer_repo(
-    registry_model: &str,
-    settings: Option<&Value>,
-) -> Result<Option<String>, String> {
-    let setting = settings
-        .and_then(|settings| settings.get("hybrid"))
-        .and_then(|hybrid| hybrid.get("local_tokenizer"));
-    match setting {
-        Some(Value::Bool(false)) => return Ok(None),
-        Some(Value::String(repo)) if is_repo_id(repo) => return Ok(Some(repo.clone())),
-        Some(_) => {
-            return Err("settings hybrid.local_tokenizer must be a Hugging Face repo id \"owner/name\" publishing the local model's tokenizer.json, or false".to_owned());
-        }
-        None => {}
-    }
-    if registry_model == crate::hybrid_profile::LOCAL_REGISTRY_MODEL {
-        return Ok(None);
-    }
-    Ok(KNOWN_REPOS
-        .iter()
-        .find(|(model, _)| *model == registry_model)
-        .map(|(_, repo)| (*repo).to_owned()))
-}
-
-fn is_repo_id(value: &str) -> bool {
-    let mut parts = value.split('/');
-    let valid = |part: Option<&str>| {
-        part.is_some_and(|part| {
-            !part.is_empty()
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
-        })
-    };
-    valid(parts.next()) && valid(parts.next()) && parts.next().is_none()
+/// A tokenizer snapshot directory, and whether it is the cached copy because
+/// Hugging Face did not serve the current one.
+pub(crate) struct Snapshot {
+    pub(crate) dir: PathBuf,
+    pub(crate) cached: bool,
 }
 
 /// Downloads the counter's files at the repo's current commit into the
-/// Hugging Face cache, or reuses the cached snapshot when the Hub is
-/// unreachable. Returns the snapshot directory.
-pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
-    let commit = match rayline_hf::hf_api_get_commit(repo) {
-        Ok(commit) => commit,
-        Err(error) => cached_commit(repo).ok_or(error)?,
+/// Hugging Face cache. When the Hub does not answer or a file fails to
+/// download, the last complete snapshot is used instead.
+pub(crate) fn fetch(repo: &str) -> Result<Snapshot, String> {
+    let (commit, cached_commit) = match rayline_hf::hf_api_get_commit(repo) {
+        Ok(commit) => (commit, false),
+        Err(error) => (cached_commit(repo).ok_or(error)?, true),
     };
     // Complete only when every optional file is cached or confirmed absent
     // (404); a rate limit or network failure leaves the snapshot unrecorded.
@@ -86,7 +43,7 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
         }
         if let Err(error) = rayline_hf::download_to_hf_cache(repo, file, &commit) {
             if required {
-                return Err(format!("download {file} from {repo}: {error}"));
+                return cached_or(repo, format!("download {file} from {repo}: {error}"));
             }
             if !is_absent(&error) {
                 complete = false;
@@ -104,14 +61,18 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
         return Err(format!("{repo} publishes no chat template"));
     }
     if !complete {
-        // A partial snapshot could miscount; use the last complete one, or
-        // start without a counter.
-        return cached(repo)
-            .ok_or_else(|| format!("could not fetch all of {repo}'s tokenizer files"));
+        // A partial snapshot could miscount; use the last complete one.
+        return cached_or(
+            repo,
+            format!("could not fetch all of {repo}'s tokenizer files"),
+        );
     }
-    // `cached` falls back to this snapshot alone.
-    let _ = std::fs::write(complete_marker(repo), &commit);
-    Ok(dir)
+    // `cached_or` uses this snapshot alone.
+    let _ = std::fs::write(complete_marker(&rayline_hf::hf_cache_dir(), repo), &commit);
+    Ok(Snapshot {
+        dir,
+        cached: cached_commit,
+    })
 }
 
 /// The Hub answered that the file does not exist in the repo.
@@ -121,21 +82,30 @@ fn is_absent(error: &str) -> bool {
 
 /// Names the last snapshot `fetch` finished. `refs/main` moves as each file
 /// downloads, so it can name a snapshot still missing optional files.
-fn complete_marker(repo: &str) -> PathBuf {
-    rayline_hf::hf_cache_dir()
-        .join(rayline_hf::repo_to_folder_name(repo))
+fn complete_marker(hub: &Path, repo: &str) -> PathBuf {
+    hub.join(rayline_hf::repo_to_folder_name(repo))
         .join("rayline-counter-complete")
 }
 
-/// The cached snapshot, without the network: what `start` uses when the
-/// Hub does not answer in time.
-pub(crate) fn cached(repo: &str) -> Option<PathBuf> {
-    let commit = std::fs::read_to_string(complete_marker(repo)).ok()?;
+/// The last complete snapshot, marked cached, when the Hub did not serve the
+/// current one; without one, `error`. What `start` uses when the Hub does not
+/// answer in time or a download fails.
+pub(crate) fn cached_or(repo: &str, error: String) -> Result<Snapshot, String> {
+    cached_in(&rayline_hf::hf_cache_dir(), repo, error)
+}
+
+fn cached_in(hub: &Path, repo: &str, error: String) -> Result<Snapshot, String> {
+    let Ok(commit) = std::fs::read_to_string(complete_marker(hub, repo)) else {
+        return Err(error);
+    };
     let commit = commit.trim();
     if commit.is_empty() || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
+        return Err(error);
     }
-    let dir = rayline_hf::hf_cache_snapshot_path(repo, "", commit);
+    let dir = hub
+        .join(rayline_hf::repo_to_folder_name(repo))
+        .join("snapshots")
+        .join(commit);
     let complete = dir.join(rayline_tokencount::TOKENIZER_FILE).is_file()
         && [
             rayline_tokencount::TEMPLATE_FILE,
@@ -143,7 +113,11 @@ pub(crate) fn cached(repo: &str) -> Option<PathBuf> {
         ]
         .iter()
         .any(|file| dir.join(file).is_file());
-    complete.then_some(dir)
+    if complete {
+        Ok(Snapshot { dir, cached: true })
+    } else {
+        Err(error)
+    }
 }
 
 /// The commit `refs/main` names in the Hugging Face cache.
@@ -159,7 +133,53 @@ fn cached_commit(repo: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+
+    const REPO: &str = "example/model";
+
+    fn temp_hub(name: &str) -> PathBuf {
+        let hub =
+            std::env::temp_dir().join(format!("rayline-tokenizer-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&hub);
+        std::fs::create_dir_all(&hub).unwrap();
+        hub
+    }
+
+    #[test]
+    fn without_a_complete_cached_snapshot_the_download_error_stands() {
+        let hub = temp_hub("none");
+        let error = "download tokenizer.json from example/model: status 500".to_owned();
+        assert_eq!(
+            cached_in(&hub, REPO, error.clone()).err(),
+            Some(error.clone())
+        );
+        // A marked snapshot that lacks its chat template is not complete.
+        let snapshot = hub
+            .join(rayline_hf::repo_to_folder_name(REPO))
+            .join("snapshots")
+            .join("abc123");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join(rayline_tokencount::TOKENIZER_FILE), "{}").unwrap();
+        std::fs::write(complete_marker(&hub, REPO), "abc123").unwrap();
+        assert_eq!(cached_in(&hub, REPO, error.clone()).err(), Some(error));
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn a_complete_cached_snapshot_is_used_and_marked_cached() {
+        let hub = temp_hub("complete");
+        let snapshot = hub
+            .join(rayline_hf::repo_to_folder_name(REPO))
+            .join("snapshots")
+            .join("abc123");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join(rayline_tokencount::TOKENIZER_FILE), "{}").unwrap();
+        std::fs::write(snapshot.join(rayline_tokencount::TEMPLATE_FILE), "").unwrap();
+        std::fs::write(complete_marker(&hub, REPO), "abc123\n").unwrap();
+        let used = cached_in(&hub, REPO, "unused".to_owned()).unwrap();
+        assert_eq!(used.dir, snapshot);
+        assert!(used.cached);
+        let _ = std::fs::remove_dir_all(&hub);
+    }
 
     #[test]
     fn only_a_missing_file_counts_as_absent() {
@@ -168,40 +188,5 @@ mod tests {
             "Download failed with status 429 Too Many Requests"
         ));
         assert!(!is_absent("error sending request: connection reset"));
-    }
-
-    #[test]
-    fn known_models_map_to_their_published_repo() {
-        assert_eq!(
-            tokenizer_repo("z-ai/glm-5.3-flash", None)
-                .unwrap()
-                .as_deref(),
-            Some("zai-org/GLM-5.3-Flash")
-        );
-        assert_eq!(
-            tokenizer_repo(crate::hybrid_profile::LOCAL_REGISTRY_MODEL, None).unwrap(),
-            None
-        );
-        assert_eq!(tokenizer_repo("acme/unknown-1", None).unwrap(), None);
-    }
-
-    #[test]
-    fn the_setting_names_a_repo_or_turns_counting_off() {
-        let named = json!({"hybrid": {"local_tokenizer": "acme/Model-1.5"}});
-        assert_eq!(
-            tokenizer_repo("acme/unknown-1", Some(&named))
-                .unwrap()
-                .as_deref(),
-            Some("acme/Model-1.5")
-        );
-        let off = json!({"hybrid": {"local_tokenizer": false}});
-        assert_eq!(
-            tokenizer_repo("z-ai/glm-5.3-flash", Some(&off)).unwrap(),
-            None
-        );
-        for bad in [json!("no-owner"), json!("a/b/c"), json!(true), json!(3)] {
-            let settings = json!({"hybrid": {"local_tokenizer": bad}});
-            assert!(tokenizer_repo("z-ai/glm-5.3-flash", Some(&settings)).is_err());
-        }
     }
 }

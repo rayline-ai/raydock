@@ -74,16 +74,14 @@ pub struct Args {
     #[arg(long)]
     env_name: Option<String>,
     /// Model that answers Claude Code's auto-mode classifier, through the
-    /// profile's cloud Messages router.
-    #[arg(long, default_value = crate::hybrid_classifier::DEFAULT_CLASSIFIER_MODEL)]
-    classifier_model: String,
-    /// Snapshot directory of the local model's tokenizer and chat template:
-    /// rld counts the local deployment's prompts with them for the core.
+    /// profile's cloud Messages router: `routing.classifier_model`.
     #[arg(long)]
-    token_counter_dir: Option<PathBuf>,
-    /// The local deployment the counter sizes.
-    #[arg(long, default_value = "local")]
-    token_counter_deployment: String,
+    classifier_model: String,
+    /// A deployment and the snapshot directory of its model's tokenizer and
+    /// chat template: rld counts that deployment's prompts with them for the
+    /// core. Once per deployment with a `tokenizer`.
+    #[arg(long = "token-counter-dir", num_args = 2, value_names = ["DEPLOYMENT", "DIR"])]
+    token_counters: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,7 +116,7 @@ struct Gateway {
     /// The command that renews the router key Decisions uses.
     login_command: String,
     /// Where Claude Code's auto-mode classifier goes instead of the core.
-    classifier_pin: Option<crate::hybrid_classifier::CloudPin>,
+    classifier: crate::hybrid_classifier::Route,
     metrics: Arc<RouterMetrics>,
     routing_metadata: RoutingMetadata,
 }
@@ -130,7 +128,14 @@ pub async fn run(args: Args) -> Result<()> {
     let credential_env = credential_env_names(&args.config)?;
     let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
     let routing_metadata = RoutingMetadata::from_config(&config);
-    let classifier_pin = crate::hybrid_classifier::cloud_pin(&config, &args.classifier_model);
+    let classifier = crate::hybrid_classifier::route(&config, &args.classifier_model)
+        .map_err(anyhow::Error::msg)?;
+    if std::env::var(&classifier.auth_env).map_or(true, |key| key.is_empty()) {
+        bail!(
+            "`{}` is not set, so the auto-mode classifier cannot reach Rayline cloud",
+            classifier.auth_env
+        );
+    }
     let startup_timeout = Duration::from_secs(args.startup_timeout_secs);
     let startup_deadline = tokio::time::Instant::now() + startup_timeout;
     // Register before spawning so cancellation during startup also reaps the child.
@@ -144,42 +149,33 @@ pub async fn run(args: Args) -> Result<()> {
         token: args.token_file.clone(),
         ready: None,
     };
-    // A counter that cannot load leaves the core sizing the local model
-    // itself; the session still starts.
     let counter_token = token();
-    let mut counter_task = None;
+    let counters = args
+        .token_counters
+        .chunks_exact(2)
+        .map(|pair| (pair[0].clone(), PathBuf::from(&pair[1])))
+        .collect::<Vec<_>>();
     let mut core_config = args.config.clone();
-    if let Some(dir) = &args.token_counter_dir {
-        match crate::hybrid_counter::prepare(
-            dir,
-            &args.config,
-            &args.token_counter_deployment,
-            counter_token.clone(),
-        )
-        .await
-        {
-            Ok(prepared) => {
-                tracing::info!(dir = %dir.display(), "local prompt counter ready");
-                core_config = prepared.config;
-                counter_task = Some(tokio::spawn(crate::hybrid_counter::serve(
-                    prepared.listener,
-                    prepared.counter,
+    let mut counter_tasks = AbortOnDrop(Vec::new());
+    if !counters.is_empty() {
+        let prepared =
+            crate::hybrid_counter::prepare(&counters, &args.config, counter_token.clone())
+                .await
+                .context("load the prompt counters")?;
+        core_config = prepared.config;
+        for (counter, listener) in prepared.counters {
+            counter_tasks
+                .0
+                .push(tokio::spawn(crate::hybrid_counter::serve(
+                    listener, counter,
                 )));
-            }
-            Err(error) => tracing::warn!(
-                error = format!("{error:#}"),
-                "local prompt counter unavailable; the core sizes the local model itself"
-            ),
         }
     }
-    let mut counter_task = AbortOnDrop(counter_task);
     let (mut child, mut parent_pipe) =
         spawn_core(&args.core, &core_config, &core_token, &counter_token)?;
-    // An execution core older than the token_counter contract refuses the
-    // counted profile at startup; start it again on the plain one.
-    let first = tokio::select! {
+    let handshake = tokio::select! {
         result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
-            result.context("execution core startup timed out")?
+            result.context("execution core startup timed out")??
         }
         result = &mut signals => {
             result?;
@@ -187,34 +183,7 @@ pub async fn run(args: Args) -> Result<()> {
             return Ok(());
         }
     };
-    let first = match first {
-        Err(error) if core_config != args.config => {
-            tracing::warn!(
-                error = format!("{error:#}"),
-                "execution core refused the prompt counter; starting it without one"
-            );
-            stop_child(&mut child, &mut parent_pipe)
-                .await
-                .context("stop execution core")?;
-            if let Some(task) = counter_task.0.take() {
-                task.abort();
-            }
-            (child, parent_pipe) =
-                spawn_core(&args.core, &args.config, &core_token, &counter_token)?;
-            None
-        }
-        other => Some(other?),
-    };
     let outcome = async {
-        let handshake = match first {
-            Some(handshake) => handshake,
-            None => tokio::select! {
-                result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
-                    result.context("execution core startup timed out")??
-                }
-                result = &mut signals => { result?; return Ok(()); }
-            },
-        };
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -241,7 +210,7 @@ pub async fn run(args: Args) -> Result<()> {
             capabilities: capabilities.clone(),
             shutdown: shutdown_tx,
             login_command: login_command(args.env_name.as_deref()),
-            classifier_pin,
+            classifier,
             metrics: RouterMetrics::new("rayline-hybrid"),
             routing_metadata,
         });
@@ -497,12 +466,10 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         }
         Err(error) => bail!("read request body: {error}"),
     };
-    if let Some(pin) = &state.classifier_pin
-        && parts.method == Method::POST
+    if parts.method == Method::POST
         && crate::hybrid_classifier::is_classifier(parts.uri.path(), &body)
-        && let Some(response) = send_classifier_to_cloud(state, pin, &parts, &body).await?
     {
-        return Ok(response);
+        return send_classifier_to_cloud(state, &state.classifier, &parts, &body).await;
     }
     let mut observation = (parts.method == Method::POST
         && matches!(
@@ -575,32 +542,25 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
     }
 }
 
-/// Sends an auto-mode classifier request to the cloud pin the way the core
-/// dispatches a model-pin turn. None (the core takes the request) when the
-/// pin's credential is not in this process's environment.
+/// Sends an auto-mode classifier request to Rayline cloud the way the core
+/// dispatches a model-pin turn.
 async fn send_classifier_to_cloud(
     state: &Gateway,
-    pin: &crate::hybrid_classifier::CloudPin,
+    route: &crate::hybrid_classifier::Route,
     parts: &hyper::http::request::Parts,
     body: &[u8],
-) -> Result<Option<Response<Body>>> {
-    let Some(key) = std::env::var(&pin.auth_env)
-        .ok()
-        .filter(|key| !key.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(pinned) = crate::hybrid_classifier::pinned_body(body, &pin.wire_model) else {
-        return Ok(None);
-    };
+) -> Result<Response<Body>> {
+    let key = std::env::var(&route.auth_env)?;
+    let pinned = crate::hybrid_classifier::pinned_body(body, &route.wire_model)
+        .context("the classifier request is not a JSON object")?;
     let mut outgoing = state
         .client
-        .post(&pin.url)
+        .post(&route.url)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .header("anthropic-version", "2023-06-01")
-        .header("x-workshop-required-model", &pin.wire_model);
-    // The pin is the Rayline router itself (same origin as Decisions), so it
+        .header("x-workshop-required-model", &route.wire_model);
+    // The route is the Rayline router itself (same origin as Decisions), so it
     // gets every session header the client sent, unchanged (the same set the
     // local router forwards to the hosted router). The router keys the call
     // from those headers exactly as it keys the turn being classified;
@@ -611,13 +571,13 @@ async fn send_classifier_to_cloud(
         }
     }
     let mut observation = RequestObservation::start(state.metrics.clone(), body);
-    observation.record_classifier(&pin.wire_model);
+    observation.record_classifier(&route.wire_model);
     let upstream = outgoing.bearer_auth(key).body(pinned).send().await?;
     let status = upstream.status();
     tracing::info!(
-        model = %pin.wire_model,
+        model = %route.wire_model,
         status = status.as_u16(),
-        "auto-mode classifier sent to the cloud pin"
+        "auto-mode classifier sent to Rayline cloud"
     );
     if !status.is_success() {
         // The router's message can echo request content, so only its error
@@ -639,7 +599,7 @@ async fn send_classifier_to_cloud(
                     .map(str::to_owned)
             })
             .unwrap_or_default();
-        tracing::warn!(status = status.as_u16(), %error_type, "cloud pin refused the auto-mode classifier");
+        tracing::warn!(status = status.as_u16(), %error_type, "Rayline cloud refused the auto-mode classifier");
         let response = buffered_response(
             state,
             status,
@@ -649,9 +609,9 @@ async fn send_classifier_to_cloud(
             RetryHint::default(),
         )?;
         observation.finish(status.as_u16(), Some("classifier request refused"));
-        return Ok(Some(response));
+        return Ok(response);
     }
-    observed_response(upstream, observation, Upstream::Classifier).map(Some)
+    observed_response(upstream, observation, Upstream::Classifier)
 }
 
 async fn send_to_core(
@@ -1129,7 +1089,7 @@ fn explain_decisions_failure(
             "{message}: the Rayline routing service is busy. Send the turn again after the retry-after interval."
         ),
         DecisionsFailure::Refused => format!(
-            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `hybrid.local_registry_model` in settings and run `raydock hybrid stop` and `raydock hybrid start`."
+            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `models` in settings.json and run `raydock hybrid stop` and `raydock hybrid start`."
         ),
     };
     *value.pointer_mut("/error/message")? = serde_json::Value::String(explained);
@@ -1208,10 +1168,10 @@ fn spawn_core(
 }
 
 /// Aborts the counter's server when rld's run ends.
-struct AbortOnDrop(Option<tokio::task::JoinHandle<Result<()>>>);
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<Result<()>>>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
+        for task in &self.0 {
             task.abort();
         }
     }
