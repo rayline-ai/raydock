@@ -407,8 +407,8 @@ impl Harness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
     pub harness: Harness,
-    pub env_name: Option<String>,
-    pub root_env_explicit: bool,
+    /// The hosted environment the loaded config selects.
+    pub hosted: crate::status::HostedEnvironment,
     /// Args passed through to the harness unchanged.
     pub args: Vec<OsString>,
 }
@@ -516,12 +516,11 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
 
     // Same env -> router URL resolution as `rayline run claude`: built-in prod, or
     // settings.json `environments.<env>.base_url` for `--env`.
-    let hosted = crate::status::resolve_hosted_environment(request.env_name.as_deref(), &home)
-        .map_err(|error| error.to_string())?;
+    let hosted = &request.hosted;
     let env_name = hosted.name().to_owned();
     let router_url = normalize_router_url(&hosted.base_url);
     // The stored `rlk-` key, signing in first when signed out, like `rayline run claude`.
-    let key = crate::status::router_key(&hosted, &home)
+    let key = crate::status::router_key(hosted, &home)
         .await
         .map_err(|error| error.to_string())?;
 

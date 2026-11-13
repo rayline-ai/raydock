@@ -43,8 +43,9 @@ pub struct RunRequest {
     pub model: Option<String>,
     pub auth_mode: CodexAuthMode,
     pub codex_args: Vec<OsString>,
-    /// Hosted environment (`--env`) whose router Codex talks to.
-    pub env_name: Option<String>,
+    /// The hosted environment the loaded config selects, whose router Codex
+    /// talks to.
+    pub hosted: crate::status::HostedEnvironment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,7 +53,9 @@ pub struct ConfigureRequest {
     /// See [`RunRequest::model`].
     pub model: Option<String>,
     pub auth_mode: CodexAuthMode,
-    pub env_name: Option<String>,
+    /// The hosted environment the loaded config selects, whose router Codex
+    /// talks to.
+    pub hosted: crate::status::HostedEnvironment,
 }
 
 /// The `rayline` provider Codex is configured with.
@@ -71,14 +74,12 @@ pub(crate) struct Provider {
 pub(crate) async fn resolve_provider(
     auth_mode: CodexAuthMode,
     model: Option<&str>,
-    env_name: Option<&str>,
+    hosted: &crate::status::HostedEnvironment,
 ) -> Result<Provider, String> {
     auth_mode.require_auto()?;
     let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
-    let hosted = crate::status::resolve_hosted_environment(env_name, &home)
-        .map_err(|error| error.to_string())?;
     let router_url = crate::harness::normalize_router_url(&hosted.base_url);
-    let key = crate::status::router_key(&hosted, &home)
+    let key = crate::status::router_key(hosted, &home)
         .await
         .map_err(|error| error.to_string())?;
     let model = match model {
@@ -107,7 +108,7 @@ pub async fn run(request: RunRequest) -> ExitCode {
     let provider = match resolve_provider(
         request.auth_mode,
         request.model.as_deref(),
-        request.env_name.as_deref(),
+        &request.hosted,
     )
     .await
     {
@@ -175,13 +176,9 @@ pub(crate) fn provider_config_toml(provider: &Provider) -> String {
 /// Write the `rayline` profile to `$CODEX_HOME/rayline.config.toml` (Codex's
 /// default home is `~/.codex`), owner-only since it holds the router key.
 pub async fn configure(request: &ConfigureRequest) -> io::Result<String> {
-    let provider = resolve_provider(
-        request.auth_mode,
-        request.model.as_deref(),
-        request.env_name.as_deref(),
-    )
-    .await
-    .map_err(io::Error::other)?;
+    let provider = resolve_provider(request.auth_mode, request.model.as_deref(), &request.hosted)
+        .await
+        .map_err(io::Error::other)?;
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
@@ -262,7 +259,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn subscription_and_none_fail_before_reading_a_key() {
         for mode in [CodexAuthMode::Subscription, CodexAuthMode::None] {
-            let error = super::resolve_provider(mode, None, Some("no-such-env"))
+            let hosted = crate::status::HostedEnvironment {
+                env: None,
+                base_url: "http://127.0.0.1:9".to_owned(),
+                login_url: "http://127.0.0.1:9/cli-auth".to_owned(),
+            };
+            let error = super::resolve_provider(mode, None, &hosted)
                 .await
                 .unwrap_err();
             assert!(error.contains("not available yet"), "{error}");

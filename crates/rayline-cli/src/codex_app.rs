@@ -29,15 +29,16 @@ pub struct AppRunRequest {
     pub auth_mode: CodexAuthMode,
     /// Extra args passed through to `codex app` (e.g. a workspace path).
     pub codex_args: Vec<OsString>,
-    /// Hosted environment (`--env`) whose router the app talks to.
-    pub env_name: Option<String>,
+    /// The hosted environment the loaded config selects, whose router the
+    /// app talks to.
+    pub hosted: crate::status::HostedEnvironment,
 }
 
 pub async fn run(request: AppRunRequest) -> ExitCode {
     let provider = match crate::codex::resolve_provider(
         request.auth_mode,
         request.model.as_deref(),
-        request.env_name.as_deref(),
+        &request.hosted,
     )
     .await
     {

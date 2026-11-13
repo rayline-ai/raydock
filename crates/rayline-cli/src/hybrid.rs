@@ -262,10 +262,15 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     )
                 }
                 None => {
-                    let hosted = crate::status::resolve_hosted_environment(
-                        (env != crate::status::PROD_ENV).then_some(env.as_str()),
+                    let hosted = crate::config::load_in(
                         &home,
+                        &crate::config::LoadOptions {
+                            mode: crate::config::Mode::Cloud,
+                            env: (env != crate::status::PROD_ENV).then_some(env.as_str()),
+                            harness_protocol: None,
+                        },
                     )
+                    .map(|settings| crate::status::hosted_environment(&settings))
                     .map_err(|error| {
                         io::Error::other(format!("unknown environment {env:?}: {error}"))
                     })?;

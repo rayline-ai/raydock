@@ -110,12 +110,11 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let root_env_explicit = env.is_some();
-    let env_name = settings.env.clone();
+    let hosted = status::hosted_environment(&settings);
     match command {
-        cli::Command::Auth(auth) => run_auth(auth, env_name, root_env_explicit).await,
+        cli::Command::Auth(auth) => run_auth(auth, hosted).await,
         cli::Command::Run(run) if settings.local => run_local(run).await,
-        cli::Command::Run(run) => run_cloud(run.launch, env_name, root_env_explicit).await,
+        cli::Command::Run(run) => run_cloud(run.launch, hosted).await,
         cli::Command::Top { json } => {
             print_or_fail(top::render_top(&top::TopRequest { json }).await, "Error")
         }
@@ -138,12 +137,11 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
     }
 }
 
-async fn run_auth(auth: cli::Auth, env_name: Option<String>, root_env_explicit: bool) -> ExitCode {
+async fn run_auth(auth: cli::Auth, hosted: status::HostedEnvironment) -> ExitCode {
     match auth {
         cli::Auth::Login { no_browser, paste } => {
             let request = status::AuthLoginRequest {
-                env_name,
-                root_env_explicit,
+                hosted,
                 no_browser,
                 paste,
             };
@@ -156,41 +154,25 @@ async fn run_auth(auth: cli::Auth, env_name: Option<String>, root_env_explicit: 
             }
         }
         cli::Auth::Logout => {
-            let request = status::AuthLogoutRequest {
-                env_name,
-                root_env_explicit,
-            };
+            let request = status::AuthLogoutRequest { hosted };
             match status::logout(&request).await {
                 Ok(message) => write_auth_message(&message, "logout"),
                 Err(error) => {
-                    eprintln!("Error: failed to update credentials: {error}");
+                    eprintln!("Error: {error}");
                     ExitCode::from(1)
                 }
             }
         }
         cli::Auth::Status => {
-            let request = status::StatusRequest {
-                env_name,
-                auth_token: None,
-                root_env_explicit,
-            };
+            let request = status::StatusRequest { hosted };
             print_or_fail(status::render_status(&request), "Error")
         }
         cli::Auth::Token => {
-            let shown_env = status::resolve_env(env_name.as_deref(), None);
-            let request = status::AuthTokenRequest {
-                env_name,
-                auth_token: None,
-                root_env_explicit,
-            };
-            match status::resolve_auth_token(&request).await {
-                Ok(status::AuthTokenOutcome::Available(value)) => {
+            let request = status::AuthTokenRequest { hosted };
+            match status::auth_token(&request).await {
+                Ok(value) => {
                     println!("{}", terminal_output_text(&value));
                     ExitCode::SUCCESS
-                }
-                Ok(status::AuthTokenOutcome::NotLoggedIn) => {
-                    eprintln!("Error: Not logged in to {shown_env}. Run: rayline auth login");
-                    ExitCode::from(1)
                 }
                 Err(error) => {
                     eprintln!("Error: {error}");
@@ -245,19 +227,13 @@ async fn run_local(run: cli::Run) -> ExitCode {
 }
 
 /// A cloud-mode run through the hosted router.
-async fn run_cloud(
-    launch: cli::Launch,
-    env_name: Option<String>,
-    root_env_explicit: bool,
-) -> ExitCode {
+async fn run_cloud(launch: cli::Launch, hosted: status::HostedEnvironment) -> ExitCode {
     match launch {
         cli::Launch::Claude { isolated, args } => {
             exec_claude(claude::RunRequest {
-                env_name,
-                auth_token: None,
+                hosted,
                 args,
                 isolated,
-                root_env_explicit,
             })
             .await
         }
@@ -269,9 +245,7 @@ async fn run_cloud(
                 model: options.model,
                 auth_mode: options.auth.unwrap_or(codex::CodexAuthMode::Auto),
                 codex_args: args,
-                root_env_explicit,
-                env_name,
-                auth_token: None,
+                hosted,
             })
             .await
         }
@@ -280,9 +254,7 @@ async fn run_cloud(
                 model: options.model,
                 auth_mode: options.auth.unwrap_or(codex::CodexAuthMode::Auto),
                 codex_args: args,
-                root_env_explicit,
-                env_name,
-                auth_token: None,
+                hosted,
             })
             .await
         }
@@ -290,9 +262,7 @@ async fn run_cloud(
             let request = codex::ConfigureRequest {
                 model: options.model,
                 auth_mode: options.auth.unwrap_or(codex::CodexAuthMode::Auto),
-                env_name,
-                auth_token: None,
-                root_env_explicit,
+                hosted,
             };
             print_or_fail(
                 codex::configure(&request).await,
@@ -302,9 +272,7 @@ async fn run_cloud(
         cli::Launch::Harness { harness, args } => {
             harness::run(harness::RunRequest {
                 harness,
-                env_name,
-                auth_token: None,
-                root_env_explicit,
+                hosted,
                 args,
             })
             .await
