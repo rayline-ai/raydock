@@ -4,7 +4,7 @@
 //! yet, so `start`, `status`, `validate`, `stop`, `install-service` and
 //! `uninstall-service` fail. `off` and `uninstall` restore the Desktop profile
 //! and deployment mode that were selected before Rayline ARC, from the recovery
-//! record in `~/.rayline/claude-desktop/`.
+//! record in `~/.rayline/harness/claude-desktop/`.
 
 mod desktop;
 
