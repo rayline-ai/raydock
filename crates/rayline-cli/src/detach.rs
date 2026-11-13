@@ -1,5 +1,5 @@
-//! Starting a long-lived background child (`rld`) away from the terminal that
-//! launched it.
+//! Starting a long-lived background child away from the terminal that launched
+//! it.
 
 use std::io;
 use std::process::{Child, Command};

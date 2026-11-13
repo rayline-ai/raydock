@@ -16,7 +16,7 @@ The fallback workflow creates platform archives:
 - `rayline-<version>-linux_aarch64.tar.gz`
 
 Each archive contains a single `rayline-<version>-<platform>/` directory with
-`raydock`, its `rayline` alias, `rld`, `rayline-core`, `rayline-core-source.json`,
+`raydock`, its `rayline` alias, `rayline-core`, `rayline-core-source.json`,
 `rayline-core-LICENSE`, `README.md`, `LICENSE` and `NOTICE`.
 
 Generate the formula from the release `SHA256SUMS` file and use the matching
