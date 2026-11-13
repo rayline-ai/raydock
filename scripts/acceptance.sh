@@ -54,23 +54,26 @@ skip=0
 manual=0
 
 # with_timeout <secs> <cmd...>: runs cmd in its own process group and kills
-# the whole group after <secs> (TERM, then KILL 10s later), so no harness
-# child outlives the turn.
+# the whole group after <secs> or on Ctrl-C (TERM, then KILL after up to 10s),
+# so no harness child outlives the turn.
 with_timeout() {
   perl -e '
+    use POSIX ":sys_wait_h";
     my $secs = shift;
     my $pid = fork // die "fork: $!\n";
     if (!$pid) { setpgrp(0, 0); exec @ARGV or die "exec: $!\n" }
     setpgrp($pid, $pid);
-    $SIG{INT} = $SIG{TERM} = sub { kill "TERM", -$pid; exit 130 };
-    $SIG{ALRM} = sub {
+    sub stop_group {
+      my ($code, $message) = @_;
       kill "TERM", -$pid;
-      sleep 10;
+      for (1 .. 10) { waitpid($pid, WNOHANG); last unless kill 0, -$pid; sleep 1 }
       kill "KILL", -$pid;
       waitpid($pid, 0);
-      print STDERR "timed out after ${secs}s\n";
-      exit 124;
-    };
+      print STDERR $message if $message;
+      exit $code;
+    }
+    $SIG{INT} = $SIG{TERM} = sub { stop_group(130) };
+    $SIG{ALRM} = sub { stop_group(124, "timed out after ${secs}s\n") };
     alarm $secs;
     waitpid($pid, 0);
     exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
