@@ -83,10 +83,6 @@ need() {
 
 need curl
 need awk
-if ! command -v minisign >/dev/null 2>&1; then
-  echo "required command not found: minisign, which verifies the release signature. Install it: https://jedisct1.github.io/minisign/" >&2
-  exit 1
-fi
 
 os="$(uname -s)"
 arch="$(uname -m)"
@@ -129,16 +125,6 @@ download() {
 }
 
 download "$base_url/SHA256SUMS" "$tmp_dir/SHA256SUMS"
-download "$base_url/SHA256SUMS.minisig" "$tmp_dir/SHA256SUMS.minisig"
-
-# rayline production signing public key (matches MINISIGN_PUBLIC_KEYS in rayline-cli; see RELEASING-SIGNING.md).
-RAYLINE_PUBKEY="RWRKGvuHHJS76PGzxmnM/1NX8SFhTi3mPj/axsIjv/Ehnw71G4Ei9xb1"
-if ! minisign -Vm "$tmp_dir/SHA256SUMS" -P "$RAYLINE_PUBKEY" >/dev/null 2>&1; then
-  echo "error: SHA256SUMS signature verification failed. The release may be tampered." >&2
-  exit 1
-fi
-echo "SHA256SUMS signature verified."
-
 download "$base_url/$rayline_asset" "$tmp_dir/$rayline_asset"
 download "$base_url/$core_asset" "$tmp_dir/$core_asset"
 download "$base_url/rayline-core-LICENSE" "$tmp_dir/rayline-core-LICENSE"

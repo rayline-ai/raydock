@@ -89,10 +89,6 @@ switch ($arch) {
     default { Fail "unsupported Windows architecture: $arch" }
 }
 
-if (-not (Get-Command minisign -ErrorAction SilentlyContinue)) {
-    Fail "required command not found: minisign, which verifies the release signature. Install it: https://jedisct1.github.io/minisign/"
-}
-
 if (-not $PSBoundParameters.ContainsKey('Version')) {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
 } elseif ($Version.StartsWith('v')) {
@@ -108,22 +104,11 @@ New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
 try {
     $SumsPath = Join-Path $TempDir "SHA256SUMS"
-    $SigPath = Join-Path $TempDir "SHA256SUMS.minisig"
     $RaylinePath = Join-Path $TempDir $RaylineAsset
     $CorePath = Join-Path $TempDir $CoreAsset
     $LicensePath = Join-Path $TempDir "rayline-core-LICENSE"
 
     Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS" -OutFile $SumsPath
-    Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS.minisig" -OutFile $SigPath
-
-    # rayline production signing public key (matches MINISIGN_PUBLIC_KEYS in rayline-cli; see RELEASING-SIGNING.md).
-    $PublicKey = "RWRKGvuHHJS76PGzxmnM/1NX8SFhTi3mPj/axsIjv/Ehnw71G4Ei9xb1"
-    & minisign -Vm $SumsPath -P $PublicKey *> $null
-    if ($LASTEXITCODE -ne 0) {
-        Fail "SHA256SUMS signature verification failed. The release may be tampered."
-    }
-    Write-Host "SHA256SUMS signature verified."
-
     Invoke-WebRequest -Uri "$BaseUrl/$RaylineAsset" -OutFile $RaylinePath
     Invoke-WebRequest -Uri "$BaseUrl/$CoreAsset" -OutFile $CorePath
     Invoke-WebRequest -Uri "$BaseUrl/rayline-core-LICENSE" -OutFile $LicensePath

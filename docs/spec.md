@@ -521,7 +521,7 @@ Everything below is deleted outright: code, tests, docs and help text.
 3. `RAYLINE_CLI_AUTH_URL`, `RAYLINE_MODELS_REGISTRY_URL`. `environments` covers them.
 4. `RAYLINE_UPDATE_BASE_URL`, `RAYLINE_UPDATE_INSTALL_PATH`. Hidden `update` options replace them (section 4.2).
 5. The old local router, `rld` and proxy mode: `RAYLINE_MODEL_REPO`, `RAYLINE_MODEL_FILE`, `RAYLINE_MODEL_REVISION`, `RAYLINE_MODEL_SHA256`, `RAYLINE_LLAMA_TAG`, `RAYLINE_CTX_SIZE`, `RAYLINE_LOCAL_MODEL_ID`, `RAYLINE_NO_LOCAL_MODEL`, `RAYLINE_ADAPTER_PORT`, `RAYLINE_ADAPTER_UPSTREAM_MODEL`, `RAYLINE_ADAPTER_UPSTREAM_URL`, `RAYLINE_INJECTOR_PORT`, `RAYLINE_PROXY_PORT`, `RAYLINE_ISOLATED_PROXY_PORT`, `RAYLINE_ROUTER_URL`, `RAYLINE_DECISION_PLANE`, `RAYLINE_LOCAL_ROUTER_PORT`, `RAYLINE_ROUTER_CONFIG`, `RAYLINE_DATA_DIR`, `RAYLINE_PROXY_CA_CERT_PATH`, `RAYLINE_PROXY_CA_KEY_PATH`, `RAYLINE_UPSTREAM_CA_FILE`, `RAYLINE_ROUTE_STATUS_PATH`, `RAYLINE_ANTHROPIC_URL`, `RAYLINE_PROXY_ROUTING_MODE`, `RAYLINE_CLAUDE_ROUTING_MODE`, `RAYLINE_METRICS_PORT`, `RAYLINE_METRICS_URL`, `RLD_BIN`; proxy injection of `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, `NO_PROXY`, `NODE_EXTRA_CA_CERTS`; the old router config folder from `APPDATA` and `XDG_CONFIG_HOME`; `OLLAMA_HOST` and `LMSTUDIO_HOST`.
-6. Installer overrides: `RAYLINE_INSTALL_DIR` (`--install-dir` replaces it), `RAYLINE_RELEASE_BASE_URL` (the installer's hidden `--base-url` replaces it, section 4.4) and `RAYLINE_MINISIGN_PUBKEY` (the installers trust only the pinned release key).
+6. Installer overrides: `RAYLINE_INSTALL_DIR` (`--install-dir` replaces it), `RAYLINE_RELEASE_BASE_URL` (the installer's hidden `--base-url` replaces it, section 4.4) and `RAYLINE_MINISIGN_PUBKEY` (the installers check no signature).
 
 ## 11. Done means tested
 

@@ -43,33 +43,20 @@ reaches GitHub without a valid signature.
 
 ## 3. Embed the public key in source
 
-The public key is pinned in three places, which must match. Set each to the
-base64 key from `prod.pub` (the single line after `untrusted comment:`):
+The public key is pinned in `crates/rayline-cli/src/lib.rs`, read by
+`rayline update`. Set it to the base64 key from `prod.pub` (the single line
+after `untrusted comment:`):
 
-- `crates/rayline-cli/src/lib.rs`, read by `rayline update`:
+```rust
+pub const MINISIGN_PUBLIC_KEYS: &[&str] = &[
+    "<prod-pubkey-base64>", // rayline production signing key
+];
+```
 
-  ```rust
-  pub const MINISIGN_PUBLIC_KEYS: &[&str] = &[
-      "<prod-pubkey-base64>", // rayline production signing key
-  ];
-  ```
-
-- `scripts/install-rayline.sh`:
-
-  ```sh
-  RAYLINE_PUBKEY="<prod-pubkey-base64>"
-  ```
-
-- `scripts/install-rayline.ps1`:
-
-  ```powershell
-  $PublicKey = "<prod-pubkey-base64>"
-  ```
-
-The installers trust only this pinned key. No env var overrides it.
+The install scripts pin no key: they check the release with `SHA256SUMS` only.
 
 Commit the changes and ship. The new key takes effect for all subsequent
-`rayline update` calls and fresh installs.
+`rayline update` calls.
 
 ---
 
@@ -113,6 +100,7 @@ Signature and comment signature verified
   reviewers). No automated process can sign without a human approving the run.
 - `verify_signature` in `update.rs` is fail-closed: a missing or invalid
   `.minisig` causes `rayline update` to abort before any binary is installed.
-- Both installers require minisign and abort if the signature doesn't verify.
+- The installers do not check the signature. They check each file against
+  `SHA256SUMS` and abort on a mismatch.
 - Private keys must never be committed to the repository. Only public keys
   (or their base64 strings) belong in source.

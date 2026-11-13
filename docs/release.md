@@ -44,9 +44,8 @@ Supported platform tags match the self-updater contract in
 - `macosx_11_0_arm64`
 - `windows_x86_64`
 
-The public install scripts download from GitHub Releases. They need
-`minisign`: they verify `SHA256SUMS.minisig` against the pinned release key,
-then each file they install against `SHA256SUMS`.
+The public install scripts download from GitHub Releases. They check each file
+they install against `SHA256SUMS`; they do not check its signature.
 
 ## Self-Update Mirror
 

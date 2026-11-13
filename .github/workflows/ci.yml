@@ -80,7 +80,6 @@ jobs:
 
       - name: Validate release install and local lifecycle
         run: |
-          sudo apt-get install -y minisign
           cargo build --locked -p rayline-cli
           python3 scripts/test-release-install.py
           python3 scripts/test-local-lifecycle.py
