@@ -114,7 +114,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
     let env_name = settings.env.clone();
     match command {
         cli::Command::Auth(auth) => run_auth(auth, env_name, root_env_explicit).await,
-        cli::Command::Run(run) if settings.local => run_local(run.launch).await,
+        cli::Command::Run(run) if settings.local => run_local(run).await,
         cli::Command::Run(run) => run_cloud(run.launch, env_name, root_env_explicit).await,
         cli::Command::Top { json } => {
             print_or_fail(top::render_top(&top::TopRequest { json }).await, "Error")
@@ -226,12 +226,12 @@ fn print_or_fail<E: std::fmt::Display>(result: Result<String, E>, prefix: &str) 
 
 /// A local-mode run: today's `hybrid run` path. The kept options it does not
 /// run yet are refused here, in one place, until sub-PR 6b.
-async fn run_local(launch: cli::Launch) -> ExitCode {
-    if let Some(option) = launch.not_in_local_mode() {
+async fn run_local(run: cli::Run) -> ExitCode {
+    if let Some(option) = run.not_in_local_mode() {
         eprintln!("Error: {option} is not available in local mode yet");
         return ExitCode::from(1);
     }
-    let (name, args) = match launch {
+    let (name, args) = match run.launch {
         cli::Launch::Claude { args, .. } => ("claude", args),
         cli::Launch::Codex { args, .. } => ("codex", args),
         cli::Launch::Harness { harness, args } => (harness.name(), args),

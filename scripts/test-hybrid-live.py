@@ -192,14 +192,15 @@ def main():
     output = args.output_dir.resolve()
     home = output / "home"
     state = home / ".rayline" / "hybrid"
-    # `rayline run pi --config <file>` reads this file; its `routing` puts the
-    # run in local mode, which connects to <home>/.rayline/hybrid.
-    routing_file = output / "routing.json"
-    routing_file.write_text(json.dumps({"routing": {
+    home.mkdir(mode=0o700)
+    # `rayline run pi --local` needs `routing` in the settings file and connects
+    # to the process in <home>/.rayline/hybrid.
+    settings = home / ".config" / "rayline" / "settings.json"
+    settings.parent.mkdir(parents=True, mode=0o700)
+    settings.write_text(json.dumps({"routing": {
         "decisions_model": "arc-swift-1.0",
         "classifier_model": "anthropic/claude-haiku-5.5",
         "policy": {"preset": "arc-policy.hybrid-default.v1"}}}))
-    home.mkdir(mode=0o700)
     env = dict(os.environ, HOME=str(home), PI_TELEMETRY="0", PI_OFFLINE="1")
     cli = [str(args.rayline.resolve()), "hybrid", "--state-dir", str(state)]
     log = state / "runtime.log"
@@ -237,7 +238,7 @@ def main():
             report["tasks"].append(task_report)
             stdout_path, stderr_path = output / f"{name}-pi.jsonl", output / f"{name}-pi.stderr"
             with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
-                process = subprocess.Popen([str(args.rayline.resolve()), "run", "pi", "--config", str(routing_file), "--", "--provider", "rayline", "--model", "rayline-auto",
+                process = subprocess.Popen([str(args.rayline.resolve()), "run", "pi", "--local", "--", "--provider", "rayline", "--model", "rayline-auto",
                     "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
                     "--tools", "read,write,edit,bash", "--thinking", "off", "--mode", "json", "--print", prompt],
                     env=env, cwd=cwd, stdout=stdout, stderr=stderr, start_new_session=True)

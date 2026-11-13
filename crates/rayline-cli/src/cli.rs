@@ -237,6 +237,20 @@ pub(crate) struct CodexOptions {
     pub auth: Option<CodexAuthMode>,
 }
 
+impl Run {
+    /// The option or command that local mode does not run yet, if this run
+    /// uses one. Local mode runs what the deleted `hybrid run` ran: it
+    /// connects to the running local process, which does not record its
+    /// config file, so a `--config` file could not be checked against it
+    /// (section 3.3 item 3). Sub-PR 6b lifts these refusals.
+    pub(crate) fn not_in_local_mode(&self) -> Option<&'static str> {
+        match self.config {
+            ConfigFlag::File(_) => Some("`--config`"),
+            ConfigFlag::Default | ConfigFlag::Local => self.launch.not_in_local_mode(),
+        }
+    }
+}
+
 impl Launch {
     /// The protocol the harness speaks, checked against `endpoints` in a
     /// local-mode run.
@@ -250,10 +264,9 @@ impl Launch {
         }
     }
 
-    /// The kept option or command that local mode does not run yet, if this
-    /// launch uses one. Local mode runs what the deleted `hybrid run` ran, which
-    /// had none of them. Sub-PR 6b lifts these refusals.
-    pub(crate) fn not_in_local_mode(&self) -> Option<&'static str> {
+    /// The kept option or command that local mode does not run yet: the
+    /// deleted `hybrid run` had none of them.
+    fn not_in_local_mode(&self) -> Option<&'static str> {
         match self {
             Launch::Claude { isolated: true, .. } => Some("`--isolated`"),
             Launch::ClaudeDesktop(_) => Some("`run claude-desktop`"),
@@ -1378,7 +1391,11 @@ mod tests {
 
     #[test]
     fn local_mode_names_the_kept_options_it_does_not_run_yet() {
-        let local = |args: &[&str]| run(args).launch.not_in_local_mode();
+        let local = |args: &[&str]| run(args).not_in_local_mode();
+        assert_eq!(
+            local(&["run", "pi", "--config", "routing.json"]),
+            Some("`--config`")
+        );
         assert_eq!(
             local(&["run", "claude", "--isolated"]),
             Some("`--isolated`")

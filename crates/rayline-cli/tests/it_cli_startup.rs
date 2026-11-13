@@ -28,7 +28,7 @@ impl Home {
         fs::write(dir.join("settings.json"), json).expect("settings file");
     }
 
-    /// Runs `raydock` with `PATH` empty, so a run that got as far as starting
+    /// Runs `raydock` in the home directory with `PATH` empty, so a run that got as far as starting
     /// a harness would fail differently.
     fn run(&self, args: &[&str]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_raydock"));
@@ -39,6 +39,7 @@ impl Home {
         }
         command
             .args(args)
+            .current_dir(&self.0)
             .env("HOME", &self.0)
             .env("PATH", "")
             .output()
@@ -55,6 +56,9 @@ impl Drop for Home {
 const ROUTING: &str = r#"{"routing": {"decisions_model": "arc-swift-1.0",
     "classifier_model": "anthropic/claude-haiku-5.5",
     "policy": {"preset": "arc-policy.hybrid-default.v1"}}}"#;
+
+/// A `--config` file with `routing`, inside the temporary home.
+const ROUTING_FILE: &str = "routing.json";
 
 fn assert_fails(output: &Output, code: i32, stderr: &str) {
     let text = String::from_utf8_lossy(&output.stderr);
@@ -134,6 +138,7 @@ fn a_bad_update_channel_fails_before_update_runs() {
 fn local_mode_refuses_the_kept_options_it_does_not_run_yet() {
     let home = Home::new();
     home.settings(ROUTING);
+    fs::write(home.0.join(ROUTING_FILE), ROUTING).expect("routing file");
     for (args, option) in [
         (
             &["run", "claude", "--local", "--isolated"][..],
@@ -149,6 +154,7 @@ fn local_mode_refuses_the_kept_options_it_does_not_run_yet() {
             "`run codex configure`",
         ),
         (&["run", "codex", "--local", "--model", "m"], "`--model`"),
+        (&["run", "pi", "--config", ROUTING_FILE], "`--config`"),
     ] {
         assert_fails(
             &home.run(args),
