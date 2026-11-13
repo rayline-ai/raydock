@@ -172,15 +172,16 @@ fn render_status_from_home(
 ) -> Result<String, AuthError> {
     let credentials = credentials::load(home)?;
     let Some(account) = credentials.account(hosted.slot()) else {
-        return Ok(format!("Not logged in. Run: {}\n", auth_command()));
+        return Ok(format!(
+            "{}\n",
+            AuthError::SignedOut(hosted.name().to_owned())
+        ));
     };
     let session = &account.session;
 
     let mut output = String::new();
     output.push_str(&format!("  Email:       {}\n", session.email));
-    if let Some(env) = &hosted.env {
-        output.push_str(&format!("  Environment: {env}\n"));
-    }
+    output.push_str(&format!("  Environment: {}\n", hosted.name()));
     let signed_in_at =
         credentials::format_timestamp(session.signed_in_at).map_err(AuthError::WriteFailed)?;
     output.push_str(&format!("  Logged in:   {signed_in_at}\n"));
@@ -1554,10 +1555,15 @@ mod tests {
         let home = temp_home("status");
         let prod = hosted(None, UNREACHABLE);
         let dev = hosted(Some("dev"), UNREACHABLE);
-        let signed_out = format!("Not logged in. Run: {} auth login\n", crate::CLI_BIN);
+        let signed_out = |env: &str| {
+            format!(
+                "Not logged in to {env}. Run: {} auth login\n",
+                crate::CLI_BIN
+            )
+        };
         assert_eq!(
             render_status_from_home(&prod, &home, NOW).unwrap(),
-            signed_out
+            signed_out("prod")
         );
 
         save_account(&home, None, account(LATER));
@@ -1571,14 +1577,14 @@ mod tests {
             "{output}"
         );
         assert!(output.contains("  Token TTL:   60m 0s\n"), "{output}");
-        assert!(!output.contains("Environment:"), "{output}");
+        assert!(output.contains("  Environment: prod\n"), "{output}");
         assert!(
             !output.contains(ACCESS_TOKEN) && !output.contains(API_KEY),
             "{output}"
         );
         assert_eq!(
             render_status_from_home(&dev, &home, NOW).unwrap(),
-            signed_out
+            signed_out("dev")
         );
 
         save_account(&home, Some("dev"), account(NOW - 1));
