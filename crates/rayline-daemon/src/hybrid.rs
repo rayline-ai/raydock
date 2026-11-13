@@ -202,7 +202,7 @@ pub async fn run(args: Args) -> Result<()> {
         let state = Arc::new(Gateway {
             core_url: handshake.listen_url,
             core_token,
-            inbound: InboundGuard::new(gateway_token).context("generate gateway token")?,
+            inbound: InboundGuard::new(gateway_token),
             client,
             port,
             core_pid: handshake.pid,

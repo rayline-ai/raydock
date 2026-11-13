@@ -115,6 +115,22 @@ fn a_missing_config_file_fails_before_anything_runs() {
 }
 
 #[test]
+fn claude_is_found_on_path_only() {
+    let home = Home::new();
+    // Where Claude Code's installers put it; neither is looked at.
+    for file in [".local/bin/claude", ".claude/local/claude"] {
+        let file = home.0.join(file);
+        fs::create_dir_all(file.parent().expect("parent")).expect("install dir");
+        fs::write(file, "").expect("claude");
+    }
+    assert_fails(
+        &home.run(&["run", "claude"]),
+        1,
+        "`claude` not found on PATH",
+    );
+}
+
+#[test]
 fn a_config_file_starts_the_local_process_from_it() {
     let home = Home::new();
     fs::write(home.0.join(ROUTING_FILE), ROUTING).expect("routing file");

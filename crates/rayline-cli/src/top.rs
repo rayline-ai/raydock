@@ -489,24 +489,13 @@ fn top_sort_value(row: &Value, sort: TopSort) -> f64 {
 fn top_table_header(width: u16) -> String {
     if width < 120 {
         format!(
-            "{:<14} {:<10} {:<7} {:<10} {:>7} {:>7} {:>7} {:>6} {:>6} MODEL",
-            "REQ", "AGENT", "TARGET", "STATE", "OUT", "CACHE %", "TTFT", "PF", "TG"
+            "{:<14} {:<7} {:<10} {:>7} {:>7} {:>7} {:>6} {:>6} MODEL",
+            "REQ", "TARGET", "STATE", "OUT", "CACHE %", "TTFT", "PF", "TG"
         )
     } else {
         format!(
-            "{:<18} {:<16} {:<12} {:<8} {:<10} {:>7} {:>7} {:>7} {:>8} {:>8} {:>6} {:>6} MODEL / POLICY",
-            "REQ",
-            "UPSTREAM",
-            "AGENT",
-            "TARGET",
-            "STATE",
-            "IN",
-            "OUT",
-            "CACHE %",
-            "AGE",
-            "TTFT",
-            "PF",
-            "TG"
+            "{:<18} {:<8} {:<10} {:>7} {:>7} {:>7} {:>8} {:>8} {:>6} {:>6} MODEL / POLICY",
+            "REQ", "TARGET", "STATE", "IN", "OUT", "CACHE %", "AGE", "TTFT", "PF", "TG"
         )
     }
 }
@@ -515,10 +504,6 @@ fn top_table_row(row: &Value, width: u16) -> String {
     let request_id = truncate_cell(
         value_str(row, "request_id"),
         if width < 120 { 14 } else { 18 },
-    );
-    let agent = truncate_cell(
-        value_str(row, "agent_type"),
-        if width < 120 { 10 } else { 12 },
     );
     let target = truncate_cell(top_target_cell(row), 8);
     let state = truncate_cell(value_str(row, "state"), 10);
@@ -531,15 +516,14 @@ fn top_table_row(row: &Value, width: u16) -> String {
 
     if width < 120 {
         return format!(
-            "{request_id:<14} {agent:<10} {target:<7} {state:<10} {output_tokens:>7} {cache_hit:>7} {ttft:>7} {prefill_tps:>6} {generation_tps:>6} {model}"
+            "{request_id:<14} {target:<7} {state:<10} {output_tokens:>7} {cache_hit:>7} {ttft:>7} {prefill_tps:>6} {generation_tps:>6} {model}"
         );
     }
 
-    let upstream = truncate_cell(value_str(row, "upstream_request_id"), 16);
     let input_tokens = count_cell(row, "input_tokens");
     let age = ms_cell(row, "duration_ms");
     format!(
-        "{request_id:<18} {upstream:<16} {agent:<12} {target:<8} {state:<10} {input_tokens:>7} {output_tokens:>7} {cache_hit:>7} {age:>8} {ttft:>8} {prefill_tps:>6} {generation_tps:>6} {model}"
+        "{request_id:<18} {target:<8} {state:<10} {input_tokens:>7} {output_tokens:>7} {cache_hit:>7} {age:>8} {ttft:>8} {prefill_tps:>6} {generation_tps:>6} {model}"
     )
 }
 
@@ -563,8 +547,6 @@ fn format_top_snapshot(snapshot: &Value) -> String {
 
 fn format_top_row(row: &Value) -> String {
     let request_id = value_str(row, "request_id");
-    let upstream = value_str(row, "upstream_request_id");
-    let agent = value_str(row, "agent_type");
     let target = top_target_cell(row);
     let model = value_str(row, "executed_model");
     let state = value_str(row, "state");
@@ -574,7 +556,7 @@ fn format_top_row(row: &Value) -> String {
     let generation_tps = rate_cell(row, "output_tps");
     let cache_hit = percent_cell(row, "cache_hit_ratio");
     format!(
-        "{request_id:<22} upstream={upstream:<16} {agent:<12} {target:<10} {state:<10} out={output_tokens:<7} cache%={cache_hit:<7} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} {model}\n"
+        "{request_id:<22} {target:<10} {state:<10} out={output_tokens:<7} cache%={cache_hit:<7} ttft={ttft:<8} pf={prefill_tps:<6} tg={generation_tps:<6} {model}\n"
     )
 }
 
@@ -962,7 +944,6 @@ mod tests {
 
         let row = serde_json::json!({
             "request_id": "req",
-            "agent_type": "main",
             "target": "local",
             "state": "done",
             "executed_model": "model",
@@ -980,48 +961,12 @@ mod tests {
             .map(str::to_owned)
             .collect::<Vec<_>>();
         assert_eq!(
-            &cells[5..12],
-            ["10.2k", "1.2M", "88%", "10.2s", "999ms", "12.0k", "1.2M"]
+            cells,
+            [
+                "req", "local", "done", "10.2k", "1.2M", "88%", "10.2s", "999ms", "12.0k", "1.2M",
+                "model"
+            ]
         );
-    }
-
-    #[test]
-    fn top_table_shows_the_upstream_request_id_after_the_request_id() {
-        let header = top_table_header(140);
-        let req = header.find("REQ").expect("header includes request column");
-        let upstream = header
-            .find("UPSTREAM")
-            .expect("header includes upstream column");
-        let agent = header.find("AGENT").expect("header includes agent column");
-        assert!(req < upstream);
-        assert!(upstream < agent);
-
-        let row = serde_json::json!({
-            "request_id": "req_1",
-            "upstream_request_id": "rt_0123456789abcdefghij",
-            "agent_type": "main",
-            "target": "remote",
-            "state": "completed",
-            "executed_model": "model",
-        });
-        let cells = top_table_row(&row, 140)
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        assert_eq!(cells[0], "req_1");
-        assert_eq!(cells[1].chars().count(), 16);
-        assert!(cells[1].starts_with("rt_0123456789"));
-        assert_eq!(cells[2], "main");
-        assert_eq!(cells[3], "cloud");
-
-        let local = serde_json::json!({"request_id": "req_2", "target": "local"});
-        let cells = top_table_row(&local, 140)
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        assert_eq!(&cells[..2], ["req_2", "-"]);
-        assert!(format_top_row(&local).contains("upstream=-"));
-        assert!(format_top_row(&row).contains("upstream=rt_0123456789abcdefghij"));
     }
 
     #[test]

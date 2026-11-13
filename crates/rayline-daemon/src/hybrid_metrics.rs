@@ -165,8 +165,6 @@ impl RoutingMetadata {
             requested_model: None,
             policy: self.policy.clone(),
             task_class: header(headers, "x-rayline-event"),
-            agent_id: None,
-            agent_type: None,
         });
     }
 }
@@ -211,8 +209,6 @@ impl RequestObservation {
             request_id: id.clone(),
             source: "hybrid".to_owned(),
             requested_model,
-            agent_id: None,
-            agent_type: None,
         });
         Self {
             id,
@@ -241,8 +237,6 @@ impl RequestObservation {
             requested_model: None,
             policy: Some("classifier cloud pin".to_owned()),
             task_class: Some("sidecall".to_owned()),
-            agent_id: None,
-            agent_type: None,
         });
     }
 
