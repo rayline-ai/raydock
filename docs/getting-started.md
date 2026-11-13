@@ -182,7 +182,7 @@ rayline update --check
 | `--check` | Reports whether an update is available, without installing it. |
 | `--version <version>` | Installs this version. |
 | `--force` | Installs even when the target version isn't newer. |
-| `--dry-run` | Shows what the update would do, without doing it. |
+| `--dry-run` | Downloads and verifies the update, then reports what it would install, without installing it. |
 
 ## Files
 
