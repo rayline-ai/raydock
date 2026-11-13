@@ -1,8 +1,8 @@
 //! `rayline run codex app`: launch the Codex desktop app on ARC through the
 //! Rayline router.
 //!
-//! Takes the same `--auth`/`--model` flags as `rayline run codex` and points the
-//! app at the same `rayline` provider. The desktop app-server differs from the
+//! Takes the same `--model` flag as `rayline run codex` and points the app at
+//! the same `rayline` provider. The desktop app-server differs from the
 //! CLI in two ways that shape this module:
 //!
 //! 1. It reads persistent config only from its `CODEX_HOME`, so the provider
@@ -27,12 +27,9 @@ use std::process::ExitCode;
 
 use toml_edit::{DocumentMut, Item, Table, TomlError, Value};
 
-use crate::codex::CodexAuthMode;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppRunRequest {
     pub model: Option<String>,
-    pub auth_mode: CodexAuthMode,
     /// Extra args passed through to `codex app` (e.g. a workspace path).
     pub codex_args: Vec<OsString>,
     /// The hosted environment the loaded config selects, whose router the
@@ -41,19 +38,14 @@ pub struct AppRunRequest {
 }
 
 pub async fn run(request: AppRunRequest) -> ExitCode {
-    let provider = match crate::codex::resolve_provider(
-        request.auth_mode,
-        request.model.as_deref(),
-        &request.hosted,
-    )
-    .await
-    {
-        Ok(provider) => provider,
-        Err(error) => {
-            eprintln!("Error: {error}");
-            return ExitCode::from(1);
-        }
-    };
+    let provider =
+        match crate::codex::resolve_provider(request.model.as_deref(), &request.hosted).await {
+            Ok(provider) => provider,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return ExitCode::from(1);
+            }
+        };
 
     // 1. Compute the config to write. Nothing changes on disk yet, so a
     //    declined restart below leaves everything untouched.

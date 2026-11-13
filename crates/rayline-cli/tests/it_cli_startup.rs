@@ -137,9 +137,7 @@ fn a_config_file_starts_the_local_process_from_it() {
     for args in [
         &["run", "pi", "--config", ROUTING_FILE][..],
         &["local", "start", "--config", ROUTING_FILE],
-        // Both send Codex only the gateway token.
-        &["run", "codex", "--config", ROUTING_FILE, "--auth", "auto"],
-        &["run", "codex", "--config", ROUTING_FILE, "--auth", "none"],
+        &["run", "codex", "--config", ROUTING_FILE],
     ] {
         assert_fails(&home.run(args), 1, "installed rayline-core is missing at");
     }
@@ -204,10 +202,6 @@ fn local_mode_refuses_the_kept_options_it_does_not_run() {
             "`run codex configure`",
         ),
         (&["run", "codex", "--local", "--model", "m"], "`--model`"),
-        (
-            &["run", "codex", "--local", "--auth", "subscription"],
-            "`--auth subscription`",
-        ),
     ] {
         assert_fails(
             &home.run(args),

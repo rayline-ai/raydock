@@ -70,7 +70,7 @@ rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...
 5. Rayline options come first, right after the harness name. The first argument that is not a Rayline option, or everything after `--`, goes to the harness unchanged, including `--help`.
 6. `rayline run --help` prints the usage above. `rayline run <HARNESS>` with an unknown harness is a usage error.
 7. Each harness keeps today's behaviour in both modes, apart from what this spec removes.
-8. Local mode refuses these kept options and commands (section 9) before anything starts: `rayline run claude --isolated`, `rayline run claude-desktop`, `rayline run codex app`, `rayline run codex configure`, and `rayline run codex` with `--model` or `--auth subscription`. `app` and `configure` are Rayline commands only as the word right after `rayline run codex`. After Rayline's options they are codex arguments, so `rayline run codex --local app` passes `app` to codex.
+8. Local mode refuses these kept options and commands (section 9) before anything starts: `rayline run claude --isolated`, `rayline run claude-desktop`, `rayline run codex app`, `rayline run codex configure`, and `rayline run codex` with `--model`. `app` and `configure` are Rayline commands only as the word right after `rayline run codex`. After Rayline's options they are codex arguments, so `rayline run codex --local app` passes `app` to codex.
 9. For `claude`, `codex`, `pi` and `opencode`, local mode refuses a command line that resumes or forks a saved session, before anything starts. It looks at the harness arguments before any `--`, in both the `--flag` and `--flag=value` forms, and refuses these:
    - `claude`: `-r`, `-c`, `--resume`, `--continue`, `--fork-session`, `--resume-session-at`;
    - `codex`: `resume` or `fork` as the first argument, or `exec resume` as the first two;
@@ -424,7 +424,7 @@ These keep today's behaviour for now, under the new command shape. Their aliases
 1. `rayline auth login`: `-b, --no-browser` (device-code login) and `-p, --paste` (paste the callback URL). `--paste` with `--no-browser` behaves as today (`--paste` wins). Launching a harness while signed out signs in on the spot with the default flow when stdin and stdout are both terminals. Otherwise the launch fails as signed out. A local-mode launch that reuses a running local process doesn't read the credentials, so it runs even when signed out.
 2. `rayline update`: `--check`, `--version <version>`, `--force`, `--dry-run`.
 3. `rayline run claude --isolated`: gives Claude Code its own config folder (`~/.rayline/harness/claude-code/`) so it can run beside other sessions.
-4. `rayline run codex`: `--model <model>` and `--auth auto|subscription|none`; the subcommands `rayline run codex app [WORKSPACE]` (launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`) and `rayline run codex configure` (writes a Codex profile, `rayline.config.toml`, to the user's Codex home: `CODEX_HOME`, else `~/.codex`, Codex's own default).
+4. `rayline run codex`: `--model <model>`; the subcommands `rayline run codex app [WORKSPACE]` (launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`) and `rayline run codex configure` (writes a Codex profile, `rayline.config.toml`, to the user's Codex home: `CODEX_HOME`, else `~/.codex`, Codex's own default).
 5. `rayline run claude-desktop [COMMAND]`: `start` (default), `status`, `validate`, `stop`, `install-service`, `uninstall-service`, `off`, `uninstall`, and `--manual`, `--prefixed-ids`, `--desktop-config <path>`. Desktop runs on the shared local process; its own router copy is gone. Its model ids are unchanged.
 
 ## 10. Removed
@@ -465,7 +465,7 @@ Everything below is deleted outright: code, tests, docs and help text.
 2. A missing `refresh_token` replaced by the access token.
 3. Sign-in flow guessed from `SSH_CONNECTION`, `DISPLAY`, `WAYLAND_DISPLAY` or `BROWSER`. `--no-browser` is the explicit way.
 4. API mode aliases (`claude`, `openai`, `responses`, `openai_responses`): one name per mode.
-5. Codex auth mode aliases (`no-auth`, `local`, `codex-subscription`, `chatgpt`, `codex`) and `--subscription`: only `auto`, `subscription`, `none`.
+5. Codex `--auth`, with all its values (`auto`, `subscription`, `none`, `no-auth`, `local`, `codex-subscription`, `chatgpt`, `codex`), and `--subscription`.
 6. `n_ctx` as a context-window alias.
 7. "Legacy mode" for the `current`/`execution_context_v1` API modes, support for a core without the token-counter contract, and legacy adapter overrides.
 8. The Decisions environment guessed from its URL.

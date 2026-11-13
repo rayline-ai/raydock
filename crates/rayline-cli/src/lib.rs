@@ -289,7 +289,6 @@ async fn run_cloud(launch: cli::Launch, hosted: status::HostedEnvironment) -> Ex
         cli::Launch::Codex { options, args } => {
             codex::run(codex::RunRequest {
                 model: options.model,
-                auth_mode: options.auth.unwrap_or(codex::CodexAuthMode::Auto),
                 codex_args: args,
                 hosted,
             })
@@ -298,7 +297,6 @@ async fn run_cloud(launch: cli::Launch, hosted: status::HostedEnvironment) -> Ex
         cli::Launch::CodexApp { options, args } => {
             codex_app::run(codex_app::AppRunRequest {
                 model: options.model,
-                auth_mode: options.auth.unwrap_or(codex::CodexAuthMode::Auto),
                 codex_args: args,
                 hosted,
             })
@@ -307,7 +305,6 @@ async fn run_cloud(launch: cli::Launch, hosted: status::HostedEnvironment) -> Ex
         cli::Launch::CodexConfigure(options) => {
             let request = codex::ConfigureRequest {
                 model: options.model,
-                auth_mode: options.auth.unwrap_or(codex::CodexAuthMode::Auto),
                 hosted,
             };
             print_or_fail(
