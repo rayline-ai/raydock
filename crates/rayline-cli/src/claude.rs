@@ -133,6 +133,7 @@ pub enum RunError {
     ConfigDir(io::Error),
     IsolatedProfile(io::Error),
     LaunchRecord(io::Error),
+    DaemonProbe(io::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -152,6 +153,7 @@ impl std::fmt::Display for RunError {
             Self::LaunchRecord(error) => {
                 write!(formatter, "Claude Code launch record: {error}")
             }
+            Self::DaemonProbe(error) => write!(formatter, "Claude Code daemon: {error}"),
         }
     }
 }
@@ -427,12 +429,16 @@ async fn get_router_settings(
 }
 
 pub(crate) fn claude_agent_view_disabled() -> bool {
-    env::var(CLAUDE_DISABLE_AGENT_VIEW_ENV).is_ok_and(|value| {
-        !matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "" | "0" | "false" | "no"
-        )
-    })
+    env::var(CLAUDE_DISABLE_AGENT_VIEW_ENV).is_ok_and(|value| agent_view_disabled_by(&value))
+}
+
+/// Claude Code's own reading of `CLAUDE_CODE_DISABLE_AGENT_VIEW`: only `1`,
+/// `true`, `yes` and `on` (trimmed, any case) disable the agent view.
+fn agent_view_disabled_by(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// Resolve the Claude Code config dir this run targets. In isolated mode that is
@@ -1504,5 +1510,26 @@ mod arc_default_tests {
         );
         assert_eq!(forwarded_model_arg(&args(&["-p", "hi"])), None);
         assert_eq!(forwarded_model_arg(&args(&["--model="])), None);
+    }
+}
+
+#[cfg(test)]
+mod agent_view_env_tests {
+    use super::agent_view_disabled_by;
+
+    #[test]
+    fn only_the_values_claude_code_reads_as_true_disable_the_agent_view() {
+        for value in [
+            "1", "true", "TRUE", "yes", "Yes", "on", "ON", " 1 ", "	true
+",
+        ] {
+            assert!(agent_view_disabled_by(value), "{value:?}");
+        }
+        for value in [
+            "", " ", "0", "false", "no", "off", "2", "-1", "enabled", "disable", "y", "t", "1.0",
+            "true1",
+        ] {
+            assert!(!agent_view_disabled_by(value), "{value:?}");
+        }
     }
 }

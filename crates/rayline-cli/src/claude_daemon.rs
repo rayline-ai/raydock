@@ -61,9 +61,10 @@ impl LaunchPreflight<'_> {
         let state = if crate::claude::claude_agent_view_disabled() {
             None
         } else {
-            inspect_running_daemon(self.config_dir)
+            inspect_running_daemon(self.config_dir, pid_is_alive).map_err(RunError::DaemonProbe)?
         };
-        let proceed = proceed_preflight(self.config_dir, state.as_ref());
+        let proceed = proceed_preflight(self.config_dir, state.as_ref(), pid_is_alive)
+            .map_err(RunError::DaemonProbe)?;
         let Some(state) = state else {
             return Ok(PreflightOutcome::Proceed(proceed));
         };
@@ -96,13 +97,18 @@ impl LaunchPreflight<'_> {
     }
 }
 
-fn proceed_preflight(config_dir: &Path, state: Option<&DaemonState>) -> ProceedPreflight {
-    let preserve_spawned_by_pid = state
-        .and_then(|state| state.spawned_by_pid)
-        .or_else(|| read_daemon_lock(config_dir).and_then(|(_, spawned_by_pid, _)| spawned_by_pid));
-    ProceedPreflight {
+fn proceed_preflight(
+    config_dir: &Path,
+    state: Option<&DaemonState>,
+    is_alive: impl Fn(u32) -> io::Result<bool>,
+) -> io::Result<ProceedPreflight> {
+    let preserve_spawned_by_pid = match state {
+        Some(state) => state.spawned_by_pid,
+        None => read_daemon_lock(config_dir, is_alive)?.and_then(|lock| lock.spawned_by_pid),
+    };
+    Ok(ProceedPreflight {
         preserve_spawned_by_pid,
-    }
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -121,14 +127,29 @@ enum DaemonOwner {
     Unverified,
 }
 
-fn read_daemon_lock(config_dir: &Path) -> Option<(u32, Option<u32>, Option<i64>)> {
+struct DaemonLock {
+    pid: u32,
+    spawned_by_pid: Option<u32>,
+    started_at_ms: Option<i64>,
+}
+
+/// The daemon `daemon.lock` names, when its process is running. A liveness
+/// check that fails is an error.
+fn read_daemon_lock(
+    config_dir: &Path,
+    is_alive: impl Fn(u32) -> io::Result<bool>,
+) -> io::Result<Option<DaemonLock>> {
+    let Some(lock) = parse_daemon_lock(config_dir) else {
+        return Ok(None);
+    };
+    Ok(is_alive(lock.pid)?.then_some(lock))
+}
+
+fn parse_daemon_lock(config_dir: &Path) -> Option<DaemonLock> {
     let raw = fs::read_to_string(config_dir.join("daemon.lock")).ok()?;
     let lock = serde_json::from_str::<Value>(&raw).ok()?;
     let pid = lock.get("pid")?.as_u64()?;
     let pid = u32::try_from(pid).ok().filter(|pid| *pid > 0)?;
-    if !pid_is_alive(pid) {
-        return None;
-    }
     let spawned_by_pid = lock
         .get("spawnedBy")
         .and_then(Value::as_object)
@@ -137,45 +158,65 @@ fn read_daemon_lock(config_dir: &Path) -> Option<(u32, Option<u32>, Option<i64>)
         .and_then(|pid| u32::try_from(pid).ok())
         .filter(|pid| *pid > 0);
     let started_at_ms = lock.get("startedAt").and_then(Value::as_i64);
-    Some((pid, spawned_by_pid, started_at_ms))
+    Some(DaemonLock {
+        pid,
+        spawned_by_pid,
+        started_at_ms,
+    })
 }
 
-fn pid_is_alive(pid: u32) -> bool {
+fn pid_is_alive(pid: u32) -> io::Result<bool> {
     #[cfg(unix)]
     {
         // SAFETY: kill(pid, 0) performs an existence/permission probe only; it
         // does not deliver a signal or mutate process state.
         let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
         if rc == 0 {
-            return true;
+            return Ok(true);
         }
-        io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+        Ok(io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = pid;
-        false
+        let pid = i32::try_from(pid).map_err(|_| {
+            io::Error::other(format!(
+                "could not check whether process {pid} is running: not a Windows process id"
+            ))
+        })?;
+        crate::hybrid::process_exists(pid)
     }
 }
 
-fn inspect_running_daemon(config_dir: &Path) -> Option<DaemonState> {
-    let (pid, spawned_by_pid, started_at_ms) = read_daemon_lock(config_dir)?;
-    match read_process_env(pid) {
-        Some(env_vars) => Some(DaemonState {
+/// The running daemon and its env. A daemon whose env cannot be read (every
+/// daemon on Windows) is `env_unreadable`, so its owner is unverified.
+fn inspect_running_daemon(
+    config_dir: &Path,
+    is_alive: impl Fn(u32) -> io::Result<bool>,
+) -> io::Result<Option<DaemonState>> {
+    let Some(DaemonLock {
+        pid,
+        spawned_by_pid,
+        started_at_ms,
+    }) = read_daemon_lock(config_dir, is_alive)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(match read_process_env(pid) {
+        Some(env_vars) => DaemonState {
             pid,
             env_vars,
             env_unreadable: false,
             spawned_by_pid,
             started_at_ms,
-        }),
-        None => Some(DaemonState {
+        },
+        None => DaemonState {
             pid,
             env_vars: BTreeMap::new(),
             env_unreadable: true,
             spawned_by_pid,
             started_at_ms,
-        }),
-    }
+        },
+    }))
 }
 
 fn read_process_env(pid: u32) -> Option<BTreeMap<String, String>> {
@@ -1117,6 +1158,94 @@ mod tests {
         assert!(
             error.to_string().contains(&tmp_path.display().to_string()),
             "{error}"
+        );
+    }
+
+    fn write_daemon_lock(config_dir: &Path, pid: u32) {
+        fs::write(
+            config_dir.join("daemon.lock"),
+            serde_json::json!({ "pid": pid, "spawnedBy": { "pid": 7 } }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// The pid probe says a running process is alive and a finished one is
+    /// not. On Windows this is the same probe the local process check uses.
+    #[test]
+    fn the_pid_probe_tells_a_live_process_from_a_finished_one() {
+        assert!(pid_is_alive(std::process::id()).unwrap());
+        let mut finished = if cfg!(windows) {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/D", "/C", "exit 0"]);
+            command
+        } else {
+            std::process::Command::new("true")
+        }
+        .spawn()
+        .unwrap();
+        let pid = finished.id();
+        finished.wait().unwrap();
+        assert!(!pid_is_alive(pid).unwrap());
+    }
+
+    /// A liveness check that fails is an error, never a daemon taken to be
+    /// stopped.
+    #[test]
+    fn a_failed_pid_probe_is_an_error_not_a_stopped_daemon() {
+        let home = temp_home();
+        write_daemon_lock(&home, 4242);
+        let failed = |pid: u32| -> io::Result<bool> {
+            Err(io::Error::other(format!(
+                "could not check whether process {pid} is running: probe failed"
+            )))
+        };
+        let expected = "could not check whether process 4242 is running: probe failed";
+        assert_eq!(
+            inspect_running_daemon(&home, failed)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            proceed_preflight(&home, None, failed)
+                .err()
+                .unwrap()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            RunError::DaemonProbe(io::Error::other(expected)).to_string(),
+            format!("Claude Code daemon: {expected}")
+        );
+        // A stopped daemon is no daemon; its spawner is not preserved.
+        assert!(
+            inspect_running_daemon(&home, |_| Ok(false))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            proceed_preflight(&home, None, |_| Ok(false))
+                .unwrap()
+                .preserve_spawned_by_pid,
+            None
+        );
+    }
+
+    /// Windows has no way to read another process's env, so a live daemon there
+    /// is unverified: the launch asks or stops instead of reusing it.
+    #[cfg(windows)]
+    #[test]
+    fn a_live_windows_daemon_is_unverified() {
+        let home = temp_home();
+        write_daemon_lock(&home, std::process::id());
+        let state = inspect_running_daemon(&home, pid_is_alive)
+            .unwrap()
+            .expect("a running daemon");
+        assert!(state.env_unreadable);
+        assert_eq!(state.spawned_by_pid, Some(7));
+        assert_eq!(
+            classify_launch_safety(&state, &launch_request(), &home).unwrap(),
+            Safety::Conflict
         );
     }
 }

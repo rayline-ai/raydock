@@ -1141,7 +1141,7 @@ fn signal_process(pid: i32, signal: i32) -> io::Result<()> {
 /// Whether `pid` is running, asked of Windows directly: no subprocess, no
 /// PATH. A check that fails is an error naming the pid, never an answer.
 #[cfg(windows)]
-fn process_exists(pid: i32) -> io::Result<bool> {
+pub(crate) fn process_exists(pid: i32) -> io::Result<bool> {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
