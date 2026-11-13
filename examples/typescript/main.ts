@@ -8,8 +8,7 @@
  * Prerequisites:
  *   1. npm install
  *   2. Generate a router key at https://platform.rayline.ai/keys. It looks like
- *      "rlk-...". Either export it as RAYLINE_API_KEY or paste it into API_KEY
- *      below.
+ *      "rlk-...". Export it as RAYLINE_API_KEY.
  *
  * Run:
  *   npx tsx main.ts
@@ -20,10 +19,13 @@ import Anthropic from "@anthropic-ai/sdk";
 // Hosted Rayline router endpoint.
 const BASE_URL = "https://api.rayline.ai";
 
-// Your Rayline router key (rlk-...). Taken from the RAYLINE_API_KEY env var if
-// set, otherwise paste it here. Router keys are *bearer* tokens, so they are
-// passed via `authToken` (Authorization: Bearer ...), not `apiKey`.
-const API_KEY = process.env.RAYLINE_API_KEY ?? "rlk-REPLACE_ME";
+// Your Rayline router key (rlk-...). Router keys are *bearer* tokens, so they
+// are passed via `authToken` (Authorization: Bearer ...), not `apiKey`.
+const API_KEY = process.env.RAYLINE_API_KEY;
+if (!API_KEY) {
+  console.error("RAYLINE_API_KEY is not set. Export your Rayline router key (rlk-...) as RAYLINE_API_KEY.");
+  process.exit(1);
+}
 
 const client = new Anthropic({ baseURL: BASE_URL, authToken: API_KEY });
 
