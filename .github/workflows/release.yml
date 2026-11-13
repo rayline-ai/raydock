@@ -23,7 +23,6 @@ concurrency:
 
 env:
   RUST_VERSION: "1.88.0"
-  RAYLINE_CHANNEL: "prod"
 
 jobs:
   build:
@@ -69,8 +68,12 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
-            echo "Release tag must start with v followed by a version: $RELEASE_TAG" >&2
+          # The version grammar `raydock update` parses: X.Y.Z, optionally
+          # -<main|dev|rc>.<N> and +<build>, numbers without leading zeros.
+          number='(0|[1-9][0-9]*)'
+          version_re="^v${number}\.${number}\.${number}(-(main|dev|rc)\.${number})?(\+[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*)?$"
+          if [[ ! "$RELEASE_TAG" =~ $version_re ]]; then
+            echo "Release tag $RELEASE_TAG is not v<X.Y.Z>[-<main|dev|rc>.<N>][+<build>] with numbers without leading zeros" >&2
             exit 1
           fi
           echo "version=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
@@ -118,7 +121,7 @@ jobs:
           RAYLINE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          cargo build --release -p rayline-cli -p rayline-daemon --locked
+          cargo build --release -p rayline-cli --locked
 
       - name: Test installed command migration
         shell: bash
@@ -136,14 +139,11 @@ jobs:
           mkdir -p dist package
 
           rayline_asset="rayline-${PLATFORM_TAG}"
-          daemon_asset="rld-${PLATFORM_TAG}"
           cp "target/release/raydock${EXE_SUFFIX}" "dist/${rayline_asset}"
-          cp "target/release/rld${EXE_SUFFIX}" "dist/${daemon_asset}"
 
           package_dir="rayline-${VERSION}-${PLATFORM_TAG}"
           mkdir -p "package/${package_dir}"
           cp "target/release/raydock${EXE_SUFFIX}" "package/${package_dir}/raydock${EXE_SUFFIX}"
-          cp "target/release/rld${EXE_SUFFIX}" "package/${package_dir}/rld${EXE_SUFFIX}"
           cp "dist/rayline-core-${PLATFORM_TAG}" "package/${package_dir}/rayline-core${EXE_SUFFIX}"
           cp dist/rayline-core-source.json dist/rayline-core-LICENSE "package/${package_dir}/"
           cp README.md LICENSE NOTICE "package/${package_dir}/"
@@ -160,8 +160,8 @@ jobs:
               "Compress-Archive -Path 'package/${package_dir}/*' -DestinationPath 'dist/${package_dir}.${ARCHIVE_EXT}' -Force"
           else
             ln -s raydock "package/${package_dir}/rayline"
-            chmod 0755 "dist/${rayline_asset}" "dist/${daemon_asset}" "dist/rayline-core-${PLATFORM_TAG}"
-            chmod 0755 "package/${package_dir}/raydock" "package/${package_dir}/rld" "package/${package_dir}/rayline-core"
+            chmod 0755 "dist/${rayline_asset}" "dist/rayline-core-${PLATFORM_TAG}"
+            chmod 0755 "package/${package_dir}/raydock" "package/${package_dir}/rayline-core"
             tar -C package -czf "dist/${package_dir}.${ARCHIVE_EXT}" "${package_dir}"
           fi
 
@@ -254,8 +254,12 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          if [[ ! "$RELEASE_TAG" =~ ^v[0-9] ]]; then
-            echo "Release tag must start with v followed by a version: $RELEASE_TAG" >&2
+          # The version grammar `raydock update` parses: X.Y.Z, optionally
+          # -<main|dev|rc>.<N> and +<build>, numbers without leading zeros.
+          number='(0|[1-9][0-9]*)'
+          version_re="^v${number}\.${number}\.${number}(-(main|dev|rc)\.${number})?(\+[A-Za-z0-9._-]*[A-Za-z0-9][A-Za-z0-9._-]*)?$"
+          if [[ ! "$RELEASE_TAG" =~ $version_re ]]; then
+            echo "Release tag $RELEASE_TAG is not v<X.Y.Z>[-<main|dev|rc>.<N>][+<build>] with numbers without leading zeros" >&2
             exit 1
           fi
           version="${RELEASE_TAG#v}"
@@ -264,8 +268,8 @@ jobs:
           Raydock ${version}
 
           Assets:
-          - \`rayline-<platform>\`, \`rld-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`raydock update\` and the install scripts. Asset names remain stable for existing updaters.
-          - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain all three binaries, source provenance and license/readme files.
+          - \`rayline-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`raydock update\` and the install scripts. Asset names remain stable for existing updaters.
+          - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain \`raydock\`, its \`rayline\` alias, \`rayline-core\`, source provenance and license/readme files.
           - \`SHA256SUMS\` covers every uploaded binary, archive and provenance file.
           - \`SHA256SUMS.minisig\` is the minisign signature over \`SHA256SUMS\`.
           EOF

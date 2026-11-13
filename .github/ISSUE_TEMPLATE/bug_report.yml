@@ -8,7 +8,7 @@ body:
       value: |
         Before filing, search existing issues and make sure this is not a security vulnerability. Security reports must use GitHub Private Vulnerability Reporting from the Security tab.
 
-        Include only sanitized config and logs. Do not paste API keys, tokens, private prompts, customer data, or unsanitized proxy logs.
+        Include only sanitized config and logs. Do not paste API keys, tokens, private prompts, customer data, or unsanitized logs.
   - type: checkboxes
     id: preflight
     attributes:
@@ -18,7 +18,7 @@ body:
           required: true
         - label: I reproduced this on the latest Rayline release or current main.
           required: true
-        - label: I removed API keys, tokens, local CA keys, private prompts, customer data, and unsanitized logs.
+        - label: I removed API keys, tokens, private prompts, customer data, and unsanitized logs.
           required: true
         - label: This is not a security vulnerability.
           required: true
@@ -36,14 +36,9 @@ body:
       description: Pick every affected area you can narrow this to.
       multiple: true
       options:
-        - CLI (rayline)
-        - Daemon (rld)
-        - Claude Code routing
-        - Local router
-        - Transparent proxy or TLS interception
-        - Header injector
-        - Adapter or local model
-        - Model download or cache
+        - CLI (raydock)
+        - Harness launch (Claude Code, Codex, others)
+        - Local mode (rayline local, rayline-core)
         - Installer or updater
         - Build from source
         - Documentation or examples
@@ -107,13 +102,13 @@ body:
     id: logs
     attributes:
       label: Logs or diagnostics
-      description: Paste sanitized output from `raydock router status`, `raydock router logs --lines 120`, the failing command, or relevant `~/.rayline/rld/*.log` snippets.
+      description: Paste sanitized output from `rayline auth status`, the failing command, or relevant `~/.rayline/local/runtime.log` snippets.
       render: text
   - type: textarea
     id: config
     attributes:
       label: Sanitized config
-      description: Paste relevant `~/.config/rayline/settings.json`, router config JSON, and env var names with secret values, tokens, private URLs, and prompts removed.
+      description: Paste relevant `~/.config/rayline/settings.json` and env var names with secret values, tokens, private URLs, and prompts removed.
       render: json
   - type: input
     id: regression

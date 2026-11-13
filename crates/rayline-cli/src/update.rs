@@ -8,21 +8,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use minisign_verify::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
+use url::Url;
 
-const UPDATE_BASE_URL_ENV: &str = "RAYLINE_UPDATE_BASE_URL";
-const UPDATE_INSTALL_PATH_ENV: &str = "RAYLINE_UPDATE_INSTALL_PATH";
-/// First release that ships the execution core (`rayline-core`). Older
-/// releases have no core assets, so rolling back to one skips the core.
-const CORE_FIRST_VERSION: &str = "0.2.13";
+use crate::config::UpdateChannel;
+
 const CORE_LICENSE_NAME: &str = "rayline-core-LICENSE";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateRequest {
-    pub channel: Option<String>,
-    pub pinned_version: Option<String>,
+    pub pinned_version: Option<Version>,
     pub force: bool,
     pub check_only: bool,
     pub dry_run: bool,
+    /// Hidden `--base-url`: where releases are read from.
+    pub base_url: Option<Url>,
+    /// Hidden `--install-path`: which binary is replaced.
+    pub install_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +38,9 @@ pub enum UpdateError {
     Checksum(String),
     InvalidVersion(String),
     Install(String),
+    /// A Windows install step whose file another process still held open
+    /// after `move_into_place` waited for it.
+    InUse(String),
     Network(String),
     Signature(String),
     UnsupportedPlatform(String),
@@ -44,14 +48,7 @@ pub enum UpdateError {
 
 struct UpdateArtifacts {
     launcher: PathBuf,
-    daemon: PathBuf,
-    /// The execution core and its license; `None` for a release that
-    /// predates the core (see [`release_ships_core`]).
-    core: Option<CoreArtifacts>,
-}
-
-struct CoreArtifacts {
-    binary: PathBuf,
+    core: PathBuf,
     license: PathBuf,
 }
 
@@ -60,6 +57,7 @@ impl std::fmt::Display for UpdateError {
         match self {
             Self::Checksum(message)
             | Self::Install(message)
+            | Self::InUse(message)
             | Self::Network(message)
             | Self::Signature(message)
             | Self::UnsupportedPlatform(message) => formatter.write_str(message),
@@ -70,31 +68,60 @@ impl std::fmt::Display for UpdateError {
 
 impl std::error::Error for UpdateError {}
 
-pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
-    let home = dirs::home_dir();
-    let channel = request
-        .channel
-        .clone()
-        .unwrap_or_else(|| resolve_channel(home.as_deref()));
+/// Maps an io error to an install error that names the failed operation and
+/// the path it was on.
+pub(crate) fn io_failed<'a>(
+    operation: &'a str,
+    path: &'a Path,
+) -> impl FnOnce(io::Error) -> UpdateError + 'a {
+    move |error| UpdateError::Install(format!("failed to {operation} {}: {error}", path.display()))
+}
 
-    if channel == "local" {
-        return Ok(UpdateResult {
-            message: concat!(
-                "Local dev install detected \u{2014} refresh with ",
-                "`make install` or `make install-dev`.\n"
-            )
-            .to_owned(),
-            exit_code: 2,
-            stderr: true,
-        });
-    }
-
-    let install_path = install_path().map_err(|error| {
+/// Maps an io error to an install error that names the failed operation and
+/// both of its paths.
+fn io_failed_between<'a>(
+    operation: &'a str,
+    from: &'a Path,
+    to: &'a Path,
+) -> impl FnOnce(io::Error) -> UpdateError + 'a {
+    move |error| {
         UpdateError::Install(format!(
-            "failed to resolve {} install path: {error}",
-            crate::CLI_BIN
+            "failed to {operation} {} to {}: {error}",
+            from.display(),
+            to.display()
         ))
-    })?;
+    }
+}
+
+/// `rayline update` on `channel`, the loaded `update.channel`.
+pub async fn run(
+    request: &UpdateRequest,
+    channel: UpdateChannel,
+) -> Result<UpdateResult, UpdateError> {
+    run_on(request, channel, crate::MINISIGN_PUBLIC_KEYS).await
+}
+
+/// The pointer file naming the latest release on `channel`.
+fn latest_pointer(channel: UpdateChannel) -> &'static str {
+    match channel {
+        UpdateChannel::Prod => "cli/latest.txt",
+        UpdateChannel::Dev => "cli/latest-dev.txt",
+        UpdateChannel::Main => "cli/latest-main.txt",
+    }
+}
+
+/// `run` with the keys release signatures are checked against.
+async fn run_on(
+    request: &UpdateRequest,
+    channel: UpdateChannel,
+    pubkeys: &[&str],
+) -> Result<UpdateResult, UpdateError> {
+    let base_url = request
+        .base_url
+        .as_ref()
+        .map_or(crate::UPDATE_BASE_URL, Url::as_str)
+        .trim_end_matches('/');
+    let install_path = install_path(request.install_path.as_deref())?;
     if is_app_bundle_managed(&install_path) {
         return Ok(UpdateResult {
             message: format!(
@@ -106,7 +133,7 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
             stderr: false,
         });
     }
-    if is_homebrew_managed(&install_path) {
+    if is_homebrew_managed(&install_path)? {
         return Ok(UpdateResult {
             message: format!(
                 "Installed via Homebrew. Run `brew upgrade {}` to update.\n",
@@ -119,93 +146,38 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
     let platform_tag = detect_platform_tag()?;
     let current = Version::parse(crate::RAYLINE_VERSION)
         .map_err(|_| UpdateError::InvalidVersion(crate::RAYLINE_VERSION.to_owned()))?;
-    let target = match request.pinned_version.as_deref() {
-        Some(version) => {
-            Version::parse(version).map_err(|_| UpdateError::InvalidVersion(version.to_owned()))?
-        }
-        None => fetch_latest_version(&channel).await?,
+    let target = match &request.pinned_version {
+        Some(version) => version.clone(),
+        None => fetch_latest_version(base_url, channel, pubkeys).await?,
     };
 
-    let mut decision = evaluate_check(
+    let decision = evaluate_check(
         &current,
         &target,
-        request.pinned_version.is_some() || request.channel.is_some(),
+        request.pinned_version.is_some(),
         request.force,
     );
-    let core_install_path =
-        install_path.with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
-    if decision.exit_code == 0 && !core_install_path.is_file() {
-        if target.normalized != current.normalized {
-            // This build is newer than the channel's latest pointer: there is
-            // nothing to update to, so report that and name the repair rather
-            // than failing the check.
-            return Ok(UpdateResult {
-                message: format!(
-                    "{}Execution core is missing; repair it with `raydock update --version {}`.\n",
-                    decision.message, current.normalized
-                ),
-                ..decision
-            });
-        }
-        decision = UpdateResult {
-            message: format!(
-                "Execution core is missing; reinstall the complete {} release with `raydock update`.\n",
-                current.public
-            ),
-            exit_code: 1,
-            stderr: false,
-        };
-    }
     if decision.exit_code == 0 || request.check_only {
         return Ok(decision);
     }
 
-    if !core_install_path.is_file() && !predates_core(&target) {
-        eprintln!("Execution core is missing; verifying the complete release.");
-    }
     let temp_dir = temp_update_dir()?;
-    let artifacts = download_and_verify(&target, platform_tag, &temp_dir).await;
+    let artifacts = download_and_verify(base_url, &target, platform_tag, &temp_dir, pubkeys).await;
     let result = match artifacts {
         Ok(artifacts) => {
             if request.dry_run {
-                let message = match &artifacts.core {
-                    Some(core) => format!(
-                        "Would install {}, {}, {} and {}.\n",
-                        artifacts.launcher.display(),
-                        artifacts.daemon.display(),
-                        core.binary.display(),
-                        core.license.display()
-                    ),
-                    None => format!(
-                        "Would install {} and {}; {} predates the execution core, so an installed rayline-core would be removed.\n",
-                        artifacts.launcher.display(),
-                        artifacts.daemon.display(),
-                        target.public
-                    ),
-                };
                 Ok(UpdateResult {
-                    message,
+                    message: format!(
+                        "Would install {}, {} and {}.\n",
+                        artifacts.launcher.display(),
+                        artifacts.core.display(),
+                        artifacts.license.display()
+                    ),
                     exit_code: 0,
                     stderr: false,
                 })
             } else {
-                let daemon_install_path = install_path
-                    .parent()
-                    .ok_or_else(|| {
-                        UpdateError::Install(format!(
-                            "install path has no parent directory: {}",
-                            install_path.display()
-                        ))
-                    })?
-                    // `EXE_SUFFIX` is "" on Unix and ".exe" on Windows, so the
-                    // daemon installs as `rld` on Unix and `rld.exe` on Windows
-                    // (matching the `.exe` lookup in `router::find_on_path`).
-                    .join(format!(
-                        "{}{}",
-                        crate::DAEMON_BIN,
-                        std::env::consts::EXE_SUFFIX
-                    ));
-                let core_install_path = daemon_install_path
+                let core_install_path = install_path
                     .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
                 let license_install_path = core_install_path.with_file_name(CORE_LICENSE_NAME);
                 #[cfg(windows)]
@@ -214,22 +186,10 @@ pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
                         "Could not finish old update backup cleanup: {error}. Continuing installation; a later update will retry."
                     );
                 }
-                if let Some(core) = &artifacts.core {
-                    replace_file(&core.license, &license_install_path, false)?;
-                    replace_binary(&core.binary, &core_install_path)?;
-                }
+                replace_file(&artifacts.license, &license_install_path, false)?;
+                replace_binary(&artifacts.core, &core_install_path)?;
                 replace_binary(&artifacts.launcher, &install_path)?;
-                replace_binary(&artifacts.daemon, &daemon_install_path)?;
                 crate::command_alias::install_alias(&install_path)?;
-                if artifacts.core.is_none() {
-                    // Rollback to a pre-core release: remove the newer core
-                    // and its license so no later launcher (for example one
-                    // installed by the older two-binary updater) runs a core
-                    // that does not match it; it then reports the core as
-                    // missing and `raydock update` installs the matching one.
-                    remove_stale_core(&[&core_install_path, &license_install_path]);
-                }
-                cleanup_legacy_uv_install(crate::UV_TOOL_NAME, &install_path);
                 Ok(UpdateResult {
                     message: format!(
                         "Updated {} {} \u{2192} {}.\n",
@@ -265,50 +225,6 @@ fn bare_version_hint(target: &Version, error: UpdateError) -> UpdateError {
     }
 }
 
-/// Remove an installed core and license after a rollback to a pre-core
-/// release. The rollback has already succeeded, so a failure is a warning.
-fn remove_stale_core(paths: &[&Path]) {
-    for path in paths {
-        match fs::remove_file(path) {
-            Ok(()) => eprintln!("Removed {} (not part of this release).", path.display()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!(
-                "Warning: could not remove {}: {error}; delete it by hand.",
-                path.display()
-            ),
-        }
-    }
-}
-
-/// True when `version`'s release number is older than [`CORE_FIRST_VERSION`].
-/// Pre-release and build labels are ignored, so `0.2.13-dev.1` needs the core.
-fn predates_core(version: &Version) -> bool {
-    Version::parse(CORE_FIRST_VERSION).is_ok_and(|first| version.base_cmp(&first) == Ordering::Less)
-}
-
-/// Decide from a release's signature-verified SHA256SUMS whether it ships the
-/// execution core. Listed (the platform core or its license): install both,
-/// each checksum-verified. Not listed: allowed only for a release older than
-/// [`CORE_FIRST_VERSION`]; a newer release without the core fails closed.
-fn release_ships_core(
-    sums: &str,
-    platform_tag: &str,
-    version: &Version,
-) -> Result<bool, UpdateError> {
-    if expected_sha256(sums, &format!("rayline-core-{platform_tag}")).is_ok()
-        || expected_sha256(sums, CORE_LICENSE_NAME).is_ok()
-    {
-        return Ok(true);
-    }
-    if predates_core(version) {
-        return Ok(false);
-    }
-    Err(UpdateError::Checksum(format!(
-        "SHA256SUMS for {} does not list rayline-core-{platform_tag}; releases from {CORE_FIRST_VERSION} on must ship it",
-        version.public
-    )))
-}
-
 pub fn evaluate_check(
     current: &Version,
     target: &Version,
@@ -341,80 +257,12 @@ pub fn evaluate_check(
     }
 }
 
-pub fn resolve_channel(home: Option<&Path>) -> String {
-    let env_channel = std::env::var("RAYLINE_UPDATE_CHANNEL").ok();
-    resolve_channel_from_sources(home, env_channel.as_deref(), crate::RAYLINE_CHANNEL)
-}
-
-fn resolve_channel_from_sources(
-    home: Option<&Path>,
-    env_channel: Option<&str>,
-    embedded_channel: &str,
-) -> String {
-    if let Some(channel) = env_channel {
-        if is_valid_channel(channel) {
-            return channel.to_owned();
-        }
-    }
-
-    if let Some(home) = home {
-        if let Some(channel) = config_channel(home) {
-            return channel;
-        }
-    }
-
-    if is_valid_channel(embedded_channel) {
-        return embedded_channel.to_owned();
-    }
-
-    "local".to_owned()
-}
-
-fn config_channel(home: &Path) -> Option<String> {
-    let path = home
-        .join(".config")
-        .join(crate::CONFIG_DIR)
-        .join("cli.toml");
-    let contents = std::fs::read_to_string(path).ok()?;
-    let mut in_update_section = false;
-
-    for raw_line in contents.lines() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line.starts_with('[') && line.ends_with(']') {
-            in_update_section = line == "[update]";
-            continue;
-        }
-        if !in_update_section {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        if key.trim() != "channel" {
-            continue;
-        }
-        let channel = value.trim().trim_matches('"').trim_matches('\'');
-        if is_valid_channel(channel) {
-            return Some(channel.to_owned());
-        }
-    }
-
-    None
-}
-
-fn is_valid_channel(channel: &str) -> bool {
-    // Release ladder for both brands: main (rolling, rawest) -> dev (release
-    // candidate) -> prod (public X.Y.Z). `local` is the dev-build sentinel.
-    matches!(channel, "prod" | "dev" | "main" | "local")
-}
-
-async fn fetch_latest_version(channel: &str) -> Result<Version, UpdateError> {
-    let url = latest_url_for(channel).ok_or_else(|| {
-        UpdateError::Network(format!("channel '{channel}' has no latest pointer"))
-    })?;
+async fn fetch_latest_version(
+    base_url: &str,
+    channel: UpdateChannel,
+    pubkeys: &[&str],
+) -> Result<Version, UpdateError> {
+    let url = format!("{base_url}/{}", latest_pointer(channel));
     let pointer = fetch_pointer_bytes(&url).await?;
     // Fail closed: the version pointer must carry a verifiable signature before
     // we trust the version it names. This prevents an attacker from FORGING a
@@ -425,7 +273,7 @@ async fn fetch_latest_version(channel: &str) -> Result<Version, UpdateError> {
     // anti-rollback/freshness (a signed timestamp+expiry or highest-seen-version
     // floor) is tracked as a follow-up — see docs/release.md.
     let signature = fetch_pointer_bytes(&format!("{url}.minisig")).await?;
-    parse_verified_latest(&pointer, &signature, crate::MINISIGN_PUBLIC_KEYS)
+    parse_verified_latest(&pointer, &signature, pubkeys)
 }
 
 async fn fetch_pointer_bytes(url: &str) -> Result<Vec<u8>, UpdateError> {
@@ -469,26 +317,16 @@ fn parse_verified_latest(
     })
 }
 
-fn latest_url_for(channel: &str) -> Option<String> {
-    let latest_key = match channel {
-        "prod" => "cli/latest.txt",
-        "dev" => "cli/latest-dev.txt",
-        "main" => "cli/latest-main.txt",
-        _ => return None,
-    };
-    Some(format!("{}/{latest_key}", base_url()))
+fn artifact_url_for(base_url: &str, version: &str, platform_tag: &str, name: &str) -> String {
+    format!("{base_url}/cli/v{version}/{name}-{platform_tag}")
 }
 
-fn artifact_url_for(version: &str, platform_tag: &str, name: &str) -> String {
-    format!("{}/cli/v{version}/{name}-{platform_tag}", base_url())
+fn checksums_url_for(base_url: &str, version: &str) -> String {
+    format!("{base_url}/cli/v{version}/SHA256SUMS")
 }
 
-fn checksums_url_for(version: &str) -> String {
-    format!("{}/cli/v{version}/SHA256SUMS", base_url())
-}
-
-fn checksums_sig_url_for(version: &str) -> String {
-    format!("{}/cli/v{version}/SHA256SUMS.minisig", base_url())
+fn checksums_sig_url_for(base_url: &str, version: &str) -> String {
+    format!("{base_url}/cli/v{version}/SHA256SUMS.minisig")
 }
 
 /// Verify that `sums` is signed by at least one of the pinned `pubkeys`.
@@ -531,15 +369,6 @@ pub fn verify_signature(
     ))
 }
 
-pub(crate) fn base_url() -> String {
-    std::env::var(UPDATE_BASE_URL_ENV)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| crate::UPDATE_BASE_URL.to_owned())
-        .trim_end_matches('/')
-        .to_owned()
-}
-
 pub(crate) fn detect_platform_tag() -> Result<&'static str, UpdateError> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Ok("macosx_11_0_arm64"),
@@ -554,95 +383,67 @@ pub(crate) fn detect_platform_tag() -> Result<&'static str, UpdateError> {
 }
 
 async fn download_and_verify(
+    base_url: &str,
     target: &Version,
     platform_tag: &str,
     dest_dir: &Path,
+    pubkeys: &[&str],
 ) -> Result<UpdateArtifacts, UpdateError> {
     let version = target.normalized.as_str();
-    fs::create_dir_all(dest_dir).map_err(UpdateError::from)?;
+    fs::create_dir_all(dest_dir).map_err(io_failed("create", dest_dir))?;
     let launcher_name = format!("{}-{platform_tag}", crate::CLI_ASSET);
-    let daemon_name = format!("{}-{platform_tag}", crate::DAEMON_BIN);
     let launcher_path = dest_dir.join(&launcher_name);
-    let daemon_path = dest_dir.join(&daemon_name);
     let core_name = format!("rayline-core-{platform_tag}");
     let core_path = dest_dir.join(&core_name);
-    let license_name = CORE_LICENSE_NAME;
-    let license_path = dest_dir.join(license_name);
+    let license_path = dest_dir.join(CORE_LICENSE_NAME);
     let sums_path = dest_dir.join("SHA256SUMS");
     let sig_path = dest_dir.join("SHA256SUMS.minisig");
 
     // Download checksums and its signature first so we can verify before
     // trusting any artifact bytes.
-    download_to(&checksums_url_for(version), &sums_path)
+    download_to(&checksums_url_for(base_url, version), &sums_path)
         .await
         .map_err(|error| bare_version_hint(target, error))?;
-    download_to(&checksums_sig_url_for(version), &sig_path).await?;
+    download_to(&checksums_sig_url_for(base_url, version), &sig_path).await?;
 
     // Verify signature BEFORE reading or trusting the checksums file.
     // Fail closed: missing or invalid signature aborts the update.
-    let sums_bytes = fs::read(&sums_path).map_err(UpdateError::from)?;
-    let sig_bytes = fs::read(&sig_path).map_err(UpdateError::from)?;
-    verify_signature(&sums_bytes, &sig_bytes, crate::MINISIGN_PUBLIC_KEYS)?;
+    let sums_bytes = fs::read(&sums_path).map_err(io_failed("read", &sums_path))?;
+    let sig_bytes = fs::read(&sig_path).map_err(io_failed("read", &sig_path))?;
+    verify_signature(&sums_bytes, &sig_bytes, pubkeys)?;
 
     let sums = String::from_utf8(sums_bytes)
         .map_err(|_| UpdateError::Checksum("SHA256SUMS contains invalid UTF-8".to_owned()))?;
-    // Decided from the verified manifest before any artifact is fetched.
-    let with_core = release_ships_core(&sums, platform_tag, target)?;
 
     download_to(
-        &artifact_url_for(version, platform_tag, crate::CLI_ASSET),
+        &artifact_url_for(base_url, version, platform_tag, crate::CLI_ASSET),
         &launcher_path,
     )
     .await?;
     download_to(
-        &artifact_url_for(version, platform_tag, crate::DAEMON_BIN),
-        &daemon_path,
+        &artifact_url_for(base_url, version, platform_tag, "rayline-core"),
+        &core_path,
+    )
+    .await?;
+    download_to(
+        &format!("{base_url}/cli/v{version}/{CORE_LICENSE_NAME}"),
+        &license_path,
     )
     .await?;
 
     verify_checksum(&sums, &launcher_name, &launcher_path)?;
-    verify_checksum(&sums, &daemon_name, &daemon_path)?;
-
-    let core = if with_core {
-        download_to(
-            &artifact_url_for(version, platform_tag, "rayline-core"),
-            &core_path,
-        )
-        .await?;
-        download_to(
-            &format!("{}/cli/v{version}/{license_name}", base_url()),
-            &license_path,
-        )
-        .await?;
-        verify_checksum(&sums, &core_name, &core_path)?;
-        verify_checksum(&sums, license_name, &license_path)?;
-        Some(CoreArtifacts {
-            binary: core_path,
-            license: license_path,
-        })
-    } else {
-        eprintln!(
-            "Release {} predates the execution core; installing without it.",
-            target.public
-        );
-        None
-    };
+    verify_checksum(&sums, &core_name, &core_path)?;
+    verify_checksum(&sums, CORE_LICENSE_NAME, &license_path)?;
 
     Ok(UpdateArtifacts {
         launcher: launcher_path,
-        daemon: daemon_path,
-        core,
+        core: core_path,
+        license: license_path,
     })
 }
 
 pub(crate) async fn download_to(url: &str, path: &Path) -> Result<(), UpdateError> {
     let part = path.with_extension("part");
-    if let Some(source) = url.strip_prefix("file://") {
-        fs::copy(source, &part).map_err(UpdateError::from)?;
-        fs::rename(&part, path).map_err(UpdateError::from)?;
-        return Ok(());
-    }
-
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -661,8 +462,8 @@ pub(crate) async fn download_to(url: &str, path: &Path) -> Result<(), UpdateErro
         .bytes()
         .await
         .map_err(|error| UpdateError::Network(format!("download failed for {url}: {error}")))?;
-    fs::write(&part, bytes).map_err(UpdateError::from)?;
-    fs::rename(&part, path).map_err(UpdateError::from)?;
+    fs::write(&part, bytes).map_err(io_failed("write", &part))?;
+    fs::rename(&part, path).map_err(io_failed_between("move", &part, path))?;
     Ok(())
 }
 
@@ -705,34 +506,48 @@ pub(crate) fn verify_checksum(
 }
 
 fn sha256_file(path: &Path) -> Result<String, UpdateError> {
-    let bytes = fs::read(path).map_err(UpdateError::from)?;
+    let bytes = fs::read(path).map_err(io_failed("read", path))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn install_path() -> io::Result<PathBuf> {
-    std::env::var_os(UPDATE_INSTALL_PATH_ENV)
-        .map(PathBuf::from)
-        .map_or_else(std::env::current_exe, Ok)
-        .map(resolve_install_path)
-        .map(|path| crate::command_alias::primary_path(&path))
+/// The binary to replace: `--install-path` as given (the parser has checked
+/// it names `raydock`), else the running binary, whose `rayline` alias maps
+/// to the `raydock` beside it.
+fn install_path(option: Option<&Path>) -> Result<PathBuf, UpdateError> {
+    match option {
+        Some(path) => resolve_install_path(path.to_path_buf()),
+        None => {
+            let running = std::env::current_exe().map_err(|error| {
+                UpdateError::Install(format!("failed to locate the running executable: {error}"))
+            })?;
+            Ok(crate::command_alias::primary_path(&resolve_install_path(
+                running,
+            )?))
+        }
+    }
 }
 
 /// `current_exe()` may return the invoking symlink rather than its target on
-/// some platforms (macOS). A migrated install runs the binary through the
-/// legacy `rl -> rayline` alias the installer leaves behind, and self-update
-/// must replace the real binary: renaming the download over the alias would
-/// orphan `rayline` at the old version, reintroducing exactly the divergence
-/// the installer migration removes. Nonexistent paths (e.g. an env override
-/// pointing at a not-yet-created file) pass through unchanged.
-fn resolve_install_path(path: PathBuf) -> PathBuf {
-    fs::canonicalize(&path).unwrap_or(path)
+/// some platforms (macOS), for example the `rayline` alias. Self-update must
+/// replace the real binary, not the alias. A path that does not exist yet
+/// (an `--install-path` naming a file to create) passes through unchanged;
+/// any other failure to resolve it is an error naming the path.
+fn resolve_install_path(path: PathBuf) -> Result<PathBuf, UpdateError> {
+    match fs::canonicalize(&path) {
+        Ok(resolved) => Ok(resolved),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path),
+        Err(error) => Err(io_failed("resolve", &path)(error)),
+    }
 }
 
-pub(crate) fn is_homebrew_managed(install_path: &Path) -> bool {
-    let Some(prefix) = homebrew_prefix() else {
-        return false;
-    };
-    path_is_under_prefix(install_path, &prefix)
+/// True when `install_path` is under Homebrew's prefix. Without `brew` on
+/// `PATH` nothing is Homebrew-managed; a `brew --prefix` that fails is an
+/// error.
+pub(crate) fn is_homebrew_managed(install_path: &Path) -> Result<bool, UpdateError> {
+    Ok(match command_on_path("brew") {
+        Some(brew) => path_is_under_prefix(install_path, &brew_prefix(&brew)?),
+        None => false,
+    })
 }
 
 /// True when the running `rayline` lives inside a `.app` bundle (directly, or via a
@@ -753,22 +568,27 @@ fn path_is_under_prefix(install_path: &Path, prefix: &Path) -> bool {
     install_path.starts_with(prefix)
 }
 
-fn homebrew_prefix() -> Option<PathBuf> {
-    let brew = command_on_path("brew")?;
+/// The prefix `brew --prefix` prints, run with the `brew` at `brew`.
+fn brew_prefix(brew: &Path) -> Result<PathBuf, UpdateError> {
+    let failed = |reason: String| {
+        UpdateError::Install(format!(
+            "`brew --prefix` ({}) failed: {reason}",
+            brew.display()
+        ))
+    };
     let output = Command::new(brew)
         .arg("--prefix")
         .stdin(Stdio::null())
         .output()
-        .ok()?;
+        .map_err(|error| failed(error.to_string()))?;
     if !output.status.success() {
-        return None;
+        return Err(failed(output.status.to_string()));
     }
-    let prefix = String::from_utf8(output.stdout).ok()?;
-    let prefix = prefix.trim();
-    if prefix.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(prefix))
+    let prefix = String::from_utf8(output.stdout)
+        .map_err(|_| failed("it printed a prefix that is not UTF-8".to_owned()))?;
+    match prefix.trim() {
+        "" => Err(failed("it printed no prefix".to_owned())),
+        prefix => Ok(PathBuf::from(prefix)),
     }
 }
 
@@ -781,8 +601,6 @@ fn replace_file(
     install_path: &Path,
     executable: bool,
 ) -> Result<(), UpdateError> {
-    #[cfg(not(unix))]
-    let _ = executable;
     let parent = install_path.parent().ok_or_else(|| {
         UpdateError::Install(format!(
             "install path has no parent directory: {}",
@@ -797,23 +615,15 @@ fn replace_file(
     })?;
 
     let staged = staged_install_path(install_path)?;
-    fs::copy(downloaded, &staged).map_err(|error| {
-        UpdateError::Install(format!(
-            "failed to stage update at {}: {error}",
-            staged.display()
-        ))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 });
-        fs::set_permissions(&staged, permissions).map_err(|error| {
-            UpdateError::Install(format!(
-                "failed to set update permissions at {}: {error}",
-                staged.display()
-            ))
-        })?;
+    let mut source = fs::File::open(downloaded).map_err(|error| stage_failed(&staged, error))?;
+    let staged_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|error| stage_failed(&staged, error))?;
+    if let Err(error) = fill_staged(&mut source, staged_file, &staged, executable) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
     }
 
     let result = move_into_place(&staged, install_path);
@@ -823,13 +633,49 @@ fn replace_file(
     result
 }
 
+/// Copy `source`'s bytes into the new `staged_file`, then give it the install
+/// permissions. A plain byte copy: on macOS `fs::copy` first tries an APFS
+/// clone, which can fail with `EINVAL`.
+fn fill_staged(
+    source: &mut fs::File,
+    mut staged_file: fs::File,
+    staged: &Path,
+    executable: bool,
+) -> Result<(), UpdateError> {
+    #[cfg(not(unix))]
+    let _ = executable;
+    io::copy(source, &mut staged_file).map_err(|error| stage_failed(staged, error))?;
+    drop(staged_file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 });
+        fs::set_permissions(staged, permissions).map_err(|error| {
+            UpdateError::Install(format!(
+                "failed to set update permissions at {}: {error}",
+                staged.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn stage_failed(staged: &Path, error: io::Error) -> UpdateError {
+    UpdateError::Install(format!(
+        "failed to stage update at {}: {error}",
+        staged.display()
+    ))
+}
+
 /// Atomically move the staged binary onto `install_path`.
 ///
 /// On Unix `rename(2)` replaces the target even while it is running. Windows
 /// locks a running `.exe` and rejects renaming over it, but it *does* allow
 /// renaming the running file out of the way — so we move the current binary to
 /// a sidecar path first, then move the update into place, restoring the
-/// original if the second move fails.
+/// original if the second move fails. On Windows every rename waits briefly
+/// while another process holds the file ([`rename_when_released`]).
 #[cfg(not(windows))]
 pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     fs::rename(staged, install_path).map_err(|error| {
@@ -843,41 +689,85 @@ pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), 
 #[cfg(windows)]
 pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     if !install_path.exists() {
-        return fs::rename(staged, install_path).map_err(|error| {
-            UpdateError::Install(format!(
-                "failed to install {}: {error}",
-                install_path.display()
-            ))
+        return rename_when_released(staged, install_path).map_err(|error| {
+            install_failure(
+                &error,
+                format!("failed to install {}: {error}", install_path.display()),
+            )
         });
     }
 
     let backup = staged_install_path(install_path)?;
-    fs::rename(install_path, &backup).map_err(|error| {
-        UpdateError::Install(format!(
-            "failed to move existing binary {} aside: {error}",
-            install_path.display()
-        ))
+    rename_when_released(install_path, &backup).map_err(|error| {
+        install_failure(
+            &error,
+            format!(
+                "failed to move existing binary {} aside: {error}",
+                install_path.display()
+            ),
+        )
     })?;
 
-    match fs::rename(staged, install_path) {
+    match rename_when_released(staged, install_path) {
         Ok(()) => {
             retire_replaced_backup(&backup, install_path);
             Ok(())
         }
         Err(error) => {
             // Restore the original so a failed update never leaves a hole.
-            fs::rename(&backup, install_path).map_err(|restore_error| {
+            rename_when_released(&backup, install_path).map_err(|restore_error| {
                 UpdateError::Install(format!(
                     "failed to replace {}: {error}; restore also failed: {restore_error}. Original preserved at {}",
                     install_path.display(),
                     backup.display()
                 ))
             })?;
-            Err(UpdateError::Install(format!(
-                "failed to replace {}: {error}",
-                install_path.display()
-            )))
+            Err(install_failure(
+                &error,
+                format!("failed to replace {}: {error}", install_path.display()),
+            ))
         }
+    }
+}
+
+/// How long a Windows rename waits for another process to close the file.
+/// Antivirus and indexing services open a newly written or newly started
+/// executable for a moment without delete sharing.
+#[cfg(windows)]
+const HELD_FILE_WAIT: Duration = Duration::from_secs(2);
+
+/// Windows' sharing and lock violations: another process has the file open.
+#[cfg(windows)]
+fn held_by_another_process(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+/// `fs::rename`, retried with a growing pause for up to [`HELD_FILE_WAIT`]
+/// while another process holds the file. Any other error, or a hold that
+/// outlasts the wait, is returned as it is.
+#[cfg(windows)]
+fn rename_when_released(from: &Path, to: &Path) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + HELD_FILE_WAIT;
+    let mut pause = Duration::from_millis(10);
+    loop {
+        match fs::rename(from, to) {
+            Err(error)
+                if held_by_another_process(&error) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(200));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn install_failure(error: &io::Error, message: String) -> UpdateError {
+    if held_by_another_process(error) {
+        UpdateError::InUse(message)
+    } else {
+        UpdateError::Install(message)
     }
 }
 
@@ -886,8 +776,9 @@ pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), 
 /// and must not stop installation of the remaining companion binaries.
 #[cfg(any(windows, test))]
 fn retire_replaced_backup(backup: &Path, install_path: &Path) {
-    let result = sidecar_install_path(install_path, "old")
-        .and_then(|retired| fs::rename(backup, retired).map_err(UpdateError::from));
+    let result = sidecar_install_path(install_path, "old").and_then(|retired| {
+        fs::rename(backup, &retired).map_err(io_failed_between("move", backup, &retired))
+    });
     if let Err(error) = result {
         eprintln!(
             "Updated {}; retained previous file at {} because it could not be marked for cleanup: {error}. Remove it manually after older sessions and installers exit.",
@@ -941,13 +832,13 @@ fn cleanup_retired_backups(install_path: &Path) -> Result<(), UpdateError> {
             parent.display()
         ))
     })? {
-        let entry = entry?;
+        let entry = entry.map_err(io_failed("list update backups in", parent))?;
         if entry.file_name().to_str().is_some_and(is_retired_backup) {
             match entry.file_type() {
                 Ok(kind) if kind.is_file() => remove_retired_backup(&entry.path())?,
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(io_failed("inspect", &entry.path())(error)),
             }
         }
     }
@@ -959,7 +850,6 @@ fn is_retired_backup(name: &str) -> bool {
     [
         "raydock.exe",
         "rayline.exe",
-        "rld.exe",
         "rayline-core.exe",
         CORE_LICENSE_NAME,
     ]
@@ -999,52 +889,6 @@ fn remove_retired_backup(path: &Path) -> Result<(), UpdateError> {
     }
 }
 
-fn cleanup_legacy_uv_install(tool_name: &str, install_path: &Path) {
-    if std::env::var_os(UPDATE_INSTALL_PATH_ENV).is_some() {
-        return;
-    }
-    let Some(uv) = command_on_path("uv") else {
-        return;
-    };
-    if is_uv_tool_managed_install(&uv, tool_name, install_path) {
-        return;
-    }
-    let _ = run_legacy_uv_uninstall(&uv, tool_name);
-}
-
-fn is_uv_tool_managed_install(uv: &Path, tool_name: &str, install_path: &Path) -> bool {
-    let output = Command::new(uv)
-        .args(["tool", "dir"])
-        .stdin(Stdio::null())
-        .output()
-        .ok();
-    let Some(output) = output.filter(|output| output.status.success()) else {
-        return false;
-    };
-    let Some(tools_dir) = String::from_utf8(output.stdout)
-        .ok()
-        .map(|path| path.trim().to_owned())
-        .filter(|path| !path.is_empty())
-    else {
-        return false;
-    };
-    is_uv_tool_managed_path(tool_name, install_path, Path::new(&tools_dir))
-}
-
-fn is_uv_tool_managed_path(tool_name: &str, install_path: &Path, tools_dir: &Path) -> bool {
-    path_is_under_prefix(install_path, &tools_dir.join(tool_name))
-}
-
-fn run_legacy_uv_uninstall(uv: &Path, tool_name: &str) -> io::Result<bool> {
-    let status = Command::new(uv)
-        .args(["tool", "uninstall", tool_name])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    Ok(status.success())
-}
-
 fn command_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
@@ -1066,7 +910,7 @@ fn temp_update_dir() -> Result<PathBuf, UpdateError> {
         crate::CLI_BIN,
         std::process::id()
     ));
-    fs::create_dir_all(&path).map_err(UpdateError::from)?;
+    fs::create_dir_all(&path).map_err(io_failed("create", &path))?;
     Ok(path)
 }
 
@@ -1074,20 +918,27 @@ fn temp_update_dir() -> Result<PathBuf, UpdateError> {
 pub struct Version {
     normalized: String,
     public: String,
-    base_parts: Vec<u64>,
-    suffix: Option<String>,
+    base: [u64; 3],
+    prerelease: Option<(Prerelease, u64)>,
+}
+
+/// The pre-release labels releases use, ordered low to high. `main` sits below
+/// `dev` because the release ladder is main (rawest, rolling) -> dev (release
+/// candidate) -> prod: a main build must never be reported as newer than the
+/// dev build it is promoted into. `rc` is a public release candidate.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Prerelease {
+    Main,
+    Dev,
+    Rc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VersionParseError;
 
-#[derive(Debug, Eq, PartialEq)]
-enum VersionToken {
-    Number(u64),
-    Text(String),
-}
-
 impl Version {
+    /// `X.Y.Z`, optionally followed by `-<main|dev|rc>.<N>` and `+<build>`.
+    /// Every number is a decimal without leading zeros that fits a u64.
     pub fn parse(raw: &str) -> Result<Self, VersionParseError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1104,68 +955,68 @@ impl Version {
             validate_version_label(local)?;
         }
 
-        let (base_parts, suffix) = parse_public_version(public)?;
+        let (base, prerelease) = match public.split_once('-') {
+            Some((base, prerelease)) => (base, Some(parse_prerelease(prerelease)?)),
+            None => (public, None),
+        };
 
         Ok(Self {
             normalized: trimmed.to_ascii_lowercase(),
             public: public.to_owned(),
-            base_parts,
-            suffix: suffix.map(str::to_ascii_lowercase),
+            base: parse_base_version(base)?,
+            prerelease,
         })
     }
 
-    fn base_cmp(&self, other: &Self) -> Ordering {
-        let length = self.base_parts.len().max(other.base_parts.len());
-        for index in 0..length {
-            let left = self.base_parts.get(index).copied().unwrap_or(0);
-            let right = other.base_parts.get(index).copied().unwrap_or(0);
-            match left.cmp(&right) {
-                Ordering::Equal => {}
-                ordering => return ordering,
-            }
-        }
-        Ordering::Equal
-    }
-
+    /// A pre-release sorts below the release it leads up to.
     fn public_cmp(&self, other: &Self) -> Ordering {
-        match self.base_cmp(other) {
-            Ordering::Equal => compare_suffixes(self.suffix.as_deref(), other.suffix.as_deref()),
-            ordering => ordering,
-        }
+        self.base
+            .cmp(&other.base)
+            .then_with(|| match (self.prerelease, other.prerelease) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(&right),
+            })
     }
 }
 
-fn parse_public_version(public: &str) -> Result<(Vec<u64>, Option<&str>), VersionParseError> {
-    let mut base_parts = Vec::new();
-    let mut index = 0;
-    let bytes = public.as_bytes();
-
-    loop {
-        let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        if start == index {
-            return Err(VersionParseError);
-        }
-        base_parts.push(
-            public[start..index]
-                .parse::<u64>()
-                .map_err(|_| VersionParseError)?,
-        );
-
-        if index == bytes.len() {
-            return Ok((base_parts, None));
-        }
-        if bytes[index] == b'.' && index + 1 < bytes.len() && bytes[index + 1].is_ascii_digit() {
-            index += 1;
-            continue;
-        }
-
-        let suffix = &public[index..];
-        validate_version_label(suffix)?;
-        return Ok((base_parts, Some(suffix)));
+/// Exactly `X.Y.Z`.
+fn parse_base_version(base: &str) -> Result<[u64; 3], VersionParseError> {
+    let mut parts = base.split('.');
+    let base = [
+        parse_version_number(parts.next())?,
+        parse_version_number(parts.next())?,
+        parse_version_number(parts.next())?,
+    ];
+    match parts.next() {
+        Some(_) => Err(VersionParseError),
+        None => Ok(base),
     }
+}
+
+/// `<main|dev|rc>.<N>`, one spelling per label.
+fn parse_prerelease(prerelease: &str) -> Result<(Prerelease, u64), VersionParseError> {
+    let (label, number) = prerelease.split_once('.').ok_or(VersionParseError)?;
+    let label = match label {
+        "main" => Prerelease::Main,
+        "dev" => Prerelease::Dev,
+        "rc" => Prerelease::Rc,
+        _ => return Err(VersionParseError),
+    };
+    Ok((label, parse_version_number(Some(number))?))
+}
+
+/// A decimal without leading zeros that fits a u64.
+fn parse_version_number(number: Option<&str>) -> Result<u64, VersionParseError> {
+    let number = number.ok_or(VersionParseError)?;
+    if number.is_empty()
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+        || (number.len() > 1 && number.starts_with('0'))
+    {
+        return Err(VersionParseError);
+    }
+    number.parse::<u64>().map_err(|_| VersionParseError)
 }
 
 fn validate_version_label(label: &str) -> Result<(), VersionParseError> {
@@ -1180,135 +1031,99 @@ fn validate_version_label(label: &str) -> Result<(), VersionParseError> {
     Ok(())
 }
 
-fn compare_suffixes(left: Option<&str>, right: Option<&str>) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(right)) if suffix_is_post_release(right) => Ordering::Less,
-        (Some(left), None) if suffix_is_post_release(left) => Ordering::Greater,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-        (Some(left), Some(right)) => compare_suffix_tokens(left, right),
-    }
-}
-
-fn suffix_is_post_release(suffix: &str) -> bool {
-    suffix_tokens(suffix).first().is_some_and(
-        |token| matches!(token, VersionToken::Text(text) if text_rank(text) == POST_RELEASE_RANK),
-    )
-}
-
-fn compare_suffix_tokens(left: &str, right: &str) -> Ordering {
-    let left_tokens = suffix_tokens(left);
-    let right_tokens = suffix_tokens(right);
-    let length = left_tokens.len().max(right_tokens.len());
-    for index in 0..length {
-        match (left_tokens.get(index), right_tokens.get(index)) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(left), Some(right)) => match compare_version_tokens(left, right) {
-                Ordering::Equal => {}
-                ordering => return ordering,
-            },
-        }
-    }
-    Ordering::Equal
-}
-
-fn compare_version_tokens(left: &VersionToken, right: &VersionToken) -> Ordering {
-    match (left, right) {
-        (VersionToken::Number(left), VersionToken::Number(right)) => left.cmp(right),
-        (VersionToken::Text(left), VersionToken::Text(right)) => {
-            match text_rank(left).cmp(&text_rank(right)) {
-                Ordering::Equal => left.cmp(right),
-                ordering => ordering,
-            }
-        }
-        (VersionToken::Number(_), VersionToken::Text(_)) => Ordering::Less,
-        (VersionToken::Text(_), VersionToken::Number(_)) => Ordering::Greater,
-    }
-}
-
-fn suffix_tokens(suffix: &str) -> Vec<VersionToken> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut current_is_digit = None;
-    for ch in suffix
-        .trim_start_matches(['.', '-', '_'])
-        .chars()
-        .flat_map(char::to_lowercase)
-    {
-        if matches!(ch, '.' | '-' | '_') {
-            push_suffix_token(&mut tokens, &mut current, &mut current_is_digit);
-            continue;
-        }
-        let is_digit = ch.is_ascii_digit();
-        if current_is_digit.is_some_and(|current| current != is_digit) {
-            push_suffix_token(&mut tokens, &mut current, &mut current_is_digit);
-        }
-        current_is_digit = Some(is_digit);
-        current.push(ch);
-    }
-    push_suffix_token(&mut tokens, &mut current, &mut current_is_digit);
-    tokens
-}
-
-fn push_suffix_token(
-    tokens: &mut Vec<VersionToken>,
-    current: &mut String,
-    current_is_digit: &mut Option<bool>,
-) {
-    if current.is_empty() {
-        *current_is_digit = None;
-        return;
-    }
-    if current_is_digit.unwrap_or(false) {
-        let number = current.parse::<u64>().unwrap_or(u64::MAX);
-        tokens.push(VersionToken::Number(number));
-    } else {
-        tokens.push(VersionToken::Text(std::mem::take(current)));
-    }
-    current.clear();
-    *current_is_digit = None;
-}
-
-/// Rank of a post-release label (`1.0.0-post1`), the only suffix family that
-/// sorts *above* a bare release. Kept as a named constant so `text_rank` and
-/// `suffix_is_post_release` cannot drift apart.
-const POST_RELEASE_RANK: u8 = 6;
-
-fn text_rank(text: &str) -> u8 {
-    // Ordered low -> high. `main` sits below `dev` because the release ladder is
-    // main (rawest, rolling) -> dev (release candidate) -> prod: a main build
-    // must never be reported as newer than the dev build it is promoted into.
-    match text {
-        "main" => 0,
-        "dev" => 1,
-        "a" | "alpha" => 2,
-        "b" | "beta" => 3,
-        "c" | "pre" | "preview" | "rc" => 4,
-        "post" | "r" | "rev" => POST_RELEASE_RANK,
-        _ => 5,
-    }
-}
-
-impl From<io::Error> for UpdateError {
-    fn from(error: io::Error) -> Self {
-        Self::Network(error.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
     #[test]
-    fn cleanup_removes_only_committed_windows_backups() -> Result<(), UpdateError> {
+    fn a_missing_install_path_passes_through_and_other_resolve_failures_name_it() {
+        let root = std::env::temp_dir().join(format!("raydock-resolve-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let missing = root.join("missing").join("raydock");
+        assert_eq!(resolve_install_path(missing.clone()).unwrap(), missing);
+        // A regular file used as a directory (unix) or a name the file system
+        // rejects (Windows) fails for a reason other than absence.
+        #[cfg(unix)]
+        let unusable = {
+            fs::write(root.join("file"), "").unwrap();
+            root.join("file").join("raydock")
+        };
+        #[cfg(windows)]
+        let unusable = root.join("bad<name").join("raydock");
+        let error = resolve_install_path(unusable.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with(&format!("failed to resolve {}: ", unusable.display())),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_failing_brew_prefix_is_an_error_naming_it() {
+        let root = std::env::temp_dir().join(format!("raydock-brew-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let missing = root.join("no-such-brew");
+        let error = brew_prefix(&missing).unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("`brew --prefix` ({}) failed: ", missing.display())),
+            "{error}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = |name: &str, body: &str| {
+                let path = root.join(name);
+                fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            };
+            let exits = script("exits", "exit 3");
+            assert_eq!(
+                brew_prefix(&exits).unwrap_err().to_string(),
+                format!(
+                    "`brew --prefix` ({}) failed: exit status: 3",
+                    exits.display()
+                )
+            );
+            let silent = script("silent", "echo");
+            assert_eq!(
+                brew_prefix(&silent).unwrap_err().to_string(),
+                format!(
+                    "`brew --prefix` ({}) failed: it printed no prefix",
+                    silent.display()
+                )
+            );
+            let prints = script("prints", "echo /opt/homebrew");
+            assert_eq!(
+                brew_prefix(&prints).unwrap(),
+                PathBuf::from("/opt/homebrew")
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_io_failure_names_the_operation_and_path() {
+        let path = std::env::temp_dir().join("raydock-update-no-such-file");
+        let error = sha256_file(&path).unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("failed to read {}: ", path.display())),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_only_committed_windows_backups() -> TestResult {
         let root = temp_update_dir()?;
         let retired = [
             ".raydock.exe.old-123-456",
             ".rayline.exe.old-123-abcdef",
-            ".rld.exe.old-123-456",
             ".rayline-core.exe.old-123-456",
             ".rayline-core-LICENSE.old-123-456",
         ];
@@ -1338,7 +1153,7 @@ mod tests {
             retired.len() + 1,
             "retirement must keep the old file until a later sweep"
         );
-        let directory = root.join(".rld.exe.old-123-789");
+        let directory = root.join(".rayline-core.exe.old-123-789");
         fs::create_dir(&directory)?;
         cleanup_retired_backups(&root.join("raydock.exe"))?;
         for name in retired {
@@ -1355,7 +1170,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_cleanup_retries_locked_retired_backup() -> Result<(), UpdateError> {
+    fn windows_cleanup_retries_locked_retired_backup() -> TestResult {
         use std::os::windows::fs::OpenOptionsExt;
 
         let root = temp_update_dir()?;
@@ -1374,9 +1189,89 @@ mod tests {
         Ok(())
     }
 
+    /// Opens `path` the way a scanner does: readable, but without delete
+    /// sharing, so renaming it fails with a sharing violation while open.
+    #[cfg(windows)]
+    fn hold_without_delete_sharing(path: &Path) -> io::Result<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+    }
+
     #[cfg(windows)]
     #[test]
-    fn windows_swap_defers_cleanup_and_preserves_failed_swap() -> Result<(), UpdateError> {
+    fn windows_swap_waits_for_another_process_to_release_the_file() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
+        fs::write(&installed, b"original")?;
+        fs::write(&staged, b"new")?;
+        let held = hold_without_delete_sharing(&installed)?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        move_into_place(&staged, &installed)?;
+        release.join().expect("release thread");
+        assert_eq!(fs::read(&installed)?, b"new");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_fresh_install_waits_for_another_process_to_release_the_file() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
+        fs::write(&staged, b"new")?;
+        let held = hold_without_delete_sharing(&staged)?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        move_into_place(&staged, &installed)?;
+        release.join().expect("release thread");
+        assert_eq!(fs::read(&installed)?, b"new");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_swap_held_past_the_wait_is_an_in_use_error_and_changes_nothing() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
+        fs::write(&installed, b"original")?;
+        fs::write(&staged, b"new")?;
+        let held = hold_without_delete_sharing(&installed)?;
+        let Err(UpdateError::InUse(message)) = move_into_place(&staged, &installed) else {
+            panic!("a file held past the wait must be an in-use error");
+        };
+        drop(held);
+        assert!(
+            message.starts_with(&format!(
+                "failed to move existing binary {} aside: ",
+                installed.display()
+            )),
+            "{message}"
+        );
+        assert!(message.contains("(os error 32)"), "{message}");
+        assert_eq!(fs::read(&installed)?, b"original");
+        assert_eq!(fs::read(&staged)?, b"new");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_swap_defers_cleanup_and_preserves_failed_swap() -> TestResult {
         let root = temp_update_dir()?;
         let installed = root.join("raydock.exe");
         let staged = root.join("staged.exe");
@@ -1395,8 +1290,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_retirement_failure_preserves_committed_install_and_backup() -> Result<(), UpdateError>
-    {
+    fn windows_retirement_failure_preserves_committed_install_and_backup() -> TestResult {
         use std::os::windows::fs::OpenOptionsExt;
 
         let root = temp_update_dir()?;
@@ -1418,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    fn core_license_installs_as_verified_nonexecutable_data() -> Result<(), UpdateError> {
+    fn core_license_installs_as_verified_nonexecutable_data() -> TestResult {
         let root = temp_update_dir()?;
         let source = root.join("rayline-core-LICENSE");
         let destination = root.join("installed/rayline-core-LICENSE");
@@ -1443,8 +1337,129 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_failed_staging_leaves_no_staged_file() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock");
+        fs::write(&installed, b"installed")?;
+        // A missing source fails before the staged file exists; a directory
+        // fails after it is created on Unix and on opening it on Windows.
+        let directory = root.join("downloaded-directory");
+        fs::create_dir(&directory)?;
+        for downloaded in [root.join("no-such-download"), directory] {
+            let error = replace_binary(&downloaded, &installed)
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("failed to stage update at "), "{error}");
+            let staged: Vec<_> = fs::read_dir(&root)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<_, _>>()?;
+            assert!(
+                !staged
+                    .iter()
+                    .any(|name| name.to_string_lossy().starts_with(".raydock.tmp-")),
+                "{staged:?}"
+            );
+            assert_eq!(fs::read(&installed)?, b"installed");
+        }
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     fn version(raw: &str) -> Version {
         Version::parse(raw).unwrap_or_else(|_| panic!("test version {raw} parses"))
+    }
+
+    #[test]
+    fn versions_order_along_the_release_ladder() {
+        // Low to high: the main and dev ladder builds, a public release
+        // candidate, then the release.
+        let ladder = [
+            "0.2.9+ee1afb00b6cd",
+            "0.3.0-main.7+ee1afb00b6cd",
+            "0.3.0-main.100+ee1afb00b6cd",
+            "0.3.0-dev.1+ee1afb00b6cd",
+            "0.3.0-dev.42+ee1afb00b6cd",
+            "0.3.0-rc.1",
+            "0.3.0-rc.2",
+            "0.3.0+ee1afb00b6cd",
+            "0.3.1-main.1+ee1afb00b6cd",
+        ];
+        for (index, lower) in ladder.iter().enumerate() {
+            for higher in &ladder[index + 1..] {
+                assert_eq!(
+                    version(higher).public_cmp(&version(lower)),
+                    Ordering::Greater,
+                    "{higher} > {lower}"
+                );
+                assert_eq!(
+                    version(lower).public_cmp(&version(higher)),
+                    Ordering::Less,
+                    "{lower} < {higher}"
+                );
+            }
+        }
+        assert_eq!(
+            version("0.2.0-rc.1").public_cmp(&version("0.2.0-rc.1")),
+            Ordering::Equal
+        );
+        assert_eq!(
+            version("0.3.0+aaaaaaaaaaaa").public_cmp(&version("0.3.0+bbbbbbbbbbbb")),
+            Ordering::Equal,
+            "the build label does not order releases"
+        );
+    }
+
+    #[test]
+    fn a_pre_release_is_main_dev_or_rc_with_one_number() {
+        for raw in [
+            "0.0.0-sigtest1",
+            "1.2.3-alpha.1",
+            "1.2.3-beta.1",
+            "1.2.3-pre.1",
+            "1.2.3-post.1",
+            "1.2.3-rc",
+            "1.2.3-rc1",
+            "1.2.3-rc.",
+            "1.2.3-rc.01",
+            "1.2.3-rc.1.2",
+            "1.2.3-rc_1",
+            "1.2.3-RC.1",
+            "1.2.3-Dev.1",
+            "1.2.3rc.1",
+            "1.2.3-",
+            "1.2.3-rc.18446744073709551616",
+        ] {
+            assert_eq!(Version::parse(raw), Err(VersionParseError), "{raw}");
+        }
+        assert_eq!(
+            version("1.2.3-rc.18446744073709551615").prerelease,
+            Some((Prerelease::Rc, u64::MAX))
+        );
+        assert_eq!(version("1.2.3-rc.0").prerelease, Some((Prerelease::Rc, 0)));
+    }
+
+    #[test]
+    fn a_base_version_is_exactly_three_numbers() {
+        for raw in [
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.2.",
+            ".1.2",
+            "1..2",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.3a",
+            "v1.2.3",
+            "18446744073709551616.0.0",
+        ] {
+            assert_eq!(Version::parse(raw), Err(VersionParseError), "{raw}");
+        }
+        assert_eq!(version("0.0.0").base, [0, 0, 0]);
+        assert_eq!(version("10.20.30").base, [10, 20, 30]);
+        assert_eq!(version("18446744073709551615.0.0").base, [u64::MAX, 0, 0]);
     }
 
     #[test]
@@ -1464,89 +1479,11 @@ mod tests {
         assert_eq!(bare_version_hint(&version("0.2.12"), other.clone()), other);
     }
 
-    #[test]
-    fn rollback_removes_a_stale_core_and_tolerates_none() -> Result<(), UpdateError> {
-        let root = temp_update_dir()?;
-        let core = root.join("rayline-core");
-        let license = root.join(CORE_LICENSE_NAME);
-        fs::write(&core, b"core")?;
-        fs::write(&license, b"license")?;
-        remove_stale_core(&[&core, &license]);
-        assert!(!core.exists() && !license.exists());
-        remove_stale_core(&[&core, &license]);
-        fs::remove_dir_all(root)?;
-        Ok(())
-    }
-
-    #[test]
-    fn pre_core_rollback_is_decided_from_signed_checksums() {
-        let platform = "macosx_11_0_arm64";
-        let two_binaries = format!("aa  rayline-{platform}\nbb  rld-{platform}\n");
-        let with_core =
-            format!("{two_binaries}cc  rayline-core-{platform}\ndd  rayline-core-LICENSE\n");
-        let license_only = format!("{two_binaries}dd  rayline-core-LICENSE\n");
-        let other_platform = format!("{two_binaries}cc  rayline-core-linux_x86_64\n");
-        // (sums, target, expected: Some(ships core) or None for fail closed)
-        let cases: [(&str, &str, Option<bool>); 12] = [
-            (&two_binaries, "0.2.12", Some(false)),
-            (&two_binaries, "0.1.0", Some(false)),
-            (&two_binaries, "0.2.12-dev.3", Some(false)),
-            (&two_binaries, "0.2.12+local", Some(false)),
-            (&two_binaries, "0.2.13", None),
-            (&two_binaries, "0.2.13-dev.1", None),
-            (&two_binaries, "0.3.0", None),
-            (&two_binaries, "1.0", None),
-            (&other_platform, "0.2.14", None),
-            (&with_core, "0.2.13", Some(true)),
-            // A listed core is installed (and checksum-verified) even for an
-            // old version number; a partial listing then fails verification.
-            (&with_core, "0.2.12", Some(true)),
-            (&license_only, "0.2.12", Some(true)),
-        ];
-        for (sums, target, expected) in cases {
-            let decision = release_ships_core(sums, platform, &version(target));
-            match expected {
-                Some(ships) => assert_eq!(decision, Ok(ships), "{target}: {sums:?}"),
-                None => {
-                    let Err(UpdateError::Checksum(message)) = decision else {
-                        panic!("{target} without a core must fail closed: {decision:?}");
-                    };
-                    assert!(message.contains(&format!("rayline-core-{platform}")));
-                    assert!(message.contains(CORE_FIRST_VERSION));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn uv_tool_managed_path_matches_tool_environment() {
-        let tools_dir = Path::new("/Users/test/.local/share/uv/tools");
-        let install_path = tools_dir.join("rayline-cli").join("bin").join("rayline");
-
-        assert!(is_uv_tool_managed_path(
-            "rayline-cli",
-            &install_path,
-            tools_dir
-        ));
-    }
-
-    #[test]
-    fn uv_tool_managed_path_rejects_other_installs() {
-        let tools_dir = Path::new("/Users/test/.local/share/uv/tools");
-        let install_path = Path::new("/usr/local/bin/rayline");
-
-        assert!(!is_uv_tool_managed_path(
-            "rayline-cli",
-            install_path,
-            tools_dir
-        ));
-    }
-
     // ── Signature verification tests ─────────────────────────────────────────
 
     // Test public key (matches the .minisig in tests/fixtures/SHA256SUMS.minisig)
     // Generated for testing only — NOT the production key.
-    const TEST_PUBKEY: &str = "RWRqzAWsbJCJh9W2BSnYcbRiBwshTgouNtwYqkmFX1Qs6kXdxY70sRCP";
+    const TEST_PUBKEY: &str = "RWRrxu13/uJmEyk8KO8zSLW71qzyxIAYFeYo1nde3MpRDaEwS7yVv2U1";
 
     // Untrusted public key (different keypair, not in the pinned set)
     const UNTRUSTED_PUBKEY: &str = "RWQR3fP7y6Yexmbshr2vDmkWJeKelP8y80oyaUgE9AjMymImLFrUu0Dy";
@@ -1643,52 +1580,261 @@ mod tests {
     // verify_signature tests above; parse_verified_latest delegates to that same
     // function, so those paths are not re-tested against the pointer payload.
 
-    // ── Integration tests for download_and_verify ─────────────────────────────
+    // ── update against a fake release server ─────────────────────────────────
 
-    /// download_and_verify returns Err when SHA256SUMS.minisig is absent from
-    /// the release directory. The pipeline must fail closed: no signature means
-    /// no installation, even if SHA256SUMS itself is present.
-    ///
-    /// Setup: a `file://` release server with SHA256SUMS but no .minisig.
-    /// The `file://` short-circuit in `download_to` makes this a pure I/O test
-    /// with no network dependency.
+    // Signs tests/fixtures/release-*SHA256SUMS. Testing only — NOT the
+    // production key.
+    const RELEASE_TEST_PUBKEY: &str = "RWQ7upEBuCoV7z5WLNio5DhgB/JWqJVgNLY9gCH96m8L8UV+8rhE6fUV";
+    const TEST_RELEASE: &str = "99.0.0";
+    const LAUNCHER: &[u8] = b"fixture launcher\n";
+    const CORE: &[u8] = b"fixture core\n";
+    const LICENSE: &[u8] = b"fixture license\n";
+
+    /// A fixture as it was signed: a checkout may have turned its LF into CRLF.
+    fn signed_fixture(name: &str) -> Vec<u8> {
+        let mut bytes = fixture(name);
+        bytes.retain(|byte| *byte != b'\r');
+        bytes
+    }
+
+    type Files = std::collections::HashMap<String, Vec<u8>>;
+
+    /// An HTTP release server on 127.0.0.1 serving `files` by path, recording
+    /// every path it is asked for.
+    struct FakeReleaseServer {
+        base_url: String,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl FakeReleaseServer {
+        fn start(files: Files) -> Self {
+            use std::io::{BufRead, Write};
+
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+            let base_url = format!("http://{}", listener.local_addr().expect("server address"));
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = std::sync::Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { continue };
+                    let Ok(reader) = stream.try_clone() else {
+                        continue;
+                    };
+                    let mut reader = io::BufReader::new(reader);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut header = String::new();
+                    while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                        header.clear();
+                    }
+                    let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                    let (status, body) = match files.get(path) {
+                        Some(body) => ("200 OK", body.as_slice()),
+                        None => ("404 Not Found", &[][..]),
+                    };
+                    log.lock().expect("request log").push(path.to_owned());
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(body);
+                }
+            });
+            Self { base_url, requests }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().expect("request log").clone()
+        }
+    }
+
+    /// Release files for TEST_RELEASE on this platform, with `sums` naming the
+    /// SHA256SUMS fixture (signed with RELEASE_TEST_PUBKEY).
+    fn release_files(sums: &str) -> Files {
+        let release = format!("/cli/v{TEST_RELEASE}");
+        let mut files = Files::from([
+            (format!("{release}/SHA256SUMS"), signed_fixture(sums)),
+            (
+                format!("{release}/SHA256SUMS.minisig"),
+                signed_fixture(&format!("{sums}.minisig")),
+            ),
+            (format!("{release}/{CORE_LICENSE_NAME}"), LICENSE.to_vec()),
+        ]);
+        let platform = detect_platform_tag().expect("supported test platform");
+        for (name, bytes) in [(crate::CLI_ASSET, LAUNCHER), ("rayline-core", CORE)] {
+            files.insert(format!("{release}/{name}-{platform}"), bytes.to_vec());
+        }
+        files
+    }
+
+    fn exe(dir: &Path, name: &str) -> PathBuf {
+        dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    /// An install directory holding only `raydock`, and a request that
+    /// replaces it from `server`.
+    fn install_from(server: &FakeReleaseServer) -> TestResult<(PathBuf, UpdateRequest)> {
+        let install = temp_update_dir()?;
+        let installed = exe(&install, crate::CLI_BIN);
+        fs::write(&installed, b"installed")?;
+        let request = UpdateRequest {
+            pinned_version: Some(version(TEST_RELEASE)),
+            force: false,
+            check_only: false,
+            dry_run: false,
+            base_url: Some(Url::parse(&format!("{}/", server.base_url)).unwrap()),
+            install_path: Some(installed),
+        };
+        Ok((install, request))
+    }
+
     #[tokio::test]
-    async fn self_update_fails_closed_without_minisig() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let test_root = std::env::temp_dir().join(format!("rayline-test-no-minisig-{unique}"));
-        let dest_dir = std::env::temp_dir().join(format!("rayline-test-dest-{unique}"));
+    async fn check_reads_the_channel_pointer_from_the_base_url() -> TestResult {
+        for (channel, pointer) in [
+            (UpdateChannel::Prod, "/cli/latest.txt"),
+            (UpdateChannel::Dev, "/cli/latest-dev.txt"),
+            (UpdateChannel::Main, "/cli/latest-main.txt"),
+        ] {
+            let server = FakeReleaseServer::start(Files::from([
+                (pointer.to_owned(), signed_fixture("latest.txt")),
+                (
+                    format!("{pointer}.minisig"),
+                    signed_fixture("latest.txt.minisig"),
+                ),
+            ]));
+            let (install, request) = install_from(&server)?;
+            fs::write(exe(&install, "rayline-core"), b"installed core")?;
+            let request = UpdateRequest {
+                pinned_version: None,
+                check_only: true,
+                ..request
+            };
+            let result = run_on(&request, channel, &[LATEST_TEST_PUBKEY]).await?;
+            assert_eq!(result.exit_code, 1, "{}", result.message);
+            assert!(
+                result.message.contains(&format!("\u{2192} {TEST_RELEASE}")),
+                "{}",
+                result.message
+            );
+            assert_eq!(
+                server.requests(),
+                [pointer.to_owned(), format!("{pointer}.minisig")]
+            );
+            assert_eq!(fs::read(exe(&install, crate::CLI_BIN))?, b"installed");
+            fs::remove_dir_all(install)?;
+        }
+        Ok(())
+    }
 
-        // Create the release directory structure that download_and_verify expects.
-        // checksums_url_for("1.0.0") → "<base>/cli/v1.0.0/SHA256SUMS"
-        let release_dir = test_root.join("cli").join("v1.0.0");
-        fs::create_dir_all(&release_dir).expect("create release dir");
-        fs::create_dir_all(&dest_dir).expect("create dest dir");
+    #[tokio::test]
+    async fn update_installs_the_release_at_the_install_path() -> TestResult {
+        let server = FakeReleaseServer::start(release_files("release-SHA256SUMS"));
+        let (install, request) = install_from(&server)?;
+        let installed = exe(&install, crate::CLI_BIN);
 
-        // SHA256SUMS is present — intentionally NO SHA256SUMS.minisig.
-        fs::write(
-            release_dir.join("SHA256SUMS"),
-            b"abc123  rayline-macosx_11_0_arm64\ndef456  rld-macosx_11_0_arm64\n",
-        )
-        .expect("write SHA256SUMS");
-
-        // Point download_and_verify at the local file tree.
-        let base_url = format!("file://{}", test_root.display());
-        // SAFETY: test binary is single-threaded (tokio::test with default
-        // worker count 1); no other test reads RAYLINE_UPDATE_BASE_URL.
-        unsafe { std::env::set_var(UPDATE_BASE_URL_ENV, &base_url) };
-        let result = download_and_verify(&version("1.0.0"), "macosx_11_0_arm64", &dest_dir).await;
-        unsafe { std::env::remove_var(UPDATE_BASE_URL_ENV) };
-
-        // Cleanup best-effort (test trees are small)
-        let _ = fs::remove_dir_all(&test_root);
-        let _ = fs::remove_dir_all(&dest_dir);
-
+        let dry_run = UpdateRequest {
+            dry_run: true,
+            ..request.clone()
+        };
+        let result = run_on(&dry_run, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await?;
         assert!(
-            result.is_err(),
-            "download_and_verify must return Err when SHA256SUMS.minisig is absent"
+            result.message.starts_with("Would install"),
+            "{}",
+            result.message
         );
+        assert_eq!(
+            fs::read_dir(&install)?.count(),
+            1,
+            "a dry run installs nothing"
+        );
+        assert_eq!(fs::read(&installed)?, b"installed");
+
+        let result = run_on(&request, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await?;
+        assert_eq!(result.exit_code, 0, "{}", result.message);
+        assert!(result.message.contains(TEST_RELEASE), "{}", result.message);
+        assert_eq!(fs::read(&installed)?, LAUNCHER);
+        assert_eq!(fs::read(exe(&install, "rayline-core"))?, CORE);
+        assert_eq!(fs::read(install.join(CORE_LICENSE_NAME))?, LICENSE);
+        assert!(fs::symlink_metadata(exe(&install, "rayline")).is_ok());
+        // Windows keeps the replaced launcher as a retired backup.
+        let mut installed_names = fs::read_dir(&install)?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<Vec<_>>>()?;
+        installed_names.retain(|name| !is_retired_backup(name));
+        installed_names.sort();
+        let mut expected_names = [crate::CLI_BIN, "rayline", "rayline-core"]
+            .map(|name| format!("{name}{}", std::env::consts::EXE_SUFFIX))
+            .to_vec();
+        expected_names.push(CORE_LICENSE_NAME.to_owned());
+        expected_names.sort();
+        assert_eq!(installed_names, expected_names);
+        // A pinned version reads no channel pointer.
+        let release = format!("/cli/v{TEST_RELEASE}/");
+        assert!(
+            server
+                .requests()
+                .iter()
+                .all(|path| path.starts_with(&release)),
+            "{:?}",
+            server.requests()
+        );
+        fs::remove_dir_all(install)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_release_without_the_core() -> TestResult {
+        let server = FakeReleaseServer::start(release_files("release-no-core-SHA256SUMS"));
+        let (install, request) = install_from(&server)?;
+        let result = run_on(&request, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await;
+        let Err(UpdateError::Checksum(message)) = result else {
+            panic!("a release without the core must fail closed: {result:?}");
+        };
+        assert!(message.contains("rayline-core-"), "{message}");
+        assert_eq!(fs::read_dir(&install)?.count(), 1);
+        assert_eq!(fs::read(exe(&install, crate::CLI_BIN))?, b"installed");
+        fs::remove_dir_all(install)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_release_without_a_signature() -> TestResult {
+        let mut files = release_files("release-SHA256SUMS");
+        let signature = format!("/cli/v{TEST_RELEASE}/SHA256SUMS.minisig");
+        files.remove(&signature);
+        let server = FakeReleaseServer::start(files);
+        let (install, request) = install_from(&server)?;
+        let result = run_on(&request, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await;
+        let Err(UpdateError::Network(message)) = result else {
+            panic!("a release without SHA256SUMS.minisig must fail closed: {result:?}");
+        };
+        assert!(message.contains("SHA256SUMS.minisig"), "{message}");
+        assert_eq!(
+            server.requests(),
+            [format!("/cli/v{TEST_RELEASE}/SHA256SUMS"), signature],
+            "no artifact is downloaded before the signature checks out"
+        );
+        assert_eq!(fs::read_dir(&install)?.count(), 1);
+        assert_eq!(fs::read(exe(&install, crate::CLI_BIN))?, b"installed");
+        fs::remove_dir_all(install)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_release_signed_by_another_key() -> TestResult {
+        let server = FakeReleaseServer::start(release_files("release-SHA256SUMS"));
+        let (install, request) = install_from(&server)?;
+        let result = run_on(&request, UpdateChannel::Prod, crate::MINISIGN_PUBLIC_KEYS).await;
+        assert!(
+            matches!(result, Err(UpdateError::Signature(_))),
+            "{result:?}"
+        );
+        assert_eq!(fs::read_dir(&install)?.count(), 1);
+        assert_eq!(fs::read(exe(&install, crate::CLI_BIN))?, b"installed");
+        fs::remove_dir_all(install)?;
+        Ok(())
     }
 }

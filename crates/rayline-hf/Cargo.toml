@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Hugging Face cache scan + download"
+description = "Hugging Face cache download"
 homepage.workspace = true
 repository.workspace = true
 publish.workspace = true
@@ -19,5 +19,4 @@ reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls-native
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
-dirs.workspace = true
 sha2 = "0.10"

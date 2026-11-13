@@ -6,38 +6,34 @@ repo-specific.
 ## Crate Boundaries
 
 - `rayline-cli`: user commands and CLI UX.
-- `rayline-daemon`: `rld` process orchestration.
-- `rayline-proxy`: proxying, TLS interception, CA handling, request routing.
-- `rayline-injector`: process/environment injection.
-- `rayline-adapter`: adapter protocol translation.
-- `rayline-local-router`: static routing policy and endpoint selection.
-- `rayline-hf`, `rayline-llama`, `rayline-metrics`: model/cache/runtime support.
+- `rayline-daemon`: the local process, the execution core supervisor and
+  loopback gateway. It is a library; `raydock` runs it through its internal
+  entry point.
+- `rayline-local-router`: shared helpers for the local process's gateway.
+- `rayline-hf`, `rayline-tokencount`, `rayline-metrics`: model cache, token
+  counting and request metrics for local mode.
 
 Keep protocol and routing logic in shared crates. Do not duplicate it in CLI
-handlers. Prefer focused modules over growing the existing large CLI/proxy files.
+handlers. Prefer focused modules over growing the existing large CLI files.
 
 ## CLI Contracts
 
-- Use the current routing flags in new docs, tests, and examples:
-  `--local`, `--via proxy|env`, and `--route all|subagents`.
-- Treat `--local-router`, `--no-proxy`, and `--routing-mode ...` as deprecated
-  compatibility aliases only.
-- `--local` means local static routing without hosted auth.
-- `--via env` is cloud-only and must not be combined with local inference or
-  selective subagent routing.
-- Local routing defaults to `--route subagents`; cloud routing defaults to
-  `--route all`.
-- Use `--router-config-path` when `routes.subagents` is meant to constrain the
-  transparent proxy allowlist. Do not rely on `RAYLINE_ROUTER_CONFIG` alone for
-  that allowlist.
-- `raydock top` should work for proxy-mode launches when metrics can bind.
-  Metrics bind failures are best-effort and must not break proxy data flow.
+- `docs/spec.md` is the contract for every command, option, config key, env
+  var and file. Implement exactly what it lists. Add nothing it does not list.
+- Fail fast: validate config, env overrides and flags once at load, and
+  credentials before any command that uses them acts. Refuse with an error
+  naming the key or flag. Code after load trusts the parsed config: no checks,
+  defaults or fallbacks at call sites.
+- No fallbacks, aliases, alternative spellings, migrations or compatibility
+  code. One name per key and flag, one value per meaning.
+- No hard-coded model ids, context windows, output limits or prices.
+- Code and comments describe what the code does now, not what it replaced.
 
 ## Commands
 
 ```bash
 cargo build --workspace --locked
-cargo build --release -p rayline-cli -p rayline-daemon --locked
+cargo build --release -p rayline-cli --locked
 cargo +1.88.0 fmt --all -- --check
 cargo +1.88.0 test --workspace --locked -- --test-threads=1
 cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings
@@ -55,9 +51,8 @@ relevant full gate before handoff.
   generated certs, private keys, or unsanitized logs.
 - Treat `rls_`, `rlr_`, `rlk-`, provider keys, `RAYLINE_ROUTER_API_KEY`, and
   Claude/Anthropic auth env vars as secrets.
-- Changes touching TLS CA handling, key storage, process injection, proxy
-  routing, install/update scripts, release workflows, or auth storage need extra
-  review.
+- Changes touching key storage, harness launch environments, local-mode routing,
+  install/update scripts, release workflows, or auth storage need extra review.
 - Do not log full prompts or credentials in normal output, tests, or diagnostics.
 
 ## Rust Rules
@@ -74,9 +69,6 @@ relevant full gate before handoff.
 
 - Prefer local fake services, `127.0.0.1:0`, and behavior-level assertions.
 - Default tests must not require live provider credentials or external services.
-- Keep the live Claude Code proxy test ignored; run it explicitly only for that
-  integration path:
-  `CLAUDE_BIN=/path/to/claude cargo test -p rayline-proxy --test it_claude_live -- --ignored --nocapture`
 - Update docs when public CLI flags, env vars, routing behavior, install/update
   behavior, or release behavior changes.
 

@@ -2,7 +2,7 @@
 //! `config.yml`. A named profile (`OMP_PROFILE`/`PI_PROFILE`) makes omp ignore
 //! that override, so both are removed. omp also reads Claude Code's config from
 //! `CLAUDE_CONFIG_DIR` (MCP servers, skills); in testing, a
-//! `CLAUDE_CONFIG_DIR` inherited from `raydock claude` pulling another config
+//! `CLAUDE_CONFIG_DIR` inherited from `rayline run claude` pulling another config
 //! into omp, so it is removed too. Header values name env vars; `apiKey` is the
 //! literal key.
 //!
@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, RenderContext, yaml_file};
+use super::{Plan, RenderContext, yaml_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 /// First omp that sends `X-Claude-Code-Session-Id` in `auth: apiKey` mode.
@@ -78,7 +78,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "name": model.display_name,
                 // ARC owns reasoning effort; do not expose omp thinking controls.
                 "reasoning": !hosted_arc,
-                "input": ctx.input_modalities(),
+                "input": model.input_modalities,
                 "contextWindow": model.context_window,
                 "maxTokens": model.max_output_tokens
             });
@@ -104,7 +104,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 // Without `auth: apiKey` omp poses as Claude Code (renamed tools,
                 // billing system block). apiKey mode is the honest request shape.
                 "auth": "apiKey",
-                "headers": ctx.conversation_headers(CONV_ID_ENV),
                 "models": entries
             }
         }

@@ -1,7 +1,7 @@
-//! The execution core's `token_counter` for the local deployment: rld loads
-//! the local model's published tokenizer and chat template, serves the
-//! count on its own loopback listener with its own credential, and hands the
-//! core a copy of its configuration that names it.
+//! The execution core's `token_counter` for each deployment whose model names
+//! a `tokenizer`: the local process loads that model's published tokenizer and chat
+//! template, serves the count on its own loopback listener with its own
+//! credential, and hands the core a copy of its configuration that names it.
 //!
 //! Without a counter the core sizes a model it has no tokenizer for by bytes,
 //! several times its real token count, and an image in the history makes that
@@ -42,49 +42,63 @@ pub(crate) struct Counter {
     remembered: Mutex<VecDeque<([u8; 32], usize)>>,
 }
 
-/// A loaded counter, its listener, and the core configuration that names it.
+/// The loaded counters, each with its listener, and the core configuration
+/// that names them.
 pub(crate) struct Prepared {
-    pub(crate) counter: Arc<Counter>,
-    pub(crate) listener: TcpListener,
+    pub(crate) counters: Vec<(Arc<Counter>, TcpListener)>,
     pub(crate) config: PathBuf,
 }
 
-/// Loads the model files in `dir` and writes `<config>.counted.json`: the
-/// core configuration with the deployment's `token_counter`, `token_units`
-/// and, for a model with an image processor, image input.
+/// Loads the model files of each `(deployment, dir)` and writes
+/// `<config>.counted.json`: the core configuration with each deployment's
+/// `token_counter`, `token_units` and, for a model with an image processor,
+/// image input.
 pub(crate) async fn prepare(
-    dir: &Path,
+    counters: &[(String, PathBuf)],
     config: &Path,
-    deployment: &str,
     token: String,
 ) -> Result<Prepared> {
-    let dir = dir.to_owned();
-    let counter = tokio::task::spawn_blocking(move || PromptCounter::from_dir(&dir))
-        .await
-        .context("load the prompt counter")??;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let url = format!(
-        "http://127.0.0.1:{}{COUNTER_PATH}",
-        listener.local_addr()?.port()
-    );
     let mut profile: Value = serde_json::from_slice(&std::fs::read(config)?)?;
-    name_counter(
-        &mut profile,
-        deployment,
-        &url,
-        counter.units(),
-        counter.accepts_images(),
-    )?;
+    let mut prepared = Vec::with_capacity(counters.len());
+    for (deployment, dir) in counters {
+        let counter = tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            move || PromptCounter::from_dir(&dir)
+        })
+        .await
+        .context("load the prompt counter")?
+        .with_context(|| {
+            format!(
+                "load the prompt counter for {deployment} from {}",
+                dir.display()
+            )
+        })?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let url = format!(
+            "http://127.0.0.1:{}{COUNTER_PATH}",
+            listener.local_addr()?.port()
+        );
+        name_counter(
+            &mut profile,
+            deployment,
+            &url,
+            counter.units(),
+            counter.accepts_images(),
+        )?;
+        prepared.push((
+            Arc::new(Counter {
+                counter: Arc::new(counter),
+                token: token.clone(),
+                remembered: Mutex::new(VecDeque::new()),
+            }),
+            listener,
+        ));
+    }
     let counted = config.with_extension("counted.json");
     let _ = std::fs::remove_file(&counted);
     crate::hybrid::write_private_new(&counted, &serde_json::to_vec_pretty(&profile)?)?;
     Ok(Prepared {
-        counter: Arc::new(Counter {
-            counter: Arc::new(counter),
-            token,
-            remembered: Mutex::new(VecDeque::new()),
-        }),
-        listener,
+        counters: prepared,
         config: counted,
     })
 }
@@ -108,23 +122,15 @@ fn name_counter(
     if target.get("kind").and_then(Value::as_str) != Some("local") {
         bail!("deployment {deployment} is not local");
     }
-    if target.get("prompt_counter").is_some() {
-        bail!("deployment {deployment} already has a llama.cpp prompt_counter");
+    let modalities = target
+        .get_mut("input_modalities")
+        .and_then(Value::as_array_mut)
+        .with_context(|| format!("deployment {deployment} has no input_modalities"))?;
+    if images && !modalities.iter().any(|modality| modality == "image") {
+        modalities.push(json!("image"));
     }
     target["token_counter"] = json!({"url": url, "auth_env": COUNTER_KEY_ENV});
     target["token_units"] = json!(units);
-    if images {
-        let modalities = target
-            .get_mut("input_modalities")
-            .and_then(Value::as_array_mut);
-        match modalities {
-            Some(modalities) if !modalities.iter().any(|modality| modality == "image") => {
-                modalities.push(json!("image"))
-            }
-            Some(_) => {}
-            None => target["input_modalities"] = json!(["text", "image"]),
-        }
-    }
     Ok(())
 }
 
@@ -296,11 +302,23 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_cloud_or_already_counted_deployment() {
+    fn refuses_a_cloud_or_missing_deployment() {
         assert!(name_counter(&mut profile(), "cloud-opus", "u", "u", false).is_err());
         assert!(name_counter(&mut profile(), "missing", "u", "u", false).is_err());
-        let mut counted = profile();
-        counted["deployments"][0]["prompt_counter"] = json!({});
-        assert!(name_counter(&mut counted, "local", "u", "u", false).is_err());
+    }
+
+    #[test]
+    fn a_local_deployment_without_input_modalities_is_an_error() {
+        for images in [false, true] {
+            let mut value = profile();
+            let local = value["deployments"][0].as_object_mut().unwrap();
+            local.remove("input_modalities");
+            let error = name_counter(&mut value, "local", "u", "u", images).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "deployment local has no input_modalities"
+            );
+            assert!(value["deployments"][0].get("token_counter").is_none());
+        }
     }
 }

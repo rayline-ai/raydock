@@ -48,17 +48,21 @@ impl Source {
 }
 
 impl ImageSizing {
-    /// Reads `image_processor` (or the top level) of `processor_config.json`.
-    /// A config with no patch size describes no image input: `None`.
+    /// Reads `image_processor` (or the top level) of a processor config.
+    /// A config with no `patch_size` anywhere describes no image input:
+    /// `None`. One whose `patch_size` is elsewhere or not an integer
+    /// describes images the counter cannot size: an error naming where.
     pub fn from_processor_config(config: &Value) -> Result<Option<Self>> {
         let processor = config.get("image_processor").unwrap_or(config);
         let Some(patch) = processor.get("patch_size").and_then(Value::as_u64) else {
+            if let Some(pointer) = find_key(config, "patch_size", String::new()) {
+                bail!("the image processor's `{pointer}` is not a `patch_size` the counter reads");
+            }
             return Ok(None);
         };
-        let merge = processor
-            .get("merge_size")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
+        let Some(merge) = processor.get("merge_size").and_then(Value::as_u64) else {
+            bail!("the image processor has a `patch_size` but no integer `merge_size`");
+        };
         let factor = patch * merge;
         let area = factor * factor;
         // Qwen2-VL-style processors name their pixel limits
@@ -89,10 +93,10 @@ impl ImageSizing {
             tokens("min_image_tokens", "min_pixels"),
             tokens("max_image_tokens", "max_pixels"),
         ) else {
-            bail!("processor_config.json has a patch size but no image token limits");
+            bail!("the image processor has a patch size but no image token limits");
         };
         if factor == 0 || min_tokens == 0 || max_tokens < min_tokens {
-            bail!("processor_config.json has inconsistent image limits");
+            bail!("the image processor has inconsistent image limits");
         }
         Ok(Some(Self {
             factor,
@@ -126,6 +130,25 @@ impl ImageSizing {
             w_bar = (w * beta / factor).ceil() * factor;
         }
         (h_bar as u64, w_bar as u64)
+    }
+}
+
+/// The JSON pointer of the first `key` in `value`, at any depth.
+fn find_key(value: &Value, key: &str, pointer: String) -> Option<String> {
+    match value {
+        Value::Object(object) => object.iter().find_map(|(name, child)| {
+            let path = format!("{pointer}/{name}");
+            if name == key {
+                Some(path)
+            } else {
+                find_key(child, key, path)
+            }
+        }),
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .find_map(|(index, child)| find_key(child, key, format!("{pointer}/{index}"))),
+        _ => None,
     }
 }
 
@@ -200,6 +223,44 @@ mod tests {
             (sizing.factor, sizing.min_tokens, sizing.max_tokens),
             (32, 64, 16384)
         );
+    }
+
+    #[test]
+    fn a_patch_size_without_a_merge_size_is_an_error_naming_it() {
+        for processor in [
+            json!({"patch_size": 14, "min_image_tokens": 16, "max_image_tokens": 8000}),
+            json!({"patch_size": 14, "merge_size": "2", "min_image_tokens": 16, "max_image_tokens": 8000}),
+        ] {
+            let error = ImageSizing::from_processor_config(&processor).unwrap_err();
+            assert!(error.to_string().contains("`merge_size`"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_patch_size_the_counter_does_not_read_is_an_error_naming_it() {
+        for (processor, pointer) in [
+            // Kimi-K3's preprocessor_config.json, trimmed to its sizing keys.
+            (
+                json!({"media_proc_cfg": {"in_patch_limit": 65536, "patch_size": 14, "merge_kernel_size": 2, "patch_limit_on_one_side": 512}}),
+                "/media_proc_cfg/patch_size",
+            ),
+            (
+                json!({"image_processor": {"merge_size": 2}, "patch_size": 14}),
+                "/patch_size",
+            ),
+            (
+                json!({"patch_size": {"height": 14, "width": 14}, "merge_size": 2}),
+                "/patch_size",
+            ),
+        ] {
+            let error = ImageSizing::from_processor_config(&processor).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the image processor's `{pointer}` is not a `patch_size` the counter reads"
+                )
+            );
+        }
     }
 
     #[test]

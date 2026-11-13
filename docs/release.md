@@ -8,8 +8,7 @@ is intentionally reviewed.
 
 `raydock` is the primary command. `rayline` remains a supported alias with no
 scheduled removal; this migration does not add an expiry. Any future removal
-requires a separate announced breaking change. Updater asset names, config
-paths, credentials, and environment variables remain unchanged.
+requires a separate announced breaking change.
 
 ## Release Tags
 
@@ -21,20 +20,22 @@ same files. Do not push `v*` tags by hand.
 
 `.github/workflows/release.yml` is a manual fallback only: it runs from
 `workflow_dispatch` with an existing tag, never on a tag push, and fails if a
-release for that tag already exists. It builds with Rust 1.88 and embeds:
-
-- `RAYLINE_VERSION=<tag without v>`
-- `RAYLINE_CHANNEL=prod`
+release for that tag already exists. It builds with Rust 1.88 and embeds
+`RAYLINE_VERSION=<tag without v>`.
 
 ## GitHub Release Assets
 
 The release workflow uploads:
 
-- `rayline-<platform>`, `rld-<platform>` and `rayline-core-<platform>` bare binaries;
+- `rayline-<platform>` and `rayline-core-<platform>` bare binaries;
 - `rayline-<version>-<platform>.tar.gz` archives for macOS/Linux;
 - `rayline-<version>-windows_x86_64.zip` for Windows;
+- `rayline-core-LICENSE`, the execution core's license;
 - `rayline-core-source.json` with the pinned public source and toolchain;
-- `SHA256SUMS` covering every uploaded binary, archive and provenance file.
+- `SHA256SUMS` covering every uploaded binary, archive, license and provenance
+  file, and `SHA256SUMS.minisig`, its minisign signature;
+- `latest.txt`, the release's version pointer, and `latest.txt.minisig`, its
+  minisign signature.
 
 Supported platform tags match the self-updater contract in
 `crates/rayline-cli/src/update.rs`:
@@ -45,8 +46,9 @@ Supported platform tags match the self-updater contract in
 - `macosx_11_0_arm64`
 - `windows_x86_64`
 
-The public install scripts download from GitHub Releases and verify the bare
-binary assets against `SHA256SUMS`.
+The public install scripts download from GitHub Releases. They need
+`minisign`: they verify `SHA256SUMS.minisig` against the pinned release key,
+then each file they install against `SHA256SUMS`.
 
 ## Self-Update Mirror
 
@@ -56,8 +58,8 @@ default. After the GitHub Release is created, mirror the bare binary assets and
 
 ```text
 https://get.rayline.ai/cli/v<version>/rayline-<platform>
-https://get.rayline.ai/cli/v<version>/rld-<platform>
 https://get.rayline.ai/cli/v<version>/rayline-core-<platform>
+https://get.rayline.ai/cli/v<version>/rayline-core-LICENSE
 https://get.rayline.ai/cli/v<version>/rayline-core-source.json
 https://get.rayline.ai/cli/v<version>/SHA256SUMS
 https://get.rayline.ai/cli/v<version>/SHA256SUMS.minisig
@@ -86,9 +88,11 @@ pointer or its signature will no longer match.
 > **Known limitation (replay / freeze).** Signing proves the pointer is
 > *authentic*, not *fresh*. An attacker who can serve content may replay an
 > older, validly-signed `latest.txt` to freeze users on a stale head, or pin
-> them to an old (still validly-signed) version above their installed one. The
-> client refuses to roll *below* the installed version (`target > current`), but
-> full anti-rollback needs freshness — a signed timestamp + expiry or a
+> them to an old (still validly-signed) version above their installed one.
+> Without `--version` or `--force`, the client refuses to roll *below* the
+> installed version (`target > current`). `--version` installs any other
+> version and `--force` installs regardless, so either can install an older
+> version. Full anti-rollback needs freshness — a signed timestamp + expiry or a
 > highest-seen-version floor — which is tracked as a follow-up, not delivered by
 > pointer signing alone.
 
@@ -116,19 +120,22 @@ scripts/install-rayline.sh --version 0.2.0 --install-dir /tmp/rayline-bin
 /tmp/rayline-bin/raydock update --check
 ```
 
-For installer validation against a staged asset directory:
+For installer validation against a staged asset directory, point the hidden
+`--base-url` option at it (it can't be combined with `--version`):
 
 ```bash
-RAYLINE_RELEASE_BASE_URL=file:///tmp/rayline-release/cli/v0.2.0 \
-  scripts/install-rayline.sh --install-dir /tmp/rayline-bin
+scripts/install-rayline.sh --base-url file:///tmp/rayline-release/cli/v0.2.0 \
+  --install-dir /tmp/rayline-bin
 ```
 
-For self-update validation without replacing the active binary, point the update
-base at a local or staged mirror:
+For self-update validation without replacing the active binary, serve the
+staged mirror over HTTP and point the hidden `--base-url` option at it
+(`--install-path` picks the binary a real update replaces):
 
 ```bash
-RAYLINE_UPDATE_BASE_URL=file:///tmp/rayline-release \
-  /tmp/rayline-bin/raydock update --dry-run --version 0.2.0
+python3 -m http.server --bind 127.0.0.1 --directory /tmp/rayline-release 8000 &
+/tmp/rayline-bin/raydock update --dry-run --version 0.2.0 \
+  --base-url http://127.0.0.1:8000
 ```
 
 ## Execution core build
@@ -147,16 +154,16 @@ The helper refuses a mismatched commit, dirty source tree or different Go
 compiler. It builds without CGO and preserves Go VCS build metadata. Its
 `rayline-core-source.json` output is identical across platform builds and must
 be included in the signed checksum manifest. Archives and installers carry all
-three binaries and `rayline-core-LICENSE`, copied from that pinned module;
+`raydock`, its `rayline` alias, `rayline-core` and `rayline-core-LICENSE`,
+copied from that pinned module;
 self-update verifies the binaries and license before installing them.
 
-The historical Mac asset IDs remain stable for existing self-updaters. The Go
-core and hybrid execution require macOS 13+, despite those historical names;
-existing Rust deployment targets are unchanged. Linux hybrid is supported.
-Windows hybrid is supported; Windows CI runs the hybrid supervisor integration
-tests (`cargo test -p rayline-daemon --test it_hybrid`) alongside the lock and
-owner-only ACL unit tests. A successful cross-build of the core is still not
-runtime acceptance on its own. Production Homebrew publishing uses the template and flat archives from
-`atlasfutures/memex-desktop`. `packaging/homebrew/raydock.rb.template` applies
+The macOS platform tags are `macosx_10_12_x86_64` and `macosx_11_0_arm64`; the
+Go core needs macOS 13+ on both. Local mode is supported on Linux and Windows
+too; Windows CI runs clippy and the whole workspace test suite, including the
+local process integration tests (`it_local_process`). A successful
+cross-build of the core is still not runtime acceptance on its own.
+Production Homebrew publishing is handled by the Rayline release pipeline.
+`packaging/homebrew/raydock.rb.template` applies
 only to this repo's manual fallback archives; see the packaging README for the
 different layouts.

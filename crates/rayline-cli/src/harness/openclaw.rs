@@ -17,16 +17,14 @@
 //!   keys the episode on; `--session-id <id>` in a later launch resumes that
 //!   session and so keeps its episode. A custom `anthropic-messages` provider
 //!   could not do this: it runs on OpenClaw's own fetch transport, which adds
-//!   no session header, so the launcher had to send a per-launch
-//!   `x-conversation-id` instead.
+//!   no session header.
 //! - The `rayline-resp` provider (e.g. `rayline-resp/arc-sage-1.0`) speaks
 //!   Responses, where `compat.supportsPromptCacheKey` sends the session as
 //!   `prompt_cache_key`; without it OpenClaw sends no key on a custom
 //!   endpoint. ARC is not served on Responses yet, so Chat Completions stays
-//!   the default.
-//! - Both providers take the per-launch `x-conversation-id` only when
-//!   `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` forces it
-//!   ([`super::ConversationIdFallback`]).
+//!   the default. Under `rayline run openclaw --local` OpenClaw speaks only Chat
+//!   Completions, its one protocol (spec section 5.2), so this provider is not
+//!   written there.
 //!
 //! OpenAI-style hosted tools (`web_search`) are not carried on a Chat
 //! Completions upstream; ordinary function tools are.
@@ -35,7 +33,7 @@ use std::ffi::OsString;
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, json_file};
+use super::{ConfigFile, Plan, RenderContext, json_file};
 
 pub(crate) const CONFIG_FILE: &str = "openclaw.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -111,9 +109,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     // provider returns the whole file (one trailing newline trimmed); its ref
     // id must be `value`. OpenClaw refuses a file other users can read.
     let api_key = json!({ "source": "file", "provider": SECRET_PROVIDER, "id": "value" });
-    let conv_ref = format!("${{{CONV_ID_ENV}}}");
-    // Both wires carry OpenClaw's session id (see the module docs).
-    let headers = ctx.conversation_headers(&conv_ref);
     let launch = &ctx.models;
     let models = |compat: serde_json::Value| {
         launch
@@ -125,7 +120,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                     "name": model.display_name,
                     // ARC selects thinking effort; clients must not expose controls.
                     "reasoning": ctx.capabilities.is_some(),
-                    "input": ctx.input_modalities(),
+                    "input": model.input_modalities,
                     "contextWindow": model.context_window,
                     "maxTokens": model.max_output_tokens,
                     "compat": compat
@@ -133,6 +128,22 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
             })
             .collect::<Vec<_>>()
     };
+    let mut providers = json!({
+        PROVIDER_ID: {
+            "baseUrl": ctx.v1_base(),
+            "apiKey": api_key,
+            "api": "openai-completions",
+            "models": models(json!({ "sendSessionAffinityHeaders": true }))
+        }
+    });
+    if ctx.capabilities.is_none() {
+        providers[RESPONSES_PROVIDER_ID] = json!({
+            "baseUrl": ctx.v1_base(),
+            "apiKey": api_key,
+            "api": "openai-responses",
+            "models": models(json!({ "supportsPromptCacheKey": true }))
+        });
+    }
     let config = json!({
         "secrets": {
             "providers": {
@@ -153,22 +164,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         },
         "models": {
             "mode": "merge",
-            "providers": {
-                PROVIDER_ID: {
-                    "baseUrl": ctx.v1_base(),
-                    "apiKey": api_key,
-                    "api": "openai-completions",
-                    "headers": headers,
-                    "models": models(json!({ "sendSessionAffinityHeaders": true }))
-                },
-                RESPONSES_PROVIDER_ID: {
-                    "baseUrl": ctx.v1_base(),
-                    "apiKey": api_key,
-                    "api": "openai-responses",
-                    "headers": headers,
-                    "models": models(json!({ "supportsPromptCacheKey": true }))
-                }
-            }
+            "providers": providers
         }
     });
     Plan {
@@ -179,7 +175,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 contents: ctx.key.to_owned(),
                 overwrite: true,
                 merged_from: None,
-                replaces_seed: None,
             },
         ],
         env_set: vec![(
@@ -229,8 +224,6 @@ mod tests {
             std::fs::read_to_string(dir.join(KEY_FILE)).unwrap(),
             TEST_KEY
         );
-        // OpenClaw keys the episode itself on both wires: no per-launch id.
-        assert_eq!(provider["headers"], serde_json::json!({}));
         let model = &provider["models"][0];
         assert_eq!(model["id"], "arc-sage-1.0");
         assert_eq!(model["name"], "ARC Sage");
@@ -250,7 +243,6 @@ mod tests {
         assert_eq!(responses["baseUrl"], format!("{TEST_URL}/v1"));
         assert_eq!(responses["api"], "openai-responses");
         assert_eq!(responses["apiKey"], key_ref);
-        assert_eq!(responses["headers"], serde_json::json!({}));
         let ids: Vec<_> = responses["models"]
             .as_array()
             .unwrap()
@@ -265,35 +257,33 @@ mod tests {
     }
 
     #[test]
-    fn conversation_header_follows_the_override() {
-        use super::super::ConversationIdFallback;
-        use super::super::tests::render_with;
-        let headers = |fallback| {
-            let (dir, _) = render_with(Harness::OpenClaw, fallback);
-            let config: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap())
-                    .unwrap();
-            let providers = &config["models"]["providers"];
-            (
-                providers["rayline"]["headers"].clone(),
-                providers["rayline-resp"]["headers"].clone(),
-            )
+    fn local_mode_writes_only_the_chat_completions_provider() {
+        use super::super::tests::temp_dir;
+        use super::super::{LaunchModels, RenderContext};
+        let dir = temp_dir("openclaw-hybrid");
+        let capabilities = rayline_local_router::ModelCapabilities {
+            context_window: 16384,
+            max_output_tokens: 8192,
+            input_modalities: vec!["text".into()],
         };
-        let header = serde_json::json!({ "x-conversation-id": "${RAYLINE_CONV_ID}" });
-        let none = serde_json::json!({});
-        // The router keys on OpenClaw's session id; the header is opt-in.
-        assert_eq!(
-            headers(ConversationIdFallback::new(None)),
-            (none.clone(), none.clone())
-        );
-        assert_eq!(
-            headers(ConversationIdFallback::new(Some("1"))),
-            (header.clone(), header)
-        );
-        assert_eq!(
-            headers(ConversationIdFallback::new(Some("0"))),
-            (none.clone(), none)
-        );
+        let ctx = RenderContext {
+            key: TEST_KEY,
+            router_url: TEST_URL,
+            config_dir: &dir,
+            capabilities: Some(&capabilities),
+            harness_major_version: None,
+            models: LaunchModels::hybrid(&capabilities),
+        };
+        let plan = super::plan(&ctx);
+        let file = plan
+            .files
+            .iter()
+            .find(|file| file.name == CONFIG_FILE)
+            .unwrap();
+        let config: serde_json::Value = serde_json::from_str(&file.contents).unwrap();
+        let providers = config["models"]["providers"].as_object().unwrap();
+        assert_eq!(providers.keys().collect::<Vec<_>>(), ["rayline"]);
+        assert_eq!(providers["rayline"]["api"], "openai-completions");
     }
 
     #[test]

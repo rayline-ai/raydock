@@ -1,5 +1,5 @@
 class Raydock < Formula
-  desc "Raydock on-device CLI for local models and cloud services"
+  desc "Raydock CLI that launches coding harnesses on ARC"
   homepage "https://rayline.ai"
   license "Apache-2.0"
   version "__VERSION__"
@@ -32,13 +32,11 @@ class Raydock < Formula
     archive_root = Dir["rayline-*"].find { |path| File.directory?(path) }
     if archive_root
       bin.install "#{archive_root}/raydock"
-      bin.install "#{archive_root}/rld"
       bin.install "#{archive_root}/rayline-core"
       pkgshare.install "#{archive_root}/rayline-core-LICENSE"
       pkgshare.install "#{archive_root}/NOTICE"
     else
       bin.install "raydock"
-      bin.install "rld"
       bin.install "rayline-core"
       pkgshare.install "rayline-core-LICENSE"
     end

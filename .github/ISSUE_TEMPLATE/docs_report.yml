@@ -12,7 +12,7 @@ body:
     attributes:
       label: Documentation location
       description: Link or name the affected README section, docs page, or example file.
-      placeholder: README.md#how-routing-works, docs/getting-started.md, examples/local-router.json
+      placeholder: README.md#quick-start, docs/getting-started.md, examples/cloud
     validations:
       required: true
   - type: textarea

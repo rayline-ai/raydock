@@ -4,23 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
 
 pub mod response;
 mod sse;
-
-pub const REQUEST_ID_HEADER: &str = "x-rayline-request-id";
-/// The cloud router's own id for a forwarded request (`rt_…`). The gateway sets
-/// this on every turn it routes; `x-workshop-route-id` carries the same value
-/// under a legacy name, so reading one name is enough.
-///
-/// Deliberately NOT `x-request-id`: the gateway sets that to the route id only
-/// on an ARC cell turn, and a direct-provider forward relays the *provider's*
-/// own `x-request-id` instead — a different id space. Recording that here would
-/// make `upstream_request_id` mean "a cloud route" sometimes and "an OpenAI
-/// request" other times, which is exactly the ambiguity this field removes.
-pub const UPSTREAM_ROUTE_ID_HEADER: &str = "x-rayline-route-id";
-pub const DEFAULT_METRICS_PORT: u16 = 20813;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -43,7 +29,6 @@ pub struct MetricsSnapshot {
     pub active: Vec<RequestSnapshot>,
     pub recent: Vec<RequestSnapshot>,
     pub totals: RouterTotals,
-    pub llama_perf: Option<LlamaPerfSnapshot>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -55,29 +40,20 @@ pub struct RouterTotals {
     pub remote_requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// Incremented each time an `agent-id` header was present but `agentType`
-    /// resolution exhausted all retries without finding the meta file.
-    /// Non-zero means Claude Code's internal schema may have changed (or a
-    /// timing/path issue). Surface in `rld status` so operators notice.
-    pub routing_uncertain: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RequestSnapshot {
     pub request_id: String,
     pub route_id: Option<String>,
-    /// The id the upstream (cloud router) gave the forwarded request, when it
-    /// sent one; `None` for local inference and for upstreams that send none.
-    pub upstream_request_id: Option<String>,
     pub source: String,
     pub state: String,
     pub target: Option<String>,
     pub endpoint_id: Option<String>,
     pub requested_model: Option<String>,
-    pub selected_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The model the router's decision picked.
     pub decision_model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The model that served the request.
     pub executed_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub executed_worker: Option<String>,
@@ -91,8 +67,6 @@ pub struct RequestSnapshot {
     pub wire_model: Option<String>,
     pub policy: Option<String>,
     pub task_class: Option<String>,
-    pub agent_id: Option<String>,
-    pub agent_type: Option<String>,
     pub started_at_unix_ms: u64,
     pub first_token_at_unix_ms: Option<u64>,
     pub completed_at_unix_ms: Option<u64>,
@@ -111,39 +85,29 @@ pub struct RequestSnapshot {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LlamaPerfSnapshot {
-    pub prefill_tokens_per_second: Option<f64>,
-    pub generation_tokens_per_second: Option<f64>,
-    pub updated_at_unix_ms: u64,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MetricsUpdate {
     RequestStarted {
         request_id: String,
         source: String,
         requested_model: Option<String>,
-        agent_id: Option<String>,
-        agent_type: Option<String>,
     },
+    /// `target` is `local` or `remote`; `None` when the receipt names no
+    /// single deployment.
     RouteDecided {
         request_id: String,
         route_id: Option<String>,
-        target: String,
+        target: Option<String>,
         endpoint_id: Option<String>,
-        selected_model: Option<String>,
         requested_model: Option<String>,
         policy: Option<String>,
         task_class: Option<String>,
-        agent_id: Option<String>,
-        agent_type: Option<String>,
     },
-    /// Selection and execution are distinct: the legacy `selected_model` in
-    /// snapshots remains the executed model. Metadata strings are capped at 1 KiB.
+    /// The models a request was routed to and served by, the only update that
+    /// carries them. Metadata strings are capped at 1 KiB.
     ExecutionIdentity {
         request_id: String,
-        selected_model: Option<String>,
+        decision_model: Option<String>,
         executed_model: Option<String>,
         executed_worker: Option<String>,
         executed_action_id: Option<String>,
@@ -154,17 +118,10 @@ pub enum MetricsUpdate {
     FirstToken {
         request_id: String,
     },
-    /// The upstream's own id for a forwarded request, read from its response
-    /// headers once they arrive.
-    UpstreamRequestId {
-        request_id: String,
-        upstream_request_id: String,
-    },
     TokenUsage {
         request_id: String,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
-        selected_model: Option<String>,
     },
     PromptCache {
         request_id: String,
@@ -179,18 +136,11 @@ pub enum MetricsUpdate {
         status_code: Option<u16>,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
-        selected_model: Option<String>,
     },
     RequestErrored {
         request_id: String,
         status_code: Option<u16>,
         error: String,
-    },
-    LlamaPerf(LlamaPerfSnapshot),
-    /// Emitted when an `agent-id` header was present but `agentType` resolution
-    /// exhausted all retries. Increments the `routing_uncertain` counter.
-    RoutingUncertain {
-        agent_id: String,
     },
 }
 
@@ -200,22 +150,17 @@ pub struct RouterMetrics {
     active: Mutex<HashMap<String, RequestRecord>>,
     recent: Mutex<VecDeque<RequestRecord>>,
     totals: Mutex<RouterTotals>,
-    llama_perf: Mutex<Option<LlamaPerfSnapshot>>,
-    updates: broadcast::Sender<MetricsUpdate>,
     recent_capacity: usize,
 }
 
 impl RouterMetrics {
     pub fn new(runtime: impl Into<String>) -> Arc<Self> {
-        let (updates, _) = broadcast::channel(256);
         Arc::new(Self {
             runtime: runtime.into(),
             started_at_unix_ms: now_unix_ms(),
             active: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
             totals: Mutex::new(RouterTotals::default()),
-            llama_perf: Mutex::new(None),
-            updates,
             recent_capacity: 200,
         })
     }
@@ -250,16 +195,7 @@ impl RouterMetrics {
             active,
             recent,
             totals,
-            llama_perf: self
-                .llama_perf
-                .lock()
-                .expect("metrics llama lock poisoned")
-                .clone(),
         }
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<MetricsUpdate> {
-        self.updates.subscribe()
     }
 
     fn apply(&self, update: MetricsUpdate) {
@@ -269,8 +205,6 @@ impl RouterMetrics {
                 request_id,
                 source,
                 requested_model,
-                agent_id,
-                agent_type,
             } => {
                 let mut active = self.active.lock().expect("metrics active lock poisoned");
                 let record = active
@@ -279,37 +213,27 @@ impl RouterMetrics {
                 record.source = source.clone();
                 record.state = "started".to_owned();
                 merge_option(&mut record.requested_model, requested_model.clone());
-                merge_option(&mut record.agent_id, agent_id.clone());
-                merge_option(&mut record.agent_type, agent_type.clone());
             }
             MetricsUpdate::RouteDecided {
                 request_id,
                 route_id,
                 target,
                 endpoint_id,
-                selected_model,
                 requested_model,
                 policy,
                 task_class,
-                agent_id,
-                agent_type,
             } => {
                 let mut active = self.active.lock().expect("metrics active lock poisoned");
                 let record = active
                     .entry(request_id.clone())
                     .or_insert_with(|| RequestRecord::new(request_id.clone(), now));
                 record.state = "routed".to_owned();
-                record.target = Some(target.clone());
+                record.target = target.clone();
                 merge_option(&mut record.route_id, route_id.clone());
                 merge_option(&mut record.endpoint_id, endpoint_id.clone());
-                if record.executed_model.is_none() {
-                    merge_option(&mut record.selected_model, selected_model.clone());
-                }
                 merge_option(&mut record.requested_model, requested_model.clone());
                 merge_option(&mut record.policy, policy.clone());
                 merge_option(&mut record.task_class, task_class.clone());
-                merge_option(&mut record.agent_id, agent_id.clone());
-                merge_option(&mut record.agent_type, agent_type.clone());
             }
             MetricsUpdate::ExecutionIdentity { request_id, .. } => {
                 let mut active = self.active.lock().expect("metrics active lock poisoned");
@@ -335,46 +259,18 @@ impl RouterMetrics {
                 record.state = "streaming".to_owned();
                 record.first_token_at_unix_ms.get_or_insert(now);
             }
-            MetricsUpdate::UpstreamRequestId {
-                request_id,
-                upstream_request_id,
-            } => {
-                // The forwarder records this as soon as the upstream headers are
-                // in, which can be before anything else announced the request
-                // (Codex's auxiliary endpoints) or after a short response already
-                // completed. Like `FirstToken`, start the row when it is new; the
-                // same forwarder completes it. Holding `active` while checking
-                // `recent` pairs with completion holding it across `push_recent`,
-                // so the id cannot fall between the two.
-                let mut active = self.active.lock().expect("metrics active lock poisoned");
-                if !self.merge_recent_upstream_request_id(request_id, upstream_request_id) {
-                    let record = active
-                        .entry(request_id.clone())
-                        .or_insert_with(|| RequestRecord::new(request_id.clone(), now));
-                    record.upstream_request_id = Some(upstream_request_id.clone());
-                }
-            }
             MetricsUpdate::TokenUsage {
                 request_id,
                 input_tokens,
                 output_tokens,
-                selected_model,
             } => {
                 let mut active = self.active.lock().expect("metrics active lock poisoned");
                 if let Some(record) = active.get_mut(request_id) {
                     merge_option(&mut record.input_tokens, *input_tokens);
                     merge_option(&mut record.output_tokens, *output_tokens);
-                    if record.executed_model.is_none() {
-                        merge_option(&mut record.selected_model, selected_model.clone());
-                    }
                 } else {
                     drop(active);
-                    self.merge_recent_token_usage(
-                        request_id,
-                        *input_tokens,
-                        *output_tokens,
-                        selected_model.clone(),
-                    );
+                    self.merge_recent_token_usage(request_id, *input_tokens, *output_tokens);
                 }
             }
             MetricsUpdate::PromptCache {
@@ -409,10 +305,9 @@ impl RouterMetrics {
                 status_code,
                 input_tokens,
                 output_tokens,
-                selected_model,
             } => {
                 // Hold `active` until the row is in `recent`: a late update for
-                // this request (its upstream id, usage) must find it in one
+                // this request (its execution identity) must find it in one
                 // place or the other, never in neither. `push_recent` takes
                 // `totals` then `recent` under it, so the order is always
                 // active -> totals -> recent.
@@ -425,9 +320,6 @@ impl RouterMetrics {
                 record.status_code = *status_code;
                 merge_option(&mut record.input_tokens, *input_tokens);
                 merge_option(&mut record.output_tokens, *output_tokens);
-                if record.executed_model.is_none() {
-                    merge_option(&mut record.selected_model, selected_model.clone());
-                }
                 self.push_recent(record);
             }
             MetricsUpdate::RequestErrored {
@@ -450,45 +342,6 @@ impl RouterMetrics {
                 }
                 self.push_recent(record);
             }
-            MetricsUpdate::LlamaPerf(snapshot) => {
-                if let Some(prefill_tps) = snapshot.prefill_tokens_per_second {
-                    self.apply_single_active_local_prefill(prefill_tps);
-                }
-                let mut llama_perf = self.llama_perf.lock().expect("metrics llama lock poisoned");
-                let mut merged = llama_perf.clone().unwrap_or(LlamaPerfSnapshot {
-                    prefill_tokens_per_second: None,
-                    generation_tokens_per_second: None,
-                    updated_at_unix_ms: snapshot.updated_at_unix_ms,
-                });
-                if snapshot.prefill_tokens_per_second.is_some() {
-                    merged.prefill_tokens_per_second = snapshot.prefill_tokens_per_second;
-                }
-                if snapshot.generation_tokens_per_second.is_some() {
-                    merged.generation_tokens_per_second = snapshot.generation_tokens_per_second;
-                }
-                merged.updated_at_unix_ms = snapshot.updated_at_unix_ms;
-                *llama_perf = Some(merged);
-            }
-            MetricsUpdate::RoutingUncertain { .. } => {
-                let mut totals = self.totals.lock().expect("metrics totals lock poisoned");
-                totals.routing_uncertain = totals.routing_uncertain.saturating_add(1);
-            }
-        }
-        let _ = self.updates.send(update);
-    }
-
-    fn apply_single_active_local_prefill(&self, prefill_tps: f64) {
-        let mut active = self.active.lock().expect("metrics active lock poisoned");
-        let local_request_ids = active
-            .iter()
-            .filter(|(_, record)| record.target.as_deref() == Some("local"))
-            .map(|(request_id, _)| request_id.clone())
-            .collect::<Vec<_>>();
-        if local_request_ids.len() != 1 {
-            return;
-        }
-        if let Some(record) = active.get_mut(&local_request_ids[0]) {
-            record.prompt_tps = Some(prefill_tps);
         }
     }
 
@@ -497,7 +350,6 @@ impl RouterMetrics {
         request_id: &str,
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
-        selected_model: Option<String>,
     ) {
         let delta = {
             let mut recent = self.recent.lock().expect("metrics recent lock poisoned");
@@ -512,9 +364,6 @@ impl RouterMetrics {
             let old_output = record.output_tokens.unwrap_or(0);
             merge_option(&mut record.input_tokens, input_tokens);
             merge_option(&mut record.output_tokens, output_tokens);
-            if record.executed_model.is_none() {
-                merge_option(&mut record.selected_model, selected_model);
-            }
             (
                 old_input,
                 record.input_tokens.unwrap_or(0),
@@ -526,27 +375,6 @@ impl RouterMetrics {
             let mut totals = self.totals.lock().expect("metrics totals lock poisoned");
             totals.input_tokens = adjust_total(totals.input_tokens, delta.0, delta.1);
             totals.output_tokens = adjust_total(totals.output_tokens, delta.2, delta.3);
-        }
-    }
-
-    /// A short response can complete before its upstream id is recorded; attach
-    /// it to the finished row. Returns whether such a row was found.
-    fn merge_recent_upstream_request_id(
-        &self,
-        request_id: &str,
-        upstream_request_id: &str,
-    ) -> bool {
-        let mut recent = self.recent.lock().expect("metrics recent lock poisoned");
-        match recent
-            .iter_mut()
-            .rev()
-            .find(|record| record.request_id == request_id)
-        {
-            Some(record) => {
-                record.upstream_request_id = Some(upstream_request_id.to_owned());
-                true
-            }
-            None => false,
         }
     }
 
@@ -580,11 +408,7 @@ impl RouterMetrics {
             totals.completed_requests = totals.completed_requests.saturating_add(1);
             if record.target.as_deref() == Some("local") {
                 totals.local_requests = totals.local_requests.saturating_add(1);
-            } else if record
-                .target
-                .as_deref()
-                .is_some_and(|target| target != "unknown")
-            {
+            } else if record.target.is_some() {
                 totals.remote_requests = totals.remote_requests.saturating_add(1);
             }
             totals.input_tokens = totals
@@ -612,13 +436,11 @@ impl MetricsSink for RouterMetrics {
 struct RequestRecord {
     request_id: String,
     route_id: Option<String>,
-    upstream_request_id: Option<String>,
     source: String,
     state: String,
     target: Option<String>,
     endpoint_id: Option<String>,
     requested_model: Option<String>,
-    selected_model: Option<String>,
     decision_model: Option<String>,
     executed_model: Option<String>,
     executed_worker: Option<String>,
@@ -628,8 +450,6 @@ struct RequestRecord {
     wire_model: Option<String>,
     policy: Option<String>,
     task_class: Option<String>,
-    agent_id: Option<String>,
-    agent_type: Option<String>,
     started_at_unix_ms: u64,
     first_token_at_unix_ms: Option<u64>,
     completed_at_unix_ms: Option<u64>,
@@ -647,7 +467,7 @@ struct RequestRecord {
 impl RequestRecord {
     fn merge_execution_identity(&mut self, update: &MetricsUpdate) {
         let MetricsUpdate::ExecutionIdentity {
-            selected_model,
+            decision_model,
             executed_model,
             executed_worker,
             executed_action_id,
@@ -659,29 +479,24 @@ impl RequestRecord {
         else {
             return;
         };
-        merge_bounded(&mut self.decision_model, selected_model);
+        merge_bounded(&mut self.decision_model, decision_model);
         merge_bounded(&mut self.executed_model, executed_model);
         merge_bounded(&mut self.executed_worker, executed_worker);
         merge_bounded(&mut self.executed_action_id, executed_action_id);
         merge_bounded(&mut self.selected_action_id, selected_action_id);
         merge_bounded(&mut self.executed_control_id, executed_control_id);
         merge_bounded(&mut self.wire_model, wire_model);
-        if self.executed_model.is_some() {
-            self.selected_model = self.executed_model.clone();
-        }
     }
 
     fn new(request_id: String, now: u64) -> Self {
         Self {
             request_id,
             route_id: None,
-            upstream_request_id: None,
             source: "unknown".to_owned(),
             state: "started".to_owned(),
             target: None,
             endpoint_id: None,
             requested_model: None,
-            selected_model: None,
             decision_model: None,
             executed_model: None,
             executed_worker: None,
@@ -691,8 +506,6 @@ impl RequestRecord {
             wire_model: None,
             policy: None,
             task_class: None,
-            agent_id: None,
-            agent_type: None,
             started_at_unix_ms: now,
             first_token_at_unix_ms: None,
             completed_at_unix_ms: None,
@@ -727,23 +540,21 @@ impl RequestRecord {
             .prompt_cache_tokens
             .zip(self.prompt_tokens)
             .and_then(|(cache, total)| (total > 0).then(|| cache as f64 / total as f64));
-        let output_tps = self.output_tokens.and_then(|tokens| {
-            let generation_ms = self
-                .first_token_at_unix_ms
-                .map(|first| completed_or_now.saturating_sub(first))
-                .unwrap_or(duration_ms);
-            (generation_ms > 0).then(|| tokens as f64 / (generation_ms as f64 / 1000.0))
-        });
+        let output_tps = self
+            .output_tokens
+            .zip(self.first_token_at_unix_ms)
+            .and_then(|(tokens, first)| {
+                let generation_ms = completed_or_now.saturating_sub(first);
+                (generation_ms > 0).then(|| tokens as f64 / (generation_ms as f64 / 1000.0))
+            });
         RequestSnapshot {
             request_id: self.request_id.clone(),
             route_id: self.route_id.clone(),
-            upstream_request_id: self.upstream_request_id.clone(),
             source: self.source.clone(),
             state: self.state.clone(),
             target: self.target.clone(),
             endpoint_id: self.endpoint_id.clone(),
             requested_model: self.requested_model.clone(),
-            selected_model: self.selected_model.clone(),
             decision_model: self.decision_model.clone(),
             executed_model: self.executed_model.clone(),
             executed_worker: self.executed_worker.clone(),
@@ -753,8 +564,6 @@ impl RequestRecord {
             wire_model: self.wire_model.clone(),
             policy: self.policy.clone(),
             task_class: self.task_class.clone(),
-            agent_id: self.agent_id.clone(),
-            agent_type: self.agent_type.clone(),
             started_at_unix_ms: self.started_at_unix_ms,
             first_token_at_unix_ms: self.first_token_at_unix_ms,
             completed_at_unix_ms: self.completed_at_unix_ms,
@@ -823,19 +632,65 @@ pub fn now_unix_ms() -> u64 {
 mod tests {
     use super::*;
 
+    fn identity(request_id: &str, decision: Option<&str>, executed: Option<&str>) -> MetricsUpdate {
+        MetricsUpdate::ExecutionIdentity {
+            request_id: request_id.into(),
+            decision_model: decision.map(Into::into),
+            executed_model: executed.map(Into::into),
+            executed_worker: None,
+            executed_action_id: None,
+            selected_action_id: None,
+            executed_control_id: None,
+            wire_model: None,
+        }
+    }
+
+    /// Each model keeps its own meaning whichever update arrives first.
     #[test]
-    fn execution_identity_survives_legacy_updates_and_merges_recent() {
+    fn decision_and_executed_models_stay_apart_in_any_order() {
+        for executed_first in [false, true] {
+            let metrics = RouterMetrics::new("test-router");
+            metrics.record(MetricsUpdate::RequestStarted {
+                request_id: "req".into(),
+                source: "hybrid".into(),
+                requested_model: Some("rayline-auto".into()),
+            });
+            let mut updates = [
+                identity("req", Some("decision"), None),
+                identity("req", None, Some("executed")),
+            ];
+            if executed_first {
+                updates.reverse();
+            }
+            let [first, second] = updates;
+            metrics.record(first);
+            let row = &metrics.snapshot().active[0];
+            let (decision, executed) = if executed_first {
+                (None, Some("executed"))
+            } else {
+                (Some("decision"), None)
+            };
+            assert_eq!(row.decision_model.as_deref(), decision);
+            assert_eq!(row.executed_model.as_deref(), executed);
+            metrics.record(second);
+            let row = &metrics.snapshot().active[0];
+            assert_eq!(row.decision_model.as_deref(), Some("decision"));
+            assert_eq!(row.executed_model.as_deref(), Some("executed"));
+            assert_eq!(row.requested_model.as_deref(), Some("rayline-auto"));
+        }
+    }
+
+    #[test]
+    fn execution_identity_merges_recent_and_is_capped() {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "identity".into(),
-            source: "proxy".into(),
+            source: "hybrid".into(),
             requested_model: None,
-            agent_id: None,
-            agent_type: None,
         });
         metrics.record(MetricsUpdate::ExecutionIdentity {
             request_id: "identity".into(),
-            selected_model: Some("decision".into()),
+            decision_model: Some("decision".into()),
             executed_model: Some("executed".into()),
             executed_worker: Some("worker".into()),
             executed_action_id: Some("action".into()),
@@ -843,38 +698,20 @@ mod tests {
             executed_control_id: Some("control".into()),
             wire_model: Some("virtual".into()),
         });
-        metrics.record(MetricsUpdate::RouteDecided {
-            request_id: "identity".into(),
-            route_id: None,
-            target: "remote".into(),
-            endpoint_id: None,
-            selected_model: Some("legacy-virtual".into()),
-            requested_model: None,
-            policy: None,
-            task_class: None,
-            agent_id: None,
-            agent_type: None,
-        });
         metrics.record(MetricsUpdate::TokenUsage {
             request_id: "identity".into(),
             input_tokens: Some(3),
             output_tokens: Some(7),
-            selected_model: Some("legacy-virtual".into()),
         });
-        let active = metrics.snapshot();
-        assert_eq!(active.active[0].selected_model.as_deref(), Some("executed"));
-        assert_eq!(active.active[0].decision_model.as_deref(), Some("decision"));
-        assert_eq!(active.active[0].wire_model.as_deref(), Some("virtual"));
         metrics.record(MetricsUpdate::RequestCompleted {
             request_id: "identity".into(),
             status_code: Some(200),
             input_tokens: None,
             output_tokens: None,
-            selected_model: Some("legacy-virtual".into()),
         });
         metrics.record(MetricsUpdate::ExecutionIdentity {
             request_id: "identity".into(),
-            selected_model: None,
+            decision_model: None,
             executed_model: None,
             executed_worker: Some("é".repeat(600)),
             executed_action_id: None,
@@ -885,7 +722,6 @@ mod tests {
         let snapshot = metrics.snapshot();
         assert!(snapshot.active.is_empty());
         let row = &snapshot.recent[0];
-        assert_eq!(row.selected_model.as_deref(), Some("executed"));
         assert_eq!(row.executed_model.as_deref(), Some("executed"));
         assert_eq!(row.decision_model.as_deref(), Some("decision"));
         assert_eq!(row.executed_worker.as_ref().map(String::len), Some(1024));
@@ -901,28 +737,22 @@ mod tests {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "req-1".to_owned(),
-            source: "proxy".to_owned(),
+            source: "hybrid".to_owned(),
             requested_model: Some("rayline-auto".to_owned()),
-            agent_id: Some("agent-1".to_owned()),
-            agent_type: Some("Explore".to_owned()),
         });
         metrics.record(MetricsUpdate::RouteDecided {
             request_id: "req-1".to_owned(),
             route_id: Some("local-1".to_owned()),
-            target: "local".to_owned(),
+            target: Some("local".to_owned()),
             endpoint_id: Some("local".to_owned()),
-            selected_model: Some("qwen".to_owned()),
             requested_model: Some("rayline-auto".to_owned()),
             policy: Some("subagent:Explore".to_owned()),
             task_class: Some("subagent".to_owned()),
-            agent_id: Some("agent-1".to_owned()),
-            agent_type: Some("Explore".to_owned()),
         });
 
         let active = metrics.snapshot();
         assert_eq!(active.active.len(), 1);
         assert_eq!(active.active[0].route_id.as_deref(), Some("local-1"));
-        assert_eq!(active.active[0].agent_type.as_deref(), Some("Explore"));
 
         metrics.record(MetricsUpdate::FirstToken {
             request_id: "req-1".to_owned(),
@@ -932,7 +762,6 @@ mod tests {
             status_code: Some(200),
             input_tokens: Some(10),
             output_tokens: Some(20),
-            selected_model: Some("qwen".to_owned()),
         });
 
         let completed = metrics.snapshot();
@@ -949,24 +778,20 @@ mod tests {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "req-1".to_owned(),
-            source: "proxy".to_owned(),
+            source: "hybrid".to_owned(),
             requested_model: Some("rayline-auto".to_owned()),
-            agent_id: None,
-            agent_type: None,
         });
         metrics.record(MetricsUpdate::RequestCompleted {
             request_id: "req-1".to_owned(),
             status_code: Some(200),
             input_tokens: Some(10),
             output_tokens: Some(20),
-            selected_model: Some("claude".to_owned()),
         });
 
         metrics.record(MetricsUpdate::TokenUsage {
             request_id: "req-1".to_owned(),
             input_tokens: Some(12),
             output_tokens: Some(25),
-            selected_model: Some("claude-opus".to_owned()),
         });
         metrics.record(MetricsUpdate::PromptCache {
             request_id: "req-1".to_owned(),
@@ -982,10 +807,6 @@ mod tests {
         assert_eq!(snapshot.recent.len(), 1);
         assert_eq!(snapshot.recent[0].input_tokens, Some(12));
         assert_eq!(snapshot.recent[0].output_tokens, Some(25));
-        assert_eq!(
-            snapshot.recent[0].selected_model.as_deref(),
-            Some("claude-opus")
-        );
         assert_eq!(snapshot.recent[0].prompt_cache_tokens, Some(5));
         assert_eq!(snapshot.totals.input_tokens, 12);
         assert_eq!(snapshot.totals.output_tokens, 25);
@@ -994,7 +815,6 @@ mod tests {
             request_id: "req-1".to_owned(),
             input_tokens: Some(8),
             output_tokens: Some(18),
-            selected_model: None,
         });
 
         let corrected = metrics.snapshot();
@@ -1005,158 +825,12 @@ mod tests {
     }
 
     #[test]
-    fn upstream_request_id_attaches_to_active_and_recent_rows() {
-        let metrics = RouterMetrics::new("test-router");
-        metrics.record(MetricsUpdate::RequestStarted {
-            request_id: "req-1".to_owned(),
-            source: "local-router".to_owned(),
-            requested_model: None,
-            agent_id: None,
-            agent_type: None,
-        });
-        metrics.record(MetricsUpdate::UpstreamRequestId {
-            request_id: "req-1".to_owned(),
-            upstream_request_id: "rt_active".to_owned(),
-        });
-        let snapshot = metrics.snapshot();
-        assert_eq!(
-            snapshot.active[0].upstream_request_id.as_deref(),
-            Some("rt_active")
-        );
-
-        metrics.record(MetricsUpdate::RequestCompleted {
-            request_id: "req-1".to_owned(),
-            status_code: Some(200),
-            input_tokens: None,
-            output_tokens: None,
-            selected_model: None,
-        });
-        // A short response completes before its handler reads the header: the
-        // id still lands on the finished row and nothing is reactivated.
-        metrics.record(MetricsUpdate::UpstreamRequestId {
-            request_id: "req-1".to_owned(),
-            upstream_request_id: "rt_recent".to_owned(),
-        });
-        let snapshot = metrics.snapshot();
-        assert!(snapshot.active.is_empty());
-        assert_eq!(snapshot.recent.len(), 1);
-        assert_eq!(
-            snapshot.recent[0].upstream_request_id.as_deref(),
-            Some("rt_recent")
-        );
-
-        // Nothing announced this request yet (Codex's auxiliary endpoints only
-        // report once the stream starts): the id starts the row, and the
-        // forwarder's completion finds it there.
-        metrics.record(MetricsUpdate::UpstreamRequestId {
-            request_id: "req-new".to_owned(),
-            upstream_request_id: "rt_first".to_owned(),
-        });
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.active.len(), 1);
-        assert_eq!(snapshot.active[0].request_id, "req-new");
-        assert_eq!(
-            snapshot.active[0].upstream_request_id.as_deref(),
-            Some("rt_first")
-        );
-        metrics.record(MetricsUpdate::FirstToken {
-            request_id: "req-new".to_owned(),
-        });
-        metrics.record(MetricsUpdate::RequestCompleted {
-            request_id: "req-new".to_owned(),
-            status_code: Some(200),
-            input_tokens: None,
-            output_tokens: None,
-            selected_model: None,
-        });
-        let snapshot = metrics.snapshot();
-        assert!(snapshot.active.is_empty());
-        assert_eq!(
-            snapshot.recent[0].upstream_request_id.as_deref(),
-            Some("rt_first")
-        );
-    }
-
-    /// Stress the invariant that a row is reachable throughout completion: with
-    /// one thread completing requests and another recording their upstream ids,
-    /// every finished row keeps its own id.
-    ///
-    /// Not a deterministic reproduction of the lost-update race. The barrier
-    /// releases both threads before either finishes its operation, so the
-    /// scheduler may serialise them; pinning the interleaving would need a sync
-    /// point inside `apply` or a model checker. The sequential half of the
-    /// invariant is covered deterministically by
-    /// `upstream_request_id_attaches_to_active_and_recent_rows`.
-    #[test]
-    fn upstream_request_id_survives_concurrent_completion() {
-        use std::sync::Barrier;
-
-        let metrics = RouterMetrics::new("test-router");
-        let rounds = 100;
-        let barrier = Arc::new(Barrier::new(2));
-        let completer = {
-            let metrics = metrics.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                for round in 0..rounds {
-                    metrics.record(MetricsUpdate::RequestStarted {
-                        request_id: format!("req-{round}"),
-                        source: "test".to_owned(),
-                        requested_model: None,
-                        agent_id: None,
-                        agent_type: None,
-                    });
-                    barrier.wait();
-                    metrics.record(MetricsUpdate::RequestCompleted {
-                        request_id: format!("req-{round}"),
-                        status_code: Some(200),
-                        input_tokens: None,
-                        output_tokens: None,
-                        selected_model: None,
-                    });
-                    barrier.wait();
-                }
-            })
-        };
-        let tagger = {
-            let metrics = metrics.clone();
-            let barrier = barrier.clone();
-            std::thread::spawn(move || {
-                for round in 0..rounds {
-                    barrier.wait();
-                    metrics.record(MetricsUpdate::UpstreamRequestId {
-                        request_id: format!("req-{round}"),
-                        upstream_request_id: format!("rt-{round}"),
-                    });
-                    barrier.wait();
-                }
-            })
-        };
-        completer.join().expect("completer thread");
-        tagger.join().expect("tagger thread");
-
-        let snapshot = metrics.snapshot();
-        assert!(snapshot.active.is_empty());
-        assert_eq!(snapshot.recent.len(), rounds);
-        for row in &snapshot.recent {
-            let round = row.request_id.trim_start_matches("req-");
-            assert_eq!(
-                row.upstream_request_id.as_deref(),
-                Some(format!("rt-{round}").as_str()),
-                "row {} lost its upstream id",
-                row.request_id
-            );
-        }
-    }
-
-    #[test]
     fn unknown_usage_updates_do_not_create_active_rows() {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::TokenUsage {
             request_id: "missing".to_owned(),
             input_tokens: Some(12),
             output_tokens: Some(25),
-            selected_model: Some("claude".to_owned()),
         });
         metrics.record(MetricsUpdate::PromptCache {
             request_id: "missing".to_owned(),
@@ -1175,26 +849,6 @@ mod tests {
     }
 
     #[test]
-    fn merges_partial_llama_perf_updates() {
-        let metrics = RouterMetrics::new("test-router");
-        metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
-            prefill_tokens_per_second: Some(123.4),
-            generation_tokens_per_second: None,
-            updated_at_unix_ms: 10,
-        }));
-        metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
-            prefill_tokens_per_second: None,
-            generation_tokens_per_second: Some(56.7),
-            updated_at_unix_ms: 20,
-        }));
-
-        let snapshot = metrics.snapshot().llama_perf.expect("llama perf");
-        assert_eq!(snapshot.prefill_tokens_per_second, Some(123.4));
-        assert_eq!(snapshot.generation_tokens_per_second, Some(56.7));
-        assert_eq!(snapshot.updated_at_unix_ms, 20);
-    }
-
-    #[test]
     fn calculates_live_prefill_and_generation_rates() {
         let mut record = RequestRecord::new("req-1".to_owned(), 1_000);
         record.target = Some("anthropic".to_owned());
@@ -1205,6 +859,16 @@ mod tests {
         let snapshot = record.snapshot(5_000);
         assert_eq!(snapshot.prefill_tps, Some(500.0));
         assert_eq!(snapshot.output_tps, Some(100.0));
+    }
+
+    #[test]
+    fn output_rate_needs_a_first_token() {
+        let mut record = RequestRecord::new("req-1".to_owned(), 1_000);
+        record.target = Some("anthropic".to_owned());
+        record.output_tokens = Some(200);
+        record.completed_at_unix_ms = Some(3_000);
+
+        assert_eq!(record.snapshot(5_000).output_tps, None);
     }
 
     #[test]
@@ -1233,64 +897,5 @@ mod tests {
 
         let snapshot = record.snapshot(2_000);
         assert_eq!(snapshot.prefill_tps, None);
-    }
-
-    #[test]
-    fn applies_llama_prefill_to_single_active_local_request() {
-        let metrics = RouterMetrics::new("test-router");
-        metrics.record(MetricsUpdate::RequestStarted {
-            request_id: "req-1".to_owned(),
-            source: "adapter".to_owned(),
-            requested_model: Some("local-router".to_owned()),
-            agent_id: None,
-            agent_type: None,
-        });
-        metrics.record(MetricsUpdate::RouteDecided {
-            request_id: "req-1".to_owned(),
-            route_id: Some("route-1".to_owned()),
-            target: "local".to_owned(),
-            endpoint_id: Some("local".to_owned()),
-            selected_model: Some("qwen".to_owned()),
-            requested_model: Some("local-router".to_owned()),
-            policy: Some("local-adapter".to_owned()),
-            task_class: None,
-            agent_id: None,
-            agent_type: Some("Explore".to_owned()),
-        });
-        metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
-            prefill_tokens_per_second: Some(321.0),
-            generation_tokens_per_second: None,
-            updated_at_unix_ms: 20,
-        }));
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.active[0].prefill_tps, Some(321.0));
-    }
-
-    #[test]
-    fn skips_llama_prefill_when_multiple_local_requests_are_active() {
-        let metrics = RouterMetrics::new("test-router");
-        for request_id in ["req-1", "req-2"] {
-            metrics.record(MetricsUpdate::RouteDecided {
-                request_id: request_id.to_owned(),
-                route_id: None,
-                target: "local".to_owned(),
-                endpoint_id: Some("local".to_owned()),
-                selected_model: Some("qwen".to_owned()),
-                requested_model: Some("local-router".to_owned()),
-                policy: Some("local-adapter".to_owned()),
-                task_class: None,
-                agent_id: None,
-                agent_type: Some("Explore".to_owned()),
-            });
-        }
-        metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
-            prefill_tokens_per_second: Some(321.0),
-            generation_tokens_per_second: None,
-            updated_at_unix_ms: 20,
-        }));
-
-        let snapshot = metrics.snapshot();
-        assert!(snapshot.active.iter().all(|row| row.prefill_tps.is_none()));
     }
 }

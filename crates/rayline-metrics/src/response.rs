@@ -270,8 +270,6 @@ impl ResponseObserver {
                 request_id: self.request_id.clone(),
                 input_tokens: input,
                 output_tokens: output,
-                // A virtual response model must not overwrite executed identity.
-                selected_model: None,
             });
         }
         if input.is_some() || cache.is_some() {
@@ -329,8 +327,6 @@ fn chat_output(value: &Value) -> bool {
                         || nonempty(call.pointer("/function/name"))
                 })
             })
-        || nonempty(value.pointer("/function_call/arguments"))
-        || nonempty(value.pointer("/function_call/name"))
 }
 
 fn generated_output(value: &Value, kind: &str) -> bool {

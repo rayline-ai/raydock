@@ -1,360 +1,118 @@
+//! `rayline run codex`: run Codex CLI on ARC through the Rayline router.
+//!
+//! Codex talks to the environment's router directly over the OpenAI Responses
+//! API. Rayline gives it its own `CODEX_HOME` (`~/.rayline/harness/codex/`),
+//! whose owner-only `config.toml` names the `rayline` provider, the model and
+//! the router key. The key never goes in Codex's argv or environment.
+
 use std::ffi::OsString;
-use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use serde_json::json;
-
-const CODEX_SUBSCRIPTION_CONFIG_FILENAME: &str = "codex-subscription-router.json";
-pub const CODEX_SUBSCRIPTION_ENDPOINT_ID: &str = "codex-subscription";
-pub const CODEX_SUBSCRIPTION_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
-/// Default model for the ChatGPT-subscription endpoint. Mirrors what plain
-/// `codex` picks on a ChatGPT account with no configured model: the
-/// top-priority entry of the backend's `/models`, which changes without notice.
-pub const CODEX_SUBSCRIPTION_DEFAULT_MODEL: &str = "gpt-6-astra";
-/// Models advertised on the subscription endpoint, default first. The router
-/// treats this as the allowlist for explicit `--model` values on this endpoint
-/// (an unlisted `--model` falls back to `routes.main`), so it must track the
-/// backend's listed models.
-pub const CODEX_SUBSCRIPTION_MODELS: [&str; 5] = [
-    CODEX_SUBSCRIPTION_DEFAULT_MODEL,
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
-    "gpt-5.5",
-];
-/// The internal virtual-marker model Codex is pointed at when the user picks no
-/// `--model`. Codex must send *some* `model` on every Responses request, so this
-/// sentinel stands in for "no explicit model — let the router's config decide"
-/// (mirrors Claude Code's `rayline-auto`). The local router recognizes it as a
-/// marker and applies main/subagent routing rather than treating it as a real
-/// model. Users select a real model (e.g. one of CODEX_SUBSCRIPTION_DEFAULT_MODEL)
-/// via `--model` instead.
-pub const CODEX_DEFAULT_SENTINEL_MODEL: &str = "rayline-local";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CodexAuthMode {
-    Auto,
-    None,
-    Subscription,
-}
-
-impl CodexAuthMode {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "auto" => Some(Self::Auto),
-            "none" | "no-auth" | "local" => Some(Self::None),
-            "subscription" | "codex-subscription" | "chatgpt" | "codex" => Some(Self::Subscription),
-            _ => None,
-        }
-    }
-
-    pub fn effective_for_run(self, config_path: Option<&PathBuf>) -> EffectiveCodexAuthMode {
-        match self {
-            // `auto` with a `--config`: the config drives auth. If its `main`
-            // routes to the `subscription` sentinel, resolve to subscription so
-            // the ChatGPT backend is materialized — otherwise the sentinel has no
-            // concrete endpoint and 502-loops on a placeholder address. Any other
-            // main (local/provider/cloud) needs no client auth.
-            Self::Auto => match config_path {
-                Some(path) if crate::router_config::config_main_is_passthrough(path) => {
-                    EffectiveCodexAuthMode::Subscription
-                }
-                Some(_) => EffectiveCodexAuthMode::None,
-                None => EffectiveCodexAuthMode::Subscription,
-            },
-            Self::Subscription => EffectiveCodexAuthMode::Subscription,
-            Self::None => EffectiveCodexAuthMode::None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum EffectiveCodexAuthMode {
-    None,
-    Subscription,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
-    /// The `--model` the user picked, or `None` when they picked none. `None`
-    /// means "route by config": the CLI stamps the internal virtual-marker
-    /// sentinel ([`CODEX_DEFAULT_SENTINEL_MODEL`]) so the local router applies
-    /// main/subagent routing. A `Some(real_model)` is passed through verbatim and
-    /// resolved by the router's direct-model routing.
+    /// The `--model` the user picked. `None` runs the key's main model.
     pub model: Option<String>,
-    pub config_path: Option<PathBuf>,
-    pub auth_mode: CodexAuthMode,
     pub codex_args: Vec<OsString>,
-    pub root_env_explicit: bool,
-    /// Hosted environment override (`--env`), forwarded to router-key
-    /// provisioning when the config routes a leg to the cloud router.
-    pub env_name: Option<String>,
-    /// Account bearer (`--auth-token`) used to mint/read the `rlk-` router key,
-    /// mirroring the Claude path. `None` falls back to stored credentials or the
-    /// interactive `raydock auth login` prompt.
-    pub auth_token: Option<String>,
+    /// The hosted environment the loaded config selects, whose router Codex
+    /// talks to.
+    pub hosted: crate::status::HostedEnvironment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigureRequest {
-    /// See [`RunRequest::model`]. `None` writes the virtual-marker sentinel.
+    /// See [`RunRequest::model`].
     pub model: Option<String>,
-    pub base_url: Option<String>,
-    pub auth_mode: CodexAuthMode,
+    /// The hosted environment the loaded config selects, whose router Codex
+    /// talks to.
+    pub hosted: crate::status::HostedEnvironment,
 }
 
-/// Provision the hosted-RCR router key (`rlk-`) when a `--config` routes a leg to
-/// the cloud router, so `raydock codex --config <cloud>` (Rc-Rc/Rc-K/Rl-K/…)
-/// authenticates from a plain `raydock auth login` — no manual
-/// `RAYLINE_ROUTER_API_KEY`. Mirrors the Claude path
-/// ([`crate::claude::ensure_router_key`]).
-///
-/// An explicit `RAYLINE_ROUTER_API_KEY` is respected and passed through verbatim
-/// as the override (no provisioning): otherwise a stored `rlk-` key would be
-/// returned instead and shadow the user's explicit value. Passing it as the
-/// override also bakes it into the daemon reuse metadata, so a key change
-/// re-fingerprints and restarts a stale daemon rather than silently reusing one
-/// (the daemon otherwise inherits the env var, so a first run still works, but
-/// the resolved value must match what it actually uses).
-///
-/// Best-effort otherwise: returns `None` when there is no config, the config
-/// routes to no cloud endpoint (subscription `A*` / local `L*` modes), or
-/// provisioning fails (e.g. not logged in and non-interactive) — the daemon then
-/// surfaces a clear error only if a cloud route is actually hit. When interactive
-/// and logged out, `ensure_router_key` drives the same `raydock auth login`
-/// prompt Claude uses.
-pub(crate) async fn resolve_cloud_router_key(
-    config_path: Option<&Path>,
-    env_name: Option<&str>,
-    auth_token: Option<&str>,
-    root_env_explicit: bool,
-) -> Option<String> {
-    let path = config_path?;
-    if !crate::router_config::config_routes_to_hosted_rcr(path) {
-        return None;
-    }
-    if let Some(explicit) = explicit_router_key() {
-        return Some(explicit);
-    }
-    let home = dirs::home_dir()?;
-    let env = crate::status::resolve_env(env_name, Some(home.as_path()));
-    crate::claude::ensure_router_key(&env, &home, auth_token, root_env_explicit)
+/// The `rayline` provider Codex is configured with.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Provider {
+    /// The router's Responses base URL, ending in `/v1`.
+    pub base_url: String,
+    /// The `rlk-` router key Codex sends as its bearer token.
+    pub key: String,
+    pub model: String,
+}
+
+/// Resolve the provider for a Codex launch: the environment's router, the
+/// stored `rlk-` router key (see [`crate::status::router_key`]) and the
+/// model (`--model`, else the key's main model).
+pub(crate) async fn resolve_provider(
+    model: Option<&str>,
+    hosted: &crate::status::HostedEnvironment,
+) -> Result<Provider, String> {
+    let home = crate::home().map_err(|error| error.to_string())?;
+    let router_url = &hosted.base_url;
+    let key = crate::status::router_key(hosted, &home)
         .await
-        .ok()
-}
-
-/// A non-empty `RAYLINE_ROUTER_API_KEY` the user set explicitly.
-fn explicit_router_key() -> Option<String> {
-    std::env::var_os("RAYLINE_ROUTER_API_KEY")
-        .and_then(|value| value.into_string().ok())
-        .filter(|value| !value.is_empty())
-}
-
-/// Resolve the config that drives a `raydock codex` / `raydock codex app` run.
-///
-/// A user-supplied `--config` is used verbatim. Otherwise the **default** is Rc-Rc
-/// — route main + subagents to the hosted cloud RCR (native OpenAI Responses),
-/// mirroring `raydock claude`'s route-all cloud default. We reuse the shared
-/// default config (`router_config::default_config_json`, materialized via
-/// `write_default_config`) and drive it through the ordinary `--config` codex
-/// path, so cloud-key provisioning ([`resolve_cloud_router_key`]) and the native
-/// materialization ([`crate::router_config::materialize_codex_config_for_local_router`])
-/// are shared, not re-implemented.
-///
-/// The default config follows `--env`: its cloud endpoint is the selected
-/// environment's router (the same `resolve_env` + `resolve_hosted_environment`
-/// resolution `raydock claude` uses), and each environment has its own file, so
-/// the router URL always matches the environment whose `rlk-` key
-/// [`resolve_cloud_router_key`] provisions. An unknown environment, or one whose
-/// router is not a hosted Rayline router, is an error rather than a silent
-/// fallback to prod.
-///
-/// A default the user edited is used as is, with no key or models read (see
-/// [`crate::router_config::edited_default_config`]). Otherwise the default is
-/// (re)written with main and subagent ids from `hosted_models(env, router_url)`,
-/// which on a real launch reads that router's `/v1/models` with the user's key.
-///
-/// Only the default `--auth auto` opts in. Explicit `--auth subscription` keeps
-/// the ChatGPT-subscription default, and `--auth none` keeps the local default —
-/// both resolve their own zero-config shapes downstream in `start_from_cli`.
-pub(crate) async fn resolve_codex_config_path<F, Fut>(
-    home: &Path,
-    config_path: Option<PathBuf>,
-    auth_mode: CodexAuthMode,
-    env_name: Option<&str>,
-    hosted_models: F,
-) -> io::Result<Option<PathBuf>>
-where
-    F: FnOnce(String, String) -> Fut,
-    Fut: std::future::Future<Output = Result<crate::harness::LaunchModels, String>>,
-{
-    if config_path.is_some() || auth_mode != CodexAuthMode::Auto {
-        return Ok(config_path);
-    }
-    let env = crate::status::resolve_env(env_name, Some(home));
-    let hosted = crate::status::resolve_hosted_environment(&env, Some(home))
-        .map_err(|error| io::Error::other(error.to_string()))?;
-    // Key provisioning and the Responses rewrite only recognise the hosted
-    // router hosts, so a default pointed anywhere else could never authenticate.
-    if !crate::router_config::endpoint_base_url_is_hosted_rcr(Some(&hosted.router_url)) {
-        return Err(io::Error::other(format!(
-            "environment '{env}' routes to {}, which the default codex config does not \
-             support; pass --config with a router config for it",
-            hosted.router_url
-        )));
-    }
-    if let Some(path) = crate::router_config::edited_default_config(home, &env, &hosted.router_url)?
-    {
-        return Ok(Some(path));
-    }
-    let models = hosted_models(env.clone(), hosted.router_url.clone())
-        .await
-        .map_err(io::Error::other)?;
-    Ok(Some(crate::router_config::write_default_config(
-        home,
-        &env,
-        &hosted.router_url,
-        &models,
-    )?))
-}
-
-/// Resolve the real home used for the Rayline router config + key (not the Codex
-/// app's isolated `CODEX_HOME`), then apply [`resolve_codex_config_path`] with
-/// the models the user's key lists on the environment's router (the explicit
-/// `RAYLINE_ROUTER_API_KEY`, else the stored or provisioned `rlk-` key).
-pub(crate) async fn resolve_codex_config_path_from_home(
-    config_path: Option<PathBuf>,
-    auth_mode: CodexAuthMode,
-    env_name: Option<&str>,
-    auth_token: Option<&str>,
-    root_env_explicit: bool,
-) -> io::Result<Option<PathBuf>> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    let hosted_models = |env: String, router_url: String| {
-        let home = home.clone();
-        async move {
-            let key = match explicit_router_key() {
-                Some(key) => key,
-                None => {
-                    crate::claude::ensure_router_key(&env, &home, auth_token, root_env_explicit)
-                        .await
-                        .map_err(|error| error.to_string())?
-                }
-            };
-            crate::harness::fetch_hosted_models(&router_url, &key).await
+        .map_err(|error| error.to_string())?;
+    let model = match model {
+        Some(model) => model.to_owned(),
+        None => {
+            crate::harness::fetch_hosted_models(router_url, &key)
+                .await?
+                .main
         }
     };
-    resolve_codex_config_path(&home, config_path, auth_mode, env_name, hosted_models).await
+    Ok(Provider {
+        base_url: format!("{router_url}/v1"),
+        key,
+        model,
+    })
 }
 
-pub async fn run(mut request: RunRequest) -> ExitCode {
-    match resolve_codex_config_path_from_home(
-        request.config_path.take(),
-        request.auth_mode,
-        request.env_name.as_deref(),
-        request.auth_token.as_deref(),
-        request.root_env_explicit,
-    )
-    .await
-    {
-        Ok(path) => request.config_path = path,
-        Err(error) => {
-            eprintln!("Error: failed to prepare the default Rayline codex config: {error}");
-            return ExitCode::from(1);
-        }
-    }
-    let router_api_key_override = resolve_cloud_router_key(
-        request.config_path.as_deref(),
-        request.env_name.as_deref(),
-        request.auth_token.as_deref(),
-        request.root_env_explicit,
-    )
-    .await;
-    let start_request = crate::router::RouterStartCliRequest {
-        api_mode: crate::router::ROUTER_API_MODE_CODEX.to_owned(),
-        proxy_routing_mode: crate::router::PROXY_ROUTING_MODE_ALL.to_owned(),
-        config_path: request.config_path.clone(),
-        codex_auth_mode: request.auth_mode,
-        root_env_explicit: request.root_env_explicit,
-        router_api_key_override,
-    };
-    match crate::router::start_from_cli(&start_request).await {
-        Ok(_) => {
-            eprintln!(
-                "Rayline Codex router ready at http://127.0.0.1:{}/v1",
-                crate::router::DEFAULT_LOCAL_ROUTER_PORT
-            );
-        }
-        Err(error) => {
-            eprintln!("Error: failed to start Rayline Codex router: {error}");
-            return ExitCode::from(1);
-        }
-    }
+/// The `CODEX_HOME` `rayline run codex` runs Codex CLI on.
+fn codex_home(home: &Path) -> PathBuf {
+    home.join(crate::DOT_CONFIG_DIR)
+        .join("harness")
+        .join("codex")
+}
 
-    let base_url = format!(
-        "http://127.0.0.1:{}/v1",
-        crate::router::DEFAULT_LOCAL_ROUTER_PORT
-    );
-    let model = request
-        .model
-        .as_deref()
-        .unwrap_or(CODEX_DEFAULT_SENTINEL_MODEL);
+pub async fn run(request: RunRequest) -> ExitCode {
+    let provider = match resolve_provider(request.model.as_deref(), &request.hosted).await {
+        Ok(provider) => provider,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let home = match crate::home() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let codex_home = codex_home(&home);
+    if let Err(error) =
+        crate::codex_app::write_codex_home(&codex_home, &provider_config_toml(&provider))
+    {
+        eprintln!("Error: failed to prepare {}: {error}", codex_home.display());
+        return ExitCode::from(1);
+    }
     let mut command = codex_command();
-    command
-        .arg("-c")
-        .arg("model_provider=\"rayline\"")
-        .arg("-c")
-        .arg(format!("model={}", toml_string(model)))
-        .arg("-c")
-        .arg("model_providers.rayline.name=\"Rayline\"")
-        .arg("-c")
-        .arg(format!(
-            "model_providers.rayline.base_url={}",
-            toml_string(&base_url)
-        ))
-        .arg("-c")
-        .arg("model_providers.rayline.wire_api=\"responses\"");
-    if request
-        .auth_mode
-        .effective_for_run(request.config_path.as_ref())
-        == EffectiveCodexAuthMode::Subscription
-    {
-        command
-            .arg("-c")
-            .arg("model_providers.rayline.requires_openai_auth=true")
-            .arg("-c")
-            .arg("forced_login_method=\"chatgpt\"");
-        if let Some(version) = codex_cli_version_header() {
-            command.arg("-c").arg(format!(
-                "model_providers.rayline.http_headers.version={}",
-                toml_string(&version)
-            ));
-        }
-    }
+    command.env("CODEX_HOME", &codex_home);
     command.args(request.codex_args);
-
     exec_or_status(&mut command)
 }
 
-/// Keep the router key out of Codex's environment (#84). Codex reaches the
-/// local router, which holds the key and authenticates the hosted leg itself,
-/// so Codex never needs it. Codex snapshots its environment for the shells it
-/// spawns (`$CODEX_HOME/shell_snapshots`), so a key it inherited would be
-/// written to disk in plain text. The launcher reads an explicit
-/// `RAYLINE_ROUTER_API_KEY` before this, when it starts the router. The
-/// harness launchers' old `RAYLINE_KEY` goes too, for a `raydock codex` started
-/// from a shell that still exports it.
+/// Keep the router key out of Codex's environment (#84). Codex reads the key
+/// from its owner-only `config.toml`, so it never needs it in the environment.
+/// Codex snapshots its environment for the shells it spawns
+/// (`$CODEX_HOME/shell_snapshots`), so a key it inherited would be written to
+/// disk in plain text.
 pub(crate) fn withhold_router_key(command: &mut Command) {
     command.env_remove("RAYLINE_ROUTER_API_KEY");
-    command.env_remove(crate::harness::KEY_ENV);
 }
 
 /// A `codex` child process with the router key withheld (#84). Every Codex
-/// spawn goes through here (the run, the version probe and the app launch),
-/// so none can inherit the key, and each finds npm's `codex.cmd` on Windows.
+/// spawn goes through here (the run and the app launch), so none can inherit
+/// the key, and each finds npm's `codex.cmd` on Windows.
 pub(crate) fn codex_command() -> Command {
     codex_command_on(std::env::var_os("PATH"))
 }
@@ -369,165 +127,38 @@ fn toml_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
-/// The default Rayline OpenAI Responses base URL (the local router's `/v1`).
-pub fn default_rayline_base_url() -> String {
+/// The Codex `config.toml` settings that point Codex at the `rayline` provider.
+/// `rayline run codex` and `rayline run codex app` merge them into their `CODEX_HOME`'s
+/// `config.toml`; `rayline run codex configure` writes them as the profile.
+pub(crate) fn provider_config_toml(provider: &Provider) -> String {
     format!(
-        "http://127.0.0.1:{}/v1",
-        crate::router::DEFAULT_LOCAL_ROUTER_PORT
+        "model = {}\nmodel_provider = \"rayline\"\n\n[model_providers.rayline]\nname = \"Rayline\"\nbase_url = {}\nwire_api = \"responses\"\nexperimental_bearer_token = {}\n",
+        toml_string(&provider.model),
+        toml_string(&provider.base_url),
+        toml_string(&provider.key),
     )
 }
 
-/// Render the `[model_providers.rayline]` TOML block that points Codex at the
-/// Rayline local router.
-///
-/// This is the single source of truth for the Codex-side provider config,
-/// shared by `raydock codex configure` (writes it as `$CODEX_HOME/
-/// rayline.config.toml`) and `raydock codex app` (writes it as the default
-/// `config.toml` inside an isolated `CODEX_HOME`, since the desktop app-server
-/// ignores `-c` overrides and only reads persistent config).
-pub fn rayline_provider_config_toml(
-    model: &str,
-    base_url: &str,
-    subscription_auth: bool,
-) -> String {
-    let http_headers = if subscription_auth {
-        codex_cli_version_header()
-            .map(|version| format!("http_headers = {{ version = {} }}\n", toml_string(&version)))
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    format!(
-        "model = {}\nmodel_provider = \"rayline\"\n{}\
-\n[model_providers.rayline]\nname = \"Rayline\"\nbase_url = {}\nwire_api = \"responses\"\n{}{}",
-        toml_string(model),
-        if subscription_auth {
-            "forced_login_method = \"chatgpt\"\n"
-        } else {
-            ""
-        },
-        toml_string(base_url),
-        if subscription_auth {
-            "requires_openai_auth = true\n"
-        } else {
-            ""
-        },
-        http_headers,
-    )
-}
-
-pub fn configure(request: &ConfigureRequest) -> io::Result<String> {
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    fs::create_dir_all(&codex_home)?;
-    let profile_path = codex_home.join("rayline.config.toml");
-    let base_url = request
-        .base_url
-        .clone()
-        .unwrap_or_else(default_rayline_base_url);
-    let subscription_auth =
-        request.auth_mode.effective_for_run(None) == EffectiveCodexAuthMode::Subscription;
-    let model = request
-        .model
-        .as_deref()
-        .unwrap_or(CODEX_DEFAULT_SENTINEL_MODEL);
-    let contents = rayline_provider_config_toml(model, &base_url, subscription_auth);
-    fs::write(&profile_path, contents)?;
-    Ok(format!(
-        "Wrote Codex Rayline profile: {}\nStart Rayline with `raydock router start --mode codex --auth {}`, then use Codex profile `rayline`.\nBase URL: {base_url}\n",
-        profile_path.display(),
-        if subscription_auth {
-            "subscription"
-        } else {
-            "none"
-        }
-    ))
-}
-
-pub fn write_subscription_router_config(home: &Path, subagents_local: bool) -> io::Result<PathBuf> {
-    let path = home
-        .join(".config")
-        .join(crate::CONFIG_DIR)
-        .join(CODEX_SUBSCRIPTION_CONFIG_FILENAME);
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let body = serde_json::to_vec_pretty(&subscription_router_config_json(subagents_local))
+/// Write the `rayline` profile to `$CODEX_HOME/rayline.config.toml` (Codex's
+/// default home is `~/.codex`), owner-only since it holds the router key.
+pub async fn configure(request: &ConfigureRequest) -> io::Result<String> {
+    let provider = resolve_provider(request.model.as_deref(), &request.hosted)
+        .await
         .map_err(io::Error::other)?;
-    fs::write(&path, body)?;
-    Ok(path)
-}
-
-/// The zero-config `raydock codex --auth subscription` router config.
-///
-/// `main` always routes to the ChatGPT subscription. When `subagents_local` is
-/// true (a usable on-device model is available), `subagent` routes to the local
-/// adapter — the hybrid default that mirrors `raydock claude`'s "main on cloud,
-/// subagents on-device" shape. When false (no local model), subagents stay on
-/// the subscription, preserving the zero-setup all-subscription behavior.
-///
-/// The `model_routes` sentinels stay pinned to the subscription: they resolve
-/// the sentinel `--model` on **main** turns. Subagent turns skip these sentinel
-/// model_routes and follow `routes.subagent` (see `select_route` in the local
-/// router), which is what makes the main≠subagent split take effect.
-pub fn subscription_router_config_json(subagents_local: bool) -> serde_json::Value {
-    let subscription = || {
-        json!({
-            "endpoint": CODEX_SUBSCRIPTION_ENDPOINT_ID,
-            "model": CODEX_SUBSCRIPTION_DEFAULT_MODEL
-        })
+    let codex_home = match crate::harness::exported_dir("CODEX_HOME")? {
+        Some(codex_home) => codex_home,
+        None => crate::home()
+            .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?
+            .join(".codex"),
     };
-    let subagent = if subagents_local {
-        json!({ "endpoint": "local" })
-    } else {
-        subscription()
-    };
-    json!({
-        "endpoints": [{
-            "id": CODEX_SUBSCRIPTION_ENDPOINT_ID,
-            "protocol": "openai_responses",
-            "base_url": CODEX_SUBSCRIPTION_BASE_URL,
-            "auth": "client_bearer",
-            "models": CODEX_SUBSCRIPTION_MODELS
-        }],
-        "routes": {
-            "main": subscription(),
-            "subagent": subagent,
-            "default": subscription(),
-            "model_routes": {
-                "rayline-codex": subscription(),
-                "rayline-local": subscription()
-            }
-        }
-    })
-}
-
-fn codex_cli_version_header() -> Option<String> {
-    let output = codex_command().arg("--version").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if let Some(version) = parse_codex_version_text(&stdout) {
-        return Some(version);
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    parse_codex_version_text(&stderr)
-}
-
-fn parse_codex_version_text(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .find(|part| {
-            part.as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_digit())
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
-        })
-        .map(ToOwned::to_owned)
+    std::fs::create_dir_all(&codex_home)?;
+    let profile_path = codex_home.join("rayline.config.toml");
+    crate::harness::write_private(&profile_path, &provider_config_toml(&provider))?;
+    Ok(format!(
+        "Wrote Codex Rayline profile: {}\nUse Codex profile `rayline`.\nBase URL: {}\n",
+        profile_path.display(),
+        provider.base_url
+    ))
 }
 
 #[cfg(unix)]
@@ -539,489 +170,76 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     ExitCode::from(127)
 }
 
+#[cfg(not(unix))]
+fn exec_or_status(command: &mut Command) -> ExitCode {
+    match command.status() {
+        Ok(status) => crate::child_exit_code(status),
+        Err(error) => {
+            eprintln!("raydock: failed to run codex: {error}");
+            ExitCode::from(127)
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
-    use super::{
-        CODEX_SUBSCRIPTION_DEFAULT_MODEL, CODEX_SUBSCRIPTION_ENDPOINT_ID, CodexAuthMode,
-        EffectiveCodexAuthMode, codex_command, codex_command_on, parse_codex_version_text,
-        resolve_cloud_router_key, resolve_codex_config_path, subscription_router_config_json,
-        withhold_router_key,
-    };
-    use serde_json::json;
-    use std::path::{Path, PathBuf};
+pub(crate) mod tests {
+    use super::{Provider, codex_command, codex_command_on, provider_config_toml};
 
-    fn temp_home() -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let home = std::env::temp_dir().join(format!(
-            "rayline-codex-home-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&home).unwrap();
-        home
-    }
-
-    fn write_config(name: &str, body: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "rayline-codex-auth-test-{}-{name}-{unique}.json",
-            std::process::id()
-        ));
-        std::fs::write(&path, body).unwrap();
-        path
-    }
-
-    // Router-key provisioning is gated on the config routing a leg to the hosted
-    // RCR. The negative cases must resolve to `None` *without* touching
-    // credentials or the network, so subscription (`A*`) and local (`L*`) Codex
-    // runs never trigger a `raydock auth login` prompt.
-    #[tokio::test]
-    async fn cloud_router_key_none_without_config() {
-        assert!(
-            resolve_cloud_router_key(None, None, None, false)
-                .await
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn cloud_router_key_none_for_local_only_config() {
-        // A purely local (ollama) config — no hosted-RCR endpoint — must not
-        // provision a key (would otherwise prompt/fail on a machine with no login).
-        let path = write_config(
-            "local-only",
-            r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#,
-        );
-        assert!(
-            resolve_cloud_router_key(Some(path.as_path()), None, None, false)
-                .await
-                .is_none()
-        );
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[tokio::test]
-    async fn cloud_router_key_passes_through_explicit_env_var() {
-        // An explicit `RAYLINE_ROUTER_API_KEY` is returned verbatim as the
-        // override (not shadowed by a stored key, and not dropped on the
-        // proxy-less Codex daemon start). Network-free: returns before
-        // `ensure_router_key`.
-        let path = write_config(
-            "rrc-cloud",
-            r#"{"endpoints":[{"id":"rayline-cloud","protocol":"openai_responses","base_url":"https://api.rayline.ai","models":["arc-sage-1.0"],"api_key_env":"RAYLINE_ROUTER_API_KEY","auth":"bearer"}],"routes":{"main":{"endpoint":"rayline-cloud","model":"arc-sage-1.0"}}}"#,
-        );
-        assert!(crate::router_config::config_routes_to_hosted_rcr(&path));
-
-        let var = "RAYLINE_ROUTER_API_KEY";
-        let previous = std::env::var_os(var);
-        // SAFETY: this test owns the var for its duration and the suite runs
-        // single-threaded (`--test-threads=1`); the original value is restored.
-        unsafe { std::env::set_var(var, "rlk-user-explicit") };
-        assert_eq!(
-            resolve_cloud_router_key(Some(path.as_path()), None, None, false).await,
-            Some("rlk-user-explicit".to_owned()),
-            "an explicit RAYLINE_ROUTER_API_KEY must pass through as the override"
-        );
-        // SAFETY: see the note above.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var(var, value),
-                None => std::env::remove_var(var),
-            }
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    /// The models a standard key lists, standing in for the `/v1/models` read.
-    async fn listed(
-        _env: String,
-        _router_url: String,
-    ) -> Result<crate::harness::LaunchModels, String> {
-        Ok(crate::harness::tests::hosted_models())
-    }
-
-    // Default `raydock codex` / `codex app` (no `--config`, auto auth) → Rc-Rc:
-    // synthesize the shared default config (route everything to the hosted RCR).
-    #[tokio::test]
-    async fn default_auto_no_config_resolves_to_rrc() {
-        let home = temp_home();
-        let resolved = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, None, listed)
-            .await
-            .unwrap();
-        let path = resolved.expect("auto + no --config should synthesize a default config");
-        // It's the shared default config, and it routes to the hosted cloud RCR
-        // (Rc-Rc), not a subscription passthrough.
-        assert!(crate::router_config::config_routes_to_hosted_rcr(&path));
-        assert!(!crate::router_config::config_main_is_passthrough(&path));
-        // Its ids are the ones the key lists.
-        assert_eq!(
-            crate::router_config::config_main_model(&path).as_deref(),
-            Some(crate::ARC_SAGE_MODEL)
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[tokio::test]
-    async fn an_edited_default_is_used_without_reading_models() {
-        // A default the user edited (here, to a local-only route) launches
-        // without a key or a /v1/models read, so it works offline or logged out.
-        let home = temp_home();
-        let path = crate::router_config::default_config_path_for_env(&home, "prod");
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let body = r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#;
-        std::fs::write(&path, body).unwrap();
-        let resolved = resolve_codex_config_path(
-            &home,
-            None,
-            CodexAuthMode::Auto,
-            None,
-            |_env: String, _router_url: String| async {
-                Err::<crate::harness::LaunchModels, String>("models were read".to_owned())
-            },
-        )
-        .await
-        .unwrap();
-        assert_eq!(resolved, Some(path.clone()));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[tokio::test]
-    async fn explicit_config_is_used_verbatim() {
-        let home = temp_home();
-        let user = write_config("user-cfg", r#"{"endpoints":[],"routes":{}}"#);
-        let resolved =
-            resolve_codex_config_path(&home, Some(user.clone()), CodexAuthMode::Auto, None, listed)
-                .await
-                .unwrap();
-        assert_eq!(resolved, Some(user.clone()));
-        let _ = std::fs::remove_file(&user);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[tokio::test]
-    async fn explicit_subscription_and_none_keep_their_own_default() {
-        // Only `auto` opts into the Rc-Rc default; `subscription` (ChatGPT) and
-        // `none` (local) keep `None` here and resolve their shapes downstream.
-        let home = temp_home();
-        assert_eq!(
-            resolve_codex_config_path(&home, None, CodexAuthMode::Subscription, None, listed)
-                .await
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            resolve_codex_config_path(&home, None, CodexAuthMode::None, None, listed)
-                .await
-                .unwrap(),
-            None
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    // `--env` scopes the default config: the generated file's cloud endpoint is
-    // the selected environment's router, never prod for a non-prod key.
-
-    const DEV_ROUTER_URL: &str = "https://api-dev.rayline.ai";
-
-    fn write_dev_environment(home: &Path) {
-        let dir = home.join(".config").join(crate::CONFIG_DIR);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("settings.json"),
-            serde_json::to_vec(&json!({
-                "environments": {
-                    "dev": {
-                        "router_url": DEV_ROUTER_URL,
-                        "cli_auth_url": "https://dev.platform.rayline.ai/cli-auth"
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    }
-
-    fn cloud_base_url(path: &Path) -> String {
-        let cfg: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        cfg["endpoints"][0]["base_url"].as_str().unwrap().to_owned()
-    }
-
-    #[tokio::test]
-    async fn default_config_uses_the_selected_env_router_url() {
-        let home = temp_home();
-        write_dev_environment(&home);
-
-        let path = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("dev"), listed)
-            .await
-            .unwrap()
-            .expect("auto + no --config should synthesize a default config");
-
-        assert_eq!(
-            path,
-            crate::router_config::default_config_path_for_env(&home, "dev")
-        );
-        assert_ne!(path, crate::router_config::default_config_path(&home));
-        assert_eq!(cloud_base_url(&path), DEV_ROUTER_URL);
-        assert!(crate::router_config::config_routes_to_hosted_rcr(&path));
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[tokio::test]
-    async fn existing_prod_default_is_not_reused_for_another_env() {
-        // The original bug: a prod `router.json` from an earlier run was reused by
-        // `--env dev`, sending the dev key to the prod router.
-        let home = temp_home();
-        write_dev_environment(&home);
-        let prod = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, None, listed)
-            .await
-            .unwrap()
-            .unwrap();
-        let prod_before = std::fs::read(&prod).unwrap();
-        assert_eq!(cloud_base_url(&prod), crate::ROUTER_PROD_URL);
-
-        let dev = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("dev"), listed)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(dev, prod);
-        assert_eq!(cloud_base_url(&dev), DEV_ROUTER_URL);
-        // Switching back to prod finds its own file, untouched.
-        let prod_again =
-            resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("prod"), listed)
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(prod_again, prod);
-        assert_eq!(std::fs::read(&prod).unwrap(), prod_before);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[tokio::test]
-    async fn env_default_config_keeps_user_edits() {
-        let home = temp_home();
-        write_dev_environment(&home);
-        let dev = resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("dev"), listed)
-            .await
-            .unwrap()
-            .unwrap();
-        let edited = r#"{"endpoints":[],"routes":{}}"#;
-        std::fs::write(&dev, edited).unwrap();
-
-        let again =
-            resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("dev"), listed)
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(again, dev);
-        assert_eq!(std::fs::read_to_string(&dev).unwrap(), edited);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[tokio::test]
-    async fn unknown_env_is_an_error_not_a_prod_default() {
-        let home = temp_home();
-        let error =
-            resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("staging"), listed)
-                .await
-                .unwrap_err();
-        assert!(error.to_string().contains("staging"), "{error}");
-        assert!(!crate::router_config::default_config_path(&home).exists());
-        assert!(!crate::router_config::default_config_path_for_env(&home, "staging").exists());
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[tokio::test]
-    async fn env_with_a_non_hosted_router_is_an_error() {
-        // The codex default only knows how to reach the hosted router hosts;
-        // any other router_url would get no key and no Responses rewrite.
-        let home = temp_home();
-        let dir = home.join(".config").join(crate::CONFIG_DIR);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("settings.json"),
-            serde_json::to_vec(&json!({
-                "environments": {
-                    "staging": {
-                        "router_url": "https://router.example.test",
-                        "cli_auth_url": "https://platform.example.test/cli-auth"
-                    }
-                }
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let error =
-            resolve_codex_config_path(&home, None, CodexAuthMode::Auto, Some("staging"), listed)
-                .await
-                .unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("router.example.test"), "{message}");
-        assert!(message.contains("--config"), "{message}");
-        assert!(!crate::router_config::default_config_path_for_env(&home, "staging").exists());
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[tokio::test]
-    async fn explicit_config_is_used_verbatim_under_another_env() {
-        let home = temp_home();
-        let user = write_config("user-cfg-env", r#"{"endpoints":[],"routes":{}}"#);
-        let resolved = resolve_codex_config_path(
-            &home,
-            Some(user.clone()),
-            CodexAuthMode::Auto,
-            Some("dev"),
-            listed,
-        )
-        .await
-        .unwrap();
-        assert_eq!(resolved, Some(user.clone()));
-        assert!(!crate::router_config::default_config_path_for_env(&home, "dev").exists());
-        let _ = std::fs::remove_file(&user);
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn parses_codex_cli_version_output() {
-        assert_eq!(
-            parse_codex_version_text("codex-cli 0.142.0\n").as_deref(),
-            Some("0.142.0")
-        );
-        assert_eq!(
-            parse_codex_version_text("codex 1.2.3-beta.1+build\n").as_deref(),
-            Some("1.2.3-beta.1+build")
-        );
-        assert_eq!(parse_codex_version_text("codex-cli\n"), None);
-    }
-
-    #[test]
-    fn subscription_config_all_subscription_when_no_local_model() {
-        // Fallback shape (no usable local model): main AND subagent → subscription.
-        let cfg = subscription_router_config_json(false);
-        assert_eq!(
-            cfg["routes"]["main"]["endpoint"],
-            CODEX_SUBSCRIPTION_ENDPOINT_ID
-        );
-        assert_eq!(
-            cfg["routes"]["main"]["model"],
-            CODEX_SUBSCRIPTION_DEFAULT_MODEL
-        );
-        assert_eq!(
-            cfg["routes"]["subagent"]["endpoint"],
-            CODEX_SUBSCRIPTION_ENDPOINT_ID
-        );
-        // Sentinel model_routes always pin main to the subscription.
-        for m in ["rayline-local", "rayline-codex"] {
-            assert_eq!(
-                cfg["routes"]["model_routes"][m]["endpoint"],
-                CODEX_SUBSCRIPTION_ENDPOINT_ID
-            );
+    /// A provider as a launch resolves it, with a placeholder key.
+    pub(crate) fn provider(model: &str) -> Provider {
+        Provider {
+            base_url: "https://api.rayline.ai/v1".to_owned(),
+            key: "rlk-test-not-a-real-key".to_owned(),
+            model: model.to_owned(),
         }
     }
 
     #[test]
-    fn subscription_config_hybrid_routes_subagents_local() {
-        // Hybrid shape (usable local model): main → subscription, subagent → local.
-        let cfg = subscription_router_config_json(true);
+    fn provider_config_points_codex_at_the_router_with_the_key() {
+        let toml = provider_config_toml(&provider("arc-sage-1.0"));
+        let doc: toml_edit::DocumentMut = toml.parse().unwrap();
+        assert_eq!(doc["model"].as_str(), Some("arc-sage-1.0"));
+        assert_eq!(doc["model_provider"].as_str(), Some("rayline"));
+        let rayline = &doc["model_providers"]["rayline"];
         assert_eq!(
-            cfg["routes"]["main"]["endpoint"],
-            CODEX_SUBSCRIPTION_ENDPOINT_ID
+            rayline["base_url"].as_str(),
+            Some("https://api.rayline.ai/v1")
         );
-        assert_eq!(cfg["routes"]["subagent"]["endpoint"], "local");
-        // No model pinned on the local subagent route — the router fills the
-        // configured local model id.
-        assert!(cfg["routes"]["subagent"].get("model").is_none());
-        // Sentinels still pin MAIN turns to the subscription; subagent turns skip
-        // them (see the local router's select_route).
-        for m in ["rayline-local", "rayline-codex"] {
-            assert_eq!(
-                cfg["routes"]["model_routes"][m]["endpoint"],
-                CODEX_SUBSCRIPTION_ENDPOINT_ID
-            );
+        assert_eq!(rayline["wire_api"].as_str(), Some("responses"));
+        assert_eq!(
+            rayline["experimental_bearer_token"].as_str(),
+            Some("rlk-test-not-a-real-key")
+        );
+        for absent in ["requires_openai_auth", "forced_login_method", "127.0.0.1"] {
+            assert!(!toml.contains(absent), "{absent}");
         }
     }
 
     #[test]
-    fn auto_without_config_resolves_to_subscription() {
-        assert_eq!(
-            CodexAuthMode::Auto.effective_for_run(None),
-            EffectiveCodexAuthMode::Subscription
+    fn codex_writes_only_under_its_harness_folder() {
+        let home = crate::harness::tests::temp_dir("codex-home");
+        // The user's Codex home, with no config.toml to seed from.
+        let user_home = crate::harness::tests::temp_dir("codex-home-user");
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+        let written = crate::codex_app::write_codex_home(
+            &super::codex_home(&home),
+            &provider_config_toml(&provider("arc-sage")),
         );
-    }
-
-    #[test]
-    fn auto_with_subscription_main_config_resolves_to_subscription() {
-        // Regression: `--auth auto` + a `main: subscription` config must resolve to
-        // subscription (materializing the ChatGPT backend) instead of "no auth",
-        // which routed the sentinel to a dead placeholder and 502-looped.
-        let path = write_config(
-            "sub-main",
-            r#"{"routes":{"main":{"endpoint":"subscription"},"subagent":{"endpoint":"local"}}}"#,
-        );
-        assert_eq!(
-            CodexAuthMode::Auto.effective_for_run(Some(&path)),
-            EffectiveCodexAuthMode::Subscription
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn auto_with_absent_main_resolves_to_subscription() {
-        // An absent `routes.main` is treated as the subscription passthrough.
-        let path = write_config("no-main", r#"{"routes":{"subagent":{"endpoint":"local"}}}"#);
-        assert_eq!(
-            CodexAuthMode::Auto.effective_for_run(Some(&path)),
-            EffectiveCodexAuthMode::Subscription
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn auto_with_non_subscription_main_config_resolves_to_none() {
-        // A local/provider main needs no client auth — auto stays "none".
-        let path = write_config(
-            "local-main",
-            r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#,
-        );
-        assert_eq!(
-            CodexAuthMode::Auto.effective_for_run(Some(&path)),
-            EffectiveCodexAuthMode::None
-        );
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn explicit_modes_ignore_config() {
-        let path = write_config(
-            "local-main2",
-            r#"{"endpoints":[{"id":"ollama","protocol":"openai_chat","base_url":"http://127.0.0.1:11434/v1","models":["qwen"]}],"routes":{"main":{"endpoint":"ollama","model":"qwen"}}}"#,
-        );
-        // `--auth subscription` always subscription, even against a local-main config.
-        assert_eq!(
-            CodexAuthMode::Subscription.effective_for_run(Some(&path)),
-            EffectiveCodexAuthMode::Subscription
-        );
-        // `--auth none` always none, even against a subscription-main config.
-        let sub = write_config(
-            "sub-main2",
-            r#"{"routes":{"main":{"endpoint":"subscription"}}}"#,
-        );
-        assert_eq!(
-            CodexAuthMode::None.effective_for_run(Some(&sub)),
-            EffectiveCodexAuthMode::None
-        );
-        let _ = std::fs::remove_file(path);
-        let _ = std::fs::remove_file(sub);
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        written.unwrap();
+        crate::harness::tests::assert_only_harness_files(&home, "codex", &[]);
+        std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(user_home).unwrap();
     }
 
     /// #84: every Codex child is built by `codex_command`, which withholds the
-    /// router key, so no spawn site can forget it: the version probe and the
-    /// app launch included.
+    /// router key, so no spawn site can forget it: the app launch included.
     #[test]
     fn every_codex_spawn_goes_through_codex_command() {
         let sources = [
@@ -1048,7 +266,7 @@ mod tests {
 
     /// Windows process creation does not apply PATHEXT, so a bare `codex`
     /// misses the `codex.cmd` launcher npm installs. The command resolves it
-    /// the way `raydock hybrid` does, and keeps withholding the router key.
+    /// the way a local-mode run does, and keeps withholding the router key.
     #[test]
     fn codex_command_finds_the_npm_launcher_on_windows() {
         let dir = crate::harness::tests::temp_dir("codex-launcher");
@@ -1072,14 +290,12 @@ mod tests {
     #[test]
     fn codex_command_withholds_the_router_key() {
         let command = codex_command();
-        for var in ["RAYLINE_ROUTER_API_KEY", "RAYLINE_KEY"] {
-            assert!(
-                command
-                    .get_envs()
-                    .any(|(key, value)| key == var && value.is_none()),
-                "codex_command does not remove {var}"
-            );
-        }
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "RAYLINE_ROUTER_API_KEY" && value.is_none()),
+            "codex_command does not remove RAYLINE_ROUTER_API_KEY"
+        );
     }
 
     /// #84: a router key in the launcher's environment must not reach Codex,
@@ -1091,7 +307,7 @@ mod tests {
         let previous = std::env::var_os(var);
         unsafe { std::env::set_var(var, "rlk-test-not-a-real-key") };
         let mut command = std::process::Command::new("/usr/bin/env");
-        withhold_router_key(&mut command);
+        super::withhold_router_key(&mut command);
         let output = command.output().expect("run env");
         match previous {
             Some(value) => unsafe { std::env::set_var(var, value) },
@@ -1103,16 +319,5 @@ mod tests {
             !printed.contains(var),
             "the child environment still carries {var}"
         );
-    }
-}
-
-#[cfg(not(unix))]
-fn exec_or_status(command: &mut Command) -> ExitCode {
-    match command.status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
-        Err(error) => {
-            eprintln!("raydock: failed to run codex: {error}");
-            ExitCode::from(127)
-        }
     }
 }

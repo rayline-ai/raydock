@@ -135,7 +135,9 @@ fn named_special_tokens_reach_the_template_and_tools_select_tool_use() {
         tool_use: Some("{{ bos_token }} tool use with tools".to_owned()),
     };
     let special = special_tokens(
-        &json!({"bos_token": {"content": "<|user|>", "special": true}, "eos_token": "<|assistant|>", "model_max_length": 9}),
+        json!({"bos_token": {"content": "<|user|>", "special": true}, "eos_token": "<|assistant|>", "model_max_length": 9})
+            .as_object()
+            .unwrap(),
     );
     assert_eq!(special.get("bos_token"), Some(&json!("<|user|>")));
     assert!(!special.contains_key("model_max_length"));
@@ -145,6 +147,94 @@ fn named_special_tokens_reach_the_template_and_tools_select_tool_use() {
         json!({"messages": [{"role": "user", "content": "x"}], "tools": [{"type": "function"}]});
     assert_eq!(counter.count_chat(&plain).unwrap().prompt_tokens, 2);
     assert_eq!(counter.count_chat(&tools).unwrap().prompt_tokens, 5);
+}
+
+/// A model snapshot directory holding `files`, removed on drop.
+struct Snapshot(std::path::PathBuf);
+
+impl Snapshot {
+    fn new(files: &[(&str, &[u8])]) -> Self {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("rayline-tokencount-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        Self(dir)
+    }
+}
+
+impl Drop for Snapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn a_tokenizer_config_that_is_not_an_object_is_an_error_naming_it() {
+    let tokenizer = tokenizer();
+    let snapshot = Snapshot::new(&[
+        (TOKENIZER_FILE, &tokenizer),
+        (TEMPLATE_FILE, b"{{ messages[0].content }}"),
+        (TOKENIZER_CONFIG_FILE, b"[]"),
+    ]);
+    let error = PromptCounter::from_dir(&snapshot.0).err().unwrap();
+    assert_eq!(
+        format!("{error:#}"),
+        format!(
+            "{} is not a JSON object",
+            snapshot.0.join(TOKENIZER_CONFIG_FILE).display()
+        )
+    );
+}
+
+#[test]
+fn a_special_token_the_files_do_not_define_is_an_error_at_load() {
+    let tokenizer = tokenizer();
+    let template =
+        b"{{ bos_token }}{% for m in messages %}{{ m.content }}{{ eos_token }}{% endfor %}";
+    let snapshot = Snapshot::new(&[
+        (TOKENIZER_FILE, &tokenizer),
+        (TEMPLATE_FILE, template),
+        (TOKENIZER_CONFIG_FILE, br#"{"eos_token": "<|assistant|>"}"#),
+    ]);
+    let error = PromptCounter::from_dir(&snapshot.0).err().unwrap();
+    assert_eq!(
+        format!("{error:#}"),
+        "the chat template uses `bos_token`, which tokenizer_config.json does not define"
+    );
+    // The tool_use template is checked too, and without tokenizer_config.json
+    // no special token is defined.
+    let templates = ChatTemplates {
+        default: "{{ messages[0].content }}".to_owned(),
+        tool_use: Some("{{ eos_token }}{{ additional_special_tokens[0] }}".to_owned()),
+    };
+    let error = PromptCounter::build(&tokenizer, &templates, None, Map::new())
+        .err()
+        .unwrap();
+    assert_eq!(
+        format!("{error:#}"),
+        "the tool_use chat template uses `additional_special_tokens`, `eos_token`, which tokenizer_config.json does not define"
+    );
+}
+
+#[test]
+fn a_missing_tokenizer_config_is_fine_when_the_template_uses_no_special_token() {
+    let tokenizer = tokenizer();
+    let snapshot = Snapshot::new(&[
+        (TOKENIZER_FILE, &tokenizer),
+        (
+            TEMPLATE_FILE,
+            b"{% for m in messages %}{{ m.content }}{% endfor %}",
+        ),
+    ]);
+    let counter = PromptCounter::from_dir(&snapshot.0).unwrap();
+    let request = json!({"messages": [{"role": "user", "content": "x"}]});
+    assert_eq!(counter.count_chat(&request).unwrap().prompt_tokens, 1);
 }
 
 #[test]

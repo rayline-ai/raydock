@@ -1,43 +1,17 @@
-//! Hugging Face cache scan + download for Rayline local models.
+//! Downloads files from the Hugging Face Hub into the Hugging Face cache.
 //!
 //! The on-disk layout (models--org--repo/{refs,blobs,snapshots/{commit}}) is
 //! byte-identical to what huggingface_hub creates, so Rayline can reuse an
 //! existing Hugging Face cache.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::{info, warn};
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/// A GGUF model found in the HF cache.
-#[derive(Debug, Clone)]
-pub struct HfCacheGguf {
-    pub repo: String,
-    pub filename: String,
-    pub path: PathBuf,
-    pub size_bytes: u64,
-}
-
-/// Progress event emitted by `download_to_hf_cache`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DownloadProgress {
-    pub stage: String,
-    pub bytes_downloaded: u64,
-    pub total_bytes: u64,
-    pub percent: f64,
-    pub filename: String,
-}
-
-/// Callback type for progress reporting. `None` is a valid no-op.
-pub type ProgressCallback<'a> = Option<&'a dyn Fn(DownloadProgress)>;
 
 #[derive(Debug, Deserialize)]
 struct HfModelInfo {
@@ -51,7 +25,6 @@ struct HfModelInfo {
 const MAX_DOWNLOAD_ATTEMPTS: u32 = 4;
 
 enum DownloadAttemptError {
-    Cancelled,
     Fatal(String),
     Retryable(String),
 }
@@ -78,229 +51,39 @@ fn is_retryable_reqwest_error(e: &reqwest::Error) -> bool {
 // Cache directory resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve the HF cache directory. Priority: `HF_HUB_CACHE`, `HF_HOME`/hub,
-/// then `~/.cache/huggingface/hub` (or `%LOCALAPPDATA%\huggingface\hub` on
-/// Windows).
-pub fn hf_cache_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HF_HUB_CACHE") {
-        return PathBuf::from(dir);
+/// The HF cache directory: `HF_HUB_CACHE`, else `HF_HOME`/hub, else
+/// `<home>/.cache/huggingface/hub`. A set but empty or non-unicode var is an
+/// error naming it.
+pub fn hf_cache_dir(home: &Path) -> Result<PathBuf, String> {
+    hf_cache_dir_from(home, |name| std::env::var_os(name))
+}
+
+fn hf_cache_dir_from(
+    home: &Path,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf, String> {
+    let read = |name: &str| -> Result<Option<PathBuf>, String> {
+        let Some(value) = var(name) else {
+            return Ok(None);
+        };
+        match value.into_string() {
+            Ok(value) if value.is_empty() => Err(format!("{name} is set but empty")),
+            Ok(value) => Ok(Some(PathBuf::from(value))),
+            Err(_) => Err(format!("{name} is not valid unicode")),
+        }
+    };
+    if let Some(dir) = read("HF_HUB_CACHE")? {
+        return Ok(dir);
     }
-    if let Ok(home) = std::env::var("HF_HOME") {
-        return PathBuf::from(home).join("hub");
+    if let Some(hf_home) = read("HF_HOME")? {
+        return Ok(hf_home.join("hub"));
     }
-    let cache =
-        dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().expect("no home dir").join(".cache"));
-    cache.join("huggingface").join("hub")
+    Ok(home.join(".cache").join("huggingface").join("hub"))
 }
 
 /// "org/repo" → "models--org--repo".
 pub fn repo_to_folder_name(repo: &str) -> String {
     format!("models--{}", repo.replace('/', "--"))
-}
-
-/// "models--org--repo" → Some("org/repo"). Resolves hyphenated org/name names
-/// by preferring the split where neither side ends/starts with `-`.
-pub fn folder_name_to_repo(folder: &str) -> Option<String> {
-    let stripped = folder.strip_prefix("models--")?;
-    if stripped.is_empty() {
-        return None;
-    }
-
-    let mut candidates: Vec<(usize, &str)> = Vec::new();
-    let bytes = stripped.as_bytes();
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            let org = &stripped[..i];
-            let name = &stripped[(i + 2)..];
-            if !org.is_empty() && !name.is_empty() {
-                candidates.push((i, name));
-            }
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-
-    if candidates.is_empty() {
-        return None;
-    }
-    if candidates.len() == 1 {
-        let (pos, _) = candidates[0];
-        return Some(format!("{}/{}", &stripped[..pos], &stripped[(pos + 2)..]));
-    }
-
-    let cache = hf_cache_dir();
-    let folder_path = cache.join(folder);
-    for &(pos, _) in &candidates {
-        let org = &stripped[..pos];
-        let name = &stripped[(pos + 2)..];
-        let refs_path = folder_path.join("refs");
-        let snapshots_path = folder_path.join("snapshots");
-        if (refs_path.is_dir() || snapshots_path.is_dir())
-            && !org.ends_with('-')
-            && !name.starts_with('-')
-        {
-            return Some(format!("{org}/{name}"));
-        }
-    }
-
-    for &(pos, _) in candidates.iter().rev() {
-        let org = &stripped[..pos];
-        let name = &stripped[(pos + 2)..];
-        if !org.ends_with('-') && !name.starts_with('-') {
-            return Some(format!("{org}/{name}"));
-        }
-    }
-
-    let (pos, _) = candidates[0];
-    Some(format!("{}/{}", &stripped[..pos], &stripped[(pos + 2)..]))
-}
-
-// ---------------------------------------------------------------------------
-// Cache scanning
-// ---------------------------------------------------------------------------
-
-/// Scan the HF cache for all GGUF files. Returns models across all cached repos.
-pub fn scan_hf_cache_gguf() -> Vec<HfCacheGguf> {
-    let cache = hf_cache_dir();
-    let mut results = Vec::new();
-
-    if !cache.is_dir() {
-        return results;
-    }
-
-    let entries = match fs::read_dir(&cache) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!("[HfCache] Failed to read cache dir {:?}: {}", cache, e);
-            return results;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let folder_name = entry.file_name().to_string_lossy().to_string();
-        if !folder_name.starts_with("models--") {
-            continue;
-        }
-
-        let repo = match folder_name_to_repo(&folder_name) {
-            Some(r) => r,
-            None => continue,
-        };
-
-        let snapshots_dir = entry.path().join("snapshots");
-        if !snapshots_dir.is_dir() {
-            continue;
-        }
-
-        let refs_main = entry.path().join("refs").join("main");
-        let preferred_commit = fs::read_to_string(&refs_main)
-            .ok()
-            .map(|s| s.trim().to_string());
-
-        if let Some(ref commit) = preferred_commit {
-            let commit_dir = snapshots_dir.join(commit);
-            if commit_dir.is_dir() {
-                collect_gguf_from_snapshot(&commit_dir, &commit_dir, &repo, &mut results);
-                continue;
-            }
-        }
-
-        let commit_dirs = match fs::read_dir(&snapshots_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        let mut seen_filenames: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        let pre_len = results.len();
-
-        for commit_entry in commit_dirs.flatten() {
-            if !commit_entry.path().is_dir() {
-                continue;
-            }
-            collect_gguf_from_snapshot(
-                &commit_entry.path(),
-                &commit_entry.path(),
-                &repo,
-                &mut results,
-            );
-        }
-
-        let mut i = pre_len;
-        while i < results.len() {
-            if !seen_filenames.insert(results[i].filename.clone()) {
-                results.swap_remove(i);
-            } else {
-                i += 1;
-            }
-        }
-    }
-
-    results
-}
-
-fn collect_gguf_from_snapshot(
-    dir: &Path,
-    snapshot_root: &Path,
-    repo: &str,
-    results: &mut Vec<HfCacheGguf>,
-) {
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-
-        if path.is_dir() {
-            collect_gguf_from_snapshot(&path, snapshot_root, repo, results);
-            continue;
-        }
-
-        let filename_str = path.file_name().unwrap_or_default().to_string_lossy();
-
-        if filename_str.ends_with(".download")
-            || !filename_str.ends_with(".gguf")
-            || filename_str.contains("mmproj")
-            || is_non_first_shard(&filename_str)
-        {
-            continue;
-        }
-
-        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let rel = path
-            .strip_prefix(snapshot_root)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        results.push(HfCacheGguf {
-            repo: repo.to_string(),
-            filename: rel,
-            path: path.clone(),
-            size_bytes: size,
-        });
-    }
-}
-
-fn is_non_first_shard(filename: &str) -> bool {
-    let stem = filename.strip_suffix(".gguf").unwrap_or(filename);
-    if let Some(of_idx) = stem.rfind("-of-") {
-        let total = &stem[(of_idx + 4)..];
-        if total.len() == 5 && total.chars().all(|c| c.is_ascii_digit()) {
-            let before_of = &stem[..of_idx];
-            if let Some(shard_sep) = before_of.rfind('-') {
-                let shard_idx = &before_of[(shard_sep + 1)..];
-                if shard_idx.len() == 5 && shard_idx.chars().all(|c| c.is_ascii_digit()) {
-                    return shard_idx != "00001";
-                }
-            }
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -355,141 +138,47 @@ fn compute_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Normalize a SHA256 digest accepted at the Rayline trust boundary.
-/// Accepts bare hex, `sha256:<hex>`, or our cache blob name `sha256-<hex>`.
-pub fn normalize_sha256(digest: &str) -> Result<String, String> {
-    let trimmed = digest.trim();
-    let without_prefix = trimmed
-        .strip_prefix("sha256:")
-        .or_else(|| trimmed.strip_prefix("sha256-"))
-        .unwrap_or(trimmed);
-    if without_prefix.len() != 64 || !without_prefix.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("expected SHA256 digest as 64 hex characters".to_string());
-    }
-    Ok(without_prefix.to_ascii_lowercase())
-}
-
 fn sha256_blob_name(digest: &str) -> String {
     format!("sha256-{digest}")
 }
 
-fn path_points_to_sha256_blob(path: &Path, expected_sha256: &str) -> bool {
-    let expected_blob = sha256_blob_name(expected_sha256);
-    if path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == expected_blob)
-    {
-        return true;
-    }
-    let Ok(target) = fs::read_link(path) else {
-        return false;
-    };
-    target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == expected_blob)
-}
-
-/// Verify a file against an expected SHA256. HF cache symlinks created by this
-/// crate point at `blobs/sha256-<digest>`, so cache hits usually take the cheap
-/// symlink-target path; otherwise the file is hashed.
-pub fn verify_file_sha256(path: &Path, expected_sha256: &str) -> Result<(), String> {
-    let expected = normalize_sha256(expected_sha256)?;
-    if path_points_to_sha256_blob(path, &expected) {
-        return Ok(());
-    }
-    let actual = compute_sha256(path)?;
-    if actual != expected {
-        return Err(format!(
-            "SHA256 mismatch for {}: expected {}, got {}",
-            path.display(),
-            expected,
-            actual
-        ));
-    }
-    Ok(())
-}
-
-pub fn hf_cache_snapshot_path(repo: &str, filename: &str, commit: &str) -> PathBuf {
-    hf_cache_dir()
-        .join(repo_to_folder_name(repo))
+pub fn hf_cache_snapshot_path(hub: &Path, repo: &str, filename: &str, commit: &str) -> PathBuf {
+    hub.join(repo_to_folder_name(repo))
         .join("snapshots")
         .join(commit)
         .join(filename)
 }
 
-/// Return the exact pinned snapshot file when present and, when provided,
-/// verified against the expected SHA256.
-pub fn verified_hf_cache_file(
-    repo: &str,
-    filename: &str,
-    commit: &str,
-    expected_sha256: Option<&str>,
-) -> Result<Option<PathBuf>, String> {
-    let snapshot = hf_cache_snapshot_path(repo, filename, commit);
-    if !snapshot.is_file() {
-        return Ok(None);
-    }
-    if let Some(expected) = expected_sha256 {
-        verify_file_sha256(&snapshot, expected)?;
-    }
-    Ok(Some(snapshot))
+/// The pinned snapshot file, when it is in the cache.
+pub fn cached_hf_file(hub: &Path, repo: &str, filename: &str, commit: &str) -> Option<PathBuf> {
+    let snapshot = hf_cache_snapshot_path(hub, repo, filename, commit);
+    snapshot.is_file().then_some(snapshot)
 }
 
 // ---------------------------------------------------------------------------
 // Download to HF cache
 // ---------------------------------------------------------------------------
 
-/// Download a file into the HF cache structure. Returns the snapshot symlink
+/// Download a file into the HF cache at `hub`. Returns the snapshot symlink
 /// path. Steps mirror `huggingface_hub`: write to `blobs/.download-*`,
 /// SHA256-rename to `blobs/sha256-{hash}`, write `refs/main`, symlink
 /// `snapshots/{commit}/{filename}` → blob.
-#[allow(clippy::too_many_arguments)]
 pub fn download_to_hf_cache(
+    hub: &Path,
     repo: &str,
     filename: &str,
     commit: &str,
-    expected_sha256: Option<&str>,
-    on_progress: ProgressCallback<'_>,
-    stage: &str,
-    cancel: Option<&AtomicBool>,
-    bytes_offset: u64,
-    total_override: u64,
-    progress_filename: Option<&str>,
 ) -> Result<PathBuf, String> {
-    download_to_hf_cache_at(
-        &hf_cache_dir(),
-        "https://huggingface.co",
-        repo,
-        filename,
-        commit,
-        expected_sha256,
-        on_progress,
-        stage,
-        cancel,
-        bytes_offset,
-        total_override,
-        progress_filename,
-    )
+    download_to_hf_cache_at(hub, "https://huggingface.co", repo, filename, commit)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn download_to_hf_cache_at(
     cache: &Path,
     hf_base_url: &str,
     repo: &str,
     filename: &str,
     commit: &str,
-    expected_sha256: Option<&str>,
-    on_progress: ProgressCallback<'_>,
-    stage: &str,
-    cancel: Option<&AtomicBool>,
-    bytes_offset: u64,
-    total_override: u64,
-    progress_filename: Option<&str>,
 ) -> Result<PathBuf, String> {
-    let expected_sha256 = expected_sha256.map(normalize_sha256).transpose()?;
     let repo_dir = cache.join(repo_to_folder_name(repo));
     let refs_dir = repo_dir.join("refs");
     let blobs_dir = repo_dir.join("blobs");
@@ -548,28 +237,10 @@ fn download_to_hf_cache_at(
         download_url, tmp_path
     );
 
-    download_file_to_path(
-        &download_url,
-        &tmp_path,
-        on_progress,
-        stage,
-        cancel,
-        bytes_offset,
-        total_override,
-        progress_filename,
-    )?;
+    download_file_to_path(&download_url, &tmp_path)?;
 
     info!("[HfCache] Computing SHA256 for {:?}", tmp_path);
     let sha256 = compute_sha256(&tmp_path)?;
-    if let Some(expected) = expected_sha256.as_deref() {
-        if sha256 != expected {
-            let _ = fs::remove_file(&tmp_path);
-            let _ = fs::remove_file(&tmp_url_path);
-            return Err(format!(
-                "SHA256 mismatch for {repo}/{filename} @ {commit}: expected {expected}, got {sha256}"
-            ));
-        }
-    }
     let blob_name = sha256_blob_name(&sha256);
     let blob_path = blobs_dir.join(&blob_name);
 
@@ -589,232 +260,39 @@ fn download_to_hf_cache_at(
     f.write_all(commit.as_bytes())
         .map_err(|e| format!("Failed to write refs/main: {e}"))?;
 
-    let depth = filename.matches('/').count();
-    let mut rel_prefix = String::from("../../");
-    for _ in 0..depth {
-        rel_prefix.push_str("../");
-    }
-    let symlink_target = format!("{rel_prefix}blobs/{blob_name}");
+    let symlink_target = snapshot_symlink_target(filename, &blob_name);
 
     let _ = fs::remove_file(&snapshot_file);
     create_symlink_or_copy(&symlink_target, &snapshot_file, &blob_path)?;
 
     info!(
-        "[HfCache] Cache entry created: {:?} -> {}",
+        "[HfCache] Cache entry created: {:?} -> {:?}",
         snapshot_file, symlink_target
     );
 
     Ok(snapshot_file)
 }
 
-/// Create the HF cache entry for an already-downloaded file (for migration
-/// of legacy non-HF-cache files into the HF cache layout).
-pub fn import_to_hf_cache(
-    existing_path: &Path,
-    repo: &str,
-    filename: &str,
-    commit: &str,
-) -> Result<PathBuf, String> {
-    let cache = hf_cache_dir();
-    let repo_dir = cache.join(repo_to_folder_name(repo));
-    let refs_dir = repo_dir.join("refs");
-    let blobs_dir = repo_dir.join("blobs");
-    let snapshot_dir = repo_dir.join("snapshots").join(commit);
-
-    fs::create_dir_all(&refs_dir).map_err(|e| format!("Failed to create refs dir: {e}"))?;
-    fs::create_dir_all(&blobs_dir).map_err(|e| format!("Failed to create blobs dir: {e}"))?;
-    fs::create_dir_all(&snapshot_dir).map_err(|e| format!("Failed to create snapshot dir: {e}"))?;
-
-    let snapshot_file = snapshot_dir.join(filename);
-    if let Some(parent) = snapshot_file.parent() {
-        if parent != snapshot_dir {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("Failed to create snapshot subdir: {e}"))?;
-        }
-    }
-
-    let sha256 = compute_sha256(existing_path)?;
-    let blob_name = format!("sha256-{sha256}");
-    let blob_path = blobs_dir.join(&blob_name);
-
-    if blob_path.exists() {
-        let _ = fs::remove_file(existing_path);
-    } else {
-        fs::rename(existing_path, &blob_path).or_else(|_| {
-            fs::copy(existing_path, &blob_path)
-                .map_err(|e| format!("Failed to copy file to blob: {e}"))?;
-            let _ = fs::remove_file(existing_path);
-            Ok::<(), String>(())
-        })?;
-    }
-
-    let refs_main = refs_dir.join("main");
-    let mut f =
-        fs::File::create(&refs_main).map_err(|e| format!("Failed to create refs/main: {e}"))?;
-    f.write_all(commit.as_bytes())
-        .map_err(|e| format!("Failed to write refs/main: {e}"))?;
-
-    let depth = filename.matches('/').count();
-    let mut rel_prefix = String::from("../../");
-    for _ in 0..depth {
-        rel_prefix.push_str("../");
-    }
-    let symlink_target = format!("{rel_prefix}blobs/{blob_name}");
-    let _ = fs::remove_file(&snapshot_file);
-    create_symlink_or_copy(&symlink_target, &snapshot_file, &blob_path)?;
-
-    info!(
-        "[HfCache] Imported {:?} -> {:?}",
-        existing_path, snapshot_file
-    );
-
-    Ok(snapshot_file)
-}
-
-// ---------------------------------------------------------------------------
-// Deletion helpers
-// ---------------------------------------------------------------------------
-
-/// Delete a model from the HF cache. Removes the snapshot symlink and the
-/// blob if no other snapshot references it.
-pub fn delete_from_hf_cache(model_path: &Path) -> Result<(), String> {
-    let blob_path = if model_path.is_symlink() {
-        fs::read_link(model_path)
-            .ok()
-            .and_then(|target| model_path.parent().map(|p| p.join(target)))
-            .and_then(|p| fs::canonicalize(p).ok())
-    } else {
-        find_matching_blob(model_path)
-    };
-
-    if model_path.exists() || model_path.is_symlink() {
-        fs::remove_file(model_path).map_err(|e| format!("Failed to remove snapshot entry: {e}"))?;
-        info!("[HfCache] Removed snapshot entry: {:?}", model_path);
-    }
-
-    if let Some(parent) = model_path.parent() {
-        let _ = fs::remove_dir(parent);
-        if let Some(grandparent) = parent.parent() {
-            let _ = fs::remove_dir(grandparent);
-        }
-    }
-
-    if let Some(ref bp) = blob_path {
-        if bp.exists() && !is_blob_referenced_elsewhere(bp)? {
-            fs::remove_file(bp).map_err(|e| format!("Failed to remove blob: {e}"))?;
-            info!("[HfCache] Removed unreferenced blob: {:?}", bp);
-        }
-    }
-
-    Ok(())
-}
-
-/// Delete a model and all its sibling shard files from the HF cache.
-pub fn delete_model_and_shards_from_hf_cache(model_path: &Path) -> Result<(), String> {
-    let snapshot_dir = model_path
-        .parent()
-        .ok_or_else(|| "Cannot determine snapshot directory".to_string())?;
-
-    let model_filename = model_path.file_name().unwrap_or_default().to_string_lossy();
-
-    if let Some(shard_prefix) = extract_shard_prefix(&model_filename) {
-        if let Ok(entries) = fs::read_dir(snapshot_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with(&shard_prefix)
-                    && name.ends_with(".gguf")
-                    && name != *model_filename
-                {
-                    let shard_path = entry.path();
-                    if let Err(e) = delete_from_hf_cache(&shard_path) {
-                        warn!("[HfCache] Failed to delete shard {:?}: {}", shard_path, e);
-                    }
-                }
-            }
-        }
-    }
-
-    delete_from_hf_cache(model_path)
-}
-
-fn extract_shard_prefix(filename: &str) -> Option<String> {
-    let stem = filename.strip_suffix(".gguf")?;
-    let of_idx = stem.rfind("-of-")?;
-    let total = &stem[(of_idx + 4)..];
-    if total.len() != 5 || !total.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    let before_of = &stem[..of_idx];
-    let shard_sep = before_of.rfind('-')?;
-    let shard_num = &before_of[(shard_sep + 1)..];
-    if shard_num.len() != 5 || !shard_num.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some(before_of[..(shard_sep + 1)].to_string())
-}
-
-fn is_blob_referenced_elsewhere(blob_path: &Path) -> Result<bool, String> {
-    let repo_dir = blob_path.parent().and_then(|p| p.parent());
-
-    let repo_dir = match repo_dir {
-        Some(d) => d,
-        None => return Ok(false),
-    };
-
-    let snapshots_dir = repo_dir.join("snapshots");
-    if !snapshots_dir.is_dir() {
-        return Ok(false);
-    }
-
-    let blob_canon = fs::canonicalize(blob_path).unwrap_or_else(|_| blob_path.to_path_buf());
-
-    fn check_dir(dir: &Path, target_blob: &Path) -> Result<bool, String> {
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(_) => return Ok(false),
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if check_dir(&path, target_blob)? {
-                    return Ok(true);
-                }
-            } else if path.is_symlink() {
-                if let Ok(link_target) = fs::read_link(&path) {
-                    let resolved = path.parent().unwrap_or(&path).join(link_target);
-                    if let Ok(canon) = fs::canonicalize(resolved) {
-                        if canon == *target_blob {
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
-
-    check_dir(&snapshots_dir, &blob_canon)
-}
-
-fn find_matching_blob(snapshot_path: &Path) -> Option<PathBuf> {
-    let snapshot_dir = snapshot_path.parent()?;
-    let snapshots_root = snapshot_dir.parent()?;
-    let repo_dir = snapshots_root.parent()?;
-    let blobs_dir = repo_dir.join("blobs");
-    if !blobs_dir.is_dir() {
-        return None;
-    }
-    let hash = compute_sha256(snapshot_path).ok()?;
-    let expected_blob = blobs_dir.join(format!("sha256-{hash}"));
-    expected_blob.exists().then_some(expected_blob)
-}
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// The snapshot file's link to its blob, relative to the snapshot file's
+/// directory (`snapshots/<commit>/` plus one level per `/` in `filename`).
+/// It is built from path components, so it uses the platform's separator.
+fn snapshot_symlink_target(filename: &str, blob_name: &str) -> PathBuf {
+    let mut target = PathBuf::from("..");
+    target.push("..");
+    for _ in 0..filename.matches('/').count() {
+        target.push("..");
+    }
+    target.push("blobs");
+    target.push(blob_name);
+    target
+}
+
 fn create_symlink_or_copy(
-    symlink_target: &str,
+    symlink_target: &Path,
     symlink_path: &Path,
     _blob_path: &Path,
 ) -> Result<(), String> {
@@ -829,12 +307,9 @@ fn create_symlink_or_copy(
         match std::os::windows::fs::symlink_file(symlink_target, symlink_path) {
             Ok(()) => {}
             Err(e) => {
-                warn!(
-                    "[HfCache] Symlink creation failed ({}), falling back to copy",
-                    e
-                );
+                warn!("[HfCache] Symlink creation failed ({e}), falling back to copy");
                 fs::copy(_blob_path, symlink_path)
-                    .map_err(|e| format!("Failed to copy blob to snapshot: {}", e))?;
+                    .map_err(|e| format!("Failed to copy blob to snapshot: {e}"))?;
             }
         }
     }
@@ -842,23 +317,13 @@ fn create_symlink_or_copy(
     #[cfg(not(any(unix, windows)))]
     {
         fs::copy(_blob_path, symlink_path)
-            .map_err(|e| format!("Failed to copy blob to snapshot: {}", e))?;
+            .map_err(|e| format!("Failed to copy blob to snapshot: {e}"))?;
     }
 
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn download_file_to_path(
-    url: &str,
-    dest_path: &Path,
-    on_progress: ProgressCallback<'_>,
-    stage: &str,
-    cancel: Option<&AtomicBool>,
-    bytes_offset: u64,
-    total_override: u64,
-    report_filename: Option<&str>,
-) -> Result<u64, String> {
+fn download_file_to_path(url: &str, dest_path: &Path) -> Result<u64, String> {
     info!("[HfCache] Downloading {} -> {:?}", url, dest_path);
 
     if let Some(parent) = dest_path.parent() {
@@ -880,22 +345,8 @@ fn download_file_to_path(
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match attempt_download(
-            url,
-            dest_path,
-            &client,
-            on_progress,
-            stage,
-            cancel,
-            bytes_offset,
-            total_override,
-            report_filename,
-        ) {
+        match attempt_download(url, dest_path, &client) {
             Ok(bytes) => return Ok(bytes),
-            Err(DownloadAttemptError::Cancelled) => {
-                let _ = fs::remove_file(dest_path);
-                return Err("Download cancelled".to_string());
-            }
             Err(DownloadAttemptError::Fatal(msg)) => {
                 let _ = fs::remove_file(dest_path);
                 return Err(msg);
@@ -910,32 +361,16 @@ fn download_file_to_path(
                     "[HfCache] Transient error on attempt {}/{}: {}. Retrying in {:?}.",
                     attempt, MAX_DOWNLOAD_ATTEMPTS, msg, backoff
                 );
-                let start = Instant::now();
-                while start.elapsed() < backoff {
-                    if let Some(flag) = cancel {
-                        if flag.load(Ordering::Relaxed) {
-                            let _ = fs::remove_file(dest_path);
-                            return Err("Download cancelled".to_string());
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(250));
-                }
+                std::thread::sleep(backoff);
             }
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn attempt_download(
     url: &str,
     dest_path: &Path,
     client: &reqwest::blocking::Client,
-    on_progress: ProgressCallback<'_>,
-    stage: &str,
-    cancel: Option<&AtomicBool>,
-    bytes_offset: u64,
-    total_override: u64,
-    report_filename: Option<&str>,
 ) -> Result<u64, DownloadAttemptError> {
     // Honor any partial file on disk — either retained from a previous
     // process invocation (via the .tmp.url sidecar guarding the call site)
@@ -987,7 +422,7 @@ fn attempt_download(
     }
 
     let resumed = existing_bytes > 0 && status.as_u16() == 206;
-    let (mut file, mut bytes_downloaded, total_bytes) = if resumed {
+    let (mut file, mut bytes_downloaded) = if resumed {
         let file = fs::OpenOptions::new()
             .append(true)
             .open(dest_path)
@@ -1002,24 +437,17 @@ fn attempt_download(
             "[HfCache] Resuming from {} bytes (total {:?})",
             existing_bytes, total
         );
-        (file, existing_bytes, total)
+        (file, existing_bytes)
     } else {
         let file = fs::File::create(dest_path)
             .map_err(|e| DownloadAttemptError::Fatal(format!("Failed to create file: {e}")))?;
-        (file, 0u64, response.content_length().unwrap_or(0))
+        (file, 0u64)
     };
 
     let mut reader = response;
     let mut buf = [0u8; 65536];
-    let mut last_emit = Instant::now();
 
     loop {
-        if let Some(flag) = cancel {
-            if flag.load(Ordering::Relaxed) {
-                return Err(DownloadAttemptError::Cancelled);
-            }
-        }
-
         let n = match reader.read(&mut buf) {
             Ok(n) => n,
             Err(e) => {
@@ -1042,60 +470,9 @@ fn attempt_download(
             )));
         }
         bytes_downloaded += n as u64;
-
-        if last_emit.elapsed() > Duration::from_millis(200) {
-            if let Some(cb) = on_progress {
-                let (effective_downloaded, effective_total) = if total_override > 0 {
-                    (bytes_offset + bytes_downloaded, total_override)
-                } else {
-                    (bytes_downloaded, total_bytes)
-                };
-                let percent = if effective_total > 0 {
-                    (effective_downloaded as f64 / effective_total as f64) * 100.0
-                } else {
-                    0.0
-                };
-                let display_filename =
-                    report_filename.map(|s| s.to_string()).unwrap_or_else(|| {
-                        dest_path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().to_string())
-                            .unwrap_or_default()
-                    });
-                cb(DownloadProgress {
-                    stage: stage.to_string(),
-                    bytes_downloaded: effective_downloaded,
-                    total_bytes: effective_total,
-                    percent,
-                    filename: display_filename,
-                });
-            }
-            last_emit = Instant::now();
-        }
     }
 
     drop(file);
-
-    if total_override == 0 {
-        if let Some(cb) = on_progress {
-            cb(DownloadProgress {
-                stage: stage.to_string(),
-                bytes_downloaded,
-                total_bytes: if total_bytes > 0 {
-                    total_bytes
-                } else {
-                    bytes_downloaded
-                },
-                percent: 100.0,
-                filename: report_filename.map(|s| s.to_string()).unwrap_or_else(|| {
-                    dest_path
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                }),
-            });
-        }
-    }
 
     info!(
         "[HfCache] Download complete: {} bytes -> {:?}",
@@ -1115,7 +492,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_repo_to_folder_name() {
@@ -1126,43 +503,55 @@ mod tests {
     }
 
     #[test]
-    fn test_folder_name_to_repo() {
+    fn the_cache_dir_comes_from_hf_vars_else_home() {
+        let home = Path::new("home");
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
         assert_eq!(
-            folder_name_to_repo("models--unsloth--Qwen3.5-2B-GGUF"),
-            Some("unsloth/Qwen3.5-2B-GGUF".to_string())
+            hf_cache_dir_from(home, vars(&[])).unwrap(),
+            home.join(".cache").join("huggingface").join("hub")
         );
         assert_eq!(
-            folder_name_to_repo("models--meta-llama--Llama-3-8B"),
-            Some("meta-llama/Llama-3-8B".to_string())
+            hf_cache_dir_from(home, vars(&[("HF_HOME", "hf")])).unwrap(),
+            Path::new("hf").join("hub")
         );
         assert_eq!(
-            folder_name_to_repo("models--google-deepmind--gemma-2-9b-it-GGUF"),
-            Some("google-deepmind/gemma-2-9b-it-GGUF".to_string())
+            hf_cache_dir_from(home, vars(&[("HF_HUB_CACHE", "hub"), ("HF_HOME", "hf")])).unwrap(),
+            Path::new("hub")
         );
-        assert_eq!(folder_name_to_repo("not-a-model"), None);
-        assert_eq!(folder_name_to_repo("models--singlepart"), None);
+        assert_eq!(
+            hf_cache_dir_from(home, vars(&[("HF_HUB_CACHE", "")])).unwrap_err(),
+            "HF_HUB_CACHE is set but empty"
+        );
+        assert_eq!(
+            hf_cache_dir_from(home, vars(&[("HF_HOME", "")])).unwrap_err(),
+            "HF_HOME is set but empty"
+        );
     }
 
     #[test]
-    fn test_is_non_first_shard() {
-        assert!(!is_non_first_shard("model.gguf"));
-        assert!(!is_non_first_shard("model-00001-of-00005.gguf"));
-        assert!(is_non_first_shard("model-00002-of-00005.gguf"));
-        assert!(is_non_first_shard("model-00003-of-00005.gguf"));
-    }
-
-    #[test]
-    fn test_extract_shard_prefix() {
-        assert_eq!(
-            extract_shard_prefix("Model-Q4-00001-of-00005.gguf"),
-            Some("Model-Q4-".to_string())
-        );
-        assert_eq!(
-            extract_shard_prefix("Model-Q4-00003-of-00005.gguf"),
-            Some("Model-Q4-".to_string())
-        );
-        assert_eq!(extract_shard_prefix("model.gguf"), None);
-        assert_eq!(extract_shard_prefix("model-Q8_0.gguf"), None);
+    fn a_non_unicode_hf_var_is_an_error_naming_it() {
+        #[cfg(unix)]
+        let bad = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        let error = hf_cache_dir_from(Path::new("home"), |name| {
+            (name == "HF_HOME").then(|| bad.clone())
+        })
+        .unwrap_err();
+        assert_eq!(error, "HF_HOME is not valid unicode");
     }
 
     #[test]
@@ -1203,17 +592,7 @@ mod tests {
             }
         });
 
-        let downloaded = download_file_to_path(
-            &url,
-            &dest_path,
-            None,
-            "download",
-            None,
-            0,
-            0,
-            Some("model.gguf"),
-        )
-        .unwrap();
+        let downloaded = download_file_to_path(&url, &dest_path).unwrap();
 
         server.join().unwrap();
         let recorded = requests.lock().unwrap();
@@ -1227,10 +606,27 @@ mod tests {
     }
 
     #[test]
-    fn test_verified_hf_cache_download_promotes_matching_sha256() {
-        let test_dir = unique_test_dir("verified-download");
+    fn snapshot_symlink_target_uses_native_separators() {
+        let native = |parts: &[&str]| parts.join(std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(
+            snapshot_symlink_target("tokenizer.json", "sha256-ab")
+                .to_str()
+                .unwrap(),
+            native(&["..", "..", "blobs", "sha256-ab"])
+        );
+        assert_eq!(
+            snapshot_symlink_target("onnx/model.onnx", "sha256-ab")
+                .to_str()
+                .unwrap(),
+            native(&["..", "..", "..", "blobs", "sha256-ab"])
+        );
+    }
+
+    #[test]
+    fn test_hf_cache_download_writes_the_blob_ref_and_snapshot() {
+        let test_dir = unique_test_dir("cache-download");
         let cache_dir = test_dir.join("hub");
-        let body = b"verified gguf bytes";
+        let body = b"tokenizer bytes";
         let expected = sha256_hex(body);
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1245,19 +641,20 @@ mod tests {
             &cache_dir,
             &base_url,
             "org/repo",
-            "model.gguf",
+            "tokenizer.json",
             "abc123",
-            Some(&expected),
-            None,
-            "model",
-            None,
-            0,
-            0,
-            Some("model.gguf"),
         )
         .unwrap();
 
         server.join().unwrap();
+        assert_eq!(
+            path,
+            cache_dir
+                .join(repo_to_folder_name("org/repo"))
+                .join("snapshots")
+                .join("abc123")
+                .join("tokenizer.json")
+        );
         assert_eq!(fs::read(&path).unwrap(), body);
         assert_eq!(
             fs::read_to_string(
@@ -1276,73 +673,6 @@ mod tests {
                 .join(format!("sha256-{expected}"))
                 .is_file()
         );
-
-        let _ = fs::remove_dir_all(test_dir);
-    }
-
-    #[test]
-    fn test_verified_hf_cache_download_rejects_sha256_mismatch() {
-        let test_dir = unique_test_dir("verified-download-mismatch");
-        let cache_dir = test_dir.join("hub");
-        let body = b"tampered bytes";
-        let wrong_expected = sha256_hex(b"expected bytes");
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _ = read_http_request(&mut stream);
-            write_http_response(&mut stream, body);
-        });
-
-        let error = download_to_hf_cache_at(
-            &cache_dir,
-            &base_url,
-            "org/repo",
-            "model.gguf",
-            "abc123",
-            Some(&wrong_expected),
-            None,
-            "model",
-            None,
-            0,
-            0,
-            Some("model.gguf"),
-        )
-        .unwrap_err();
-
-        server.join().unwrap();
-        assert!(error.contains("SHA256 mismatch"));
-        assert!(
-            !cache_dir
-                .join(repo_to_folder_name("org/repo"))
-                .join("snapshots")
-                .join("abc123")
-                .join("model.gguf")
-                .exists()
-        );
-        assert!(
-            !cache_dir
-                .join(repo_to_folder_name("org/repo"))
-                .join("blobs")
-                .join(format!("sha256-{wrong_expected}"))
-                .exists()
-        );
-
-        let _ = fs::remove_dir_all(test_dir);
-    }
-
-    #[test]
-    fn test_verify_file_sha256_accepts_prefixed_hex_and_rejects_mismatch() {
-        let test_dir = unique_test_dir("verify-sha");
-        fs::create_dir_all(&test_dir).unwrap();
-        let path = test_dir.join("model.gguf");
-        fs::write(&path, b"model bytes").unwrap();
-        let expected = sha256_hex(b"model bytes");
-
-        verify_file_sha256(&path, &format!("sha256:{expected}")).unwrap();
-        let error = verify_file_sha256(&path, &sha256_hex(b"different")).unwrap_err();
-        assert!(error.contains("SHA256 mismatch"));
 
         let _ = fs::remove_dir_all(test_dir);
     }

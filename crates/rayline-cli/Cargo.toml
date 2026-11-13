@@ -21,23 +21,22 @@ path = "src/main.rs"
 base64 = "0.22"
 crossterm = "0.28"
 clap.workspace = true
-dirs.workspace = true
 minisign-verify = "0.2.5"
 rand = "0.9"
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 tar = "0.4"
+time = { version = "0.3.47", default-features = false, features = ["std", "formatting", "parsing"] }
 tokio.workspace = true
 url = "2"
 rayline-hf = { path = "../rayline-hf" }
 rayline-tokencount = { path = "../rayline-tokencount" }
-rayline-llama = { path = "../rayline-llama" }
 rayline-local-router = { path = "../rayline-local-router" }
-rayline-metrics = { path = "../rayline-metrics" }
+rayline-daemon = { path = "../rayline-daemon" }
 zstd = "0.14"
 toml_edit = "0.25.15"
-xxhash-rust = { version = "=0.8.15", features = ["xxh64"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -46,7 +45,6 @@ libc = "0.2"
 opener = "0.6"
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
-    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",

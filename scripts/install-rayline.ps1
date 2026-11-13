@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "latest",
+    [string]$Version,
     [string]$InstallDir = $(Join-Path $HOME ".rayline\bin")
 )
 
@@ -23,9 +23,9 @@ function Remove-RetiredBackup {
 
 function Remove-RetiredBackups {
     param([string]$Directory)
-    # Only new dot .old names certify a committed replacement. Historical
-    # non-dot .old and all .tmp files can still be needed for recovery.
-    $pattern = '^\.(raydock\.exe|rayline\.exe|rld\.exe|rayline-core\.exe|rayline-core-LICENSE)\.old-[0-9]+-[0-9a-f]+$'
+    # A dot .old name marks a committed replacement. .tmp files can still be
+    # needed for recovery.
+    $pattern = '^\.(raydock\.exe|rayline\.exe|rayline-core\.exe|rayline-core-LICENSE)\.old-[0-9]+-[0-9a-f]+$'
     try {
         Get-ChildItem -LiteralPath $Directory -File -Force | Where-Object { $_.Name -match $pattern } | ForEach-Object {
             Remove-RetiredBackup -Path $_.FullName
@@ -41,46 +41,59 @@ switch ($arch) {
     default { Fail "unsupported Windows architecture: $arch" }
 }
 
-if ($env:RAYLINE_RELEASE_BASE_URL) {
-    $BaseUrl = $env:RAYLINE_RELEASE_BASE_URL.TrimEnd("/")
-} elseif ($Version -eq "latest") {
+if (-not (Get-Command minisign -ErrorAction SilentlyContinue)) {
+    Fail "required command not found: minisign, which verifies the release signature. Install it: https://jedisct1.github.io/minisign/"
+}
+
+if (-not $PSBoundParameters.ContainsKey('Version')) {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
+} elseif ($Version.StartsWith('v')) {
+    Fail "-Version takes a bare version such as 0.2.0, not $Version"
 } else {
-    $Tag = "v$($Version.TrimStart('v'))"
-    $BaseUrl = "https://github.com/$Repo/releases/download/$Tag"
+    $BaseUrl = "https://github.com/$Repo/releases/download/v$Version"
 }
 
 $RaylineAsset = "rayline-$Platform"
-$DaemonAsset = "rld-$Platform"
 $CoreAsset = "rayline-core-$Platform"
 $TempDir = Join-Path ([System.IO.Path]::GetTempPath()) "rayline-install-$PID-$([System.Guid]::NewGuid().ToString('N'))"
 New-Item -ItemType Directory -Force -Path $TempDir | Out-Null
 
 try {
     $SumsPath = Join-Path $TempDir "SHA256SUMS"
+    $SigPath = Join-Path $TempDir "SHA256SUMS.minisig"
     $RaylinePath = Join-Path $TempDir $RaylineAsset
-    $DaemonPath = Join-Path $TempDir $DaemonAsset
     $CorePath = Join-Path $TempDir $CoreAsset
     $LicensePath = Join-Path $TempDir "rayline-core-LICENSE"
 
     Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS" -OutFile $SumsPath
+    Invoke-WebRequest -Uri "$BaseUrl/SHA256SUMS.minisig" -OutFile $SigPath
+
+    # rayline production signing public key (matches MINISIGN_PUBLIC_KEYS in rayline-cli; see RELEASING-SIGNING.md).
+    $PublicKey = "RWRKGvuHHJS76PGzxmnM/1NX8SFhTi3mPj/axsIjv/Ehnw71G4Ei9xb1"
+    & minisign -Vm $SumsPath -P $PublicKey *> $null
+    if ($LASTEXITCODE -ne 0) {
+        Fail "SHA256SUMS signature verification failed. The release may be tampered."
+    }
+    Write-Host "SHA256SUMS signature verified."
+
     Invoke-WebRequest -Uri "$BaseUrl/$RaylineAsset" -OutFile $RaylinePath
-    Invoke-WebRequest -Uri "$BaseUrl/$DaemonAsset" -OutFile $DaemonPath
     Invoke-WebRequest -Uri "$BaseUrl/$CoreAsset" -OutFile $CorePath
     Invoke-WebRequest -Uri "$BaseUrl/rayline-core-LICENSE" -OutFile $LicensePath
 
-    $Expected = @{}
-    foreach ($Line in Get-Content $SumsPath) {
-        $Parts = $Line.Trim() -split "\s+"
-        if ($Parts.Length -ge 2) {
-            $Expected[$Parts[1].TrimStart("*")] = $Parts[0].ToLowerInvariant()
+    # Each line is "<sha256>  <name>", as the release's sha256sum writes it.
+    $Entries = foreach ($Line in Get-Content $SumsPath) {
+        if ($Line -cnotmatch '^([0-9a-f]{64})  (\S+)$') {
+            Fail "malformed line in release checksums: $Line"
         }
+        [pscustomobject]@{ Name = $Matches[2]; Hash = $Matches[1] }
     }
-
-    foreach ($Asset in @($RaylineAsset, $DaemonAsset, $CoreAsset, "rayline-core-LICENSE")) {
-        if (-not $Expected.ContainsKey($Asset)) {
-            Fail "release checksums do not include $Asset"
+    $Expected = @{}
+    foreach ($Asset in @($RaylineAsset, $CoreAsset, "rayline-core-LICENSE")) {
+        $Found = @($Entries | Where-Object { $_.Name -eq $Asset })
+        if ($Found.Count -ne 1) {
+            Fail "release checksums must include exactly one entry for $Asset"
         }
+        $Expected[$Asset] = $Found[0].Hash
         $Path = Join-Path $TempDir $Asset
         $Actual = (Get-FileHash -Algorithm SHA256 -Path $Path).Hash.ToLowerInvariant()
         if ($Actual -ne $Expected[$Asset]) {
@@ -118,7 +131,6 @@ try {
         # The previous image can still be running. A later installer or update
         # deletes committed .old backups; this invocation only marks them.
     }
-    Copy-Item -Force $DaemonPath (Join-Path $InstallDir "rld.exe")
     Copy-Item -Force $CorePath (Join-Path $InstallDir "rayline-core.exe")
 
     Write-Host "Installed Raydock to $InstallDir"

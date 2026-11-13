@@ -1,148 +1,96 @@
-//! `raydock codex app` — launch the Codex **desktop app** routed through Rayline.
+//! `rayline run codex app`: launch the Codex desktop app on ARC through the
+//! Rayline router.
 //!
-//! Mirrors `raydock codex` (same `--config`/`--auth`/`--model` flags, same
-//! router-daemon path) but targets the desktop app instead of the CLI. The
-//! desktop app-server differs from the CLI in two ways that shape this module:
+//! Takes the same `--model` flag as `rayline run codex` and points the app at
+//! the same `rayline` provider. The desktop app-server differs from the
+//! CLI in two ways that shape this module:
 //!
-//! 1. It **ignores `-c` overrides** — it only reads persistent config from its
-//!    `CODEX_HOME`. So we materialize the Rayline provider into a `config.toml`
-//!    inside an isolated `CODEX_HOME` (`~/.rayline/codex-app-home`) rather than
-//!    passing `-c` flags.
+//! 1. It reads persistent config only from its `CODEX_HOME`, so the provider
+//!    goes into the `config.toml` of an app home of its own
+//!    (`~/.rayline/harness/codex-app`).
 //! 2. It is **single-instance per machine**, locked to the `CODEX_HOME` its
 //!    app-server first spawned with. A second `codex app` launch just focuses
 //!    the existing window. So if an app-server is already running on a different
-//!    home, we must prompt the user to quit + relaunch under the Rayline home.
+//!    home, the user is asked to quit and relaunch it on the Rayline home. The
+//!    running app-server is found with `pgrep` and `ps`, so this check runs on
+//!    unix only.
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::ExitCode;
 
 use toml_edit::{DocumentMut, Item, Table, TomlError, Value};
-
-use crate::codex::{
-    CodexAuthMode, EffectiveCodexAuthMode, default_rayline_base_url, rayline_provider_config_toml,
-};
-
-const CODEX_APP_HOME_DIR: &str = "codex-app-home";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppRunRequest {
     pub model: Option<String>,
-    pub config_path: Option<PathBuf>,
-    pub auth_mode: CodexAuthMode,
     /// Extra args passed through to `codex app` (e.g. a workspace path).
     pub codex_args: Vec<OsString>,
-    pub root_env_explicit: bool,
-    /// Hosted environment override (`--env`) for router-key provisioning.
-    pub env_name: Option<String>,
-    /// Account bearer (`--auth-token`) for minting/reading the `rlk-` key.
-    pub auth_token: Option<String>,
+    /// The hosted environment the loaded config selects, whose router the
+    /// app talks to.
+    pub hosted: crate::status::HostedEnvironment,
 }
 
-pub async fn run(mut request: AppRunRequest) -> ExitCode {
-    // Default (no `--config`, auto auth) to Rc-Rc — route everything to the hosted
-    // cloud RCR, mirroring `raydock claude` and `raydock codex`. Shared resolver
-    // so the default is defined once.
-    match crate::codex::resolve_codex_config_path_from_home(
-        request.config_path.take(),
-        request.auth_mode,
-        request.env_name.as_deref(),
-        request.auth_token.as_deref(),
-        request.root_env_explicit,
-    )
-    .await
-    {
-        Ok(path) => request.config_path = path,
-        Err(error) => {
-            eprintln!("Error: failed to prepare the default Raydock Codex config: {error}");
-            return ExitCode::from(1);
-        }
-    }
-    // 1. Start/ensure the Rayline router — identical path to `raydock codex`.
-    let router_api_key_override = crate::codex::resolve_cloud_router_key(
-        request.config_path.as_deref(),
-        request.env_name.as_deref(),
-        request.auth_token.as_deref(),
-        request.root_env_explicit,
-    )
-    .await;
-    let start_request = crate::router::RouterStartCliRequest {
-        api_mode: crate::router::ROUTER_API_MODE_CODEX.to_owned(),
-        proxy_routing_mode: crate::router::PROXY_ROUTING_MODE_ALL.to_owned(),
-        config_path: request.config_path.clone(),
-        codex_auth_mode: request.auth_mode,
-        root_env_explicit: request.root_env_explicit,
-        router_api_key_override,
-    };
-    if let Err(error) = crate::router::start_from_cli(&start_request).await {
-        eprintln!("Error: failed to start Raydock Codex router: {error}");
-        return ExitCode::from(1);
-    }
-    eprintln!(
-        "Raydock Codex router ready at http://127.0.0.1:{}/v1",
-        crate::router::DEFAULT_LOCAL_ROUTER_PORT
-    );
+pub async fn run(request: AppRunRequest) -> ExitCode {
+    let provider =
+        match crate::codex::resolve_provider(request.model.as_deref(), &request.hosted).await {
+            Ok(provider) => provider,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return ExitCode::from(1);
+            }
+        };
 
-    // 2. Compute the config we WOULD write — no filesystem changes yet, so a
+    // 1. Compute the config to write. Nothing changes on disk yet, so a
     //    declined restart below leaves everything untouched.
-    let home = match isolated_home_path() {
+    let user_home = match crate::home() {
         Ok(home) => home,
         Err(error) => {
             eprintln!("Error: failed to resolve Codex app home: {error}");
             return ExitCode::from(1);
         }
     };
-    let subscription_auth = request
-        .auth_mode
-        .effective_for_run(request.config_path.as_ref())
-        == EffectiveCodexAuthMode::Subscription;
-    // Present the Rayline provider to the desktop app as OpenAI-authed whenever we
-    // can. That is what makes Codex use the provider's /models and show the clean
-    // "Raydock Auto" entry in the picker instead of "Custom" + its built-in GPT
-    // presets. This is presentation only — it does NOT change where the prompt
-    // goes: the router config decides that. Under the Rc-Rc default the request
-    // routes to the hosted RCR with your `rlk-` key (the endpoint is not
-    // `client_bearer`, so the ChatGPT token Codex attaches is stripped and
-    // replaced with the router key upstream). We enable it for subscription, and
-    // for the Rc-Rc default only when a ChatGPT login already exists to attach —
-    // `--auth none` (local) stays plain, and a user with no ChatGPT login keeps
-    // the working-but-plain picker rather than being forced into a login.
-    let openai_presentation =
-        subscription_auth || (request.auth_mode == CodexAuthMode::Auto && chatgpt_auth_available());
-    let config = generate_config(&request, openai_presentation);
+    let home = isolated_home_path(&user_home);
+    let config = crate::codex::provider_config_toml(&provider);
 
-    // 3. Reconcile the single-instance app-server. The comparison basis is the
-    //    running app-server's OWN loaded config (its CODEX_HOME/config.toml),
-    //    not our isolated file — that's what it actually loaded at startup.
-    match reconcile_running_app(&home, &config) {
+    // 2. Reconcile the single-instance app-server (unix only). The comparison
+    //    basis is the running app-server's OWN loaded config (its
+    //    CODEX_HOME/config.toml), not our isolated file: that's what it
+    //    actually loaded at startup.
+    #[cfg(unix)]
+    let write = match reconcile_running_app(&home, &config) {
         ReconcileOutcome::AlreadyCurrent => {
             // Config already matches; don't rewrite. Still launch so `codex app`
             // focuses the window / opens the requested workspace.
             eprintln!("The Codex app is already using Raydock. Bringing it to the front.");
+            false
         }
         ReconcileOutcome::Cancelled => {
             eprintln!("Leaving the Codex app as it is.");
             return ExitCode::SUCCESS;
         }
-        ReconcileOutcome::Proceed => {
-            // No conflicting app, or the user agreed to restart: write config now.
-            if let Err(error) = write_isolated_home(&home, &config, openai_presentation) {
-                eprintln!("Error: failed to prepare Codex app home: {error}");
-                return ExitCode::from(1);
-            }
-        }
+        // No conflicting app, or the user agreed to restart.
+        ReconcileOutcome::Proceed => true,
+    };
+    #[cfg(not(unix))]
+    let write = true;
+    if write && let Err(error) = write_codex_home(&home, &config) {
+        eprintln!("Error: failed to prepare Codex app home: {error}");
+        return ExitCode::from(1);
     }
 
-    // 4. Launch (or focus) the Codex app on the isolated home.
+    // 3. Launch (or focus) the Codex app on the isolated home.
     let mut command = crate::codex::codex_command();
     command.env("CODEX_HOME", &home).arg("app");
     command.args(&request.codex_args);
     match command.status() {
-        // A missing code means the child was killed by a signal — treat it as
-        // failure (matching the Codex CLI path), not silent success.
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Ok(status) => crate::child_exit_code(status),
         Err(error) => {
             eprintln!("raydock: failed to launch codex app: {error}");
             ExitCode::from(127)
@@ -150,48 +98,43 @@ pub async fn run(mut request: AppRunRequest) -> ExitCode {
     }
 }
 
-/// Whether a ChatGPT `auth.json` exists in the user's real Codex home. Gates the
-/// OpenAI-authed presentation for the Rc-Rc default: with a login we can attach a
-/// token (so Codex shows the clean picker), without one we must not force a login.
-fn chatgpt_auth_available() -> bool {
-    user_codex_home()
-        .map(|home| home.join("auth.json").exists())
-        .unwrap_or(false)
-}
-
-/// Resolve the user's real Codex home (`$CODEX_HOME` or `~/.codex`), used as the
-/// source of `auth.json`.
+/// Resolve the user's real Codex home (`$CODEX_HOME` or `~/.codex`), whose
+/// `config.toml` tables seed a new Rayline Codex home.
 fn user_codex_home() -> io::Result<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))
+    match crate::harness::exported_dir("CODEX_HOME")? {
+        Some(codex_home) => Ok(codex_home),
+        None => Ok(crate::home()
+            .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?
+            .join(".codex")),
+    }
 }
 
-/// The stable isolated home Rayline points the desktop app at.
-fn isolated_home_path() -> io::Result<PathBuf> {
-    let base = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    Ok(base.join(crate::DOT_CONFIG_DIR).join(CODEX_APP_HOME_DIR))
+/// The stable isolated home Rayline points the desktop app at:
+/// `~/.rayline/harness/codex-app`.
+fn isolated_home_path(home: &Path) -> PathBuf {
+    home.join(crate::DOT_CONFIG_DIR)
+        .join("harness")
+        .join("codex-app")
 }
 
 /// Root keys the generated Rayline snippet owns. Together with the
-/// `[model_providers.rayline]` table these are the only parts of the isolated
-/// `config.toml` Rayline ever writes; everything else in the file belongs to the
-/// Codex desktop app or the user.
-const RAYLINE_ROOT_KEYS: [&str; 3] = ["model", "model_provider", "forced_login_method"];
+/// `[model_providers.rayline]` table these are the only parts of a Rayline
+/// Codex home's `config.toml` Rayline ever writes; everything else in the file
+/// belongs to Codex or the user.
+const RAYLINE_ROOT_KEYS: [&str; 2] = ["model", "model_provider"];
 const MODEL_PROVIDERS_TABLE: &str = "model_providers";
 const RAYLINE_PROVIDER: &str = "rayline";
 
 /// True when the existing `config.toml` does not already carry the Rayline
-/// settings of the `generated` snippet (a changed `--model`/`--auth`/base-url,
+/// settings of the `generated` snippet (a changed `--model`, key or base URL,
 /// a missing table, …). Compared on content, not text: the desktop app
 /// re-serialises this file (line endings, trailing newline, spacing, key order)
 /// and none of that is a setting. An unparsable file also differs — rewriting
 /// is the only way to repair it.
+#[cfg(unix)]
 fn generated_config_differs(existing: &str, generated: &str) -> bool {
     let (Ok(doc), Ok(generated)) = (
-        parse_isolated_config(existing),
+        existing.parse::<DocumentMut>(),
         generated.parse::<DocumentMut>(),
     ) else {
         return true;
@@ -202,50 +145,75 @@ fn generated_config_differs(existing: &str, generated: &str) -> bool {
         || !provider_table_current(&doc, &generated)
 }
 
-/// Render the Rayline `config.toml` snippet for the desktop app from the run
-/// flags. Pure — no filesystem effects, so it can be compared against a running
-/// app-server's config before deciding whether to write/restart.
-fn generate_config(request: &AppRunRequest, subscription_auth: bool) -> String {
-    let model = request
-        .model
-        .as_deref()
-        .unwrap_or(crate::codex::CODEX_DEFAULT_SENTINEL_MODEL);
-    let base_url = default_rayline_base_url();
-    rayline_provider_config_toml(model, &base_url, subscription_auth)
-}
-
-/// Write the isolated `CODEX_HOME`: `config.toml` (the Rayline settings merged
-/// into whatever the file already holds) plus an `auth.json` link. Called only
-/// after we're committed to launching, so a declined restart never mutates the
-/// home.
-///
-/// `auth.json` is linked only when auth resolves to subscription — a `--auth
-/// none` / local-only run must not run the desktop app with the user's Codex
-/// credentials, so any existing link is removed instead.
-fn write_isolated_home(home: &Path, config: &str, subscription_auth: bool) -> io::Result<()> {
-    fs::create_dir_all(home)?;
+/// Write a Rayline Codex home (`rayline run codex`'s or the desktop app's): its
+/// `config.toml` is the Rayline settings merged into whatever the file already
+/// holds, written owner-only since it holds the router key. The app writes
+/// this only after the launch is committed, so a declined restart never changes
+/// the home.
+pub(crate) fn write_codex_home(home: &Path, config: &str) -> io::Result<()> {
     let config_path = home.join("config.toml");
     // The document to merge into:
-    //  - the isolated config.toml when it exists (the Codex desktop app persists
-    //    its own settings there: [desktop], [projects], …),
+    //  - the home's config.toml when it exists (Codex persists its own settings
+    //    there: [desktop], [projects], …),
     //  - on first creation, the tables of the user's main Codex config.toml,
     //  - otherwise nothing.
-    let existing = match fs::read_to_string(&config_path) {
-        Ok(read_value) => read_value,
-        Err(_) => user_codex_home()
-            .ok()
-            .and_then(|h| fs::read_to_string(h.join("config.toml")).ok())
-            .map(|seed| seed_tables(&seed))
-            .unwrap_or_default(),
+    // Only a missing file counts as absent; any other read or parse error fails
+    // with the path.
+    let current = read_if_present(&config_path)?;
+    let existing = match &current {
+        Some(text) => text.clone(),
+        None => {
+            let seed_path = user_codex_home()?.join("config.toml");
+            match read_if_present(&seed_path)? {
+                Some(seed) => seed_tables(&seed)
+                    .map_err(|error| toml_parse_error(&seed_path, &seed, &error))?,
+                None => String::new(),
+            }
+        }
     };
-    let merged = apply_rayline_settings(&existing, config).map_err(|error| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: {error}", config_path.display()),
-        )
-    })?;
-    fs::write(&config_path, merged)?;
-    link_auth_json(home, subscription_auth)
+    let merged = apply_rayline_settings(&existing, config)
+        .map_err(|error| toml_parse_error(&config_path, &existing, &error))?;
+    crate::harness::write_files(
+        home,
+        &[crate::harness::ConfigFile {
+            name: "config.toml",
+            contents: merged,
+            overwrite: true,
+            merged_from: current,
+        }],
+    )
+}
+
+/// An `InvalidData` error naming `path`, the line of `text` that fails to
+/// parse and the parser's message. It never quotes `text`: a Codex config line
+/// can hold a credential.
+fn toml_parse_error(path: &Path, text: &str, error: &TomlError) -> io::Error {
+    let line = error
+        .span()
+        .and_then(|span| text.get(..span.start))
+        .map(|before| format!(" line {}", before.matches('\n').count() + 1))
+        .unwrap_or_default();
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "{}{line}: invalid TOML: {}",
+            path.display(),
+            error.message().trim_end()
+        ),
+    )
+}
+
+/// The contents of `path`, or `None` when it does not exist. Any other read
+/// error fails with the path.
+fn read_if_present(path: &Path) -> io::Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(io::Error::new(
+            error.kind(),
+            format!("{}: {error}", path.display()),
+        )),
+    }
 }
 
 /// Merge the Rayline-owned settings of the `generated` snippet into `existing`
@@ -258,7 +226,7 @@ fn write_isolated_home(home: &Path, config: &str, subscription_auth: bool) -> io
 /// own), so the Rayline settings cannot be assumed to be a prefix or to be
 /// anywhere in particular.
 fn apply_rayline_settings(existing: &str, generated: &str) -> Result<String, TomlError> {
-    let mut doc = parse_isolated_config(existing)?;
+    let mut doc: DocumentMut = existing.parse()?;
     let generated: DocumentMut = generated.parse()?;
     for key in RAYLINE_ROOT_KEYS {
         if root_key_current(&doc, &generated, key) {
@@ -292,7 +260,7 @@ fn apply_rayline_settings(existing: &str, generated: &str) -> Result<String, Tom
 }
 
 /// Whether `doc` already holds the generated snippet's value for an owned root
-/// key — including "absent in both" (e.g. `forced_login_method` on `--auth none`).
+/// key, including "absent in both".
 fn root_key_current(doc: &DocumentMut, generated: &DocumentMut, key: &str) -> bool {
     doc.get(key).and_then(Item::as_str) == generated.get(key).and_then(Item::as_str)
 }
@@ -312,18 +280,6 @@ fn rayline_provider_table(doc: &DocumentMut) -> Option<&Table> {
     doc.get(MODEL_PROVIDERS_TABLE)
         .and_then(|providers| providers.get(RAYLINE_PROVIDER))
         .and_then(Item::as_table)
-}
-
-/// Parse an isolated `config.toml`. A file left with two
-/// `[model_providers.rayline]` tables by an earlier Rayline release fails to
-/// parse; drop every copy textually and retry, since the merge re-emits the
-/// table anyway. Any other error is the caller's to surface.
-fn parse_isolated_config(existing: &str) -> Result<DocumentMut, TomlError> {
-    existing.parse().or_else(|error| {
-        strip_rayline_provider_table(existing)
-            .parse()
-            .map_err(|_| error)
-    })
 }
 
 /// A table's key/value pairs rendered with formatting reset and keys sorted, so
@@ -346,103 +302,16 @@ fn canonical(table: &Table) -> String {
 /// config on first creation (`[mcp_servers]`, `[projects]`, …). Root keys are
 /// dropped: the ones we own are overridden anyway, and the rest (`profile`,
 /// `notify`, …) can change routing or run commands and are not carried over
-/// silently. An unparsable or empty seed contributes nothing.
-fn seed_tables(seed: &str) -> String {
-    let Ok(mut doc) = seed.parse::<DocumentMut>() else {
-        return String::new();
-    };
+/// silently. An unparsable seed is an error; an empty one contributes nothing.
+fn seed_tables(seed: &str) -> Result<String, TomlError> {
+    let mut doc = seed.parse::<DocumentMut>()?;
     doc.retain(|_, item| {
         item.is_array_of_tables() || item.as_table().is_some_and(|table| !table.is_dotted())
     });
-    doc.to_string()
-}
-
-/// Remove every `[model_providers.rayline]` table (its header through the line
-/// before the next table header / EOF) from `text`.
-fn strip_rayline_provider_table(text: &str) -> String {
-    let mut out = String::new();
-    let mut skipping = false;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
-            // A new table header ends any table we were skipping.
-            skipping = trimmed.trim_end() == "[model_providers.rayline]";
-        }
-        if !skipping {
-            out.push_str(line);
-        }
-    }
-    out
-}
-
-/// Reconcile the isolated `<home>/auth.json` for the effective auth mode.
-///
-/// The isolated `auth.json` can be either a **symlink** we created (points at the
-/// user's real one) or a **regular file** the desktop app wrote when the user
-/// logged in inside the app. Those must be treated differently so we never delete
-/// the user's only credentials:
-///
-///  - Subscription, source present → (re)link to the source. A prior symlink or
-///    file is replaced; the source is the fresher truth.
-///  - Subscription, source absent → keep a regular `auth.json` the app wrote
-///    (the user's only credentials); only remove a *symlink* (it's stale, pointing
-///    nowhere useful).
-///  - Auth disabled (`--auth none` / local) → remove any isolated `auth.json`
-///    (symlink or file) so the app doesn't run with the user's credentials.
-fn link_auth_json(home: &Path, subscription_auth: bool) -> io::Result<()> {
-    let link = home.join("auth.json");
-    if !subscription_auth {
-        return remove_if_present(&link);
-    }
-    let source = user_codex_home()?.join("auth.json");
-    reconcile_auth_link(&source, &link)
-}
-
-/// Make `link` reflect `source` for the subscription path:
-///  - source exists → replace `link` with a symlink to it;
-///  - source absent → keep a regular-file `link` (app-written credentials), but
-///    drop a dangling symlink.
-fn reconcile_auth_link(source: &Path, link: &Path) -> io::Result<()> {
-    let existing = fs::symlink_metadata(link).ok();
-    let is_symlink = existing.as_ref().is_some_and(|meta| meta.is_symlink());
-
-    if source.exists() {
-        if existing.is_some() {
-            fs::remove_file(link)?;
-        }
-        return symlink_file(source, link);
-    }
-    // No source: a symlink here is stale → remove it; a real file is the user's
-    // desktop-app login → keep it.
-    if is_symlink {
-        fs::remove_file(link)?;
-    }
-    Ok(())
-}
-
-/// Remove `path` if it exists (file or symlink); no-op if absent.
-fn remove_if_present(path: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => fs::remove_file(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
+    Ok(doc.to_string())
 }
 
 #[cfg(unix)]
-fn symlink_file(source: &Path, link: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(source, link)
-}
-
-#[cfg(windows)]
-fn symlink_file(source: &Path, link: &Path) -> io::Result<()> {
-    // Windows symlinks need privilege; fall back to a copy if the link fails.
-    match std::os::windows::fs::symlink_file(source, link) {
-        Ok(()) => Ok(()),
-        Err(_) => fs::copy(source, link).map(|_| ()),
-    }
-}
-
 enum ReconcileOutcome {
     /// No conflicting app-server, or the user agreed to restart — safe to write
     /// config and launch.
@@ -461,8 +330,9 @@ enum ReconcileOutcome {
 /// loaded config — the `config.toml` in *its* `CODEX_HOME` (which the app wrote
 /// to its home at launch), not our isolated file. Restart when the app is on a
 /// different home, or on our home but its loaded config no longer matches what
-/// we'd generate; otherwise a rerun with new `--model`/`--auth` would silently
-/// keep the old config.
+/// we'd generate; otherwise a rerun with a new `--model` would silently keep
+/// the old config.
+#[cfg(unix)]
 fn reconcile_running_app(home: &Path, config: &str) -> ReconcileOutcome {
     let Some(app) = find_running_app_server() else {
         return ReconcileOutcome::Proceed;
@@ -490,6 +360,7 @@ fn reconcile_running_app(home: &Path, config: &str) -> ReconcileOutcome {
 /// settings. Reads the `config.toml` in the app's own
 /// `CODEX_HOME` — what it actually loaded at startup. Unreadable ⇒ treat as a
 /// mismatch (safer to restart than to leave it stale).
+#[cfg(unix)]
 fn running_app_config_matches(app: &RunningApp, config: &str) -> bool {
     let Some(home) = app.codex_home.as_deref() else {
         return false;
@@ -500,6 +371,7 @@ fn running_app_config_matches(app: &RunningApp, config: &str) -> bool {
     }
 }
 
+#[cfg(unix)]
 struct RunningApp {
     pid: u32,
     codex_home: Option<String>,
@@ -511,6 +383,7 @@ struct RunningApp {
 /// on macOS (`Codex.app` on installs predating the rename) and `codex
 /// app-server` elsewhere — distinct from the GUI parent and the renderer/GPU
 /// helpers. We key off the `app-server` token, so the bundle name is incidental.
+#[cfg(unix)]
 fn find_running_app_server() -> Option<RunningApp> {
     let pid = pgrep_app_server()?;
     Some(RunningApp {
@@ -527,6 +400,7 @@ fn find_running_app_server() -> Option<RunningApp> {
 /// (procps) `-l` prints only the process name even with `-f`, dropping the
 /// `app-server` token. So `pgrep -f` gives us candidate pids, then we read each
 /// one's full argv from a portable per-pid source and keep the app-server.
+#[cfg(unix)]
 fn pgrep_app_server() -> Option<u32> {
     let output = Command::new("pgrep").arg("-f").arg("codex").output().ok()?;
     if !output.status.success() {
@@ -539,7 +413,8 @@ fn pgrep_app_server() -> Option<u32> {
 }
 
 /// Read a process's full command line. Linux: `/proc/<pid>/cmdline` (NUL-joined
-/// argv). macOS: `ps -p <pid> -o command=`. Mirrors `router::process_argv`.
+/// argv). macOS: `ps -p <pid> -o command=`.
+#[cfg(unix)]
 fn process_argv(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -568,6 +443,7 @@ fn process_argv(pid: u32) -> Option<String> {
 /// `app-server` subcommand token, which the CLI (`codex`, `codex resume`) and
 /// the renderer/GPU helpers never carry. Robust to injected `-c` flags between
 /// the binary and the subcommand.
+#[cfg(unix)]
 fn is_app_server_argv(argv: &str) -> bool {
     argv.split_whitespace().any(|tok| tok == "app-server")
 }
@@ -576,6 +452,7 @@ fn is_app_server_argv(argv: &str) -> bool {
 ///
 /// Linux: `/proc/<pid>/environ`. macOS: `ps eww` (the `e` flag appends the
 /// environment to the command line). Mirrors `claude_daemon::read_process_env`.
+#[cfg(unix)]
 fn read_codex_home_env(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -614,6 +491,7 @@ fn read_codex_home_env(pid: u32) -> Option<String> {
 
 /// Prompt `[y/N]` on the terminal. Defaults to "no" on non-interactive stdin or
 /// any read error, so we never restart the user's app without explicit consent.
+#[cfg(unix)]
 fn confirm_restart() -> bool {
     if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
         eprintln!("Not an interactive terminal; leaving the running Codex app as-is.");
@@ -632,6 +510,7 @@ fn confirm_restart() -> bool {
 
 /// Quit the running Codex desktop app. macOS: `osascript ... quit` (clean app
 /// teardown). Elsewhere: SIGTERM the app-server process.
+#[cfg(unix)]
 fn quit_running_app(app: &RunningApp) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -654,18 +533,9 @@ fn quit_running_app(app: &RunningApp) -> io::Result<()> {
     {
         signal_term(app.pid)?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = app;
-        return Err(io::Error::other(
-            "quitting a running Codex app is not supported on this platform",
-        ));
-    }
-
     // Wait for the app-server to actually exit before we relaunch. Launching
     // while the single instance is still tearing down races its own app
     // management and can leave the app in a bad state.
-    #[cfg(unix)]
     if wait_for_exit() {
         Ok(())
     } else {
@@ -673,8 +543,6 @@ fn quit_running_app(app: &RunningApp) -> io::Result<()> {
             "the Codex app did not close in time; not relaunching",
         ))
     }
-    #[cfg(not(unix))]
-    Ok(())
 }
 
 /// Send `SIGTERM` to a pid.
@@ -705,6 +573,7 @@ fn wait_for_exit() -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn app_server_argv_matches_despite_injected_flags() {
         // Regression: Codex injects `-c` flags between the binary and the
@@ -721,23 +590,25 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn config_unchanged_when_settings_present_whatever_the_app_layout() {
         // Same settings, but the app moved [tools] above our table, added its own
         // root key and re-serialised our table (order, spacing): still "unchanged".
-        let existing = "model = \"rayline-local\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nwire_api=\"responses\"\nname = \"Rayline\"\nbase_url =   \"http://127.0.0.1:20811/v1\"\n\n[desktop]\nx = 1\n";
+        let existing = "model = \"arc-sage-1.0\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nwire_api=\"responses\"\nname = \"Rayline\"\nbase_url =   \"https://api.rayline.ai/v1\"\nexperimental_bearer_token = \"rlk-test-not-a-real-key\"\n\n[desktop]\nx = 1\n";
         assert!(!generated_config_differs(
             existing,
-            &snippet("rayline-local", false)
+            &snippet("arc-sage-1.0")
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn running_app_config_matches_reads_the_apps_own_home() {
         // The comparison basis is the running app-server's CODEX_HOME/config.toml
         // (what it loaded), with the app's own sections tolerated.
         let dir = unique_tmp_dir("running-match");
-        let generated = snippet("rayline-local", false);
+        let generated = snippet("arc-sage-1.0");
         fs::write(
             dir.join("config.toml"),
             format!("{generated}\n[desktop]\nx = 1\n"),
@@ -750,13 +621,11 @@ mod tests {
         assert!(running_app_config_matches(&app, &generated));
 
         // A changed model no longer matches.
-        assert!(!running_app_config_matches(
-            &app,
-            &snippet("gpt-5.5", false)
-        ));
+        assert!(!running_app_config_matches(&app, &snippet("gpt-5.5")));
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn running_app_config_mismatch_when_home_unknown_or_no_file() {
         // No CODEX_HOME on the process, or no config.toml → treat as mismatch
@@ -776,109 +645,17 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn config_changed_when_model_or_auth_differs() {
-        let existing = format!(
-            "{}\n[mcp_servers.x]\ny = 1\n",
-            snippet("rayline-local", false)
-        );
+    fn config_changed_when_model_or_key_differs() {
+        let existing = format!("{}\n[mcp_servers.x]\ny = 1\n", snippet("arc-sage-1.0"));
+        assert!(generated_config_differs(&existing, &snippet("gpt-5.5")));
+        let mut provider = crate::codex::tests::provider("arc-sage-1.0");
+        provider.key = "rlk-test-another-key".to_owned();
         assert!(generated_config_differs(
             &existing,
-            &snippet("gpt-5.5", false)
+            &crate::codex::provider_config_toml(&provider)
         ));
-        assert!(generated_config_differs(
-            &existing,
-            &snippet("rayline-local", true)
-        ));
-    }
-
-    #[test]
-    fn auth_link_removed_when_source_absent() {
-        // A prior run linked auth.json; the current home has none. The stale link
-        // must be cleared so the isolated app can't reuse old credentials.
-        let dir = unique_tmp_dir("auth-absent");
-        let link = dir.join("auth.json");
-        let stale_source = dir.join("old-auth.json");
-        fs::write(&stale_source, "OLD").unwrap();
-        symlink_file(&stale_source, &link).unwrap();
-        assert!(link.exists());
-
-        let missing_source = dir.join("no-such-auth.json");
-        reconcile_auth_link(&missing_source, &link).unwrap();
-
-        assert!(!link.exists(), "stale link must be removed");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn auth_link_points_at_current_source() {
-        let dir = unique_tmp_dir("auth-present");
-        let link = dir.join("auth.json");
-        let source = dir.join("real-auth.json");
-        fs::write(&source, "TOKEN").unwrap();
-
-        reconcile_auth_link(&source, &link).unwrap();
-
-        assert_eq!(fs::read_to_string(&link).unwrap(), "TOKEN");
-        assert_eq!(fs::read_link(&link).unwrap(), source);
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn desktop_written_auth_file_kept_when_source_absent() {
-        // The user logged in inside the desktop app, which wrote a REAL auth.json
-        // in the isolated home. With no source auth (main home never logged in),
-        // subscription reconcile must NOT delete it — that's their only credential.
-        let dir = unique_tmp_dir("auth-desktop-file");
-        let link = dir.join("auth.json");
-        fs::write(&link, "DESKTOP_TOKEN").unwrap(); // regular file, not a symlink
-
-        let missing_source = dir.join("no-such-auth.json");
-        reconcile_auth_link(&missing_source, &link).unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&link).unwrap(),
-            "DESKTOP_TOKEN",
-            "app-written auth file must be preserved"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn no_auth_mode_removes_desktop_written_auth_file() {
-        // --auth none is an explicit opt-out: even a real app-written auth.json
-        // is removed so the app doesn't run with the user's credentials.
-        let dir = unique_tmp_dir("auth-none-file");
-        let link = dir.join("auth.json");
-        fs::write(&link, "DESKTOP_TOKEN").unwrap();
-
-        link_auth_json(&dir, false).unwrap();
-
-        assert!(
-            fs::symlink_metadata(&link).is_err(),
-            "no-auth must remove even a real auth file"
-        );
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn no_auth_mode_removes_link_and_creates_none() {
-        // --auth none must not expose the user's Codex credentials: an existing
-        // link is removed and no new one is created.
-        let dir = unique_tmp_dir("auth-none");
-        let link = dir.join("auth.json");
-        let stale = dir.join("stale-auth.json");
-        fs::write(&stale, "OLD").unwrap();
-        symlink_file(&stale, &link).unwrap();
-        assert!(link.exists());
-
-        link_auth_json(&dir, false).unwrap();
-
-        assert!(
-            fs::symlink_metadata(&link).is_err(),
-            "auth.json must be absent under no-auth"
-        );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     fn unique_tmp_dir(tag: &str) -> PathBuf {
@@ -889,16 +666,16 @@ mod tests {
         dir
     }
 
-    /// The snippet `generate_config` renders for a run: subscription on/off.
-    fn snippet(model: &str, subscription: bool) -> String {
-        rayline_provider_config_toml(model, &default_rayline_base_url(), subscription)
+    /// The snippet a run generates for `model`.
+    fn snippet(model: &str) -> String {
+        crate::codex::provider_config_toml(&crate::codex::tests::provider(model))
     }
 
     // An isolated config.toml as the Codex desktop app leaves it: it adds root
     // keys and tables of its own and has moved [tools] above our table.
     fn app_shaped_config(rayline_model: &str) -> String {
         format!(
-            "model = \"{rayline_model}\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
+            "model = \"{rayline_model}\"\nmodel_provider = \"rayline\"\npersonality = \"pragmatic\"\n\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = \"https://api.rayline.ai/v1\"\nwire_api = \"responses\"\n\n[desktop]\nfollowUpQueueMode = \"queue\"\n"
         )
     }
 
@@ -906,13 +683,12 @@ mod tests {
     fn rayline_table_replaced_in_place_below_app_table() {
         // A rerun with new settings must update our table where it is — one
         // copy, still below [tools] — and keep the app's root key and tables.
-        let existing = app_shaped_config("rayline-local");
-        let merged = apply_rayline_settings(&existing, &snippet("gpt-5.5", true)).unwrap();
+        let existing = app_shaped_config("arc-sage-1.0");
+        let merged = apply_rayline_settings(&existing, &snippet("gpt-5.5")).unwrap();
         assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
         assert!(merged.find("[tools]") < merged.find("[model_providers.rayline]"));
         assert!(merged.starts_with("model = \"gpt-5.5\"\nmodel_provider = \"rayline\"\n"));
-        assert!(merged.contains("forced_login_method = \"chatgpt\""));
-        assert!(merged.contains("requires_openai_auth = true"));
+        assert!(merged.contains("experimental_bearer_token = \"rlk-test-not-a-real-key\""));
         assert!(merged.contains("personality = \"pragmatic\""));
         assert!(merged.contains("[tools]\nweb_search = true"));
         assert!(merged.contains("[desktop]\nfollowUpQueueMode = \"queue\""));
@@ -921,36 +697,28 @@ mod tests {
     #[test]
     fn missing_rayline_table_is_inserted_ahead_of_other_tables() {
         let existing = "[desktop]\nx = 1\n";
-        let merged = apply_rayline_settings(existing, &snippet("rayline-local", false)).unwrap();
-        assert!(merged.starts_with("model = \"rayline-local\"\nmodel_provider = \"rayline\"\n"));
+        let merged = apply_rayline_settings(existing, &snippet("arc-sage-1.0")).unwrap();
+        assert!(merged.starts_with("model = \"arc-sage-1.0\"\nmodel_provider = \"rayline\"\n"));
         assert!(merged.find("[model_providers.rayline]") < merged.find("[desktop]"));
         assert!(!merged.contains("[model_providers]\n"));
-    }
-
-    #[test]
-    fn auth_none_rerun_removes_subscription_keys() {
-        let existing = snippet("rayline-local", true);
-        let merged = apply_rayline_settings(&existing, &snippet("rayline-local", false)).unwrap();
-        assert!(!merged.contains("forced_login_method"));
-        assert!(!merged.contains("requires_openai_auth"));
-        assert!(merged.contains("model_provider = \"rayline\""));
     }
 
     #[test]
     fn unchanged_file_is_returned_byte_for_byte() {
         let existing = format!(
             "# user comment\n{}\n[desktop] # trailing\nx = 1\n",
-            snippet("rayline-local", true)
+            snippet("arc-sage-1.0")
         );
-        let merged = apply_rayline_settings(&existing, &snippet("rayline-local", true)).unwrap();
+        let merged = apply_rayline_settings(&existing, &snippet("arc-sage-1.0")).unwrap();
         assert_eq!(merged, existing);
     }
 
+    #[cfg(unix)]
     #[test]
     fn app_reserialisation_is_not_a_change() {
         // The app rewrites the file with its own root keys, CRLF or no trailing
         // newline; none of that touches a Rayline setting.
-        let generated = snippet("rayline-local", true);
+        let generated = snippet("arc-sage-1.0");
         let with_app_key = format!("notify = [\"x\"]\n{generated}\n[desktop]\nx = 1");
         assert!(!generated_config_differs(&with_app_key, &generated));
         let crlf = with_app_key.replace('\n', "\r\n");
@@ -958,31 +726,41 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_rayline_tables_from_older_release_are_healed() {
-        // An earlier release composed a fresh block over a suffix that still held
-        // the previous table — invalid TOML the app refuses to load.
-        let existing = format!(
-            "{}\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = \"http://127.0.0.1:20811/v1\"\nwire_api = \"responses\"\n\n[desktop]\nx = 1\n",
-            snippet("rayline-local", false)
-        );
-        let generated = snippet("rayline-local", false);
-        assert!(generated_config_differs(&existing, &generated));
-        let merged = apply_rayline_settings(&existing, &generated).unwrap();
-        assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
-        assert!(merged.contains("[tools]"));
-        assert!(merged.contains("[desktop]"));
-        assert!(merged.parse::<DocumentMut>().is_ok());
-    }
-
-    #[test]
-    fn unrelated_parse_error_is_surfaced_not_clobbered() {
+    fn parse_error_is_surfaced_not_clobbered() {
         let dir = unique_tmp_dir("broken");
         fs::write(dir.join("config.toml"), "[desktop\nx = 1\n").unwrap();
-        let error = write_isolated_home(&dir, &snippet("rayline-local", false), false).unwrap_err();
+        let error = write_codex_home(&dir, &snippet("arc-sage-1.0")).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!error.to_string().contains("[desktop"), "{error}");
         assert_eq!(
             fs::read_to_string(dir.join("config.toml")).unwrap(),
             "[desktop\nx = 1\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_rayline_tables_are_an_error_naming_the_file() {
+        let dir = unique_tmp_dir("duplicate");
+        let existing = format!(
+            "{}
+[model_providers.rayline]
+name = \"Raydock\"
+",
+            snippet("arc-sage-1.0")
+        );
+        fs::write(dir.join("config.toml"), &existing).unwrap();
+        let error = write_codex_home(&dir, &snippet("arc-sage-1.0")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains(&dir.join("config.toml").display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("config.toml")).unwrap(),
+            existing
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -992,48 +770,121 @@ mod tests {
         // User's main config.toml: root keys (incl. a dotted one) are dropped,
         // tables and arrays of tables kept.
         let main = "model = \"gpt-5\"\nprofile = \"work\"\nfeatures.x = true\n\n[mcp_servers.foo]\ncommand = \"x\"\n\n[[hooks]]\nname = \"h\"\n";
-        let seeded = seed_tables(main);
+        let seeded = seed_tables(main).unwrap();
         assert!(!seeded.contains("model = "));
         assert!(!seeded.contains("profile"));
         assert!(!seeded.contains("features"));
         assert!(seeded.contains("[mcp_servers.foo]\ncommand = \"x\""));
         assert!(seeded.contains("[[hooks]]"));
-        assert_eq!(seed_tables("model = \"gpt-5\"\n"), "");
-        assert_eq!(seed_tables("not toml ="), "");
+        assert_eq!(seed_tables("model = \"gpt-5\"\n").unwrap(), "");
+        assert!(seed_tables("not toml =").is_err());
+    }
+
+    #[test]
+    fn unreadable_home_config_fails_with_its_path() {
+        // config.toml exists but cannot be read as a file: not "absent".
+        let dir = unique_tmp_dir("unreadable");
+        fs::create_dir(dir.join("config.toml")).unwrap();
+        let error = write_codex_home(&dir, &snippet("arc-sage-1.0")).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        let path = dir.join("config.toml");
+        assert!(
+            error.to_string().contains(&path.display().to_string()),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seed_config_is_absent_only_when_missing() {
+        let dir = unique_tmp_dir("seed-errors");
+        let user_home = dir.join("user-codex");
+        fs::create_dir_all(&user_home).unwrap();
+        let seed_path = user_home.join("config.toml");
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+
+        // Missing seed: the home is written from the snippet alone.
+        let home = dir.join("missing");
+        let missing = write_codex_home(&home, &snippet("arc-sage-1.0"));
+
+        // Unreadable seed: fails with the seed path, writes nothing.
+        fs::create_dir(&seed_path).unwrap();
+        let unreadable_home = dir.join("unreadable");
+        let unreadable = write_codex_home(&unreadable_home, &snippet("arc-sage-1.0"));
+        fs::remove_dir(&seed_path).unwrap();
+
+        // Invalid seed TOML: fails with the seed path and line, writes nothing
+        // and never quotes the line (it can hold a credential).
+        fs::write(
+            &seed_path,
+            "[mcp_servers.foo.env]\nTOKEN = \"seed-secret-value\n",
+        )
+        .unwrap();
+        let invalid_home = dir.join("invalid");
+        let invalid = write_codex_home(&invalid_home, &snippet("arc-sage-1.0"));
+
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+
+        missing.unwrap();
+        assert!(
+            fs::read_to_string(home.join("config.toml"))
+                .unwrap()
+                .contains("[model_providers.rayline]")
+        );
+        let seed_display = seed_path.display().to_string();
+        let unreadable = unreadable.unwrap_err();
+        assert_ne!(unreadable.kind(), io::ErrorKind::NotFound);
+        assert!(
+            unreadable.to_string().contains(&seed_display),
+            "{unreadable}"
+        );
+        assert!(!unreadable_home.join("config.toml").exists());
+        let invalid = invalid.unwrap_err();
+        assert_eq!(invalid.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            invalid
+                .to_string()
+                .starts_with(&format!("{seed_display} line 2: invalid TOML: ")),
+            "{invalid}"
+        );
+        assert!(
+            !invalid.to_string().contains("seed-secret-value"),
+            "{invalid}"
+        );
+        assert!(!invalid_home.join("config.toml").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn seed_with_existing_rayline_table_is_replaced_not_duplicated() {
         // A user who already configured Rayline in their main config.
-        let main = "model = \"rayline-local\"\n\n[model_providers.rayline]\nname = \"User Rayline\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\n[mcp_servers.foo]\ncommand = \"x\"\n";
+        let main = "model = \"arc-sage-1.0\"\n\n[model_providers.rayline]\nname = \"User Rayline\"\nbase_url = \"https://router.example.test/v1\"\n\n[mcp_servers.foo]\ncommand = \"x\"\n";
         let merged =
-            apply_rayline_settings(&seed_tables(main), &snippet("rayline-local", false)).unwrap();
+            apply_rayline_settings(&seed_tables(main).unwrap(), &snippet("arc-sage-1.0")).unwrap();
         assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
         assert!(!merged.contains("User Rayline"));
         assert!(merged.contains("[mcp_servers.foo]"));
     }
 
     #[test]
-    fn strip_rayline_table_only_removes_that_table() {
-        let text = "[a]\nx = 1\n\n[model_providers.rayline]\nname = \"y\"\nbase_url = \"z\"\n\n[b]\nq = 2\n";
-        let stripped = strip_rayline_provider_table(text);
-        assert!(stripped.contains("[a]"));
-        assert!(stripped.contains("[b]"));
-        assert!(!stripped.contains("[model_providers.rayline]"));
-        assert!(!stripped.contains("base_url = \"z\""));
-    }
-
-    #[test]
-    fn write_isolated_home_preserves_app_changes_across_reruns() {
+    fn write_codex_home_preserves_app_changes_across_reruns() {
         // Over the filesystem: first write, the app appends its own section, a
         // rerun with new settings updates ours and keeps the app's.
         let dir = unique_tmp_dir("merge-e2e");
         let iso = dir.join("config.toml");
+        // The user's Codex home, with no config.toml to seed from.
+        let user_home = unique_tmp_dir("merge-e2e-user");
         fs::write(
             &iso,
             format!(
                 "{}\n[mcp_servers.foo]\ncommand = \"x\"\n",
-                snippet("rayline-local", false)
+                snippet("arc-sage-1.0")
             ),
         )
         .unwrap();
@@ -1047,15 +898,26 @@ mod tests {
         )
         .unwrap();
 
-        write_isolated_home(&dir, &snippet("gpt-5.5", false), false).unwrap();
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+        let rerun = write_codex_home(&dir, &snippet("gpt-5.5"));
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        rerun.unwrap();
         let written = fs::read_to_string(&iso).unwrap();
         assert_eq!(written.matches("[model_providers.rayline]").count(), 1);
         assert!(written.contains("model = \"gpt-5.5\""));
         assert!(written.contains("[mcp_servers.foo]"));
         assert!(written.contains("[desktop]\nqueue = true"));
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&user_home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn app_server_argv_rejects_cli_and_helpers() {
         assert!(!is_app_server_argv("codex resume 019f3c3e-fcc9"));
@@ -1068,28 +930,47 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn config_toml_points_at_rayline_router() {
-        let toml =
-            rayline_provider_config_toml("rayline-local", &default_rayline_base_url(), false);
-        assert!(toml.contains("model_provider = \"rayline\""));
-        assert!(toml.contains("wire_api = \"responses\""));
-        assert!(toml.contains("127.0.0.1:20811/v1"));
-        // No subscription auth fields when not subscription.
-        assert!(!toml.contains("requires_openai_auth"));
+    fn codex_home_config_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = unique_tmp_dir("owner-only");
+        // The user's Codex home, with no config.toml to seed from.
+        let user_home = unique_tmp_dir("owner-only-user");
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+        let written = write_codex_home(&dir, &snippet("arc-sage-1.0"));
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        written.unwrap();
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&dir.join("config.toml")), 0o600);
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&user_home);
     }
 
     #[test]
-    fn config_toml_subscription_adds_auth_fields() {
-        let toml = rayline_provider_config_toml("gpt-5.5", &default_rayline_base_url(), true);
-        assert!(toml.contains("requires_openai_auth = true"));
-        assert!(toml.contains("forced_login_method = \"chatgpt\""));
-        assert!(toml.contains("model = \"gpt-5.5\""));
-    }
-
-    #[test]
-    fn isolated_home_is_under_rayline_dir() {
-        let home = isolated_home_path().unwrap();
-        assert!(home.ends_with(format!("{}/{}", crate::DOT_CONFIG_DIR, CODEX_APP_HOME_DIR)));
+    fn codex_app_writes_only_under_its_harness_folder() {
+        let home = crate::harness::tests::temp_dir("codex-app-home");
+        // The user's Codex home, with no config.toml to seed from.
+        let user_home = crate::harness::tests::temp_dir("codex-app-home-user");
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+        let written = write_codex_home(&isolated_home_path(&home), &snippet("arc-sage-1.0"));
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        written.unwrap();
+        crate::harness::tests::assert_only_harness_files(&home, "codex-app", &[]);
+        fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(user_home).unwrap();
     }
 }

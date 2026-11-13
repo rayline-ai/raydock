@@ -12,8 +12,7 @@ permissions:
 
 env:
   RUST_VERSION: "1.88.0"
-  RAYLINE_VERSION: "0.2.0-ci"
-  RAYLINE_CHANNEL: "main"
+  RAYLINE_VERSION: "0.2.0-dev.0"
 
 jobs:
   fmt:
@@ -79,12 +78,12 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked -- --test-threads=1
 
-      - name: Validate release install and hybrid lifecycle
+      - name: Validate release install and local lifecycle
         run: |
-          cargo build --locked -p rayline-cli -p rayline-daemon
+          sudo apt-get install -y minisign
+          cargo build --locked -p rayline-cli
           python3 scripts/test-release-install.py
-          python3 scripts/test-hybrid-lifecycle.py
-          python3 scripts/test-hybrid-live-checks.py
+          python3 scripts/test-local-lifecycle.py
 
   msrv:
     name: MSRV
@@ -134,31 +133,27 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
           rustup default "$RUST_VERSION"
 
       - name: Build release binaries
         shell: bash
-        run: cargo build --release -p rayline-cli -p rayline-daemon --locked
+        run: cargo build --release -p rayline-cli --locked
+
+      - name: Clippy (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: cargo test --workspace --locked -- --test-threads=1
 
       - name: Test installed command migration
+        if: runner.os != 'Windows'
         shell: bash
         run: cargo test -p rayline-cli --locked --test it_command_migration -- --test-threads=1
-
-      - name: Test Windows update backup lifecycle
-        if: runner.os == 'Windows'
-        shell: bash
-        run: cargo test -p rayline-cli --locked --lib update::tests::windows_ -- --test-threads=1
-
-      - name: Test Windows hybrid and router lifecycle
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo test -p rayline-local-router --locked --lib windows_state -- --test-threads=1
-          cargo test -p rayline-cli --locked --lib detach -- --test-threads=1
-          cargo test -p rayline-cli --locked --lib hybrid -- --test-threads=1
-          cargo test -p rayline-daemon --locked --test it_hybrid -- --test-threads=1
 
       - name: Parse Windows installer
         if: runner.os == 'Windows'

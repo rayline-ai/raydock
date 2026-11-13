@@ -22,8 +22,16 @@ impl Installation {
             .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
     }
 
+    /// Runs `name` with the installation as its home and no `RAYLINE_*` env
+    /// from the caller.
     fn run(&self, name: &str, args: &[&str]) -> Output {
-        Command::new(self.binary(name))
+        let mut command = Command::new(self.binary(name));
+        for (var, _) in std::env::vars_os() {
+            if var.to_string_lossy().starts_with("RAYLINE_") {
+                command.env_remove(var);
+            }
+        }
+        command
             .args(args)
             .env("HOME", &self.0)
             .env("USERPROFILE", &self.0)
@@ -72,7 +80,7 @@ fn old_updater_landing_migrates_and_alias_preserves_output_arguments_and_status(
         assert_eq!(direct.stderr, alias.stderr);
     }
     let help = install.run("rayline", &["--help"]);
-    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: raydock"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: rayline"));
     fs::write(install.binary("rayline-core"), "installed execution core").expect("core marker");
     for name in ["rayline", "raydock"] {
         let check = install.run(
@@ -80,8 +88,6 @@ fn old_updater_landing_migrates_and_alias_preserves_output_arguments_and_status(
             &[
                 "update",
                 "--check",
-                "--channel",
-                "prod",
                 "--version",
                 rayline_cli::RAYLINE_VERSION,
             ],

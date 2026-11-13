@@ -8,12 +8,9 @@
 //! treats the request as a harness side call and holds it on the action that
 //! served the last turn, which under `prefer_local` is the local model.
 //!
-//! The gateway therefore sends a classifier request straight to a cloud model
-//! (Claude Haiku 5.5 unless the user chooses another) through the router of
-//! the profile's cloud Messages pins, on the same router as Decisions, with
-//! that deployment's credential, exactly as the core would dispatch a
-//! model-pin turn. A profile with no such deployment (local only) leaves the
-//! request to the core.
+//! The gateway therefore sends a classifier request straight to Rayline cloud:
+//! the Decisions router's `/v1/messages`, with the Decisions credential and
+//! `routing.classifier_model` (passed as `--classifier-model`) as the model.
 
 use bytes::Bytes;
 use serde_json::Value;
@@ -24,61 +21,44 @@ const CLASSIFIER_PROMPT: &str = "You are a security monitor for autonomous AI co
 /// The block Claude Code puts before every system prompt.
 const BILLING_PREAMBLE: &str = "x-anthropic-billing-header:";
 
-/// The classifier's model when the user names none.
-pub(crate) const DEFAULT_CLASSIFIER_MODEL: &str = "claude-haiku-5-5";
-
-/// Where the classifier is sent: a cloud Messages pin's router and
+/// Where the classifier is sent: the Decisions router's Messages URL and
 /// credential, with the classifier's own model.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CloudPin {
+pub(crate) struct Route {
     pub url: String,
     pub wire_model: String,
     pub auth_env: String,
 }
 
-/// The classifier's route: the router URL and credential of a `model_pin`
-/// Messages deployment on the same origin as `decisions.url` (the router the
-/// launcher already checked), with `model` as the wire model. The router
-/// serves any of its models at that URL, so `model` need not be a profile
-/// target.
-pub(crate) fn cloud_pin(config: &Value, model: &str) -> Option<CloudPin> {
-    let decisions = origin(config.pointer("/decisions/url")?.as_str()?)?;
-    config
-        .get("deployments")?
-        .as_array()?
-        .iter()
-        .filter(|deployment| {
-            deployment.get("kind").and_then(Value::as_str) == Some("cloud")
-                && deployment.get("cloud_transport").and_then(Value::as_str) == Some("model_pin")
-                && deployment.get("protocol").and_then(Value::as_str)
-                    == Some("anthropic.messages.v1")
-        })
-        .filter_map(|deployment| {
-            let field = |name: &str| {
-                deployment
-                    .get(name)
-                    .and_then(Value::as_str)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
-            };
-            let pin = CloudPin {
-                url: field("url")?,
-                wire_model: model.to_owned(),
-                auth_env: field("auth_env")?,
-            };
-            (origin(&pin.url)? == decisions).then_some(pin)
-        })
-        .next()
-}
-
-/// Scheme, host and port of a URL; None for anything unparseable.
-fn origin(url: &str) -> Option<(String, String, u16)> {
-    let parsed = reqwest::Url::parse(url).ok()?;
-    Some((
-        parsed.scheme().to_owned(),
-        parsed.host_str()?.to_ascii_lowercase(),
-        parsed.port_or_known_default()?,
-    ))
+/// The classifier's route: the Decisions router's `/v1/messages` beside the
+/// `/v1/routes` that `decisions.url` names (the router the launcher already
+/// checked, path prefix kept), with `decisions.auth_env` and `model` as the
+/// wire model.
+pub(crate) fn route(config: &Value, model: &str) -> Result<Route, String> {
+    let decisions = |key: &str| {
+        config
+            .pointer(&format!("/decisions/{key}"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("the core config has no `decisions.{key}`"))
+    };
+    let url = decisions("url")?;
+    let mut messages = reqwest::Url::parse(url)
+        .map_err(|error| format!("the core config's `decisions.url` is not a URL: {error}"))?;
+    let prefix = messages
+        .path()
+        .strip_suffix("/v1/routes")
+        .ok_or_else(|| {
+            format!("the core config's `decisions.url` {url} is not a router's /v1/routes")
+        })?
+        .to_owned();
+    messages.set_path(&format!("{prefix}/v1/messages"));
+    messages.set_query(None);
+    Ok(Route {
+        url: messages.to_string(),
+        wire_model: model.to_owned(),
+        auth_env: decisions("auth_env")?.to_owned(),
+    })
 }
 
 /// Whether a request is Claude Code's auto-mode classifier: a Messages call
@@ -111,7 +91,7 @@ pub(crate) fn is_classifier(path: &str, body: &[u8]) -> bool {
     }
 }
 
-/// The request body with its model replaced by the pin's wire model. The
+/// The request body with its model replaced by the route's wire model. The
 /// classifier's quick first stage turns thinking off, which the router refuses
 /// for a model whose reasoning is mandatory ("Reasoning is mandatory for this
 /// endpoint and cannot be disabled"), so a disabled `thinking` is dropped and
@@ -136,49 +116,51 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn config(deployments: Value) -> Value {
-        json!({"decisions": {"url": "https://api.rayline.ai/v1/routes"}, "deployments": deployments})
-    }
-
-    fn pin(id: &str, url: &str, wire: &str) -> Value {
-        json!({"id": id, "kind": "cloud", "cloud_transport": "model_pin", "url": url,
-               "protocol": "anthropic.messages.v1", "wire_model": wire,
-               "auth_env": "RAYLINE_ROUTER_API_KEY"})
-    }
+    const CLASSIFIER_MODEL: &str = "claude-haiku-5-5";
 
     #[test]
-    fn takes_the_decisions_router_and_its_credential_with_the_chosen_model() {
-        let config = config(json!([
-            {"id": "local", "kind": "local", "url": "http://127.0.0.1:8000/v1/chat/completions",
-             "protocol": "openai.chat.v1", "wire_model": "glm"},
-            pin("cloud-opus", "https://api.rayline.ai/v1/messages", "claude-opus-5-5"),
-            pin("cloud-sonnet", "https://api.rayline.ai/v1/messages", "claude-sonnet-5-5"),
-        ]));
+    fn goes_to_the_decisions_router_with_its_credential_and_the_chosen_model() {
+        let config = json!({"decisions": {"url": "https://api.rayline.ai/v1/routes?cell=x",
+                                          "auth_env": "RAYLINE_ROUTER_API_KEY"}});
         assert_eq!(
-            cloud_pin(&config, DEFAULT_CLASSIFIER_MODEL),
-            Some(CloudPin {
+            route(&config, CLASSIFIER_MODEL),
+            Ok(Route {
                 url: "https://api.rayline.ai/v1/messages".into(),
                 wire_model: "claude-haiku-5-5".into(),
                 auth_env: "RAYLINE_ROUTER_API_KEY".into(),
             })
         );
+    }
+
+    #[test]
+    fn keeps_the_router_path_prefix() {
+        let config = json!({"decisions": {"url": "https://router.example/api/v1/routes",
+                                          "auth_env": "RAYLINE_ROUTER_API_KEY"}});
         assert_eq!(
-            cloud_pin(&config, "claude-sonnet-5-5").map(|pin| pin.wire_model),
-            Some("claude-sonnet-5-5".into())
+            route(&config, CLASSIFIER_MODEL).map(|route| route.url),
+            Ok("https://router.example/api/v1/messages".to_owned())
+        );
+        let elsewhere = json!({"decisions": {"url": "https://router.example/decide",
+                                             "auth_env": "RAYLINE_ROUTER_API_KEY"}});
+        assert_eq!(
+            route(&elsewhere, CLASSIFIER_MODEL),
+            Err("the core config's `decisions.url` https://router.example/decide is not a router's /v1/routes".to_owned())
         );
     }
 
     #[test]
-    fn never_sends_the_key_to_another_host_and_local_only_has_no_pin() {
-        let elsewhere = config(json!([pin(
-            "cloud-sonnet",
-            "https://elsewhere.example/v1/messages",
-            "claude-sonnet-5-5"
-        )]));
-        assert_eq!(cloud_pin(&elsewhere, DEFAULT_CLASSIFIER_MODEL), None);
-        let local_only = config(json!([{"id": "local", "kind": "local",
-            "url": "http://127.0.0.1:8000/v1/chat/completions", "protocol": "openai.chat.v1"}]));
-        assert_eq!(cloud_pin(&local_only, DEFAULT_CLASSIFIER_MODEL), None);
+    fn a_config_without_the_decisions_url_or_credential_is_refused() {
+        assert_eq!(
+            route(&json!({"decisions": {"auth_env": "K"}}), CLASSIFIER_MODEL),
+            Err("the core config has no `decisions.url`".to_owned())
+        );
+        assert_eq!(
+            route(
+                &json!({"decisions": {"url": "https://api.rayline.ai/v1/routes"}}),
+                CLASSIFIER_MODEL
+            ),
+            Err("the core config has no `decisions.auth_env`".to_owned())
+        );
     }
 
     #[test]

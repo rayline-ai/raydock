@@ -17,8 +17,7 @@ body:
         - CLI UX
         - Claude Code integration
         - Routing behavior
-        - Local model support
-        - Proxy or TLS behavior
+        - Local mode
         - Configuration
         - Install or update
         - Documentation or examples
@@ -60,7 +59,7 @@ body:
     id: compatibility_security
     attributes:
       label: Compatibility and security impact
-      description: Note any impact on proxying, local certificates, credentials, routing defaults, existing configs, or platform support.
+      description: Note any impact on credentials, routing defaults, existing configs, or platform support.
   - type: checkboxes
     id: checklist
     attributes:

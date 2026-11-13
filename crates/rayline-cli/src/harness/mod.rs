@@ -1,27 +1,29 @@
-//! `raydock opencode|pi|omp|hermes|openclaw`: launch a third-party coding harness
+//! `rayline run opencode|pi|omp|hermes|openclaw`: launch a third-party coding harness
 //! against the hosted Rayline router.
 //!
 //! Each launcher resolves the environment's router URL and `rlk-` key the same
-//! way `raydock claude` does, writes a Rayline-owned config under
-//! `~/.config/rayline/harness/<name>/<env>/`, points the harness at it through
+//! way `rayline run claude` does, writes a Rayline-owned config under
+//! `~/.rayline/harness/<name>/`, points the harness at it through
 //! the harness's own config env var, and execs the harness with the remaining
 //! args. The key lives only in that config (0600, in a 0700 dir), never in the
 //! harness's environment: every tool subprocess the harness spawns inherits its
 //! environment, so a key there would reach a model-visible `env` call. For the
-//! same reason the launch removes [`KEY_ENV`] and `RAYLINE_ROUTER_API_KEY`
-//! from the child's environment. The config dir is per harness and env (it
-//! holds the harness's sessions), so two concurrent launches of one harness on
-//! one env with different explicit `RAYLINE_ROUTER_API_KEY` values share the
-//! last-written key.
+//! same reason the launch removes `RAYLINE_ROUTER_API_KEY` from the child's
+//! environment. The config dir is per harness (it holds the harness's
+//! sessions), so two concurrent launches of one harness with different keys
+//! share the last-written key.
 //!
-//! Every config uses Anthropic Messages, except OpenClaw, whose default
-//! provider speaks OpenAI Chat Completions. The models, their names and their
+//! In cloud mode every config defaults to Anthropic Messages, except OpenClaw,
+//! whose default provider speaks OpenAI Chat Completions; Hermes and OpenClaw
+//! also get an OpenAI Responses provider beside the default. In local mode each
+//! config sets up only its harness's one protocol (spec section 5.2): Hermes
+//! Responses, OpenClaw Chat Completions. The models, their names and their
 //! limits are the ones the router's `GET /v1/models` lists for the key, read
 //! once per launch ([`fetch_hosted_models`]): the main agent defaults to the
 //! listed ARC Sage (`product: arc-sage-1.0`) and, where the harness has a
 //! separate small/background model role, that role to the listed ARC Swift
 //! (`product: arc-swift-1.0`), so a contributor or ZDR key gets its own ids.
-//! Under `raydock hybrid run` every renderer keeps `rayline-auto` (the execution
+//! Under `rayline run <harness> --local` every renderer keeps `rayline-auto` (the execution
 //! core's virtual model) and advertises the hybrid runtime's admitted limits
 //! instead ([`RenderContext::capabilities`]): a harness that asks for more
 //! output than the execution core admits has every turn refused.
@@ -35,33 +37,10 @@
 //! `session_affinity_header` (from Hermes v2026.9.21). On Responses, pi's,
 //! OpenClaw's and Hermes' `prompt_cache_key` keys the session instead. A harness session
 //! is one episode, so `--resume` / `-c` / `--session-id` in a later launch
-//! keeps the episode. These launchers talk to the hosted router directly; a
-//! client that reaches it through `rld`'s local router keeps its session
-//! headers too (`x-session-affinity`, `x-claude-code-session-id`,
-//! `x-session-id`, `x-conversation-id`), which that router forwards only to
-//! the hosted Rayline router. Where that router translates the request to
-//! another protocol, a body-only `session_id` or Responses `prompt_cache_key`
-//! reaches the hosted router as `x-session-affinity`.
-//!
-//! The per-launch conversation id ([`ConversationIdFallback`]) is off by
-//! default on every wire: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on,
-//! and then each launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as
-//! `x-conversation-id`, so one launch is one episode and a resume in a new
-//! launch starts a new one (for Hermes only when the launch starts its shared
-//! gateway, see [`hermes`]). That also collapses a subagent's turns into its
-//! parent's episode where the harness attaches the header to every request of
-//! the process. The native compat flags and config keys stay on either way;
-//! the gateway ranks `x-conversation-id` first when both arrive. The override
-//! applies to `raydock hybrid run` too, so forcing it there accepts the same
-//! episode collapse rather than silently doing nothing on that path; either
-//! path exports [`CONV_ID_ENV`] only when a rendered config references it
-//! ([`conversation_id_for`]).
+//! keeps the episode. These launchers talk to the hosted router directly.
 
 pub(crate) mod hermes;
 mod omp;
-mod omp_migration;
-mod omp_roles;
-mod omp_sessions;
 mod openclaw;
 mod opencode;
 mod pi;
@@ -75,22 +54,14 @@ use std::process::{Command, ExitCode};
 
 use serde_json::Value;
 
-/// Env var that carried the router key to the harness before 0.2.11. Removed
-/// from the child's environment, with [`ROUTER_KEY_ENV`], so neither an
-/// exported key nor one from a parent launch reaches the harness's tools.
-pub const KEY_ENV: &str = "RAYLINE_KEY";
-/// The explicit router key the launcher reads ([`explicit_router_key`]).
+/// The router key a parent launch hands its child processes. Removed from the
+/// harness's environment so it never reaches the harness's tools.
 const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
-/// Env var that carries the per-launch conversation id (fallback only).
-pub const CONV_ID_ENV: &str = "RAYLINE_CONV_ID";
-/// Header the gateway reads as the conversation (episode) key.
-pub const CONV_HEADER: &str = "x-conversation-id";
 /// Header a harness's own session id rides on, which the gateway keys the
-/// episode on when no [`CONV_HEADER`] arrives. Most harnesses send it under
-/// this name on their own; Hermes needs the name written into its config
-/// ([`hermes::SESSION_AFFINITY_KEY`]).
+/// episode on. Most harnesses send it under this name on their own; Hermes
+/// needs the name written into its config ([`hermes::SESSION_AFFINITY_KEY`]).
 pub const SESSION_AFFINITY_HEADER: &str = "x-session-affinity";
-/// The execution core's virtual model under `raydock hybrid run`.
+/// The execution core's virtual model under `rayline run <harness> --local`.
 pub const ROUTER_MODEL: &str = crate::VIRTUAL_ROUTER_MODEL;
 
 /// A model's price in USD per million tokens, from the router's
@@ -114,6 +85,10 @@ pub(crate) struct LaunchModel {
     /// same `arc-sage-1.0` for ARC Sage in every data mode. `None` for a
     /// model that is no ARC product (hybrid's virtual model).
     pub product: Option<String>,
+    /// The input it accepts: `["text", "image"]` for a hosted model whose
+    /// listing has `capabilities.vision: true`, `["text"]` when false; the
+    /// core's admitted modalities under `--local`.
+    pub input_modalities: Vec<String>,
     /// Its row on the price card ([`LaunchModels::apply_arc_prices`]), for a
     /// harness that shows costs (omp); `None` when not read or not on it.
     pub price: Option<ModelPrice>,
@@ -128,10 +103,6 @@ pub(crate) struct LaunchModels {
     pub background: String,
     /// Every model the provider entry lists, default first.
     pub offered: Vec<LaunchModel>,
-    /// The ARC product of each id the price card's catalog names
-    /// ([`LaunchModels::apply_arc_prices`]), mode ids included, so a saved
-    /// pick from another data mode finds its product's listed id.
-    pub products: std::collections::BTreeMap<String, String>,
 }
 
 impl LaunchModels {
@@ -158,13 +129,17 @@ impl LaunchModels {
                         .and_then(Value::as_u64)
                         .ok_or_else(|| format!("{id} has no {field}"))
                 };
+                let vision = entry
+                    .get("capabilities")
+                    .and_then(|capabilities| capabilities.get("vision"))
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| format!("{id} has no capabilities.vision"))?;
                 Ok(LaunchModel {
                     id: id.to_owned(),
-                    // An entry without a display name goes by its id.
                     display_name: entry
                         .get("display_name")
                         .and_then(Value::as_str)
-                        .unwrap_or(id)
+                        .ok_or_else(|| format!("{id} has no display_name"))?
                         .to_owned(),
                     context_window: limit("context_length")?,
                     max_output_tokens: limit("max_output_tokens")?,
@@ -172,6 +147,11 @@ impl LaunchModels {
                         .get("product")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
+                    input_modalities: if vision {
+                        vec!["text".to_owned(), "image".to_owned()]
+                    } else {
+                        vec!["text".to_owned()]
+                    },
                     price: None,
                 })
             })
@@ -190,11 +170,10 @@ impl LaunchModels {
             main,
             background,
             offered,
-            products: Default::default(),
         })
     }
 
-    /// `raydock hybrid run`: the execution core serves one virtual model, at
+    /// `rayline run <harness> --local`: the execution core serves one virtual model, at
     /// the limits the hybrid runtime admits.
     pub(crate) fn hybrid(capabilities: &rayline_local_router::ModelCapabilities) -> Self {
         Self {
@@ -206,69 +185,45 @@ impl LaunchModels {
                 context_window: capabilities.context_window,
                 max_output_tokens: capabilities.max_output_tokens,
                 product: None,
+                input_modalities: capabilities.input_modalities.clone(),
                 price: None,
             }],
-            products: Default::default(),
         }
     }
 
-    /// Read a `GET /v1/arc/prices` answer: each id's product from its catalog
-    /// (`arc_mode.product`; a base id is its own product), and each offered
-    /// model's price by its own id, since every data mode has its own row. A
-    /// model without a complete row gets no price.
-    pub(crate) fn apply_arc_prices(&mut self, prices: &Value) {
-        if let Some(catalog) = prices["catalog"].as_object() {
-            self.products = catalog
-                .iter()
-                .map(|(id, entry)| {
-                    let product = entry.pointer("/arc_mode/product").and_then(Value::as_str);
-                    (id.clone(), product.unwrap_or(id).to_owned())
-                })
-                .collect();
-        }
+    /// Read a `GET /v1/arc/prices` answer: each offered model's price by its
+    /// own id, since every data mode has its own row. The card does not price
+    /// every model, so a model without a row gets no price; a row missing a
+    /// field is an error naming the model and the field.
+    pub(crate) fn apply_arc_prices(&mut self, prices: &Value) -> Result<(), String> {
+        let rows = prices
+            .get("card")
+            .and_then(|card| card.get("prices"))
+            .and_then(Value::as_object)
+            .ok_or("the response has no `card.prices` object")?;
         for model in &mut self.offered {
-            let row = &prices["card"]["prices"][model.id.as_str()];
-            let field = |name: &str| row.get(name).and_then(Value::as_f64);
-            model.price = match (
-                field("input"),
-                field("output"),
-                field("cache_read"),
-                field("cache_write"),
-            ) {
-                (Some(input), Some(output), Some(cache_read), Some(cache_write)) => {
-                    Some(ModelPrice {
-                        input,
-                        output,
-                        cache_read,
-                        cache_write,
-                    })
-                }
-                _ => None,
+            let Some(row) = rows.get(&model.id) else {
+                model.price = None;
+                continue;
             };
+            let field = |name: &str| {
+                row.get(name)
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| format!("the price row for {} has no {name}", model.id))
+            };
+            model.price = Some(ModelPrice {
+                input: field("input")?,
+                output: field("output")?,
+                cache_read: field("cache_read")?,
+                cache_write: field("cache_write")?,
+            });
         }
+        Ok(())
     }
 
     /// The main agent's model.
     pub(crate) fn main_model(&self) -> &LaunchModel {
         &self.offered[0]
-    }
-
-    /// What a harness's saved pick of `id` becomes: `None` while the key lists
-    /// `id`; otherwise the listed model of `id`'s product (a seeded
-    /// `arc-sage-1.0` on a contributor key is `arc-sage-contributor-1.0`, and
-    /// a saved `arc-swift-contributor-1.0` on a standard key `arc-swift-1.0`),
-    /// else `default` (the retired Legacy `rayline-router`).
-    pub(crate) fn stale_pick<'a>(&'a self, id: &str, default: &'a str) -> Option<&'a str> {
-        if self.offered.iter().any(|model| model.id == id) {
-            return None;
-        }
-        let product = self.products.get(id).map_or(id, String::as_str);
-        Some(
-            self.offered
-                .iter()
-                .find(|model| model.product.as_deref() == Some(product))
-                .map_or(default, |model| model.id.as_str()),
-        )
     }
 }
 
@@ -286,11 +241,17 @@ pub(crate) async fn fetch_hosted_models(
         .map_err(|error| format!("couldn't read this key's models from {url}: {error}"))
 }
 
-/// The router's public ARC price card, `GET /v1/arc/prices`.
-pub(crate) async fn fetch_arc_prices(router_url: &str) -> Result<Value, String> {
+/// The router's public ARC price card, `GET /v1/arc/prices`, applied to
+/// `models` ([`LaunchModels::apply_arc_prices`]). Fails the launch when the
+/// card cannot be read, as [`fetch_hosted_models`] does for the listing.
+pub(crate) async fn apply_hosted_prices(
+    router_url: &str,
+    models: &mut LaunchModels,
+) -> Result<(), String> {
     let url = format!("{router_url}/v1/arc/prices");
     get_json(&url, None)
         .await
+        .and_then(|prices| models.apply_arc_prices(&prices))
         .map_err(|error| format!("couldn't read the ARC prices from {url}: {error}"))
 }
 
@@ -313,45 +274,6 @@ async fn get_json(url: &str, bearer: Option<&str>) -> Result<Value, String> {
         return Err(format!("HTTP {status}: {body}"));
     }
     Ok(body)
-}
-
-/// Output ceiling for models outside the hosted ARC tiers: the harness
-/// default the router admits.
-pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
-/// Runtime override for [`ConversationIdFallback`]: `1` or `0`.
-pub const CONV_ID_FALLBACK_ENV: &str = "RAYLINE_HARNESS_CONV_ID_FALLBACK";
-
-/// When a config sends the per-launch `x-conversation-id`: only when
-/// [`CONV_ID_FALLBACK_ENV`] forces it. The router keys episodes on native
-/// harness session ids, or derives one where a wire has none.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConversationIdFallback {
-    /// [`CONV_ID_FALLBACK_ENV`]: `Some(true)` always, `Some(false)` never.
-    pub forced: Option<bool>,
-}
-
-impl ConversationIdFallback {
-    /// `override_value` is [`CONV_ID_FALLBACK_ENV`] (`1`/`true`/`on` or
-    /// `0`/`false`/`off`; anything else is ignored).
-    pub(crate) fn new(override_value: Option<&str>) -> Self {
-        Self {
-            forced: parse_switch(override_value),
-        }
-    }
-
-    /// Whether a config sends the header.
-    pub(crate) fn enabled(self) -> bool {
-        self.forced == Some(true)
-    }
-}
-
-/// A `1`/`true`/`on` or `0`/`false`/`off` override; anything else is `None`.
-pub(crate) fn parse_switch(value: Option<&str>) -> Option<bool> {
-    match value.map(|value| value.trim().to_ascii_lowercase()) {
-        Some(value) if matches!(value.as_str(), "1" | "true" | "on") => Some(true),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off") => Some(false),
-        _ => None,
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -378,7 +300,7 @@ impl Harness {
             .find(|harness| harness.name() == command)
     }
 
-    /// The `rayline <name>` subcommand and the config directory name.
+    /// The `rayline run <name>` harness name and the config directory name.
     pub fn name(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
@@ -415,32 +337,38 @@ impl Harness {
     }
 
     /// The installed harness's major version, where a renderer or the launch
-    /// args depend on it (OpenCode); None otherwise or when unreadable.
-    pub(crate) fn major_version(self, binary: Option<&Path>) -> Option<u64> {
+    /// args depend on it: `Some` for OpenCode ([`opencode::major_version`]),
+    /// run as `probe`, the harness with the launch's environment; `None` for
+    /// every other harness.
+    pub(crate) fn major_version(self, probe: Command) -> Result<Option<u64>, String> {
         match self {
-            Self::OpenCode => opencode::major_version(binary?),
-            _ => None,
+            Self::OpenCode => opencode::major_version(probe).map(Some),
+            _ => Ok(None),
         }
     }
 
+    /// Refuse `args` local mode can't run: OpenClaw's container mode.
+    pub(crate) fn require_hybrid_args(self, args: &[OsString]) -> io::Result<()> {
+        let env_container =
+            std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
+        if self == Self::OpenClaw && (env_container || openclaw::uses_container(args)) {
+            return Err(io::Error::other(
+                "OpenClaw container mode cannot use the hybrid gateway configuration; run an agent locally",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The launch args for `args`, which [`Self::require_hybrid_args`] accepted.
     pub(crate) fn hybrid_args(
         self,
         args: &[OsString],
         major_version: Option<u64>,
-    ) -> io::Result<Vec<OsString>> {
-        if self == Self::OpenClaw {
-            let env_container =
-                std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
-            if env_container || openclaw::uses_container(args) {
-                return Err(io::Error::other(
-                    "OpenClaw container mode cannot use the hybrid gateway configuration; run an agent locally",
-                ));
-            }
-            Ok(openclaw::launch_args(args))
-        } else if self == Self::OpenCode {
-            Ok(opencode_args(args, major_version))
-        } else {
-            Ok(args.to_vec())
+    ) -> Vec<OsString> {
+        match (self, major_version) {
+            (Self::OpenClaw, _) => openclaw::launch_args(args),
+            (Self::OpenCode, Some(major_version)) => opencode_args(args, major_version),
+            _ => args.to_vec(),
         }
     }
 }
@@ -448,9 +376,8 @@ impl Harness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
     pub harness: Harness,
-    pub env_name: Option<String>,
-    pub auth_token: Option<String>,
-    pub root_env_explicit: bool,
+    /// The hosted environment the loaded config selects.
+    pub hosted: crate::status::HostedEnvironment,
     /// Args passed through to the harness unchanged.
     pub args: Vec<OsString>,
 }
@@ -463,31 +390,18 @@ pub(crate) struct RenderContext<'a> {
     /// (e.g. `https://api-dev.rayline.ai`).
     pub router_url: &'a str,
     pub config_dir: &'a Path,
-    /// When configs carry the per-launch `x-conversation-id` header.
-    pub conversation_id: ConversationIdFallback,
-    /// pi only: whether to set `compat.allowEmptySignature`
-    /// ([`pi::allow_empty_signature`]).
-    pub allow_empty_signature: bool,
-    /// The limits `raydock hybrid run` admits (context window the harness may
+    /// The limits `rayline run <harness> --local` admits (context window the harness may
     /// budget against, the core's output cap, input modalities). `None`: the
     /// hosted router's defaults.
     pub capabilities: Option<&'a rayline_local_router::ModelCapabilities>,
     /// The installed harness's major version ([`Harness::major_version`]).
     pub harness_major_version: Option<u64>,
     /// The models this launch selects and offers: the router's listing for a
-    /// hosted launch, [`LaunchModels::hybrid`] under `raydock hybrid run`.
+    /// hosted launch, [`LaunchModels::hybrid`] under `rayline run <harness> --local`.
     pub models: LaunchModels,
 }
 
 impl RenderContext<'_> {
-    /// Input modalities to advertise for the router model.
-    pub fn input_modalities(&self) -> Value {
-        match self.capabilities {
-            Some(caps) => serde_json::json!(caps.input_modalities),
-            None => serde_json::json!(["text", "image"]),
-        }
-    }
-
     /// Base URL for clients that append `/v1/messages` themselves.
     pub fn messages_base(&self) -> String {
         self.router_url.to_owned()
@@ -496,17 +410,6 @@ impl RenderContext<'_> {
     /// Base URL for clients that expect the `/v1` prefix in the base.
     pub fn v1_base(&self) -> String {
         format!("{}/v1", self.router_url)
-    }
-
-    /// Conversation-id headers: `{CONV_HEADER: value}` (`value` is the
-    /// harness's reference to [`CONV_ID_ENV`]) when the fallback is forced
-    /// on, else `{}`.
-    pub fn conversation_headers(&self, value: &str) -> Value {
-        if self.conversation_id.enabled() {
-            serde_json::json!({ CONV_HEADER: value })
-        } else {
-            serde_json::json!({})
-        }
     }
 }
 
@@ -524,11 +427,6 @@ pub(crate) struct ConfigFile {
     /// reads exactly this when it is replaced (the harness saved a setting
     /// meanwhile), the write is refused rather than losing that edit.
     pub merged_from: Option<String>,
-    /// For a create-once file (`overwrite: false`): the seed an earlier
-    /// release wrote with a default that has since changed. A file that still
-    /// reads exactly this was never edited, so it holds no choice and is
-    /// replaced with `contents`; any other text is kept.
-    pub replaces_seed: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -551,7 +449,7 @@ pub async fn run(request: RunRequest) -> ExitCode {
 }
 
 async fn prepare(request: RunRequest) -> Result<Command, String> {
-    let home = dirs::home_dir().ok_or("home directory not found")?;
+    let home = crate::home().map_err(|error| error.to_string())?;
     let harness = request.harness;
     let binary = find_on_path(harness.binary()).ok_or_else(|| {
         format!(
@@ -561,64 +459,35 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    // Same env -> router URL resolution as `raydock claude`: `--env` (default
-    // prod), then settings.json `environments.<env>.router_url`.
-    let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(&home));
-    let hosted = crate::status::resolve_hosted_environment(&env_name, Some(&home))
-        .map_err(|error| error.to_string())?;
-    let router_url = normalize_router_url(&hosted.router_url);
-    // An explicit RAYLINE_ROUTER_API_KEY wins, as on the codex path; otherwise
-    // the stored `rlk-` key, minted (and signed in) on demand like `raydock claude`.
-    let key = match explicit_router_key() {
-        Some(key) => key,
-        None => crate::claude::ensure_router_key(
-            &env_name,
-            &home,
-            request.auth_token.as_deref(),
-            request.root_env_explicit,
-        )
+    // Same env -> router URL resolution as `rayline run claude`: built-in prod, or
+    // settings.json `environments.<env>.base_url` for `--env`.
+    let hosted = &request.hosted;
+    let env_name = hosted.name().to_owned();
+    let router_url = hosted.base_url.clone();
+    // The stored `rlk-` key, signing in first when signed out, like `rayline run claude`.
+    let key = crate::status::router_key(hosted, &home)
         .await
-        .map_err(|error| error.to_string())?,
-    };
+        .map_err(|error| error.to_string())?;
 
     if harness == Harness::Omp {
         omp::warn_if_old(&binary);
     }
 
     let mut models = fetch_hosted_models(&router_url, &key).await?;
-    // omp shows each model's cost, and omp and pi move a saved pick from
-    // another data mode to its product's listed id: both from the price card.
-    if matches!(harness, Harness::Omp | Harness::Pi) {
-        match fetch_arc_prices(&router_url).await {
-            Ok(prices) => models.apply_arc_prices(&prices),
-            Err(error) => eprintln!(
-                "warning: {error}; {} shows no model costs, and a saved pick from another \
-                 data mode moves to its default model",
-                harness.name()
-            ),
-        }
+    // omp shows each model's cost, from the price card.
+    if harness == Harness::Omp {
+        apply_hosted_prices(&router_url, &mut models).await?;
     }
-    let config_dir = config_dir(&home, harness, &env_name);
+    let config_dir = config_dir(&home, harness);
     let ctx = RenderContext {
         key: &key,
         router_url: &router_url,
         config_dir: &config_dir,
-        conversation_id: ConversationIdFallback::new(
-            std::env::var(CONV_ID_FALLBACK_ENV).ok().as_deref(),
-        ),
-        allow_empty_signature: pi::allow_empty_signature(
-            &env_name,
-            std::env::var(pi::ALLOW_EMPTY_SIGNATURE_ENV).ok().as_deref(),
-        ),
         capabilities: None,
-        harness_major_version: harness.major_version(Some(&binary)),
+        harness_major_version: harness.major_version(cloud_probe(&binary))?,
         models,
     };
     let plan = harness.plan(&ctx)?;
-    if harness == Harness::Omp {
-        omp_migration::migrate(&config_dir, &request.args, &ctx.models)
-            .map_err(|error| format!("failed to migrate hosted omp state: {error}"))?;
-    }
     write_files(&config_dir, &plan.files).map_err(|error| {
         format!(
             "failed to write {} config in {}: {error}",
@@ -627,19 +496,14 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    let conv_id = conversation_id_for(&plan, new_conversation_id);
-    let episode = match &conv_id {
-        Some(id) => format!("conversation {id}"),
-        None => "episode keyed on the harness session".to_owned(),
-    };
     eprintln!(
-        "{}: {} -> {router_url} (env {env_name}, {episode})\n  config: {}",
+        "{}: {} -> {router_url} (env {env_name})\n  config: {}",
         crate::DISPLAY_NAME,
         harness.name(),
         config_dir.display()
     );
-    let args = match harness {
-        Harness::OpenClaw => {
+    let args = match (harness, ctx.harness_major_version) {
+        (Harness::OpenClaw, _) => {
             let env_container =
                 std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
             if env_container || openclaw::uses_container(&request.args) {
@@ -661,10 +525,10 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             }
             args
         }
-        Harness::OpenCode => opencode_args(&request.args, ctx.harness_major_version),
+        (Harness::OpenCode, Some(major_version)) => opencode_args(&request.args, major_version),
         _ => request.args,
     };
-    let command = build_command(&binary, &plan, conv_id.as_deref(), &args);
+    let command = build_command(&binary, &plan, &args);
     if harness == Harness::Hermes && cfg!(windows) {
         hermes::prepare_launch(&command)?;
     }
@@ -673,7 +537,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
 
 /// OpenCode's args with `--standalone` where OpenCode 2 would attach to its
 /// background service ([`opencode::launch_args`]).
-fn opencode_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString> {
+fn opencode_args(args: &[OsString], major_version: u64) -> Vec<OsString> {
     let launched = opencode::launch_args(args, major_version);
     if launched.len() != args.len() {
         eprintln!(
@@ -683,30 +547,11 @@ fn opencode_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString>
     launched
 }
 
-fn explicit_router_key() -> Option<String> {
-    std::env::var(ROUTER_KEY_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
-}
-
-/// `~/.config/rayline/harness/<name>/<env>/`
-pub(crate) fn config_dir(home: &Path, harness: Harness, env_name: &str) -> PathBuf {
-    home.join(".config")
-        .join(crate::CONFIG_DIR)
+/// `~/.rayline/harness/<name>/`, cloud mode's harness folder.
+pub(crate) fn config_dir(home: &Path, harness: Harness) -> PathBuf {
+    home.join(crate::DOT_CONFIG_DIR)
         .join("harness")
         .join(harness.name())
-        .join(env_name)
-}
-
-/// Strip trailing slashes and a trailing `/v1` so renderers can add exactly the
-/// suffix their client expects.
-pub(crate) fn normalize_router_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    trimmed
-        .strip_suffix("/v1")
-        .unwrap_or(trimmed)
-        .trim_end_matches('/')
-        .to_owned()
 }
 
 pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
@@ -716,16 +561,12 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(windows)]
+    rayline_local_router::windows_state::restrict_to_owner(dir, true)?;
     for file in files {
         let path = dir.join(file.name);
         if !file.overwrite && path.exists() {
-            let untouched_old_seed = file
-                .replaces_seed
-                .as_ref()
-                .is_some_and(|seed| fs::read_to_string(&path).ok().as_ref() == Some(seed));
-            if !untouched_old_seed {
-                continue;
-            }
+            continue;
         }
         let tmp = dir.join(format!(".{}.tmp-{}", file.name, std::process::id()));
         write_private(&tmp, &file.contents)?;
@@ -743,10 +584,25 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `contents` to a new file at `path` that only the owner can read: the
-/// Rayline-owned configs hold the router key. A stale file is removed first,
-/// since an open of an existing file keeps its mode.
-fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+/// Write `contents` to a new file at `path` that only the owner can read (mode
+/// 0600 on Unix, an owner-only DACL on Windows, set before anything is
+/// written): the Rayline-owned configs hold the router key. A stale file is
+/// removed first, since an open of an existing file keeps its mode.
+/// A harness home the user exported (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`):
+/// `None` when unset, the path as given otherwise. An empty value is an error
+/// naming the variable.
+pub(crate) fn exported_dir(var: &str) -> io::Result<Option<PathBuf>> {
+    match std::env::var_os(var) {
+        None => Ok(None),
+        Some(value) if value.is_empty() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{var} is set but empty: unset it or set it to a directory"),
+        )),
+        Some(value) => Ok(Some(PathBuf::from(value))),
+    }
+}
+
+pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write as _;
     match fs::remove_file(path) {
         Ok(()) => {}
@@ -760,19 +616,24 @@ fn write_private(path: &Path, contents: &str) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(contents.as_bytes())
+    let mut file = options.open(path)?;
+    #[cfg(windows)]
+    rayline_local_router::windows_state::restrict_to_owner(path, false)?;
+    file.write_all(contents.as_bytes())
 }
 
-pub(crate) fn build_command(
-    binary: &Path,
-    plan: &Plan,
-    conv_id: Option<&str>,
-    args: &[OsString],
-) -> Command {
+/// `binary` without the router key, as [`build_command`] launches it, for a
+/// probe that runs before the plan exists.
+fn cloud_probe(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command.env_remove(ROUTER_KEY_ENV);
+    command
+}
+
+pub(crate) fn build_command(binary: &Path, plan: &Plan, args: &[OsString]) -> Command {
     let mut command = Command::new(binary);
     command.args(args);
     // The key reaches the harness through its config only (see the module docs).
-    command.env_remove(KEY_ENV);
     command.env_remove(ROUTER_KEY_ENV);
     for name in &plan.env_remove {
         command.env_remove(name);
@@ -780,39 +641,7 @@ pub(crate) fn build_command(
     for (name, value) in &plan.env_set {
         command.env(name, value);
     }
-    match conv_id {
-        Some(conv_id) => command.env(CONV_ID_ENV, conv_id),
-        // An inherited id (e.g. from a parent launch) must not leak in.
-        None => command.env_remove(CONV_ID_ENV),
-    };
     command
-}
-
-/// The per-launch id to export, minted by `mint` only when a rendered config
-/// actually references [`CONV_ID_ENV`]. A harness that keys the episode on its
-/// own session id references nothing, and then exporting an id would leave an
-/// unused variable in the environment every tool subprocess inherits.
-pub(crate) fn conversation_id_for(plan: &Plan, mint: impl FnOnce() -> String) -> Option<String> {
-    plan.files
-        .iter()
-        .any(|file| file.contents.contains(CONV_ID_ENV))
-        .then(mint)
-}
-
-/// A random (v4) UUID. One per launch; see [`ConversationIdFallback`].
-pub(crate) fn new_conversation_id() -> String {
-    let mut bytes: [u8; 16] = rand::random();
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
 }
 
 pub(crate) fn json_file(name: &'static str, value: &Value, overwrite: bool) -> ConfigFile {
@@ -823,7 +652,6 @@ pub(crate) fn json_file(name: &'static str, value: &Value, overwrite: bool) -> C
         contents,
         overwrite,
         merged_from: None,
-        replaces_seed: None,
     }
 }
 
@@ -833,7 +661,6 @@ pub(crate) fn yaml_file(name: &'static str, value: &Value, overwrite: bool) -> C
         contents: to_yaml(value),
         overwrite,
         merged_from: None,
-        replaces_seed: None,
     }
 }
 
@@ -988,7 +815,7 @@ fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
 #[cfg(not(unix))]
 fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
     match command.status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Ok(status) => crate::child_exit_code(status),
         Err(error) => {
             eprintln!("raydock: failed to run {}: {error}", harness.binary());
             ExitCode::from(127)
@@ -1016,6 +843,39 @@ pub(crate) mod tests {
         dir
     }
 
+    /// Asserts that Rayline wrote files under `home` and that each one is
+    /// under `~/.rayline/harness/<name>/`, so none is under `~/.config/rayline`.
+    /// `inputs` are paths under `home` the test or the harness itself owns.
+    pub(crate) fn assert_only_harness_files(home: &Path, name: &str, inputs: &[&str]) {
+        fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if fs::symlink_metadata(&path).unwrap().is_dir() {
+                    walk(&path, files);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(home, &mut files);
+        files.retain(|file| {
+            !inputs
+                .iter()
+                .any(|input| file.starts_with(home.join(input)))
+        });
+        assert!(!files.is_empty(), "{name} wrote nothing");
+        let root = home.join(".rayline/harness").join(name);
+        for file in files {
+            assert!(
+                file.starts_with(&root),
+                "{name} wrote {} outside {}",
+                file.display(),
+                root.display()
+            );
+        }
+    }
+
     /// A `GET /v1/models` answer for a key in `mode` (`None`: standard),
     /// listing Swift before Sage as the router does.
     pub(crate) fn listing(mode: Option<&str>) -> Value {
@@ -1027,7 +887,8 @@ pub(crate) mod tests {
             json!({
                 "id": id, "object": "model", "owned_by": "rayline",
                 "display_name": name, "product": product,
-                "context_length": 1_000_000, "max_output_tokens": 128_000
+                "context_length": 1_000_000, "max_output_tokens": 128_000,
+                "capabilities": {"vision": true, "tools": true, "reasoning": true}
             })
         };
         json!({
@@ -1050,7 +911,8 @@ pub(crate) mod tests {
         body["data"][0]["context_length"] = json!(200_000);
         body["data"].as_array_mut().unwrap().push(json!({
             "id": "other/model", "object": "model", "owned_by": "other",
-            "context_length": 32_000, "max_output_tokens": 4_096
+            "display_name": "Other", "context_length": 32_000, "max_output_tokens": 4_096,
+            "capabilities": {"vision": false, "tools": true, "reasoning": true}
         }));
         let models = LaunchModels::from_listing(&body).unwrap();
         assert_eq!(models.main, "arc-sage-contributor-1.0");
@@ -1069,8 +931,10 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(models.offered[1].context_window, 200_000);
-        assert_eq!(models.offered[2].display_name, "other/model");
+        assert_eq!(models.offered[2].display_name, "Other");
         assert_eq!(models.offered[2].product, None);
+        assert_eq!(models.offered[0].input_modalities, ["text", "image"]);
+        assert_eq!(models.offered[2].input_modalities, ["text"]);
     }
 
     #[test]
@@ -1092,17 +956,37 @@ pub(crate) mod tests {
             LaunchModels::from_listing(&body).unwrap_err(),
             "arc-sage-1.0 has no max_output_tokens"
         );
+        let mut body = listing(None);
+        body["data"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("display_name");
+        assert_eq!(
+            LaunchModels::from_listing(&body).unwrap_err(),
+            "arc-swift-1.0 has no display_name"
+        );
+        let mut body = listing(None);
+        body["data"][1]["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("vision");
+        assert_eq!(
+            LaunchModels::from_listing(&body).unwrap_err(),
+            "arc-sage-1.0 has no capabilities.vision"
+        );
     }
 
     #[test]
     fn prices_come_from_each_ids_card_row() {
         let mut models = LaunchModels::from_listing(&listing(Some("contributor"))).unwrap();
-        models.apply_arc_prices(&json!({"card": {"prices": {
-            "arc-sage-contributor-1.0": {
-                "input": 0.5, "output": 2.5, "cache_read": 0.025, "cache_write": 0.625
-            },
-            "arc-sage-1.0": {"input": 9.0, "output": 9.0, "cache_read": 9.0, "cache_write": 9.0}
-        }}}));
+        models
+            .apply_arc_prices(&json!({"card": {"prices": {
+                "arc-sage-contributor-1.0": {
+                    "input": 0.5, "output": 2.5, "cache_read": 0.025, "cache_write": 0.625
+                },
+                "arc-sage-1.0": {"input": 9.0, "output": 9.0, "cache_read": 9.0, "cache_write": 9.0}
+            }}}))
+            .unwrap();
         assert_eq!(
             models.main_model().price,
             Some(ModelPrice {
@@ -1116,39 +1000,43 @@ pub(crate) mod tests {
         assert_eq!(models.offered[1].price, None);
     }
 
+    #[test]
+    fn an_incomplete_price_row_or_card_is_an_error() {
+        let mut models = LaunchModels::from_listing(&listing(None)).unwrap();
+        assert_eq!(
+            models
+                .apply_arc_prices(&json!({"card": {"prices": {
+                    "arc-sage-1.0": {"input": 0.5, "output": 2.5, "cache_read": 0.025}
+                }}}))
+                .unwrap_err(),
+            "the price row for arc-sage-1.0 has no cache_write"
+        );
+        assert_eq!(
+            models.apply_arc_prices(&json!({"card": {}})).unwrap_err(),
+            "the response has no `card.prices` object"
+        );
+    }
+
     /// A hosted dev context writing into `dir`.
     pub(crate) fn render_context(dir: &Path) -> RenderContext<'_> {
         RenderContext {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
-            conversation_id: ConversationIdFallback::new(None),
-            allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
             models: hosted_models(),
         }
     }
 
-    /// Render `harness` with no override into a temp dir and return
-    /// (dir, plan).
+    /// Render `harness` into a temp dir and return (dir, plan).
     pub(crate) fn render(harness: Harness) -> (PathBuf, Plan) {
-        render_with(harness, ConversationIdFallback::new(None))
-    }
-
-    /// Render `harness` with the given fallback policy.
-    pub(crate) fn render_with(
-        harness: Harness,
-        conversation_id: ConversationIdFallback,
-    ) -> (PathBuf, Plan) {
         let home = temp_dir(harness.name());
-        let dir = config_dir(&home, harness, "dev");
+        let dir = config_dir(&home, harness);
         let ctx = RenderContext {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id,
-            allow_empty_signature: pi::allow_empty_signature("dev", None),
             capabilities: None,
             harness_major_version: None,
             models: hosted_models(),
@@ -1166,24 +1054,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn config_dir_is_per_harness_and_env() {
+    fn config_dir_is_per_harness() {
         let home = Path::new("/home/u");
         assert_eq!(
-            config_dir(home, Harness::Pi, "dev"),
-            PathBuf::from("/home/u/.config/rayline/harness/pi/dev")
+            config_dir(home, Harness::Pi),
+            PathBuf::from("/home/u/.rayline/harness/pi")
         );
     }
 
     #[test]
-    fn router_url_is_normalized() {
-        for raw in [
-            "https://api-dev.rayline.ai",
-            "https://api-dev.rayline.ai/",
-            "https://api-dev.rayline.ai/v1",
-            "https://api-dev.rayline.ai/v1/",
-        ] {
-            assert_eq!(normalize_router_url(raw), "https://api-dev.rayline.ai");
+    fn every_harness_writes_only_under_its_harness_folder() {
+        for harness in Harness::ALL {
+            let (dir, _) = render(harness);
+            let home = dir.ancestors().nth(3).unwrap();
+            assert_only_harness_files(home, harness.name(), &[]);
+            fs::remove_dir_all(home).unwrap();
         }
+    }
+
+    #[test]
+    fn an_empty_exported_dir_is_an_error_naming_the_var() {
+        const VAR: &str = "RAYLINE_TEST_EXPORTED_DIR";
+        // SAFETY: the variable is this test's own; no other code reads it.
+        unsafe { std::env::remove_var(VAR) };
+        assert_eq!(exported_dir(VAR).unwrap(), None);
+        unsafe { std::env::set_var(VAR, "") };
+        let error = exported_dir(VAR).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(VAR), "{error}");
+        unsafe { std::env::set_var(VAR, "~/x") };
+        assert_eq!(exported_dir(VAR).unwrap(), Some(PathBuf::from("~/x")));
+        unsafe { std::env::remove_var(VAR) };
     }
 
     #[test]
@@ -1194,21 +1095,20 @@ pub(crate) mod tests {
         assert_eq!(Harness::from_command("claude"), None);
     }
 
+    #[cfg(windows)]
     #[test]
-    fn conversation_id_is_a_v4_uuid() {
-        let id = new_conversation_id();
-        assert_eq!(id.len(), 36);
-        let parts: Vec<&str> = id.split('-').collect();
-        assert_eq!(
-            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
-            [8, 4, 4, 4, 12]
-        );
-        assert!(parts[2].starts_with('4'));
-        assert!(matches!(
-            parts[3].chars().next(),
-            Some('8' | '9' | 'a' | 'b')
-        ));
-        assert_ne!(id, new_conversation_id());
+    fn write_files_restricts_the_dir_and_files_to_the_owner() {
+        use rayline_local_router::windows_state::is_owner_only;
+        let dir = temp_dir("write-acl").join("cfg");
+        let files = [ConfigFile {
+            name: "config.toml",
+            contents: "secret = 1\n".to_owned(),
+            overwrite: true,
+            merged_from: None,
+        }];
+        write_files(&dir, &files).unwrap();
+        assert!(is_owner_only(&dir).unwrap());
+        assert!(is_owner_only(&dir.join("config.toml")).unwrap());
     }
 
     #[test]
@@ -1221,14 +1121,12 @@ pub(crate) mod tests {
                     contents: text.to_owned(),
                     overwrite: true,
                     merged_from: None,
-                    replaces_seed: None,
                 },
                 ConfigFile {
                     name: "default.json",
                     contents: text.to_owned(),
                     overwrite: false,
                     merged_from: None,
-                    replaces_seed: None,
                 },
             ]
         };
@@ -1245,7 +1143,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn command_carries_conversation_id_and_removes_keys() {
+    fn command_sets_the_plan_env_and_removes_keys() {
         let plan = Plan {
             files: Vec::new(),
             env_set: vec![("OPENCODE_CONFIG", OsString::from("/x/opencode.json"))],
@@ -1254,7 +1152,6 @@ pub(crate) mod tests {
         let command = build_command(
             Path::new("/bin/true"),
             &plan,
-            Some("conv-1"),
             &[OsString::from("run"), OsString::from("hi")],
         );
         let envs: Vec<(String, Option<String>)> = command
@@ -1266,91 +1163,16 @@ pub(crate) mod tests {
                 )
             })
             .collect();
-        assert!(envs.contains(&("RAYLINE_KEY".into(), None)));
         assert!(envs.contains(&("RAYLINE_ROUTER_API_KEY".into(), None)));
         assert!(
             !envs
                 .iter()
                 .any(|(_, value)| value.as_deref() == Some(TEST_KEY))
         );
-        assert!(envs.contains(&("RAYLINE_CONV_ID".into(), Some("conv-1".into()))));
         assert!(envs.contains(&("OPENCODE_CONFIG".into(), Some("/x/opencode.json".into()))));
         assert!(envs.contains(&("CLAUDE_CONFIG_DIR".into(), None)));
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["run", "hi"]);
-    }
-
-    #[test]
-    fn conversation_id_fallback_is_off_by_default() {
-        assert!(!ConversationIdFallback::new(None).enabled());
-    }
-
-    #[test]
-    fn conversation_id_fallback_override() {
-        for on in ["1", "true", "ON", " on "] {
-            assert!(ConversationIdFallback::new(Some(on)).enabled(), "{on:?}");
-        }
-        for off in ["0", "false", "Off"] {
-            assert!(!ConversationIdFallback::new(Some(off)).enabled(), "{off:?}");
-        }
-        // Unrecognized or empty values keep the default (off).
-        assert!(!ConversationIdFallback::new(Some("")).enabled());
-        assert!(!ConversationIdFallback::new(Some("maybe")).enabled());
-    }
-
-    #[test]
-    fn native_session_keys_are_the_default() {
-        let command = build_command(Path::new("/bin/true"), &Plan::default(), None, &[]);
-        let conv = command
-            .get_envs()
-            .find(|(k, _)| *k == std::ffi::OsStr::new(CONV_ID_ENV));
-        assert_eq!(conv, Some((std::ffi::OsStr::new(CONV_ID_ENV), None)));
-        for harness in Harness::ALL {
-            let (dir, plan) = render(harness);
-            for file in &plan.files {
-                let text = fs::read_to_string(dir.join(file.name)).unwrap();
-                assert!(
-                    !text.contains(CONV_HEADER) && !text.contains(CONV_ID_ENV),
-                    "{}: {} still sends the per-launch id",
-                    harness.name(),
-                    file.name
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn forced_fallback_sends_the_conversation_header() {
-        for harness in Harness::ALL {
-            let (dir, plan) = render_with(harness, ConversationIdFallback::new(Some("1")));
-            let sends = plan.files.iter().any(|file| {
-                let text = fs::read_to_string(dir.join(file.name)).unwrap();
-                text.contains(CONV_HEADER) && text.contains(CONV_ID_ENV)
-            });
-            assert!(sends, "{} must send {CONV_HEADER}", harness.name());
-        }
-    }
-
-    #[test]
-    fn create_once_files_never_reference_the_conversation_id() {
-        // RAYLINE_CONV_ID is set from the rendered plan, so a file that is not
-        // rewritten each launch must never reference it.
-        for harness in Harness::ALL {
-            for fallback in [
-                ConversationIdFallback::new(None),
-                ConversationIdFallback::new(Some("1")),
-            ] {
-                let (_dir, plan) = render_with(harness, fallback);
-                for file in plan.files.iter().filter(|file| !file.overwrite) {
-                    assert!(
-                        !file.contents.contains(CONV_ID_ENV),
-                        "{}: {}",
-                        harness.name(),
-                        file.name
-                    );
-                }
-            }
-        }
     }
 
     /// The key reaches each harness through an owner-only Rayline config file,
@@ -1364,7 +1186,6 @@ pub(crate) mod tests {
                 let path = dir.join(file.name);
                 let text = fs::read_to_string(&path).unwrap();
                 holds_key |= text.contains(TEST_KEY);
-                assert!(!text.contains(KEY_ENV), "{}: {}", harness.name(), file.name);
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
@@ -1388,14 +1209,14 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn harness_child_never_inherits_a_router_key() {
-        let vars = [KEY_ENV, ROUTER_KEY_ENV];
+        let vars = [ROUTER_KEY_ENV];
         let previous: Vec<_> = vars.iter().map(std::env::var_os).collect();
         for var in vars {
             // SAFETY: tests run with --test-threads=1 (AGENTS.md), so no other
             // thread reads the environment concurrently.
             unsafe { std::env::set_var(var, "rlk-test-not-a-real-key") };
         }
-        let output = build_command(Path::new("/usr/bin/env"), &Plan::default(), None, &[])
+        let output = build_command(Path::new("/usr/bin/env"), &Plan::default(), &[])
             .output()
             .expect("run env");
         for (var, value) in vars.iter().zip(previous) {
@@ -1427,7 +1248,6 @@ pub(crate) mod tests {
             contents: "new".to_owned(),
             overwrite: true,
             merged_from: None,
-            replaces_seed: None,
         }];
         write_files(&dir, &files).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");

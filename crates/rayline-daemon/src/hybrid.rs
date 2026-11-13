@@ -1,5 +1,4 @@
 //! Supervise the execution core and forward its native HTTP/SSE surfaces.
-//! This path never enters the static router or local model adapter.
 
 use std::convert::Infallible;
 use std::io::{self, Write};
@@ -39,26 +38,26 @@ const MAX_REQUEST_BYTES: usize = 64 << 20;
 /// starts), when the service names no `retry-after`. Jittered by
 /// [`jittered`] so many sessions do not resend in step.
 const DECISIONS_RETRY_DELAY: Duration = Duration::from_secs(5);
-/// The longest `retry-after` rld waits out itself. A longer one is passed to
-/// the harness without an rld retry.
+/// The longest `retry-after` the gateway waits out itself. A longer one is
+/// passed to the harness without a gateway retry.
 const DECISIONS_MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 /// `retry-after` the harness gets for a retryable failure when the service
 /// named none.
 const DEFAULT_HARNESS_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-#[derive(clap::Args, Debug)]
+/// The local process's options. Only `raydock local start` passes them; the
+/// gateway always binds a free loopback port and records it in the ready file.
+#[derive(clap::Parser, Debug)]
+#[command(no_binary_name = true)]
 pub struct Args {
-    /// Execution core binary. Built and versioned separately from rld.
+    /// Execution core binary. Built and versioned separately from raydock.
     #[arg(long)]
     core: PathBuf,
     /// Credential-free execution-core configuration.
     #[arg(long)]
     config: PathBuf,
-    /// Loopback gateway port; zero chooses a free port.
-    #[arg(long, default_value_t = 20815)]
-    port: u16,
     /// Shared deadline for core initialization and readiness, including profile checks.
-    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     startup_timeout_secs: u64,
     /// Private file receiving this instance's gateway token.
     #[arg(long)]
@@ -66,25 +65,23 @@ pub struct Args {
     /// Private directory file receiving non-secret startup metadata.
     #[arg(long)]
     ready_file: PathBuf,
-    /// Router URL of a configured Rayline environment that may receive
-    /// Decisions requests, in addition to the built-in routers and loopback.
-    #[arg(long = "router-url")]
-    router_urls: Vec<String>,
+    /// Router of the Rayline environment the process runs for: Decisions
+    /// may go to it, the built-in prod router or loopback.
+    #[arg(long)]
+    router_url: String,
     /// Rayline environment whose router key Decisions uses; named in the
     /// sign-in hint when Decisions refuses that key.
     #[arg(long)]
     env_name: Option<String>,
     /// Model that answers Claude Code's auto-mode classifier, through the
-    /// profile's cloud Messages router.
-    #[arg(long, default_value = crate::hybrid_classifier::DEFAULT_CLASSIFIER_MODEL)]
-    classifier_model: String,
-    /// Snapshot directory of the local model's tokenizer and chat template:
-    /// rld counts the local deployment's prompts with them for the core.
+    /// profile's cloud Messages router: `routing.classifier_model`.
     #[arg(long)]
-    token_counter_dir: Option<PathBuf>,
-    /// The local deployment the counter sizes.
-    #[arg(long, default_value = "local")]
-    token_counter_deployment: String,
+    classifier_model: String,
+    /// A deployment and the snapshot directory of its model's tokenizer and
+    /// chat template: the gateway counts that deployment's prompts with them for the
+    /// core. Once per deployment with a `tokenizer`.
+    #[arg(long = "token-counter-dir", num_args = 2, value_names = ["DEPLOYMENT", "DIR"])]
+    token_counters: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -102,7 +99,6 @@ struct Ready {
     pid: u32,
     core_pid: u32,
     instance_id: String,
-    credential_env: Vec<String>,
     capabilities: ModelCapabilities,
 }
 
@@ -119,7 +115,7 @@ struct Gateway {
     /// The command that renews the router key Decisions uses.
     login_command: String,
     /// Where Claude Code's auto-mode classifier goes instead of the core.
-    classifier_pin: Option<crate::hybrid_classifier::CloudPin>,
+    classifier: crate::hybrid_classifier::Route,
     metrics: Arc<RouterMetrics>,
     routing_metadata: RoutingMetadata,
 }
@@ -127,16 +123,22 @@ struct Gateway {
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 
 pub async fn run(args: Args) -> Result<()> {
-    check_decisions_url(&args.config, &args.router_urls)?;
-    let credential_env = credential_env_names(&args.config)?;
+    check_decisions_url(&args.config, &args.router_url)?;
     let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
-    let routing_metadata = RoutingMetadata::from_config(&config);
-    let classifier_pin = crate::hybrid_classifier::cloud_pin(&config, &args.classifier_model);
+    let routing_metadata = RoutingMetadata::from_config(&config).map_err(anyhow::Error::msg)?;
+    let classifier = crate::hybrid_classifier::route(&config, &args.classifier_model)
+        .map_err(anyhow::Error::msg)?;
+    if std::env::var(&classifier.auth_env).map_or(true, |key| key.is_empty()) {
+        bail!(
+            "`{}` is not set, so the auto-mode classifier cannot reach Rayline cloud",
+            classifier.auth_env
+        );
+    }
     let startup_timeout = Duration::from_secs(args.startup_timeout_secs);
     let startup_deadline = tokio::time::Instant::now() + startup_timeout;
     // Register before spawning so cancellation during startup also reaps the child.
     let mut signals = Box::pin(shutdown_signal()?);
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
     let core_token = token();
     let gateway_token = token();
@@ -145,42 +147,33 @@ pub async fn run(args: Args) -> Result<()> {
         token: args.token_file.clone(),
         ready: None,
     };
-    // A counter that cannot load leaves the core sizing the local model
-    // itself; the session still starts.
     let counter_token = token();
-    let mut counter_task = None;
+    let counters = args
+        .token_counters
+        .chunks_exact(2)
+        .map(|pair| (pair[0].clone(), PathBuf::from(&pair[1])))
+        .collect::<Vec<_>>();
     let mut core_config = args.config.clone();
-    if let Some(dir) = &args.token_counter_dir {
-        match crate::hybrid_counter::prepare(
-            dir,
-            &args.config,
-            &args.token_counter_deployment,
-            counter_token.clone(),
-        )
-        .await
-        {
-            Ok(prepared) => {
-                tracing::info!(dir = %dir.display(), "local prompt counter ready");
-                core_config = prepared.config;
-                counter_task = Some(tokio::spawn(crate::hybrid_counter::serve(
-                    prepared.listener,
-                    prepared.counter,
+    let mut counter_tasks = AbortOnDrop(Vec::new());
+    if !counters.is_empty() {
+        let prepared =
+            crate::hybrid_counter::prepare(&counters, &args.config, counter_token.clone())
+                .await
+                .context("load the prompt counters")?;
+        core_config = prepared.config;
+        for (counter, listener) in prepared.counters {
+            counter_tasks
+                .0
+                .push(tokio::spawn(crate::hybrid_counter::serve(
+                    listener, counter,
                 )));
-            }
-            Err(error) => tracing::warn!(
-                error = format!("{error:#}"),
-                "local prompt counter unavailable; the core sizes the local model itself"
-            ),
         }
     }
-    let mut counter_task = AbortOnDrop(counter_task);
     let (mut child, mut parent_pipe) =
         spawn_core(&args.core, &core_config, &core_token, &counter_token)?;
-    // An execution core older than the token_counter contract refuses the
-    // counted profile at startup; start it again on the plain one.
-    let first = tokio::select! {
+    let handshake = tokio::select! {
         result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
-            result.context("execution core startup timed out")?
+            result.context("execution core startup timed out")??
         }
         result = &mut signals => {
             result?;
@@ -188,34 +181,7 @@ pub async fn run(args: Args) -> Result<()> {
             return Ok(());
         }
     };
-    let first = match first {
-        Err(error) if core_config != args.config => {
-            tracing::warn!(
-                error = format!("{error:#}"),
-                "execution core refused the prompt counter; starting it without one"
-            );
-            stop_child(&mut child, &mut parent_pipe)
-                .await
-                .context("stop execution core")?;
-            if let Some(task) = counter_task.0.take() {
-                task.abort();
-            }
-            (child, parent_pipe) =
-                spawn_core(&args.core, &args.config, &core_token, &counter_token)?;
-            None
-        }
-        other => Some(other?),
-    };
     let outcome = async {
-        let handshake = match first {
-            Some(handshake) => handshake,
-            None => tokio::select! {
-                result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
-                    result.context("execution core startup timed out")??
-                }
-                result = &mut signals => { result?; return Ok(()); }
-            },
-        };
         let client = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -234,7 +200,7 @@ pub async fn run(args: Args) -> Result<()> {
         let state = Arc::new(Gateway {
             core_url: handshake.listen_url,
             core_token,
-            inbound: InboundGuard::new(gateway_token).context("generate gateway token")?,
+            inbound: InboundGuard::new(gateway_token),
             client,
             port,
             core_pid: handshake.pid,
@@ -242,8 +208,8 @@ pub async fn run(args: Args) -> Result<()> {
             capabilities: capabilities.clone(),
             shutdown: shutdown_tx,
             login_command: login_command(args.env_name.as_deref()),
-            classifier_pin,
-            metrics: RouterMetrics::new("rayline-hybrid"),
+            classifier,
+            metrics: RouterMetrics::new("rayline-local"),
             routing_metadata,
         });
         let ready = Ready {
@@ -253,7 +219,6 @@ pub async fn run(args: Args) -> Result<()> {
             pid: std::process::id(),
             core_pid: handshake.pid,
             instance_id,
-            credential_env,
             capabilities,
         };
         write_private_new(&args.ready_file, &serde_json::to_vec(&ready)?)?;
@@ -282,39 +247,9 @@ pub async fn run(args: Args) -> Result<()> {
 /// Decisions requests carry execution context and the router key, so the core
 /// is started only when `decisions.url` is a Rayline router or loopback. This
 /// repeats the launcher's check on the file the core will actually read.
-fn check_decisions_url(path: &Path, router_urls: &[String]) -> Result<()> {
-    rayline_local_router::decisions_url::check_config_bytes(
-        &std::fs::read(path)?,
-        router_urls.iter().map(String::as_str),
-    )
-    .map_err(anyhow::Error::msg)
-}
-
-fn credential_env_names(path: &Path) -> Result<Vec<String>> {
-    // Read only environment references; the core owns full config validation.
-    #[derive(Default, Deserialize)]
-    struct Auth {
-        auth_env: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct References {
-        #[serde(default)]
-        decisions: Auth,
-        #[serde(default)]
-        deployments: Vec<Auth>,
-    }
-    let references: References = serde_json::from_slice(&std::fs::read(path)?)?;
-    let mut names: Vec<_> = std::iter::once(references.decisions)
-        .chain(references.deployments)
-        .filter_map(|auth| auth.auth_env)
-        .filter(|name| !name.is_empty())
-        .collect();
-    if names.iter().any(|name| name.contains(['=', '\0'])) {
-        bail!("credential environment reference is not a valid variable name");
-    }
-    names.sort();
-    names.dedup();
-    Ok(names)
+fn check_decisions_url(path: &Path, router_url: &str) -> Result<()> {
+    rayline_local_router::decisions_url::check_config_bytes(&std::fs::read(path)?, [router_url])
+        .map_err(anyhow::Error::msg)
 }
 
 async fn read_handshake(child: &mut Child) -> Result<CoreHandshake> {
@@ -498,12 +433,10 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
         }
         Err(error) => bail!("read request body: {error}"),
     };
-    if let Some(pin) = &state.classifier_pin
-        && parts.method == Method::POST
+    if parts.method == Method::POST
         && crate::hybrid_classifier::is_classifier(parts.uri.path(), &body)
-        && let Some(response) = send_classifier_to_cloud(state, pin, &parts, &body).await?
     {
-        return Ok(response);
+        return send_classifier_to_cloud(state, &state.classifier, &parts, &body).await;
     }
     let mut observation = (parts.method == Method::POST
         && matches!(
@@ -541,7 +474,7 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
             .unwrap_or("-");
         if !retried
             && let Some(failure) = failure
-            && let Some(delay) = rld_retry_delay(failure, hint)
+            && let Some(delay) = gateway_retry_delay(failure, hint)
         {
             // Nothing ran: the core decides before it dispatches, and treats an
             // identical resend like the harness's own retry.
@@ -576,34 +509,27 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
     }
 }
 
-/// Sends an auto-mode classifier request to the cloud pin the way the core
-/// dispatches a model-pin turn. None (the core takes the request) when the
-/// pin's credential is not in this process's environment.
+/// Sends an auto-mode classifier request to Rayline cloud the way the core
+/// dispatches a model-pin turn.
 async fn send_classifier_to_cloud(
     state: &Gateway,
-    pin: &crate::hybrid_classifier::CloudPin,
+    route: &crate::hybrid_classifier::Route,
     parts: &hyper::http::request::Parts,
     body: &[u8],
-) -> Result<Option<Response<Body>>> {
-    let Some(key) = std::env::var(&pin.auth_env)
-        .ok()
-        .filter(|key| !key.is_empty())
-    else {
-        return Ok(None);
-    };
-    let Some(pinned) = crate::hybrid_classifier::pinned_body(body, &pin.wire_model) else {
-        return Ok(None);
-    };
+) -> Result<Response<Body>> {
+    let key = std::env::var(&route.auth_env)?;
+    let pinned = crate::hybrid_classifier::pinned_body(body, &route.wire_model)
+        .context("the classifier request is not a JSON object")?;
     let mut outgoing = state
         .client
-        .post(&pin.url)
+        .post(&route.url)
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .header("anthropic-version", "2023-06-01")
-        .header("x-workshop-required-model", &pin.wire_model);
-    // The pin is the Rayline router itself (same origin as Decisions), so it
+        .header("x-workshop-required-model", &route.wire_model);
+    // The route is the Rayline router itself (same origin as Decisions), so it
     // gets every session header the client sent, unchanged (the same set the
-    // local router forwards to the hosted router). The router keys the call
+    // local process forwards to the hosted router). The router keys the call
     // from those headers exactly as it keys the turn being classified;
     // Claude Code's `x-claude-code-session-id` is one of its own rungs.
     for name in std::iter::once("anthropic-beta").chain(rayline_local_router::SESSION_HEADERS) {
@@ -612,13 +538,13 @@ async fn send_classifier_to_cloud(
         }
     }
     let mut observation = RequestObservation::start(state.metrics.clone(), body);
-    observation.record_classifier(&pin.wire_model);
+    observation.record_classifier(&route.wire_model);
     let upstream = outgoing.bearer_auth(key).body(pinned).send().await?;
     let status = upstream.status();
     tracing::info!(
-        model = %pin.wire_model,
+        model = %route.wire_model,
         status = status.as_u16(),
-        "auto-mode classifier sent to the cloud pin"
+        "auto-mode classifier sent to Rayline cloud"
     );
     if !status.is_success() {
         // The router's message can echo request content, so only its error
@@ -640,7 +566,7 @@ async fn send_classifier_to_cloud(
                     .map(str::to_owned)
             })
             .unwrap_or_default();
-        tracing::warn!(status = status.as_u16(), %error_type, "cloud pin refused the auto-mode classifier");
+        tracing::warn!(status = status.as_u16(), %error_type, "Rayline cloud refused the auto-mode classifier");
         let response = buffered_response(
             state,
             status,
@@ -650,9 +576,9 @@ async fn send_classifier_to_cloud(
             RetryHint::default(),
         )?;
         observation.finish(status.as_u16(), Some("classifier request refused"));
-        return Ok(Some(response));
+        return Ok(response);
     }
-    observed_response(upstream, observation, Upstream::Classifier).map(Some)
+    observed_response(upstream, observation, Upstream::Classifier)
 }
 
 async fn send_to_core(
@@ -974,8 +900,11 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
 
 /// The routing service's retry advice, as the core passes it on with its 502:
 /// `retry-after` (delta-seconds) and `x-should-retry` (`true`/`false`, the
-/// Anthropic and OpenAI SDKs' own header). Absent from a core that does not
-/// forward them, and then rld's defaults apply.
+/// Anthropic and OpenAI SDKs' own header). The core passes each on by itself:
+/// `retry-after` when the routing service sent delta-seconds (capped at
+/// 300 s), `x-should-retry` when it sent exactly `true` or `false`. On a
+/// transport failure it passes on neither. A missing one takes the gateway's
+/// default for that header alone, for an unavailable or busy service.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RetryHint {
     retry_after: Option<Duration>,
@@ -1004,11 +933,11 @@ impl RetryHint {
     }
 }
 
-/// How long rld waits before its one resend of a failed turn, or None when it
+/// How long the gateway waits before its one resend of a failed turn, or None when it
 /// does not resend: only an unavailable or busy service is worth another try,
 /// never when the service says not to, and never past
 /// [`DECISIONS_MAX_RETRY_WAIT`] (the harness gets that wait instead).
-fn rld_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Duration> {
+fn gateway_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Duration> {
     if !matches!(
         failure,
         DecisionsFailure::Unavailable | DecisionsFailure::Throttled
@@ -1019,6 +948,7 @@ fn rld_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Duratio
     match hint.retry_after {
         Some(wait) if wait > DECISIONS_MAX_RETRY_WAIT => None,
         Some(wait) => Some(wait.max(Duration::from_secs(1))),
+        // No `retry-after`: a transport failure, or a refusal without one.
         None => Some(jittered(DECISIONS_RETRY_DELAY, rand::random::<f64>())),
     }
 }
@@ -1038,7 +968,7 @@ fn login_command(env_name: Option<&str>) -> String {
 /// The core's error response, with a Decisions failure explained: what to
 /// run for a refused key, and that an unavailable service is retryable.
 ///
-/// An explained failure always carries `x-should-retry: false`: rld has
+/// An explained failure always carries `x-should-retry: false`: the gateway has
 /// already spent the turn's one resend (or the service ruled one out), and
 /// harness SDKs otherwise resend a 5xx or 429 up to about ten times, each a
 /// fresh lookup on the shared routing service. A retryable one also carries
@@ -1072,7 +1002,9 @@ fn buffered_response(
             }
             response = response.header("x-should-retry", "false");
             if retryable {
-                // At least the second rld itself waits.
+                // At least the second the gateway waits itself. The service's
+                // own, else the default: the core sends none on a transport
+                // failure, or on a refusal without one.
                 let wait = hint
                     .retry_after
                     .unwrap_or(DEFAULT_HARNESS_RETRY_AFTER)
@@ -1121,7 +1053,7 @@ fn explain_decisions_failure(
     let message = value.pointer("/error/message")?.as_str()?.to_owned();
     let explained = match failure {
         DecisionsFailure::Auth => format!(
-            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `raydock hybrid stop` and `raydock hybrid start` so the runtime uses the new key."
+            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `raydock local stop`: the next run starts the local process with the new key."
         ),
         DecisionsFailure::Unavailable => format!(
             "{message}: the Rayline routing service could not decide this turn right now (it may be unavailable, or a development cell may still be starting, which takes about a minute). This is retryable: send the turn again after the retry-after interval."
@@ -1130,7 +1062,7 @@ fn explain_decisions_failure(
             "{message}: the Rayline routing service is busy. Send the turn again after the retry-after interval."
         ),
         DecisionsFailure::Refused => format!(
-            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `hybrid.local_registry_model` in settings and run `raydock hybrid stop` and `raydock hybrid start`."
+            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `models` in settings.json and run `raydock local stop`: the next run starts the local process from the changed file."
         ),
     };
     *value.pointer_mut("/error/message")? = serde_json::Value::String(explained);
@@ -1198,7 +1130,7 @@ fn spawn_core(
         .spawn()
         .context("start ARC execution core")?;
     // Keep the pipe open even while Child::wait closes its own stdin handle.
-    // The core exits on EOF if rld is terminated without running cleanup.
+    // The core exits on EOF if the local process is terminated without running cleanup.
     let parent_pipe = Some(
         child
             .stdin
@@ -1208,11 +1140,11 @@ fn spawn_core(
     Ok((child, parent_pipe))
 }
 
-/// Aborts the counter's server when rld's run ends.
-struct AbortOnDrop(Option<tokio::task::JoinHandle<Result<()>>>);
+/// Aborts the counter's server when the local process's run ends.
+struct AbortOnDrop(Vec<tokio::task::JoinHandle<Result<()>>>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
-        if let Some(task) = self.0.take() {
+        for task in &self.0 {
             task.abort();
         }
     }
@@ -1274,8 +1206,8 @@ fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
         let mut brk = ctrl_break()?;
         let mut close = ctrl_close()?;
         let mut shutdown = ctrl_shutdown()?;
-        // `raydock hybrid` runs rld without a console it can signal, so it
-        // asks for a stop through this event instead.
+        // `raydock local start` runs the local process without a console it
+        // can signal, so it asks for a stop through this event instead.
         let event = rayline_local_router::windows_state::StopEvent::create()
             .context("create hybrid stop event")?;
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -1487,7 +1419,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("`raydock --env dev auth login`"),
+            message.contains("`raydock --env dev auth login`, then `raydock local stop`"),
             "{message}"
         );
         // The wire shape is kept.
@@ -1545,33 +1477,36 @@ mod tests {
     }
 
     #[test]
-    fn rld_resends_only_an_unavailable_or_busy_turn_the_service_allows() {
+    fn the_gateway_resends_only_an_unavailable_or_busy_turn_the_service_allows() {
         let hint = |retry_after: Option<u64>, should_retry: Option<bool>| RetryHint {
             retry_after: retry_after.map(Duration::from_secs),
             should_retry,
         };
         for failure in [DecisionsFailure::Unavailable, DecisionsFailure::Throttled] {
             assert_eq!(
-                rld_retry_delay(failure, hint(Some(3), None)),
+                gateway_retry_delay(failure, hint(Some(3), None)),
                 Some(Duration::from_secs(3))
             );
             assert_eq!(
-                rld_retry_delay(failure, hint(Some(3), Some(true))),
+                gateway_retry_delay(failure, hint(Some(3), Some(true))),
                 Some(Duration::from_secs(3))
             );
             // At least a second, at most the cap.
             assert_eq!(
-                rld_retry_delay(failure, hint(Some(0), None)),
+                gateway_retry_delay(failure, hint(Some(0), None)),
                 Some(Duration::from_secs(1))
             );
             assert_eq!(
-                rld_retry_delay(failure, hint(Some(30), None)),
+                gateway_retry_delay(failure, hint(Some(30), None)),
                 Some(DECISIONS_MAX_RETRY_WAIT)
             );
-            assert_eq!(rld_retry_delay(failure, hint(Some(31), None)), None);
-            assert_eq!(rld_retry_delay(failure, hint(Some(3), Some(false))), None);
-            assert_eq!(rld_retry_delay(failure, hint(None, Some(false))), None);
-            let default = rld_retry_delay(failure, hint(None, None)).unwrap();
+            assert_eq!(gateway_retry_delay(failure, hint(Some(31), None)), None);
+            assert_eq!(
+                gateway_retry_delay(failure, hint(Some(3), Some(false))),
+                None
+            );
+            assert_eq!(gateway_retry_delay(failure, hint(None, Some(false))), None);
+            let default = gateway_retry_delay(failure, hint(None, None)).unwrap();
             assert!(
                 default >= DECISIONS_RETRY_DELAY / 2 && default < DECISIONS_RETRY_DELAY * 3 / 2,
                 "{default:?}"
@@ -1579,7 +1514,7 @@ mod tests {
         }
         for failure in [DecisionsFailure::Auth, DecisionsFailure::Refused] {
             for advice in [hint(None, None), hint(Some(1), Some(true))] {
-                assert_eq!(rld_retry_delay(failure, advice), None, "{failure:?}");
+                assert_eq!(gateway_retry_delay(failure, advice), None, "{failure:?}");
             }
         }
     }

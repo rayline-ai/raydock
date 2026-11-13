@@ -5,17 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Rayline local-router runtime: llama-server + adapter + header-injector"
+description = "The Rayline local process: ARC execution core supervisor and loopback gateway"
 homepage.workspace = true
 repository.workspace = true
 publish.workspace = true
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "rld"
-path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -26,22 +22,13 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-dirs.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
 futures.workspace = true
 rand = "0.9"
-rayline-hf = { path = "../rayline-hf" }
-rayline-llama = { path = "../rayline-llama" }
 rayline-metrics = { path = "../rayline-metrics" }
 rayline-local-router = { path = "../rayline-local-router" }
-rayline-adapter = { path = "../rayline-adapter" }
-rayline-injector = { path = "../rayline-injector" }
-rayline-proxy = { path = "../rayline-proxy" }
 rayline-tokencount = { path = "../rayline-tokencount" }
 sha2 = "0.10"
-reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls-native-roots"] }
-
-[build-dependencies]
-serde_json.workspace = true
+reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots"] }

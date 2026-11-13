@@ -1,971 +1,196 @@
-# Getting Started with Raydock
+# Getting started
 
-This guide takes you from a fresh install to a working hybrid session — your
-main agent on cloud Claude, background subagents on a model running locally — and
-then into the configuration you'll reach for as you go deeper.
+This guide covers installing Rayline, signing in, running a coding harness on
+ARC, and the options each harness has.
 
-Two ways to run it:
+```
+Usage: rayline [OPTIONS] COMMAND [ARGS]...
 
-- **`raydock claude --local`** — the local static router. No hosted account, no
-  network calls for routing decisions. Out of the box it sends read-only
-  subagents such as Explore to your local model and keeps everything else,
-  including the main agent, on cloud Claude.
-- **`raydock claude`** — adds hosted Rayline routing on top of Claude Code. This
-  signs you in with a Rayline-scoped CLI session (an opaque `rls_`/`rlr_` token)
-  and mints a separate `rlk-` router key for hosted requests.
+Options:
+  --version        Show version
+  --help           Show this message and exit
 
-## Quick Start
+Commands:
+  auth             Sign in, sign out, show status, print a token
+  run              Launch a coding harness on ARC
+  local            Start, stop or inspect the local Rayline process
+  top              Show live request metrics
+  update           Check for or install a Rayline update
+```
 
-Start a Claude Code session with the local router:
+## Install
+
+macOS and Linux:
 
 ```bash
-raydock claude --local
+curl -fsSL https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.sh | sh
 ```
 
-Run it next to a normal Claude Code background daemon, using an isolated Claude
-config dir so the two don't interfere:
-
-```bash
-raydock claude --local --isolated
-```
-
-You can also start the router **without** launching Claude Code — handy when you
-want to drive it from your own code (for example an Anthropic SDK client pointed
-at the proxy on `http://127.0.0.1:20810`). It routes every request through the
-router by default, so requesting model `rayline-local` reaches your on-device
-model:
-
-```bash
-raydock router start                 # route all (default)
-raydock router start --route subagents
-raydock router stop                  # stop it when done
-```
-
-See [examples/cloud](../examples/cloud) and [examples/local](../examples/local)
-for runnable Python and TypeScript clients.
-
-## oh-my-pi (omp)
-
-Install [oh-my-pi](https://github.com/can1357/oh-my-pi#install), then launch it
-through Raydock:
-
-```bash
-raydock omp
-```
-
-On first use, Raydock signs you into Rayline and provisions the hosted router
-key. No provider YAML, exported API key, local inference server, or proxy setup
-is required. Requests go to **Rayline Platform in the cloud** and are billed to
-your Rayline account, not an Anthropic subscription.
-
-The launcher registers a custom **`rayline` provider** over Anthropic Messages
-with `auth: apiKey`; it does not impersonate Anthropic or Claude Code. The
-default, slow, and plan roles use **ARC Sage**; smol uses **ARC Swift**. These
-are role assignments, not measured speed or intelligence rankings. ARC chooses
-the underlying model and reasoning effort for each request.
-
-### Choose a model and resume
-
-Use omp's model picker, or select a model for one launch:
-
-```bash
-raydock omp --model rayline/arc-swift-1.0
-raydock omp --continue
-```
-
-Role choices saved in omp survive later launches. With omp **18.1.10 or newer**,
-its native session ID also keeps the routing episode together when resuming;
-upgrade if Raydock warns about an older version.
-
-### What the picker shows
-
-Raydock supplies the ARC fixed rates in USD per million tokens:
-
-| Model | Input | Output | Cache read | Cache write |
-| --- | ---: | ---: | ---: | ---: |
-| ARC Sage | $1 | $5 | $0.05 | $1.25 |
-| ARC Swift | $0.05 | $0.25 | $0.005 | $0.0625 |
-
-These are effective card 26 (2026-10-27). See
-[current ARC pricing](https://docs.rayline.ai/arc/pricing) and check
-[Rayline Usage](https://platform.rayline.ai) for actual charges. omp's local
-cost estimates use the rate card bundled with your Raydock release.
-
-Hosted ARC entries advertise text and image input, a 1,000,000-token context
-window, and a 128,000-token output limit. The output limit is a client setting,
-not a guarantee that every routed model can produce that many tokens.
-Client-controlled thinking is disabled because ARC selects effort.
-Intelligence and speed columns may be empty: no benchmark scores are supplied,
-and speed measurements depend on omp and the requests actually served.
-
-The hosted omp picker lists only **ARC Sage** and **ARC Swift**. Hybrid routing
-is separate: its execution core uses its own virtual model, `rayline-auto`.
-Hybrid has no single ARC tier rate; if omp displays it as free, use your
-upstream billing records instead.
-
-### Configuration and troubleshooting
-
-Raydock keeps its isolated omp configuration and sessions under
-`~/.config/rayline/harness/omp/<environment>/` (`prod` by default):
-
-- `models.yml` is managed by Raydock and refreshed on every launch, including
-  pricing corrections. Do not edit it for persistent customizations.
-- `config.yml` is seeded once. On hosted launches,
-  `rayline/rayline-router` role choices migrate to Sage (`smol` to Swift);
-  other saved choices, comments and settings are preserved.
-- Saved sessions migrate their `rayline-router` selections too, so noninteractive
-  `--continue --print` and `--resume` still work. Historical messages, usage and
-  served-model labels are not rewritten. Explicit `--session-dir`, `--resume`
-  and `--restore` paths are included. Journal modification times are preserved
-  so `--continue` does not switch to an older conversation just because it
-  migrated. Raydock cooperates with omp's settings lock and refuses active
-  writers, concurrent edits, symlinks and malformed targeted state instead of
-  overwriting it; close the settings/session writer before retrying.
-- The generated key is stored in owner-only configuration, not exported to
-  omp's tool subprocesses. Do not share the generated file.
-- `OMP_PROFILE`, `PI_PROFILE`, and `CLAUDE_CONFIG_DIR` are removed from the
-  launched child's environment so another profile does not override this setup.
-  Your calling shell is unchanged.
-
-If ARC still appears free, update Raydock and **restart through `raydock omp`**.
-To inspect the generated metadata without sending an inference request:
-
-```bash
-raydock omp models rayline --json --no-extensions
-```
-
-Sage should report input/output costs of `1`/`5`; Swift `0.05`/`0.25`.
-If another model is selected, check explicit CLI flags and project overrides.
-For your usual non-Rayline configuration, launch `omp` normally outside the
-Raydock-managed environment.
-
-### Manual direct API configuration
-
-Prefer the launcher unless you need to own the provider configuration.
-Follow the [direct API guide](https://docs.rayline.ai/tools/omp) in a separate
-configuration directory, using `api: anthropic-messages`, `auth: apiKey`,
-`baseUrl: https://api.rayline.ai` (no `/v1`), and an environment-variable
-**name** such as `RAYLINE_API_KEY` for `apiKey`. Include the four `cost` fields
-above for each ARC model; omitted costs can appear free in omp. Keep credentials
-out of project files. The guide's 2,048-token example is a response budget,
-not the launcher's output setting.
-
-## Codex CLI And App
-
-Rayline can also expose a local OpenAI Responses-compatible endpoint for Codex.
-This path does not use the Anthropic transparent proxy or a local CA; Codex talks
-directly to Rayline over HTTP on `127.0.0.1`.
-
-For a one-off Codex CLI run, let Rayline start the router and pass temporary
-Codex provider overrides:
-
-```bash
-raydock codex -- exec "summarize this repo"
-```
-
-With no `--config`, `raydock codex` defaults to **Rc-Rc** — it routes everything
-(main + subagents) to the hosted cloud router (RCR) over native OpenAI Responses,
-authenticated with your `raydock auth login` session key, on ARC: the main agent
-on `arc-sage-1.0` and subagents on `arc-swift-1.0`. This mirrors the default
-`raydock claude`, which likewise routes everything to the cloud router on ARC; a
-`--config` overrides selected routes to local/API-key/subscription endpoints.
-
-To use your ChatGPT/Codex subscription for the main agent instead, pass
-`--auth subscription` (Codex reuses its existing ChatGPT login; subagents route
-to the on-device model when one is available). Use `--auth none` for local/no
-hosted auth.
-
-Use `--model <name>` before `--` to request a different Rayline or configured
-model. Without it the session runs on ARC (see [Which model runs](#which-model-runs-arc-by-default));
-naming a concrete model **pins** it, so the router's choice is skipped. Two lanes ignore an inherited `claude-*` id by
-design — background haiku calls and Claude Code subagent turns. See
-[routing-modes](../examples/routing-modes/README.md#what-model-means-at-the-rayline-cloud-endpoint).
-
-### Desktop app
-
-`raydock codex app` launches the Codex **desktop app** through Rayline in one
-step. It accepts the same flags as `raydock codex` (`--config`, `--auth`,
-`--model`), starts the router, and points the app at Rayline:
-
-```bash
-raydock codex app                 # launch the desktop app routed through Rayline
-raydock codex app ~/projects/app  # optionally open a workspace path
-raydock codex app --auth none --config <path>   # local/API-key routing
-```
-
-Rayline runs the desktop app on an isolated Codex home
-(`~/.rayline/codex-app-home`) so it never disturbs your normal Codex
-configuration:
-
-- On first launch it seeds that home from your existing Codex config (preserving
-  your settings) and uses your Codex login when auth resolves to subscription.
-  On later launches it refreshes only the Rayline routing and preserves whatever
-  the app has since saved (open projects, plugins, and other app settings).
-- The app is single-instance. If it is already running with a **different**
-  configuration, `raydock codex app` prompts before quitting and relaunching it;
-  if it already matches, it just brings the window to the front.
-- With `--auth none` (or a local-only config), your Codex login is not used for
-  the isolated app.
-
-### Reusable CLI profile
-
-To write a standalone Codex profile (for the CLI, or manual configuration)
-instead of launching the app, use `raydock codex configure` and start the
-router yourself:
-
-```bash
-raydock codex configure
-raydock router start --mode codex --auth subscription
-```
-
-`raydock codex configure` writes `$CODEX_HOME/rayline.config.toml` when
-`CODEX_HOME` is set, otherwise `~/.codex/rayline.config.toml`. The generated
-profile points Codex at:
-
-```text
-http://127.0.0.1:20811/v1
-```
-
-Equivalent manual Codex config:
-
-```toml
-model = "rayline-local"
-model_provider = "rayline"
-forced_login_method = "chatgpt"
-
-[model_providers.rayline]
-name = "Raydock"
-base_url = "http://127.0.0.1:20811/v1"
-wire_api = "responses"
-requires_openai_auth = true
-```
-
-The router command also accepts `raydock router --mode openai` as shorthand for
-`raydock router start --mode codex`.
-
-Check for CLI updates:
-
-```bash
-raydock update --check
-```
-
-Inspect or stop the router and proxy processes:
-
-```bash
-raydock router status
-raydock router logs
-raydock router logs --lines 120
-raydock router top
-raydock router stop
-```
-
-## Claude Desktop (Code)
-
-`raydock claude-desktop` connects Claude Code inside the Claude desktop app to ARC.
-Desktop's Code sessions ignore `ANTHROPIC_BASE_URL`; they reach a gateway only
-through the app's third-party inference ("3P") mode, and Desktop accepts only
-model ids that look like Anthropic models. The launcher therefore:
-
-- runs a **dedicated** `rld` with its own state (`~/.rayline/claude-desktop`)
-  and ports (router 20831, adapter 20828, injector 20829, metrics 20833), so it
-  never touches the shared router on 20808–20814 or your Claude Code CLI config;
-- offers Desktop two models, shown in the picker as **arc-sage** (the default)
-  and **arc-swift** (the cheaper tier). Desktop requires Claude-style model
-  ids, so the import uses `claude-arc-sage` and `claude-arc-swift` internally,
-  and explicit `model_routes` entries map them to the first-party tier ids
-  `arc-sage` and `arc-swift` (`--prefixed-ids` forwards the `rayline/arc-*`
-  aliases instead, for a router that predates the bare ids), stamping `x-rayline-client: claude-desktop`. ARC is not
-  a Claude model, and Rayline is not affiliated with Anthropic;
-- keeps your `rlk-` key in the router's environment only. Desktop gets
-  `http://127.0.0.1:20831` and a random per-instance gateway token
-  (`~/.rayline/claude-desktop/gateway-token`, mode 600) through
-  `~/.rayline/claude-desktop/claude-desktop-import.json`. By default the launcher
-  installs the same configuration as a named **Rayline ARC** profile in
-  `~/Library/Application Support/Claude-3p/configLibrary/`, selects it and
-  opens Desktop. A running Desktop is asked to quit gracefully before changes;
-  if it refuses, no selection changes are made. `--manual` instead prints
-  **Developer → Configure Third-Party Inference… → Import configuration**
-  instructions (skip enabling Developer Mode if the Developer menu exists).
-  The router answers only requests that carry
-  that token, address a loopback Host on its port, carry no non-loopback
-  Origin, and send JSON, so other local processes and web pages (DNS
-  rebinding, cross-site `text/plain` posts) cannot spend on your account.
-  After every start or restart the launcher checks that the router refuses a
-  request without the token. If it does not (for example an `rld` older than
-  the CLI), the launcher stops it and exits with an error;
-- keeps Claude Code's session together: the router forwards the client's
-  session headers (`x-claude-code-session-id`, `x-session-affinity`,
-  `x-session-id`, `x-conversation-id`) unchanged to the hosted Rayline router,
-  which keys the routing episode on them. The local router sends these
-  headers to the hosted Rayline router only, never to another provider;
-- routes only to ARC: the router config replaces the built-in endpoints, so
-  no model id can reach another provider, and it restarts the router when the
-  key, token, config or `rld` changes. The login service pins the `rld` path
-  the launcher resolved. Claude Desktop's third-party mode is macOS-only, so
-  the launcher targets macOS (the router also runs on Linux, for testing);
-
-```bash
-raydock claude-desktop                    # configure and launch Desktop
-raydock claude-desktop --manual           # router only; print import instructions
-raydock --env dev claude-desktop          # route to the dev environment instead
-raydock claude-desktop status             # health, request totals, Desktop check
-raydock claude-desktop validate           # Desktop's applied config vs. the router
-raydock claude-desktop install-service    # LaunchAgent ai.rayline.claude-desktop
-raydock claude-desktop stop
-raydock claude-desktop off                # switch Desktop back to your subscription
-raydock claude-desktop uninstall          # restore selection, remove service + router state
-```
-
-3P mode applies to the whole Desktop app: it switches away from your
-claude.ai subscription, and Chat and Cowork are off while it is active. To
-switch back after automatic setup, run `raydock claude-desktop off`: it restores
-both the previously selected profile and deployment mode, then reopens Desktop.
-You may need to sign in again. `stop` only stops the router. `uninstall` restores
-before deleting the recovery record; the saved Rayline profile stays available.
-Restoration and gateway cleanup also work if Claude.app was moved or removed;
-if Desktop cannot be reopened, the command reports that without undoing recovery.
-For manual imports, `off` prints the steps to sign out of Gateway mode and sign
-in with your Anthropic account.
-
-Recovery state is owner-only in `~/.rayline/claude-desktop/desktop-profile.json`.
-Repeated starts reuse the same profile and preserve the original recovery
-selection. Changes to unrelated preferences and saved profiles are preserved.
-The **Rayline ARC** profile itself is managed by Rayline and rewritten on each
-start (for example after a gateway token change); save edits under another
-profile name. Automatic setup refuses externally changed profile selections,
-hybrid pointers, or deployment modes, unreadable previous profiles, unknown
-profile metadata, and organization-managed inference settings instead of
-overwriting them. Interrupted writes retain recovery state for `off`. Desktop
-configuration and recovery writes never follow symlinks and are synced to disk
-in order. Do not delete
-that file while recovery is pending. A failed launch attempts to restore the
-previous selection; the gateway remains running for manual setup. Lifecycle
-commands share a nonblocking cross-process lease at `~/.rayline/claude-desktop.lock`
-so another start cannot interleave with restoration or uninstall. That small
-lock file deliberately survives uninstall. Manual-only cleanup does not inspect
-Desktop paths when no recovery is pending.
-
-The library location and restart behavior are documented in
-[Anthropic's configuration guide](https://claude.com/docs/third-party/claude-desktop/configuration-format).
-The exact metadata and deployment-mode writes are a compatibility boundary,
-verified against Desktop 3.6556.2; they are not a public profile-launch API.
-Anthropic does not support routing
-Claude Code to non-Claude models through a gateway, so a Desktop update can
-change this behaviour; `scripts/smoke-claude-app.sh` checks the wire path with
-one headless Claude Code turn per model.
-
-## Which Model Runs (ARC by Default)
-
-Hosted launches run on ARC unless you choose otherwise. The main agent uses
-`arc-sage-1.0`; subagents and background tasks use `arc-swift-1.0` wherever the
-harness gives them their own model setting:
-
-| Launcher | Main agent | Subagents / background |
-|---|---|---|
-| `raydock claude` (hosted) | `arc-sage-1.0` | `arc-swift-1.0` (`CLAUDE_CODE_SUBAGENT_MODEL`, forced on every subagent, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` with `--route all`); with `--model X` and `--route all`, X |
-| `raydock codex` (default Rc-Rc) | `arc-sage-1.0` | `arc-swift-1.0` |
-| `raydock opencode` | `arc-sage-1.0` | `small_model`: `arc-swift-1.0` |
-| `raydock pi` | `arc-sage-1.0` | — |
-| `raydock omp` | `arc-sage-1.0` (`default`, `slow`, `plan`) | `smol`: `arc-swift-1.0` |
-| `raydock hermes` | `arc-sage-1.0` | — |
-| `raydock openclaw` | `arc-sage-1.0` | — |
-
-Hosted `raydock claude` picks the model of every subagent and background task
-itself, and ignores the models Claude Code's own agent definitions name. It sets
-`CLAUDE_CODE_SUBAGENT_MODEL_FORCE=1` with the subagent model, so every subagent
-runs on it: Claude Code's built-in Explore and Plan agents would otherwise
-inherit the main agent's model, and the switch also overrides a model a custom
-agent names and one the main agent passes when it spawns a subagent. With
-`--model X` and `--route all`, subagents and background tasks run on X as well
-(the hosted router still replaces a `claude-*` model on those turns); a
-cloud-only `--config`'s `routes.subagent` takes precedence. Under
-`--route subagents`, subagents stay on `arc-swift-1.0`. To let Claude Code pick
-per agent, export your own `CLAUDE_CODE_SUBAGENT_MODEL` (it keeps Claude Code's
-own precedence) or launch `claude` without Raydock.
-
-Hosted generated harness configs list only ARC Sage and ARC Swift. A model
-you set yourself is kept: `--model` (before or after `--`) or `ANTHROPIC_MODEL`
-for Claude Code (subagents and background tasks then run on it too), a cloud-only `--config`'s
-`routes.main` and `routes.subagent` models (with `--route all`; without a
-`routes.subagent`, subagents follow `routes.main`), a `--router-config-path`
-subagent allowlist (Raydock then sets no subagent model), your own `CLAUDE_CODE_SUBAGENT_MODEL` or
-`ANTHROPIC_DEFAULT_HAIKU_MODEL`, a `--config` route, and the model pi and omp
-saved, except that hosted omp replaces `rayline-router` references with ARC in
-both saved roles and session selections. Pi's `settings.json` moves to ARC only
-while it still reads exactly as an 0.2.x release wrote it. Raydock rewrites its model
-keys in the Hermes and OpenClaw configs on every launch.
-
-The local and hybrid paths (`--local`, a local-plane `--config`, account-local
-routing, `raydock hybrid run`) use the local router's virtual
-model, `rayline-auto`, which tells it to apply
-its own routes. Any other model name the local router does not know, including
-`rayline-router`, also follows `routes.main`.
-`raydock claude-desktop` already runs on ARC, and `raydock codex --auth
-subscription` keeps your ChatGPT subscription for the main agent.
-
-## Hermes on Windows
-
-`raydock hermes` runs Hermes with its own Hermes home
-(`~/.config/rayline/harness/hermes/<env>`). Hermes on Windows keeps its Python
-dependencies per home and will not start in a home without them, so the first
-launch runs `hermes pm repair` for that home ("Setting up Hermes for Raydock"),
-which can take a few minutes; later launches skip it. If the repair fails,
-Raydock prints the exact command to run yourself, for example in PowerShell:
+Windows PowerShell:
 
 ```powershell
-$env:HERMES_HOME = 'C:\Users\you\.config\rayline\harness\hermes\prod'; hermes pm repair; Remove-Item Env:HERMES_HOME
+irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1 | iex
 ```
 
-## OpenClaw
+The installer places `raydock`, its alias `rayline`, `rayline-core` and
+`rayline-core-LICENSE` in `~/.rayline/bin`. It needs
+[`minisign`](https://jedisct1.github.io/minisign/): it verifies the release's
+`SHA256SUMS.minisig` against the pinned release key, then each file it
+downloads against `SHA256SUMS`. Both `raydock` and `rayline` run the same
+CLI, and this guide writes `rayline`.
 
-`raydock openclaw` runs OpenClaw against the Rayline router with a generated
-config. The default `rayline` provider speaks OpenAI Chat Completions (OpenClaw's
-own default protocol) with `compat.sendSessionAffinityHeaders`, so OpenClaw sends
-its session id as `x-session-affinity` and the router keeps one routing episode
-per OpenClaw session, including a `--session-id` resume in a later launch. A
-second provider, `rayline-resp`, lists the same models over OpenAI Responses.
-Hosted OpenAI tools such as `web_search` are not carried on Chat Completions;
-ordinary function tools are.
-
-The launcher gives the router key to OpenClaw as a file SecretRef that reads an
-owner-only `router-key` file next to that config, so the key stays out of
-OpenClaw's own files and out of the environment its tools inherit. The other
-launchers (`raydock opencode`, `pi`, `omp`, `hermes`) likewise write the key into
-their owner-only generated config, never into the harness's environment.
-
-If you configure OpenClaw by hand, do the same. Put the key in a file only you
-can read (`chmod 600`), declare it as a file secret provider, and write the
-provider's `apiKey` as a SecretRef to it:
-
-```json
-"secrets": {
-  "providers": {
-    "rayline": { "source": "file", "path": "/absolute/path/to/router-key", "mode": "singleValue" }
-  }
-},
-"models": {
-  "providers": {
-    "rayline": {
-      "baseUrl": "https://api.rayline.ai/v1",
-      "api": "openai-completions",
-      "apiKey": { "source": "file", "provider": "rayline", "id": "value" },
-      "models": [{ "id": "arc-sage-1.0", "compat": { "sendSessionAffinityHeaders": true } }]
-    }
-  }
-}
-```
-
-Avoid a plain or `${VAR}` string: OpenClaw resolves it when it loads the config,
-and then writes the resolved key into its agent model cache
-(`~/.openclaw/agents/<agent>/agent/models.json`) in plain text. For a SecretRef
-it writes only a marker there. Avoid an environment SecretRef too: every tool
-OpenClaw runs inherits its environment, so a shell `env` would show the key.
-
-## Choosing Where Requests Go
-
-Routing comes down to three independent flags on `raydock claude`. You'll rarely
-reach past `--local`; the other two are advanced overrides.
-
-| Flag | What it controls | Values | Default |
-| --- | --- | --- | --- |
-| `--local` | **Who decides** — where routing decisions are made | flag (cloud when absent) | cloud (hosted) |
-| `--via` | **How it connects** — how Claude Code reaches the router | `proxy`, `env` | `proxy` |
-| `--route` | **What flows through** — what the proxy sends to the router | `all`, `subagents` | router-dependent (see below) |
-
-### `--local` — who decides
-
-- **Absent:** the **hosted cloud router** at `api.rayline.ai` makes routing and
-  model decisions (requires `raydock auth login`).
-- **Present:** the **on-device static router** decides locally. No login, and no
-  routing decision leaves your machine. `--local` forces the proxy, since local
-  inference is only reachable through it.
-
-### `--via` — how it connects
-
-How Rayline wires Claude Code to the router. Both are first-class Claude Code
-injection points:
-
-- **`proxy`** (default): a local proxy intercepts and forwards each request.
-  **Required** to reach local inference or to route selectively. Also enables
-  `raydock top` and per-request metrics.
-- **`env`**: points `ANTHROPIC_BASE_URL`/`ANTHROPIC_MODEL` at the router for the
-  whole session — lightest weight, no background process. **Cloud-only**: it
-  can't reach local inference and can't route selectively, so it's rejected when
-  combined with `--local` or `--route subagents`.
-
-### `--route` — what flows through
-
-What goes through the router versus straight to Anthropic:
-
-- **`all`**: route every request (main agent + subagents).
-- **`subagents`**: route only subagent traffic; the main agent stays on cloud
-  Claude. This is the hybrid path — quality main agent, offloaded subagents.
-  With the cloud router, Raydock sets `CLAUDE_CODE_SUBAGENT_MODEL=arc-swift-1.0`
-  (unless you set it), so subagents run on ARC Swift. A routed subagent turn that
-  still names a Claude model is sent with its `--config` route's model
-  (`routes.subagents.<type>`, then `routes.subagent`), else `arc-swift-1.0`; a
-  subagent that names another model keeps it.
-
-When the router serves the main agent (`--route all`), refusals are the
-router's to handle, so Rayline turns off Claude Code's own refusal recovery:
-it sets `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK=1` (no resend to another Claude
-model) and `CLAUDE_CODE_DISABLE_REFUSAL_RETRY=1` (no same-model resend). A value
-you set yourself is kept. `--route subagents` leaves Claude Code's defaults.
-In proxy mode (`--route all` and `--route subagents`) Rayline also sets
-`CLAUDE_CODE_TETHER_LIVE=0`, turning off Claude Code's message threads: in
-proxy mode Claude Code treats the router as first-party Anthropic and would
-send later tool turns as continuations of server-held history, which the
-router does not keep. With it off, every request carries the full
-conversation. A value you set yourself is kept.
-A running Claude Code daemon is reused only if it holds the same values (its
-background agents inherit its env); otherwise Rayline treats it as a conflict.
-
-The default depends on the router, because the two are used differently:
-
-- **Cloud router → `all`.** The hosted router does model selection, so applying
-  it everywhere is the intended behavior.
-- **Local router → `subagents`.** Local sessions are hybrid by default; pass
-  `--route all` to route the main agent as well. The default local config still
-  sends main to cloud Claude; set `routes.main.endpoint` to `local` in a router
-  config for a fully-local session.
-
-### Common combinations
-
-| Command | Who decides | How it connects | What flows through |
-| --- | --- | --- | --- |
-| `raydock claude` | cloud | proxy | all |
-| `raydock claude --via env` | cloud | env | all |
-| `raydock claude --local` | local | proxy | subagents |
-| `raydock claude --local --route all` | local | proxy | all |
-| `raydock claude --route subagents` | cloud | proxy | subagents |
-
-`raydock claude --via env --local` and `raydock claude --via env --route subagents`
-are rejected: the env mechanism is cloud-only and can't route selectively.
-
-### Deprecated flags
-
-These older flags still work for one release and print a one-line warning naming
-the replacement:
-
-| Deprecated | Use instead |
-| --- | --- |
-| `--local-router` | `--local` |
-| `--no-proxy` | `--via env` |
-| `--routing-mode override` | `--via env` |
-| `--routing-mode proxy` | `--route all` |
-| `--routing-mode proxy-subagents` | `--route subagents` |
-
-## Signing In to Hosted Rayline
-
-Skip this section if you only use `--local` — the local path never needs an
-account.
-
-Run `raydock auth login` to sign in. Browser login redeems a PKCE code through
-`https://api.rayline.ai/v1/auth/cli/token`; device login uses the Rayline-native
-`/v1/auth/cli/device/*` endpoints. The CLI stores Rayline-scoped opaque session
-credentials — not Firebase or Google OAuth tokens.
-
-Hosted Claude launches mint and store an `rlk-` router key separately from the
-CLI session. Logging out calls `/v1/auth/cli/revoke` best-effort, clears the
-local session, and drops the stored router key.
-
-Custom hosted environments can be configured in
-`~/.config/rayline/settings.json` for internal/dev routing.
-
-## Routing Specific Subagents (Override Config)
-
-The router config is JSON layered over Raydock's defaults. Save it wherever
-you like — the examples below use `~/.config/rayline/local-router.json`.
-
-Pass the file with `--router-config-path` when `routes.subagents` is meant to
-limit which Claude Code subagents reach the local router. The local router can
-also read `RAYLINE_ROUTER_CONFIG`, but the transparent proxy builds its subagent
-allowlist **only** from `--router-config-path`.
-
-This override keeps default Claude Code behavior as passthrough and routes only an
-explicitly named `Explore` subagent to the active local model:
-
-```json
-{
-  "routes": {
-    "subagents": {
-      "Explore": {
-        "endpoint": "local"
-      }
-    }
-  }
-}
-```
-
-Launch with that config:
+## Sign in
 
 ```bash
-raydock claude \
-  --local \
-  --isolated \
-  --router-config-path ~/.config/rayline/local-router.json
+rayline auth login
 ```
 
-Notes:
+| Command | Does |
+|---|---|
+| `rayline auth login` | Signs in to Rayline in the browser. |
+| `rayline auth logout` | Revokes the stored session and removes the stored router key. |
+| `rayline auth status` | Shows the signed-in account and environment. |
+| `rayline auth token` | Prints a valid account bearer token. |
 
-- `endpoint: "local"` means the managed local adapter. If `model` is omitted,
-  Raydock fills in the active local model.
-- With `--route subagents`, `routes.subagents` also becomes the proxy allowlist.
-  The proxy matches the resolved Claude Code agent type case-insensitively, so
-  `Explore` is enough once Claude Code has written subagent metadata. This
-  allowlist behavior requires launching with `--router-config-path`; don't rely
-  on `RAYLINE_ROUTER_CONFIG` alone for allowlists.
-- If `routes.subagents` is omitted, all detected subagents can reach the local
-  router. Main-thread Claude Code traffic still passes through normally under
-  `--route subagents`.
+`rayline auth login` has two options:
 
-## One Model For Everything (`routes.main` Only)
+- `-b`, `--no-browser`: sign in with a device code instead of opening a
+  browser.
+- `-p`, `--paste`: paste the callback URL yourself. If you also pass
+  `--no-browser`, `--paste` wins.
 
-`routes.subagent` is optional. A config that declares `routes.main` and no
-`routes.subagent` routes **subagents to the same target as main**, so a
-single-model setup needs one route entry. This ships as
-[`K.json`](../examples/routing-modes/K.json):
+If you launch a harness while signed out, Rayline signs you in first, with the
+browser flow.
 
-```json
-{
-  "endpoints": [
-    {
-      "id": "openrouter",
-      "protocol": "anthropic_messages",
-      "base_url": "https://openrouter.ai/api",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "auth": "bearer",
-      "models": ["moonshotai/kimi-k2.6"]
-    }
-  ],
-  "routes": {
-    "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k2.6" }
-  }
-}
+Sign-in writes `~/.config/rayline/credentials.json`. The file holds your
+session and your router key, and sign-in creates both together. `rayline auth
+logout` removes them. It is the only place Rayline reads them from: no env var
+or flag overrides it. Treat it as a secret. If it can't be loaded, Rayline
+refuses to run and tells you to run `rayline auth login`.
+
+## Run a harness
+
 ```
+rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...
+```
+
+| Harness | Runs |
+|---|---|
+| `claude` | Claude Code |
+| `codex` | Codex CLI |
+| `opencode` | opencode |
+| `pi` | pi |
+| `omp` | oh-my-pi |
+| `hermes` | Hermes Agent |
+| `openclaw` | OpenClaw |
 
 ```bash
-export OPENROUTER_API_KEY=<your-api-key>
-raydock codex app --config ./kimi.json     # or: raydock claude --config ./kimi.json
+rayline run claude
+rayline run claude -- -p "Explain this repository"
+rayline run codex -- exec "summarize this repo"
 ```
 
-Resolution order for a subagent turn is: a matching `routes.subagents.<type>`
-entry → `routes.subagent` → `routes.main` → `routes.default`. Add
-`routes.subagent` only when subagents should differ from main (for example main
-on a frontier model, subagents on-device):
+- With neither `--local` nor `--config`, the run is in **cloud mode**. The
+  harness talks to Rayline cloud directly, and no local process runs. Config
+  comes from `~/.config/rayline/settings.json`, and that file is optional.
+- `--local` runs in **local mode**, through the local Rayline process. See
+  [Local mode](local-mode.md).
+- `--config <file>` uses `<file>` instead of `settings.json`, without merging
+  the two. The run is in local mode if `<file>` has a `routing` section, and
+  in cloud mode if it doesn't.
+- `--local` and `--config` together are a usage error.
+- Local mode refuses `rayline run claude --isolated`,
+  `rayline run codex --model`, `rayline run codex app` and
+  `rayline run codex configure`. The error says the option isn't available in
+  local mode.
+- Rayline options come right after the harness name. The first argument that
+  isn't a Rayline option, and everything after `--`, goes to the harness
+  unchanged, including `--help`.
+- `rayline run --help` prints the usage. An unknown harness is a usage error.
 
-```json
-"routes": {
-  "main": { "endpoint": "openrouter", "model": "moonshotai/kimi-k2.6" },
-  "subagent": { "endpoint": "local" }
-}
-```
+Rayline writes the files it generates for a harness under
+`~/.rayline/harness/<name>/` in cloud mode and under
+`~/.rayline/local/harness/<name>/` in local mode. Each mode writes its own
+endpoint, key and model list there.
 
-The shipped **`K-K`** mode
-([`examples/routing-modes/K-K.json`](../examples/routing-modes/K-K.json)) is a
-pure-keyed version of this split: one OpenRouter endpoint serving two models, with
-`routes.main` on `kimi-k2.6` and `routes.subagent` on `glm-4.6`.
+### Claude Code
 
-The same applies to the hosted cloud router: a config needs only its `main`
-entry, and subagents then follow that model. The generated default
-`~/.config/rayline/router.json` routes `main` to `arc-sage-1.0` and `subagent` to
-`arc-swift-1.0`. With a non-prod
-`--env <name>` and no `--config`, `raydock codex` generates and reads
-`~/.config/rayline/router.<name>.json` instead, pointed at that environment's
-router, so a non-prod key never reaches the prod router. The file is created
-once and never rewritten. A file that routes to a model the hosted router does
-not serve, such as `rayline-router` (the default an 0.2.x release generated),
-fails visibly with the router's error until you change those routes to an ARC
-model. To reuse customized routes for a non-prod environment, copy them into
-`router.<name>.json`.
-
-## Connecting Provider Endpoints
-
-Provider endpoints go in the same static router config. Keep API keys in env vars
-so secrets never live in JSON. By default the local router sends `api_key_env` as
-`x-api-key` for `anthropic_messages` endpoints and as bearer auth for
-`openai_chat` and `openai_responses` endpoints. Set the optional per-endpoint
-`auth` field (`"bearer"`, `"api_key"`, or `"client_bearer"`) to override that.
-`client_bearer` forwards Codex's inbound `Authorization` and
-`ChatGPT-Account-ID` headers to the selected upstream and is restricted to the
-ChatGPT Codex backend or loopback development endpoints.
-
-All protocols stream incrementally on their native path: `anthropic_messages`
-forwards the upstream's native Anthropic SSE verbatim, `openai_chat` translates
-the upstream OpenAI Chat SSE into Anthropic SSE for Claude Code, and
-`openai_responses` forwards OpenAI Responses SSE for Codex/OpenAI-compatible
-clients. `openai_chat` also forwards image blocks: Anthropic `image` blocks
-become OpenAI `image_url` content parts (base64 sources become `data:` URLs).
-
-When Codex talks to the local router, Rayline handles the provider paths Codex
-uses today:
-
-- `GET /v1/models`
-- `POST /v1/responses`
-- `POST /v1/responses/count_tokens`
-- `POST /v1/responses/compact`
-- `POST /v1/memories/trace_summarize`
-- `POST /v1/images/generations`
-- `POST /v1/images/edits`
-- `POST /v1/alpha/search`
-
-For routes that select an `openai_responses` endpoint, Rayline passes OpenAI
-Responses-family requests through to the upstream and rewrites only the selected
-model. For Anthropic, OpenAI Chat, or local-adapter routes, Rayline translates
-Codex Responses create requests into the target protocol and synthesizes Codex
-Responses SSE/JSON back to the client, including `compaction` output items for
-Codex remote compaction turns.
-
-**Codex subscription passthrough** uses Codex's own ChatGPT login. In a
-`raydock codex --auth subscription --config <path>` config, the shared
-`subscription` sentinel from Claude configs is materialized into this endpoint:
-
-```json
-{
-  "endpoints": [
-    {
-      "id": "codex-subscription",
-      "protocol": "openai_responses",
-      "base_url": "https://chatgpt.com/backend-api/codex",
-      "auth": "client_bearer",
-      "models": ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5"]
-    }
-  ],
-  "routes": {
-    "main": {
-      "endpoint": "codex-subscription",
-      "model": "gpt-6-astra"
-    },
-    "subagent": {
-      "endpoint": "local",
-      "model": ""
-    }
-  }
-}
-```
-
-That shape keeps the main Codex turn on the user's subscription while allowing a
-local or API-key route for subagents/model overrides.
-
-**Anthropic-compatible endpoint:**
-
-```json
-{
-  "endpoints": [
-    {
-      "id": "anthropic-compatible",
-      "protocol": "anthropic_messages",
-      "base_url": "https://anthropic-compatible.example.com",
-      "api_key_env": "ANTHROPIC_COMPATIBLE_API_KEY",
-      "models": ["claude-sonnet-5"]
-    }
-  ],
-  "routes": {
-    "subagents": {
-      "Explore": {
-        "endpoint": "anthropic-compatible",
-        "model": "claude-sonnet-5"
-      }
-    }
-  }
-}
-```
-
-**OpenRouter** (recommended via its Anthropic-native endpoint). OpenRouter serves
-`POST https://openrouter.ai/api/v1/messages`, a real Anthropic Messages endpoint
-that returns native Anthropic SSE and supports images and tools. Use
-`protocol: anthropic_messages` with `base_url: "https://openrouter.ai/api"` (the
-router appends `/v1/messages`) and `auth: "bearer"` so the key is sent as
-`Authorization: Bearer`. This gives true native streaming for free:
-
-```json
-{
-  "endpoints": [
-    {
-      "id": "openrouter",
-      "protocol": "anthropic_messages",
-      "base_url": "https://openrouter.ai/api",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "auth": "bearer",
-      "models": ["anthropic/claude-sonnet-5"]
-    }
-  ],
-  "routes": {
-    "subagents": {
-      "Explore": {
-        "endpoint": "openrouter",
-        "model": "anthropic/claude-sonnet-5"
-      }
-    }
-  }
-}
-```
-
-**OpenAI for Claude Code** (which has no Anthropic-native endpoint) uses the
-`openai_chat` protocol with `https://api.openai.com/v1` and `OPENAI_API_KEY`.
-The router opens the upstream with `stream: true` and translates the OpenAI Chat
-SSE into Anthropic SSE in real time, so OpenAI also streams token by token:
-
-```json
-{
-  "endpoints": [
-    {
-      "id": "openai",
-      "protocol": "openai_chat",
-      "base_url": "https://api.openai.com/v1",
-      "api_key_env": "OPENAI_API_KEY",
-      "models": ["gpt-6-astra"]
-    }
-  ],
-  "routes": {
-    "subagents": {
-      "Explore": {
-        "endpoint": "openai",
-        "model": "gpt-6-astra"
-      }
-    }
-  }
-}
-```
-
-**OpenAI-compatible Responses for Codex** uses the `openai_responses` protocol
-with a `/v1` base URL. The router opens `/responses`, uses bearer auth when
-`api_key_env` is set, and streams Responses SSE through to Codex. Auxiliary
-Codex provider endpoints under `/responses/*`, `/memories/trace_summarize`,
-`/images/*`, and `/alpha/search` pass through on native `openai_responses`
-routes.
-
-**Arbitrary local OpenAI-compatible endpoint**, including a separately managed
-llama.cpp server:
-
-```json
-{
-  "endpoints": [
-    {
-      "id": "local-llama",
-      "protocol": "openai_chat",
-      "base_url": "http://127.0.0.1:8080/v1",
-      "api_key_env": "LLAMA_API_KEY",
-      "models": ["qwen3.6-35b-local"]
-    }
-  ],
-  "routes": {
-    "subagents": {
-      "Explore": {
-        "endpoint": "local-llama",
-        "model": "qwen3.6-35b-local"
-      }
-    }
-  }
-}
-```
-
-If that local server needs no auth, omit `api_key_env`.
-
-Direct endpoints in the router JSON only control where the local router sends
-matching requests — they don't control the daemon's managed local adapter. An
-explicit `raydock claude --local` launch still starts the managed local adapter
-with the active local-model config; without a custom local-model config, that's
-the bundled llama.cpp path.
-
-To use Raydock's managed local adapter, route to `endpoint: "local"` as
-shown above. If you want the managed adapter to use your own server and skip the
-bundled GGUF model, configure a custom local model:
+`--isolated` gives Claude Code its own config folder,
+`~/.rayline/harness/claude-code/`, so it can run beside your other Claude Code
+sessions:
 
 ```bash
-raydock local custom \
-  --url http://127.0.0.1:8080 \
-  --model qwen3.6-35b-local
+rayline run claude --isolated
 ```
 
-The custom local-model endpoint must serve the Anthropic Messages API at
-`/v1/messages`. The same config is stored under `local_model` in
-`~/.config/rayline/settings.json`:
+### Codex
 
-```json
-{
-  "local_model": {
-    "mode": "custom",
-    "base_url": "http://127.0.0.1:8080",
-    "model": "qwen3.6-35b-local"
-  }
-}
-```
+| Option or subcommand | Does |
+|---|---|
+| `--model <model>` | The model Codex asks for. |
+| `rayline run codex app [WORKSPACE]` | Launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`, and opens `WORKSPACE` if you give one. |
+| `rayline run codex configure` | Writes a Codex profile to `$CODEX_HOME/rayline.config.toml`. |
 
-## Where the Logs Live
+### opencode, pi, oh-my-pi, Hermes Agent and OpenClaw
 
-Router state lives under `~/.rayline/rld`.
-
-| Component | Path |
-| --- | --- |
-| Local-router supervisor, adapter, injector, and local-router logs | `~/.rayline/rld/rl-rld.log` |
-| Managed llama.cpp stdout/stderr | `~/.rayline/rld/llama-server.log` |
-| Shared transparent proxy log | `~/.rayline/rld/rl-rld-proxy.log` |
-| Isolated transparent proxy log | `~/.rayline/rld/cc/rl-rld-proxy.log` |
-
-`raydock router logs` prints the combined `rl-rld.log`. Use `tail` for the
-component-specific files:
+These take only the options every harness has, `--local` and `--config`. Every
+other argument goes to the harness:
 
 ```bash
-tail -f ~/.rayline/rld/rl-rld.log
-tail -f ~/.rayline/rld/llama-server.log
-tail -f ~/.rayline/rld/rl-rld-proxy.log
-tail -f ~/.rayline/rld/cc/rl-rld-proxy.log
+rayline run omp
+rayline run pi -- "Fix the failing test in parser.py"
 ```
 
-Isolated launches use `~/.rayline/cc` as `CLAUDE_CONFIG_DIR` and keep their proxy
-state in `~/.rayline/rld/cc`. The model/router process stays shared in
-`~/.rayline/rld`; an isolated launch starts a separate proxy sidecar when needed.
+## Local mode
 
-`llama-server.log` is present only when the active local-model config uses the
-bundled managed llama.cpp path. A direct endpoint in the router JSON can route
-matching requests elsewhere, but it doesn't by itself stop the managed adapter
-from starting. Configure `raydock local custom` to make the daemon use
-`--upstream-url` and skip the bundled GGUF server.
+Local mode routes each request through a Rayline process on your machine, so
+ARC can send it to your own inference servers. See [Local mode](local-mode.md).
 
-## Troubleshooting
+## Watch requests
 
-If a local launch seems stuck, watch the combined router log and — for the
-bundled managed llama.cpp path — the llama.cpp log:
+`rayline top` shows live request metrics from the local process, and
+`rayline top --json` prints one snapshot. Both need a running local process.
+
+## Update
 
 ```bash
-tail -f ~/.rayline/rld/rl-rld.log
-tail -f ~/.rayline/rld/llama-server.log
+rayline update
+rayline update --check
 ```
 
-First model load can take a minute or two. If a custom local-model endpoint is
-unreachable, check daemon status and probe it (Chat Completions, which hybrid
-routing uses; Anthropic Messages, which `--local` Claude Code uses, is
-reported too):
+| Option | Does |
+|---|---|
+| `--check` | Reports whether an update is available, without installing it. |
+| `--version <version>` | Installs this version. |
+| `--force` | Installs even when the target version isn't newer. |
+| `--dry-run` | Downloads and verifies the update, then reports what it would install, without installing it. |
 
-```bash
-raydock router status
-raydock local test --url http://127.0.0.1:8080 --model qwen3.6-35b-local
+If Rayline was installed with Homebrew or comes with Rayline.app,
+`rayline update` installs nothing and tells you to update through Homebrew or
+the app instead.
+
+## Files
+
+`~/.config/rayline/` holds only two files:
+
+- `settings.json`, which you write. It is optional.
+- `credentials.json`, which `rayline auth login` and `rayline auth logout`
+  write.
+
+`~/.rayline/` holds the files Rayline writes:
+
+```
+~/.rayline/
+  bin/                          raydock, rayline -> raydock, rayline-core,
+                                rayline-core-LICENSE
+  local/                        local process state
+    harness/<name>/             files Rayline generates per harness in local mode
+  harness/<name>/               files Rayline generates per harness in cloud mode
 ```
 
-To force a clean restart:
+## Config errors
 
-```bash
-raydock router stop
-raydock claude --local --isolated --router-config-path ~/.config/rayline/local-router.json
-```
-
-If a turn fails with a provider-side error (Codex shows "Provider returned
-error"), the router log now records the upstream status:
-
-```
-WARN rayline_local_router: upstream returned HTTP 400 (task=main selected=…)
-```
-
-The response body is passed through to the client untouched — read it there for
-the provider's own message. Two payload shapes providers commonly reject are
-already handled on the Codex path, so they are not the cause:
-
-- Tool names namespaced with characters outside `[A-Za-z][A-Za-z0-9_-]*`
-  (`server.tool`, `server/tool`) are rewritten on the way upstream and restored
-  on the way back.
-- Empty text blocks (a replayed assistant turn that was only a tool call, a
-  cancelled stream) are pruned before the request is sent.
-
-To validate the full end-to-end Claude Code path through Raydock, see
-[Acceptance testing](acceptance-testing.md).
+Rayline checks `settings.json`, `credentials.json`, env overrides and flags
+once, when it loads. If something is wrong it refuses to run, with an error
+that names the key or flag. [Local mode](local-mode.md#config-errors) lists
+every config check.

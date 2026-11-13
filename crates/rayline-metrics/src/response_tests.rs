@@ -105,10 +105,8 @@ fn each_protocol_reports_usage_and_cache_across_chunk_splits() {
                     MetricsUpdate::TokenUsage {
                         input_tokens,
                         output_tokens,
-                        selected_model,
                         ..
                     } => {
-                        assert_eq!(selected_model, None);
                         got_input = input_tokens.or(got_input);
                         got_output = output_tokens.or(got_output);
                     }

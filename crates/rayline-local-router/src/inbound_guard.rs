@@ -1,17 +1,14 @@
-//! Optional per-instance token for a local router that a desktop app reaches
-//! over loopback (`rayline claude-desktop`).
+//! The per-instance token for the local process, which clients reach over
+//! loopback.
 //!
-//! Every local router already refuses browser-reachable traffic (non-loopback
+//! The local process already refuses browser-reachable traffic (non-loopback
 //! `Host` or `Origin`, CORS preflight, non-JSON POST) before routing. That
-//! keeps web pages out but not other local processes. With a guard configured,
-//! every request except `GET /healthz` must also present the per-instance
-//! token as `Authorization: Bearer` or `x-api-key`.
+//! keeps web pages out but not other local processes, so every request except
+//! `GET /healthz` must also present the per-instance token as
+//! `Authorization: Bearer` or `x-api-key`.
 
 use hyper::header::{AUTHORIZATION, HeaderMap};
 use hyper::{Method, StatusCode};
-
-/// Env var `rld serve` reads the per-instance token from.
-pub const INBOUND_TOKEN_ENV: &str = "RAYLINE_LOCAL_ROUTER_INBOUND_TOKEN";
 
 const API_KEY_HEADER: &str = "x-api-key";
 
@@ -37,16 +34,10 @@ pub struct Refusal {
 }
 
 impl InboundGuard {
-    /// A guard for `token`; `None` for an empty token (no guard is not a guard
-    /// with an empty secret).
-    pub fn new(token: impl Into<String>) -> Option<Self> {
-        let token = token.into();
-        (!token.is_empty()).then_some(Self { token })
-    }
-
-    /// The guard named by [`INBOUND_TOKEN_ENV`], if it is set and non-empty.
-    pub fn from_env() -> Option<Self> {
-        Self::new(std::env::var(INBOUND_TOKEN_ENV).ok()?)
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            token: token.into(),
+        }
     }
 
     pub fn check(&self, method: &Method, path: &str, headers: &HeaderMap) -> Result<(), Refusal> {
@@ -78,14 +69,7 @@ impl InboundGuard {
         [bearer, api_key]
             .into_iter()
             .flatten()
-            .any(|presented| self.is_token(presented))
-    }
-
-    /// Whether `presented` (a bearer token or `x-api-key` value) is this
-    /// guard's token. A route that forwards caller credentials upstream uses
-    /// it to keep the router's own token from reaching a provider.
-    pub fn is_token(&self, presented: &str) -> bool {
-        constant_time_eq(presented.trim().as_bytes(), self.token.as_bytes())
+            .any(|presented| constant_time_eq(presented.trim().as_bytes(), self.token.as_bytes()))
     }
 }
 
@@ -108,9 +92,7 @@ mod tests {
         for (name, value) in pairs {
             map.insert(*name, HeaderValue::from_str(value).expect("header"));
         }
-        InboundGuard::new(TOKEN)
-            .expect("guard")
-            .check(&method, path, &map)
+        InboundGuard::new(TOKEN).check(&method, path, &map)
     }
 
     #[test]
@@ -151,9 +133,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_token_is_no_guard_and_debug_redacts() {
-        assert!(InboundGuard::new("").is_none());
-        let guard = InboundGuard::new(TOKEN).expect("guard");
+    fn debug_redacts_the_token() {
+        let guard = InboundGuard::new(TOKEN);
         assert!(!format!("{guard:?}").contains(TOKEN));
     }
 }

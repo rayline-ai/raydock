@@ -15,35 +15,22 @@
 //! has no declared scope it sends its own root, the same value as its
 //! children, and they share one episode.
 //! Older Hermes releases warn once per provider that the key is unknown and
-//! then ignore it, so declaring it never fails a launch; they never applied
-//! `extra_headers` on Messages either, so the per-launch id gave them no
-//! identity on that wire.
+//! then ignore it, so declaring it never fails a launch.
 //!
-//! Neither provider sends the per-launch `x-conversation-id` unless
-//! `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` forces it, including under
-//! `raydock hybrid run`: Hermes sends a session key on both wires (the header
-//! on Messages, `prompt_cache_key` on Responses), so the execution core's
-//! `session_identity_required` check is satisfied without a
-//! per-launch id. A per-launch id would instead put a subagent, the parent and
-//! the side call in one episode, since Hermes attaches a provider's
-//! `extra_headers` to every request of the process and the gateway ranks
-//! `x-conversation-id` ahead of `x-session-affinity`. Hermes runs turns in a
-//! shared gateway process per `HERMES_HOME`, so a forced id reaches the wire
-//! only when the launch starts that gateway; a gateway left running by an
-//! earlier launch sends the literal `${RAYLINE_CONV_ID}` instead, which the
-//! router then keys every such launch on. One Hermes call skips
-//! the affinity merge: the summary it requests on reaching its iteration cap,
-//! on Messages only. Under hybrid on `--provider rayline` the core
-//! refuses that call and Hermes reports the cap with no summary.
+//! Hermes sends a session key on both wires (the header on Messages,
+//! `prompt_cache_key` on Responses). Under `rayline run <harness> --local`
+//! only Responses is written, and its key satisfies the execution core's
+//! `session_identity_required` check. One Hermes call skips the affinity
+//! merge: the summary it requests on reaching its iteration cap, on Messages
+//! only.
 //!
-//! The `rayline-resp` provider (`--provider rayline-resp`, the default under
-//! `raydock hybrid run`) speaks Responses and declares no header: Hermes sends
+//! The `rayline-resp` provider (`--provider rayline-resp`, the only provider
+//! under `rayline run <harness> --local`) speaks Responses and declares no header: Hermes sends
 //! a `prompt_cache_key` there that is distinct per session and per delegate
 //! child, which the router's ladder and the hybrid core both read as the
 //! conversation, so each child lands in its own episode. A header would rank
 //! above it and merge the children. Each entry has its own base_url because
-//! Hermes looks up `extra_headers`, the affinity header and model
-//! capabilities by base_url.
+//! Hermes looks up the affinity header and model capabilities by base_url.
 //!
 //! Prompt caching: Hermes places Anthropic `cache_control` markers on a custom
 //! Messages route only for a model whose name looks like Claude or whose entry
@@ -72,12 +59,10 @@ use std::{
 
 use serde_json::{Value, json};
 
-use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, to_yaml, yaml_merge};
+use super::{ConfigFile, Plan, RenderContext, to_yaml, yaml_merge};
 
 pub(crate) const CONFIG_FILE: &str = "config.yaml";
 pub(crate) const MESSAGES_PROVIDER: &str = "rayline";
-/// The Messages provider's name before 0.4.3, removed from existing configs.
-const LEGACY_MESSAGES_PROVIDER: &str = "rayline-anth";
 pub(crate) const RESPONSES_PROVIDER: &str = "rayline-resp";
 /// Hermes' per-provider key naming the header its conversation id rides on.
 pub(crate) const SESSION_AFFINITY_KEY: &str = "session_affinity_header";
@@ -85,16 +70,14 @@ pub(crate) const SESSION_AFFINITY_KEY: &str = "session_affinity_header";
 pub(crate) const PROMPT_CACHING_KEY: &str = "prompt_caching";
 
 /// The keys Rayline sets in `config.yaml`. `fallback_providers` stays empty
-/// and the legacy `fallback_model` is removed, so a failed turn never moves
-/// off the router. The Messages provider's old name is removed too, so an
-/// existing config lists it once, as `rayline`.
+/// and `fallback_model` is removed, so a failed turn never moves off the
+/// router.
 const OWNED: &[&[&str]] = &[
     &["model", "provider"],
     &["model", "default"],
     &["model", "context_length"],
     &["providers", MESSAGES_PROVIDER],
     &["providers", RESPONSES_PROVIDER],
-    &["providers", LEGACY_MESSAGES_PROVIDER],
     &["fallback_providers"],
     &["fallback_model"],
 ];
@@ -120,36 +103,29 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
     // Responses: no affinity header. Hermes sends a per-session (and per
     // delegate child) `prompt_cache_key` there, which the router and the hybrid
     // core both read as the conversation; the header would merge the children.
-    let mut responses = json!({
+    let responses = json!({
         "base_url": ctx.v1_base(),
         "api_key": ctx.key,
         "api_mode": "codex_responses",
         "models": models(false)
     });
     // Messages: the header is the only identity Hermes can send on this wire.
-    let mut messages = json!({
+    let messages = json!({
         "base_url": ctx.messages_base(),
         "api_key": ctx.key,
         "api_mode": "anthropic_messages",
         "models": models(true),
         SESSION_AFFINITY_KEY: super::SESSION_AFFINITY_HEADER
     });
-    // Both wires carry a Hermes session key (the header on Messages,
-    // `prompt_cache_key` on Responses), so the per-launch id is opt-in on
-    // both, with no hybrid exception.
-    if ctx.conversation_id.enabled() {
-        let header = json!({ super::CONV_HEADER: format!("${{{CONV_ID_ENV}}}") });
-        responses["extra_headers"] = header.clone();
-        messages["extra_headers"] = header;
-    }
-    // Under hybrid routing the default is Responses: on Messages Hermes always
-    // asks for its model's full output ceiling (128k for an unknown model; it
-    // has no setting to lower it), which the execution core refuses. On
-    // Responses it sends no output cap and the core applies its own.
-    let default_provider = if ctx.capabilities.is_some() {
-        RESPONSES_PROVIDER
+    // In local mode Hermes speaks only Responses, its one protocol (spec
+    // section 5.2), so the Messages provider is not written.
+    let (default_provider, providers) = if ctx.capabilities.is_some() {
+        (RESPONSES_PROVIDER, json!({ RESPONSES_PROVIDER: responses }))
     } else {
-        MESSAGES_PROVIDER
+        (
+            MESSAGES_PROVIDER,
+            json!({ MESSAGES_PROVIDER: messages, RESPONSES_PROVIDER: responses }),
+        )
     };
     let config = json!({
         "model": {
@@ -157,10 +133,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
             "default": launch.main,
             "context_length": launch.main_model().context_window
         },
-        "providers": {
-            MESSAGES_PROVIDER: messages,
-            RESPONSES_PROVIDER: responses
-        },
+        "providers": providers,
         "fallback_providers": []
     });
     let path = ctx.config_dir.join(CONFIG_FILE);
@@ -183,7 +156,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
             contents,
             overwrite: true,
             merged_from,
-            replaces_seed: None,
         }],
         env_set: vec![("HERMES_HOME", ctx.config_dir.as_os_str().to_owned())],
         env_remove: Vec::new(),
@@ -220,8 +192,8 @@ pub(crate) fn prepare_launch(command: &Command) -> Result<(), String> {
     else {
         return Ok(());
     };
-    let launcher = launcher_identity(Path::new(command.get_program()));
-    prepare_home(Path::new(home), launcher.as_deref(), |args| {
+    let launcher = launcher_identity(Path::new(command.get_program()))?;
+    prepare_home(Path::new(home), &launcher, |args| {
         finish(sibling(command, args))
     })
 }
@@ -243,8 +215,12 @@ fn sibling(command: &Command, args: &[&str]) -> Command {
 }
 
 /// Runs a Hermes command to completion with no stdin, capturing its output.
+/// A command that cannot run is an error with its program.
 fn finish(mut command: Command) -> io::Result<Finished> {
-    let output = command.stdin(Stdio::null()).output()?;
+    let output = command.stdin(Stdio::null()).output().map_err(|error| {
+        let program = Path::new(command.get_program()).display().to_string();
+        io::Error::new(error.kind(), format!("{program}: {error}"))
+    })?;
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     Ok(Finished {
@@ -256,16 +232,23 @@ fn finish(mut command: Command) -> io::Result<Finished> {
 /// The launcher's resolved path, size and modification time. Hermes keys its
 /// per-home state on the checkout the launcher runs, and a launcher for another
 /// checkout (moved or reinstalled Hermes, another `hermes` first on PATH) is a
-/// different file or a rewritten one. `None` when it cannot be read.
-fn launcher_identity(program: &Path) -> Option<String> {
-    let path = fs::canonicalize(program).ok()?;
-    let meta = fs::metadata(&path).ok()?;
+/// different file or a rewritten one. A launcher that cannot be read is an
+/// error with its path.
+fn launcher_identity(program: &Path) -> Result<String, String> {
+    let failed = |error: String| {
+        format!(
+            "failed to read the Hermes launcher {}: {error}",
+            program.display()
+        )
+    };
+    let path = fs::canonicalize(program).map_err(|error| failed(error.to_string()))?;
+    let meta = fs::metadata(&path).map_err(|error| failed(error.to_string()))?;
     let modified = meta
         .modified()
-        .ok()?
+        .map_err(|error| failed(error.to_string()))?
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
-    Some(format!(
+        .map_err(|error| failed(error.to_string()))?;
+    Ok(format!(
         "{}\n{}\n{}.{:09}\n",
         path.display(),
         meta.len(),
@@ -284,41 +267,56 @@ fn launcher_identity(program: &Path) -> Option<String> {
 /// replaced). Otherwise a cheap
 /// `hermes --version` asks Hermes itself: only when it refuses and names
 /// `hermes pm repair` does the repair run, so an install that ships its own
-/// environment is left alone. A probe that cannot run is not an error here;
-/// the launch reports it.
+/// environment is left alone. A probe that cannot run, or that fails without
+/// naming the repair, is an error, and so is a marker that exists but cannot
+/// be read.
 pub(crate) fn prepare_home(
     home: &Path,
-    launcher: Option<&str>,
+    launcher: &str,
     mut run: impl FnMut(&[&str]) -> io::Result<Finished>,
 ) -> Result<(), String> {
     let marker = home.join(READY_MARKER);
-    let record = |launcher: &str| {
-        let environments = environments(home);
-        (!environments.is_empty()).then(|| format!("{launcher}{}\n", environments.join("\n")))
+    let record = || -> Result<Option<String>, String> {
+        let environments = environments(home)?;
+        Ok((!environments.is_empty()).then(|| format!("{launcher}{}\n", environments.join("\n"))))
     };
-    if let Some(record) = launcher.and_then(record)
-        && fs::read_to_string(&marker).is_ok_and(|seen| seen == record)
-    {
-        return Ok(());
+    if let Some(record) = record()? {
+        let seen = match fs::read_to_string(&marker) {
+            Ok(seen) => Some(seen),
+            // Not prepared yet: ask Hermes.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("failed to read {}: {error}", marker.display())),
+        };
+        if seen.as_deref() == Some(record.as_str()) {
+            return Ok(());
+        }
     }
-    let remember = || {
-        // Best effort: without the record the next launch probes again.
-        match launcher.and_then(record) {
-            Some(record) => {
-                let _ = fs::write(&marker, record);
-            }
-            None => {
-                let _ = fs::remove_file(&marker);
-            }
+    let remember = || -> Result<(), String> {
+        match record()? {
+            Some(record) => fs::write(&marker, record)
+                .map_err(|error| format!("failed to write {}: {error}", marker.display())),
+            None => match fs::remove_file(&marker) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    Err(format!("failed to remove {}: {error}", marker.display()))
+                }
+                _ => Ok(()),
+            },
         }
     };
     match run(&["--version"]) {
         Ok(probe) if probe.success => {
-            remember();
+            remember()?;
             return Ok(());
         }
         Ok(probe) if probe.output.contains(REPAIR_COMMAND) => {}
-        _ => return Ok(()),
+        Ok(probe) => {
+            return Err(format!(
+                "`hermes --version` failed with HERMES_HOME={}:\n{}",
+                home.display(),
+                last_lines(&probe.output)
+            ));
+        }
+        Err(error) => return Err(format!("`hermes --version` did not run: {error}")),
     }
     eprintln!(
         "  Setting up Hermes for {} (one time; this can take a few minutes)...",
@@ -326,7 +324,7 @@ pub(crate) fn prepare_home(
     );
     match run(&["pm", "repair"]) {
         Ok(repair) if repair.success => {
-            remember();
+            remember()?;
             eprintln!("  Hermes is set up.");
             Ok(())
         }
@@ -336,27 +334,48 @@ pub(crate) fn prepare_home(
 }
 
 /// The Hermes dependency environments `home` records that still exist, one
-/// per install that has one, sorted.
-fn environments(home: &Path) -> Vec<String> {
-    let Ok(installs) = fs::read_dir(home.join(INSTALLS_DIR)) else {
-        return Vec::new();
+/// per install that has one, sorted. A home with no installs dir has none.
+fn environments(home: &Path) -> Result<Vec<String>, String> {
+    let dir = home.join(INSTALLS_DIR);
+    let read_error = |error: io::Error| format!("failed to read {}: {error}", dir.display());
+    let installs = match fs::read_dir(&dir) {
+        Ok(installs) => installs,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(read_error(error)),
     };
-    let mut environments: Vec<String> = installs
-        .flatten()
-        .filter_map(|install| recorded_environment(&install.path().join(FACTS_FILE)))
-        .collect();
+    let mut environments = Vec::new();
+    for install in installs {
+        let facts = install.map_err(read_error)?.path().join(FACTS_FILE);
+        environments.extend(recorded_environment(&facts)?);
+    }
     environments.sort();
-    environments
+    Ok(environments)
 }
 
-fn recorded_environment(facts: &Path) -> Option<String> {
-    let text = fs::read_to_string(facts).ok()?;
-    let facts = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()?;
-    let environment = facts.pointer("/packages/venv/environment")?.as_str()?;
-    Path::new(environment)
+/// The environment an install's facts file records, if it records one and its
+/// venv is there. An install with no facts file has none; a facts file that
+/// cannot be read or is not JSON is an error.
+fn recorded_environment(facts: &Path) -> Result<Option<String>, String> {
+    let text = match fs::read_to_string(facts) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read {}: {error}", facts.display())),
+    };
+    let value = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        .map_err(|error| format!("invalid JSON in {}: {error}", facts.display()))?;
+    let Some(environment) = value.pointer("/packages/venv/environment") else {
+        return Ok(None);
+    };
+    let Some(environment) = environment.as_str() else {
+        return Err(format!(
+            "{}: packages.venv.environment is not a string",
+            facts.display()
+        ));
+    };
+    Ok(Path::new(environment)
         .join("pyvenv.cfg")
         .is_file()
-        .then(|| environment.to_owned())
+        .then(|| environment.to_owned()))
 }
 
 fn last_lines(output: &str) -> String {
@@ -393,116 +412,52 @@ mod tests {
     use super::super::tests::{env_value, render};
     use super::CONFIG_FILE;
 
-    /// Both providers treat the per-launch id the same way: only when forced.
+    /// In local mode Hermes speaks only Responses: the render writes only
+    /// `rayline-resp` and removes a `rayline` Messages provider an earlier
+    /// cloud launch wrote (Hermes' `prompt_cache_key` is the identity the core
+    /// reads).
     #[test]
-    fn neither_provider_carries_the_conversation_id_unless_forced() {
-        use super::super::ConversationIdFallback;
-        use super::super::tests::render_with;
-        let headers = |fallback| {
-            let (dir, _) = render_with(Harness::Hermes, fallback);
-            let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
-            let messages = config
-                .split("  rayline-resp:")
-                .next()
-                .unwrap()
-                .contains("x-conversation-id: \"${RAYLINE_CONV_ID}\"");
-            let responses = config
-                .split("  rayline-resp:")
-                .nth(1)
-                .unwrap()
-                .contains("x-conversation-id: \"${RAYLINE_CONV_ID}\"");
-            (messages, responses)
-        };
-        // Neither provider sends the per-launch id unless forced: Messages
-        // declares session_affinity_header and Responses relies on Hermes'
-        // prompt_cache_key, so Hermes' own keys drive the episode.
-        assert_eq!(headers(ConversationIdFallback::new(None)), (false, false));
-        assert_eq!(
-            headers(ConversationIdFallback::new(Some("1"))),
-            (true, true)
-        );
-        assert_eq!(
-            headers(ConversationIdFallback::new(Some("0"))),
-            (false, false)
-        );
-    }
-
-    /// Under hybrid the rendered config carries no per-launch id: the Messages
-    /// provider declares the header and the Responses provider relies on
-    /// Hermes' `prompt_cache_key`, which the core reads as identity. (The one
-    /// Hermes request that sends neither is documented in the module docs;
-    /// this checks the config contract, not runtime identity.)
-    #[test]
-    fn hybrid_config_carries_no_per_launch_id() {
-        use super::super::tests::{TEST_KEY, TEST_URL, temp_dir};
-        use super::super::{ConversationIdFallback, RenderContext, write_files};
+    fn local_mode_writes_only_the_responses_provider() {
+        use super::super::tests::{TEST_KEY, TEST_URL, hosted_models, temp_dir};
+        use super::super::{RenderContext, write_files};
         let dir = temp_dir("hermes-hybrid");
         let capabilities = rayline_local_router::ModelCapabilities {
             context_window: 16384,
             max_output_tokens: 8192,
             input_modalities: vec!["text".into()],
         };
-        let ctx = RenderContext {
+        let cloud = RenderContext {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id: ConversationIdFallback { forced: None },
-            allow_empty_signature: true,
-            capabilities: Some(&capabilities),
+            capabilities: None,
             harness_major_version: None,
-            models: super::super::LaunchModels::hybrid(&capabilities),
+            models: hosted_models(),
         };
-        write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
+        write_files(&dir, &super::plan(&cloud).unwrap().files).unwrap();
         let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
-        let (messages, responses) = config.split_once("  rayline-resp:").unwrap();
-        assert!(!config.contains("x-conversation-id"));
-        assert!(
-            messages.contains("session_affinity_header: \"x-session-affinity\""),
-            "{messages}"
-        );
-        assert!(
-            !responses.contains("session_affinity_header"),
-            "{responses}"
-        );
-        assert!(config.contains("provider: \"custom:rayline-resp\""));
-    }
+        assert!(config.contains("  rayline:"), "{config}");
 
-    /// Turning the fallback off after a forced launch drops the stale
-    /// `extra_headers` from both providers in place: each provider map is
-    /// owned whole, so the merge replaces it rather than keeping old children.
-    #[test]
-    fn unforcing_removes_the_per_launch_header_in_place() {
-        use super::super::tests::{TEST_KEY, TEST_URL, temp_dir};
-        use super::super::{ConversationIdFallback, RenderContext, write_files};
-        let dir = temp_dir("hermes-toggle");
-        let render = |forced: Option<&str>| {
-            let ctx = RenderContext {
-                key: TEST_KEY,
-                router_url: TEST_URL,
-                config_dir: &dir,
-                conversation_id: ConversationIdFallback::new(forced),
-                allow_empty_signature: false,
-                capabilities: None,
-                harness_major_version: None,
-                models: super::super::tests::hosted_models(),
-            };
-            write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
-            std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap()
+        let local = RenderContext {
+            capabilities: Some(&capabilities),
+            models: super::super::LaunchModels::hybrid(&capabilities),
+            ..cloud
         };
-        assert_eq!(render(Some("1")).matches("x-conversation-id").count(), 2);
-        let off = render(None);
-        assert!(
-            !off.contains("x-conversation-id") && !off.contains("extra_headers"),
-            "{off}"
-        );
-        assert_eq!(render(None), off);
+        write_files(&dir, &super::plan(&local).unwrap().files).unwrap();
+        let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
+        assert!(!config.contains("  rayline:"), "{config}");
+        assert!(!config.contains("anthropic_messages"), "{config}");
+        assert!(config.contains("  rayline-resp:"), "{config}");
+        assert!(config.contains("provider: \"custom:rayline-resp\""));
+        assert!(!config.contains("x-conversation-id"));
+        assert!(!config.contains("session_affinity_header"), "{config}");
     }
 
     /// Launch Hermes twice over a config Hermes and the user already wrote.
     #[test]
     fn an_edit_between_merge_and_write_is_kept() {
         use super::super::tests::{TEST_URL, temp_dir};
-        use super::super::{ConversationIdFallback, RenderContext, write_files};
+        use super::super::{RenderContext, write_files};
         let dir = temp_dir("hermes-race");
         let path = dir.join(CONFIG_FILE);
         std::fs::write(&path, "agent:\n  max_turns: 40\n").unwrap();
@@ -510,8 +465,6 @@ mod tests {
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id: ConversationIdFallback::new(None),
-            allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
             models: super::super::tests::hosted_models(),
@@ -530,12 +483,11 @@ mod tests {
         );
     }
 
-    /// The seed holds the Messages provider under its pre-0.4.3 name
-    /// (`rayline-anth`); the launch removes it and writes `rayline`.
+    /// The seed holds a stale `rayline` provider; the launch replaces it.
     #[test]
     fn relaunch_keeps_user_settings_and_is_idempotent() {
         use super::super::tests::{TEST_URL, temp_dir};
-        use super::super::{ConversationIdFallback, RenderContext, write_files};
+        use super::super::{RenderContext, write_files};
         let dir = temp_dir("hermes-merge");
         let path = dir.join(CONFIG_FILE);
         std::fs::write(
@@ -545,7 +497,7 @@ mod tests {
   provider: anthropic
   reasoning_effort: high
 providers:
-  rayline-anth:
+  rayline:
     base_url: https://stale.example
     models:
       arc-sage-1.0:
@@ -575,8 +527,6 @@ fallback_model:
                 key: super::super::tests::TEST_KEY,
                 router_url: TEST_URL,
                 config_dir: &dir,
-                conversation_id: ConversationIdFallback::new(None),
-                allow_empty_signature: false,
                 capabilities: None,
                 harness_major_version: None,
                 models: super::super::tests::hosted_models(),
@@ -593,8 +543,6 @@ fallback_model:
   reasoning_effort: high
   context_length: 1000000
 providers:
-  mine:
-    base_url: https://mine.example
   rayline:
     api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
@@ -607,6 +555,8 @@ providers:
         context_length: 1000000
         prompt_caching: true
     session_affinity_header: \"x-session-affinity\"
+  mine:
+    base_url: https://mine.example
   rayline-resp:
     api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
@@ -635,16 +585,14 @@ fallback_providers: []
 
     #[test]
     fn unreadable_config_is_an_error_not_a_rewrite() {
+        use super::super::RenderContext;
         use super::super::tests::{TEST_URL, temp_dir};
-        use super::super::{ConversationIdFallback, RenderContext};
         let dir = temp_dir("hermes-bad");
         std::fs::write(dir.join(CONFIG_FILE), "---\nmodel: x\n").unwrap();
         let ctx = RenderContext {
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id: ConversationIdFallback::new(None),
-            allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
             models: super::super::tests::hosted_models(),
@@ -696,13 +644,13 @@ providers:
 
     mod prepare_home {
         use super::super::super::tests::temp_dir;
-        use super::super::{Finished, prepare_home, sibling};
+        use super::super::{Finished, finish, launcher_identity, prepare_home, sibling};
         use std::path::Path;
         use std::process::Command;
 
         const REFUSAL: &str = "hermes: no dependency environment is committed for this \
                                install; run `hermes pm repair`";
-        const LAUNCHER: Option<&str> = Some("C:\\hermes\\bin\\hermes.exe\n100\n1.000000000\n");
+        const LAUNCHER: &str = "C:\\hermes\\bin\\hermes.exe\n100\n1.000000000\n";
 
         /// Lays out `installs/<key>/facts.json` the way `hermes pm repair`
         /// leaves it, with the recorded venv present.
@@ -766,18 +714,13 @@ providers:
             let mut calls = Vec::new();
             prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap();
 
-            let other = Some("D:\\other\\hermes.exe\n200\n2.000000000\n");
+            let other = "D:\\other\\hermes.exe\n200\n2.000000000\n";
             let mut probed = Vec::new();
             prepare_home(&home, other, hermes(&home, &mut probed)).unwrap();
             assert_eq!(probed, ["--version"]);
             let mut again = Vec::new();
             prepare_home(&home, other, hermes(&home, &mut again)).unwrap();
             assert!(again.is_empty(), "{again:?}");
-
-            // A launcher that cannot be identified is always asked.
-            let mut unknown = Vec::new();
-            prepare_home(&home, None, hermes(&home, &mut unknown)).unwrap();
-            assert_eq!(unknown, ["--version"]);
         }
 
         /// With environments for two checkouts in the home, losing one is
@@ -832,31 +775,148 @@ providers:
             assert_eq!(again, ["--version", "pm repair"]);
         }
 
-        /// An install that starts without a per-home environment (or fails for
-        /// another reason) is not repaired; the launch goes ahead and Hermes
-        /// reports any other failure itself.
+        /// A facts file that cannot be read, or is not JSON, stops the launch
+        /// with its path; Hermes is not run.
+        #[test]
+        fn a_bad_facts_file_is_an_error_naming_it() {
+            for (name, bad) in [("unreadable", None), ("invalid", Some("{not json"))] {
+                let home = temp_dir(&format!("hermes-facts-{name}"));
+                let install = home.join("installs").join("d74c6fbcc1df5714");
+                let facts = install.join("facts.json");
+                match bad {
+                    // A directory where the file belongs cannot be read as one.
+                    None => std::fs::create_dir_all(&facts).unwrap(),
+                    Some(text) => {
+                        std::fs::create_dir_all(&install).unwrap();
+                        std::fs::write(&facts, text).unwrap();
+                    }
+                }
+                let mut calls = Vec::new();
+                let error = prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap_err();
+                assert!(
+                    error.contains(&facts.display().to_string()),
+                    "{name}: {error}"
+                );
+                assert!(calls.is_empty(), "{name}: {calls:?}");
+            }
+        }
+
+        /// An installs dir that cannot be read stops the launch with its path.
+        #[test]
+        fn an_unreadable_installs_dir_is_an_error_naming_it() {
+            let home = temp_dir("hermes-installs-file");
+            let installs = home.join("installs");
+            std::fs::write(&installs, "not a dir").unwrap();
+            let mut calls = Vec::new();
+            let error = prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap_err();
+            assert!(error.contains(&installs.display().to_string()), "{error}");
+            assert!(calls.is_empty(), "{calls:?}");
+        }
+
+        /// A ready marker that cannot be written, or removed, stops the launch
+        /// with its path.
+        #[test]
+        fn a_marker_that_cannot_be_written_or_removed_is_an_error() {
+            // Written: a read-only marker from another launcher, so the probe
+            // runs and passes over a recorded environment, then the write fails.
+            let home = temp_dir("hermes-marker-write");
+            commit_environment(&home);
+            let marker = home.join(super::super::READY_MARKER);
+            std::fs::write(&marker, "another launcher\n").unwrap();
+            let mut permissions = std::fs::metadata(&marker).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&marker, permissions.clone()).unwrap();
+            let mut calls = Vec::new();
+            let error = prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap_err();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&marker, permissions).unwrap();
+            assert!(error.contains(&marker.display().to_string()), "{error}");
+            assert_eq!(calls, ["--version"]);
+            // Removed: a directory where the marker belongs, and the probe
+            // passes with no environment to record.
+            let home = temp_dir("hermes-marker-remove");
+            let marker = home.join(super::super::READY_MARKER);
+            std::fs::create_dir_all(&marker).unwrap();
+            let error = prepare_home(&home, LAUNCHER, |_| finished(true, "Hermes Agent v0.23.1"))
+                .unwrap_err();
+            assert!(error.contains(&marker.display().to_string()), "{error}");
+        }
+
+        /// A marker that exists but cannot be read stops the launch with its
+        /// path before Hermes runs; a missing one only means "ask Hermes".
+        #[test]
+        fn an_unreadable_marker_is_an_error_naming_it() {
+            let home = temp_dir("hermes-marker-read");
+            commit_environment(&home);
+            // A directory where the marker belongs cannot be read as a file.
+            let marker = home.join(super::super::READY_MARKER);
+            std::fs::create_dir_all(&marker).unwrap();
+            let mut calls = Vec::new();
+            let error = prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap_err();
+            assert!(error.contains("failed to read"), "{error}");
+            assert!(error.contains(&marker.display().to_string()), "{error}");
+            assert!(calls.is_empty(), "{calls:?}");
+            // Positive control: with no marker, Hermes is asked and the
+            // marker is written.
+            std::fs::remove_dir(&marker).unwrap();
+            let mut calls = Vec::new();
+            prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap();
+            assert_eq!(calls, ["--version"]);
+            assert!(marker.is_file());
+        }
+
+        /// An install that starts without a per-home environment is not
+        /// repaired: the launch goes ahead.
         #[test]
         fn no_repair_unless_hermes_asks_for_it() {
             let home = temp_dir("hermes-no-ask");
-            for probe in [
-                (true, "Hermes Agent v0.23.1"),
-                (false, "some other failure"),
-            ] {
-                let mut calls = Vec::new();
-                prepare_home(&home, None, |args| {
-                    calls.push(args.join(" "));
-                    finished(probe.0, probe.1)
-                })
-                .unwrap();
-                assert_eq!(calls, ["--version"]);
-            }
             let mut calls = Vec::new();
-            prepare_home(&home, None, |args| {
+            prepare_home(&home, LAUNCHER, |args| {
                 calls.push(args.join(" "));
-                Err(std::io::Error::other("not found"))
+                finished(true, "Hermes Agent v0.23.1")
             })
             .unwrap();
             assert_eq!(calls, ["--version"]);
+        }
+
+        /// A probe that fails without asking for the repair, or cannot run,
+        /// stops the launch with the command, the home and Hermes' output.
+        #[test]
+        fn a_probe_that_fails_or_cannot_run_is_an_error() {
+            let home = temp_dir("hermes-probe-fails");
+            let error = prepare_home(&home, LAUNCHER, |_| finished(false, "some other failure"))
+                .unwrap_err();
+            assert!(error.contains("`hermes --version` failed"), "{error}");
+            assert!(error.contains(&home.display().to_string()), "{error}");
+            assert!(error.contains("    some other failure"), "{error}");
+            let error = prepare_home(&home, LAUNCHER, |_| {
+                Err(std::io::Error::other("hermes.exe: not found"))
+            })
+            .unwrap_err();
+            assert!(
+                error.contains("`hermes --version` did not run: hermes.exe: not found"),
+                "{error}"
+            );
+            assert!(!home.join(super::super::READY_MARKER).exists());
+        }
+
+        /// A launcher that cannot be read, or a Hermes command that cannot
+        /// run, is an error with its path.
+        #[test]
+        fn an_unreadable_launcher_is_an_error_naming_it() {
+            let dir = temp_dir("hermes-launcher");
+            let launcher = dir.join("hermes.exe");
+            let shown = launcher.display().to_string();
+            let error = launcher_identity(&launcher).unwrap_err();
+            assert!(error.contains(&shown), "{error}");
+            let Err(error) = finish(Command::new(&launcher)) else {
+                panic!("a missing program ran");
+            };
+            assert!(error.to_string().contains(&shown), "{error}");
+            std::fs::write(&launcher, "x").unwrap();
+            let identity = launcher_identity(&launcher).unwrap();
+            assert!(identity.contains("\n1\n"), "{identity}");
         }
 
         /// A failed repair stops the launch, records nothing, and names the
