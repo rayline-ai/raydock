@@ -8,12 +8,12 @@ Cloud turns run on Rayline cloud and are billed to your account (a few cents per
 
 1. Rayline is installed (`rayline --version` works) and signed in (`rayline auth login`).
 2. The harnesses you want to test are on `PATH`: `claude`, `codex`, `opencode`, `pi`, `omp`, `hermes`, `openclaw`. Claude Desktop is tested by hand (below). The script skips any harness that isn't installed.
-3. `~/.config/rayline/settings.json` has a `routing` section and the endpoints and models local mode uses. Every env var named by an `api_key_env` is set.
+3. `~/.config/rayline/settings.json` (or the `CONFIG` file, below) has a `routing` section and the endpoints and models local mode uses. Every env var named by an `api_key_env` is set.
 4. `bash` and `perl` (both ship with macOS and most Linux distributions).
 
 ## settings.json
 
-Local mode reads everything from `~/.config/rayline/settings.json`. The script never writes it. An example with one inference server:
+Local mode reads everything from `~/.config/rayline/settings.json`, or from the `CONFIG` file. The script never writes either. An example with one inference server:
 
 ```json
 {
@@ -48,7 +48,10 @@ The endpoint must list the protocol of every harness you run in local mode: `ant
 scripts/acceptance.sh              # every harness
 scripts/acceptance.sh codex pi     # only these harnesses
 RAYLINE=target/release/raydock scripts/acceptance.sh   # test a local build
+CONFIG=~/acceptance.json scripts/acceptance.sh         # local mode from this file
 ```
+
+`CONFIG=<file>` runs local mode from `<file>` instead of `~/.config/rayline/settings.json`, so you don't have to replace your own settings: the script runs `rayline local start --config <file>` and `rayline run <harness> --config <file>` (without `--local`, since a file with a `routing` section puts the run in local mode). Cloud mode still uses the default file. A `CONFIG` file without a `routing` section is an error before any turn runs.
 
 The script:
 

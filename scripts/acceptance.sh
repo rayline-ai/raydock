@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 # Acceptance test: one real turn per installed harness, in cloud mode
 # (`rayline run <harness>`) and in local mode (`rayline run <harness> --local`).
-# Usage: scripts/acceptance.sh [HARNESS...]   (default: every harness)
-# Local mode uses ~/.config/rayline/settings.json, which must have a `routing`
-# section. The script writes no config. It starts the local process with
-# `rayline local start` and stops it with `rayline local stop` when done.
+# Usage: [CONFIG=<file>] scripts/acceptance.sh [HARNESS...]
+#   (default: every harness)
+# Local mode uses ~/.config/rayline/settings.json, or <file> when CONFIG is
+# set; either must have a `routing` section. With CONFIG, local mode runs
+# `rayline local start --config <file>` and `rayline run <harness> --config
+# <file>`; cloud mode always uses the default file. The script writes no
+# config. It starts the local process with `rayline local start` and stops it
+# with `rayline local stop` when done.
 # See docs/acceptance-testing.md.
 set -uo pipefail
 
 RAYLINE=${RAYLINE:-rayline}
+CONFIG=${CONFIG:-}
 HARNESSES=(claude claude-desktop codex opencode pi omp hermes openclaw)
 PROMPT="Reply with the word ACCEPT immediately followed by the sum of 17 and 25, with no space and nothing else."
 ANSWER=ACCEPT42
@@ -16,7 +21,7 @@ TIMEOUT=600
 DESKTOP_APP=/Applications/Claude.app
 
 usage() {
-  echo "usage: $0 [HARNESS...]" >&2
+  echo "usage: [CONFIG=<file>] $0 [HARNESS...]" >&2
   echo "harnesses: ${HARNESSES[*]}" >&2
   exit 2
 }
@@ -107,7 +112,7 @@ run_mode() {
       echo "SKIP    $harness $mode (not installed)"
       skip=$((skip + 1))
     elif [ "$harness" = claude-desktop ]; then
-      echo "MANUAL  claude-desktop $mode: run \`$RAYLINE run claude-desktop${*:+ $*}\` and send one turn in Code (docs/acceptance-testing.md)"
+      echo "MANUAL  claude-desktop $mode: run \`$RAYLINE run claude-desktop${*:+$(printf ' %q' "$@")}\` and send one turn in Code (docs/acceptance-testing.md)"
       manual=$((manual + 1))
     else
       run_turn "$harness" "$mode" "$@"
@@ -125,6 +130,22 @@ for harness in "${selected[@]}"; do
   $known || { echo "unknown harness: $harness" >&2; usage; }
 done
 
+# `rayline run --config <file>` is in local mode only when <file> has a
+# `routing` section, so a CONFIG without one would run no local turn.
+local_start=("$RAYLINE" local start)
+local_run=(--local)
+if [ -n "$CONFIG" ]; then
+  perl -MJSON::PP -e '
+    my $file = shift;
+    open my $fh, "<", $file or die "CONFIG=$file: $!\n";
+    my $config = eval { JSON::PP->new->decode(do { local $/; <$fh> }) };
+    ref $config eq "HASH" or die "CONFIG=$file: not a JSON object\n";
+    exists $config->{routing} or die "CONFIG=$file has no routing section, which local mode needs\n";
+  ' "$CONFIG" || exit 2
+  local_start+=(--config "$CONFIG")
+  local_run=(--config "$CONFIG")
+fi
+
 echo "== versions"
 "$RAYLINE" --version || exit 1
 for harness in "${selected[@]}"; do
@@ -139,10 +160,10 @@ echo "== cloud mode"
 run_mode cloud
 
 echo "== local mode"
-if "$RAYLINE" local start; then
+if "${local_start[@]}"; then
   trap '"$RAYLINE" local stop; exit 130' INT TERM
   "$RAYLINE" local status
-  run_mode local --local
+  run_mode local "${local_run[@]}"
   trap - INT TERM
   if ! "$RAYLINE" local stop; then
     echo "FAIL    rayline local stop"
