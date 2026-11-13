@@ -299,12 +299,15 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn codex_home_is_under_rayline_harness() {
-        let home = std::path::Path::new("/home/user");
-        assert_eq!(
-            super::codex_home(home),
-            home.join(".rayline").join("harness").join("codex")
-        );
+    fn codex_writes_only_under_its_harness_folder() {
+        let home = crate::harness::tests::temp_dir("codex-home");
+        crate::codex_app::write_codex_home(
+            &super::codex_home(&home),
+            &provider_config_toml(&provider("arc-sage")),
+        )
+        .unwrap();
+        crate::harness::tests::assert_only_harness_files(&home, "codex", &[]);
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     /// #84: every Codex child is built by `codex_command`, which withholds the

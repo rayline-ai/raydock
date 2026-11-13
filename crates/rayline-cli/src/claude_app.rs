@@ -122,13 +122,17 @@ pub async fn run(request: AppRequest) -> ExitCode {
     }
 }
 
-/// A cross-process lease on Desktop's profile, outside the Desktop state
-/// directory. LOCK_NB makes a second `off` or `uninstall` fail immediately.
+/// A cross-process lease on Desktop's profile:
+/// `~/.rayline/harness/claude-desktop/claude-desktop.lock`. LOCK_NB makes a
+/// second `off` or `uninstall` fail immediately.
 #[cfg(unix)]
 fn lifecycle_lock(home: &Path) -> io::Result<fs::File> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
-    let root = home.join(crate::DOT_CONFIG_DIR);
+    let root = home
+        .join(crate::DOT_CONFIG_DIR)
+        .join("harness")
+        .join("claude-desktop");
     private_dir(&root)?;
     let file = fs::OpenOptions::new()
         .create(true)

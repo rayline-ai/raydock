@@ -21,7 +21,7 @@ impl Home {
                 "rayline-desktop-lifecycle-{}-{stamp}",
                 std::process::id()
             ));
-        fs::create_dir_all(path.join(".rayline/claude-desktop")).expect("home");
+        fs::create_dir_all(path.join(".rayline/harness/claude-desktop")).expect("home");
         Self(path)
     }
     fn run(&self, action: &str) -> Output {
@@ -70,7 +70,10 @@ fn restoring_commands_observe_the_same_cross_process_lease() {
         .create_new(true)
         .write(true)
         .mode(0o600)
-        .open(home.0.join(".rayline/claude-desktop.lock"))
+        .open(
+            home.0
+                .join(".rayline/harness/claude-desktop/claude-desktop.lock"),
+        )
         .expect("lock");
     // SAFETY: flock receives a valid open descriptor and no borrowed pointers.
     assert_eq!(
@@ -88,7 +91,7 @@ fn restoring_commands_observe_the_same_cross_process_lease() {
             "{action} failed for the wrong reason: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(home.0.join(".rayline/claude-desktop").is_dir());
+        assert!(home.0.join(".rayline/harness/claude-desktop").is_dir());
     }
     drop(lock);
     for action in ["off", "uninstall"] {
@@ -97,7 +100,7 @@ fn restoring_commands_observe_the_same_cross_process_lease() {
             "{action} must work after the lease is released"
         );
     }
-    assert!(home.0.join(".rayline/claude-desktop").is_dir());
+    assert!(home.0.join(".rayline/harness/claude-desktop").is_dir());
 }
 
 #[cfg(target_os = "macos")]

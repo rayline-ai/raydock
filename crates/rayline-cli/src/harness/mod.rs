@@ -3,16 +3,15 @@
 //!
 //! Each launcher resolves the environment's router URL and `rlk-` key the same
 //! way `raydock claude` does, writes a Rayline-owned config under
-//! `~/.config/rayline/harness/<name>/<env>/`, points the harness at it through
+//! `~/.rayline/harness/<name>/`, points the harness at it through
 //! the harness's own config env var, and execs the harness with the remaining
 //! args. The key lives only in that config (0600, in a 0700 dir), never in the
 //! harness's environment: every tool subprocess the harness spawns inherits its
 //! environment, so a key there would reach a model-visible `env` call. For the
 //! same reason the launch removes [`KEY_ENV`] and `RAYLINE_ROUTER_API_KEY`
-//! from the child's environment. The config dir is per harness and env (it
-//! holds the harness's sessions), so two concurrent launches of one harness on
-//! one env with different explicit `RAYLINE_ROUTER_API_KEY` values share the
-//! last-written key.
+//! from the child's environment. The config dir is per harness (it holds the
+//! harness's sessions), so two concurrent launches of one harness with
+//! different keys share the last-written key.
 //!
 //! Every config uses Anthropic Messages, except OpenClaw, whose default
 //! provider speaks OpenAI Chat Completions. The models, their names and their
@@ -598,7 +597,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             ),
         }
     }
-    let config_dir = config_dir(&home, harness, &env_name);
+    let config_dir = config_dir(&home, harness);
     let ctx = RenderContext {
         key: &key,
         router_url: &router_url,
@@ -689,13 +688,11 @@ fn explicit_router_key() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-/// `~/.config/rayline/harness/<name>/<env>/`
-pub(crate) fn config_dir(home: &Path, harness: Harness, env_name: &str) -> PathBuf {
-    home.join(".config")
-        .join(crate::CONFIG_DIR)
+/// `~/.rayline/harness/<name>/`
+pub(crate) fn config_dir(home: &Path, harness: Harness) -> PathBuf {
+    home.join(crate::DOT_CONFIG_DIR)
         .join("harness")
         .join(harness.name())
-        .join(env_name)
 }
 
 /// Strip trailing slashes and a trailing `/v1` so renderers can add exactly the
@@ -1022,6 +1019,39 @@ pub(crate) mod tests {
         dir
     }
 
+    /// Asserts that Rayline wrote files under `home` and that each one is
+    /// under `~/.rayline/harness/<name>/`, so none is under `~/.config/rayline`.
+    /// `inputs` are paths under `home` the test or the harness itself owns.
+    pub(crate) fn assert_only_harness_files(home: &Path, name: &str, inputs: &[&str]) {
+        fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if fs::symlink_metadata(&path).unwrap().is_dir() {
+                    walk(&path, files);
+                } else {
+                    files.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(home, &mut files);
+        files.retain(|file| {
+            !inputs
+                .iter()
+                .any(|input| file.starts_with(home.join(input)))
+        });
+        assert!(!files.is_empty(), "{name} wrote nothing");
+        let root = home.join(".rayline/harness").join(name);
+        for file in files {
+            assert!(
+                file.starts_with(&root),
+                "{name} wrote {} outside {}",
+                file.display(),
+                root.display()
+            );
+        }
+    }
+
     /// A `GET /v1/models` answer for a key in `mode` (`None`: standard),
     /// listing Swift before Sage as the router does.
     pub(crate) fn listing(mode: Option<&str>) -> Value {
@@ -1148,7 +1178,7 @@ pub(crate) mod tests {
         conversation_id: ConversationIdFallback,
     ) -> (PathBuf, Plan) {
         let home = temp_dir(harness.name());
-        let dir = config_dir(&home, harness, "dev");
+        let dir = config_dir(&home, harness);
         let ctx = RenderContext {
             key: TEST_KEY,
             router_url: TEST_URL,
@@ -1172,12 +1202,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn config_dir_is_per_harness_and_env() {
+    fn config_dir_is_per_harness() {
         let home = Path::new("/home/u");
         assert_eq!(
-            config_dir(home, Harness::Pi, "dev"),
-            PathBuf::from("/home/u/.config/rayline/harness/pi/dev")
+            config_dir(home, Harness::Pi),
+            PathBuf::from("/home/u/.rayline/harness/pi")
         );
+    }
+
+    #[test]
+    fn every_harness_writes_only_under_its_harness_folder() {
+        for harness in Harness::ALL {
+            let (dir, _) = render(harness);
+            let home = dir.ancestors().nth(3).unwrap();
+            assert_only_harness_files(home, harness.name(), &[]);
+            fs::remove_dir_all(home).unwrap();
+        }
     }
 
     #[test]

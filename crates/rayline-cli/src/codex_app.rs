@@ -7,7 +7,7 @@
 //!
 //! 1. It reads persistent config only from its `CODEX_HOME`, so the provider
 //!    goes into the `config.toml` of an app home of its own
-//!    (`~/.rayline/codex-app-home`).
+//!    (`~/.rayline/harness/codex-app`).
 //! 2. It is **single-instance per machine**, locked to the `CODEX_HOME` its
 //!    app-server first spawned with. A second `codex app` launch just focuses
 //!    the existing window. So if an app-server is already running on a different
@@ -22,8 +22,6 @@ use std::process::{Command, ExitCode};
 use toml_edit::{DocumentMut, Item, Table, TomlError, Value};
 
 use crate::codex::CodexAuthMode;
-
-const CODEX_APP_HOME_DIR: &str = "codex-app-home";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppRunRequest {
@@ -57,13 +55,11 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
 
     // 1. Compute the config to write. Nothing changes on disk yet, so a
     //    declined restart below leaves everything untouched.
-    let home = match isolated_home_path() {
-        Ok(home) => home,
-        Err(error) => {
-            eprintln!("Error: failed to resolve Codex app home: {error}");
-            return ExitCode::from(1);
-        }
+    let Some(user_home) = dirs::home_dir() else {
+        eprintln!("Error: failed to resolve Codex app home: home directory not found");
+        return ExitCode::from(1);
     };
+    let home = isolated_home_path(&user_home);
     let config = crate::codex::provider_config_toml(&provider);
 
     // 2. Reconcile the single-instance app-server. The comparison basis is the
@@ -112,11 +108,12 @@ fn user_codex_home() -> io::Result<PathBuf> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))
 }
 
-/// The stable isolated home Rayline points the desktop app at.
-fn isolated_home_path() -> io::Result<PathBuf> {
-    let base = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
-    Ok(base.join(crate::DOT_CONFIG_DIR).join(CODEX_APP_HOME_DIR))
+/// The stable isolated home Rayline points the desktop app at:
+/// `~/.rayline/harness/codex-app`.
+fn isolated_home_path(home: &Path) -> PathBuf {
+    home.join(crate::DOT_CONFIG_DIR)
+        .join("harness")
+        .join("codex-app")
 }
 
 /// Root keys the generated Rayline snippet owns. Together with the
@@ -843,8 +840,10 @@ mod tests {
     }
 
     #[test]
-    fn isolated_home_is_under_rayline_dir() {
-        let home = isolated_home_path().unwrap();
-        assert!(home.ends_with(format!("{}/{}", crate::DOT_CONFIG_DIR, CODEX_APP_HOME_DIR)));
+    fn codex_app_writes_only_under_its_harness_folder() {
+        let home = crate::harness::tests::temp_dir("codex-app-home");
+        write_codex_home(&isolated_home_path(&home), &snippet("arc-sage-1.0")).unwrap();
+        crate::harness::tests::assert_only_harness_files(&home, "codex-app", &[]);
+        fs::remove_dir_all(home).unwrap();
     }
 }
