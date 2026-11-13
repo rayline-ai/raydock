@@ -1232,9 +1232,13 @@ mod tests {
             harness(Harness::Pi, &["--env", "dev"])
         );
         for args in [
-            &["auth", "status", "--env", "dev"][..],
+            &["auth", "--env", "dev"][..],
+            &["auth", "login", "--env", "dev"],
+            &["auth", "status", "--env", "dev"],
             &["run", "claude-desktop", "--env=dev"],
+            &["run", "codex", "configure", "--env", "dev"],
             &["top", "--env", "dev"],
+            &["update", "--env=dev"],
         ] {
             assert!(
                 error(args).contains("`--env` goes before the command: `rayline --env <name> "),
@@ -1249,7 +1253,9 @@ mod tests {
             &["--env", "a/b", "run", "pi"],
             "invalid `--env` name (use letters, digits, `-` and `_`)",
         );
-        assert_error(&["--env"], "`--env` needs a value");
+        for args in [&["--env"][..], &["--env="], &["--env", "--help"]] {
+            assert_error(args, "`--env` needs a value");
+        }
         assert_error(
             &["--env", "a", "--env", "b", "top"],
             "`--env` given more than once",
@@ -1534,6 +1540,177 @@ mod tests {
                 "`--base-url` must be an absolute http or https URL",
             );
         }
+    }
+
+    #[test]
+    fn update_options_need_a_value_and_are_given_once() {
+        for (name, value) in [
+            ("--version", "1.2.3"),
+            ("--base-url", "http://127.0.0.1:1"),
+            ("--install-path", "/tmp/raydock"),
+        ] {
+            let needs = format!("`{name}` needs a value");
+            assert_error(&["update", name], &needs);
+            assert_error(&["update", &format!("{name}=")], &needs);
+            assert_error(&["update", name, "--check"], &needs);
+            assert_error(
+                &["update", name, value, &format!("{name}={value}")],
+                &format!("`{name}` given more than once"),
+            );
+        }
+        for flag in ["--force", "--check", "--dry-run", "--help"] {
+            assert_error(
+                &["update", &format!("{flag}=yes")],
+                &format!("unexpected `{flag}=…`"),
+            );
+        }
+        assert_error(&["update", "now"], "unexpected `now`");
+    }
+
+    #[test]
+    fn codex_options_need_a_value_and_are_given_once() {
+        for words in [
+            &["run", "codex"][..],
+            &["run", "codex", "app"],
+            &["run", "codex", "configure"],
+        ] {
+            let with = |extra: &[&str]| -> Vec<String> {
+                words
+                    .iter()
+                    .chain(extra)
+                    .map(|arg| (*arg).to_owned())
+                    .collect()
+            };
+            let check = |extra: &[&str], problem: &str| {
+                let args = with(extra);
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                assert_error(&args, problem);
+            };
+            for name in ["--model", "--auth"] {
+                let needs = format!("`{name}` needs a value");
+                check(&[name], &needs);
+                check(&[&format!("{name}=")], &needs);
+                check(&[name, "--local"], &needs);
+            }
+            check(
+                &["--model", "a", "--model=b"],
+                "`--model` given more than once",
+            );
+            check(
+                &["--auth", "auto", "--auth=none"],
+                "`--auth` given more than once",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_auth_option_or_extra_argument_is_a_usage_error() {
+        assert_error(&["auth", "--bogus"], "unexpected `--bogus`");
+        assert_error(&["auth", "login", "now"], "unexpected `now`");
+        assert_error(&["auth", "logout", "--all"], "unexpected `--all`");
+        assert_error(&["auth", "status", "dev"], "unexpected `dev`");
+    }
+
+    #[test]
+    fn a_flag_given_a_value_is_a_usage_error_where_nothing_follows() {
+        assert_error(
+            &["run", "claude-desktop", "--local=yes"],
+            "unexpected `--local=…`",
+        );
+        assert_error(
+            &["run", "codex", "configure", "--help=yes"],
+            "unexpected `--help=…`",
+        );
+        assert_error(&["top", "--json=yes"], "unexpected `--json=…`");
+    }
+
+    /// An argument that is not valid UTF-8 on this platform.
+    fn not_utf8() -> OsString {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            OsString::from_vec(vec![0xff])
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt as _;
+            OsString::from_wide(&[0xd800])
+        }
+    }
+
+    /// `args` with a non-UTF-8 argument after them.
+    fn then_not_utf8(args: &[&str]) -> Vec<OsString> {
+        let mut argv = argv(args);
+        argv.push(not_utf8());
+        argv
+    }
+
+    #[test]
+    fn an_argument_that_is_not_utf8_is_a_usage_error() {
+        for (args, help) in [
+            (&[][..], "rayline"),
+            (&["--env", "dev"], "rayline"),
+            (&["auth"], "rayline auth"),
+            (&["auth", "login"], "rayline auth login"),
+            (&["auth", "logout"], "rayline auth logout"),
+            (&["auth", "status"], "rayline auth status"),
+            (&["auth", "token"], "rayline auth token"),
+            (&["top"], "rayline top"),
+            (&["update"], "rayline update"),
+            (&["run"], "rayline run"),
+            (&["run", "claude-desktop"], "rayline run claude-desktop"),
+            (
+                &["run", "claude-desktop", "stop"],
+                "rayline run claude-desktop",
+            ),
+            (
+                &["run", "codex", "configure"],
+                "rayline run codex configure",
+            ),
+        ] {
+            let error = match parse(&then_not_utf8(args)) {
+                Err(error) => error.to_string(),
+                Ok(parsed) => panic!("{args:?} was accepted as {parsed:?}"),
+            };
+            assert!(
+                error.starts_with(
+                    "rayline: got an argument that is not valid UTF-8
+
+"
+                ) && error.ends_with(&format!("Run `{help} --help` for details.")),
+                "{args:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_argument_that_is_not_utf8_goes_to_a_harness_unchanged() {
+        assert_eq!(
+            parse(&then_not_utf8(&["run", "claude", "--local"])),
+            Ok(Parsed::Command {
+                env: None,
+                command: Command::Run(Run {
+                    config: ConfigFlag::Local,
+                    launch: Launch::Claude {
+                        isolated: false,
+                        args: vec![not_utf8()],
+                    },
+                }),
+            })
+        );
+        assert_eq!(
+            parse(&then_not_utf8(&["run", "pi", "--"])),
+            Ok(Parsed::Command {
+                env: None,
+                command: Command::Run(Run {
+                    config: ConfigFlag::Default,
+                    launch: Launch::Harness {
+                        harness: Harness::Pi,
+                        args: vec![not_utf8()],
+                    },
+                }),
+            })
+        );
     }
 
     // ── Removed forms (section 10.1) ─────────────────────────────────────
