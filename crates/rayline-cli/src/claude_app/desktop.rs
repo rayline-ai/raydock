@@ -239,6 +239,7 @@ impl ProfileStore {
             config: root.join("claude_desktop_config.json"),
             journal: home
                 .join(crate::DOT_CONFIG_DIR)
+                .join("harness")
                 .join("claude-desktop")
                 .join("desktop-profile.json"),
         }
@@ -776,17 +777,30 @@ mod tests {
     #[test]
     fn concurrent_profile_changes_are_excluded_until_guard_drops() {
         let f = Fixture::new();
-        let state_dir = f.store.journal.parent().expect("state directory");
-        fs::create_dir_all(state_dir).expect("state directory");
         let guard = super::super::lifecycle_lock(&f.home).expect("first lock");
         assert!(super::super::lifecycle_lock(&f.home).is_err());
-        fs::remove_dir_all(state_dir).expect("remove the state directory");
-        assert!(
-            super::super::lifecycle_lock(&f.home).is_err(),
-            "the lock must live outside the state directory"
-        );
         drop(guard);
         assert!(super::super::lifecycle_lock(&f.home).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_state_is_written_only_under_its_harness_folder() {
+        let f = Fixture::new();
+        let _guard = super::super::lifecycle_lock(&f.home).expect("lock");
+        let original = f.seed(Value::Null);
+        f.select_rayline(&original);
+        crate::harness::tests::assert_only_harness_files(&f.home, "claude-desktop", &["Library"]);
+        assert!(
+            f.home
+                .join(".rayline/harness/claude-desktop/claude-desktop.lock")
+                .is_file()
+        );
+        assert!(
+            f.home
+                .join(".rayline/harness/claude-desktop/desktop-profile.json")
+                .is_file()
+        );
     }
 
     #[cfg(unix)]

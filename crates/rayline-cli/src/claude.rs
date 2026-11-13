@@ -50,7 +50,7 @@ pub struct RunRequest {
     pub env_name: Option<String>,
     pub auth_token: Option<String>,
     pub args: Vec<OsString>,
-    /// Run against an isolated Claude config dir (`~/.<brand>/cc`) so this
+    /// Run against an isolated Claude config dir (`~/.rayline/harness/claude-code`) so this
     /// session can start its own background-agents supervisor alongside a
     /// standard Claude Code daemon instead of conflicting with it. The dir is a
     /// thin overlay: shared content (projects, sessions, history, skills,
@@ -603,7 +603,7 @@ pub(crate) fn claude_agent_view_disabled() -> bool {
 }
 
 /// Resolve the Claude Code config dir this run targets. In isolated mode that is
-/// the brand's private dir (`~/.<brand>/cc`); otherwise it honors an externally
+/// Rayline's own dir (`~/.rayline/harness/claude-code`); otherwise it honors an externally
 /// set `CLAUDE_CONFIG_DIR`, falling back to the standard `~/.claude`.
 fn claude_config_dir(home: &Path, isolated: bool) -> PathBuf {
     if isolated {
@@ -615,9 +615,11 @@ fn claude_config_dir(home: &Path, isolated: bool) -> PathBuf {
         .unwrap_or_else(|| home.join(".claude"))
 }
 
-/// The brand-private Claude config dir used by `--isolated` (e.g. `~/.rayline/cc`).
+/// The Claude config dir used by `--isolated`: `~/.rayline/harness/claude-code`.
 pub(crate) fn isolated_cc_dir(home: &Path) -> PathBuf {
-    home.join(crate::DOT_CONFIG_DIR).join("cc")
+    home.join(crate::DOT_CONFIG_DIR)
+        .join("harness")
+        .join("claude-code")
 }
 
 /// Write-target directories Claude creates session work under. Created in the
@@ -1218,6 +1220,36 @@ mod router_auto_compact_window_tests {
 #[cfg(test)]
 mod claude_command_tests {
     use super::*;
+
+    #[test]
+    fn isolated_claude_code_writes_only_under_its_harness_folder() {
+        let home = crate::harness::tests::temp_dir("claude-code-home");
+        fs::create_dir_all(home.join(".claude")).unwrap();
+        fs::write(home.join(".claude/settings.json"), "{}").unwrap();
+        fs::write(home.join(".claude.json"), "{}").unwrap();
+        apply_isolated_config_dir(&mut Command::new("claude"), &home);
+        crate::claude_daemon::record_rayline_claude_launch(LaunchRecord {
+            home: &home,
+            pid: 1,
+            request: &RequestSpec {
+                env_name: "prod",
+                auto_compact_window: None,
+                refusal_recovery: &[],
+                args: &[],
+            },
+            preserve_spawned_by_pid: None,
+        });
+        crate::harness::tests::assert_only_harness_files(
+            &home,
+            "claude-code",
+            &[".claude", ".claude.json"],
+        );
+        assert!(
+            home.join(".rayline/harness/claude-code/daemon-launches.json")
+                .is_file()
+        );
+        fs::remove_dir_all(home).unwrap();
+    }
 
     /// A router key in the launcher's environment must not reach Claude Code,
     /// whose Bash tool hands its environment to every command it runs.

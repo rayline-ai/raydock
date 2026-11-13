@@ -42,7 +42,7 @@ pub const ARC_SWIFT_MODEL: &str = "arc-swift-1.0";
 pub const VIRTUAL_ROUTER_MODEL: &str = "rayline-auto";
 pub const UPDATE_BASE_URL: &str = "https://get.rayline.ai";
 pub const INSTALLER_URL: &str = "https://get.rayline.ai/install.sh";
-pub const CLAUDE_LAUNCHES_SUFFIX: &str = ".config/rayline/claude-daemon-launches.json";
+pub const CLAUDE_LAUNCHES_SUFFIX: &str = ".rayline/harness/claude-code/daemon-launches.json";
 pub const RAYLINE_VERSION: &str = env!("RAYLINE_VERSION");
 
 // Production minisign public key(s) for release / self-update signature verification.
@@ -188,7 +188,7 @@ Launch the Codex desktop app on ARC through the Rayline router.
 
 The desktop app-server ignores -c overrides and is single-instance, so this
 writes the Rayline provider into an isolated CODEX_HOME
-(~/.rayline/codex-app-home) and launches the app there. If the app is already
+(~/.rayline/harness/codex-app) and launches the app there. If the app is already
 running on a different config, you'll be prompted to restart it.
 
 Options:
