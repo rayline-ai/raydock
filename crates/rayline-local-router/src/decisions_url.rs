@@ -1,10 +1,10 @@
-//! Where hybrid routing may send Decisions requests.
+//! Where the local process may send Decisions requests.
 //!
 //! A Decisions request carries the session's execution context and the router
 //! API key, so it may go only to a Rayline router (HTTPS on a router's exact
 //! host and port) or to a loopback address (tests and a local Decisions
-//! service). Both `rayline hybrid start` and `rld hybrid` apply this check, so
-//! a hand-edited core configuration cannot widen it.
+//! service). Both `rayline local start` and the local process apply this
+//! check, so a hand-edited core configuration cannot widen it.
 
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -13,9 +13,9 @@ use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
-/// Routers of the built-in Rayline environments. Configured environments add
-/// their own `router_url`.
-pub const BUILTIN_ROUTER_URLS: &[&str] = &["https://api.rayline.ai", "https://api-dev.rayline.ai"];
+/// The router of the built-in prod environment. A configured environment's
+/// router is passed in.
+pub const BUILTIN_ROUTER_URLS: &[&str] = &["https://api.rayline.ai"];
 
 /// Check the `decisions.url` of an execution-core configuration file as the
 /// Go core will read it: duplicate object keys are refused anywhere (Go merges
@@ -268,7 +268,6 @@ mod tests {
         let cases: &[(&str, bool)] = &[
             // Built-in and configured routers, exact host and port.
             ("https://api.rayline.ai/v1/routes", true),
-            ("https://api-dev.rayline.ai/v1/routes", true),
             ("https://API.Rayline.AI/v1/routes", true),
             ("HTTPS://api.rayline.ai/v1/routes", true),
             ("https://api.rayline.ai:443/v1/routes", true),
@@ -283,6 +282,7 @@ mod tests {
             ("http://LOCALHOST:9/decisions", true),
             // Not a router: Modal and other hosts.
             ("https://rayline--decisions.modal.run/v1/routes", false),
+            ("https://api-dev.rayline.ai/v1/routes", false),
             ("https://decisions.example.com/v1/routes", false),
             ("https://router.example.test/v1/routes", false),
             ("https://api.rayline.ai.evil.test/v1/routes", false),

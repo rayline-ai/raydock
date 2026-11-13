@@ -327,7 +327,7 @@ pub(crate) mod tests {
 
     /// Windows process creation does not apply PATHEXT, so a bare `codex`
     /// misses the `codex.cmd` launcher npm installs. The command resolves it
-    /// the way `raydock hybrid` does, and keeps withholding the router key.
+    /// the way a local-mode run does, and keeps withholding the router key.
     #[test]
     fn codex_command_finds_the_npm_launcher_on_windows() {
         let dir = crate::harness::tests::temp_dir("codex-launcher");

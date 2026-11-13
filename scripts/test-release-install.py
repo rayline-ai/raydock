@@ -52,7 +52,7 @@ def main():
         platform = {("Darwin", "arm64"): "macosx_11_0_arm64", ("Darwin", "x86_64"): "macosx_10_12_x86_64",
                     ("Linux", "x86_64"): "linux_x86_64", ("Linux", "aarch64"): "linux_aarch64"}[(system, arch)]
         files = {"rayline": ROOT / "target/debug/raydock",
-                 "rayline-core": ROOT / "crates/rayline-daemon/tests/fixtures/execution-contract.py"}
+                 "rayline-core": ROOT / "crates/rayline-cli/tests/fixtures/execution-contract.py"}
         expected = {}
         for name, source in files.items():
             expected[name] = source.read_bytes()

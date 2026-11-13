@@ -136,6 +136,39 @@ Options:
   --help                  Show this message and exit
 ";
 
+const LOCAL_HELP: &str = "\
+Usage: rayline local COMMAND
+
+Commands:
+  start    Start the local process
+  status   Show whether the local process is running
+  stop     Stop the local process
+";
+
+const LOCAL_START_HELP: &str = "\
+Usage: rayline local start [--config <file>]
+
+Start the local process from ~/.config/rayline/settings.json, or from <file>.
+The config must have a `routing` section.
+
+Options:
+  --config <file>  Read the config from <file> instead of the default file
+  --help           Show this message and exit
+";
+
+const LOCAL_STATUS_HELP: &str = "\
+Usage: rayline local status
+
+Show whether the local process is running, its address, the config file and
+the environment it was started from.
+";
+
+const LOCAL_STOP_HELP: &str = "\
+Usage: rayline local stop
+
+Stop the local process. External inference servers keep running.
+";
+
 const TOP_HELP: &str = "\
 Usage: rayline top [--json]
 
@@ -156,6 +189,10 @@ Options:
   --dry-run            Download and verify without replacing Rayline
 ";
 
+/// The first argument that runs the local process (section 4.3). Only
+/// `rayline local start` passes it; it is in no help text.
+pub(crate) const LOCAL_PROCESS: &str = "__local-process";
+
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Parsed {
@@ -163,9 +200,9 @@ pub(crate) enum Parsed {
     Help(&'static str),
     /// `--version`.
     Version,
-    /// The hidden `hybrid start|status|stop` the CI lifecycle scripts drive,
-    /// with its arguments. Sub-PR 6b replaces it with `rayline local`.
-    Hybrid(Vec<OsString>),
+    /// The internal entry point the local process runs from (section 4.3),
+    /// with the options `rayline local start` passes it.
+    LocalProcess(Vec<OsString>),
     Command {
         /// `--env <name>`. `None` is prod.
         env: Option<String>,
@@ -177,6 +214,7 @@ pub(crate) enum Parsed {
 pub(crate) enum Command {
     Auth(Auth),
     Run(Run),
+    Local(Local),
     Top {
         json: bool,
     },
@@ -190,6 +228,17 @@ pub(crate) enum Auth {
     Logout,
     Status,
     Token,
+}
+
+/// `rayline local start|status|stop` (section 3.3).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Local {
+    /// `--config <file>`, or `None` for the default file.
+    Start {
+        config: Option<PathBuf>,
+    },
+    Status,
+    Stop,
 }
 
 /// `rayline run <HARNESS> [--local | --config <file>] ...`.
@@ -242,16 +291,10 @@ pub(crate) struct CodexOptions {
 }
 
 impl Run {
-    /// The option or command that local mode does not run yet, if this run
-    /// uses one. Local mode runs what the deleted `hybrid run` ran: it
-    /// connects to the running local process, which does not record its
-    /// config file, so a `--config` file could not be checked against it
-    /// (section 3.3 item 3). Sub-PR 6b lifts these refusals.
+    /// The option or command that local mode does not run, if this run uses
+    /// one.
     pub(crate) fn not_in_local_mode(&self) -> Option<&'static str> {
-        match self.config {
-            ConfigFlag::File(_) => Some("`--config`"),
-            ConfigFlag::Default | ConfigFlag::Local => self.launch.not_in_local_mode(),
-        }
+        self.launch.not_in_local_mode()
     }
 }
 
@@ -272,8 +315,9 @@ impl Launch {
         }
     }
 
-    /// The kept option or command that local mode does not run yet: the
-    /// deleted `hybrid run` had none of them.
+    /// The kept option or command that local mode does not run: the deleted
+    /// `hybrid run` had none of them. Codex's `--auth auto` and `--auth none`
+    /// both send only the gateway token there.
     fn not_in_local_mode(&self) -> Option<&'static str> {
         match self {
             Launch::Claude { isolated: true, .. } => Some("`--isolated`"),
@@ -281,7 +325,9 @@ impl Launch {
             Launch::CodexApp { .. } => Some("`run codex app`"),
             Launch::CodexConfigure(_) => Some("`run codex configure`"),
             Launch::Codex { options, .. } if options.model.is_some() => Some("`--model`"),
-            Launch::Codex { options, .. } if options.auth.is_some() => Some("`--auth`"),
+            Launch::Codex { options, .. } if options.auth == Some(CodexAuthMode::Subscription) => {
+                Some("`--auth subscription`")
+            }
             Launch::Claude { .. } | Launch::Codex { .. } | Launch::Harness { .. } => None,
         }
     }
@@ -344,6 +390,22 @@ const CODEX_APP: Help = Help {
 const CODEX_CONFIGURE: Help = Help {
     words: " run codex configure",
     text: CODEX_CONFIGURE_HELP,
+};
+const LOCAL: Help = Help {
+    words: " local",
+    text: LOCAL_HELP,
+};
+const LOCAL_START: Help = Help {
+    words: " local start",
+    text: LOCAL_START_HELP,
+};
+const LOCAL_STATUS: Help = Help {
+    words: " local status",
+    text: LOCAL_STATUS_HELP,
+};
+const LOCAL_STOP: Help = Help {
+    words: " local stop",
+    text: LOCAL_STOP_HELP,
 };
 const TOP: Help = Help {
     words: " top",
@@ -470,6 +532,15 @@ fn unexpected(help: Help, arg: &str) -> UsageError {
     help.error(format!("unexpected {}", shown(arg)))
 }
 
+/// `--env` given to a command that acts on the one running local process,
+/// whatever environment it was started for.
+fn env_not_read(help: Help) -> UsageError {
+    help.error(format!(
+        "`--env` does not apply to `rayline{}`: it acts on the one running local process",
+        help.words
+    ))
+}
+
 fn set_once<T>(slot: &mut Option<T>, value: T, name: &str, help: Help) -> Result<(), UsageError> {
     if slot.is_some() {
         return Err(help.error(format!("`{name}` given more than once")));
@@ -483,8 +554,13 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
     let mut args = Args {
         args: argv.get(1..).unwrap_or_default(),
     };
-    if args.peek().is_none() {
-        return Ok(Parsed::Help(ROOT_HELP));
+    match args.peek() {
+        None => return Ok(Parsed::Help(ROOT_HELP)),
+        Some(arg) if arg == LOCAL_PROCESS => {
+            args.next();
+            return Ok(Parsed::LocalProcess(args.rest()));
+        }
+        Some(_) => {}
     }
     let mut env = None;
     while let Some(arg) = args.next_str(ROOT)? {
@@ -501,10 +577,6 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
                 }
                 set_once(&mut env, value.to_owned(), "--env", ROOT)?;
             }
-            "hybrid" if env.is_some() => {
-                return Err(ROOT.error("`hybrid` takes `--env` after `hybrid start`"));
-            }
-            "hybrid" => return Ok(Parsed::Hybrid(args.rest())),
             _ if arg.starts_with('-') => {
                 return Err(ROOT.error(unknown("option", arg)));
             }
@@ -516,6 +588,14 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
                     },
                     "run" => match parse_run(&mut args)? {
                         Ok(run) => Command::Run(run),
+                        Err(help) => return Ok(Parsed::Help(help)),
+                    },
+                    "local" => match parse_local(&mut args)? {
+                        Ok(Local::Status) if env.is_some() => {
+                            return Err(env_not_read(LOCAL_STATUS));
+                        }
+                        Ok(Local::Stop) if env.is_some() => return Err(env_not_read(LOCAL_STOP)),
+                        Ok(local) => Command::Local(local),
                         Err(help) => return Ok(Parsed::Help(help)),
                     },
                     "top" => match parse_top(&mut args)? {
@@ -574,6 +654,34 @@ fn parse_auth_login(args: &mut Args<'_>) -> Result<OrHelp<Auth>, UsageError> {
         }
     }
     Ok(Ok(Auth::Login { no_browser, paste }))
+}
+
+fn parse_local(args: &mut Args<'_>) -> Result<OrHelp<Local>, UsageError> {
+    let (local, help) = match args.next_str(LOCAL)? {
+        None | Some("--help") => return Ok(Err(LOCAL_HELP)),
+        Some("start") => return parse_local_start(args),
+        Some("status") => (Local::Status, LOCAL_STATUS),
+        Some("stop") => (Local::Stop, LOCAL_STOP),
+        Some(arg) if arg.starts_with('-') => return Err(unexpected(LOCAL, arg)),
+        Some(arg) => return Err(LOCAL.error(unknown("local command", arg))),
+    };
+    Ok(no_arguments(args, help)?.map(|()| local).ok_or(help.text))
+}
+
+fn parse_local_start(args: &mut Args<'_>) -> Result<OrHelp<Local>, UsageError> {
+    let mut config = None;
+    while let Some(arg) = args.next_str(LOCAL_START)? {
+        let (name, inline) = split_option(arg);
+        match name {
+            "--config" => {
+                let file = args.value(name, inline, LOCAL_START)?;
+                set_once(&mut config, PathBuf::from(file), name, LOCAL_START)?;
+            }
+            "--help" if inline.is_none() => return Ok(Err(LOCAL_START_HELP)),
+            _ => return Err(unexpected(LOCAL_START, arg)),
+        }
+    }
+    Ok(Ok(Local::Start { config }))
 }
 
 /// `top [--json]`: `None` asks for its help.
@@ -960,6 +1068,11 @@ mod tests {
             (&["auth", "logout", "--help"], AUTH_LOGOUT_HELP),
             (&["auth", "status", "--help"], AUTH_STATUS_HELP),
             (&["auth", "token", "--help"], AUTH_TOKEN_HELP),
+            (&["local"], LOCAL_HELP),
+            (&["local", "--help"], LOCAL_HELP),
+            (&["local", "start", "--help"], LOCAL_START_HELP),
+            (&["local", "status", "--help"], LOCAL_STATUS_HELP),
+            (&["local", "stop", "--help"], LOCAL_STOP_HELP),
             (&["top", "--help"], TOP_HELP),
             (&["update", "--help"], UPDATE_HELP),
             (&["run", "claude-desktop", "--help"], CLAUDE_DESKTOP_HELP),
@@ -990,6 +1103,10 @@ mod tests {
             CLAUDE_DESKTOP_HELP,
             CODEX_APP_HELP,
             CODEX_CONFIGURE_HELP,
+            LOCAL_HELP,
+            LOCAL_START_HELP,
+            LOCAL_STATUS_HELP,
+            LOCAL_STOP_HELP,
             TOP_HELP,
             UPDATE_HELP,
         ] {
@@ -1415,12 +1532,8 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_names_the_kept_options_it_does_not_run_yet() {
+    fn local_mode_names_the_kept_options_it_does_not_run() {
         let local = |args: &[&str]| run(args).not_in_local_mode();
-        assert_eq!(
-            local(&["run", "pi", "--config", "routing.json"]),
-            Some("`--config`")
-        );
         assert_eq!(
             local(&["run", "claude", "--isolated"]),
             Some("`--isolated`")
@@ -1435,11 +1548,17 @@ mod tests {
             Some("`run codex configure`")
         );
         assert_eq!(local(&["run", "codex", "--model", "m"]), Some("`--model`"));
-        assert_eq!(local(&["run", "codex", "--auth", "auto"]), Some("`--auth`"));
+        assert_eq!(
+            local(&["run", "codex", "--auth", "subscription"]),
+            Some("`--auth subscription`")
+        );
         for args in [
             &["run", "claude", "-p", "hi"][..],
             &["run", "codex", "exec"],
+            &["run", "codex", "--auth", "auto"],
+            &["run", "codex", "--auth", "none"],
             &["run", "pi"],
+            &["run", "pi", "--config", "routing.json"],
         ] {
             assert_eq!(local(args), None, "{args:?}");
         }
@@ -1655,6 +1774,10 @@ mod tests {
             (&["auth", "logout"], "rayline auth logout"),
             (&["auth", "status"], "rayline auth status"),
             (&["auth", "token"], "rayline auth token"),
+            (&["local"], "rayline local"),
+            (&["local", "start"], "rayline local start"),
+            (&["local", "status"], "rayline local status"),
+            (&["local", "stop"], "rayline local stop"),
             (&["top"], "rayline top"),
             (&["update"], "rayline update"),
             (&["run"], "rayline run"),
@@ -1679,6 +1802,57 @@ mod tests {
 "
                 ) && error.ends_with(&format!("Run `{help} --help` for details.")),
                 "{args:?}: {error}"
+            );
+        }
+    }
+
+    // ── local (section 3.3) ──────────────────────────────────────────────
+
+    #[test]
+    fn local_starts_from_the_default_file_or_one_given() {
+        for (args, local) in [
+            (&["local", "start"][..], Local::Start { config: None }),
+            (
+                &["local", "start", "--config", "/tmp/hybrid.json"],
+                Local::Start {
+                    config: Some(PathBuf::from("/tmp/hybrid.json")),
+                },
+            ),
+            (
+                &["local", "start", "--config=/tmp/hybrid.json"],
+                Local::Start {
+                    config: Some(PathBuf::from("/tmp/hybrid.json")),
+                },
+            ),
+            (&["local", "status"], Local::Status),
+            (&["local", "stop"], Local::Stop),
+        ] {
+            assert_eq!(command(args).1, Command::Local(local), "{args:?}");
+        }
+        assert_eq!(
+            command(&["--env", "dev", "local", "start"]),
+            (
+                Some("dev".to_owned()),
+                Command::Local(Local::Start { config: None })
+            )
+        );
+        assert_error(
+            &["local", "start", "--config", "a", "--config", "b"],
+            "`--config` given more than once",
+        );
+        assert_error(&["local", "start", "--config"], "`--config` needs a value");
+        assert_error(&["local", "stop", "now"], "unexpected `now`");
+        assert_error(
+            &["local", "status", "--env", "dev"],
+            "`--env` goes before the command: `rayline --env <name> local status`",
+        );
+        for command in ["status", "stop"] {
+            assert_error(
+                &["--env", "dev", "local", command],
+                &format!(
+                    "`--env` does not apply to `rayline local {command}`: \
+                     it acts on the one running local process"
+                ),
             );
         }
     }
@@ -1727,7 +1901,7 @@ mod tests {
             "hermes",
             "openclaw",
             "status",
-            "local",
+            "hybrid",
             "router",
             "chat",
             "api",
@@ -1739,6 +1913,25 @@ mod tests {
             assert_error(&[name], &format!("unknown command `{name}`"));
         }
         assert_error(&["claude", "run"], "unknown command `claude`");
+        for name in [
+            "models",
+            "download",
+            "use",
+            "remove",
+            "custom",
+            "show",
+            "test",
+            "clear",
+            "on",
+            "off",
+            "onboard",
+            "subagents",
+        ] {
+            assert_error(&["local", name], &format!("unknown local command `{name}`"));
+        }
+        for option in ["--url", "--base-url", "--port", "--state-dir", "--env"] {
+            assert!(error(&["local", "start", option, "x"]).starts_with("rayline: "));
+        }
     }
 
     #[test]
@@ -1767,22 +1960,5 @@ mod tests {
         ] {
             assert!(!error(args).contains(word), "{args:?}");
         }
-    }
-
-    #[test]
-    fn hybrid_is_hidden_and_takes_its_own_arguments() {
-        assert_eq!(
-            parsed(&["hybrid", "status"]),
-            Parsed::Hybrid(os(&["status"]))
-        );
-        assert!(
-            !ROOT_HELP
-                .lines()
-                .any(|line| line.trim_start().starts_with("hybrid"))
-        );
-        assert_error(
-            &["--env", "dev", "hybrid", "status"],
-            "`hybrid` takes `--env` after `hybrid start`",
-        );
     }
 }

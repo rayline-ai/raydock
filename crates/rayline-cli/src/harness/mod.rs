@@ -34,13 +34,7 @@
 //! `session_affinity_header` (from Hermes v2026.9.21). On Responses, pi's,
 //! OpenClaw's and Hermes' `prompt_cache_key` keys the session instead. A harness session
 //! is one episode, so `--resume` / `-c` / `--session-id` in a later launch
-//! keeps the episode. These launchers talk to the hosted router directly; a
-//! client that reaches it through `rld`'s local router keeps its session
-//! headers too (`x-session-affinity`, `x-claude-code-session-id`,
-//! `x-session-id`, `x-conversation-id`), which that router forwards only to
-//! the hosted Rayline router. Where that router translates the request to
-//! another protocol, a body-only `session_id` or Responses `prompt_cache_key`
-//! reaches the hosted router as `x-session-affinity`.
+//! keeps the episode. These launchers talk to the hosted router directly.
 
 pub(crate) mod hermes;
 mod omp;
@@ -329,24 +323,28 @@ impl Harness {
         }
     }
 
+    /// Refuse `args` local mode can't run: OpenClaw's container mode.
+    pub(crate) fn require_hybrid_args(self, args: &[OsString]) -> io::Result<()> {
+        let env_container =
+            std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
+        if self == Self::OpenClaw && (env_container || openclaw::uses_container(args)) {
+            return Err(io::Error::other(
+                "OpenClaw container mode cannot use the hybrid gateway configuration; run an agent locally",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The launch args for `args`, which [`Self::require_hybrid_args`] accepted.
     pub(crate) fn hybrid_args(
         self,
         args: &[OsString],
         major_version: Option<u64>,
-    ) -> io::Result<Vec<OsString>> {
-        if self == Self::OpenClaw {
-            let env_container =
-                std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
-            if env_container || openclaw::uses_container(args) {
-                return Err(io::Error::other(
-                    "OpenClaw container mode cannot use the hybrid gateway configuration; run an agent locally",
-                ));
-            }
-            Ok(openclaw::launch_args(args))
-        } else if let (Self::OpenCode, Some(major_version)) = (self, major_version) {
-            Ok(opencode_args(args, major_version))
-        } else {
-            Ok(args.to_vec())
+    ) -> Vec<OsString> {
+        match (self, major_version) {
+            (Self::OpenClaw, _) => openclaw::launch_args(args),
+            (Self::OpenCode, Some(major_version)) => opencode_args(args, major_version),
+            _ => args.to_vec(),
         }
     }
 }
@@ -540,7 +538,7 @@ fn opencode_args(args: &[OsString], major_version: u64) -> Vec<OsString> {
     launched
 }
 
-/// `~/.rayline/harness/<name>/`
+/// `~/.rayline/harness/<name>/`, cloud mode's harness folder.
 pub(crate) fn config_dir(home: &Path, harness: Harness) -> PathBuf {
     home.join(crate::DOT_CONFIG_DIR)
         .join("harness")

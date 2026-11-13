@@ -38,26 +38,26 @@ const MAX_REQUEST_BYTES: usize = 64 << 20;
 /// starts), when the service names no `retry-after`. Jittered by
 /// [`jittered`] so many sessions do not resend in step.
 const DECISIONS_RETRY_DELAY: Duration = Duration::from_secs(5);
-/// The longest `retry-after` rld waits out itself. A longer one is passed to
-/// the harness without an rld retry.
+/// The longest `retry-after` the gateway waits out itself. A longer one is
+/// passed to the harness without a gateway retry.
 const DECISIONS_MAX_RETRY_WAIT: Duration = Duration::from_secs(30);
 /// `retry-after` the harness gets for a retryable failure when the service
 /// named none.
 const DEFAULT_HARNESS_RETRY_AFTER: Duration = Duration::from_secs(30);
 
-#[derive(clap::Args, Debug)]
+/// The local process's options. Only `raydock local start` passes them; the
+/// gateway always binds a free loopback port and records it in the ready file.
+#[derive(clap::Parser, Debug)]
+#[command(no_binary_name = true)]
 pub struct Args {
-    /// Execution core binary. Built and versioned separately from rld.
+    /// Execution core binary. Built and versioned separately from raydock.
     #[arg(long)]
     core: PathBuf,
     /// Credential-free execution-core configuration.
     #[arg(long)]
     config: PathBuf,
-    /// Loopback gateway port; zero chooses a free port.
-    #[arg(long, default_value_t = 20815)]
-    port: u16,
     /// Shared deadline for core initialization and readiness, including profile checks.
-    #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=3600))]
     startup_timeout_secs: u64,
     /// Private file receiving this instance's gateway token.
     #[arg(long)]
@@ -65,10 +65,10 @@ pub struct Args {
     /// Private directory file receiving non-secret startup metadata.
     #[arg(long)]
     ready_file: PathBuf,
-    /// Router URL of a configured Rayline environment that may receive
-    /// Decisions requests, in addition to the built-in routers and loopback.
-    #[arg(long = "router-url")]
-    router_urls: Vec<String>,
+    /// Router of the Rayline environment the process runs for: Decisions
+    /// may go to it, the built-in prod router or loopback.
+    #[arg(long)]
+    router_url: String,
     /// Rayline environment whose router key Decisions uses; named in the
     /// sign-in hint when Decisions refuses that key.
     #[arg(long)]
@@ -78,7 +78,7 @@ pub struct Args {
     #[arg(long)]
     classifier_model: String,
     /// A deployment and the snapshot directory of its model's tokenizer and
-    /// chat template: rld counts that deployment's prompts with them for the
+    /// chat template: the gateway counts that deployment's prompts with them for the
     /// core. Once per deployment with a `tokenizer`.
     #[arg(long = "token-counter-dir", num_args = 2, value_names = ["DEPLOYMENT", "DIR"])]
     token_counters: Vec<String>,
@@ -124,7 +124,7 @@ struct Gateway {
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 
 pub async fn run(args: Args) -> Result<()> {
-    check_decisions_url(&args.config, &args.router_urls)?;
+    check_decisions_url(&args.config, &args.router_url)?;
     let credential_env = credential_env_names(&args.config)?;
     let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
     let routing_metadata = RoutingMetadata::from_config(&config);
@@ -140,7 +140,7 @@ pub async fn run(args: Args) -> Result<()> {
     let startup_deadline = tokio::time::Instant::now() + startup_timeout;
     // Register before spawning so cancellation during startup also reaps the child.
     let mut signals = Box::pin(shutdown_signal()?);
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, args.port)).await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
     let core_token = token();
     let gateway_token = token();
@@ -211,7 +211,7 @@ pub async fn run(args: Args) -> Result<()> {
             shutdown: shutdown_tx,
             login_command: login_command(args.env_name.as_deref()),
             classifier,
-            metrics: RouterMetrics::new("rayline-hybrid"),
+            metrics: RouterMetrics::new("rayline-local"),
             routing_metadata,
         });
         let ready = Ready {
@@ -250,12 +250,9 @@ pub async fn run(args: Args) -> Result<()> {
 /// Decisions requests carry execution context and the router key, so the core
 /// is started only when `decisions.url` is a Rayline router or loopback. This
 /// repeats the launcher's check on the file the core will actually read.
-fn check_decisions_url(path: &Path, router_urls: &[String]) -> Result<()> {
-    rayline_local_router::decisions_url::check_config_bytes(
-        &std::fs::read(path)?,
-        router_urls.iter().map(String::as_str),
-    )
-    .map_err(anyhow::Error::msg)
+fn check_decisions_url(path: &Path, router_url: &str) -> Result<()> {
+    rayline_local_router::decisions_url::check_config_bytes(&std::fs::read(path)?, [router_url])
+        .map_err(anyhow::Error::msg)
 }
 
 fn credential_env_names(path: &Path) -> Result<Vec<String>> {
@@ -507,7 +504,7 @@ async fn forward(state: &Gateway, request: Request<Incoming>) -> Result<Response
             .unwrap_or("-");
         if !retried
             && let Some(failure) = failure
-            && let Some(delay) = rld_retry_delay(failure, hint)
+            && let Some(delay) = gateway_retry_delay(failure, hint)
         {
             // Nothing ran: the core decides before it dispatches, and treats an
             // identical resend like the harness's own retry.
@@ -934,7 +931,7 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
 /// The routing service's retry advice, as the core passes it on with its 502:
 /// `retry-after` (delta-seconds) and `x-should-retry` (`true`/`false`, the
 /// Anthropic and OpenAI SDKs' own header). Absent from a core that does not
-/// forward them, and then rld's defaults apply.
+/// forward them, and then the gateway's defaults apply.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RetryHint {
     retry_after: Option<Duration>,
@@ -963,11 +960,11 @@ impl RetryHint {
     }
 }
 
-/// How long rld waits before its one resend of a failed turn, or None when it
+/// How long the gateway waits before its one resend of a failed turn, or None when it
 /// does not resend: only an unavailable or busy service is worth another try,
 /// never when the service says not to, and never past
 /// [`DECISIONS_MAX_RETRY_WAIT`] (the harness gets that wait instead).
-fn rld_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Duration> {
+fn gateway_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Duration> {
     if !matches!(
         failure,
         DecisionsFailure::Unavailable | DecisionsFailure::Throttled
@@ -997,7 +994,7 @@ fn login_command(env_name: Option<&str>) -> String {
 /// The core's error response, with a Decisions failure explained: what to
 /// run for a refused key, and that an unavailable service is retryable.
 ///
-/// An explained failure always carries `x-should-retry: false`: rld has
+/// An explained failure always carries `x-should-retry: false`: the gateway has
 /// already spent the turn's one resend (or the service ruled one out), and
 /// harness SDKs otherwise resend a 5xx or 429 up to about ten times, each a
 /// fresh lookup on the shared routing service. A retryable one also carries
@@ -1031,7 +1028,7 @@ fn buffered_response(
             }
             response = response.header("x-should-retry", "false");
             if retryable {
-                // At least the second rld itself waits.
+                // At least the second the gateway waits itself.
                 let wait = hint
                     .retry_after
                     .unwrap_or(DEFAULT_HARNESS_RETRY_AFTER)
@@ -1080,7 +1077,7 @@ fn explain_decisions_failure(
     let message = value.pointer("/error/message")?.as_str()?.to_owned();
     let explained = match failure {
         DecisionsFailure::Auth => format!(
-            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `raydock hybrid stop` and `raydock hybrid start` so the runtime uses the new key."
+            "{message}: Decisions rejected the Rayline router key. Run `{login_command}`, then `raydock local stop`: the next run starts the local process with the new key."
         ),
         DecisionsFailure::Unavailable => format!(
             "{message}: the Rayline routing service could not decide this turn right now (it may be unavailable, or a development cell may still be starting, which takes about a minute). This is retryable: send the turn again after the retry-after interval."
@@ -1089,7 +1086,7 @@ fn explain_decisions_failure(
             "{message}: the Rayline routing service is busy. Send the turn again after the retry-after interval."
         ),
         DecisionsFailure::Refused => format!(
-            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `models` in settings.json and run `raydock hybrid stop` and `raydock hybrid start`."
+            "{message}: the Rayline routing service refused this turn, and sending it again will not change that. If it names a model or price, check `models` in settings.json and run `raydock local stop`: the next run starts the local process from the changed file."
         ),
     };
     *value.pointer_mut("/error/message")? = serde_json::Value::String(explained);
@@ -1157,7 +1154,7 @@ fn spawn_core(
         .spawn()
         .context("start ARC execution core")?;
     // Keep the pipe open even while Child::wait closes its own stdin handle.
-    // The core exits on EOF if rld is terminated without running cleanup.
+    // The core exits on EOF if the local process is terminated without running cleanup.
     let parent_pipe = Some(
         child
             .stdin
@@ -1167,7 +1164,7 @@ fn spawn_core(
     Ok((child, parent_pipe))
 }
 
-/// Aborts the counter's server when rld's run ends.
+/// Aborts the counter's server when the local process's run ends.
 struct AbortOnDrop(Vec<tokio::task::JoinHandle<Result<()>>>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -1233,8 +1230,8 @@ fn shutdown_signal() -> Result<impl std::future::Future<Output = Result<()>>> {
         let mut brk = ctrl_break()?;
         let mut close = ctrl_close()?;
         let mut shutdown = ctrl_shutdown()?;
-        // `raydock hybrid` runs rld without a console it can signal, so it
-        // asks for a stop through this event instead.
+        // `raydock local start` runs the local process without a console it
+        // can signal, so it asks for a stop through this event instead.
         let event = rayline_local_router::windows_state::StopEvent::create()
             .context("create hybrid stop event")?;
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
@@ -1446,7 +1443,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.contains("`raydock --env dev auth login`"),
+            message.contains("`raydock --env dev auth login`, then `raydock local stop`"),
             "{message}"
         );
         // The wire shape is kept.
@@ -1504,33 +1501,36 @@ mod tests {
     }
 
     #[test]
-    fn rld_resends_only_an_unavailable_or_busy_turn_the_service_allows() {
+    fn the_gateway_resends_only_an_unavailable_or_busy_turn_the_service_allows() {
         let hint = |retry_after: Option<u64>, should_retry: Option<bool>| RetryHint {
             retry_after: retry_after.map(Duration::from_secs),
             should_retry,
         };
         for failure in [DecisionsFailure::Unavailable, DecisionsFailure::Throttled] {
             assert_eq!(
-                rld_retry_delay(failure, hint(Some(3), None)),
+                gateway_retry_delay(failure, hint(Some(3), None)),
                 Some(Duration::from_secs(3))
             );
             assert_eq!(
-                rld_retry_delay(failure, hint(Some(3), Some(true))),
+                gateway_retry_delay(failure, hint(Some(3), Some(true))),
                 Some(Duration::from_secs(3))
             );
             // At least a second, at most the cap.
             assert_eq!(
-                rld_retry_delay(failure, hint(Some(0), None)),
+                gateway_retry_delay(failure, hint(Some(0), None)),
                 Some(Duration::from_secs(1))
             );
             assert_eq!(
-                rld_retry_delay(failure, hint(Some(30), None)),
+                gateway_retry_delay(failure, hint(Some(30), None)),
                 Some(DECISIONS_MAX_RETRY_WAIT)
             );
-            assert_eq!(rld_retry_delay(failure, hint(Some(31), None)), None);
-            assert_eq!(rld_retry_delay(failure, hint(Some(3), Some(false))), None);
-            assert_eq!(rld_retry_delay(failure, hint(None, Some(false))), None);
-            let default = rld_retry_delay(failure, hint(None, None)).unwrap();
+            assert_eq!(gateway_retry_delay(failure, hint(Some(31), None)), None);
+            assert_eq!(
+                gateway_retry_delay(failure, hint(Some(3), Some(false))),
+                None
+            );
+            assert_eq!(gateway_retry_delay(failure, hint(None, Some(false))), None);
+            let default = gateway_retry_delay(failure, hint(None, None)).unwrap();
             assert!(
                 default >= DECISIONS_RETRY_DELAY / 2 && default < DECISIONS_RETRY_DELAY * 3 / 2,
                 "{default:?}"
@@ -1538,7 +1538,7 @@ mod tests {
         }
         for failure in [DecisionsFailure::Auth, DecisionsFailure::Refused] {
             for advice in [hint(None, None), hint(Some(1), Some(true))] {
-                assert_eq!(rld_retry_delay(failure, advice), None, "{failure:?}");
+                assert_eq!(gateway_retry_delay(failure, advice), None, "{failure:?}");
             }
         }
     }

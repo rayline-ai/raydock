@@ -24,7 +24,7 @@ pub async fn render_top(request: &TopRequest) -> io::Result<String> {
 }
 
 async fn render_top_from_home(home: &Path, request: &TopRequest) -> io::Result<String> {
-    let source = TopSource::connect(&home.join(".rayline").join("hybrid")).await?;
+    let source = TopSource::connect(&crate::hybrid::state_dir(home)).await?;
 
     if request.json {
         let snapshot = source.fetch_snapshot().await?;
@@ -73,7 +73,7 @@ impl TopSource {
 
     async fn fetch_snapshot(&self) -> io::Result<Value> {
         let snapshot = fetch_top_snapshot(&self.client, &self.url).await?;
-        if snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-hybrid")
+        if snapshot.get("runtime").and_then(Value::as_str) != Some("rayline-local")
             || ["pid", "core_pid", "instance_id"]
                 .iter()
                 .any(|key| snapshot.get(key) != self.identity.get(key))
@@ -123,15 +123,36 @@ fn validate_top_snapshot(snapshot: &Value) -> io::Result<()> {
     };
     for key in ["active", "recent"] {
         match object.get(key) {
-            None => {}
             Some(Value::Array(rows)) if rows.iter().all(Value::is_object) => {}
-            Some(_) => return invalid(&format!("`{key}` is not an array of objects")),
+            _ => return invalid(&format!("`{key}` is not an array of objects")),
         }
     }
-    match object.get("totals") {
-        None | Some(Value::Object(_)) => Ok(()),
-        Some(_) => invalid("`totals` is not an object"),
+    let Some(Value::Object(totals)) = object.get("totals") else {
+        return invalid("`totals` is not an object");
+    };
+    for key in TOTALS {
+        if !totals.get(*key).is_some_and(Value::is_u64) {
+            return invalid(&format!("`totals.{key}` is not a count"));
+        }
     }
+    Ok(())
+}
+
+/// The `totals` counts top shows.
+const TOTALS: &[&str] = &[
+    "completed_requests",
+    "errored_requests",
+    "local_requests",
+    "remote_requests",
+    "input_tokens",
+    "output_tokens",
+];
+
+/// The `key` rows of a snapshot `validate_top_snapshot` accepted.
+fn rows<'a>(snapshot: &'a Value, key: &str) -> &'a [Value] {
+    snapshot[key]
+        .as_array()
+        .expect("validate_top_snapshot checked the rows")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,7 +330,7 @@ fn draw_top_summary(
     paused: bool,
     sort: TopSort,
 ) -> io::Result<u16> {
-    let totals = snapshot.get("totals").unwrap_or(&Value::Null);
+    let totals = &snapshot["totals"];
     y = draw_line(
         stdout,
         y,
@@ -441,18 +462,11 @@ fn top_row_color(row: &Value) -> Option<Color> {
 }
 
 fn row_count(snapshot: &Value, key: &str) -> usize {
-    snapshot
-        .get(key)
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len)
+    rows(snapshot, key).len()
 }
 
 fn sorted_top_rows(snapshot: &Value, key: &str, sort: TopSort) -> Vec<Value> {
-    let mut rows = snapshot
-        .get(key)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let mut rows = rows(snapshot, key).to_vec();
     rows.sort_by(|left, right| {
         top_sort_value(right, sort)
             .partial_cmp(&top_sort_value(left, sort))
@@ -532,16 +546,14 @@ fn top_table_row(row: &Value, width: u16) -> String {
 fn format_top_snapshot(snapshot: &Value) -> String {
     let active = row_count(snapshot, "active");
     let recent = row_count(snapshot, "recent");
-    let totals = snapshot.get("totals").unwrap_or(&Value::Null);
+    let totals = &snapshot["totals"];
     let mut output = format!(
         "Raydock top snapshot\nactive: {active}  recent: {recent}  completed: {}  errors: {}\n",
         totals_u64(totals, "completed_requests"),
         totals_u64(totals, "errored_requests"),
     );
-    if let Some(rows) = snapshot.get("active").and_then(Value::as_array) {
-        for row in rows {
-            output.push_str(&format_top_row(row));
-        }
+    for row in rows(snapshot, "active") {
+        output.push_str(&format_top_row(row));
     }
     if active == 0 {
         output.push_str("no active requests\n");
@@ -574,7 +586,9 @@ fn value_str<'a>(row: &'a Value, key: &str) -> &'a str {
 }
 
 fn totals_u64(totals: &Value, key: &str) -> u64 {
-    totals.get(key).and_then(Value::as_u64).unwrap_or(0)
+    totals[key]
+        .as_u64()
+        .expect("validate_top_snapshot checked the totals")
 }
 
 fn count_cell(row: &Value, key: &str) -> String {
@@ -711,7 +725,7 @@ mod tests {
     ) -> tokio::task::JoinHandle<()> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let state_dir = home.join(".rayline/hybrid");
+        let state_dir = crate::hybrid::state_dir(home);
         fs::create_dir_all(&state_dir).unwrap();
         let mut state = serde_json::json!({
             "contract_version": 1, "ready": true,
@@ -746,9 +760,10 @@ mod tests {
                 } else if let Some(body) = state.get("snapshot_body") {
                     body.clone()
                 } else {
-                    serde_json::json!({"runtime": "rayline-hybrid", "instance_id": "test-core",
+                    serde_json::json!({"runtime": "rayline-local", "instance_id": "test-core",
                         "pid": std::process::id(), "core_pid": std::process::id(),
-                        "totals": {"completed_requests": 1, "output_tokens": 12}, "active": [],
+                        "totals": {"completed_requests": 1, "errored_requests": 0, "local_requests": 0,
+                            "remote_requests": 1, "input_tokens": 0, "output_tokens": 12}, "active": [],
                         "recent": [{"request_id": "hybrid_1", "target": "remote", "state": "completed",
                             "selected_model": null, "requested_model": "virtual-model", "output_tokens": 12}]})
                 };
@@ -782,14 +797,14 @@ mod tests {
         let server = hybrid_top_fixture(&home, serde_json::json!({})).await;
         let rendered = render_top_from_home(&home, &JSON).await.unwrap();
         let snapshot: Value = serde_json::from_str(&rendered).unwrap();
-        assert_eq!(snapshot["runtime"], "rayline-hybrid");
+        assert_eq!(snapshot["runtime"], "rayline-local");
         assert_eq!(snapshot["recent"][0]["selected_model"], Value::Null);
         assert_eq!(snapshot["recent"][0]["output_tokens"], 12);
         assert_eq!(top_target_cell(&snapshot["recent"][0]), "cloud");
         assert!(!top_model_cell(&snapshot["recent"][0]).contains("virtual-model"));
 
         fs::write(
-            home.join(".rayline/hybrid/gateway-token"),
+            crate::hybrid::state_dir(&home).join("gateway-token"),
             "wrong-private-token",
         )
         .unwrap();
@@ -817,7 +832,7 @@ mod tests {
             serde_json::json!({"replace_snapshot_identity": true}),
         )
         .await;
-        let source = TopSource::connect(&home.join(".rayline/hybrid"))
+        let source = TopSource::connect(&crate::hybrid::state_dir(&home))
             .await
             .unwrap();
         assert!(source.fetch_snapshot().await.is_ok());
@@ -831,7 +846,7 @@ mod tests {
         );
         server.abort();
 
-        let ready_path = home.join(".rayline/hybrid/ready.json");
+        let ready_path = crate::hybrid::state_dir(&home).join("ready.json");
         let original: Value = serde_json::from_slice(&fs::read(&ready_path).unwrap()).unwrap();
         for patch in [
             serde_json::json!({"ready": false}),
@@ -866,13 +881,27 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_snapshots_are_errors_never_panics() {
-        let head = serde_json::json!({"runtime": "rayline-hybrid", "pid": std::process::id(),
-            "core_pid": std::process::id(), "instance_id": "test-core"});
+        let totals = serde_json::json!({"completed_requests": 0, "errored_requests": 0,
+            "local_requests": 0, "remote_requests": 0, "input_tokens": 0, "output_tokens": 0});
+        let valid = serde_json::json!({"runtime": "rayline-local", "pid": std::process::id(),
+            "core_pid": std::process::id(), "instance_id": "test-core",
+            "active": [], "recent": [], "totals": totals});
+        validate_top_snapshot(&valid).unwrap();
         let with = |key: &str, value: Value| {
-            let mut body = head.clone();
+            let mut body = valid.clone();
             body[key] = value;
             body
         };
+        let without = |key: &str| {
+            let mut body = valid.clone();
+            body.as_object_mut().unwrap().remove(key);
+            body
+        };
+        let mut partial_totals = totals.clone();
+        partial_totals
+            .as_object_mut()
+            .unwrap()
+            .remove("errored_requests");
         for body in [
             serde_json::json!([]),
             serde_json::json!(0),
@@ -880,6 +909,11 @@ mod tests {
             with("active", serde_json::json!([1])),
             with("recent", serde_json::json!("x")),
             with("totals", serde_json::json!(3)),
+            without("active"),
+            without("recent"),
+            without("totals"),
+            with("totals", partial_totals),
+            with("totals", serde_json::json!({"completed_requests": -1})),
         ] {
             let home = unique_test_dir("top-malformed");
             let server =

@@ -26,7 +26,6 @@ pub mod update;
 pub const CLI_BIN: &str = "raydock";
 /// Immutable download identifier; existing updaters verify these filenames.
 pub const CLI_ASSET: &str = "rayline";
-pub const DAEMON_BIN: &str = "rld";
 pub const DISPLAY_NAME: &str = "Raydock";
 pub const CONFIG_DIR: &str = "rayline";
 pub const DOT_CONFIG_DIR: &str = ".rayline";
@@ -111,7 +110,15 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             println!("raydock {RAYLINE_VERSION}");
             return ExitCode::SUCCESS;
         }
-        Ok(cli::Parsed::Hybrid(args)) => return hybrid::run(args).await,
+        Ok(cli::Parsed::LocalProcess(args)) => {
+            return match rayline_daemon::run(args).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Error: {error:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Ok(cli::Parsed::Command { env, command }) => (env, command),
         Err(error) => {
             eprintln!("{error}");
@@ -127,9 +134,14 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             },
             Some(run.launch.protocol()),
         ),
-        cli::Command::Auth(_) | cli::Command::Top { .. } | cli::Command::Update(_) => {
-            (config::Mode::Cloud, None)
+        cli::Command::Local(cli::Local::Start { config: Some(file) }) => {
+            (config::Mode::LocalFile(file), None)
         }
+        cli::Command::Local(cli::Local::Start { config: None }) => (config::Mode::Local, None),
+        cli::Command::Auth(_)
+        | cli::Command::Local(cli::Local::Status | cli::Local::Stop)
+        | cli::Command::Top { .. }
+        | cli::Command::Update(_) => (config::Mode::Cloud, None),
     };
     let settings = match config::load(&config::LoadOptions {
         mode,
@@ -145,7 +157,10 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
     let hosted = status::hosted_environment(&settings);
     match command {
         cli::Command::Auth(auth) => run_auth(auth, hosted).await,
-        cli::Command::Run(run) if settings.local => run_local(run).await,
+        cli::Command::Run(run) if settings.local => run_local(run, &settings).await,
+        cli::Command::Local(cli::Local::Start { .. }) => hybrid::start(&settings).await,
+        cli::Command::Local(cli::Local::Status) => hybrid::status().await,
+        cli::Command::Local(cli::Local::Stop) => hybrid::stop().await,
         cli::Command::Run(run) => run_cloud(run.launch, hosted).await,
         cli::Command::Top { json } => {
             print_or_fail(top::render_top(&top::TopRequest { json }).await, "Error")
@@ -238,11 +253,11 @@ fn print_or_fail<E: std::fmt::Display>(result: Result<String, E>, prefix: &str) 
     }
 }
 
-/// A local-mode run: today's `hybrid run` path. The kept options it does not
-/// run yet are refused here, in one place, until sub-PR 6b.
-async fn run_local(run: cli::Run) -> ExitCode {
+/// A local-mode run on the local process. The kept options it does not run
+/// are refused here, in one place.
+async fn run_local(run: cli::Run, settings: &config::Settings) -> ExitCode {
     if let Some(option) = run.not_in_local_mode() {
-        eprintln!("Error: {option} is not available in local mode yet");
+        eprintln!("Error: {option} is not available in local mode");
         return ExitCode::from(1);
     }
     let (name, args) = match run.launch {
@@ -255,7 +270,7 @@ async fn run_local(run: cli::Run) -> ExitCode {
             unreachable!("not_in_local_mode refuses these launches")
         }
     };
-    hybrid::run_local(name, &args).await
+    hybrid::run_local(settings, name, &args).await
 }
 
 /// A cloud-mode run through the hosted router.

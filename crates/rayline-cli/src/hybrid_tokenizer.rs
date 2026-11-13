@@ -1,7 +1,7 @@
 //! Fetches a model's tokenizer and chat template from Hugging Face, the repo
-//! its `models.*.tokenizer` names, for rld's prompt counter
-//! (`rld hybrid --token-counter-dir`). A model with no `tokenizer` is counted
-//! by the core.
+//! its `models.*.tokenizer` names, for the local process's prompt counter
+//! (`--token-counter-dir`). A model with no `tokenizer` is counted by the
+//! core.
 
 use std::path::{Path, PathBuf};
 
@@ -28,7 +28,7 @@ pub(crate) struct Snapshot {
 pub(crate) fn fetch(repo: &str) -> Result<Snapshot, String> {
     let (commit, cached_commit) = match rayline_hf::hf_api_get_commit(repo) {
         Ok(commit) => (commit, false),
-        Err(error) => (cached_commit(repo).ok_or(error)?, true),
+        Err(error) => (cached_commit(repo)?.ok_or(error)?, true),
     };
     // Complete only when every optional file is cached or confirmed absent
     // (404); a rate limit or network failure leaves the snapshot unrecorded.
@@ -68,7 +68,8 @@ pub(crate) fn fetch(repo: &str) -> Result<Snapshot, String> {
         );
     }
     // `cached_or` uses this snapshot alone.
-    let _ = std::fs::write(complete_marker(&rayline_hf::hf_cache_dir(), repo), &commit);
+    let marker = complete_marker(&rayline_hf::hf_cache_dir(), repo);
+    std::fs::write(&marker, &commit).map_err(|error| format!("{}: {error}", marker.display()))?;
     Ok(Snapshot {
         dir,
         cached: cached_commit,
@@ -88,24 +89,26 @@ fn complete_marker(hub: &Path, repo: &str) -> PathBuf {
 }
 
 /// The last complete snapshot, marked cached, when the Hub did not serve the
-/// current one; without one, `error`. What `start` uses when the Hub does not
-/// answer in time or a download fails.
+/// current one; when `fetch` never finished one, `error`. A marker that cannot
+/// be read, or names no commit or an incomplete snapshot, is an error naming
+/// it. What `start` uses when the Hub does not answer in time or a download
+/// fails.
 pub(crate) fn cached_or(repo: &str, error: String) -> Result<Snapshot, String> {
     cached_in(&rayline_hf::hf_cache_dir(), repo, error)
 }
 
 fn cached_in(hub: &Path, repo: &str, error: String) -> Result<Snapshot, String> {
-    let Ok(commit) = std::fs::read_to_string(complete_marker(hub, repo)) else {
+    let marker = complete_marker(hub, repo);
+    let Some(commit) = read_commit(&marker)? else {
         return Err(error);
     };
-    let commit = commit.trim();
-    if commit.is_empty() || !commit.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(error);
+    if !commit.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{}: not a commit: {commit}", marker.display()));
     }
     let dir = hub
         .join(rayline_hf::repo_to_folder_name(repo))
         .join("snapshots")
-        .join(commit);
+        .join(&commit);
     let complete = dir.join(rayline_tokencount::TOKENIZER_FILE).is_file()
         && [
             rayline_tokencount::TEMPLATE_FILE,
@@ -113,21 +116,38 @@ fn cached_in(hub: &Path, repo: &str, error: String) -> Result<Snapshot, String> 
         ]
         .iter()
         .any(|file| dir.join(file).is_file());
-    if complete {
-        Ok(Snapshot { dir, cached: true })
-    } else {
-        Err(error)
+    if !complete {
+        return Err(format!(
+            "{}: the snapshot {} it names is incomplete",
+            marker.display(),
+            dir.display()
+        ));
     }
+    Ok(Snapshot { dir, cached: true })
 }
 
 /// The commit `refs/main` names in the Hugging Face cache.
-fn cached_commit(repo: &str) -> Option<String> {
-    let refs = rayline_hf::hf_cache_dir()
-        .join(rayline_hf::repo_to_folder_name(repo))
-        .join("refs")
-        .join("main");
-    let commit = std::fs::read_to_string(refs).ok()?.trim().to_owned();
-    (!commit.is_empty()).then_some(commit)
+fn cached_commit(repo: &str) -> Result<Option<String>, String> {
+    read_commit(
+        &rayline_hf::hf_cache_dir()
+            .join(rayline_hf::repo_to_folder_name(repo))
+            .join("refs")
+            .join("main"),
+    )
+}
+
+/// The commit `file` names, `None` when it does not exist. An unreadable or
+/// empty file is an error naming it.
+fn read_commit(file: &Path) -> Result<Option<String>, String> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("{}: {error}", file.display())),
+    };
+    match text.trim() {
+        "" => Err(format!("{}: empty", file.display())),
+        commit => Ok(Some(commit.to_owned())),
+    }
 }
 
 #[cfg(test)]
@@ -145,22 +165,44 @@ mod tests {
     }
 
     #[test]
-    fn without_a_complete_cached_snapshot_the_download_error_stands() {
+    fn without_a_finished_snapshot_the_download_error_stands() {
         let hub = temp_hub("none");
         let error = "download tokenizer.json from example/model: status 500".to_owned();
         assert_eq!(
             cached_in(&hub, REPO, error.clone()).err(),
             Some(error.clone())
         );
-        // A marked snapshot that lacks its chat template is not complete.
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn a_bad_marker_is_an_error_naming_it() {
+        let hub = temp_hub("bad-marker");
         let snapshot = hub
             .join(rayline_hf::repo_to_folder_name(REPO))
             .join("snapshots")
             .join("abc123");
         std::fs::create_dir_all(&snapshot).unwrap();
         std::fs::write(snapshot.join(rayline_tokencount::TOKENIZER_FILE), "{}").unwrap();
-        std::fs::write(complete_marker(&hub, REPO), "abc123").unwrap();
-        assert_eq!(cached_in(&hub, REPO, error.clone()).err(), Some(error));
+        let marker = complete_marker(&hub, REPO);
+        let cached = || cached_in(&hub, REPO, "unused".to_owned()).err().unwrap();
+        // A marked snapshot that lacks its chat template is incomplete.
+        std::fs::write(&marker, "abc123").unwrap();
+        assert_eq!(
+            cached(),
+            format!(
+                "{}: the snapshot {} it names is incomplete",
+                marker.display(),
+                snapshot.display()
+            )
+        );
+        std::fs::write(&marker, "\n").unwrap();
+        assert_eq!(cached(), format!("{}: empty", marker.display()));
+        std::fs::write(&marker, "../x").unwrap();
+        assert_eq!(
+            cached(),
+            format!("{}: not a commit: ../x", marker.display())
+        );
         let _ = std::fs::remove_dir_all(&hub);
     }
 
