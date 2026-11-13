@@ -130,7 +130,9 @@ rayline update --check
 
 Its options are **kept for review** (section 9). The channel comes from `update.channel` (section 5.6).
 
-`rayline update` refuses Homebrew and Rayline.app installs: it replaces nothing and exits 0, with or without `--check`. When the binary it would replace is inside a `.app` bundle, it prints ``rayline is managed by Rayline.app. Update the app to update the CLI:`` and, on the next line, ``re-download from https://get.rayline.ai``. When that binary is under `brew --prefix` (with `brew` on `PATH`), it prints ``Installed via Homebrew. Run `brew upgrade rayline` to update.``
+`rayline update` refuses Homebrew and Rayline.app installs: with any of its options (`--check`, `--version`, `--force`, `--dry-run`), it replaces nothing and exits 0. When the binary it would replace is inside a `.app` bundle, it prints ``rayline is managed by Rayline.app. Update the app to update the CLI:`` and, on the next line, ``re-download from https://get.rayline.ai``. When that binary is under `brew --prefix` (with `brew` on `PATH`), it prints ``Installed via Homebrew. Run `brew upgrade rayline` to update.``
+
+When the binary is not inside a `.app` bundle and `brew` is on `PATH` but `brew --prefix` fails or prints nothing, `rayline update` fails: it replaces nothing, prints ``Error: `brew --prefix` (<brew>) failed: <reason>`` to stderr and exits 1. `<brew>` is the path of the `brew` it ran, and `<reason>` is the exit status, the error from starting it, ``it printed no prefix`` or ``it printed a prefix that is not UTF-8``.
 
 ### 3.6 Installers
 

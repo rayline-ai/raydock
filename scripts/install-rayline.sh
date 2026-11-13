@@ -17,7 +17,7 @@ Usage:
 Options:
   --version      Release version to install, for example 0.2.0.
                  Defaults to the latest GitHub release.
-  --install-dir  Directory for rayline and rayline-core.
+  --install-dir  Directory for rayline, rayline-core and rayline-core-LICENSE.
                  Defaults to ~/.rayline/bin.
 EOF
 }
@@ -31,7 +31,7 @@ while [ "$#" -gt 0 ]; do
       }
       case "$2" in
         v*)
-          echo "--version takes a bare version such as 0.2.0, not $2" >&2
+          echo "--version takes a bare version such as 0.5.0, not $2" >&2
           exit 2
           ;;
       esac

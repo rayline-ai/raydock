@@ -96,7 +96,7 @@ if (-not (Get-Command minisign -ErrorAction SilentlyContinue)) {
 if (-not $PSBoundParameters.ContainsKey('Version')) {
     $BaseUrl = "https://github.com/$Repo/releases/latest/download"
 } elseif ($Version.StartsWith('v')) {
-    Fail "-Version takes a bare version such as 0.2.0, not $Version"
+    Fail "-Version takes a bare version such as 0.5.0, not $Version"
 } else {
     $BaseUrl = "https://github.com/$Repo/releases/download/v$Version"
 }
