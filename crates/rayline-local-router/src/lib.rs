@@ -111,15 +111,7 @@ pub fn reject_untrusted_request(
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.split(';').next())
             .map(str::trim);
-        let allowed = mime.is_some_and(|mime| {
-            mime.eq_ignore_ascii_case("application/json")
-                // Codex subscription passthrough uploads image edits as
-                // multipart; a browser sending this cross-site still carries
-                // the Origin refused above.
-                || (uri.path() == "/v1/images/edits"
-                    && mime.eq_ignore_ascii_case("multipart/form-data"))
-        });
-        if !allowed {
+        if !mime.is_some_and(|mime| mime.eq_ignore_ascii_case("application/json")) {
             return refuse(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "invalid_request_error",
@@ -200,19 +192,18 @@ mod tests {
                 "{method} {headers:?}"
             );
         }
-        // Codex image edits upload multipart; no other route accepts it.
+        // No route accepts a multipart body.
         const MULTIPART: GuardHeaders = &[
             ("host", "127.0.0.1:20811"),
             ("content-type", "multipart/form-data; boundary=x"),
         ];
-        assert_eq!(
-            guard_status(Method::POST, "/v1/images/edits", MULTIPART),
-            None
-        );
-        assert_eq!(
-            guard_status(Method::POST, "/v1/messages", MULTIPART),
-            Some(StatusCode::UNSUPPORTED_MEDIA_TYPE)
-        );
+        for path in ["/v1/images/edits", "/v1/messages"] {
+            assert_eq!(
+                guard_status(Method::POST, path, MULTIPART),
+                Some(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+                "{path}"
+            );
+        }
         // HTTP/2 carries the authority in the URI instead of a Host header.
         assert_eq!(
             guard_status(Method::GET, "http://127.0.0.1:20811/healthz", &[]),

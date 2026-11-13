@@ -1,8 +1,8 @@
 //! `rayline run codex app`: launch the Codex desktop app on ARC through the
 //! Rayline router.
 //!
-//! Takes the same `--auth`/`--model` flags as `rayline run codex` and points the
-//! app at the same `rayline` provider. The desktop app-server differs from the
+//! Takes the same `--model` flag as `rayline run codex` and points the app at
+//! the same `rayline` provider. The desktop app-server differs from the
 //! CLI in two ways that shape this module:
 //!
 //! 1. It reads persistent config only from its `CODEX_HOME`, so the provider
