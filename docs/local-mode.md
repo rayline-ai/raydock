@@ -84,9 +84,11 @@ Each harness speaks one protocol:
 | `codex` | `openai_responses` |
 | `opencode`, `pi`, `omp`, `hermes`, `openclaw` | `openai_chat` |
 
-Requests pass straight through to an endpoint, with no translation. An
-endpoint must list the protocol of the harness you run, or Rayline refuses to
-run.
+Requests pass straight through to an endpoint, with no translation. In a
+local-mode run, every endpoint in the config must list the protocol of the
+harness you run, or Rayline refuses to run. With the example above, `claude`
+and `pi` can run in local mode, but `codex` can't, because `ollama` doesn't
+list `openai_responses`.
 
 ### `models`
 
@@ -142,7 +144,7 @@ Three `routing` keys can be set from the environment:
 ```bash
 rayline local start
 rayline run claude --local
-rayline run codex --local -- exec "summarize this repo"
+rayline run pi --local -- "Fix the failing test in parser.py"
 rayline local status
 rayline local stop
 ```
