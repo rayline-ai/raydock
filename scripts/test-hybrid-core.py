@@ -252,6 +252,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="rayline-real-core-") as tmp:
         root = Path(tmp)
         state = root / ".rayline" / "hybrid"
+        # `rayline run <harness> --config <file>` reads this file; its `routing`
+        # puts the run in local mode, which connects to ~/.rayline/hybrid.
+        routing_file = root / "routing.json"
+        routing_file.write_text(json.dumps({"routing": {
+            "decisions_model": "arc-swift-1.0",
+            "classifier_model": "anthropic/claude-haiku-5.5",
+            "policy": {"preset": "arc-policy.hybrid-default.v1"}}}))
         package = root / "synthetic-package.json"
         package.write_bytes(package_bytes)
         config = {"contract_version": 1, "package_path": str(package), "package_sha256": package_sha,
@@ -459,11 +466,11 @@ def main():
                 harness_scenario.update(active=True, path=str(sample))
                 prompt = f"Read {sample} and then reply with Synthetic execution complete."
                 if args.pi:
-                    output = cli("run", "pi", "--", "--provider", "rayline", "--model", "rayline-auto",
+                    output = run_cli("run", "pi", "--config", str(routing_file), "--", "--provider", "rayline", "--model", "rayline-auto",
                         "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates",
                         "--no-context-files", "--tools", "read", "--thinking", "off", "--print", prompt)
                 else:
-                    output = cli("run", "claude", "--", "--print", "--max-turns", "3", "--tools", "Read",
+                    output = run_cli("run", "claude", "--config", str(routing_file), "--", "--print", "--max-turns", "3", "--tools", "Read",
                         "--allowedTools", "Read", "--no-session-persistence", "--setting-sources", "", prompt)
                 assert "Synthetic execution complete." in output, output
                 assert harness_scenario["turns"] == 2, harness_scenario

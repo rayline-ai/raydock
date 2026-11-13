@@ -431,6 +431,14 @@ fn shown(arg: &str) -> String {
     }
 }
 
+/// "unknown {kind} `arg`", naming `arg` only if it may be echoed.
+fn unknown(kind: &str, arg: &str) -> String {
+    match shown(arg).as_str() {
+        "an argument" => format!("unknown {kind}"),
+        shown => format!("unknown {kind} {shown}"),
+    }
+}
+
 fn unexpected(help: Help, arg: &str) -> UsageError {
     if arg == "--env" || arg.starts_with("--env=") {
         return help.error(format!(
@@ -466,9 +474,9 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
             "--env" => {
                 let value = args.value("--env", inline, ROOT)?;
                 if !crate::status::is_valid_root_env(value) {
-                    return Err(ROOT.error(
-                        "invalid `--env` name (use letters, digits, `-` and `_`)",
-                    ));
+                    return Err(
+                        ROOT.error("invalid `--env` name (use letters, digits, `-` and `_`)")
+                    );
                 }
                 set_once(&mut env, value.to_owned(), "--env", ROOT)?;
             }
@@ -477,7 +485,7 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
             }
             "hybrid" => return Ok(Parsed::Hybrid(args.rest())),
             _ if arg.starts_with('-') => {
-                return Err(ROOT.error(format!("unknown option {}", shown(arg))));
+                return Err(ROOT.error(unknown("option", arg)));
             }
             command => {
                 let command = match command {
@@ -497,7 +505,7 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
                         Some(request) => Command::Update(request),
                         None => return Ok(Parsed::Help(UPDATE_HELP)),
                     },
-                    _ => return Err(ROOT.error(format!("unknown command {}", shown(command)))),
+                    _ => return Err(ROOT.error(unknown("command", command))),
                 };
                 return Ok(Parsed::Command { env, command });
             }
@@ -527,7 +535,7 @@ fn parse_auth(args: &mut Args<'_>) -> Result<OrHelp<Auth>, UsageError> {
         Some("token") => (Auth::Token, AUTH_TOKEN),
         Some(arg) if arg.starts_with('-') => return Err(unexpected(AUTH, arg)),
         Some(arg) => {
-            return Err(AUTH.error(format!("unknown auth command {}", shown(arg))));
+            return Err(AUTH.error(unknown("auth command", arg)));
         }
     };
     Ok(no_arguments(args, help)?.map(|()| auth).ok_or(help.text))
@@ -678,8 +686,7 @@ fn parse_run(args: &mut Args<'_>) -> Result<OrHelp<Run>, UsageError> {
                 Some(word) if !word.starts_with('-') => {
                     args.next();
                     AppAction::parse(word).ok_or_else(|| {
-                        CLAUDE_DESKTOP
-                            .error(format!("unknown claude-desktop command {}", shown(word)))
+                        CLAUDE_DESKTOP.error(unknown("claude-desktop command", word))
                     })?
                 }
                 _ => AppAction::Start,
@@ -702,7 +709,7 @@ fn parse_run(args: &mut Args<'_>) -> Result<OrHelp<Run>, UsageError> {
         },
         name => match Harness::from_command(name) {
             Some(harness) => (Target::Harness(harness), RunGrammar::new(RUN, false, true)),
-            None => return Err(RUN.error(format!("unknown harness {}", shown(name)))),
+            None => return Err(RUN.error(unknown("harness", name))),
         },
     };
     let Some(options) = run_options(args, grammar)? else {
@@ -739,10 +746,7 @@ fn parse_run(args: &mut Args<'_>) -> Result<OrHelp<Run>, UsageError> {
 /// Reads the Rayline options of a run, which come first (section 3.2): up to
 /// the first other argument, or `--`, after which the rest goes to the
 /// harness. `None` asks for the command's own help.
-fn run_options(
-    args: &mut Args<'_>,
-    grammar: RunGrammar,
-) -> Result<Option<RunOptions>, UsageError> {
+fn run_options(args: &mut Args<'_>, grammar: RunGrammar) -> Result<Option<RunOptions>, UsageError> {
     let help = grammar.help;
     let mut options = RunOptions::default();
     while let Some(arg) = args.peek() {
@@ -809,4 +813,736 @@ fn run_options(
 
 fn both_config_flags(help: Help) -> UsageError {
     help.error("`--local` and `--config` can't be used together")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(args: &[&str]) -> Vec<OsString> {
+        std::iter::once("rayline")
+            .chain(args.iter().copied())
+            .map(OsString::from)
+            .collect()
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn parsed(args: &[&str]) -> Parsed {
+        parse(&argv(args)).unwrap_or_else(|error| panic!("{args:?} was rejected: {error}"))
+    }
+
+    fn command(args: &[&str]) -> (Option<String>, Command) {
+        match parsed(args) {
+            Parsed::Command { env, command } => (env, command),
+            other => panic!("{args:?} gave {other:?}"),
+        }
+    }
+
+    fn run(args: &[&str]) -> Run {
+        match command(args) {
+            (None, Command::Run(run)) => run,
+            other => panic!("{args:?} gave {other:?}"),
+        }
+    }
+
+    fn error(args: &[&str]) -> String {
+        match parse(&argv(args)) {
+            Err(error) => error.to_string(),
+            Ok(parsed) => panic!("{args:?} was accepted as {parsed:?}"),
+        }
+    }
+
+    fn assert_error(args: &[&str], problem: &str) {
+        let error = error(args);
+        assert!(
+            error.starts_with(&format!("rayline: {problem}\n\n")),
+            "{args:?}: {error}"
+        );
+    }
+
+    fn claude(args: &[&str]) -> Launch {
+        Launch::Claude {
+            isolated: false,
+            args: os(args),
+        }
+    }
+
+    fn harness(harness: Harness, args: &[&str]) -> Launch {
+        Launch::Harness {
+            harness,
+            args: os(args),
+        }
+    }
+
+    // ── Help text (section 3) ────────────────────────────────────────────
+
+    /// The code block that opens section 3 of the spec.
+    fn spec_section_3_block() -> String {
+        let spec = include_str!("../../../docs/spec.md").replace("\r\n", "\n");
+        let section = spec
+            .split_once("\n## 3. Public CLI\n")
+            .expect("section 3")
+            .1;
+        let block = section
+            .split_once("```\n")
+            .expect("block start")
+            .1
+            .split_once("```\n")
+            .expect("block end")
+            .0;
+        block.to_owned()
+    }
+
+    #[test]
+    fn root_and_run_help_are_section_3_word_for_word() {
+        assert_eq!(format!("{ROOT_HELP}\n{RUN_HELP}"), spec_section_3_block());
+    }
+
+    #[test]
+    fn root_help_is_printed_with_no_arguments_and_for_help() {
+        assert_eq!(parsed(&[]), Parsed::Help(ROOT_HELP));
+        assert_eq!(parsed(&["--help"]), Parsed::Help(ROOT_HELP));
+        assert_eq!(parsed(&["--env", "dev", "--help"]), Parsed::Help(ROOT_HELP));
+    }
+
+    #[test]
+    fn run_help_is_the_run_usage_and_harnesses() {
+        assert_eq!(parsed(&["run", "--help"]), Parsed::Help(RUN_HELP));
+    }
+
+    #[test]
+    fn version_is_a_root_option() {
+        assert_eq!(parsed(&["--version"]), Parsed::Version);
+        assert_eq!(parsed(&["--env", "dev", "--version"]), Parsed::Version);
+    }
+
+    #[test]
+    fn kept_commands_print_their_own_help() {
+        for (args, help) in [
+            (&["auth"][..], AUTH_HELP),
+            (&["auth", "--help"], AUTH_HELP),
+            (&["auth", "login", "--help"], AUTH_LOGIN_HELP),
+            (&["auth", "logout", "--help"], AUTH_LOGOUT_HELP),
+            (&["auth", "status", "--help"], AUTH_STATUS_HELP),
+            (&["auth", "token", "--help"], AUTH_TOKEN_HELP),
+            (&["top", "--help"], TOP_HELP),
+            (&["update", "--help"], UPDATE_HELP),
+            (&["run", "claude-desktop", "--help"], CLAUDE_DESKTOP_HELP),
+            (
+                &["run", "claude-desktop", "status", "--help"],
+                CLAUDE_DESKTOP_HELP,
+            ),
+            (&["run", "codex", "app", "--help"], CODEX_APP_HELP),
+            (
+                &["run", "codex", "configure", "--help"],
+                CODEX_CONFIGURE_HELP,
+            ),
+        ] {
+            assert_eq!(parsed(args), Parsed::Help(help), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn every_help_names_rayline_and_no_removed_option() {
+        for help in [
+            ROOT_HELP,
+            RUN_HELP,
+            AUTH_HELP,
+            AUTH_LOGIN_HELP,
+            AUTH_LOGOUT_HELP,
+            AUTH_STATUS_HELP,
+            AUTH_TOKEN_HELP,
+            CLAUDE_DESKTOP_HELP,
+            CODEX_APP_HELP,
+            CODEX_CONFIGURE_HELP,
+            TOP_HELP,
+            UPDATE_HELP,
+        ] {
+            assert!(help.starts_with("Usage: rayline "), "{help}");
+            for removed in [
+                "raydock",
+                "--auth-token",
+                "--env",
+                "--base-url",
+                "--install-path",
+                "--subscription",
+                "hybrid run",
+            ] {
+                assert!(!help.contains(removed), "{removed} in {help}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_usage_error_names_the_problem_the_usage_and_the_help() {
+        assert_eq!(
+            error(&["run", "nope"]),
+            "rayline: unknown harness `nope`\n\n\
+             Usage: rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...\n\
+             Run `rayline run --help` for details."
+        );
+    }
+
+    // ── run <HARNESS> (section 3.2) ──────────────────────────────────────
+
+    #[test]
+    fn every_harness_runs_in_cloud_mode_with_neither_flag() {
+        for (name, launch) in [
+            ("claude", claude(&[])),
+            ("claude-desktop", Launch::ClaudeDesktop(AppAction::Start)),
+            (
+                "codex",
+                Launch::Codex {
+                    options: CodexOptions::default(),
+                    args: Vec::new(),
+                },
+            ),
+            ("opencode", harness(Harness::OpenCode, &[])),
+            ("pi", harness(Harness::Pi, &[])),
+            ("omp", harness(Harness::Omp, &[])),
+            ("hermes", harness(Harness::Hermes, &[])),
+            ("openclaw", harness(Harness::OpenClaw, &[])),
+        ] {
+            assert_eq!(
+                run(&["run", name]),
+                Run {
+                    config: ConfigFlag::Default,
+                    launch
+                },
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_harness_list_in_run_help_is_every_harness_run_takes() {
+        let names = RUN_HELP
+            .split_once("Harnesses:\n")
+            .expect("harnesses")
+            .1
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 8);
+        for name in names {
+            run(&["run", name]);
+        }
+    }
+
+    #[test]
+    fn local_and_config_select_the_config() {
+        assert_eq!(run(&["run", "pi", "--local"]).config, ConfigFlag::Local);
+        assert_eq!(
+            run(&["run", "pi", "--config", "my.json"]).config,
+            ConfigFlag::File(PathBuf::from("my.json"))
+        );
+        assert_eq!(
+            run(&["run", "pi", "--config=my.json"]).config,
+            ConfigFlag::File(PathBuf::from("my.json"))
+        );
+    }
+
+    #[test]
+    fn local_and_config_together_are_a_usage_error() {
+        for args in [
+            &["run", "claude", "--local", "--config", "x.json"][..],
+            &["run", "claude", "--config", "x.json", "--local"],
+            &["run", "codex", "--config=x.json", "--local"],
+            &["run", "codex", "app", "--local", "--config", "x.json"],
+            &["run", "claude-desktop", "--config", "x.json", "--local"],
+        ] {
+            assert_error(args, "`--local` and `--config` can't be used together");
+        }
+    }
+
+    #[test]
+    fn a_flag_given_twice_is_a_usage_error() {
+        assert_error(
+            &["run", "pi", "--local", "--local"],
+            "`--local` given more than once",
+        );
+        assert_error(
+            &["run", "pi", "--config", "a", "--config", "b"],
+            "`--config` given more than once",
+        );
+        assert_error(
+            &["run", "claude", "--isolated", "--isolated"],
+            "`--isolated` given more than once",
+        );
+        assert_error(
+            &["run", "codex", "--model", "a", "--model", "b"],
+            "`--model` given more than once",
+        );
+    }
+
+    #[test]
+    fn config_needs_a_value() {
+        for args in [
+            &["run", "pi", "--config"][..],
+            &["run", "pi", "--config="],
+            &["run", "pi", "--config", "--local"],
+        ] {
+            assert_error(args, "`--config` needs a value");
+        }
+    }
+
+    #[test]
+    fn an_unknown_or_missing_harness_is_a_usage_error() {
+        assert_error(&["run"], "missing harness");
+        assert_error(&["run", "nope"], "unknown harness `nope`");
+        assert_error(&["run", "Claude"], "unknown harness");
+        assert_error(&["run", "claude-code"], "unknown harness `claude-code`");
+    }
+
+    #[test]
+    fn the_harness_comes_before_rayline_options() {
+        for args in [
+            &["run", "--local", "claude"][..],
+            &["run", "--config", "x.json", "pi"],
+        ] {
+            let error = error(args);
+            assert!(
+                error.starts_with("rayline: the harness comes first"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_first_other_argument_and_everything_after_go_to_the_harness() {
+        assert_eq!(
+            run(&["run", "claude", "--local", "-p", "hi", "--config", "x.json"]),
+            Run {
+                config: ConfigFlag::Local,
+                launch: claude(&["-p", "hi", "--config", "x.json"]),
+            }
+        );
+        assert_eq!(
+            run(&["run", "pi", "--model", "m", "--local"]).launch,
+            harness(Harness::Pi, &["--model", "m", "--local"])
+        );
+        assert_eq!(
+            run(&["run", "claude", "--model", "opus", "--isolated"]).launch,
+            claude(&["--model", "opus", "--isolated"])
+        );
+    }
+
+    #[test]
+    fn everything_after_double_dash_goes_to_the_harness() {
+        assert_eq!(
+            run(&["run", "claude", "--local", "--", "--config", "x", "--"]),
+            Run {
+                config: ConfigFlag::Local,
+                launch: claude(&["--config", "x", "--"]),
+            }
+        );
+        assert_eq!(
+            run(&["run", "hermes", "--", "--local"]),
+            Run {
+                config: ConfigFlag::Default,
+                launch: harness(Harness::Hermes, &["--local"]),
+            }
+        );
+        assert_eq!(
+            run(&["run", "codex", "--", "app"]).launch,
+            Launch::Codex {
+                options: CodexOptions::default(),
+                args: os(&["app"]),
+            }
+        );
+    }
+
+    #[test]
+    fn harness_help_goes_to_the_harness() {
+        for name in ["claude", "opencode", "pi", "omp", "hermes", "openclaw"] {
+            let launch = run(&["run", name, "--help"]).launch;
+            let args = match launch {
+                Launch::Claude { args, .. } | Launch::Harness { args, .. } => args,
+                other => panic!("{name}: {other:?}"),
+            };
+            assert_eq!(args, os(&["--help"]), "{name}");
+        }
+        assert_eq!(
+            run(&["run", "codex", "--local", "--help"]),
+            Run {
+                config: ConfigFlag::Local,
+                launch: Launch::Codex {
+                    options: CodexOptions::default(),
+                    args: os(&["--help"]),
+                },
+            }
+        );
+        assert_eq!(
+            run(&["run", "claude", "--", "--help"]).launch,
+            claude(&["--help"])
+        );
+    }
+
+    #[test]
+    fn env_is_global_and_comes_before_the_command() {
+        assert_eq!(
+            command(&["--env", "dev", "run", "claude"]),
+            (
+                Some("dev".to_owned()),
+                Command::Run(Run {
+                    config: ConfigFlag::Default,
+                    launch: claude(&[]),
+                })
+            )
+        );
+        assert_eq!(command(&["--env=dev", "top"]).0, Some("dev".to_owned()));
+        // After the harness it is the harness's own option.
+        assert_eq!(
+            run(&["run", "pi", "--env", "dev"]).launch,
+            harness(Harness::Pi, &["--env", "dev"])
+        );
+        for args in [
+            &["auth", "status", "--env", "dev"][..],
+            &["run", "claude-desktop", "--env=dev"],
+            &["top", "--env", "dev"],
+        ] {
+            assert!(
+                error(args).contains("`--env` goes before the command: `rayline --env <name> "),
+                "{args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_names_are_checked() {
+        assert_error(
+            &["--env", "a/b", "run", "pi"],
+            "invalid `--env` name (use letters, digits, `-` and `_`)",
+        );
+        assert_error(&["--env"], "`--env` needs a value");
+        assert_error(
+            &["--env", "a", "--env", "b", "top"],
+            "`--env` given more than once",
+        );
+        assert_error(&["--env", "dev"], "missing command");
+    }
+
+    // ── Kept options and subcommands (section 9) ─────────────────────────
+
+    #[test]
+    fn claude_takes_isolated() {
+        assert_eq!(
+            run(&["run", "claude", "--isolated", "-p", "hi"]).launch,
+            Launch::Claude {
+                isolated: true,
+                args: os(&["-p", "hi"]),
+            }
+        );
+        assert_eq!(
+            run(&["run", "pi", "--isolated"]).launch,
+            harness(Harness::Pi, &["--isolated"])
+        );
+    }
+
+    #[test]
+    fn claude_desktop_takes_a_command_and_no_other_arguments() {
+        for (word, action) in [
+            ("start", AppAction::Start),
+            ("status", AppAction::Status),
+            ("validate", AppAction::Validate),
+            ("stop", AppAction::Stop),
+            ("install-service", AppAction::InstallService),
+            ("uninstall-service", AppAction::UninstallService),
+            ("off", AppAction::Off),
+            ("uninstall", AppAction::Uninstall),
+        ] {
+            assert_eq!(
+                run(&["run", "claude-desktop", word]).launch,
+                Launch::ClaudeDesktop(action)
+            );
+        }
+        assert_eq!(
+            run(&["run", "claude-desktop", "status", "--config", "x.json"]).config,
+            ConfigFlag::File(PathBuf::from("x.json"))
+        );
+        assert_error(
+            &["run", "claude-desktop", "bogus"],
+            "unknown claude-desktop command `bogus`",
+        );
+        for removed in ["--manual", "--prefixed-ids", "--desktop-config"] {
+            assert_error(
+                &["run", "claude-desktop", removed],
+                &format!("unexpected `{removed}`"),
+            );
+        }
+        assert_error(
+            &["run", "claude-desktop", "status", "extra"],
+            "unexpected `extra`",
+        );
+    }
+
+    #[test]
+    fn codex_takes_model_and_auth_before_its_own_arguments() {
+        assert_eq!(
+            run(&[
+                "run",
+                "codex",
+                "--model",
+                "m",
+                "--auth=none",
+                "exec",
+                "--model",
+                "x"
+            ])
+            .launch,
+            Launch::Codex {
+                options: CodexOptions {
+                    model: Some("m".to_owned()),
+                    auth: Some(CodexAuthMode::None),
+                },
+                args: os(&["exec", "--model", "x"]),
+            }
+        );
+    }
+
+    #[test]
+    fn codex_auth_takes_only_auto_subscription_and_none() {
+        for (value, mode) in [
+            ("auto", CodexAuthMode::Auto),
+            ("subscription", CodexAuthMode::Subscription),
+            ("none", CodexAuthMode::None),
+        ] {
+            assert_eq!(
+                run(&["run", "codex", "--auth", value]).launch,
+                Launch::Codex {
+                    options: CodexOptions {
+                        model: None,
+                        auth: Some(mode),
+                    },
+                    args: Vec::new(),
+                }
+            );
+        }
+        for alias in ["no-auth", "local", "codex-subscription", "chatgpt", "codex"] {
+            assert_error(
+                &["run", "codex", "--auth", alias],
+                "`--auth` must be auto, subscription or none",
+            );
+        }
+    }
+
+    #[test]
+    fn codex_app_takes_its_options_then_the_workspace() {
+        assert_eq!(
+            run(&["run", "codex", "app", "--model", "m", "~/work"]),
+            Run {
+                config: ConfigFlag::Default,
+                launch: Launch::CodexApp {
+                    options: CodexOptions {
+                        model: Some("m".to_owned()),
+                        auth: None,
+                    },
+                    args: os(&["~/work"]),
+                },
+            }
+        );
+        // With a Rayline option first, `app` is Codex CLI's own argument.
+        assert_eq!(
+            run(&["run", "codex", "--local", "app"]),
+            Run {
+                config: ConfigFlag::Local,
+                launch: Launch::Codex {
+                    options: CodexOptions::default(),
+                    args: os(&["app"]),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn codex_configure_takes_only_model_and_auth() {
+        assert_eq!(
+            run(&["run", "codex", "configure", "--auth", "auto"]).launch,
+            Launch::CodexConfigure(CodexOptions {
+                model: None,
+                auth: Some(CodexAuthMode::Auto),
+            })
+        );
+        assert_error(
+            &["run", "codex", "configure", "--base-url", "http://x"],
+            "unexpected `--base-url`",
+        );
+        assert_error(
+            &["run", "codex", "configure", "extra"],
+            "unexpected `extra`",
+        );
+    }
+
+    #[test]
+    fn local_mode_names_the_kept_options_it_does_not_run_yet() {
+        let local = |args: &[&str]| run(args).launch.not_in_local_mode();
+        assert_eq!(
+            local(&["run", "claude", "--isolated"]),
+            Some("`--isolated`")
+        );
+        assert_eq!(
+            local(&["run", "claude-desktop"]),
+            Some("`run claude-desktop`")
+        );
+        assert_eq!(local(&["run", "codex", "app"]), Some("`run codex app`"));
+        assert_eq!(
+            local(&["run", "codex", "configure"]),
+            Some("`run codex configure`")
+        );
+        assert_eq!(local(&["run", "codex", "--model", "m"]), Some("`--model`"));
+        assert_eq!(local(&["run", "codex", "--auth", "auto"]), Some("`--auth`"));
+        for args in [
+            &["run", "claude", "-p", "hi"][..],
+            &["run", "codex", "exec"],
+            &["run", "pi"],
+        ] {
+            assert_eq!(local(args), None, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn each_launch_names_its_protocol() {
+        let protocol = |args: &[&str]| run(args).launch.protocol();
+        assert_eq!(protocol(&["run", "claude"]), Protocol::AnthropicMessages);
+        assert_eq!(
+            protocol(&["run", "claude-desktop"]),
+            Protocol::AnthropicMessages
+        );
+        for codex in [&["run", "codex"][..], &["run", "codex", "app"]] {
+            assert_eq!(protocol(codex), Protocol::OpenaiResponses);
+        }
+        for name in ["opencode", "pi", "omp", "hermes", "openclaw"] {
+            assert_eq!(protocol(&["run", name]), Protocol::OpenaiChat, "{name}");
+        }
+    }
+
+    // ── auth, top, update ────────────────────────────────────────────────
+
+    #[test]
+    fn auth_commands_parse() {
+        assert_eq!(
+            command(&["auth", "login", "-b", "--paste"]).1,
+            Command::Auth(Auth::Login {
+                no_browser: true,
+                paste: true,
+            })
+        );
+        assert_eq!(command(&["auth", "logout"]).1, Command::Auth(Auth::Logout));
+        assert_eq!(command(&["auth", "status"]).1, Command::Auth(Auth::Status));
+        assert_eq!(command(&["auth", "token"]).1, Command::Auth(Auth::Token));
+        assert_error(&["auth", "whoami"], "unknown auth command `whoami`");
+        assert_error(&["auth", "token", "--json"], "unexpected `--json`");
+        assert_error(
+            &["auth", "login", "--auth-token", "t"],
+            "unexpected `--auth-token`",
+        );
+    }
+
+    #[test]
+    fn top_takes_only_json() {
+        assert_eq!(command(&["top"]).1, Command::Top { json: false });
+        assert_eq!(command(&["top", "--json"]).1, Command::Top { json: true });
+        assert_error(&["top", "--watch"], "unexpected `--watch`");
+    }
+
+    #[test]
+    fn update_takes_its_options_and_the_hidden_release_testing_ones() {
+        assert_eq!(
+            command(&[
+                "update",
+                "--check",
+                "--version",
+                "1.2.3",
+                "--base-url=http://127.0.0.1:1",
+                "--install-path",
+                "/tmp/raydock",
+            ])
+            .1,
+            Command::Update(UpdateRequest {
+                pinned_version: Some("1.2.3".to_owned()),
+                force: false,
+                check_only: true,
+                dry_run: false,
+                base_url: Some("http://127.0.0.1:1".to_owned()),
+                install_path: Some(PathBuf::from("/tmp/raydock")),
+            })
+        );
+        assert_error(&["update", "--channel", "dev"], "unexpected `--channel`");
+    }
+
+    // ── Removed forms (section 10.1) ─────────────────────────────────────
+
+    #[test]
+    fn removed_commands_are_unknown() {
+        for name in [
+            "claude",
+            "claude-desktop",
+            "codex",
+            "opencode",
+            "pi",
+            "omp",
+            "hermes",
+            "openclaw",
+            "status",
+            "local",
+            "router",
+            "chat",
+            "api",
+            "menubar",
+            "install-cli",
+            "hook-send",
+            "agent",
+        ] {
+            assert_error(&[name], &format!("unknown command `{name}`"));
+        }
+        assert_error(&["claude", "run"], "unknown command `claude`");
+    }
+
+    #[test]
+    fn removed_root_options_are_unknown() {
+        assert_error(
+            &["--auth-token", "t", "run", "pi"],
+            "unknown option `--auth-token`",
+        );
+        assert_error(
+            &["--auth-token=t", "top"],
+            "unknown option `--auth-token=…`",
+        );
+        assert_error(&["-v"], "unknown option `-v`");
+    }
+
+    #[test]
+    fn rejected_arguments_are_not_echoed() {
+        let secret = "sk-rayline-SECRET";
+        for args in [
+            &[secret][..],
+            &["run", secret],
+            &["auth", secret],
+            &["top", secret],
+            &["run", "claude-desktop", "status", secret],
+            &[&format!("--{secret}")],
+        ] {
+            assert!(!error(args).contains(secret), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn hybrid_is_hidden_and_takes_its_own_arguments() {
+        assert_eq!(
+            parsed(&["hybrid", "status"]),
+            Parsed::Hybrid(os(&["status"]))
+        );
+        assert!(
+            !ROOT_HELP
+                .lines()
+                .any(|line| line.trim_start().starts_with("hybrid"))
+        );
+        assert_error(
+            &["--env", "dev", "hybrid", "status"],
+            "`hybrid` takes `--env` after `hybrid start`",
+        );
+    }
 }

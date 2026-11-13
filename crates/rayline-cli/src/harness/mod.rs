@@ -337,7 +337,7 @@ impl Harness {
             .find(|harness| harness.name() == command)
     }
 
-    /// The `rayline <name>` subcommand and the config directory name.
+    /// The `rayline run <name>` harness name and the config directory name.
     pub fn name(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",

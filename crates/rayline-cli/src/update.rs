@@ -25,7 +25,6 @@ pub struct UpdateRequest {
     pub install_path: Option<PathBuf>,
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateResult {
     pub message: String,

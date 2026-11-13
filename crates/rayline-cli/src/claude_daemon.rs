@@ -517,9 +517,12 @@ fn format_daemon_conflict_error(
     // When isolation is available, surface it as a third path that keeps the
     // other daemon running instead of stopping it.
     let isolated_alt = if allow_isolated {
-        let rerun_isolated = format!("{} {env_flag}run claude --isolated {arg_str}", crate::CLI_BIN)
-            .trim_end()
-            .to_owned();
+        let rerun_isolated = format!(
+            "{} {env_flag}run claude --isolated {arg_str}",
+            crate::CLI_BIN
+        )
+        .trim_end()
+        .to_owned();
         format!(
             "\n\nOr run alongside it in an isolated config dir (~/{}/harness/claude-code):\n  {rerun_isolated}",
             crate::DOT_CONFIG_DIR
