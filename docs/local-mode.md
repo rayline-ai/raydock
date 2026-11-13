@@ -80,9 +80,9 @@ Each harness speaks one protocol:
 
 | Harness | Protocol |
 |---|---|
-| `claude`, `claude-desktop` | `anthropic_messages` |
-| `codex` | `openai_responses` |
-| `opencode`, `pi`, `omp`, `hermes`, `openclaw` | `openai_chat` |
+| `claude`, `claude-desktop`, `pi`, `omp`, `opencode` | `anthropic_messages` |
+| `codex`, `hermes` | `openai_responses` |
+| `openclaw` | `openai_chat` |
 
 Requests pass straight through to an endpoint, with no translation. In a
 local-mode run, every endpoint in the config must list the protocol of the

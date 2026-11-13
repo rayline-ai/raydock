@@ -165,7 +165,7 @@ Your own inference servers, keyed by id.
 | `protocols` | list of `anthropic_messages`, `openai_chat`, `openai_responses` | yes, non-empty | The wire protocols it serves. |
 | `api_key_env` | string | no | Name of the env var holding its key. No secrets in the file. |
 
-Each harness speaks one protocol: `claude` and `claude-desktop` speak `anthropic_messages`, `codex` speaks `openai_responses`, the others speak `openai_chat`. When the endpoint lists the harness's protocol, requests pass straight through with no translation. When it doesn't, the config is wrong and Rayline refuses to run.
+Each harness speaks one protocol, the one its Rayline config sets up: `claude`, `claude-desktop`, `pi`, `omp` and `opencode` speak `anthropic_messages`; `codex` and `hermes` speak `openai_responses`; `openclaw` speaks `openai_chat`. In local mode, Rayline sets up only that one protocol for each harness. When the endpoint lists the harness's protocol, requests pass straight through with no translation. When it doesn't, the config is wrong and Rayline refuses to run.
 
 ### 5.3 `models`
 
