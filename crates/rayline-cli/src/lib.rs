@@ -53,7 +53,6 @@ pub const UPDATE_BASE_URL: &str = "https://get.rayline.ai";
 pub const INSTALLER_URL: &str = "https://get.rayline.ai/install.sh";
 pub const CLAUDE_LAUNCHES_SUFFIX: &str = ".config/rayline/claude-daemon-launches.json";
 pub const RAYLINE_VERSION: &str = env!("RAYLINE_VERSION");
-pub const RAYLINE_CHANNEL: &str = env!("RAYLINE_CHANNEL");
 
 // Production minisign public key(s) for release / self-update signature verification.
 // The matching secret key lives only in the GitHub `release` environment secret
