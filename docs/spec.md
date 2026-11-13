@@ -104,11 +104,13 @@ Harness-specific options and subcommands are **kept for review** (section 9).
 7. The local process passes each request on with a session id and a branch id:
    - session: the request's `x-rayline-session-id`, else the first of `x-conversation-id`, `x-parent-session-id`, `x-session-affinity`, `x-session-id`, `x-claude-code-session-id` that it carries, else none;
    - branch: the request's `x-rayline-branch-id`, else `thread-id`, else `x-claude-code-agent-id`, else, when it carries `x-parent-session-id`, `x-session-affinity` or `x-session-id`, else `main`.
-8. When the core fails a turn before any output because its call to the routing service failed, the local process resends the turn once if the service was unavailable (no answer, or HTTP 408, 409 or 5xx) or busy (HTTP 429). It doesn't resend when the service says `x-should-retry: false` or a `retry-after` over 30 seconds. It waits the service's `retry-after` (at least 1 second), else about 5 seconds, jittered between 2.5 and 7.5 so sessions don't resend in step.
+8. When the core fails a turn before any output because its call to the routing service failed, the local process resends the turn once, and only when the service was unavailable (no answer, or HTTP 408, 409 or 5xx) or busy (HTTP 429). It doesn't resend when the service says `x-should-retry: false` or a `retry-after` over 30 seconds. Before the resend it waits the service's `retry-after` (at least 1 second), else about 5 seconds, jittered between 2.5 and 7.5 so sessions don't resend in step.
 
-   When the turn still fails, the harness gets the error with `x-should-retry: false`, so its SDK doesn't resend it again: 503 for unavailable and 429 for busy, both with `retry-after` (the service's, else 30 seconds); 403 for a rejected router key; 400 for any other refusal.
+   When the turn still fails, or isn't resent, the harness gets the error with `x-should-retry: false`, so its SDK doesn't resend it again:
+   - unavailable: 503, and busy: 429. Both carry `retry-after`: the service's (which the core caps at 300 seconds, and the local process raises to at least 1), else 30 seconds.
+   - a rejected router key: 403, and any other refusal: 400. Neither is resent, and neither carries `retry-after`.
 
-   The core passes on the service's advice only for a refusal whose `Retry-After` is delta-seconds and whose `X-Should-Retry` is exactly `true` or `false`. When the service doesn't answer, or refuses without that advice, the turn has no `retry-after` or `x-should-retry`: the local process waits about 5 seconds for its one resend and tells the harness `retry-after: 30`.
+   The core passes on the service's two headers separately: `Retry-After` only as delta-seconds, and `X-Should-Retry` only as exactly `true` or `false`. A refusal can carry one without the other, and the local process uses the one it gets. A missing header takes its own default, and only for an unavailable or busy service. Without `retry-after`, the local process waits about 5 seconds for its resend and tells the harness `retry-after: 30`. Without `x-should-retry`, the turn may be resent. When the service doesn't answer, the core passes on neither.
 
 ### 3.4 `rayline top`
 

@@ -930,11 +930,11 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
 
 /// The routing service's retry advice, as the core passes it on with its 502:
 /// `retry-after` (delta-seconds) and `x-should-retry` (`true`/`false`, the
-/// Anthropic and OpenAI SDKs' own header). The core omits both when the
-/// routing service did not answer (a transport failure), and when it refused
-/// without that advice (`Retry-After` absent or not delta-seconds, or
-/// `X-Should-Retry` not exactly `true` or `false`); then the gateway's
-/// defaults apply.
+/// Anthropic and OpenAI SDKs' own header). The core passes each on by itself:
+/// `retry-after` when the routing service sent delta-seconds (capped at
+/// 300 s), `x-should-retry` when it sent exactly `true` or `false`. On a
+/// transport failure it passes on neither. A missing one takes the gateway's
+/// default for that header alone, for an unavailable or busy service.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RetryHint {
     retry_after: Option<Duration>,
@@ -978,7 +978,7 @@ fn gateway_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Dur
     match hint.retry_after {
         Some(wait) if wait > DECISIONS_MAX_RETRY_WAIT => None,
         Some(wait) => Some(wait.max(Duration::from_secs(1))),
-        // No advice: a transport failure, or a refusal without it.
+        // No `retry-after`: a transport failure, or a refusal without one.
         None => Some(jittered(DECISIONS_RETRY_DELAY, rand::random::<f64>())),
     }
 }
@@ -1034,7 +1034,7 @@ fn buffered_response(
             if retryable {
                 // At least the second the gateway waits itself. The service's
                 // own, else the default: the core sends none on a transport
-                // failure, or on a refusal without advice.
+                // failure, or on a refusal without one.
                 let wait = hint
                     .retry_after
                     .unwrap_or(DEFAULT_HARNESS_RETRY_AFTER)
