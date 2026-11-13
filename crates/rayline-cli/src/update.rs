@@ -592,8 +592,6 @@ fn replace_file(
     install_path: &Path,
     executable: bool,
 ) -> Result<(), UpdateError> {
-    #[cfg(not(unix))]
-    let _ = executable;
     let parent = install_path.parent().ok_or_else(|| {
         UpdateError::Install(format!(
             "install path has no parent directory: {}",
@@ -608,23 +606,15 @@ fn replace_file(
     })?;
 
     let staged = staged_install_path(install_path)?;
-    fs::copy(downloaded, &staged).map_err(|error| {
-        UpdateError::Install(format!(
-            "failed to stage update at {}: {error}",
-            staged.display()
-        ))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let permissions = fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 });
-        fs::set_permissions(&staged, permissions).map_err(|error| {
-            UpdateError::Install(format!(
-                "failed to set update permissions at {}: {error}",
-                staged.display()
-            ))
-        })?;
+    let mut source = fs::File::open(downloaded).map_err(|error| stage_failed(&staged, error))?;
+    let staged_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|error| stage_failed(&staged, error))?;
+    if let Err(error) = fill_staged(&mut source, staged_file, &staged, executable) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
     }
 
     let result = move_into_place(&staged, install_path);
@@ -632,6 +622,41 @@ fn replace_file(
         let _ = fs::remove_file(&staged);
     }
     result
+}
+
+/// Copy `source`'s bytes into the new `staged_file`, then give it the install
+/// permissions. A plain byte copy: on macOS `fs::copy` first tries an APFS
+/// clone, which can fail with `EINVAL`.
+fn fill_staged(
+    source: &mut fs::File,
+    mut staged_file: fs::File,
+    staged: &Path,
+    executable: bool,
+) -> Result<(), UpdateError> {
+    #[cfg(not(unix))]
+    let _ = executable;
+    io::copy(source, &mut staged_file).map_err(|error| stage_failed(staged, error))?;
+    drop(staged_file);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(if executable { 0o755 } else { 0o644 });
+        fs::set_permissions(staged, permissions).map_err(|error| {
+            UpdateError::Install(format!(
+                "failed to set update permissions at {}: {error}",
+                staged.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn stage_failed(staged: &Path, error: io::Error) -> UpdateError {
+    UpdateError::Install(format!(
+        "failed to stage update at {}: {error}",
+        staged.display()
+    ))
 }
 
 /// Atomically move the staged binary onto `install_path`.
@@ -1148,6 +1173,35 @@ mod tests {
         fs::write(&source, b"tampered license")?;
         assert!(verify_checksum(&sums, "rayline-core-LICENSE", &source).is_err());
         assert_eq!(fs::read(&destination)?, content);
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_staging_leaves_no_staged_file() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock");
+        fs::write(&installed, b"installed")?;
+        // A missing source fails before the staged file exists; a directory
+        // fails after it is created on Unix and on opening it on Windows.
+        let directory = root.join("downloaded-directory");
+        fs::create_dir(&directory)?;
+        for downloaded in [root.join("no-such-download"), directory] {
+            let error = replace_binary(&downloaded, &installed)
+                .unwrap_err()
+                .to_string();
+            assert!(error.starts_with("failed to stage update at "), "{error}");
+            let staged: Vec<_> = fs::read_dir(&root)?
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<_, _>>()?;
+            assert!(
+                !staged
+                    .iter()
+                    .any(|name| name.to_string_lossy().starts_with(".raydock.tmp-")),
+                "{staged:?}"
+            );
+            assert_eq!(fs::read(&installed)?, b"installed");
+        }
         fs::remove_dir_all(root)?;
         Ok(())
     }
