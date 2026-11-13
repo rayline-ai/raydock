@@ -1,5 +1,5 @@
 class Raydock < Formula
-  desc "Raydock on-device CLI for local models and cloud services"
+  desc "Raydock CLI that launches coding harnesses on ARC"
   homepage "https://rayline.ai"
   license "Apache-2.0"
   version "__VERSION__"

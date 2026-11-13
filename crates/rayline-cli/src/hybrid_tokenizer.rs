@@ -81,21 +81,10 @@ pub(crate) fn fetch(repo: &str) -> Result<PathBuf, String> {
         .map(|file| (file, true))
         .chain(OPTIONAL.iter().map(|file| (file, false)))
     {
-        if rayline_hf::verified_hf_cache_file(repo, file, &commit, None)?.is_some() {
+        if rayline_hf::cached_hf_file(repo, file, &commit).is_some() {
             continue;
         }
-        if let Err(error) = rayline_hf::download_to_hf_cache(
-            repo,
-            file,
-            &commit,
-            None,
-            None,
-            "tokenizer",
-            None,
-            0,
-            0,
-            None,
-        ) {
+        if let Err(error) = rayline_hf::download_to_hf_cache(repo, file, &commit) {
             if required {
                 return Err(format!("download {file} from {repo}: {error}"));
             }

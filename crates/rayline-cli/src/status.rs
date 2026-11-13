@@ -520,16 +520,7 @@ async fn request_rayline_device_session(
         session_id: required_login_string(&data, "sessionId")?,
         user_code: required_login_string(&data, "userCode")?,
         verification_uri: required_login_string(&data, "verificationUri")?,
-        interval_seconds: data
-            .get("intervalSeconds")
-            .and_then(value_as_i64)
-            .unwrap_or(5)
-            .max(1),
-        expires_in_seconds: data
-            .get("expiresInSeconds")
-            .and_then(value_as_i64)
-            .unwrap_or(600)
-            .max(1),
+        expires_in_seconds: required_login_seconds(&data, "expiresInSeconds")?,
     })
 }
 
@@ -550,8 +541,7 @@ async fn poll_rayline_device_session(
 ) -> Result<SessionGrant, AuthError> {
     let url = format!("{}/v1/auth/cli/device/poll", hosted.base_url);
     let started = Instant::now();
-    let timeout = Duration::from_secs(device.expires_in_seconds as u64);
-    let mut interval = device.interval_seconds as u64;
+    let timeout = Duration::from_secs(device.expires_in_seconds);
     let client = auth_http_client()
         .map_err(|error| AuthError::LoginFailed(format!("Device login polling failed: {error}")))?;
 
@@ -594,11 +584,7 @@ async fn poll_rayline_device_session(
                     .map_err(AuthError::LoginFailed);
             }
             "pending" => {
-                interval = data
-                    .get("intervalSeconds")
-                    .and_then(value_as_i64)
-                    .unwrap_or(interval as i64)
-                    .max(1) as u64;
+                let interval = required_login_seconds(&data, "intervalSeconds")?;
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
             "expired" => {
@@ -936,6 +922,20 @@ fn required_login_string(data: &Value, key: &str) -> Result<String, AuthError> {
         .ok_or_else(|| AuthError::LoginFailed(format!("Login response missing {key}")))
 }
 
+fn required_login_seconds(data: &Value, key: &str) -> Result<u64, AuthError> {
+    let value = data
+        .get(key)
+        .ok_or_else(|| AuthError::LoginFailed(format!("Login response missing {key}")))?;
+    value
+        .as_u64()
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| {
+            AuthError::LoginFailed(format!(
+                "Login response {key} must be a positive whole number of seconds, got {value}"
+            ))
+        })
+}
+
 fn required_response_string(data: &Value, key: &str, context: &str) -> Result<String, String> {
     data.get(key)
         .and_then(value_as_str)
@@ -1216,12 +1216,6 @@ fn value_as_str(value: &Value) -> Option<&str> {
     value.as_str()
 }
 
-fn value_as_i64(value: &Value) -> Option<i64> {
-    value
-        .as_i64()
-        .or_else(|| value.as_str().and_then(|raw| raw.parse::<i64>().ok()))
-}
-
 fn json_value_for_message(value: &Value) -> String {
     match value {
         Value::String(message) => message.clone(),
@@ -1274,8 +1268,7 @@ struct RaylineDeviceSession {
     session_id: String,
     user_code: String,
     verification_uri: String,
-    interval_seconds: i64,
-    expires_in_seconds: i64,
+    expires_in_seconds: u64,
 }
 
 struct HttpRequest {
@@ -1774,6 +1767,114 @@ mod tests {
         assert_eq!(dev.router_key.saved_at, dev.session.signed_in_at);
         assert_eq!(stored(&home, None).unwrap(), prod_before);
         let _ = fs::remove_dir_all(&home);
+    }
+
+    fn device_start_body(expires_in_seconds: Option<Value>) -> Value {
+        let mut body = json!({
+            "sessionId": "device-session",
+            "userCode": "ABCD-EFGH",
+            "verificationUri": "https://platform.example.test/device",
+            "intervalSeconds": 1,
+        });
+        if let Some(value) = expires_in_seconds {
+            body["expiresInSeconds"] = value;
+        }
+        body
+    }
+
+    fn login_failure(error: AuthError) -> String {
+        match error {
+            AuthError::LoginFailed(message) => message,
+            other => panic!("expected LoginFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_start_requires_expires_in_seconds() {
+        let api = FakeApi::start(&[("/v1/auth/cli/device/start", 200, device_start_body(None))]);
+        let error = request_rayline_device_session(&hosted(None, &api.base_url))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            login_failure(error),
+            "Login response missing expiresInSeconds"
+        );
+    }
+
+    #[tokio::test]
+    async fn device_start_refuses_expires_in_seconds_that_is_not_whole_positive_seconds() {
+        for value in [json!(0), json!(-5), json!("600"), json!(1.5), Value::Null] {
+            let api = FakeApi::start(&[(
+                "/v1/auth/cli/device/start",
+                200,
+                device_start_body(Some(value.clone())),
+            )]);
+            let error = request_rayline_device_session(&hosted(None, &api.base_url))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                login_failure(error),
+                format!(
+                    "Login response expiresInSeconds must be a positive whole number of seconds, got {value}"
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn device_start_reads_expires_in_seconds() {
+        let api = FakeApi::start(&[(
+            "/v1/auth/cli/device/start",
+            200,
+            device_start_body(Some(json!(600))),
+        )]);
+        let device = request_rayline_device_session(&hosted(None, &api.base_url))
+            .await
+            .unwrap();
+        assert_eq!(
+            device,
+            RaylineDeviceSession {
+                session_id: "device-session".to_string(),
+                user_code: "ABCD-EFGH".to_string(),
+                verification_uri: "https://platform.example.test/device".to_string(),
+                expires_in_seconds: 600,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_poll_requires_interval_seconds() {
+        for (body, expected) in [
+            (
+                json!({ "status": "pending" }),
+                "Login response missing intervalSeconds".to_string(),
+            ),
+            (
+                json!({ "status": "pending", "intervalSeconds": 0 }),
+                "Login response intervalSeconds must be a positive whole number of seconds, got 0"
+                    .to_string(),
+            ),
+            (
+                json!({ "status": "pending", "intervalSeconds": "5" }),
+                "Login response intervalSeconds must be a positive whole number of seconds, got \"5\""
+                    .to_string(),
+            ),
+        ] {
+            let api = FakeApi::start(&[("/v1/auth/cli/device/poll", 200, body)]);
+            let device = RaylineDeviceSession {
+                session_id: "device-session".to_string(),
+                user_code: "ABCD-EFGH".to_string(),
+                verification_uri: "https://platform.example.test/device".to_string(),
+                expires_in_seconds: 60,
+            };
+            let Err(error) =
+                poll_rayline_device_session(&hosted(None, &api.base_url), &device).await
+            else {
+                panic!("a pending poll without a valid intervalSeconds signed in");
+            };
+            assert_eq!(login_failure(error), expected);
+            assert_eq!(api.paths(), ["POST /v1/auth/cli/device/poll"]);
+        }
     }
 
     #[tokio::test]

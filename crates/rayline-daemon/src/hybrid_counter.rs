@@ -109,7 +109,7 @@ fn name_counter(
         bail!("deployment {deployment} is not local");
     }
     if target.get("prompt_counter").is_some() {
-        bail!("deployment {deployment} already has a llama.cpp prompt_counter");
+        bail!("deployment {deployment} already has a prompt_counter");
     }
     target["token_counter"] = json!({"url": url, "auth_env": COUNTER_KEY_ENV});
     target["token_units"] = json!(units);
