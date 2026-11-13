@@ -61,9 +61,8 @@ rayline run claude --local
 
 ## Supported harnesses
 
-`claude` (Claude Code), `claude-desktop` (Claude Desktop's Code sessions),
-`codex` (Codex CLI), `opencode`, `pi`, `omp` (oh-my-pi), `hermes` (Hermes Agent)
-and `openclaw` (OpenClaw).
+`claude` (Claude Code), `codex` (Codex CLI), `opencode`, `pi`, `omp`
+(oh-my-pi), `hermes` (Hermes Agent) and `openclaw` (OpenClaw).
 
 ## Documentation
 

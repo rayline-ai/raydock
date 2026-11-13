@@ -8,7 +8,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
 
-use crate::claude_app::AppAction;
 use crate::config::Protocol;
 use crate::harness::Harness;
 use crate::update::{UpdateRequest, Version};
@@ -34,7 +33,6 @@ Usage: rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...
 
 Harnesses:
   claude           Claude Code
-  claude-desktop   Claude Desktop's Code sessions
   codex            Codex CLI
   opencode         opencode
   pi               pi
@@ -78,29 +76,6 @@ const AUTH_TOKEN_HELP: &str = "\
 Usage: rayline auth token
 
 Print a valid account bearer token for scripts and integrations.
-";
-
-const CLAUDE_DESKTOP_HELP: &str = "\
-Usage: rayline run claude-desktop [COMMAND] [--config <file>]
-
-Run Claude Code inside the Claude desktop app on ARC. Desktop runs on the
-shared local process, which is not available yet: start, status, validate,
-stop, install-service and uninstall-service fail until it is. off and
-uninstall restore the Desktop profile and mode selected before Rayline ARC.
-
-Commands:
-  start              Configure and launch Desktop with ARC (default)
-  status             Show the Desktop check
-  validate           Check Desktop's applied configuration
-  stop               Stop serving Desktop
-  install-service    Serve Desktop at login
-  uninstall-service  Remove the login service
-  off                Restore the previous Desktop profile and mode
-  uninstall          Restore the previous Desktop profile and mode, and show
-                     how to remove the Rayline ARC gateway from Desktop
-
-Options:
-  --help             Show this message and exit
 ";
 
 const CODEX_APP_HELP: &str = "\
@@ -259,7 +234,6 @@ pub(crate) enum Launch {
         isolated: bool,
         args: Vec<OsString>,
     },
-    ClaudeDesktop(AppAction),
     Codex {
         options: CodexOptions,
         args: Vec<OsString>,
@@ -294,7 +268,7 @@ impl Launch {
     /// up (spec section 5.2), checked against `endpoints` in a local-mode run.
     pub(crate) fn protocol(&self) -> Protocol {
         match self {
-            Launch::Claude { .. } | Launch::ClaudeDesktop(_) => Protocol::AnthropicMessages,
+            Launch::Claude { .. } => Protocol::AnthropicMessages,
             Launch::Codex { .. } | Launch::CodexApp { .. } | Launch::CodexConfigure(_) => {
                 Protocol::OpenaiResponses
             }
@@ -311,7 +285,6 @@ impl Launch {
     fn not_in_local_mode(&self) -> Option<&'static str> {
         match self {
             Launch::Claude { isolated: true, .. } => Some("`--isolated`"),
-            Launch::ClaudeDesktop(_) => Some("`run claude-desktop`"),
             Launch::CodexApp { .. } => Some("`run codex app`"),
             Launch::CodexConfigure(_) => Some("`run codex configure`"),
             Launch::Codex { options, .. } if options.model.is_some() => Some("`--model`"),
@@ -365,10 +338,6 @@ const AUTH_STATUS: Help = Help {
 const AUTH_TOKEN: Help = Help {
     words: " auth token",
     text: AUTH_TOKEN_HELP,
-};
-const CLAUDE_DESKTOP: Help = Help {
-    words: " run claude-desktop",
-    text: CLAUDE_DESKTOP_HELP,
 };
 const CODEX_APP: Help = Help {
     words: " run codex app",
@@ -784,7 +753,6 @@ struct RunOptions {
 /// The harness a run launches, before its options are read.
 enum Target {
     Claude,
-    ClaudeDesktop(AppAction),
     Codex,
     CodexApp,
     CodexConfigure,
@@ -815,21 +783,6 @@ fn parse_run(args: &mut Args<'_>) -> Result<OrHelp<Run>, UsageError> {
                 ..RunGrammar::new(RUN, false, true)
             },
         ),
-        "claude-desktop" => {
-            let action = match args.peek().and_then(|arg| arg.to_str()) {
-                Some(word) if !word.starts_with('-') => {
-                    args.next();
-                    AppAction::parse(word).ok_or_else(|| {
-                        CLAUDE_DESKTOP.error(unknown("claude-desktop command", word))
-                    })?
-                }
-                _ => AppAction::Start,
-            };
-            (
-                Target::ClaudeDesktop(action),
-                RunGrammar::new(CLAUDE_DESKTOP, true, false),
-            )
-        }
         "codex" => match args.peek().and_then(|arg| arg.to_str()) {
             Some("app") => {
                 args.next();
@@ -859,7 +812,6 @@ fn parse_run(args: &mut Args<'_>) -> Result<OrHelp<Run>, UsageError> {
             isolated: options.isolated,
             args: options.args,
         },
-        Target::ClaudeDesktop(action) => Launch::ClaudeDesktop(action),
         Target::Codex => Launch::Codex {
             options: options.codex,
             args: options.args,
@@ -1062,11 +1014,6 @@ mod tests {
             (&["local", "stop", "--help"], LOCAL_STOP_HELP),
             (&["top", "--help"], TOP_HELP),
             (&["update", "--help"], UPDATE_HELP),
-            (&["run", "claude-desktop", "--help"], CLAUDE_DESKTOP_HELP),
-            (
-                &["run", "claude-desktop", "status", "--help"],
-                CLAUDE_DESKTOP_HELP,
-            ),
             (&["run", "codex", "app", "--help"], CODEX_APP_HELP),
             (
                 &["run", "codex", "configure", "--help"],
@@ -1087,7 +1034,6 @@ mod tests {
             AUTH_LOGOUT_HELP,
             AUTH_STATUS_HELP,
             AUTH_TOKEN_HELP,
-            CLAUDE_DESKTOP_HELP,
             CODEX_APP_HELP,
             CODEX_CONFIGURE_HELP,
             LOCAL_HELP,
@@ -1128,7 +1074,6 @@ mod tests {
     fn every_harness_runs_in_cloud_mode_with_neither_flag() {
         for (name, launch) in [
             ("claude", claude(&[])),
-            ("claude-desktop", Launch::ClaudeDesktop(AppAction::Start)),
             (
                 "codex",
                 Launch::Codex {
@@ -1162,7 +1107,7 @@ mod tests {
             .lines()
             .filter_map(|line| line.split_whitespace().next())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 8);
+        assert_eq!(names.len(), 7);
         for name in names {
             run(&["run", name]);
         }
@@ -1188,7 +1133,6 @@ mod tests {
             &["run", "claude", "--config", "x.json", "--local"],
             &["run", "codex", "--config=x.json", "--local"],
             &["run", "codex", "app", "--local", "--config", "x.json"],
-            &["run", "claude-desktop", "--config", "x.json", "--local"],
         ] {
             assert_error(args, "`--local` and `--config` can't be used together");
         }
@@ -1342,7 +1286,6 @@ mod tests {
             &["auth", "--env", "dev"][..],
             &["auth", "login", "--env", "dev"],
             &["auth", "status", "--env", "dev"],
-            &["run", "claude-desktop", "--env=dev"],
             &["run", "codex", "configure", "--env", "dev"],
             &["top", "--env", "dev"],
             &["update", "--env=dev"],
@@ -1384,43 +1327,6 @@ mod tests {
         assert_eq!(
             run(&["run", "pi", "--isolated"]).launch,
             harness(Harness::Pi, &["--isolated"])
-        );
-    }
-
-    #[test]
-    fn claude_desktop_takes_a_command_and_no_other_arguments() {
-        for (word, action) in [
-            ("start", AppAction::Start),
-            ("status", AppAction::Status),
-            ("validate", AppAction::Validate),
-            ("stop", AppAction::Stop),
-            ("install-service", AppAction::InstallService),
-            ("uninstall-service", AppAction::UninstallService),
-            ("off", AppAction::Off),
-            ("uninstall", AppAction::Uninstall),
-        ] {
-            assert_eq!(
-                run(&["run", "claude-desktop", word]).launch,
-                Launch::ClaudeDesktop(action)
-            );
-        }
-        assert_eq!(
-            run(&["run", "claude-desktop", "status", "--config", "x.json"]).config,
-            ConfigFlag::File(PathBuf::from("x.json"))
-        );
-        assert_error(
-            &["run", "claude-desktop", "bogus"],
-            "unknown claude-desktop command `bogus`",
-        );
-        for removed in ["--manual", "--prefixed-ids", "--desktop-config"] {
-            assert_error(
-                &["run", "claude-desktop", removed],
-                &format!("unexpected `{removed}`"),
-            );
-        }
-        assert_error(
-            &["run", "claude-desktop", "status", "extra"],
-            "unexpected `extra`",
         );
     }
 
@@ -1513,10 +1419,6 @@ mod tests {
             local(&["run", "claude", "--isolated"]),
             Some("`--isolated`")
         );
-        assert_eq!(
-            local(&["run", "claude-desktop"]),
-            Some("`run claude-desktop`")
-        );
         assert_eq!(local(&["run", "codex", "app"]), Some("`run codex app`"));
         assert_eq!(
             local(&["run", "codex", "configure"]),
@@ -1537,10 +1439,6 @@ mod tests {
     fn each_launch_names_its_protocol() {
         let protocol = |args: &[&str]| run(args).launch.protocol();
         assert_eq!(protocol(&["run", "claude"]), Protocol::AnthropicMessages);
-        assert_eq!(
-            protocol(&["run", "claude-desktop"]),
-            Protocol::AnthropicMessages
-        );
         for codex in [&["run", "codex"][..], &["run", "codex", "app"]] {
             assert_eq!(protocol(codex), Protocol::OpenaiResponses);
         }
@@ -1742,7 +1640,7 @@ mod tests {
     #[test]
     fn a_flag_given_a_value_is_a_usage_error_where_nothing_follows() {
         assert_error(
-            &["run", "claude-desktop", "--local=yes"],
+            &["run", "codex", "configure", "--local=yes"],
             "unexpected `--local=…`",
         );
         assert_error(
@@ -1790,11 +1688,6 @@ mod tests {
             (&["top"], "rayline top"),
             (&["update"], "rayline update"),
             (&["run"], "rayline run"),
-            (&["run", "claude-desktop"], "rayline run claude-desktop"),
-            (
-                &["run", "claude-desktop", "stop"],
-                "rayline run claude-desktop",
-            ),
             (
                 &["run", "codex", "configure"],
                 "rayline run codex configure",
@@ -1964,7 +1857,7 @@ mod tests {
             &["run", word],
             &["auth", word],
             &["top", word],
-            &["run", "claude-desktop", "status", word],
+            &["run", "codex", "configure", word],
             &["update", "--version", word],
             &["update", "--install-path", word],
             &[&format!("--{word}")],
