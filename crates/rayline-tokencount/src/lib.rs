@@ -67,7 +67,11 @@ impl PromptCounter {
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let tokenizer_bytes = std::fs::read(dir.join(TOKENIZER_FILE))
             .with_context(|| format!("read {}", dir.join(TOKENIZER_FILE).display()))?;
-        let config = read_json(&dir.join(TOKENIZER_CONFIG_FILE))?;
+        let config_path = dir.join(TOKENIZER_CONFIG_FILE);
+        let config = read_json(&config_path)?;
+        if config.as_ref().is_some_and(|config| !config.is_object()) {
+            bail!("{} is not a JSON object", config_path.display());
+        }
         let templates = read_templates(dir, config.as_ref())?;
         let mut images = None;
         for file in [PROCESSOR_FILE, PREPROCESSOR_FILE] {
@@ -78,7 +82,11 @@ impl PromptCounter {
                 break;
             }
         }
-        let special_tokens = config.as_ref().map(special_tokens).unwrap_or_default();
+        let special_tokens = config
+            .as_ref()
+            .and_then(Value::as_object)
+            .map(special_tokens)
+            .unwrap_or_default();
         Self::build(&tokenizer_bytes, &templates, images, special_tokens)
     }
 
@@ -113,6 +121,28 @@ impl PromptCounter {
         if let Some(tool_use) = &templates.tool_use {
             env.add_template_owned("tool_use", without_generation_tags(tool_use))
                 .context("compile the tool_use chat template")?;
+        }
+        for (name, label) in [
+            ("chat", "the chat template"),
+            ("tool_use", "the tool_use chat template"),
+        ] {
+            let Ok(template) = env.get_template(name) else {
+                continue;
+            };
+            let mut missing: Vec<String> = template
+                .undeclared_variables(false)
+                .into_iter()
+                .filter(|variable| {
+                    is_special_token(variable) && !special_tokens.contains_key(variable)
+                })
+                .collect();
+            missing.sort();
+            if !missing.is_empty() {
+                bail!(
+                    "{label} uses `{}`, which {TOKENIZER_CONFIG_FILE} does not define",
+                    missing.join("`, `")
+                );
+            }
         }
         let mut digest = Sha256::new();
         digest.update(Sha256::digest(tokenizer_json));
@@ -300,14 +330,17 @@ fn read_templates(dir: &Path, config: Option<&Value>) -> Result<ChatTemplates> {
     }
 }
 
+/// A template variable `transformers` fills from the special tokens: a
+/// missing one would render as nothing.
+fn is_special_token(variable: &str) -> bool {
+    variable.ends_with("_token") || variable == "additional_special_tokens"
+}
+
 /// The `*_token` entries of `tokenizer_config.json` (a string or an added
 /// token's `content`) and `additional_special_tokens`, as `transformers`
 /// passes them to the template.
-fn special_tokens(config: &Value) -> Map<String, Value> {
+fn special_tokens(config: &Map<String, Value>) -> Map<String, Value> {
     let mut tokens = Map::new();
-    let Some(config) = config.as_object() else {
-        return tokens;
-    };
     let content = |value: &Value| -> Option<Value> {
         match value {
             Value::String(_) => Some(value.clone()),

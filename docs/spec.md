@@ -224,7 +224,7 @@ Not in public docs. Prod is built in. Internal users add other environments and 
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
-| `base_url` | string (URL) | yes | The Rayline API for that environment. |
+| `base_url` | string (URL) | yes | The Rayline API for that environment: `https`, or `http` on a loopback host, with no `user:password@`. Any other URL is a load error naming the key and the URL. |
 | `login_url` | string (URL) | yes | The page `rayline auth login` opens. |
 
 An environment name is one or more ASCII letters, digits, `-` and `_`. The same rule applies to `--env`, to the names under `environments`, and to the environment slots in `credentials.json`. Any other name is an error that names it.

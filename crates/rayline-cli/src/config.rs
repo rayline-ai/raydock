@@ -712,11 +712,21 @@ impl<'a> Doc<'a> {
         key: &str,
     ) -> Result<Environment, ConfigError> {
         self.known_keys(entry, key, &["base_url", "login_url"])?;
+        let base_url_key = child(key, "base_url");
+        let base_url = self.url(self.required(entry, key, "base_url")?, &base_url_key)?;
+        // Decisions go only to an environment's router, so a router URL they
+        // could not go to is an error here rather than a refusal later.
+        if let Some(problem) = rayline_local_router::decisions_url::router_url_problem(&base_url) {
+            return Err(self.err(
+                base_url_key,
+                format!(
+                    "{problem}, not {}",
+                    rayline_local_router::decisions_url::without_credentials(&base_url)
+                ),
+            ));
+        }
         Ok(Environment {
-            base_url: self.url(
-                self.required(entry, key, "base_url")?,
-                &child(key, "base_url"),
-            )?,
+            base_url,
             login_url: self.url(
                 self.required(entry, key, "login_url")?,
                 &child(key, "login_url"),
@@ -1659,6 +1669,24 @@ mod tests {
                 "must be an http or https URL",
             ),
             (
+                &["environments", "dev", "base_url"],
+                json!("http://api.dev.example.com"),
+                "environments.dev.base_url",
+                "must be https, or http on a loopback host, not http://api.dev.example.com/",
+            ),
+            (
+                &["environments", "dev", "base_url"],
+                json!("https://user:secret@api.dev.example.com"),
+                "environments.dev.base_url",
+                "must not contain user:password@, not https://api.dev.example.com/",
+            ),
+            (
+                &["environments", "dev", "base_url"],
+                json!("http://user@127.0.0.1:9"),
+                "environments.dev.base_url",
+                "must not contain user:password@, not http://127.0.0.1:9/",
+            ),
+            (
                 &["endpoints", "gpu-box", "protocols"],
                 json!(["openai_chat", "anthropic_messages", "openai_chat"]),
                 "endpoints.gpu-box.protocols",
@@ -1690,6 +1718,27 @@ mod tests {
                 key_error(load_doc(&doc)),
                 (key.to_owned(), problem.to_owned()),
                 "{path:?} = {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_environment_router_may_be_http_only_on_loopback() {
+        for base_url in [
+            "http://127.0.0.1:9",
+            "http://localhost:8080",
+            "http://[::1]:9",
+        ] {
+            let mut doc = example();
+            set(
+                &mut doc,
+                &["environments", "dev", "base_url"],
+                json!(base_url),
+            );
+            let settings = load_doc(&doc).unwrap();
+            assert_eq!(
+                settings.environments["dev"].base_url,
+                Url::parse(base_url).unwrap()
             );
         }
     }
