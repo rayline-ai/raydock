@@ -256,7 +256,7 @@ Load refuses, naming the key:
 6. `--env <name>` with no `environments.<name>` entry. `prod` gets no special case.
 7. A routing env override when the file has no `routing` section. The mode comes from the file only.
 8. A `--config <file>` that doesn't exist. Only the default file is optional.
-9. An empty map key, a URL that isn't absolute `http` or `https`, a duplicate in `protocols`, or a `price` missing any of its four fields.
+9. A key repeated in one JSON object, an empty map key, a URL that isn't absolute `http` or `https`, a duplicate in `protocols`, or a `price` missing any of its four fields.
 
 When the local process starts, before it serves anything, it also refuses:
 
