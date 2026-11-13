@@ -82,6 +82,7 @@ impl LaunchPreflight<'_> {
         match resolve_daemon_conflict(
             state.pid,
             &message,
+            self.home,
             self.claude_bin,
             self.config_dir,
             self.allow_isolated,
@@ -390,6 +391,7 @@ fn parse_conflict_choice(answer: &str, allow_isolated: bool) -> ConflictChoice {
 fn resolve_daemon_conflict(
     pid: u32,
     message: &str,
+    home: &Path,
     claude_bin: &Path,
     config_dir: &Path,
     allow_isolated: bool,
@@ -402,21 +404,7 @@ fn resolve_daemon_conflict(
         return Err(RunError::DaemonConflict(message.to_owned()));
     }
 
-    let brand = crate::DISPLAY_NAME;
-    if allow_isolated {
-        let isolated_dir = crate::home()
-            .map(|home| crate::claude::isolated_cc_dir(&home).display().to_string())
-            .unwrap_or_else(|_| format!("~/{}/harness/claude-code", crate::DOT_CONFIG_DIR));
-        eprintln!(
-            "A conflicting Claude Code daemon is running (PID {pid}); it must be stopped or bypassed before this {brand} session can start.\n\n  [s] Stop it and start a {brand} daemon here  ({STOP_COMMAND})\n  [i] Run isolated  (separate daemon under {isolated_dir}; leaves the other running)\n  [c] Cancel"
-        );
-        eprint!("Choose [s/i/c] (s): ");
-    } else {
-        eprintln!(
-            "A conflicting Claude Code daemon is running (PID {pid}); it must be stopped before this {brand} session can start."
-        );
-        eprint!("Stop it and continue? [Y/n] ");
-    }
+    eprint!("{}", conflict_prompt(pid, home, allow_isolated));
     if io::stderr().flush().is_err() {
         return Err(RunError::DaemonConflict(message.to_owned()));
     }
@@ -433,6 +421,23 @@ fn resolve_daemon_conflict(
         ConflictChoice::RunIsolated => Ok(ConflictOutcome::SwitchToIsolated),
         // Declined: print the full instructions so the user can switch by hand.
         ConflictChoice::Cancel => Err(RunError::DaemonConflict(message.to_owned())),
+    }
+}
+
+/// The daemon-conflict prompt. The isolated choice names the isolated config
+/// dir under `home`.
+fn conflict_prompt(pid: u32, home: &Path, allow_isolated: bool) -> String {
+    let brand = crate::DISPLAY_NAME;
+    if allow_isolated {
+        let isolated_dir = crate::claude::isolated_cc_dir(home);
+        format!(
+            "A conflicting Claude Code daemon is running (PID {pid}); it must be stopped or bypassed before this {brand} session can start.\n\n  [s] Stop it and start a {brand} daemon here  ({STOP_COMMAND})\n  [i] Run isolated  (separate daemon under {}; leaves the other running)\n  [c] Cancel\nChoose [s/i/c] (s): ",
+            isolated_dir.display()
+        )
+    } else {
+        format!(
+            "A conflicting Claude Code daemon is running (PID {pid}); it must be stopped before this {brand} session can start.\nStop it and continue? [Y/n] "
+        )
     }
 }
 
@@ -740,6 +745,21 @@ mod tests {
             Value::Array(vec![launch_entry(request, pid, ts)]).to_string(),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_isolated_choice_names_the_isolated_dir_under_home() {
+        let home = temp_home();
+        let prompt = conflict_prompt(42, &home, true);
+        let isolated_dir = crate::claude::isolated_cc_dir(&home);
+        assert!(
+            prompt.contains(&format!(
+                "(separate daemon under {}; leaves the other running)",
+                isolated_dir.display()
+            )),
+            "{prompt}"
+        );
+        assert!(!conflict_prompt(42, &home, false).contains("[i] Run isolated"));
     }
 
     #[test]
