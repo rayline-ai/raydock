@@ -1,9 +1,10 @@
-//! Windows support for hybrid runtime state, shared by the CLI and `rld`.
+//! Windows support for hybrid runtime state, shared by the CLI and the local
+//! process.
 //!
 //! Unix keeps hybrid state private with 0700/0600 modes. Windows has no mode
 //! bits, so the same files get a protected DACL that grants only the current
-//! user. A named event gives the CLI a graceful way to stop a detached `rld`
-//! that has no console it can signal and no gateway serving yet.
+//! user. A named event gives the CLI a graceful way to stop a detached local
+//! process that has no console it can signal and no gateway serving yet.
 
 use std::ffi::OsStr;
 use std::io;
@@ -227,7 +228,7 @@ fn stop_event_name(pid: u32) -> Vec<u16> {
     wide(OsStr::new(&format!("Local\\rayline-hybrid-stop-{pid}")))
 }
 
-/// The event a running `rld` waits on; `request_stop` with its pid sets it.
+/// The event a running local process waits on; `request_stop` with its pid sets it.
 pub struct StopEvent(Handle);
 
 // SAFETY: an event handle may be waited on from any thread.
@@ -261,7 +262,7 @@ impl StopEvent {
     }
 }
 
-/// Ask the `rld` with `pid` to stop gracefully. `NotFound` means no such
+/// Ask the local process with `pid` to stop gracefully. `NotFound` means no such
 /// event: the process is gone, or it is not a hybrid supervisor.
 pub fn request_stop(pid: u32) -> io::Result<()> {
     let name = stop_event_name(pid);

@@ -16,6 +16,17 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "target/debug/raydock"
+# A core that speaks contract version 99. Like the fixture, it writes its pid
+# beside the config and exits when the local process closes its stdin.
+INCOMPATIBLE_CORE = """#!/usr/bin/env python3
+import json, os, pathlib, sys, threading, time
+config = pathlib.Path(sys.argv[sys.argv.index("--config") + 1])
+config.with_suffix(".pid").write_text(str(os.getpid()))
+if os.environ.get("RAYLINE_EXEC_PARENT_PIPE") == "1":
+    threading.Thread(target=lambda: (sys.stdin.buffer.read(), os._exit(0)), daemon=True).start()
+print(json.dumps({"contract_version": 99, "listen_url": "http://127.0.0.1:9", "pid": os.getpid()}), flush=True)
+time.sleep(3600)
+"""
 
 
 def main():
@@ -36,10 +47,8 @@ def main():
         credential_env = sorted(local_env + ["RAYLINE_ROUTER_API_KEY"])
         for name in local_env:
             env[name] = "synthetic-runtime-only-" + name
-        for name in ("RAYLINE_ROUTER_API_KEY", "RAYLINE_EXEC_AUTH_TOKEN", "RAYLINE_API_KEY"):
+        for name in ("RAYLINE_ROUTER_API_KEY", "RAYLINE_EXEC_AUTH_TOKEN"):
             env.pop(name, None)
-        # The fixture core writes its requests here.
-        env["RAYLINE_FIXTURE_EVENTS"] = str(root / "events.jsonl")
         core = installed / "rayline-core"
         shutil.copy(ROOT / "crates/rayline-cli/tests/fixtures/execution-contract.py", core)
         core.chmod(0o700)
@@ -142,7 +151,8 @@ print('harness request reached execution core')
             harness.chmod(0o700)
             env["PATH"] = str(harness_dir) + os.pathsep + env["PATH"]
             assert "harness request reached execution core" in run("claude", "--", "-p", "test")
-            event = json.loads((root / "events.jsonl").read_text().splitlines()[-1])
+            # The fixture core writes its requests beside the config it was given.
+            event = json.loads((state / "events.jsonl").read_text().splitlines()[-1])
             assert event["path"] == "/v1/messages"
             # The local process hands the core the saved router key (Decisions
             # and the cloud pins) and the endpoints' keys. The fixture lists a
@@ -224,9 +234,8 @@ print(json.dumps(sys.argv[1:]))
             local("stop")
             wait_dead(third["core_pid"])
             # An incompatible core fails startup and leaves no owned process/state.
-            env["RAYLINE_FIXTURE_CONTRACT_VERSION"] = "99"
+            core.write_text(INCOMPATIBLE_CORE)
             raydock_cmd("--env", "fixture", "local", "start", success=False)
-            env.pop("RAYLINE_FIXTURE_CONTRACT_VERSION")
             # The core receives Raydock's composed configuration.
             wait_dead(int((state / "core-config.pid").read_text()))
             assert not (state / "ready.json").exists()

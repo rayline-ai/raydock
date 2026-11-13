@@ -37,9 +37,8 @@ pub const ARC_SAGE_MODEL: &str = "arc-sage-1.0";
 /// The model a hosted harness launch gives subagents and background tasks,
 /// where the harness tells them apart from the main agent: ARC Swift.
 pub const ARC_SWIFT_MODEL: &str = "arc-swift-1.0";
-/// The virtual model of the routers that run on this machine: the local
-/// router reads it as "route by `routes.main`", and it is the hybrid execution
-/// core's only model. It names no hosted model; the hosted router refuses it.
+/// The virtual model of the local process: the hybrid execution core's only
+/// model. It names no hosted model; the hosted router refuses it.
 pub const VIRTUAL_ROUTER_MODEL: &str = "rayline-auto";
 pub const UPDATE_BASE_URL: &str = "https://get.rayline.ai";
 pub const INSTALLER_URL: &str = "https://get.rayline.ai/install.sh";

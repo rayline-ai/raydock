@@ -152,8 +152,8 @@ impl Runtime {
         ));
         fs::create_dir(&dir).unwrap();
         let script = install_core(&dir);
-        let mut config = json!({"events":dir.join("events.jsonl"),
-            "cancelled":dir.join("cancelled"), "contract_version":version,
+        // The fixture writes its requests to events.jsonl beside this config.
+        let mut config = json!({"cancelled":dir.join("cancelled"), "contract_version":version,
             "handshake_delay":delay, "decisions": {"url": decisions_url, "auth_env": "RAYLINE_ROUTER_API_KEY"},
             "launcher": cfg!(windows)});
         if let Some(capabilities) = capabilities {

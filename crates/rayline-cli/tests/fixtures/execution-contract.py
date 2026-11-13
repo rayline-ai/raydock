@@ -15,14 +15,15 @@ parser.add_argument("--config", required=True)
 parser.add_argument("--listen", required=True)
 args = parser.parse_args()
 config = json.loads(pathlib.Path(args.config).read_text())
-# A config `raydock hybrid start` builds names no fixture files; the launch
-# environment does.
-events = pathlib.Path(config["events"] if "events" in config else os.environ["RAYLINE_FIXTURE_EVENTS"])
+# The requests go beside the config, which `rayline local start` builds with
+# no fixture keys.
+events = pathlib.Path(args.config).parent / "events.jsonl"
 token = os.environ["RAYLINE_EXEC_AUTH_TOKEN"]
 credential_env = [entry["auth_env"] for entry in
                   [config.get("decisions", {})] + config.get("deployments", []) if entry.get("auth_env")]
 pathlib.Path(args.config).with_suffix(".pid").write_text(str(os.getpid()))
-# Windows runs this script through a .cmd launcher, the process rld spawned.
+# Windows runs this script through a .cmd launcher, the process the local
+# process spawned.
 core_pid = os.getppid() if config.get("launcher") else os.getpid()
 
 
@@ -184,8 +185,7 @@ class Server(http.server.ThreadingHTTPServer):
 
 server = Server(("127.0.0.1", 0), Handler)
 time.sleep(config.get("handshake_delay", 0))
-contract_version = int(os.environ.get("RAYLINE_FIXTURE_CONTRACT_VERSION", config.get("contract_version", 1)))
-print(json.dumps({"contract_version": contract_version,
+print(json.dumps({"contract_version": config["contract_version"],
                   "listen_url": "http://127.0.0.1:" + str(server.server_port),
                   "pid": core_pid}), flush=True)
 server.serve_forever()

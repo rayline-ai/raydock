@@ -10,8 +10,16 @@ use serde_json::Value;
 #[derive(Clone, Deserialize)]
 struct Deployment {
     id: String,
-    kind: String,
+    kind: DeploymentKind,
     wire_model: String,
+}
+
+/// Where a deployment runs: this machine or Rayline cloud.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum DeploymentKind {
+    Local,
+    Cloud,
 }
 
 #[derive(Default)]
@@ -23,15 +31,18 @@ pub(super) struct RoutingMetadata {
 }
 
 impl RoutingMetadata {
-    pub(super) fn from_config(config: &Value) -> Self {
+    /// The attribution data in the core config. A deployment that does not
+    /// parse, such as one whose `kind` is neither `local` nor `cloud`, is an
+    /// error naming it.
+    pub(super) fn from_config(config: &Value) -> Result<Self, String> {
         let mut metadata = Self::default();
         if let Some(deployments) = config.get("deployments").and_then(Value::as_array) {
-            for value in deployments {
-                if let Ok(deployment) = serde_json::from_value::<Deployment>(value.clone()) {
-                    metadata
-                        .deployments
-                        .insert(deployment.id.clone(), deployment);
-                }
+            for (index, value) in deployments.iter().enumerate() {
+                let deployment = serde_json::from_value::<Deployment>(value.clone())
+                    .map_err(|error| format!("core config `deployments[{index}]`: {error}"))?;
+                metadata
+                    .deployments
+                    .insert(deployment.id.clone(), deployment);
             }
         }
         for field in ["derived_actions", "bindings"] {
@@ -75,7 +86,7 @@ impl RoutingMetadata {
             .pointer("/decisions/routing/policy/preset")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        metadata
+        Ok(metadata)
     }
 
     fn deployment(
@@ -141,17 +152,15 @@ impl RoutingMetadata {
                 executed_control_id: header(headers, "x-rayline-executed-control-id"),
                 wire_model: deployment.map(|deployment| deployment.wire_model.clone()),
             });
-        let target = deployment
-            .map(|deployment| match deployment.kind.as_str() {
-                "local" => "local",
-                "cloud" => "remote",
-                _ => "unknown",
-            })
-            .unwrap_or("unknown");
+        // A receipt with no unambiguous deployment has no target.
+        let target = deployment.map(|deployment| match deployment.kind {
+            DeploymentKind::Local => "local",
+            DeploymentKind::Cloud => "remote",
+        });
         observation.metrics.record(MetricsUpdate::RouteDecided {
             request_id: observation.id.clone(),
             route_id: header(headers, "x-rayline-route-id"),
-            target: target.to_owned(),
+            target: target.map(str::to_owned),
             endpoint_id: deployment.map(|deployment| deployment.id.clone()),
             requested_model: None,
             policy: self.policy.clone(),
@@ -227,7 +236,7 @@ impl RequestObservation {
         self.metrics.record(MetricsUpdate::RouteDecided {
             request_id: self.id.clone(),
             route_id: None,
-            target: "remote".to_owned(),
+            target: Some("remote".to_owned()),
             endpoint_id: None,
             requested_model: None,
             policy: Some("classifier cloud pin".to_owned()),
@@ -281,7 +290,8 @@ mod tests {
         let metadata = RoutingMetadata::from_config(&json!({
             "deployments": [{"id":"spark","kind":"local","wire_model":"served-glm"}],
             "bindings": [{"worker":"glm","action_id":"a1","deployment_id":"spark"}]
-        }));
+        }))
+        .unwrap();
         let metrics = RouterMetrics::new("hybrid");
         let observation =
             RequestObservation::start(metrics.clone(), br#"{"model":"rayline-auto"}"#);
@@ -344,7 +354,7 @@ mod tests {
                 {"id":"cloud","kind":"cloud","wire_model":"cloud-wire"},
                 {"id":"local","kind":"local","wire_model":"local-wire"}
             ]);
-            let metadata = RoutingMetadata::from_config(&config);
+            let metadata = RoutingMetadata::from_config(&config).unwrap();
             let metrics = RouterMetrics::new("hybrid");
             let mut observation = RequestObservation::start(metrics.clone(), b"{}");
             let mut headers = HeaderMap::new();
@@ -359,11 +369,7 @@ mod tests {
             metadata.record(&observation, &headers, "instance");
             observation.finish(200, None);
             let snapshot = metrics.snapshot();
-            assert_eq!(
-                snapshot.recent[0].target.as_deref(),
-                Some("unknown"),
-                "{config}"
-            );
+            assert!(snapshot.recent[0].target.is_none(), "{config}");
             assert!(snapshot.recent[0].endpoint_id.is_none());
             assert_eq!(snapshot.totals.remote_requests, 0);
             assert_eq!(snapshot.totals.local_requests, 0);
@@ -375,7 +381,8 @@ mod tests {
         let metadata = RoutingMetadata::from_config(&json!({
             "deployments": [{"id":"a","kind":"local","wire_model":"m"},{"id":"b","kind":"cloud","wire_model":"m"}],
             "derived_actions": [{"worker":"w","deployment_id":"a"},{"worker":"w","deployment_id":"b"}]
-        }));
+        }))
+        .unwrap();
         assert!(metadata.deployment(Some("w"), None, Some("m")).is_none());
         let metrics = RouterMetrics::new("hybrid");
         let observation = RequestObservation::start(metrics.clone(), b"{}");
@@ -383,5 +390,16 @@ mod tests {
         headers.insert("x-rayline-instance-id", "old-instance".parse().unwrap());
         metadata.record(&observation, &headers, "new-instance");
         assert!(metrics.snapshot().active[0].target.is_none());
+    }
+
+    #[test]
+    fn a_deployment_kind_other_than_local_or_cloud_is_an_error_naming_it() {
+        let error = RoutingMetadata::from_config(&json!({
+            "deployments": [{"id":"a","kind":"local","wire_model":"m"},{"id":"b","kind":"gpu","wire_model":"m"}]
+        }))
+        .err()
+        .expect("an unknown kind is refused");
+        assert!(error.contains("`deployments[1]`"), "{error}");
+        assert!(error.contains("`gpu`"), "{error}");
     }
 }
