@@ -135,7 +135,7 @@ fn forwarded_model_arg(args: &[OsString]) -> Option<String> {
 #[derive(Debug)]
 pub enum RunError {
     ClaudeMissing,
-    HomeNotFound,
+    HomeNotFound(crate::HomeError),
     DaemonConflict(String),
     Router(String),
     Auth(crate::status::AuthError),
@@ -148,7 +148,7 @@ impl std::fmt::Display for RunError {
             Self::ClaudeMissing => formatter.write_str(
                 "`claude` not found on PATH. Install Claude Code: https://docs.claude.com/en/docs/claude-code/setup",
             ),
-            Self::HomeNotFound => formatter.write_str("home directory not found"),
+            Self::HomeNotFound(error) => error.fmt(formatter),
             Self::DaemonConflict(message) => formatter.write_str(message),
             Self::Router(message) => formatter.write_str(message),
             Self::Auth(error) => error.fmt(formatter),
@@ -168,7 +168,7 @@ impl From<crate::status::AuthError> for RunError {
 }
 
 pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
-    let home = dirs::home_dir().ok_or(RunError::HomeNotFound)?;
+    let home = crate::home().map_err(RunError::HomeNotFound)?;
     let claude_bin = find_claude_bin(&home).ok_or(RunError::ClaudeMissing)?;
     run_command_from_home(request, &home, claude_bin).await
 }

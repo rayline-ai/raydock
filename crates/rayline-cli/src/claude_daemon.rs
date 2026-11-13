@@ -400,9 +400,9 @@ fn resolve_daemon_conflict(
 
     let brand = crate::DISPLAY_NAME;
     if allow_isolated {
-        let isolated_dir = dirs::home_dir()
+        let isolated_dir = crate::home()
             .map(|home| crate::claude::isolated_cc_dir(&home).display().to_string())
-            .unwrap_or_else(|| format!("~/{}/harness/claude-code", crate::DOT_CONFIG_DIR));
+            .unwrap_or_else(|_| format!("~/{}/harness/claude-code", crate::DOT_CONFIG_DIR));
         eprintln!(
             "A conflicting Claude Code daemon is running (PID {pid}); it must be stopped or bypassed before this {brand} session can start.\n\n  [s] Stop it and start a {brand} daemon here  ({STOP_COMMAND})\n  [i] Run isolated  (separate daemon under {isolated_dir}; leaves the other running)\n  [c] Cancel"
         );

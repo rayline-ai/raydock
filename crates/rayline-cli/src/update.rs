@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use minisign_verify::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::config::UpdateChannel;
 
@@ -15,12 +16,12 @@ const CORE_LICENSE_NAME: &str = "rayline-core-LICENSE";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateRequest {
-    pub pinned_version: Option<String>,
+    pub pinned_version: Option<Version>,
     pub force: bool,
     pub check_only: bool,
     pub dry_run: bool,
     /// Hidden `--base-url`: where releases are read from.
-    pub base_url: Option<String>,
+    pub base_url: Option<Url>,
     /// Hidden `--install-path`: which binary is replaced.
     pub install_path: Option<PathBuf>,
 }
@@ -63,6 +64,31 @@ impl std::fmt::Display for UpdateError {
 
 impl std::error::Error for UpdateError {}
 
+/// Maps an io error to an install error that names the failed operation and
+/// the path it was on.
+pub(crate) fn io_failed<'a>(
+    operation: &'a str,
+    path: &'a Path,
+) -> impl FnOnce(io::Error) -> UpdateError + 'a {
+    move |error| UpdateError::Install(format!("failed to {operation} {}: {error}", path.display()))
+}
+
+/// Maps an io error to an install error that names the failed operation and
+/// both of its paths.
+fn io_failed_between<'a>(
+    operation: &'a str,
+    from: &'a Path,
+    to: &'a Path,
+) -> impl FnOnce(io::Error) -> UpdateError + 'a {
+    move |error| {
+        UpdateError::Install(format!(
+            "failed to {operation} {} to {}: {error}",
+            from.display(),
+            to.display()
+        ))
+    }
+}
+
 /// `rayline update` on `channel`, the loaded `update.channel`.
 pub async fn run(
     request: &UpdateRequest,
@@ -88,8 +114,8 @@ async fn run_on(
 ) -> Result<UpdateResult, UpdateError> {
     let base_url = request
         .base_url
-        .as_deref()
-        .unwrap_or(crate::UPDATE_BASE_URL)
+        .as_ref()
+        .map_or(crate::UPDATE_BASE_URL, Url::as_str)
         .trim_end_matches('/');
     let install_path = install_path(request.install_path.as_deref()).map_err(|error| {
         UpdateError::Install(format!(
@@ -108,7 +134,7 @@ async fn run_on(
             stderr: false,
         });
     }
-    if is_homebrew_managed(&install_path) {
+    if is_homebrew_managed(&install_path)? {
         return Ok(UpdateResult {
             message: format!(
                 "Installed via Homebrew. Run `brew upgrade {}` to update.\n",
@@ -121,50 +147,21 @@ async fn run_on(
     let platform_tag = detect_platform_tag()?;
     let current = Version::parse(crate::RAYLINE_VERSION)
         .map_err(|_| UpdateError::InvalidVersion(crate::RAYLINE_VERSION.to_owned()))?;
-    let target = match request.pinned_version.as_deref() {
-        Some(version) => {
-            Version::parse(version).map_err(|_| UpdateError::InvalidVersion(version.to_owned()))?
-        }
+    let target = match &request.pinned_version {
+        Some(version) => version.clone(),
         None => fetch_latest_version(base_url, channel, pubkeys).await?,
     };
 
-    let mut decision = evaluate_check(
+    let decision = evaluate_check(
         &current,
         &target,
         request.pinned_version.is_some(),
         request.force,
     );
-    let core_install_path =
-        install_path.with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
-    if decision.exit_code == 0 && !core_install_path.is_file() {
-        if target.normalized != current.normalized {
-            // This build is newer than the channel's latest pointer: there is
-            // nothing to update to, so report that and name the repair rather
-            // than failing the check.
-            return Ok(UpdateResult {
-                message: format!(
-                    "{}Execution core is missing; repair it with `raydock update --version {}`.\n",
-                    decision.message, current.normalized
-                ),
-                ..decision
-            });
-        }
-        decision = UpdateResult {
-            message: format!(
-                "Execution core is missing; reinstall the complete {} release with `raydock update`.\n",
-                current.public
-            ),
-            exit_code: 1,
-            stderr: false,
-        };
-    }
     if decision.exit_code == 0 || request.check_only {
         return Ok(decision);
     }
 
-    if !core_install_path.is_file() {
-        eprintln!("Execution core is missing; verifying the complete release.");
-    }
     let temp_dir = temp_update_dir()?;
     let artifacts = download_and_verify(base_url, &target, platform_tag, &temp_dir, pubkeys).await;
     let result = match artifacts {
@@ -181,6 +178,8 @@ async fn run_on(
                     stderr: false,
                 })
             } else {
+                let core_install_path = install_path
+                    .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
                 let license_install_path = core_install_path.with_file_name(CORE_LICENSE_NAME);
                 #[cfg(windows)]
                 if let Err(error) = cleanup_retired_backups(&install_path) {
@@ -392,7 +391,7 @@ async fn download_and_verify(
     pubkeys: &[&str],
 ) -> Result<UpdateArtifacts, UpdateError> {
     let version = target.normalized.as_str();
-    fs::create_dir_all(dest_dir).map_err(UpdateError::from)?;
+    fs::create_dir_all(dest_dir).map_err(io_failed("create", dest_dir))?;
     let launcher_name = format!("{}-{platform_tag}", crate::CLI_ASSET);
     let launcher_path = dest_dir.join(&launcher_name);
     let core_name = format!("rayline-core-{platform_tag}");
@@ -410,8 +409,8 @@ async fn download_and_verify(
 
     // Verify signature BEFORE reading or trusting the checksums file.
     // Fail closed: missing or invalid signature aborts the update.
-    let sums_bytes = fs::read(&sums_path).map_err(UpdateError::from)?;
-    let sig_bytes = fs::read(&sig_path).map_err(UpdateError::from)?;
+    let sums_bytes = fs::read(&sums_path).map_err(io_failed("read", &sums_path))?;
+    let sig_bytes = fs::read(&sig_path).map_err(io_failed("read", &sig_path))?;
     verify_signature(&sums_bytes, &sig_bytes, pubkeys)?;
 
     let sums = String::from_utf8(sums_bytes)
@@ -447,8 +446,9 @@ async fn download_and_verify(
 pub(crate) async fn download_to(url: &str, path: &Path) -> Result<(), UpdateError> {
     let part = path.with_extension("part");
     if let Some(source) = url.strip_prefix("file://") {
-        fs::copy(source, &part).map_err(UpdateError::from)?;
-        fs::rename(&part, path).map_err(UpdateError::from)?;
+        let source = Path::new(source);
+        fs::copy(source, &part).map_err(io_failed_between("copy", source, &part))?;
+        fs::rename(&part, path).map_err(io_failed_between("move", &part, path))?;
         return Ok(());
     }
 
@@ -470,8 +470,8 @@ pub(crate) async fn download_to(url: &str, path: &Path) -> Result<(), UpdateErro
         .bytes()
         .await
         .map_err(|error| UpdateError::Network(format!("download failed for {url}: {error}")))?;
-    fs::write(&part, bytes).map_err(UpdateError::from)?;
-    fs::rename(&part, path).map_err(UpdateError::from)?;
+    fs::write(&part, bytes).map_err(io_failed("write", &part))?;
+    fs::rename(&part, path).map_err(io_failed_between("move", &part, path))?;
     Ok(())
 }
 
@@ -514,7 +514,7 @@ pub(crate) fn verify_checksum(
 }
 
 fn sha256_file(path: &Path) -> Result<String, UpdateError> {
-    let bytes = fs::read(path).map_err(UpdateError::from)?;
+    let bytes = fs::read(path).map_err(io_failed("read", path))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
@@ -536,11 +536,14 @@ fn resolve_install_path(path: PathBuf) -> PathBuf {
     fs::canonicalize(&path).unwrap_or(path)
 }
 
-pub(crate) fn is_homebrew_managed(install_path: &Path) -> bool {
-    let Some(prefix) = homebrew_prefix() else {
-        return false;
-    };
-    path_is_under_prefix(install_path, &prefix)
+/// True when `install_path` is under Homebrew's prefix. Without `brew` on
+/// `PATH` nothing is Homebrew-managed; a `brew --prefix` that fails is an
+/// error.
+pub(crate) fn is_homebrew_managed(install_path: &Path) -> Result<bool, UpdateError> {
+    Ok(match command_on_path("brew") {
+        Some(brew) => path_is_under_prefix(install_path, &brew_prefix(&brew)?),
+        None => false,
+    })
 }
 
 /// True when the running `rayline` lives inside a `.app` bundle (directly, or via a
@@ -561,22 +564,27 @@ fn path_is_under_prefix(install_path: &Path, prefix: &Path) -> bool {
     install_path.starts_with(prefix)
 }
 
-fn homebrew_prefix() -> Option<PathBuf> {
-    let brew = command_on_path("brew")?;
+/// The prefix `brew --prefix` prints, run with the `brew` at `brew`.
+fn brew_prefix(brew: &Path) -> Result<PathBuf, UpdateError> {
+    let failed = |reason: String| {
+        UpdateError::Install(format!(
+            "`brew --prefix` ({}) failed: {reason}",
+            brew.display()
+        ))
+    };
     let output = Command::new(brew)
         .arg("--prefix")
         .stdin(Stdio::null())
         .output()
-        .ok()?;
+        .map_err(|error| failed(error.to_string()))?;
     if !output.status.success() {
-        return None;
+        return Err(failed(output.status.to_string()));
     }
-    let prefix = String::from_utf8(output.stdout).ok()?;
-    let prefix = prefix.trim();
-    if prefix.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(prefix))
+    let prefix = String::from_utf8(output.stdout)
+        .map_err(|_| failed("it printed a prefix that is not UTF-8".to_owned()))?;
+    match prefix.trim() {
+        "" => Err(failed("it printed no prefix".to_owned())),
+        prefix => Ok(PathBuf::from(prefix)),
     }
 }
 
@@ -694,8 +702,9 @@ pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), 
 /// and must not stop installation of the remaining companion binaries.
 #[cfg(any(windows, test))]
 fn retire_replaced_backup(backup: &Path, install_path: &Path) {
-    let result = sidecar_install_path(install_path, "old")
-        .and_then(|retired| fs::rename(backup, retired).map_err(UpdateError::from));
+    let result = sidecar_install_path(install_path, "old").and_then(|retired| {
+        fs::rename(backup, &retired).map_err(io_failed_between("move", backup, &retired))
+    });
     if let Err(error) = result {
         eprintln!(
             "Updated {}; retained previous file at {} because it could not be marked for cleanup: {error}. Remove it manually after older sessions and installers exit.",
@@ -749,13 +758,13 @@ fn cleanup_retired_backups(install_path: &Path) -> Result<(), UpdateError> {
             parent.display()
         ))
     })? {
-        let entry = entry?;
+        let entry = entry.map_err(io_failed("list update backups in", parent))?;
         if entry.file_name().to_str().is_some_and(is_retired_backup) {
             match entry.file_type() {
                 Ok(kind) if kind.is_file() => remove_retired_backup(&entry.path())?,
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(io_failed("inspect", &entry.path())(error)),
             }
         }
     }
@@ -827,7 +836,7 @@ fn temp_update_dir() -> Result<PathBuf, UpdateError> {
         crate::CLI_BIN,
         std::process::id()
     ));
-    fs::create_dir_all(&path).map_err(UpdateError::from)?;
+    fs::create_dir_all(&path).map_err(io_failed("create", &path))?;
     Ok(path)
 }
 
@@ -1053,18 +1062,69 @@ fn text_rank(text: &str) -> u8 {
     }
 }
 
-impl From<io::Error> for UpdateError {
-    fn from(error: io::Error) -> Self {
-        Self::Network(error.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
     #[test]
-    fn cleanup_removes_only_committed_windows_backups() -> Result<(), UpdateError> {
+    fn a_failing_brew_prefix_is_an_error_naming_it() {
+        let root = std::env::temp_dir().join(format!("raydock-brew-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let missing = root.join("no-such-brew");
+        let error = brew_prefix(&missing).unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("`brew --prefix` ({}) failed: ", missing.display())),
+            "{error}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let script = |name: &str, body: &str| {
+                let path = root.join(name);
+                fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+                path
+            };
+            let exits = script("exits", "exit 3");
+            assert_eq!(
+                brew_prefix(&exits).unwrap_err().to_string(),
+                format!(
+                    "`brew --prefix` ({}) failed: exit status: 3",
+                    exits.display()
+                )
+            );
+            let silent = script("silent", "echo");
+            assert_eq!(
+                brew_prefix(&silent).unwrap_err().to_string(),
+                format!(
+                    "`brew --prefix` ({}) failed: it printed no prefix",
+                    silent.display()
+                )
+            );
+            let prints = script("prints", "echo /opt/homebrew");
+            assert_eq!(
+                brew_prefix(&prints).unwrap(),
+                PathBuf::from("/opt/homebrew")
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_io_failure_names_the_operation_and_path() {
+        let path = std::env::temp_dir().join("raydock-update-no-such-file");
+        let error = sha256_file(&path).unwrap_err().to_string();
+        assert!(
+            error.starts_with(&format!("failed to read {}: ", path.display())),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_only_committed_windows_backups() -> TestResult {
         let root = temp_update_dir()?;
         let retired = [
             ".raydock.exe.old-123-456",
@@ -1115,7 +1175,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_cleanup_retries_locked_retired_backup() -> Result<(), UpdateError> {
+    fn windows_cleanup_retries_locked_retired_backup() -> TestResult {
         use std::os::windows::fs::OpenOptionsExt;
 
         let root = temp_update_dir()?;
@@ -1136,7 +1196,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_swap_defers_cleanup_and_preserves_failed_swap() -> Result<(), UpdateError> {
+    fn windows_swap_defers_cleanup_and_preserves_failed_swap() -> TestResult {
         let root = temp_update_dir()?;
         let installed = root.join("raydock.exe");
         let staged = root.join("staged.exe");
@@ -1155,8 +1215,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_retirement_failure_preserves_committed_install_and_backup() -> Result<(), UpdateError>
-    {
+    fn windows_retirement_failure_preserves_committed_install_and_backup() -> TestResult {
         use std::os::windows::fs::OpenOptionsExt;
 
         let root = temp_update_dir()?;
@@ -1178,7 +1237,7 @@ mod tests {
     }
 
     #[test]
-    fn core_license_installs_as_verified_nonexecutable_data() -> Result<(), UpdateError> {
+    fn core_license_installs_as_verified_nonexecutable_data() -> TestResult {
         let root = temp_update_dir()?;
         let source = root.join("rayline-core-LICENSE");
         let destination = root.join("installed/rayline-core-LICENSE");
@@ -1473,23 +1532,23 @@ mod tests {
 
     /// An install directory holding only `raydock`, and a request that
     /// replaces it from `server`.
-    fn install_from(server: &FakeReleaseServer) -> Result<(PathBuf, UpdateRequest), UpdateError> {
+    fn install_from(server: &FakeReleaseServer) -> TestResult<(PathBuf, UpdateRequest)> {
         let install = temp_update_dir()?;
         let installed = exe(&install, crate::CLI_BIN);
         fs::write(&installed, b"installed")?;
         let request = UpdateRequest {
-            pinned_version: Some(TEST_RELEASE.to_owned()),
+            pinned_version: Some(version(TEST_RELEASE)),
             force: false,
             check_only: false,
             dry_run: false,
-            base_url: Some(format!("{}/", server.base_url)),
+            base_url: Some(Url::parse(&format!("{}/", server.base_url)).unwrap()),
             install_path: Some(installed),
         };
         Ok((install, request))
     }
 
     #[tokio::test]
-    async fn check_reads_the_channel_pointer_from_the_base_url() -> Result<(), UpdateError> {
+    async fn check_reads_the_channel_pointer_from_the_base_url() -> TestResult {
         for (channel, pointer) in [
             (UpdateChannel::Prod, "/cli/latest.txt"),
             (UpdateChannel::Dev, "/cli/latest-dev.txt"),
@@ -1527,7 +1586,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_installs_the_release_at_the_install_path() -> Result<(), UpdateError> {
+    async fn update_installs_the_release_at_the_install_path() -> TestResult {
         let server = FakeReleaseServer::start(release_files("release-SHA256SUMS"));
         let (install, request) = install_from(&server)?;
         let installed = exe(&install, crate::CLI_BIN);
@@ -1583,7 +1642,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_refuses_a_release_without_the_core() -> Result<(), UpdateError> {
+    async fn update_refuses_a_release_without_the_core() -> TestResult {
         let server = FakeReleaseServer::start(release_files("release-no-core-SHA256SUMS"));
         let (install, request) = install_from(&server)?;
         let result = run_on(&request, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await;
@@ -1598,7 +1657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_refuses_a_release_signed_by_another_key() -> Result<(), UpdateError> {
+    async fn update_refuses_a_release_signed_by_another_key() -> TestResult {
         let server = FakeReleaseServer::start(release_files("release-SHA256SUMS"));
         let (install, request) = install_from(&server)?;
         let result = run_on(&request, UpdateChannel::Prod, crate::MINISIGN_PUBLIC_KEYS).await;

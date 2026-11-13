@@ -179,12 +179,13 @@ pub(crate) fn format_timestamp(seconds: i64) -> io::Result<String> {
 }
 
 fn parse(contents: &str) -> Result<Credentials, String> {
-    let value: Value = serde_json::from_str(contents).map_err(|error| {
-        format!(
+    let value = crate::config::parse_json(contents).map_err(|failure| match failure {
+        crate::config::JsonFailure::Syntax(error) => format!(
             "not valid JSON (line {}, column {})",
             error.line(),
             error.column()
-        )
+        ),
+        crate::config::JsonFailure::DuplicateKey(key) => format!("`{key}` appears more than once"),
     })?;
     let root = value
         .as_object()
@@ -498,6 +499,26 @@ mod tests {
             "not valid JSON (line 1, column 12)"
         );
         assert!(parse("").expect_err("empty").starts_with("not valid JSON"));
+    }
+
+    #[test]
+    fn rejects_a_repeated_key_naming_it() {
+        let session = session_json().to_string();
+        let router_key = router_key_json().to_string();
+        let repeated_slot = format!(
+            r#"{{"session": {session}, "router_key": {router_key}, "session": {session}}}"#
+        );
+        let repeated_field = format!(
+            r#"{{"environments": {{"dev": {{"session": {session}, "router_key": {{"api_key": "{API_KEY}", "api_key": "{API_KEY}", "subject": "uid_abc123", "saved_at": "2026-11-12T10:00:05Z"}}}}}}}}"#
+        );
+        for (text, key) in [
+            (repeated_slot, "session"),
+            (repeated_field, "environments.dev.router_key.api_key"),
+        ] {
+            let reason = parse(&text).expect_err("a repeated key");
+            assert_eq!(reason, format!("`{key}` appears more than once"));
+            assert!(!reason.contains(API_KEY), "{reason}");
+        }
     }
 
     #[test]

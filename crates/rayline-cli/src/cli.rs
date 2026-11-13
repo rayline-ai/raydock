@@ -12,7 +12,8 @@ use crate::claude_app::AppAction;
 use crate::codex::CodexAuthMode;
 use crate::config::Protocol;
 use crate::harness::Harness;
-use crate::update::UpdateRequest;
+use crate::update::{UpdateRequest, Version};
+use url::Url;
 
 pub(crate) const ROOT_HELP: &str = "\
 Usage: rayline [OPTIONS] COMMAND [ARGS]...
@@ -176,8 +177,11 @@ pub(crate) enum Parsed {
 pub(crate) enum Command {
     Auth(Auth),
     Run(Run),
-    Top { json: bool },
-    Update(UpdateRequest),
+    Top {
+        json: bool,
+    },
+    /// Boxed: a parsed version and URL make it much larger than the others.
+    Update(Box<UpdateRequest>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -519,7 +523,7 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
                         None => return Ok(Parsed::Help(TOP_HELP)),
                     },
                     "update" => match parse_update(&mut args)? {
-                        Some(request) => Command::Update(request),
+                        Some(request) => Command::Update(Box::new(request)),
                         None => return Ok(Parsed::Help(UPDATE_HELP)),
                     },
                     _ => return Err(ROOT.error(unknown("command", command))),
@@ -599,11 +603,22 @@ fn parse_update(args: &mut Args<'_>) -> Result<Option<UpdateRequest>, UsageError
         match name {
             "--version" => {
                 let value = args.value(name, inline, UPDATE)?;
-                set_once(&mut pinned_version, value.to_owned(), name, UPDATE)?;
+                let version = Version::parse(value).map_err(|_| {
+                    UPDATE.error("invalid `--version` (use a release version such as `1.2.3`)")
+                })?;
+                set_once(&mut pinned_version, version, name, UPDATE)?;
             }
             "--base-url" => {
                 let value = args.value(name, inline, UPDATE)?;
-                set_once(&mut base_url, value.to_owned(), name, UPDATE)?;
+                let url = match Url::parse(value) {
+                    Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+                    _ => {
+                        return Err(
+                            UPDATE.error("`--base-url` must be an absolute http or https URL")
+                        );
+                    }
+                };
+                set_once(&mut base_url, url, name, UPDATE)?;
             }
             "--install-path" => {
                 let value = args.value(name, inline, UPDATE)?;
@@ -1488,16 +1503,37 @@ mod tests {
                 "/tmp/raydock",
             ])
             .1,
-            Command::Update(UpdateRequest {
-                pinned_version: Some("1.2.3".to_owned()),
+            Command::Update(Box::new(UpdateRequest {
+                pinned_version: Some(Version::parse("1.2.3").unwrap()),
                 force: false,
                 check_only: true,
                 dry_run: false,
-                base_url: Some("http://127.0.0.1:1".to_owned()),
+                base_url: Some(Url::parse("http://127.0.0.1:1").unwrap()),
                 install_path: Some(PathBuf::from("/tmp/raydock")),
-            })
+            }))
         );
         assert_error(&["update", "--channel", "dev"], "unexpected `--channel`");
+    }
+
+    #[test]
+    fn update_refuses_a_bad_version_or_base_url_at_parse() {
+        for version in ["latest", "1.2.3+", "v1..2"] {
+            assert_error(
+                &["update", "--version", version],
+                "invalid `--version` (use a release version such as `1.2.3`)",
+            );
+        }
+        for url in [
+            "get.rayline.ai",
+            "/releases",
+            "ftp://get.rayline.ai",
+            "file:///tmp/x",
+        ] {
+            assert_error(
+                &["update", &format!("--base-url={url}")],
+                "`--base-url` must be an absolute http or https URL",
+            );
+        }
     }
 
     // ── Removed forms (section 10.1) ─────────────────────────────────────

@@ -186,8 +186,8 @@ pub struct LoadOptions<'a> {
 /// A config that Rayline refuses to run with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
-    /// The home directory, which holds the default file, was not found.
-    NoHome,
+    /// The home directory, which holds the default file, is unknown.
+    NoHome(crate::HomeError),
     /// The file could not be read.
     Read { file: PathBuf, error: String },
     /// The file is not a JSON object.
@@ -209,7 +209,7 @@ pub enum ConfigError {
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ConfigError::NoHome => write!(f, "home directory not found"),
+            ConfigError::NoHome(error) => error.fmt(f),
             ConfigError::Read { file, error } => write!(f, "{}: {error}", file.display()),
             ConfigError::Parse { file, error } => {
                 write!(f, "{}: {error}", file.display())
@@ -240,7 +240,7 @@ const UPDATE_CHANNEL: (&str, &str) = ("RAYLINE_UPDATE_CHANNEL", "update.channel"
 /// Loads the config. Precedence, lowest to highest: built-in defaults, the
 /// file, env overrides.
 pub fn load(options: &LoadOptions<'_>) -> Result<Settings, ConfigError> {
-    let home = dirs::home_dir().ok_or(ConfigError::NoHome)?;
+    let home = crate::home().map_err(ConfigError::NoHome)?;
     load_in(&home, options)
 }
 
@@ -527,7 +527,7 @@ impl<'a> Doc<'a> {
                 .get("routing")
                 .map(|value| self.routing(value))
                 .transpose()?,
-            environments: self.entries(root, "environments", Self::environment)?,
+            environments: self.environments(root)?,
             update: root
                 .get("update")
                 .map(|value| self.update(value))
@@ -688,6 +688,24 @@ impl<'a> Doc<'a> {
         }))
     }
 
+    /// `environments`, whose names follow the `--env` name rule.
+    fn environments(
+        &self,
+        root: &Map<String, Value>,
+    ) -> Result<BTreeMap<String, Environment>, ConfigError> {
+        let environments = self.entries(root, "environments", Self::environment)?;
+        if let Some(name) = environments
+            .keys()
+            .find(|name| !crate::status::is_valid_root_env(name))
+        {
+            return Err(self.err(
+                child("environments", name),
+                "is not a valid environment name (use letters, digits, `-` and `_`)",
+            ));
+        }
+        Ok(environments)
+    }
+
     fn environment(
         &self,
         entry: &Map<String, Value>,
@@ -826,15 +844,15 @@ pub(crate) fn child(key: &str, name: &str) -> String {
     }
 }
 
-/// Why the file's text is not a config document.
-enum JsonFailure {
+/// Why a file's text is not a JSON document Rayline accepts.
+pub(crate) enum JsonFailure {
     Syntax(serde_json::Error),
     /// An object repeats a key: the repeated key.
     DuplicateKey(String),
 }
 
 /// Parses JSON text, refusing any object that repeats a key.
-fn parse_json(text: &str) -> Result<Value, JsonFailure> {
+pub(crate) fn parse_json(text: &str) -> Result<Value, JsonFailure> {
     let duplicate = RefCell::new(None);
     let mut deserializer = serde_json::Deserializer::from_str(text);
     let parsed = StrictValue {
@@ -1598,6 +1616,25 @@ mod tests {
         }
         let empty = temp_home();
         assert_eq!(key_error(load(&empty, opts(Mode::Local))).0, "routing");
+    }
+
+    #[test]
+    fn environment_names_follow_the_env_name_rule() {
+        for name in ["dev.eu", "dev eu", "dév"] {
+            let mut doc = example();
+            set(
+                &mut doc,
+                &["environments", name],
+                json!({"base_url": "https://dev.example.test", "login_url": "https://dev.example.test/cli-auth"}),
+            );
+            assert_eq!(
+                key_error(load_doc(&doc)),
+                (
+                    child("environments", name),
+                    "is not a valid environment name (use letters, digits, `-` and `_`)".to_owned()
+                )
+            );
+        }
     }
 
     #[test]

@@ -174,7 +174,7 @@ fn run_inner(request: &AppRequest) -> Result<String, String> {
 }
 
 fn restore() -> Result<bool, String> {
-    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    let home = crate::home().map_err(|error| error.to_string())?;
     let _lease = lifecycle_lock(&home).map_err(|error| error.to_string())?;
     desktop::restore(&home).map_err(|error| error.to_string())
 }

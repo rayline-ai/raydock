@@ -1,7 +1,5 @@
 //! The installed binary refuses a bad command line or config before it runs
-//! anything (docs/spec.md sections 3 and 5.8). Unix only: on Windows the home
-//! directory does not come from `HOME`.
-#![cfg(unix)]
+//! anything (docs/spec.md sections 3 and 5.8).
 
 use std::fs;
 use std::path::PathBuf;
@@ -41,6 +39,7 @@ impl Home {
             .args(args)
             .current_dir(&self.0)
             .env("HOME", &self.0)
+            .env("USERPROFILE", &self.0)
             .env("PATH", "")
             .output()
             .expect("run raydock")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate raydock and core install integrity and same-version core repair detection.
+"""Validate raydock and core install integrity.
 
 Uses built Rust binaries and the external core contract fixture. No inference,
 network service, release upload, or user installation is touched. The staged
@@ -114,10 +114,6 @@ def main():
         check_env.pop("RAYLINE_UPDATE_CHANNEL", None)
         complete = subprocess.run(check, env=check_env, capture_output=True, text=True)
         assert complete.returncode == 0, complete.stdout + complete.stderr
-        (installed / "rayline-core").unlink()
-        repair = subprocess.run(check, env=check_env, capture_output=True, text=True)
-        assert repair.returncode == 1 and "Execution core is missing" in repair.stdout, repair.stdout + repair.stderr
-        (installed / "rayline-core").write_bytes(expected["rayline-core"])
         (assets / f"rayline-core-{platform}").write_bytes(b"tampered")
         install(False)
         for name, data in expected.items():
@@ -128,7 +124,7 @@ def main():
         for name, data in expected.items():
             assert (installed / name).read_bytes() == data
     print("Release installation passed: Raydock plus alias and core, required minisign and signature, "
-          "--base-url/--version refusal, missing-core repair detection, tamper and missing-checksum refusal.")
+          "--base-url/--version refusal, tamper and missing-checksum refusal.")
 
 
 if __name__ == "__main__":

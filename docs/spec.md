@@ -216,6 +216,8 @@ Not in public docs. Prod is built in. Internal users add other environments and 
 | `base_url` | string (URL) | yes | The Rayline API for that environment. |
 | `login_url` | string (URL) | yes | The page `rayline auth login` opens. |
 
+An environment name is one or more ASCII letters, digits, `-` and `_`. The same rule applies to `--env`, to the names under `environments`, and to the environment slots in `credentials.json`. Any other name is an error that names it.
+
 ### 5.6 Internal: `update`
 
 Not in public docs.
@@ -301,7 +303,7 @@ One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `ses
 
 1. The settings overrides in section 5.7.
 2. The env var each endpoint's `api_key_env` names.
-3. OS: `PATH`, `NO_COLOR`.
+3. OS: `PATH`, and the home directory. One function reads it, from `HOME` on unix and `USERPROFILE` on Windows. When that var is unset or empty, it is an error that names the var. There is no other source for the home directory.
 4. Harness homes, read to find a harness's own files: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `PI_CONFIG_DIR`, `XDG_STATE_HOME`, `OPENCLAW_CONTAINER`.
 5. Values the user set for a harness, passed on unchanged: `NODE_USE_SYSTEM_CA`, `CLAUDE_CODE_AUTO_MODE_SERVER`, `CLAUDE_CODE_DISABLE_AGENT_VIEW`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`.
 6. Shared Hugging Face cache: `HF_HOME`, `HF_HUB_CACHE`.

@@ -1,8 +1,4 @@
-#![cfg(unix)]
-
 use std::fs;
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,6 +24,7 @@ impl Home {
         Command::new(env!("CARGO_BIN_EXE_raydock"))
             .env_clear()
             .env("HOME", &self.0)
+            .env("USERPROFILE", &self.0)
             .env("PATH", "/usr/bin:/bin")
             .args(["run", "claude-desktop", action])
             .output()
@@ -63,8 +60,12 @@ fn local_process_commands_are_not_available_yet() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn restoring_commands_observe_the_same_cross_process_lease() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let home = Home::new();
     let lock = fs::OpenOptions::new()
         .create_new(true)

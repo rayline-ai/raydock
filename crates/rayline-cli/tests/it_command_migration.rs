@@ -22,8 +22,16 @@ impl Installation {
             .join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
     }
 
+    /// Runs `name` with the installation as its home and no `RAYLINE_*` env
+    /// from the caller.
     fn run(&self, name: &str, args: &[&str]) -> Output {
-        Command::new(self.binary(name))
+        let mut command = Command::new(self.binary(name));
+        for (var, _) in std::env::vars_os() {
+            if var.to_string_lossy().starts_with("RAYLINE_") {
+                command.env_remove(var);
+            }
+        }
+        command
             .args(args)
             .env("HOME", &self.0)
             .env("USERPROFILE", &self.0)

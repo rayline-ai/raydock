@@ -77,7 +77,7 @@ pub(crate) async fn resolve_provider(
     hosted: &crate::status::HostedEnvironment,
 ) -> Result<Provider, String> {
     auth_mode.require_auto()?;
-    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
+    let home = crate::home().map_err(|error| error.to_string())?;
     let router_url = crate::harness::normalize_router_url(&hosted.base_url);
     let key = crate::status::router_key(hosted, &home)
         .await
@@ -118,9 +118,12 @@ pub async fn run(request: RunRequest) -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let Some(home) = dirs::home_dir() else {
-        eprintln!("Error: home directory not found");
-        return ExitCode::from(1);
+    let home = match crate::home() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            return ExitCode::from(1);
+        }
     };
     let codex_home = codex_home(&home);
     if let Err(error) =
@@ -179,10 +182,12 @@ pub async fn configure(request: &ConfigureRequest) -> io::Result<String> {
     let provider = resolve_provider(request.auth_mode, request.model.as_deref(), &request.hosted)
         .await
         .map_err(io::Error::other)?;
-    let codex_home = std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    let codex_home = match std::env::var_os("CODEX_HOME") {
+        Some(codex_home) => PathBuf::from(codex_home),
+        None => crate::home()
+            .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?
+            .join(".codex"),
+    };
     std::fs::create_dir_all(&codex_home)?;
     let profile_path = codex_home.join("rayline.config.toml");
     crate::harness::write_private(&profile_path, &provider_config_toml(&provider))?;
@@ -205,7 +210,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 #[cfg(not(unix))]
 fn exec_or_status(command: &mut Command) -> ExitCode {
     match command.status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Ok(status) => crate::child_exit_code(status),
         Err(error) => {
             eprintln!("raydock: failed to run codex: {error}");
             ExitCode::from(127)
