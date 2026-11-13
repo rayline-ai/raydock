@@ -293,10 +293,7 @@ fn create_symlink_or_copy(
         match std::os::windows::fs::symlink_file(symlink_target, symlink_path) {
             Ok(()) => {}
             Err(e) => {
-                warn!(
-                    "[HfCache] Symlink creation failed ({}), falling back to copy",
-                    e
-                );
+                warn!("[HfCache] Symlink creation failed ({e}), falling back to copy");
                 fs::copy(_blob_path, symlink_path)
                     .map_err(|e| format!("Failed to copy blob to snapshot: {e}"))?;
             }

@@ -11,13 +11,19 @@
 //! 2. It is **single-instance per machine**, locked to the `CODEX_HOME` its
 //!    app-server first spawned with. A second `codex app` launch just focuses
 //!    the existing window. So if an app-server is already running on a different
-//!    home, the user is asked to quit and relaunch it on the Rayline home.
+//!    home, the user is asked to quit and relaunch it on the Rayline home. The
+//!    running app-server is found with `pgrep` and `ps`, so this check runs on
+//!    unix only.
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, IsTerminal, Write};
+use std::io;
+#[cfg(unix)]
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::ExitCode;
 
 use toml_edit::{DocumentMut, Item, Table, TomlError, Value};
 
@@ -61,26 +67,30 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
     let home = isolated_home_path(&user_home);
     let config = crate::codex::provider_config_toml(&provider);
 
-    // 2. Reconcile the single-instance app-server. The comparison basis is the
-    //    running app-server's OWN loaded config (its CODEX_HOME/config.toml),
-    //    not our isolated file: that's what it actually loaded at startup.
-    match reconcile_running_app(&home, &config) {
+    // 2. Reconcile the single-instance app-server (unix only). The comparison
+    //    basis is the running app-server's OWN loaded config (its
+    //    CODEX_HOME/config.toml), not our isolated file: that's what it
+    //    actually loaded at startup.
+    #[cfg(unix)]
+    let write = match reconcile_running_app(&home, &config) {
         ReconcileOutcome::AlreadyCurrent => {
             // Config already matches; don't rewrite. Still launch so `codex app`
             // focuses the window / opens the requested workspace.
             eprintln!("The Codex app is already using Raydock. Bringing it to the front.");
+            false
         }
         ReconcileOutcome::Cancelled => {
             eprintln!("Leaving the Codex app as it is.");
             return ExitCode::SUCCESS;
         }
-        ReconcileOutcome::Proceed => {
-            // No conflicting app, or the user agreed to restart: write config now.
-            if let Err(error) = write_codex_home(&home, &config) {
-                eprintln!("Error: failed to prepare Codex app home: {error}");
-                return ExitCode::from(1);
-            }
-        }
+        // No conflicting app, or the user agreed to restart.
+        ReconcileOutcome::Proceed => true,
+    };
+    #[cfg(not(unix))]
+    let write = true;
+    if write && let Err(error) = write_codex_home(&home, &config) {
+        eprintln!("Error: failed to prepare Codex app home: {error}");
+        return ExitCode::from(1);
     }
 
     // 3. Launch (or focus) the Codex app on the isolated home.
@@ -129,6 +139,7 @@ const RAYLINE_PROVIDER: &str = "rayline";
 /// re-serialises this file (line endings, trailing newline, spacing, key order)
 /// and none of that is a setting. An unparsable file also differs — rewriting
 /// is the only way to repair it.
+#[cfg(unix)]
 fn generated_config_differs(existing: &str, generated: &str) -> bool {
     let (Ok(doc), Ok(generated)) = (
         parse_isolated_config(existing),
@@ -338,6 +349,7 @@ fn strip_rayline_provider_table(text: &str) -> String {
     out
 }
 
+#[cfg(unix)]
 enum ReconcileOutcome {
     /// No conflicting app-server, or the user agreed to restart — safe to write
     /// config and launch.
@@ -358,6 +370,7 @@ enum ReconcileOutcome {
 /// different home, or on our home but its loaded config no longer matches what
 /// we'd generate; otherwise a rerun with a new `--model` would silently keep
 /// the old config.
+#[cfg(unix)]
 fn reconcile_running_app(home: &Path, config: &str) -> ReconcileOutcome {
     let Some(app) = find_running_app_server() else {
         return ReconcileOutcome::Proceed;
@@ -385,6 +398,7 @@ fn reconcile_running_app(home: &Path, config: &str) -> ReconcileOutcome {
 /// settings. Reads the `config.toml` in the app's own
 /// `CODEX_HOME` — what it actually loaded at startup. Unreadable ⇒ treat as a
 /// mismatch (safer to restart than to leave it stale).
+#[cfg(unix)]
 fn running_app_config_matches(app: &RunningApp, config: &str) -> bool {
     let Some(home) = app.codex_home.as_deref() else {
         return false;
@@ -395,6 +409,7 @@ fn running_app_config_matches(app: &RunningApp, config: &str) -> bool {
     }
 }
 
+#[cfg(unix)]
 struct RunningApp {
     pid: u32,
     codex_home: Option<String>,
@@ -406,6 +421,7 @@ struct RunningApp {
 /// on macOS (`Codex.app` on installs predating the rename) and `codex
 /// app-server` elsewhere — distinct from the GUI parent and the renderer/GPU
 /// helpers. We key off the `app-server` token, so the bundle name is incidental.
+#[cfg(unix)]
 fn find_running_app_server() -> Option<RunningApp> {
     let pid = pgrep_app_server()?;
     Some(RunningApp {
@@ -422,6 +438,7 @@ fn find_running_app_server() -> Option<RunningApp> {
 /// (procps) `-l` prints only the process name even with `-f`, dropping the
 /// `app-server` token. So `pgrep -f` gives us candidate pids, then we read each
 /// one's full argv from a portable per-pid source and keep the app-server.
+#[cfg(unix)]
 fn pgrep_app_server() -> Option<u32> {
     let output = Command::new("pgrep").arg("-f").arg("codex").output().ok()?;
     if !output.status.success() {
@@ -435,6 +452,7 @@ fn pgrep_app_server() -> Option<u32> {
 
 /// Read a process's full command line. Linux: `/proc/<pid>/cmdline` (NUL-joined
 /// argv). macOS: `ps -p <pid> -o command=`.
+#[cfg(unix)]
 fn process_argv(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -463,6 +481,7 @@ fn process_argv(pid: u32) -> Option<String> {
 /// `app-server` subcommand token, which the CLI (`codex`, `codex resume`) and
 /// the renderer/GPU helpers never carry. Robust to injected `-c` flags between
 /// the binary and the subcommand.
+#[cfg(unix)]
 fn is_app_server_argv(argv: &str) -> bool {
     argv.split_whitespace().any(|tok| tok == "app-server")
 }
@@ -471,6 +490,7 @@ fn is_app_server_argv(argv: &str) -> bool {
 ///
 /// Linux: `/proc/<pid>/environ`. macOS: `ps eww` (the `e` flag appends the
 /// environment to the command line). Mirrors `claude_daemon::read_process_env`.
+#[cfg(unix)]
 fn read_codex_home_env(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
@@ -509,6 +529,7 @@ fn read_codex_home_env(pid: u32) -> Option<String> {
 
 /// Prompt `[y/N]` on the terminal. Defaults to "no" on non-interactive stdin or
 /// any read error, so we never restart the user's app without explicit consent.
+#[cfg(unix)]
 fn confirm_restart() -> bool {
     if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
         eprintln!("Not an interactive terminal; leaving the running Codex app as-is.");
@@ -527,6 +548,7 @@ fn confirm_restart() -> bool {
 
 /// Quit the running Codex desktop app. macOS: `osascript ... quit` (clean app
 /// teardown). Elsewhere: SIGTERM the app-server process.
+#[cfg(unix)]
 fn quit_running_app(app: &RunningApp) -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
@@ -549,18 +571,9 @@ fn quit_running_app(app: &RunningApp) -> io::Result<()> {
     {
         signal_term(app.pid)?;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = app;
-        return Err(io::Error::other(
-            "quitting a running Codex app is not supported on this platform",
-        ));
-    }
-
     // Wait for the app-server to actually exit before we relaunch. Launching
     // while the single instance is still tearing down races its own app
     // management and can leave the app in a bad state.
-    #[cfg(unix)]
     if wait_for_exit() {
         Ok(())
     } else {
@@ -568,8 +581,6 @@ fn quit_running_app(app: &RunningApp) -> io::Result<()> {
             "the Codex app did not close in time; not relaunching",
         ))
     }
-    #[cfg(not(unix))]
-    Ok(())
 }
 
 /// Send `SIGTERM` to a pid.
@@ -600,6 +611,7 @@ fn wait_for_exit() -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn app_server_argv_matches_despite_injected_flags() {
         // Regression: Codex injects `-c` flags between the binary and the
@@ -616,6 +628,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn config_unchanged_when_settings_present_whatever_the_app_layout() {
         // Same settings, but the app moved [tools] above our table, added its own
@@ -627,6 +640,7 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
     #[test]
     fn running_app_config_matches_reads_the_apps_own_home() {
         // The comparison basis is the running app-server's CODEX_HOME/config.toml
@@ -649,6 +663,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn running_app_config_mismatch_when_home_unknown_or_no_file() {
         // No CODEX_HOME on the process, or no config.toml → treat as mismatch
@@ -668,6 +683,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[test]
     fn config_changed_when_model_or_key_differs() {
         let existing = format!("{}\n[mcp_servers.x]\ny = 1\n", snippet("arc-sage-1.0"));
@@ -735,6 +751,7 @@ mod tests {
         assert_eq!(merged, existing);
     }
 
+    #[cfg(unix)]
     #[test]
     fn app_reserialisation_is_not_a_change() {
         // The app rewrites the file with its own root keys, CRLF or no trailing
@@ -755,6 +772,7 @@ mod tests {
             snippet("arc-sage-1.0")
         );
         let generated = snippet("arc-sage-1.0");
+        #[cfg(unix)]
         assert!(generated_config_differs(&existing, &generated));
         let merged = apply_rayline_settings(&existing, &generated).unwrap();
         assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
@@ -939,6 +957,7 @@ mod tests {
         let _ = fs::remove_dir_all(&user_home);
     }
 
+    #[cfg(unix)]
     #[test]
     fn app_server_argv_rejects_cli_and_helpers() {
         assert!(!is_app_server_argv("codex resume 019f3c3e-fcc9"));
