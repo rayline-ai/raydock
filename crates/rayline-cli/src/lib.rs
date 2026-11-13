@@ -1,4 +1,3 @@
-mod command_alias;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -22,10 +21,10 @@ pub mod status;
 mod top;
 pub mod update;
 
-pub const CLI_BIN: &str = "raydock";
+pub const CLI_BIN: &str = "rayline";
 /// Immutable download identifier; existing updaters verify these filenames.
 pub const CLI_ASSET: &str = "rayline";
-pub const DISPLAY_NAME: &str = "Raydock";
+pub const DISPLAY_NAME: &str = "Rayline CLI";
 pub const CONFIG_DIR: &str = "rayline";
 pub const DOT_CONFIG_DIR: &str = ".rayline";
 pub const ROUTER_PROD_URL: &str = "https://api.rayline.ai";
@@ -84,14 +83,6 @@ pub const MINISIGN_PUBLIC_KEYS: &[&str] = &[
 ];
 
 pub async fn run() -> ExitCode {
-    match command_alias::migrate_legacy_payload() {
-        Ok(Some(primary)) => return command_alias::forward(&primary),
-        Ok(None) => {}
-        Err(error) => {
-            eprintln!("Raydock command migration failed: {error}");
-            return ExitCode::FAILURE;
-        }
-    }
     let original_argv = env::args_os().collect::<Vec<_>>();
     run_argv(&original_argv).await
 }
@@ -105,7 +96,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(cli::Parsed::Version) => {
-            println!("raydock {RAYLINE_VERSION}");
+            println!("{CLI_BIN} {RAYLINE_VERSION}");
             return ExitCode::SUCCESS;
         }
         Ok(cli::Parsed::LocalProcess(args)) => {
@@ -362,7 +353,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     use std::os::unix::process::CommandExt;
 
     let error = command.exec();
-    eprintln!("raydock: failed to exec claude: {error}");
+    eprintln!("rayline: failed to exec claude: {error}");
     ExitCode::from(127)
 }
 
@@ -371,7 +362,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
     match command.status() {
         Ok(status) => crate::child_exit_code(status),
         Err(error) => {
-            eprintln!("raydock: failed to run claude: {error}");
+            eprintln!("rayline: failed to run claude: {error}");
             ExitCode::from(127)
         }
     }

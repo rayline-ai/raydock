@@ -1036,7 +1036,7 @@ mod tests {
         );
     }
 
-    // Raydock sets message threads to `0`, so a daemon that holds another
+    // Rayline CLI sets message threads to `0`, so a daemon that holds another
     // value, or none, is not this launch's.
     #[test]
     fn daemon_holding_a_message_threads_value_conflicts() {
@@ -1066,7 +1066,7 @@ mod tests {
             classify_launch_safety(&state(env), &launch_request(), &home).unwrap(),
             Safety::Conflict
         );
-        // Positive control: a daemon holding Raydock's values is reused.
+        // Positive control: a daemon holding Rayline CLI's values is reused.
         assert_eq!(
             classify_launch_safety(&state(rayline_env()), &launch_request(), &home).unwrap(),
             Safety::Safe

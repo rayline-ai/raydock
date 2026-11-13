@@ -32,12 +32,11 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1 | iex
 ```
 
-The installer places `raydock`, its alias `rayline`, `rayline-core` and
-`rayline-core-LICENSE` in `~/.rayline/bin`. It needs
+The installer places `rayline`, `rayline-core` and `rayline-core-LICENSE` in
+`~/.rayline/bin`. It needs
 [`minisign`](https://jedisct1.github.io/minisign/): it verifies the release's
 `SHA256SUMS.minisig` against the pinned release key, then each file it
-downloads against `SHA256SUMS`. Both `raydock` and `rayline` run the same
-CLI, and this guide writes `rayline`.
+downloads against `SHA256SUMS`.
 
 ## Sign in
 
@@ -199,8 +198,7 @@ the app instead.
 
 ```
 ~/.rayline/
-  bin/                          raydock, rayline -> raydock, rayline-core,
-                                rayline-core-LICENSE
+  bin/                          rayline, rayline-core, rayline-core-LICENSE
   local/                        local process state
     harness/<name>/             files Rayline generates per harness in local mode
   harness/<name>/               files Rayline generates per harness in cloud mode

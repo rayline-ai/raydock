@@ -181,7 +181,7 @@ impl LaunchModels {
             background: ROUTER_MODEL.to_owned(),
             offered: vec![LaunchModel {
                 id: ROUTER_MODEL.to_owned(),
-                display_name: "Raydock router".to_owned(),
+                display_name: "Rayline router".to_owned(),
                 context_window: capabilities.context_window,
                 max_output_tokens: capabilities.max_output_tokens,
                 product: None,
@@ -808,7 +808,7 @@ fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
     use std::os::unix::process::CommandExt as _;
 
     let error = command.exec();
-    eprintln!("raydock: failed to exec {}: {error}", harness.binary());
+    eprintln!("rayline: failed to exec {}: {error}", harness.binary());
     ExitCode::from(127)
 }
 
@@ -817,7 +817,7 @@ fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
     match command.status() {
         Ok(status) => crate::child_exit_code(status),
         Err(error) => {
-            eprintln!("raydock: failed to run {}: {error}", harness.binary());
+            eprintln!("rayline: failed to run {}: {error}", harness.binary());
             ExitCode::from(127)
         }
     }

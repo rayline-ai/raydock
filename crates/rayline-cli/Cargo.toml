@@ -14,7 +14,7 @@ publish.workspace = true
 workspace = true
 
 [[bin]]
-name = "raydock"
+name = "rayline"
 path = "src/main.rs"
 
 [dependencies]

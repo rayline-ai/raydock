@@ -15,18 +15,18 @@ The fallback workflow creates platform archives:
 - `rayline-<version>-linux_aarch64.tar.gz`
 
 Each archive contains a single `rayline-<version>-<platform>/` directory with
-`raydock`, its `rayline` alias, `rayline-core`, `rayline-core-source.json`,
-`rayline-core-LICENSE`, `README.md`, `LICENSE` and `NOTICE`.
+`rayline`, `rayline-core`, `rayline-core-source.json`, `rayline-core-LICENSE`,
+`README.md`, `LICENSE` and `NOTICE`.
 
 Generate the formula from the release `SHA256SUMS` file and use the matching
 archive for each OS/architecture. Do not point Homebrew at bare binary assets;
 those are reserved for the install scripts and self-update mirror.
 
 Homebrew installs are intentionally treated as externally managed by
-`raydock update`; users should run:
+`rayline update`; users should run:
 
 ```bash
-brew upgrade raydock
+brew upgrade rayline
 ```
 
 Set `__RELEASE_BASE_URL__` to

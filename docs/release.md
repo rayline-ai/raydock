@@ -1,13 +1,12 @@
 # Release Process
 
-Raydock releases are binary-first. The Rust workspace is not published to
+Rayline CLI releases are binary-first. The Rust workspace is not published to
 crates.io yet; all crates are marked `publish = false` until the package split
 is intentionally reviewed.
 
 ## Command name
 
-The installed binary is `raydock`. `rayline` is an alias for it
-(`~/.rayline/bin/rayline -> raydock`), and both run the same CLI.
+The installed binary is `rayline` (`~/.rayline/bin/rayline`).
 
 ## Release Tags
 
@@ -51,7 +50,7 @@ then each file they install against `SHA256SUMS`.
 
 ## Self-Update Mirror
 
-The built-in `raydock update` command reads from `https://get.rayline.ai` by
+The built-in `rayline update` command reads from `https://get.rayline.ai` by
 default. After the GitHub Release is created, mirror the bare binary assets and
 **both** signature files to:
 
@@ -64,7 +63,7 @@ https://get.rayline.ai/cli/v<version>/SHA256SUMS
 https://get.rayline.ai/cli/v<version>/SHA256SUMS.minisig
 ```
 
-`SHA256SUMS.minisig` is **required**: `raydock update` verifies it against the
+`SHA256SUMS.minisig` is **required**: `rayline update` verifies it against the
 pinned public key before trusting any checksum, and fails closed if it is
 missing or invalid.
 
@@ -115,8 +114,8 @@ After the release workflow completes, validate at least one installer path:
 
 ```bash
 scripts/install-rayline.sh --version 0.2.0 --install-dir /tmp/rayline-bin
-/tmp/rayline-bin/raydock --version
-/tmp/rayline-bin/raydock update --check
+/tmp/rayline-bin/rayline --version
+/tmp/rayline-bin/rayline update --check
 ```
 
 For installer validation against a staged asset directory, point the hidden
@@ -133,7 +132,7 @@ staged mirror over HTTP and point the hidden `--base-url` option at it
 
 ```bash
 python3 -m http.server --bind 127.0.0.1 --directory /tmp/rayline-release 8000 &
-/tmp/rayline-bin/raydock update --dry-run --version 0.2.0 \
+/tmp/rayline-bin/rayline update --dry-run --version 0.2.0 \
   --base-url http://127.0.0.1:8000
 ```
 
@@ -153,7 +152,7 @@ The helper refuses a mismatched commit, dirty source tree or different Go
 compiler. It builds without CGO and preserves Go VCS build metadata. Its
 `rayline-core-source.json` output is identical across platform builds and must
 be included in the signed checksum manifest. Archives and installers carry all
-`raydock`, its `rayline` alias, `rayline-core` and `rayline-core-LICENSE`,
+`rayline`, `rayline-core` and `rayline-core-LICENSE`,
 copied from that pinned module;
 self-update verifies the binaries and license before installing them.
 
@@ -163,6 +162,6 @@ too; Windows CI runs clippy and the whole workspace test suite, including the
 local process integration tests (`it_local_process`). A successful
 cross-build of the core is still not runtime acceptance on its own.
 Production Homebrew publishing is handled by the Rayline release pipeline.
-`packaging/homebrew/raydock.rb.template` applies
+`packaging/homebrew/rayline.rb.template` applies
 only to this repo's manual fallback archives; see the packaging README for the
 different layouts.

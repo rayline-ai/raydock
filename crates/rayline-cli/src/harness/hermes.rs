@@ -45,10 +45,10 @@
 //! Dependency environment (Windows): Hermes keeps the Python environment it
 //! runs on per home, under `HERMES_HOME\installs`, and on Windows it refuses
 //! to start in a home that has none ("no dependency environment is committed
-//! for this install; run `hermes pm repair`"). Raydock's home starts empty,
+//! for this install; run `hermes pm repair`"). Rayline CLI's home starts empty,
 //! and a plain `hermes pm repair` would repair the default home instead, so
 //! before a Windows launch [`prepare_launch`] builds the environment once with
-//! `HERMES_HOME` set to Raydock's home. Later launches of the same Hermes find
+//! `HERMES_HOME` set to Rayline CLI's home. Later launches of the same Hermes find
 //! it and skip the repair.
 
 use std::{
@@ -166,7 +166,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
 /// Hermes checkout, whose `facts.json` names the committed environment.
 const INSTALLS_DIR: &str = "installs";
 const FACTS_FILE: &str = "facts.json";
-/// Raydock's record, in its Hermes home, of the Hermes launcher that last
+/// Rayline CLI's record, in its Hermes home, of the Hermes launcher that last
 /// started there and the environments the home held then (see
 /// [`prepare_home`]).
 const READY_MARKER: &str = ".raydock-hermes-ready";
@@ -391,7 +391,7 @@ fn last_lines(output: &str) -> String {
 }
 
 /// The error for a failed repair: Hermes' last output, then the command to run
-/// by hand in PowerShell and in Command Prompt, each scoped to Raydock's home
+/// by hand in PowerShell and in Command Prompt, each scoped to Rayline CLI's home
 /// so the user's own Hermes home is untouched afterwards.
 fn repair_failed(home: &Path, output: &str) -> String {
     let home = home.display().to_string();
@@ -706,7 +706,7 @@ providers:
             assert!(again.is_empty(), "{again:?}");
         }
 
-        /// An environment Raydock never saw this launcher start on (another
+        /// An environment Rayline CLI never saw this launcher start on (another
         /// checkout's, or one repaired by hand) is checked with Hermes once.
         #[test]
         fn another_launcher_is_probed_again() {
@@ -920,7 +920,7 @@ providers:
         }
 
         /// A failed repair stops the launch, records nothing, and names the
-        /// exact command, with Raydock's home, for both Windows shells.
+        /// exact command, with Rayline CLI's home, for both Windows shells.
         #[test]
         fn a_failed_repair_prints_the_command_with_the_home() {
             let home = temp_dir("hermes-repair-fails").join("it's");

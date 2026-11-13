@@ -623,7 +623,7 @@ fn probe_verdict(outcome: Result<u16, ()>) -> ProbeVerdict {
     }
 }
 
-/// This `raydock`, with symlinks resolved: the local process runs from it.
+/// This `rayline`, with symlinks resolved: the local process runs from it.
 fn current_exe() -> io::Result<PathBuf> {
     fs::canonicalize(std::env::current_exe()?)
 }
@@ -639,7 +639,7 @@ fn installed_binary(name: &str) -> io::Result<PathBuf> {
         io::Error::new(
             error.kind(),
             format!(
-                "installed {name} is missing at {}: {error}. Reinstall the complete release with `raydock update --force`",
+                "installed {name} is missing at {}: {error}. Reinstall the complete release with `rayline update --force`",
                 path.display()
             ),
         )
@@ -1329,7 +1329,7 @@ mod tests {
             "{message}"
         );
         assert!(
-            message.ends_with("Reinstall the complete release with `raydock update --force`"),
+            message.ends_with("Reinstall the complete release with `rayline update --force`"),
             "{message}"
         );
     }

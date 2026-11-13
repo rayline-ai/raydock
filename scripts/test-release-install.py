@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate raydock and core install integrity.
+"""Validate rayline and core install integrity.
 
 Uses built Rust binaries and the external core contract fixture. No inference,
 network service, release upload, or user installation is touched. The staged
@@ -24,7 +24,7 @@ def main():
         for path in (assets, commands, no_minisign):
             path.mkdir()
         # Controlled command paths: one with minisign, one without.
-        for name in ("sh", "cat", "curl", "awk", "uname", "mktemp", "rm", "shasum", "install", "mkdir", "ln"):
+        for name in ("sh", "cat", "curl", "awk", "uname", "mktemp", "rm", "shasum", "install", "mkdir"):
             executable = shutil.which(name)
             assert executable, f"required test command: {name}"
             (commands / name).symlink_to(executable)
@@ -51,7 +51,7 @@ def main():
         system, arch = os.uname().sysname, os.uname().machine
         platform = {("Darwin", "arm64"): "macosx_11_0_arm64", ("Darwin", "x86_64"): "macosx_10_12_x86_64",
                     ("Linux", "x86_64"): "linux_x86_64", ("Linux", "aarch64"): "linux_aarch64"}[(system, arch)]
-        files = {"rayline": ROOT / "target/debug/raydock",
+        files = {"rayline": ROOT / "target/debug/rayline",
                  "rayline-core": ROOT / "crates/rayline-cli/tests/fixtures/execution-contract.py"}
         expected = {}
         for name, source in files.items():
@@ -77,7 +77,7 @@ def main():
         # --base-url names one release, so --version can't be combined with it.
         both = run_installer("--base-url", assets.as_uri(), "--version", "0.2.0", "--install-dir", str(installed))
         assert both.returncode == 2 and "--base-url" in both.stderr, both.stdout + both.stderr
-        # --version takes a bare version, the spelling `raydock update --version` takes.
+        # --version takes a bare version, the spelling `rayline update --version` takes.
         prefixed = run_installer("--version", "v0.2.0", "--install-dir", str(installed))
         assert prefixed.returncode == 2 and "--version" in prefixed.stderr, prefixed.stdout + prefixed.stderr
         # The real installer trusts only the pinned key; the old key override is gone.
@@ -97,17 +97,14 @@ def main():
         ignored = root / "ignored"
         default = run_installer("--base-url", assets.as_uri(), RAYLINE_INSTALL_DIR=str(ignored))
         assert default.returncode == 0, default.stdout + default.stderr
-        assert (root / ".rayline/bin/raydock").read_bytes() == expected["rayline"]
+        assert (root / ".rayline/bin/rayline").read_bytes() == expected["rayline"]
         assert not ignored.exists()
 
         install(True)
-        assert (installed / "rayline").is_symlink()
-        assert (installed / "rayline").resolve() == (installed / "raydock").resolve()
-        assert (installed / "raydock").read_bytes() == expected["rayline"]
         for name, data in expected.items():
             assert (installed / name).read_bytes() == data
         assert (installed / "rayline-core-LICENSE").read_bytes() == license_data
-        assert sorted(path.name for path in installed.iterdir()) == ["raydock", "rayline", "rayline-core", "rayline-core-LICENSE"]
+        assert sorted(path.name for path in installed.iterdir()) == ["rayline", "rayline-core", "rayline-core-LICENSE"]
         (assets / "rayline-core-LICENSE").write_bytes(b"tampered license")
         install(False)
         for name, data in expected.items():
@@ -115,7 +112,7 @@ def main():
         assert (installed / "rayline-core-LICENSE").read_bytes() == license_data
         (assets / "rayline-core-LICENSE").write_bytes(license_data)
         version = subprocess.check_output([str(installed / "rayline"), "--version"], text=True).split()[1]
-        check = [str(installed / "rayline"), "update", "--check", "--version", version, "--install-path", str(installed / "raydock")]
+        check = [str(installed / "rayline"), "update", "--check", "--version", version, "--install-path", str(installed / "rayline")]
         check_env = {key: value for key, value in os.environ.items() if not key.startswith("RAYLINE_")}
         check_env["HOME"] = str(root)
         complete = subprocess.run(check, env=check_env, capture_output=True, text=True)
@@ -129,7 +126,7 @@ def main():
         install(False)
         for name, data in expected.items():
             assert (installed / name).read_bytes() == data
-    print("Release installation passed: Raydock plus alias and core, required minisign and signature, "
+    print("Release installation passed: Rayline CLI and core, required minisign and signature, "
           "--base-url/--version and v-prefixed --version refusal, tamper, binary-mode and missing-checksum refusal.")
 
 

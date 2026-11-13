@@ -189,7 +189,6 @@ async fn run_on(
                 replace_file(&artifacts.license, &license_install_path, false)?;
                 replace_binary(&artifacts.core, &core_install_path)?;
                 replace_binary(&artifacts.launcher, &install_path)?;
-                crate::command_alias::install_alias(&install_path)?;
                 Ok(UpdateResult {
                     message: format!(
                         "Updated {} {} \u{2192} {}.\n",
@@ -217,7 +216,7 @@ fn bare_version_hint(target: &Version, error: UpdateError) -> UpdateError {
             if !target.normalized.contains('+') && message.ends_with("HTTP 404") =>
         {
             UpdateError::Network(format!(
-                "release {} was not found. Releases are published under their full version including the build label; run `raydock update --version {}+<build>` with the full version from the release notes (`raydock --version` prints it for an installed release).",
+                "release {} was not found. Releases are published under their full version including the build label; run `rayline update --version {}+<build>` with the full version from the release notes (`rayline --version` prints it for an installed release).",
                 target.public, target.public
             ))
         }
@@ -511,8 +510,7 @@ fn sha256_file(path: &Path) -> Result<String, UpdateError> {
 }
 
 /// The binary to replace: `--install-path` as given (the parser has checked
-/// it names `raydock`), else the running binary, whose `rayline` alias maps
-/// to the `raydock` beside it.
+/// it names `rayline`), else the running binary.
 fn install_path(option: Option<&Path>) -> Result<PathBuf, UpdateError> {
     match option {
         Some(path) => resolve_install_path(path.to_path_buf()),
@@ -520,16 +518,14 @@ fn install_path(option: Option<&Path>) -> Result<PathBuf, UpdateError> {
             let running = std::env::current_exe().map_err(|error| {
                 UpdateError::Install(format!("failed to locate the running executable: {error}"))
             })?;
-            Ok(crate::command_alias::primary_path(&resolve_install_path(
-                running,
-            )?))
+            resolve_install_path(running)
         }
     }
 }
 
 /// `current_exe()` may return the invoking symlink rather than its target on
-/// some platforms (macOS), for example the `rayline` alias. Self-update must
-/// replace the real binary, not the alias. A path that does not exist yet
+/// some platforms (macOS). Self-update must replace the real binary, not the
+/// symlink. A path that does not exist yet
 /// (an `--install-path` naming a file to create) passes through unchanged;
 /// any other failure to resolve it is an error naming the path.
 fn resolve_install_path(path: PathBuf) -> Result<PathBuf, UpdateError> {
@@ -817,7 +813,7 @@ fn sidecar_install_path(install_path: &Path, kind: &str) -> Result<PathBuf, Upda
 
 /// Before an actual update, delete backups from previous successful Windows swaps.
 /// Historical .tmp files also name active staging and rollback files, so those
-/// require manual cleanup after all installers and Raydock sessions have exited.
+/// require manual cleanup after all installers and Rayline CLI sessions have exited.
 #[cfg(any(windows, test))]
 fn cleanup_retired_backups(install_path: &Path) -> Result<(), UpdateError> {
     let parent = install_path.parent().ok_or_else(|| {
@@ -847,23 +843,18 @@ fn cleanup_retired_backups(install_path: &Path) -> Result<(), UpdateError> {
 
 #[cfg(any(windows, test))]
 fn is_retired_backup(name: &str) -> bool {
-    [
-        "raydock.exe",
-        "rayline.exe",
-        "rayline-core.exe",
-        CORE_LICENSE_NAME,
-    ]
-    .iter()
-    .any(|binary| {
-        name.strip_prefix(&format!(".{binary}.old-"))
-            .and_then(|suffix| suffix.split_once('-'))
-            .is_some_and(|(pid, nonce)| {
-                !pid.is_empty()
-                    && pid.bytes().all(|b| b.is_ascii_digit())
-                    && !nonce.is_empty()
-                    && nonce.bytes().all(|b| b.is_ascii_hexdigit())
-            })
-    })
+    ["rayline.exe", "rayline-core.exe", CORE_LICENSE_NAME]
+        .iter()
+        .any(|binary| {
+            name.strip_prefix(&format!(".{binary}.old-"))
+                .and_then(|suffix| suffix.split_once('-'))
+                .is_some_and(|(pid, nonce)| {
+                    !pid.is_empty()
+                        && pid.bytes().all(|b| b.is_ascii_digit())
+                        && !nonce.is_empty()
+                        && nonce.bytes().all(|b| b.is_ascii_hexdigit())
+                })
+        })
 }
 
 #[cfg(any(windows, test))]
@@ -877,7 +868,7 @@ fn remove_retired_backup(path: &Path) -> Result<(), UpdateError> {
                 || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))) =>
         {
             eprintln!(
-                "Retained old executable {}: {error}. Close older Raydock sessions; a later update or installer will retry cleanup.",
+                "Retained old executable {}: {error}. Close older Rayline CLI sessions; a later update or installer will retry cleanup.",
                 path.display()
             );
             Ok(())
@@ -1039,20 +1030,20 @@ mod tests {
 
     #[test]
     fn a_missing_install_path_passes_through_and_other_resolve_failures_name_it() {
-        let root = std::env::temp_dir().join(format!("raydock-resolve-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("rayline-resolve-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let missing = root.join("missing").join("raydock");
+        let missing = root.join("missing").join("rayline");
         assert_eq!(resolve_install_path(missing.clone()).unwrap(), missing);
         // A regular file used as a directory (unix) or a name the file system
         // rejects (Windows) fails for a reason other than absence.
         #[cfg(unix)]
         let unusable = {
             fs::write(root.join("file"), "").unwrap();
-            root.join("file").join("raydock")
+            root.join("file").join("rayline")
         };
         #[cfg(windows)]
-        let unusable = root.join("bad<name").join("raydock");
+        let unusable = root.join("bad<name").join("rayline");
         let error = resolve_install_path(unusable.clone())
             .unwrap_err()
             .to_string();
@@ -1065,7 +1056,7 @@ mod tests {
 
     #[test]
     fn a_failing_brew_prefix_is_an_error_naming_it() {
-        let root = std::env::temp_dir().join(format!("raydock-brew-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("rayline-brew-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let missing = root.join("no-such-brew");
@@ -1110,7 +1101,7 @@ mod tests {
 
     #[test]
     fn an_io_failure_names_the_operation_and_path() {
-        let path = std::env::temp_dir().join("raydock-update-no-such-file");
+        let path = std::env::temp_dir().join("rayline-update-no-such-file");
         let error = sha256_file(&path).unwrap_err().to_string();
         assert!(
             error.starts_with(&format!("failed to read {}: ", path.display())),
@@ -1122,16 +1113,16 @@ mod tests {
     fn cleanup_removes_only_committed_windows_backups() -> TestResult {
         let root = temp_update_dir()?;
         let retired = [
-            ".raydock.exe.old-123-456",
+            ".rayline.exe.old-123-456",
             ".rayline.exe.old-123-abcdef",
             ".rayline-core.exe.old-123-456",
             ".rayline-core-LICENSE.old-123-456",
         ];
         let retained = [
-            "raydock.exe",
-            ".raydock.exe.tmp-123-456",
+            "rayline.exe",
             ".rayline.exe.tmp-123-456",
-            ".raydock.exe.old-manual-backup",
+            ".rayline-core.exe.tmp-123-456",
+            ".rayline.exe.old-manual-backup",
             ".unrelated.exe.old-123-456",
             "rayline.exe.old-0123456789abcdef0123456789abcdef",
             "rayline.exe.old-incomplete",
@@ -1139,7 +1130,7 @@ mod tests {
         for name in retired.iter().chain(retained.iter()) {
             fs::write(root.join(name), b"payload")?;
         }
-        let installed = root.join("raydock.exe");
+        let installed = root.join("rayline.exe");
         let backup = staged_install_path(&installed)?;
         fs::write(&backup, b"previous executable")?;
         retire_replaced_backup(&backup, &installed);
@@ -1155,7 +1146,7 @@ mod tests {
         );
         let directory = root.join(".rayline-core.exe.old-123-789");
         fs::create_dir(&directory)?;
-        cleanup_retired_backups(&root.join("raydock.exe"))?;
+        cleanup_retired_backups(&root.join("rayline.exe"))?;
         for name in retired {
             assert!(!root.join(name).exists(), "retired file {name}");
         }
@@ -1174,16 +1165,16 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
 
         let root = temp_update_dir()?;
-        let backup = root.join(".raydock.exe.old-123-456");
+        let backup = root.join(".rayline.exe.old-123-456");
         fs::write(&backup, b"old executable")?;
         let locked = fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
             .open(&backup)?;
-        cleanup_retired_backups(&root.join("raydock.exe"))?;
+        cleanup_retired_backups(&root.join("rayline.exe"))?;
         assert!(backup.exists());
         drop(locked);
-        cleanup_retired_backups(&root.join("raydock.exe"))?;
+        cleanup_retired_backups(&root.join("rayline.exe"))?;
         assert!(!backup.exists());
         fs::remove_dir_all(root)?;
         Ok(())
@@ -1205,7 +1196,7 @@ mod tests {
     #[test]
     fn windows_swap_waits_for_another_process_to_release_the_file() -> TestResult {
         let root = temp_update_dir()?;
-        let installed = root.join("raydock.exe");
+        let installed = root.join("rayline.exe");
         let staged = root.join("staged.exe");
         fs::write(&installed, b"original")?;
         fs::write(&staged, b"new")?;
@@ -1226,7 +1217,7 @@ mod tests {
     #[test]
     fn windows_fresh_install_waits_for_another_process_to_release_the_file() -> TestResult {
         let root = temp_update_dir()?;
-        let installed = root.join("raydock.exe");
+        let installed = root.join("rayline.exe");
         let staged = root.join("staged.exe");
         fs::write(&staged, b"new")?;
         let held = hold_without_delete_sharing(&staged)?;
@@ -1246,7 +1237,7 @@ mod tests {
     #[test]
     fn windows_swap_held_past_the_wait_is_an_in_use_error_and_changes_nothing() -> TestResult {
         let root = temp_update_dir()?;
-        let installed = root.join("raydock.exe");
+        let installed = root.join("rayline.exe");
         let staged = root.join("staged.exe");
         fs::write(&installed, b"original")?;
         fs::write(&staged, b"new")?;
@@ -1273,7 +1264,7 @@ mod tests {
     #[test]
     fn windows_swap_defers_cleanup_and_preserves_failed_swap() -> TestResult {
         let root = temp_update_dir()?;
-        let installed = root.join("raydock.exe");
+        let installed = root.join("rayline.exe");
         let staged = root.join("staged.exe");
         fs::write(&installed, b"original")?;
         fs::write(&staged, b"new")?;
@@ -1294,7 +1285,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
 
         let root = temp_update_dir()?;
-        let installed = root.join("raydock.exe");
+        let installed = root.join("rayline.exe");
         let backup = staged_install_path(&installed)?;
         fs::write(&installed, b"committed")?;
         fs::write(&backup, b"previous")?;
@@ -1340,7 +1331,7 @@ mod tests {
     #[test]
     fn a_failed_staging_leaves_no_staged_file() -> TestResult {
         let root = temp_update_dir()?;
-        let installed = root.join("raydock");
+        let installed = root.join("rayline");
         fs::write(&installed, b"installed")?;
         // A missing source fails before the staged file exists; a directory
         // fails after it is created on Unix and on opening it on Windows.
@@ -1357,7 +1348,7 @@ mod tests {
             assert!(
                 !staged
                     .iter()
-                    .any(|name| name.to_string_lossy().starts_with(".raydock.tmp-")),
+                    .any(|name| name.to_string_lossy().starts_with(".rayline.tmp-")),
                 "{staged:?}"
             );
             assert_eq!(fs::read(&installed)?, b"installed");
@@ -1674,7 +1665,7 @@ mod tests {
         dir.join(format!("{name}{}", std::env::consts::EXE_SUFFIX))
     }
 
-    /// An install directory holding only `raydock`, and a request that
+    /// An install directory holding only `rayline`, and a request that
     /// replaces it from `server`.
     fn install_from(server: &FakeReleaseServer) -> TestResult<(PathBuf, UpdateRequest)> {
         let install = temp_update_dir()?;
@@ -1758,14 +1749,13 @@ mod tests {
         assert_eq!(fs::read(&installed)?, LAUNCHER);
         assert_eq!(fs::read(exe(&install, "rayline-core"))?, CORE);
         assert_eq!(fs::read(install.join(CORE_LICENSE_NAME))?, LICENSE);
-        assert!(fs::symlink_metadata(exe(&install, "rayline")).is_ok());
         // Windows keeps the replaced launcher as a retired backup.
         let mut installed_names = fs::read_dir(&install)?
             .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
             .collect::<io::Result<Vec<_>>>()?;
         installed_names.retain(|name| !is_retired_backup(name));
         installed_names.sort();
-        let mut expected_names = [crate::CLI_BIN, "rayline", "rayline-core"]
+        let mut expected_names = [crate::CLI_BIN, "rayline-core"]
             .map(|name| format!("{name}{}", std::env::consts::EXE_SUFFIX))
             .to_vec();
         expected_names.push(CORE_LICENSE_NAME.to_owned());

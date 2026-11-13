@@ -150,11 +150,6 @@ jobs:
         shell: bash
         run: cargo test --workspace --locked -- --test-threads=1
 
-      - name: Test installed command migration
-        if: runner.os != 'Windows'
-        shell: bash
-        run: cargo test -p rayline-cli --locked --test it_command_migration -- --test-threads=1
-
       - name: Parse Windows installer
         if: runner.os == 'Windows'
         shell: pwsh

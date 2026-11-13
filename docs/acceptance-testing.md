@@ -47,7 +47,7 @@ The endpoint must list the protocol of every harness you run in local mode: `ant
 ```bash
 scripts/acceptance.sh              # every harness
 scripts/acceptance.sh codex pi     # only these harnesses
-RAYLINE=target/release/raydock scripts/acceptance.sh   # test a local build
+RAYLINE=target/release/rayline scripts/acceptance.sh   # test a local build
 CONFIG=~/acceptance.json scripts/acceptance.sh         # local mode from this file
 ```
 

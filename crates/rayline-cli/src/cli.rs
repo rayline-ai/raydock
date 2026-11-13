@@ -1495,9 +1495,9 @@ mod tests {
         }
     }
 
-    /// An `--install-path` naming this platform's `raydock` binary.
-    fn raydock_path() -> String {
-        format!("/tmp/raydock{}", std::env::consts::EXE_SUFFIX)
+    /// An `--install-path` naming this platform's `rayline` binary.
+    fn rayline_path() -> String {
+        format!("/tmp/rayline{}", std::env::consts::EXE_SUFFIX)
     }
 
     #[test]
@@ -1510,7 +1510,7 @@ mod tests {
                 "1.2.3",
                 "--base-url=http://127.0.0.1:1",
                 "--install-path",
-                &raydock_path(),
+                &rayline_path(),
             ])
             .1,
             Command::Update(Box::new(UpdateRequest {
@@ -1519,22 +1519,16 @@ mod tests {
                 check_only: true,
                 dry_run: false,
                 base_url: Some(Url::parse("http://127.0.0.1:1").unwrap()),
-                install_path: Some(PathBuf::from(raydock_path())),
+                install_path: Some(PathBuf::from(rayline_path())),
             }))
         );
         assert_error(&["update", "--channel", "dev"], "unexpected `--channel`");
     }
 
     #[test]
-    fn update_install_path_must_name_the_raydock_binary() {
-        let binary = format!("raydock{}", std::env::consts::EXE_SUFFIX);
-        for path in [
-            "/tmp/rayline",
-            "/tmp/foo",
-            "/tmp/raydock-old",
-            "/tmp/",
-            "/tmp/raydock/..",
-        ] {
+    fn update_install_path_must_name_the_rayline_binary() {
+        let binary = format!("rayline{}", std::env::consts::EXE_SUFFIX);
+        for path in ["/tmp/foo", "/tmp/rayline-old", "/tmp/", "/tmp/rayline/.."] {
             assert_error(
                 &["update", "--install-path", path],
                 &format!("`--install-path` must name `{binary}`"),
@@ -1575,7 +1569,7 @@ mod tests {
 
     #[test]
     fn update_options_need_a_value_and_are_given_once() {
-        let install_path = raydock_path();
+        let install_path = rayline_path();
         for (name, value) in [
             ("--version", "1.2.3"),
             ("--base-url", "http://127.0.0.1:1"),

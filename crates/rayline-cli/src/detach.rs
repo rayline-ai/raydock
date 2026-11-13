@@ -36,7 +36,7 @@ pub(crate) fn spawn_detached(command: &mut Command) -> io::Result<Child> {
         // CreateProcess inherits every inheritable handle, and this process's
         // own standard handles usually are (a shell hands them down that way).
         // The child would then hold the caller's stdout pipe open for its
-        // lifetime, so `raydock ... start | ...` never saw EOF. The child's
+        // lifetime, so `rayline ... start | ...` never saw EOF. The child's
         // own stdio is set by the caller, so keep ours out of it while it
         // spawns.
         let _quiet = NonInheritableStdHandles::new();
