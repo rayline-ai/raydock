@@ -1156,7 +1156,7 @@ pub(crate) mod tests {
             // thread reads the environment concurrently.
             unsafe { std::env::set_var(var, "rlk-test-not-a-real-key") };
         }
-        let output = build_command(Path::new("/usr/bin/env"), &Plan::default(), None, &[])
+        let output = build_command(Path::new("/usr/bin/env"), &Plan::default(), &[])
             .output()
             .expect("run env");
         for (var, value) in vars.iter().zip(previous) {
