@@ -17,7 +17,7 @@ body:
         - CLI UX
         - Claude Code integration
         - Routing behavior
-        - Hybrid mode
+        - Local mode
         - Configuration
         - Install or update
         - Documentation or examples

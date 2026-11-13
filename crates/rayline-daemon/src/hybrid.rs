@@ -127,7 +127,7 @@ pub async fn run(args: Args) -> Result<()> {
     check_decisions_url(&args.config, &args.router_url)?;
     let credential_env = credential_env_names(&args.config)?;
     let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
-    let routing_metadata = RoutingMetadata::from_config(&config);
+    let routing_metadata = RoutingMetadata::from_config(&config).map_err(anyhow::Error::msg)?;
     let classifier = crate::hybrid_classifier::route(&config, &args.classifier_model)
         .map_err(anyhow::Error::msg)?;
     if std::env::var(&classifier.auth_env).map_or(true, |key| key.is_empty()) {

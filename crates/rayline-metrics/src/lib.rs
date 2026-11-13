@@ -111,10 +111,12 @@ pub enum MetricsUpdate {
         agent_id: Option<String>,
         agent_type: Option<String>,
     },
+    /// `target` is `local` or `remote`; `None` when the receipt names no
+    /// single deployment.
     RouteDecided {
         request_id: String,
         route_id: Option<String>,
-        target: String,
+        target: Option<String>,
         endpoint_id: Option<String>,
         requested_model: Option<String>,
         policy: Option<String>,
@@ -266,7 +268,7 @@ impl RouterMetrics {
                     .entry(request_id.clone())
                     .or_insert_with(|| RequestRecord::new(request_id.clone(), now));
                 record.state = "routed".to_owned();
-                record.target = Some(target.clone());
+                record.target = target.clone();
                 merge_option(&mut record.route_id, route_id.clone());
                 merge_option(&mut record.endpoint_id, endpoint_id.clone());
                 merge_option(&mut record.requested_model, requested_model.clone());
@@ -489,11 +491,7 @@ impl RouterMetrics {
             totals.completed_requests = totals.completed_requests.saturating_add(1);
             if record.target.as_deref() == Some("local") {
                 totals.local_requests = totals.local_requests.saturating_add(1);
-            } else if record
-                .target
-                .as_deref()
-                .is_some_and(|target| target != "unknown")
-            {
+            } else if record.target.is_some() {
                 totals.remote_requests = totals.remote_requests.saturating_add(1);
             }
             totals.input_tokens = totals
@@ -843,7 +841,7 @@ mod tests {
         metrics.record(MetricsUpdate::RouteDecided {
             request_id: "req-1".to_owned(),
             route_id: Some("local-1".to_owned()),
-            target: "local".to_owned(),
+            target: Some("local".to_owned()),
             endpoint_id: Some("local".to_owned()),
             requested_model: Some("rayline-auto".to_owned()),
             policy: Some("subagent:Explore".to_owned()),
