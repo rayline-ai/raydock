@@ -1182,6 +1182,46 @@ mod tests {
     /// Serializes the tests that set a process-wide env var.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Puts an `opencode` that reports version 2 first on `PATH`, so a hybrid
+    /// OpenCode launch can read its version without OpenCode installed. The
+    /// caller holds ENV_LOCK; Drop restores `PATH`.
+    struct FakeOpenCode(Option<std::ffi::OsString>);
+
+    impl FakeOpenCode {
+        fn install() -> Self {
+            let dir = temp_dir("fake-opencode");
+            if cfg!(windows) {
+                fs::write(dir.join("opencode.cmd"), "@echo opencode v2.0.25\r\n").unwrap();
+            } else {
+                let binary = dir.join("opencode");
+                fs::write(&binary, "#!/bin/sh\necho 'opencode v2.0.25'\n").unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
+                }
+            }
+            let prior = std::env::var_os("PATH");
+            let mut dirs = vec![dir];
+            dirs.extend(prior.iter().flat_map(std::env::split_paths));
+            // SAFETY: serialized by ENV_LOCK; restored by Drop.
+            unsafe { std::env::set_var("PATH", std::env::join_paths(dirs).unwrap()) };
+            Self(prior)
+        }
+    }
+
+    impl Drop for FakeOpenCode {
+        fn drop(&mut self) {
+            // SAFETY: serialized as above; ENV_LOCK is still held by the caller.
+            unsafe {
+                match &self.0 {
+                    Some(prior) => std::env::set_var("PATH", prior),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
+        }
+    }
+
     fn temp_dir(name: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1388,6 +1428,7 @@ mod tests {
         };
         let capabilities = harness_capabilities(core);
         assert_eq!(capabilities.context_window, 1_000_000);
+        let _opencode = FakeOpenCode::install();
         let paths = Paths {
             dir: temp_dir("limits"),
         };
@@ -1547,6 +1588,7 @@ mod tests {
             input_modalities: vec!["text".into()],
         });
         let conv_env = std::ffi::OsStr::new(crate::harness::CONV_ID_ENV);
+        let _opencode = FakeOpenCode::install();
         let launch = |paths: &Paths, name: &str| {
             let command = harness_command(
                 paths,

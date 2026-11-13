@@ -641,7 +641,8 @@ pub fn record_rayline_claude_launch(record: LaunchRecord<'_>) -> io::Result<()> 
         fs::create_dir_all(parent)
             .map_err(|error| failed(format!("create {}", parent.display()), error))?;
     }
-    let tmp_path = path.with_extension("json.tmp");
+    // Per process, so an overlapping launch cannot rename this one's file away.
+    let tmp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let contents = serde_json::to_string(&pruned)
         .map_err(|error| failed(format!("serialise {}", path.display()), error.into()))?;
     fs::write(&tmp_path, contents)
@@ -1054,7 +1055,8 @@ mod tests {
         );
         // The temporary file cannot be written over a directory.
         let home = temp_home();
-        let tmp_path = rayline_claude_launches_path(&home).with_extension("json.tmp");
+        let tmp_path = rayline_claude_launches_path(&home)
+            .with_extension(format!("json.{}.tmp", std::process::id()));
         fs::create_dir_all(&tmp_path).unwrap();
         let error = record(&home, &request).unwrap_err();
         assert!(
