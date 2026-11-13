@@ -632,6 +632,11 @@ fn bool_like(value: Option<&Value>) -> Option<bool> {
     }
 }
 
+/// Desktop's marker for a secret it stored encrypted (`__sealed__:v1:...`).
+fn is_sealed_by_desktop(value: &str) -> bool {
+    value.trim_start().starts_with("__sealed__:")
+}
+
 /// Check a Desktop third-party configuration against this instance. Reads key
 /// names and non-secret values only; the gateway key is never echoed.
 pub fn validate_desktop_config(
@@ -672,6 +677,12 @@ pub fn validate_desktop_config(
         (Some(key), Some(token)) if key == token => (
             true,
             "inferenceGatewayApiKey matches this router's token (value not shown)",
+        ),
+        // Desktop seals the key once it applies the profile, so the stored
+        // value cannot be compared with the token.
+        (Some(key), Some(_)) if is_sealed_by_desktop(key) => (
+            true,
+            "inferenceGatewayApiKey is sealed by Desktop and cannot be compared with this router's token",
         ),
         (Some(_), Some(_)) => (
             false,
@@ -1970,6 +1981,30 @@ mod tests {
             Some(TEST_TOKEN),
         );
         assert!(findings.iter().all(|finding| finding.ok), "{findings:?}");
+    }
+
+    #[test]
+    fn a_key_sealed_by_desktop_is_not_reported_as_a_mismatch() {
+        let mut config = desktop_import_json(&gateway_url(PORTS), TEST_TOKEN);
+        config["inferenceGatewayApiKey"] = json!("__sealed__:v1:c2VhbGVkLXRlc3QtdmFsdWU=");
+        let findings = validate_desktop_config(&config, &gateway_url(PORTS), Some(TEST_TOKEN));
+        assert!(findings.iter().all(|finding| finding.ok), "{findings:?}");
+        let key = findings
+            .iter()
+            .find(|finding| finding.message.contains("inferenceGatewayApiKey"))
+            .expect("key finding");
+        assert!(key.message.contains("cannot be compared"), "{key:?}");
+        assert!(!key.message.contains("c2VhbGVk"), "{key:?}");
+
+        // An unsealed value that differs is still a mismatch.
+        config["inferenceGatewayApiKey"] = json!("rlgw-other-token");
+        let findings = validate_desktop_config(&config, &gateway_url(PORTS), Some(TEST_TOKEN));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| !finding.ok && finding.message.contains("does not match")),
+            "{findings:?}"
+        );
     }
 
     #[test]
