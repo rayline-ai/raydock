@@ -387,7 +387,7 @@ pub(crate) struct RenderContext<'a> {
     /// The router key, written into the Rayline-owned config.
     pub key: &'a str,
     /// Router origin with no trailing `/` and no `/v1`
-    /// (e.g. `https://api-dev.rayline.ai`).
+    /// (e.g. `https://router.example.test`).
     pub router_url: &'a str,
     pub config_dir: &'a Path,
     /// The limits `rayline run <harness> --local` admits (context window the harness may
@@ -828,7 +828,7 @@ pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
-    pub(crate) const TEST_URL: &str = "https://api-dev.rayline.ai";
+    pub(crate) const TEST_URL: &str = "https://router.example.test";
     pub(crate) const TEST_KEY: &str = "rlk-test";
 
     pub(crate) fn temp_dir(label: &str) -> PathBuf {

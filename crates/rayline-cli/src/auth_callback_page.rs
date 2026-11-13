@@ -2,14 +2,10 @@
 //! login` OAuth redirect.
 //!
 //! This is the only Rayline surface rendered by the CLI itself rather than by
-//! the site, so it is a hand-maintained port of the platform sign-in screen.
-//! Sources of truth, in the `memex-desktop` repo:
+//! the site, so it is a hand-maintained port of the Rayline platform sign-in
+//! screen: its palette, type and theme tokens, the card, and the backdrop.
 //!
-//! - `turbo/apps/rayline/src/app.css` — palette, type, and theme tokens.
-//! - `turbo/packages/ui/components/auth/AuthPageShell.svelte` — the card.
-//! - `turbo/packages/ui/components/auth/AuthHeroBackground.svelte` — backdrop.
-//!
-//! Two deliberate departures from those files: the backdrop is static (the
+//! Two deliberate departures from that screen: the backdrop is static (the
 //! site's is an animated SVG driven by Svelte, which a one-shot page does not
 //! need), and the card's paper grid uses a slightly stronger line in dark mode,
 //! because the site's `--color-border-subtle` is the card background there and
