@@ -129,7 +129,7 @@ impl Runtime {
             delay,
             deadline,
             capabilities,
-            "http://127.0.0.1:9/decisions",
+            "http://127.0.0.1:9/v1/routes",
             "",
             Some(ROUTER_KEY),
         )
@@ -459,7 +459,7 @@ async fn derived_models_sharing_a_worker_attribute_the_executed_deployment() {
         0,
         120,
         None,
-        "http://127.0.0.1:9/decisions",
+        "http://127.0.0.1:9/v1/routes",
         members,
         Some(ROUTER_KEY),
     );
@@ -832,7 +832,7 @@ async fn an_empty_classifier_response_is_an_error_not_a_completed_request() {
 #[tokio::test]
 async fn without_the_router_key_rld_does_not_start() {
     let mut runtime =
-        Runtime::start_with_decisions(1, 0, 120, None, "http://127.0.0.1:9/decisions", "", None);
+        Runtime::start_with_decisions(1, 0, 120, None, "http://127.0.0.1:9/v1/routes", "", None);
     assert!(!runtime.exited().await.success());
     assert!(!runtime.dir.join("config.pid").exists());
     assert!(!runtime.dir.join("ready.json").exists());

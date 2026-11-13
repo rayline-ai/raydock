@@ -30,9 +30,10 @@ pub(crate) struct Route {
     pub auth_env: String,
 }
 
-/// The classifier's route: `/v1/messages` on the origin of `decisions.url`
-/// (the router the launcher already checked), with `decisions.auth_env` and
-/// `model` as the wire model.
+/// The classifier's route: the Decisions router's `/v1/messages` beside the
+/// `/v1/routes` that `decisions.url` names (the router the launcher already
+/// checked, path prefix kept), with `decisions.auth_env` and `model` as the
+/// wire model.
 pub(crate) fn route(config: &Value, model: &str) -> Result<Route, String> {
     let decisions = |key: &str| {
         config
@@ -44,7 +45,14 @@ pub(crate) fn route(config: &Value, model: &str) -> Result<Route, String> {
     let url = decisions("url")?;
     let mut messages = reqwest::Url::parse(url)
         .map_err(|error| format!("the core config's `decisions.url` is not a URL: {error}"))?;
-    messages.set_path("/v1/messages");
+    let prefix = messages
+        .path()
+        .strip_suffix("/v1/routes")
+        .ok_or_else(|| {
+            format!("the core config's `decisions.url` {url} is not a router's /v1/routes")
+        })?
+        .to_owned();
+    messages.set_path(&format!("{prefix}/v1/messages"));
     messages.set_query(None);
     Ok(Route {
         url: messages.to_string(),
@@ -121,6 +129,22 @@ mod tests {
                 wire_model: "claude-haiku-5-5".into(),
                 auth_env: "RAYLINE_ROUTER_API_KEY".into(),
             })
+        );
+    }
+
+    #[test]
+    fn keeps_the_router_path_prefix() {
+        let config = json!({"decisions": {"url": "https://router.example/api/v1/routes",
+                                          "auth_env": "RAYLINE_ROUTER_API_KEY"}});
+        assert_eq!(
+            route(&config, CLASSIFIER_MODEL).map(|route| route.url),
+            Ok("https://router.example/api/v1/messages".to_owned())
+        );
+        let elsewhere = json!({"decisions": {"url": "https://router.example/decide",
+                                             "auth_env": "RAYLINE_ROUTER_API_KEY"}});
+        assert_eq!(
+            route(&elsewhere, CLASSIFIER_MODEL),
+            Err("the core config's `decisions.url` https://router.example/decide is not a router's /v1/routes".to_owned())
         );
     }
 

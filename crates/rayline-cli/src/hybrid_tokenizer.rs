@@ -174,12 +174,7 @@ mod tests {
         std::fs::create_dir_all(&snapshot).unwrap();
         std::fs::write(snapshot.join(rayline_tokencount::TOKENIZER_FILE), "{}").unwrap();
         std::fs::write(snapshot.join(rayline_tokencount::TEMPLATE_FILE), "").unwrap();
-        std::fs::write(
-            complete_marker(&hub, REPO),
-            "abc123
-",
-        )
-        .unwrap();
+        std::fs::write(complete_marker(&hub, REPO), "abc123\n").unwrap();
         let used = cached_in(&hub, REPO, "unused".to_owned()).unwrap();
         assert_eq!(used.dir, snapshot);
         assert!(used.cached);
