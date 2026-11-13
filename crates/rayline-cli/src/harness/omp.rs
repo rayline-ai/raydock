@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, RenderContext, yaml_file};
+use super::{Plan, RenderContext, yaml_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 /// First omp that sends `X-Claude-Code-Session-Id` in `auth: apiKey` mode.
@@ -104,7 +104,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 // Without `auth: apiKey` omp poses as Claude Code (renamed tools,
                 // billing system block). apiKey mode is the honest request shape.
                 "auth": "apiKey",
-                "headers": ctx.conversation_headers(CONV_ID_ENV),
                 "models": entries
             }
         }

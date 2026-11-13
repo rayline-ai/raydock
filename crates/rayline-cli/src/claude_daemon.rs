@@ -696,7 +696,7 @@ mod tests {
             router_url: crate::ROUTER_PROD_URL,
             auto_compact_window: Some("180000"),
             refusal_recovery: Box::leak(
-                crate::claude::refusal_recovery_values(|_| None).into_boxed_slice(),
+                crate::claude::refusal_recovery_values().into_boxed_slice(),
             ),
             args: &[],
         }
@@ -887,45 +887,39 @@ mod tests {
         );
     }
 
-    // A message-threads value the user set must be the daemon's too.
+    // Raydock sets message threads to `0`, so a daemon that holds another
+    // value, or none, is not this launch's.
     #[test]
-    fn daemon_without_the_user_message_threads_switch_conflicts() {
+    fn daemon_holding_a_message_threads_value_conflicts() {
         let home = temp_home();
         let mut request = launch_request();
-        let wanted = crate::claude::launch_env_switches(|key| {
-            (key == "CLAUDE_CODE_TETHER_LIVE").then(|| OsString::from("0"))
-        });
+        let wanted = crate::claude::launch_env_switches();
         request.refusal_recovery = &wanted;
-        assert_eq!(
-            classify_launch_safety(&state(rayline_env()), &request, &home).unwrap(),
-            Safety::Conflict
-        );
-        // Positive control: a daemon holding the switch is reused.
-        let mut env = rayline_env();
-        env.insert("CLAUDE_CODE_TETHER_LIVE".to_owned(), "0".to_owned());
-        assert_eq!(
-            classify_launch_safety(&state(env), &request, &home).unwrap(),
-            Safety::Safe
-        );
+        let holding = |value: Option<&str>| {
+            let mut env = rayline_env();
+            if let Some(value) = value {
+                env.insert("CLAUDE_CODE_TETHER_LIVE".to_owned(), value.to_owned());
+            }
+            classify_launch_safety(&state(env), &request, &home).unwrap()
+        };
+        assert_eq!(holding(Some("1")), Safety::Conflict);
+        assert_eq!(holding(None), Safety::Conflict);
+        // Positive control: a daemon holding `0` is reused.
+        assert_eq!(holding(Some("0")), Safety::Safe);
     }
 
     #[test]
-    fn daemon_holding_a_changed_user_override_conflicts() {
+    fn daemon_holding_another_refusal_value_conflicts() {
         let home = temp_home();
-        let mut request = launch_request();
-        let wanted = crate::claude::refusal_recovery_values(|key| {
-            (key == FALLBACK).then(|| OsString::from("0"))
-        });
-        request.refusal_recovery = &wanted;
-        assert_eq!(
-            classify_launch_safety(&state(rayline_env()), &request, &home).unwrap(),
-            Safety::Conflict
-        );
-        // Positive control: the same daemon holding the override is reused.
         let mut env = rayline_env();
         env.insert(FALLBACK.to_owned(), "0".to_owned());
         assert_eq!(
-            classify_launch_safety(&state(env), &request, &home).unwrap(),
+            classify_launch_safety(&state(env), &launch_request(), &home).unwrap(),
+            Safety::Conflict
+        );
+        // Positive control: a daemon holding Raydock's values is reused.
+        assert_eq!(
+            classify_launch_safety(&state(rayline_env()), &launch_request(), &home).unwrap(),
             Safety::Safe
         );
     }
@@ -979,9 +973,10 @@ mod tests {
     fn launch_record_with_other_refusal_switches_does_not_attribute() {
         let home = temp_home();
         let mut recorded = launch_request();
-        let other = crate::claude::refusal_recovery_values(|key| {
-            (key == RETRY).then(|| OsString::from("0"))
-        });
+        let other = [
+            (FALLBACK, Some("1".to_owned())),
+            (RETRY, Some("0".to_owned())),
+        ];
         recorded.refusal_recovery = &other;
         let state = unreadable_state(Some(9005), Some(1_700_000_040_000));
         write_launch_log(&home, &recorded, 9005, 1_700_000_040);

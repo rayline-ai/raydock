@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, RenderContext, json_file};
+use super::{Plan, RenderContext, json_file};
 
 pub(crate) const CONFIG_FILE: &str = "opencode.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -70,7 +70,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "options": {
                     "baseURL": ctx.v1_base(),
                     "apiKey": ctx.key,
-                    "headers": ctx.conversation_headers(&format!("{{env:{CONV_ID_ENV}}}")),
                 },
                 "models": entries
             }
@@ -225,7 +224,6 @@ mod tests {
         assert_eq!(provider["npm"], "@ai-sdk/anthropic");
         assert_eq!(provider["options"]["baseURL"], format!("{TEST_URL}/v1"));
         assert_eq!(provider["options"]["apiKey"], TEST_KEY);
-        assert_eq!(provider["options"]["headers"], serde_json::json!({}));
         // OpenCode's hosted Rayline provider exposes only the two ARC tiers.
         let ids: Vec<_> = provider["models"].as_object().unwrap().keys().collect();
         assert_eq!(ids.len(), 2);
@@ -307,7 +305,6 @@ mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id: super::super::ConversationIdFallback::new(None),
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: Some(1),

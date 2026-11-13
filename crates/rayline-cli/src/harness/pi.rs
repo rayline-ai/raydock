@@ -19,7 +19,7 @@
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, RenderContext, json_file};
+use super::{Plan, RenderContext, json_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 
@@ -61,7 +61,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "baseUrl": ctx.messages_base(),
                 "api": "anthropic-messages",
                 "apiKey": ctx.key,
-                "headers": ctx.conversation_headers(&format!("${CONV_ID_ENV}")),
                 "compat": compat,
                 "models": entries
             }
@@ -92,7 +91,6 @@ mod tests {
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
-            conversation_id: super::super::ConversationIdFallback::new(None),
             allow_empty_signature: allow,
             capabilities: None,
             harness_major_version: None,
@@ -146,7 +144,6 @@ mod tests {
         assert_eq!(provider["apiKey"], super::super::tests::TEST_KEY);
         assert_eq!(provider["compat"]["sendSessionAffinityHeaders"], true);
         assert_eq!(provider["compat"]["allowEmptySignature"], true);
-        assert_eq!(provider["headers"], serde_json::json!({}));
         let ids: Vec<_> = provider["models"]
             .as_array()
             .unwrap()
