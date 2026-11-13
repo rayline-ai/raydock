@@ -44,7 +44,6 @@ pub enum UpdateError {
 
 struct UpdateArtifacts {
     launcher: PathBuf,
-    daemon: PathBuf,
     core: PathBuf,
     license: PathBuf,
 }
@@ -173,9 +172,8 @@ async fn run_on(
             if request.dry_run {
                 Ok(UpdateResult {
                     message: format!(
-                        "Would install {}, {}, {} and {}.\n",
+                        "Would install {}, {} and {}.\n",
                         artifacts.launcher.display(),
-                        artifacts.daemon.display(),
                         artifacts.core.display(),
                         artifacts.license.display()
                     ),
@@ -183,24 +181,6 @@ async fn run_on(
                     stderr: false,
                 })
             } else {
-                let daemon_install_path = install_path
-                    .parent()
-                    .ok_or_else(|| {
-                        UpdateError::Install(format!(
-                            "install path has no parent directory: {}",
-                            install_path.display()
-                        ))
-                    })?
-                    // `EXE_SUFFIX` is "" on Unix and ".exe" on Windows, so the
-                    // daemon installs as `rld` on Unix and `rld.exe` on Windows
-                    // (matching the `.exe` lookup in `router::find_on_path`).
-                    .join(format!(
-                        "{}{}",
-                        crate::DAEMON_BIN,
-                        std::env::consts::EXE_SUFFIX
-                    ));
-                let core_install_path = daemon_install_path
-                    .with_file_name(format!("rayline-core{}", std::env::consts::EXE_SUFFIX));
                 let license_install_path = core_install_path.with_file_name(CORE_LICENSE_NAME);
                 #[cfg(windows)]
                 if let Err(error) = cleanup_retired_backups(&install_path) {
@@ -211,7 +191,6 @@ async fn run_on(
                 replace_file(&artifacts.license, &license_install_path, false)?;
                 replace_binary(&artifacts.core, &core_install_path)?;
                 replace_binary(&artifacts.launcher, &install_path)?;
-                replace_binary(&artifacts.daemon, &daemon_install_path)?;
                 crate::command_alias::install_alias(&install_path)?;
                 Ok(UpdateResult {
                     message: format!(
@@ -415,9 +394,7 @@ async fn download_and_verify(
     let version = target.normalized.as_str();
     fs::create_dir_all(dest_dir).map_err(UpdateError::from)?;
     let launcher_name = format!("{}-{platform_tag}", crate::CLI_ASSET);
-    let daemon_name = format!("{}-{platform_tag}", crate::DAEMON_BIN);
     let launcher_path = dest_dir.join(&launcher_name);
-    let daemon_path = dest_dir.join(&daemon_name);
     let core_name = format!("rayline-core-{platform_tag}");
     let core_path = dest_dir.join(&core_name);
     let license_path = dest_dir.join(CORE_LICENSE_NAME);
@@ -446,11 +423,6 @@ async fn download_and_verify(
     )
     .await?;
     download_to(
-        &artifact_url_for(base_url, version, platform_tag, crate::DAEMON_BIN),
-        &daemon_path,
-    )
-    .await?;
-    download_to(
         &artifact_url_for(base_url, version, platform_tag, "rayline-core"),
         &core_path,
     )
@@ -462,13 +434,11 @@ async fn download_and_verify(
     .await?;
 
     verify_checksum(&sums, &launcher_name, &launcher_path)?;
-    verify_checksum(&sums, &daemon_name, &daemon_path)?;
     verify_checksum(&sums, &core_name, &core_path)?;
     verify_checksum(&sums, CORE_LICENSE_NAME, &license_path)?;
 
     Ok(UpdateArtifacts {
         launcher: launcher_path,
-        daemon: daemon_path,
         core: core_path,
         license: license_path,
     })
@@ -797,7 +767,6 @@ fn is_retired_backup(name: &str) -> bool {
     [
         "raydock.exe",
         "rayline.exe",
-        "rld.exe",
         "rayline-core.exe",
         CORE_LICENSE_NAME,
     ]
@@ -1100,7 +1069,6 @@ mod tests {
         let retired = [
             ".raydock.exe.old-123-456",
             ".rayline.exe.old-123-abcdef",
-            ".rld.exe.old-123-456",
             ".rayline-core.exe.old-123-456",
             ".rayline-core-LICENSE.old-123-456",
         ];
@@ -1130,7 +1098,7 @@ mod tests {
             retired.len() + 1,
             "retirement must keep the old file until a later sweep"
         );
-        let directory = root.join(".rld.exe.old-123-789");
+        let directory = root.join(".rayline-core.exe.old-123-789");
         fs::create_dir(&directory)?;
         cleanup_retired_backups(&root.join("raydock.exe"))?;
         for name in retired {
@@ -1260,7 +1228,7 @@ mod tests {
 
     // Test public key (matches the .minisig in tests/fixtures/SHA256SUMS.minisig)
     // Generated for testing only — NOT the production key.
-    const TEST_PUBKEY: &str = "RWRqzAWsbJCJh9W2BSnYcbRiBwshTgouNtwYqkmFX1Qs6kXdxY70sRCP";
+    const TEST_PUBKEY: &str = "RWRrxu13/uJmEyk8KO8zSLW71qzyxIAYFeYo1nde3MpRDaEwS7yVv2U1";
 
     // Untrusted public key (different keypair, not in the pinned set)
     const UNTRUSTED_PUBKEY: &str = "RWQR3fP7y6Yexmbshr2vDmkWJeKelP8y80oyaUgE9AjMymImLFrUu0Dy";
@@ -1384,7 +1352,7 @@ mod tests {
         // SHA256SUMS is present — intentionally NO SHA256SUMS.minisig.
         fs::write(
             release_dir.join("SHA256SUMS"),
-            b"abc123  rayline-macosx_11_0_arm64\ndef456  rld-macosx_11_0_arm64\n",
+            b"abc123  rayline-macosx_11_0_arm64\ndef456  rayline-core-macosx_11_0_arm64\n",
         )
         .expect("write SHA256SUMS");
 
@@ -1413,10 +1381,9 @@ mod tests {
 
     // Signs tests/fixtures/release-*SHA256SUMS. Testing only — NOT the
     // production key.
-    const RELEASE_TEST_PUBKEY: &str = "RWTbDuo3B/WM3acmGbqPaML9CqKQCddfs1s5x1i/xMqrSRztkpojjYZz";
+    const RELEASE_TEST_PUBKEY: &str = "RWQ7upEBuCoV7z5WLNio5DhgB/JWqJVgNLY9gCH96m8L8UV+8rhE6fUV";
     const TEST_RELEASE: &str = "99.0.0";
     const LAUNCHER: &[u8] = b"fixture launcher\n";
-    const DAEMON: &[u8] = b"fixture daemon\n";
     const CORE: &[u8] = b"fixture core\n";
     const LICENSE: &[u8] = b"fixture license\n";
 
@@ -1494,11 +1461,7 @@ mod tests {
             (format!("{release}/{CORE_LICENSE_NAME}"), LICENSE.to_vec()),
         ]);
         let platform = detect_platform_tag().expect("supported test platform");
-        for (name, bytes) in [
-            (crate::CLI_ASSET, LAUNCHER),
-            (crate::DAEMON_BIN, DAEMON),
-            ("rayline-core", CORE),
-        ] {
+        for (name, bytes) in [(crate::CLI_ASSET, LAUNCHER), ("rayline-core", CORE)] {
             files.insert(format!("{release}/{name}-{platform}"), bytes.to_vec());
         }
         files
@@ -1590,10 +1553,21 @@ mod tests {
         assert_eq!(result.exit_code, 0, "{}", result.message);
         assert!(result.message.contains(TEST_RELEASE), "{}", result.message);
         assert_eq!(fs::read(&installed)?, LAUNCHER);
-        assert_eq!(fs::read(exe(&install, crate::DAEMON_BIN))?, DAEMON);
         assert_eq!(fs::read(exe(&install, "rayline-core"))?, CORE);
         assert_eq!(fs::read(install.join(CORE_LICENSE_NAME))?, LICENSE);
         assert!(fs::symlink_metadata(exe(&install, "rayline")).is_ok());
+        // Windows keeps the replaced launcher as a retired backup.
+        let mut installed_names = fs::read_dir(&install)?
+            .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+            .collect::<io::Result<Vec<_>>>()?;
+        installed_names.retain(|name| !is_retired_backup(name));
+        installed_names.sort();
+        let mut expected_names = [crate::CLI_BIN, "rayline", "rayline-core"]
+            .map(|name| format!("{name}{}", std::env::consts::EXE_SUFFIX))
+            .to_vec();
+        expected_names.push(CORE_LICENSE_NAME.to_owned());
+        expected_names.sort();
+        assert_eq!(installed_names, expected_names);
         // A pinned version reads no channel pointer.
         let release = format!("/cli/v{TEST_RELEASE}/");
         assert!(

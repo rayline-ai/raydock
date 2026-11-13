@@ -30,7 +30,7 @@ release for that tag already exists. It builds with Rust 1.88 and embeds:
 
 The release workflow uploads:
 
-- `rayline-<platform>`, `rld-<platform>` and `rayline-core-<platform>` bare binaries;
+- `rayline-<platform>` and `rayline-core-<platform>` bare binaries;
 - `rayline-<version>-<platform>.tar.gz` archives for macOS/Linux;
 - `rayline-<version>-windows_x86_64.zip` for Windows;
 - `rayline-core-source.json` with the pinned public source and toolchain;
@@ -56,7 +56,6 @@ default. After the GitHub Release is created, mirror the bare binary assets and
 
 ```text
 https://get.rayline.ai/cli/v<version>/rayline-<platform>
-https://get.rayline.ai/cli/v<version>/rld-<platform>
 https://get.rayline.ai/cli/v<version>/rayline-core-<platform>
 https://get.rayline.ai/cli/v<version>/rayline-core-source.json
 https://get.rayline.ai/cli/v<version>/SHA256SUMS
@@ -116,11 +115,12 @@ scripts/install-rayline.sh --version 0.2.0 --install-dir /tmp/rayline-bin
 /tmp/rayline-bin/raydock update --check
 ```
 
-For installer validation against a staged asset directory:
+For installer validation against a staged asset directory, point the hidden
+`--base-url` option at it (it can't be combined with `--version`):
 
 ```bash
-RAYLINE_RELEASE_BASE_URL=file:///tmp/rayline-release/cli/v0.2.0 \
-  scripts/install-rayline.sh --install-dir /tmp/rayline-bin
+scripts/install-rayline.sh --base-url file:///tmp/rayline-release/cli/v0.2.0 \
+  --install-dir /tmp/rayline-bin
 ```
 
 For self-update validation without replacing the active binary, point the
@@ -148,7 +148,8 @@ The helper refuses a mismatched commit, dirty source tree or different Go
 compiler. It builds without CGO and preserves Go VCS build metadata. Its
 `rayline-core-source.json` output is identical across platform builds and must
 be included in the signed checksum manifest. Archives and installers carry all
-three binaries and `rayline-core-LICENSE`, copied from that pinned module;
+`raydock`, its `rayline` alias, `rayline-core` and `rayline-core-LICENSE`,
+copied from that pinned module;
 self-update verifies the binaries and license before installing them.
 
 The historical Mac asset IDs remain stable for existing self-updaters. The Go

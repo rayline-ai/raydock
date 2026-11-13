@@ -38,7 +38,7 @@ body:
       options:
         - CLI (raydock)
         - Harness launch (Claude Code, Codex, others)
-        - Hybrid mode (rld, rayline-core)
+        - Local mode (rayline local, rayline-core)
         - Installer or updater
         - Build from source
         - Documentation or examples
@@ -102,7 +102,7 @@ body:
     id: logs
     attributes:
       label: Logs or diagnostics
-      description: Paste sanitized output from `rayline auth status`, the failing command, or relevant `~/.rayline/hybrid/` log snippets.
+      description: Paste sanitized output from `rayline auth status`, the failing command, or relevant `~/.rayline/local/runtime.log` snippets.
       render: text
   - type: textarea
     id: config

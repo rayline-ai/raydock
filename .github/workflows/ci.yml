@@ -81,6 +81,7 @@ jobs:
 
       - name: Validate release install and hybrid lifecycle
         run: |
+          sudo apt-get install -y minisign
           cargo build --locked -p rayline-cli -p rayline-daemon
           python3 scripts/test-release-install.py
           python3 scripts/test-hybrid-lifecycle.py

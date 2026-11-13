@@ -6,7 +6,7 @@ repo-specific.
 ## Crate Boundaries
 
 - `rayline-cli`: user commands and CLI UX.
-- `rayline-daemon`: `rld hybrid`, the local hybrid gateway.
+- `rayline-daemon`: the local hybrid gateway.
 - `rayline-local-router`: shared helpers for the hybrid gateway.
 - `rayline-hf`, `rayline-tokencount`, `rayline-metrics`: model cache, token
   counting and request metrics for hybrid mode.
