@@ -117,7 +117,7 @@ fn a_config_file_starts_the_local_process_from_it() {
         &["run", "codex", "--config", ROUTING_FILE, "--auth", "auto"],
         &["run", "codex", "--config", ROUTING_FILE, "--auth", "none"],
     ] {
-        assert_fails(&home.run(args), 1, "installed rayline-core is unavailable");
+        assert_fails(&home.run(args), 1, "installed rayline-core is missing at");
     }
 }
 
