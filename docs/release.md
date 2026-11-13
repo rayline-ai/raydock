@@ -20,10 +20,8 @@ same files. Do not push `v*` tags by hand.
 
 `.github/workflows/release.yml` is a manual fallback only: it runs from
 `workflow_dispatch` with an existing tag, never on a tag push, and fails if a
-release for that tag already exists. It builds with Rust 1.88 and embeds:
-
-- `RAYLINE_VERSION=<tag without v>`
-- `RAYLINE_CHANNEL=prod`
+release for that tag already exists. It builds with Rust 1.88 and embeds
+`RAYLINE_VERSION=<tag without v>`.
 
 ## GitHub Release Assets
 
