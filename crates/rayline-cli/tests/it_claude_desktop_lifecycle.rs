@@ -29,7 +29,6 @@ impl Home {
             .env_clear()
             .env("HOME", &self.0)
             .env("PATH", "/usr/bin:/bin")
-            .env("RAYLINE_CLAUDE_DESKTOP_NO_LAUNCHD", "1")
             .args(["claude-desktop", action])
             .output()
             .expect("run CLI")
@@ -42,7 +41,30 @@ impl Drop for Home {
 }
 
 #[test]
-fn mutating_commands_observe_the_same_cross_process_lease() {
+fn local_process_commands_are_not_available_yet() {
+    let home = Home::new();
+    for action in [
+        "start",
+        "status",
+        "validate",
+        "stop",
+        "install-service",
+        "uninstall-service",
+    ] {
+        let output = home.run(action);
+        assert!(!output.status.success(), "{action} succeeded");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(&format!(
+                "`raydock claude-desktop {action}` is not available yet"
+            )),
+            "{action} failed for the wrong reason: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn restoring_commands_observe_the_same_cross_process_lease() {
     let home = Home::new();
     let lock = fs::OpenOptions::new()
         .create_new(true)
@@ -55,14 +77,7 @@ fn mutating_commands_observe_the_same_cross_process_lease() {
         unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
         0
     );
-    for action in [
-        "start",
-        "stop",
-        "off",
-        "uninstall",
-        "install-service",
-        "uninstall-service",
-    ] {
+    for action in ["off", "uninstall"] {
         let output = home.run(action);
         assert!(
             !output.status.success(),
@@ -76,10 +91,13 @@ fn mutating_commands_observe_the_same_cross_process_lease() {
         assert!(home.0.join(".rayline/claude-desktop").is_dir());
     }
     drop(lock);
-    assert!(
-        home.run("off").status.success(),
-        "cleanup must work after the lease is released"
-    );
+    for action in ["off", "uninstall"] {
+        assert!(
+            home.run(action).status.success(),
+            "{action} must work after the lease is released"
+        );
+    }
+    assert!(home.0.join(".rayline/claude-desktop").is_dir());
 }
 
 #[cfg(target_os = "macos")]

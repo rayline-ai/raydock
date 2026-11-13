@@ -1,5 +1,4 @@
 //! Supervise the execution core and forward its native HTTP/SSE surfaces.
-//! This path never enters the static router or local model adapter.
 
 use std::convert::Infallible;
 use std::io::{self, Write};

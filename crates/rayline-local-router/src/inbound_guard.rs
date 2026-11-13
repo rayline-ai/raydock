@@ -10,9 +10,6 @@
 use hyper::header::{AUTHORIZATION, HeaderMap};
 use hyper::{Method, StatusCode};
 
-/// Env var `rld serve` reads the per-instance token from.
-pub const INBOUND_TOKEN_ENV: &str = "RAYLINE_LOCAL_ROUTER_INBOUND_TOKEN";
-
 const API_KEY_HEADER: &str = "x-api-key";
 
 #[derive(Clone, Eq, PartialEq)]
@@ -42,11 +39,6 @@ impl InboundGuard {
     pub fn new(token: impl Into<String>) -> Option<Self> {
         let token = token.into();
         (!token.is_empty()).then_some(Self { token })
-    }
-
-    /// The guard named by [`INBOUND_TOKEN_ENV`], if it is set and non-empty.
-    pub fn from_env() -> Option<Self> {
-        Self::new(std::env::var(INBOUND_TOKEN_ENV).ok()?)
     }
 
     pub fn check(&self, method: &Method, path: &str, headers: &HeaderMap) -> Result<(), Refusal> {

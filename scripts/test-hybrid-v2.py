@@ -42,7 +42,6 @@ def main():
     parser.add_argument("--core", type=Path, required=True, help="rayline-core built from the v2 Go core")
     parser.add_argument("--registry", type=Path, required=True, help="public compiled thinking registry")
     parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
-    parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     args = parser.parse_args()
     registry_bytes = args.registry.read_bytes()
     registry = json.loads(registry_bytes)
@@ -187,7 +186,7 @@ def main():
         settings = {"local_model": {"mode": "custom", "base_url": external, "model": "fixture-local-qwen"},
                     "hybrid": {"routing": {"schedule": {"model": ["cache_boundaries", "user_messages"]}}}}
         (settings_dir / "settings.json").write_text(json.dumps(settings))
-        env = dict(os.environ, HOME=str(root), RLD_BIN=str(args.rld.resolve()),
+        env = dict(os.environ, HOME=str(root),
                    RAYLINE_TEST_DECISIONS_KEY="synthetic-decisions-credential", RAYLINE_TEST_CLOUD_KEY="synthetic-cloud")
         env.pop("RAYLINE_ROUTER_API_KEY", None)
 

@@ -162,7 +162,6 @@ def main():
                         help="routing requires applied V/prices and local/cloud outcomes; transport explicitly makes no such claim")
     parser.add_argument("--price-profile-content-hash", help="expected saved profile table hash (sha256:<hex>), distinct from decisions.price_sha256")
     parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
-    parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     parser.add_argument("--task-timeout-secs", type=int, default=300)
     parser.add_argument("--max-generations-per-task", type=int, default=4)
     parser.add_argument("--max-run-cost-usd", type=Decimal, default=Decimal("5"))
@@ -193,7 +192,7 @@ def main():
     output = args.output_dir.resolve()
     state, home = output / "state", output / "home"
     home.mkdir(mode=0o700)
-    env = dict(os.environ, HOME=str(home), RLD_BIN=str(args.rld.resolve()), PI_TELEMETRY="0", PI_OFFLINE="1")
+    env = dict(os.environ, HOME=str(home), PI_TELEMETRY="0", PI_OFFLINE="1")
     cli = [str(args.rayline.resolve()), "hybrid", "--state-dir", str(state)]
     log = state / "runtime.log"
     report = {"proof": args.proof, "config_sha256": hashlib.sha256(config_bytes).hexdigest(),

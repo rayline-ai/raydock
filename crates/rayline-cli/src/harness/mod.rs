@@ -716,6 +716,8 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
         use std::os::unix::fs::PermissionsExt as _;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
+    #[cfg(windows)]
+    rayline_local_router::windows_state::restrict_to_owner(dir, true)?;
     for file in files {
         let path = dir.join(file.name);
         if !file.overwrite && path.exists() {
@@ -743,10 +745,11 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
     Ok(())
 }
 
-/// Write `contents` to a new file at `path` that only the owner can read: the
-/// Rayline-owned configs hold the router key. A stale file is removed first,
-/// since an open of an existing file keeps its mode.
-fn write_private(path: &Path, contents: &str) -> io::Result<()> {
+/// Write `contents` to a new file at `path` that only the owner can read (mode
+/// 0600 on Unix, an owner-only DACL on Windows, set before anything is
+/// written): the Rayline-owned configs hold the router key. A stale file is
+/// removed first, since an open of an existing file keeps its mode.
+pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write as _;
     match fs::remove_file(path) {
         Ok(()) => {}
@@ -760,7 +763,10 @@ fn write_private(path: &Path, contents: &str) -> io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    options.open(path)?.write_all(contents.as_bytes())
+    let mut file = options.open(path)?;
+    #[cfg(windows)]
+    rayline_local_router::windows_state::restrict_to_owner(path, false)?;
+    file.write_all(contents.as_bytes())
 }
 
 pub(crate) fn build_command(
@@ -1209,6 +1215,23 @@ pub(crate) mod tests {
             Some('8' | '9' | 'a' | 'b')
         ));
         assert_ne!(id, new_conversation_id());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_files_restricts_the_dir_and_files_to_the_owner() {
+        use rayline_local_router::windows_state::is_owner_only;
+        let dir = temp_dir("write-acl").join("cfg");
+        let files = [ConfigFile {
+            name: "config.toml",
+            contents: "secret = 1\n".to_owned(),
+            overwrite: true,
+            merged_from: None,
+            replaces_seed: None,
+        }];
+        write_files(&dir, &files).unwrap();
+        assert!(is_owner_only(&dir).unwrap());
+        assert!(is_owner_only(&dir.join("config.toml")).unwrap());
     }
 
     #[test]

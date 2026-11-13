@@ -144,15 +144,12 @@ pub(crate) fn rejected_argv(
         };
         return RaylineDispatch::Usage(with_usage(message, &command));
     }
-    // A management word as the value of a claude option (`--via login`) is a
-    // bad value, not a management subcommand.
-    let previous = args[stop - 1];
-    let is_claude_value = crate::is_value_option(previous) && !previous.contains('=');
-    if command[0] == "claude" && !is_claude_value && crate::is_claude_management_subcommand(bad) {
+    if command[0] == "claude" && crate::is_claude_management_subcommand(bad) {
         return RaylineDispatch::Unavailable(format!("claude {bad}"));
     }
     // Only option names are echoed: a rejected word may be a prompt or a key.
     let words = command.join(" ");
+    let previous = args[stop - 1];
     let previous_is_value =
         stop >= 2 && crate::is_value_option(args[stop - 2]) && !args[stop - 2].contains('=');
     let previous_option =
@@ -162,10 +159,7 @@ pub(crate) fn rejected_argv(
     let after = previous_option.map_or(String::new(), |option| format!(" after `{option}`"));
     // Only these commands have no `--env` of their own; elsewhere a rejected
     // `--env` was read as another option's value (`codex --auth --env dev`).
-    let without_env = matches!(
-        command[0],
-        "top" | "router" | "local" | "update" | "claude-desktop"
-    );
+    let without_env = matches!(command[0], "top" | "update" | "claude-desktop");
     if without_env && (bad == "--env" || bad.starts_with("--env=")) {
         // After another option `--env` may have been read as its value: say so too.
         let hint = misplaced_env(&command);
@@ -329,17 +323,15 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_option_is_named_with_the_subcommand_usage() {
-        let message = usage_message(&["router", "start", "--bogus"]);
-        assert!(message.starts_with("raydock: `raydock router start` rejected `--bogus`"));
-        assert!(message.contains("\nUsage: raydock router start "));
-        assert!(message.ends_with("Run `raydock router start --help` for details."));
+        let message = usage_message(&["codex", "configure", "--bogus"]);
+        assert!(message.starts_with("raydock: `raydock codex configure` rejected `--bogus`"));
+        assert!(message.contains("\nUsage: raydock codex configure "));
+        assert!(message.ends_with("Run `raydock codex configure --help` for details."));
 
-        let message = usage_message(&["router", "start", "--route", "bogus"]);
-        assert!(
-            message.starts_with(
-                "raydock: `raydock router start` rejected the argument after `--route`"
-            )
-        );
+        let message = usage_message(&["codex", "configure", "--auth", "bogus"]);
+        assert!(message.starts_with(
+            "raydock: `raydock codex configure` rejected the argument after `--auth`"
+        ));
     }
 
     #[test]
@@ -347,10 +339,6 @@ mod tests {
         assert_eq!(
             usage_message(&["top", "--env", "dev"]),
             "raydock: `--env` goes before the command: `raydock --env <name> top`"
-        );
-        assert_eq!(
-            usage_message(&["router", "status", "--env=dev"]),
-            "raydock: `--env` goes before the command: `raydock --env <name> router status`"
         );
         assert_eq!(
             usage_message(&["claude-desktop", "status", "--env", "dev"]),
@@ -366,8 +354,9 @@ mod tests {
              raydock: `--env` goes before the command: `raydock --env <name> top`"
         );
         assert!(
-            usage_message(&["router", "start", "--route", "--env", "dev"])
-                .starts_with("raydock: `raydock router start` rejected `--env` after `--route`\n")
+            usage_message(&["codex", "configure", "--auth", "--env", "dev"]).starts_with(
+                "raydock: `raydock codex configure` rejected `--env` after `--auth`\n"
+            )
         );
         let message = usage_message(&["--auth-token", "secret-value", "top", "--env", "dev"]);
         assert!(!message.contains("secret-value"), "{message}");
@@ -401,15 +390,11 @@ mod tests {
 
     #[test]
     fn missing_or_conflicting_arguments_name_the_command() {
-        let message = usage_message(&["local", "use"]);
-        assert!(
-            message
-                .starts_with("raydock: missing or conflicting arguments for `raydock local use`")
-        );
-        assert!(message.contains("\nUsage: raydock local use <number|model-id>"));
-
-        let message = usage_message(&["top", "--hybrid", "--legacy"]);
-        assert!(message.starts_with("raydock: missing or conflicting arguments for `raydock top`"));
+        let message = usage_message(&["codex", "configure", "--auth"]);
+        assert!(message.starts_with(
+            "raydock: missing or conflicting arguments for `raydock codex configure`"
+        ));
+        assert!(message.contains("\nUsage: raydock codex configure "));
     }
 
     #[test]
@@ -438,17 +423,16 @@ mod tests {
     #[test]
     fn messages_do_not_echo_passthrough_words_or_tokens() {
         for args in [
-            &["claude", "private prompt", "--via", "bogus"][..],
-            &["claude", "private prompt", "--local", "--via", "env"][..],
+            &["claude-desktop", "private prompt"][..],
+            &["codex", "configure", "--auth", "secret-value"][..],
             &["top", "--env", "--auth-token=secret-value"][..],
             &["--env", "--auth-token=secret-value", "status"][..],
             &["--env=--auth-token=secret-value", "status"][..],
             &["top", "--env", "secret-value"][..],
-            &["claude", "--via", "secret-value"][..],
             &["codex", "--auth", "secret-value"][..],
-            &["router", "logs", "-n", "secret-value"][..],
+            &["claude-desktop", "--bogus=secret-value"][..],
             &["top", "secret-value"][..],
-            &["router", "logs", "-nsecret-value"][..],
+            &["top", "-nsecret-value"][..],
             &["status", "--auth-token", "-secret-value", "unexpected"][..],
             &["status", "--auth-token", "--secret-value", "unexpected"][..],
             &["codex", "--env", "--private prompt"][..],
@@ -493,27 +477,14 @@ mod tests {
             message
                 .starts_with("raydock: `raydock codex` rejected `--subscription` after `--auth`")
         );
-        // A private-build flag is an ordinary rejected option here.
-        let message = usage_message(&["claude", "--no-telemetry"]);
-        assert!(message.starts_with("raydock: `raydock claude` rejected `--no-telemetry`"));
         let message = usage_message(&["codex", "--auth", "--env", "dev"]);
         assert!(message.starts_with("raydock: `raydock codex` rejected `--env` after `--auth`"));
         let message = usage_message(&["codex", "--auth", "--env=dev"]);
         assert!(message.starts_with("raydock: `raydock codex` rejected `--env=…` after `--auth`"));
-        let message = usage_message(&["claude", "--via=bogus"]);
-        assert!(message.starts_with("raydock: `raydock claude` rejected `--via=…`"));
-        let message = usage_message(&["claude", "--local", "--via=bogus"]);
-        assert!(
-            message.starts_with("raydock: `raydock claude` rejected `--via=…` after `--local`")
-        );
-    }
-
-    #[test]
-    fn management_word_as_an_option_value_is_a_usage_error() {
-        let message = usage_message(&["claude", "--via", "login"]);
-        assert!(
-            message.starts_with("raydock: `raydock claude` rejected the argument after `--via`")
-        );
+        let message = usage_message(&["codex", "configure", "--bogus=x"]);
+        assert!(message.starts_with("raydock: `raydock codex configure` rejected `--bogus=…`"));
+        let message = usage_message(&["claude-desktop", "off", "--bogus=x"]);
+        assert!(message.starts_with("raydock: `raydock claude-desktop off` rejected `--bogus=…`"));
     }
 
     #[test]
@@ -524,9 +495,9 @@ mod tests {
             (&["claude", "login"][..], "claude login"),
             (&["api"][..], "api"),
             (&["menubar"][..], "menubar"),
-            (&["claude", "--local", "login"][..], "claude login"),
+            (&["claude", "--env", "dev", "login"][..], "claude login"),
             (
-                &["claude", "--model", "x", "hooks", "status"][..],
+                &["claude", "--isolated", "hooks", "status"][..],
                 "claude hooks",
             ),
         ] {

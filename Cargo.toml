@@ -1,15 +1,10 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/rayline-authcache",
     "crates/rayline-hf",
     "crates/rayline-tokencount",
     "crates/rayline-metrics",
-    "crates/rayline-llama",
     "crates/rayline-local-router",
-    "crates/rayline-adapter",
-    "crates/rayline-injector",
-    "crates/rayline-proxy",
     "crates/rayline-cli",
     "crates/rayline-daemon",
 ]
@@ -33,7 +28,6 @@ todo = "deny"
 
 [workspace.dependencies]
 anyhow = "1"
-thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1.53.3", features = ["full"] }
@@ -47,10 +41,6 @@ bytes = "1"
 futures = "0.3"
 clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
-rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
-rustls = "0.23"
-time = { version = "0.3", default-features = false, features = ["std"] }
-tokio-rustls = "0.26"
 
 [profile.release-small]
 inherits = "release"
