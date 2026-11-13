@@ -356,7 +356,7 @@ Only two files:
                                 one claude-desktop command changing Desktop at a time
 ```
 
-Rayline writes nothing else, anywhere. Tests use a temporary home folder.
+Rayline writes nothing else under `~/.rayline` or `~/.config/rayline`. Outside them it writes only the harness's own files named in 9.4 and 9.5. Tests use a temporary home folder.
 
 ## 9. Kept for review
 
