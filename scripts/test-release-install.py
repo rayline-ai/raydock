@@ -63,8 +63,8 @@ def main():
         assert (installed / "rayline-core-LICENSE").read_bytes() == license_data
         (assets / "rayline-core-LICENSE").write_bytes(license_data)
         version = subprocess.check_output([str(installed / "rayline"), "--version"], text=True).split()[1]
-        check = [str(installed / "rayline"), "update", "--check", "--channel", "prod", "--version", version]
-        check_env = dict(os.environ, HOME=str(root), RAYLINE_UPDATE_INSTALL_PATH=str(installed / "rayline"))
+        check = [str(installed / "rayline"), "update", "--check", "--version", version, "--install-path", str(installed / "rayline")]
+        check_env = dict(os.environ, HOME=str(root))
         check_env.pop("RAYLINE_UPDATE_CHANNEL", None)
         complete = subprocess.run(check, env=check_env, capture_output=True, text=True)
         assert complete.returncode == 0, complete.stdout + complete.stderr

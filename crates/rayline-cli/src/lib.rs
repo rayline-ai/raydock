@@ -50,7 +50,6 @@ pub const ARC_SWIFT_MODEL: &str = "arc-swift-1.0";
 pub const VIRTUAL_ROUTER_MODEL: &str = "rayline-auto";
 pub const UPDATE_BASE_URL: &str = "https://get.rayline.ai";
 pub const INSTALLER_URL: &str = "https://get.rayline.ai/install.sh";
-pub const UV_TOOL_NAME: &str = "rayline-cli";
 pub const CLAUDE_LAUNCHES_SUFFIX: &str = ".config/rayline/claude-daemon-launches.json";
 pub const RAYLINE_VERSION: &str = env!("RAYLINE_VERSION");
 pub const RAYLINE_CHANNEL: &str = env!("RAYLINE_CHANNEL");
@@ -460,7 +459,6 @@ Usage: raydock update [OPTIONS]
 Options:
   --check              Check for an update without installing
   --version <version>  Install or check a specific version
-  --channel <channel>  Use prod, dev, main, or local
   --force              Install even when already current
   --dry-run            Download and verify without replacing Raydock
 ";
@@ -2081,8 +2079,9 @@ fn parse_update_request<'a, I>(mut args: std::iter::Peekable<I>) -> Option<updat
 where
     I: Iterator<Item = &'a OsString>,
 {
-    let mut channel = None;
     let mut pinned_version = None;
+    let mut base_url = None;
+    let mut install_path = None;
     let mut force = false;
     let mut check_only = false;
     let mut dry_run = false;
@@ -2094,15 +2093,17 @@ where
         }
         if let Some((option, value)) = arg.split_once('=') {
             match option {
-                "--channel" => channel = Some(value.to_owned()),
                 "--version" => pinned_version = Some(value.to_owned()),
+                "--base-url" => base_url = Some(value.to_owned()),
+                "--install-path" => install_path = Some(PathBuf::from(value)),
                 _ => return None,
             }
             continue;
         }
         match arg {
-            "--channel" => channel = Some(args.next()?.to_str()?.to_owned()),
             "--version" => pinned_version = Some(args.next()?.to_str()?.to_owned()),
+            "--base-url" => base_url = Some(args.next()?.to_str()?.to_owned()),
+            "--install-path" => install_path = Some(PathBuf::from(args.next()?)),
             "--force" => force = true,
             "--check" => check_only = true,
             "--dry-run" => dry_run = true,
@@ -2110,12 +2111,20 @@ where
         }
     }
 
+    if base_url.as_deref() == Some("")
+        || install_path
+            .as_ref()
+            .is_some_and(|path: &PathBuf| path.as_os_str().is_empty())
+    {
+        return None;
+    }
     Some(update::UpdateRequest {
-        channel,
         pinned_version,
         force,
         check_only,
         dry_run,
+        base_url,
+        install_path,
     })
 }
 
@@ -2477,9 +2486,9 @@ fn is_value_option(arg: &str) -> bool {
             | "--upstream-ca-path"
             | "--router-config-path"
             | "--lines"
-            | "--channel"
             | "--url"
             | "--base-url"
+            | "--install-path"
             | "--desktop-config"
     )
 }
@@ -2895,11 +2904,12 @@ mod tests {
         assert_eq!(
             rayline_dispatch_for_argv(&argv(&["rayline", "update", "--check", "--dry-run"])),
             RaylineDispatch::Update(update::UpdateRequest {
-                channel: None,
                 pinned_version: None,
                 force: false,
                 check_only: true,
                 dry_run: true,
+                base_url: None,
+                install_path: None,
             })
         );
         assert_eq!(
@@ -2909,6 +2919,62 @@ mod tests {
                 json: true,
             }
         );
+    }
+
+    #[test]
+    fn update_takes_hidden_release_testing_options_and_no_channel() {
+        let expected = RaylineDispatch::Update(update::UpdateRequest {
+            pinned_version: Some("1.2.3".to_owned()),
+            force: false,
+            check_only: false,
+            dry_run: true,
+            base_url: Some("http://127.0.0.1:9/mirror".to_owned()),
+            install_path: Some(PathBuf::from("/tmp/bin/raydock")),
+        });
+        for options in [
+            &[
+                "--base-url",
+                "http://127.0.0.1:9/mirror",
+                "--install-path",
+                "/tmp/bin/raydock",
+            ][..],
+            &[
+                "--base-url=http://127.0.0.1:9/mirror",
+                "--install-path=/tmp/bin/raydock",
+            ],
+        ] {
+            let mut args = vec!["rayline", "update"];
+            args.extend_from_slice(options);
+            args.extend(["--dry-run", "--version", "1.2.3"]);
+            assert_eq!(rayline_dispatch_for_argv(&argv(&args)), expected);
+        }
+        for rejected in [
+            &["rayline", "update", "--channel", "dev"][..],
+            &["rayline", "update", "--channel=dev"],
+            &["rayline", "update", "--base-url="],
+            &["rayline", "update", "--install-path", ""],
+        ] {
+            assert!(
+                matches!(
+                    rayline_dispatch_for_argv(&argv(rejected)),
+                    RaylineDispatch::Usage(_)
+                ),
+                "{rejected:?}"
+            );
+        }
+        assert_eq!(
+            rayline_help_for_argv(&argv(&[
+                "rayline",
+                "update",
+                "--install-path",
+                "/tmp/bin/raydock",
+                "--help"
+            ])),
+            Some(UPDATE_HELP)
+        );
+        for hidden in ["--channel", "--base-url", "--install-path"] {
+            assert!(!UPDATE_HELP.contains(hidden), "{hidden}");
+        }
     }
 
     #[test]

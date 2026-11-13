@@ -80,8 +80,6 @@ fn old_updater_landing_migrates_and_alias_preserves_output_arguments_and_status(
             &[
                 "update",
                 "--check",
-                "--channel",
-                "prod",
                 "--version",
                 rayline_cli::RAYLINE_VERSION,
             ],
