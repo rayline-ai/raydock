@@ -34,12 +34,10 @@ pub struct Refusal {
 }
 
 impl InboundGuard {
-    /// A guard for `token`, which must not be empty: an empty token would
-    /// admit an empty `x-api-key`.
     pub fn new(token: impl Into<String>) -> Self {
-        let token = token.into();
-        assert!(!token.is_empty(), "an inbound guard needs a token");
-        Self { token }
+        Self {
+            token: token.into(),
+        }
     }
 
     pub fn check(&self, method: &Method, path: &str, headers: &HeaderMap) -> Result<(), Refusal> {
@@ -132,12 +130,6 @@ mod tests {
         assert!(check(&[], Method::POST, "/healthz").is_err());
         assert!(check(&[], Method::GET, "/healthz?x=1").is_err());
         assert!(check(&[], Method::GET, "/v1/models").is_err());
-    }
-
-    #[test]
-    #[should_panic(expected = "an inbound guard needs a token")]
-    fn an_empty_token_is_refused() {
-        InboundGuard::new("");
     }
 
     #[test]

@@ -166,7 +166,7 @@ impl From<crate::status::AuthError> for RunError {
 
 pub async fn run_command(request: &RunRequest) -> Result<Command, RunError> {
     let home = crate::home().map_err(RunError::HomeNotFound)?;
-    let claude_bin = find_on_path("claude").ok_or(RunError::ClaudeMissing)?;
+    let claude_bin = crate::harness::find_on_path("claude").ok_or(RunError::ClaudeMissing)?;
     run_command_from_home(request, &home, claude_bin).await
 }
 
@@ -685,35 +685,6 @@ fn make_symlink(source: &Path, link: &Path) -> io::Result<()> {
 #[cfg(not(any(unix, windows)))]
 fn make_symlink(_source: &Path, _link: &Path) -> io::Result<()> {
     Ok(())
-}
-
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).find_map(|dir| resolve_executable_in_dir(&dir, name))
-}
-
-/// Resolve `name` to an executable inside `dir`, honoring Windows extensions.
-///
-/// On Windows an executable on PATH is stored with an extension (claude.exe
-/// from the native installer, claude.cmd from npm) while callers pass the bare
-/// stem, so we resolve it the way the shell does. The extension probe only runs
-/// when `name` has no extension of its own, leaving explicit names unchanged;
-/// elsewhere it is a plain existence check.
-fn resolve_executable_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
-    let candidate = dir.join(name);
-    if candidate.exists() {
-        return Some(candidate);
-    }
-    #[cfg(windows)]
-    if Path::new(name).extension().is_none() {
-        for ext in ["exe", "cmd", "bat", "com"] {
-            let candidate = dir.join(format!("{name}.{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 /// Makes `path` readable by the user only (`0600`) and its parent dir `0700`.

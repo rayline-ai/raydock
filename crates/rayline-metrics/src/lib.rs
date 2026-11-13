@@ -46,9 +46,6 @@ pub struct RouterTotals {
 pub struct RequestSnapshot {
     pub request_id: String,
     pub route_id: Option<String>,
-    /// The id the upstream (cloud router) gave the forwarded request, when it
-    /// sent one; `None` for local inference and for upstreams that send none.
-    pub upstream_request_id: Option<String>,
     pub source: String,
     pub state: String,
     pub target: Option<String>,
@@ -439,7 +436,6 @@ impl MetricsSink for RouterMetrics {
 struct RequestRecord {
     request_id: String,
     route_id: Option<String>,
-    upstream_request_id: Option<String>,
     source: String,
     state: String,
     target: Option<String>,
@@ -496,7 +492,6 @@ impl RequestRecord {
         Self {
             request_id,
             route_id: None,
-            upstream_request_id: None,
             source: "unknown".to_owned(),
             state: "started".to_owned(),
             target: None,
@@ -555,7 +550,6 @@ impl RequestRecord {
         RequestSnapshot {
             request_id: self.request_id.clone(),
             route_id: self.route_id.clone(),
-            upstream_request_id: self.upstream_request_id.clone(),
             source: self.source.clone(),
             state: self.state.clone(),
             target: self.target.clone(),
