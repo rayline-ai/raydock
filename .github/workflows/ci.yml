@@ -81,7 +81,7 @@ jobs:
 
       - name: Validate release install and hybrid lifecycle
         run: |
-          cargo build --locked -p rayline-cli -p rayline-daemon
+          cargo build --locked -p rayline-cli
           python3 scripts/test-release-install.py
           python3 scripts/test-hybrid-lifecycle.py
           python3 scripts/test-hybrid-live-checks.py
@@ -139,7 +139,7 @@ jobs:
 
       - name: Build release binaries
         shell: bash
-        run: cargo build --release -p rayline-cli -p rayline-daemon --locked
+        run: cargo build --release -p rayline-cli --locked
 
       - name: Test installed command migration
         shell: bash
@@ -158,7 +158,7 @@ jobs:
           cargo test -p rayline-local-router --locked --lib windows_state -- --test-threads=1
           cargo test -p rayline-cli --locked --lib detach -- --test-threads=1
           cargo test -p rayline-cli --locked --lib hybrid -- --test-threads=1
-          cargo test -p rayline-daemon --locked --test it_hybrid -- --test-threads=1
+          cargo test -p rayline-cli --locked --test it_local_process -- --test-threads=1
 
       - name: Parse Windows installer
         if: runner.os == 'Windows'

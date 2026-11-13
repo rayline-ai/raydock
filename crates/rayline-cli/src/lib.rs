@@ -80,6 +80,15 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(cli::Parsed::Hybrid(args)) => return hybrid::run(args).await,
+        Ok(cli::Parsed::LocalProcess(args)) => {
+            return match rayline_daemon::run(args).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("Error: {error:#}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Ok(cli::Parsed::Command { env, command }) => (env, command),
         Err(error) => {
             eprintln!("{error}");

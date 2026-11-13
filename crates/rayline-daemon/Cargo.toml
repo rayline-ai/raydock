@@ -5,17 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Rayline daemon: ARC execution core supervisor"
+description = "The Rayline local process: ARC execution core supervisor and loopback gateway"
 homepage.workspace = true
 repository.workspace = true
 publish.workspace = true
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "rld"
-path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
@@ -36,6 +32,3 @@ rayline-local-router = { path = "../rayline-local-router" }
 rayline-tokencount = { path = "../rayline-tokencount" }
 sha2 = "0.10"
 reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots"] }
-
-[build-dependencies]
-serde_json.workspace = true

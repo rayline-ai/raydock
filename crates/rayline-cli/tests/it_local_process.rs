@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// The router key the launcher hands rld; a synthetic stand-in.
+/// The router key `rayline local start` hands the local process; a synthetic
+/// stand-in.
 const ROUTER_KEY: &str = "rlk-test-key";
 
 struct Runtime {
@@ -23,7 +24,8 @@ impl Drop for Runtime {
     }
 }
 
-/// Ask rld to stop the way its launcher does: SIGTERM, or the Windows stop event.
+/// Ask the local process to stop the way its launcher does: SIGTERM, or the
+/// Windows stop event.
 fn request_stop(child: &Child) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -144,7 +146,7 @@ impl Runtime {
         router_key: Option<&str>,
     ) -> Self {
         let dir = std::env::temp_dir().join(format!(
-            "rayline-hybrid-{}-{:x}",
+            "rayline-local-{}-{:x}",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -165,18 +167,17 @@ impl Runtime {
             text.push('}');
         }
         fs::write(dir.join("config.json"), text).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_rld"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_raydock"));
         command.env_remove("RAYLINE_ROUTER_API_KEY");
         if let Some(key) = router_key {
             command.env("RAYLINE_ROUTER_API_KEY", key);
         }
         let child = command
-            .arg("hybrid")
+            .arg("__local-process")
             .arg("--core")
             .arg(script)
             .arg("--config")
             .arg(dir.join("config.json"))
-            .args(["--port", "0"])
             .arg("--startup-timeout-secs")
             .arg(deadline.to_string())
             .arg("--token-file")
@@ -556,7 +557,7 @@ async fn incompatible_core_never_becomes_ready_and_is_reaped() {
 #[tokio::test]
 async fn non_router_decisions_url_never_starts_the_core() {
     // A hand-edited core configuration cannot send decisions (and the router
-    // key) to a non-router host: rld refuses before spawning the core.
+    // key) to a non-router host: the local process refuses before spawning the core.
     for url in [
         "https://rayline--decisions.modal.run/v1/routes",
         "https://api.rayline.ai:8443/v1/routes",
@@ -830,7 +831,7 @@ async fn an_empty_classifier_response_is_an_error_not_a_completed_request() {
 }
 
 #[tokio::test]
-async fn without_the_router_key_rld_does_not_start() {
+async fn without_the_router_key_the_local_process_does_not_start() {
     let mut runtime =
         Runtime::start_with_decisions(1, 0, 120, None, "http://127.0.0.1:9/v1/routes", "", None);
     assert!(!runtime.exited().await.success());
@@ -998,7 +999,7 @@ async fn classifier_pin_carries_every_client_session_header_and_no_client_auth()
 }
 
 /// One harness turn whose Decisions call fails is sent to the core at most
-/// twice (rld's one resend), and the harness is told not to resend:
+/// twice (the gateway's one resend), and the harness is told not to resend:
 /// `x-should-retry: false`, which Claude Code's SDK honours.
 #[tokio::test]
 async fn a_failed_decision_reaches_the_core_at_most_twice_and_stops_the_harness_retrying() {
@@ -1022,7 +1023,7 @@ async fn a_failed_decision_reaches_the_core_at_most_twice_and_stops_the_harness_
             503,
             Some("1"),
         ),
-        // A wait longer than rld holds a turn goes to the harness instead.
+        // A wait longer than the gateway holds a turn goes to the harness instead.
         ("refused=503&retry_after=120", 1, 503, Some("120")),
         // A timeout, a conflict or another 5xx: one resend, then final.
         ("refused=408&retry_after=1", 2, 503, Some("1")),
