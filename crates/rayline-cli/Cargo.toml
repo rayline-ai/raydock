@@ -36,7 +36,6 @@ rayline-tokencount = { path = "../rayline-tokencount" }
 rayline-local-router = { path = "../rayline-local-router" }
 zstd = "0.14"
 toml_edit = "0.25.15"
-xxhash-rust = { version = "=0.8.15", features = ["xxh64"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -45,7 +44,6 @@ libc = "0.2"
 opener = "0.6"
 windows-sys = { version = "=0.61.2", features = [
     "Win32_Foundation",
-    "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",

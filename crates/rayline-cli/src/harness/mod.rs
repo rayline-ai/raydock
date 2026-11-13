@@ -58,9 +58,6 @@
 
 pub(crate) mod hermes;
 mod omp;
-mod omp_migration;
-mod omp_roles;
-mod omp_sessions;
 mod openclaw;
 mod opencode;
 mod pi;
@@ -614,10 +611,6 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         models,
     };
     let plan = harness.plan(&ctx)?;
-    if harness == Harness::Omp {
-        omp_migration::migrate(&config_dir, &request.args, &ctx.models)
-            .map_err(|error| format!("failed to migrate hosted omp state: {error}"))?;
-    }
     write_files(&config_dir, &plan.files).map_err(|error| {
         format!(
             "failed to write {} config in {}: {error}",

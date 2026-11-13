@@ -322,7 +322,7 @@ Set by one Rayline process and read only by a child it starts. Never read from t
 
 ### 7.5 Test builds only
 
-`RAYDOCK_TEST_DETACH_HELPER`, `PI_TEST_SESSION_OWNERS_DIR`, `RAYLINE_CLAUDE_DESKTOP_NO_LAUNCHD`. Compiled only into test builds, not into the shipped binary.
+`RAYDOCK_TEST_DETACH_HELPER`, `RAYLINE_CLAUDE_DESKTOP_NO_LAUNCHD`. Compiled only into test builds, not into the shipped binary.
 
 Every other env var Rayline reads today is gone (section 10).
 
