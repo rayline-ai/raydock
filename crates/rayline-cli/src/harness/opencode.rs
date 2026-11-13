@@ -36,14 +36,14 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
         let mut entry = json!({
             "name": model.display_name,
             "limit": { "context": model.context_window, "output": model.max_output_tokens },
-            "modalities": { "input": ctx.input_modalities(), "output": ["text"] },
+            "modalities": { "input": model.input_modalities, "output": ["text"] },
             "tool_call": true
         });
         if ctx.harness_major_version.is_some_and(|major| major < 2) {
-            let images = ctx
-                .input_modalities()
-                .as_array()
-                .is_some_and(|input| input.iter().any(|modality| modality == "image"));
+            let images = model
+                .input_modalities
+                .iter()
+                .any(|modality| modality == "image");
             entry["attachment"] = json!(images);
             entry["reasoning"] = json!(true);
         }

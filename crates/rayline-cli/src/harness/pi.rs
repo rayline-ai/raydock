@@ -36,7 +36,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "name": model.display_name,
                 // ARC selects thinking effort; clients must not expose controls.
                 "reasoning": ctx.capabilities.is_some(),
-                "input": ctx.input_modalities(),
+                "input": model.input_modalities,
                 "contextWindow": model.context_window,
                 "maxTokens": model.max_output_tokens
             })

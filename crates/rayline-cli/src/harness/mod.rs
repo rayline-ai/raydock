@@ -82,6 +82,10 @@ pub(crate) struct LaunchModel {
     /// same `arc-sage-1.0` for ARC Sage in every data mode. `None` for a
     /// model that is no ARC product (hybrid's virtual model).
     pub product: Option<String>,
+    /// The input it accepts: `["text", "image"]` for a hosted model whose
+    /// listing has `capabilities.vision: true`, `["text"]` when false; the
+    /// core's admitted modalities under `--local`.
+    pub input_modalities: Vec<String>,
     /// Its row on the price card ([`LaunchModels::apply_arc_prices`]), for a
     /// harness that shows costs (omp); `None` when not read or not on it.
     pub price: Option<ModelPrice>,
@@ -122,6 +126,11 @@ impl LaunchModels {
                         .and_then(Value::as_u64)
                         .ok_or_else(|| format!("{id} has no {field}"))
                 };
+                let vision = entry
+                    .get("capabilities")
+                    .and_then(|capabilities| capabilities.get("vision"))
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| format!("{id} has no capabilities.vision"))?;
                 Ok(LaunchModel {
                     id: id.to_owned(),
                     display_name: entry
@@ -135,6 +144,11 @@ impl LaunchModels {
                         .get("product")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
+                    input_modalities: if vision {
+                        vec!["text".to_owned(), "image".to_owned()]
+                    } else {
+                        vec!["text".to_owned()]
+                    },
                     price: None,
                 })
             })
@@ -168,6 +182,7 @@ impl LaunchModels {
                 context_window: capabilities.context_window,
                 max_output_tokens: capabilities.max_output_tokens,
                 product: None,
+                input_modalities: capabilities.input_modalities.clone(),
                 price: None,
             }],
         }
@@ -383,14 +398,6 @@ pub(crate) struct RenderContext<'a> {
 }
 
 impl RenderContext<'_> {
-    /// Input modalities to advertise for the router model.
-    pub fn input_modalities(&self) -> Value {
-        match self.capabilities {
-            Some(caps) => serde_json::json!(caps.input_modalities),
-            None => serde_json::json!(["text", "image"]),
-        }
-    }
-
     /// Base URL for clients that append `/v1/messages` themselves.
     pub fn messages_base(&self) -> String {
         self.router_url.to_owned()
@@ -868,7 +875,8 @@ pub(crate) mod tests {
             json!({
                 "id": id, "object": "model", "owned_by": "rayline",
                 "display_name": name, "product": product,
-                "context_length": 1_000_000, "max_output_tokens": 128_000
+                "context_length": 1_000_000, "max_output_tokens": 128_000,
+                "capabilities": {"vision": true, "tools": true, "reasoning": true}
             })
         };
         json!({
@@ -891,7 +899,8 @@ pub(crate) mod tests {
         body["data"][0]["context_length"] = json!(200_000);
         body["data"].as_array_mut().unwrap().push(json!({
             "id": "other/model", "object": "model", "owned_by": "other",
-            "display_name": "Other", "context_length": 32_000, "max_output_tokens": 4_096
+            "display_name": "Other", "context_length": 32_000, "max_output_tokens": 4_096,
+            "capabilities": {"vision": false, "tools": true, "reasoning": true}
         }));
         let models = LaunchModels::from_listing(&body).unwrap();
         assert_eq!(models.main, "arc-sage-contributor-1.0");
@@ -912,6 +921,8 @@ pub(crate) mod tests {
         assert_eq!(models.offered[1].context_window, 200_000);
         assert_eq!(models.offered[2].display_name, "Other");
         assert_eq!(models.offered[2].product, None);
+        assert_eq!(models.offered[0].input_modalities, ["text", "image"]);
+        assert_eq!(models.offered[2].input_modalities, ["text"]);
     }
 
     #[test]
@@ -941,6 +952,15 @@ pub(crate) mod tests {
         assert_eq!(
             LaunchModels::from_listing(&body).unwrap_err(),
             "arc-swift-1.0 has no display_name"
+        );
+        let mut body = listing(None);
+        body["data"][1]["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("vision");
+        assert_eq!(
+            LaunchModels::from_listing(&body).unwrap_err(),
+            "arc-sage-1.0 has no capabilities.vision"
         );
     }
 
