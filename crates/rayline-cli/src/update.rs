@@ -38,6 +38,9 @@ pub enum UpdateError {
     Checksum(String),
     InvalidVersion(String),
     Install(String),
+    /// A Windows install step whose file another process still held open
+    /// after `move_into_place` waited for it.
+    InUse(String),
     Network(String),
     Signature(String),
     UnsupportedPlatform(String),
@@ -54,6 +57,7 @@ impl std::fmt::Display for UpdateError {
         match self {
             Self::Checksum(message)
             | Self::Install(message)
+            | Self::InUse(message)
             | Self::Network(message)
             | Self::Signature(message)
             | Self::UnsupportedPlatform(message) => formatter.write_str(message),
@@ -640,7 +644,8 @@ fn replace_file(
 /// locks a running `.exe` and rejects renaming over it, but it *does* allow
 /// renaming the running file out of the way — so we move the current binary to
 /// a sidecar path first, then move the update into place, restoring the
-/// original if the second move fails.
+/// original if the second move fails. On Windows every rename waits briefly
+/// while another process holds the file ([`rename_when_released`]).
 #[cfg(not(windows))]
 pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     fs::rename(staged, install_path).map_err(|error| {
@@ -654,41 +659,85 @@ pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), 
 #[cfg(windows)]
 pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     if !install_path.exists() {
-        return fs::rename(staged, install_path).map_err(|error| {
-            UpdateError::Install(format!(
-                "failed to install {}: {error}",
-                install_path.display()
-            ))
+        return rename_when_released(staged, install_path).map_err(|error| {
+            install_failure(
+                &error,
+                format!("failed to install {}: {error}", install_path.display()),
+            )
         });
     }
 
     let backup = staged_install_path(install_path)?;
-    fs::rename(install_path, &backup).map_err(|error| {
-        UpdateError::Install(format!(
-            "failed to move existing binary {} aside: {error}",
-            install_path.display()
-        ))
+    rename_when_released(install_path, &backup).map_err(|error| {
+        install_failure(
+            &error,
+            format!(
+                "failed to move existing binary {} aside: {error}",
+                install_path.display()
+            ),
+        )
     })?;
 
-    match fs::rename(staged, install_path) {
+    match rename_when_released(staged, install_path) {
         Ok(()) => {
             retire_replaced_backup(&backup, install_path);
             Ok(())
         }
         Err(error) => {
             // Restore the original so a failed update never leaves a hole.
-            fs::rename(&backup, install_path).map_err(|restore_error| {
+            rename_when_released(&backup, install_path).map_err(|restore_error| {
                 UpdateError::Install(format!(
                     "failed to replace {}: {error}; restore also failed: {restore_error}. Original preserved at {}",
                     install_path.display(),
                     backup.display()
                 ))
             })?;
-            Err(UpdateError::Install(format!(
-                "failed to replace {}: {error}",
-                install_path.display()
-            )))
+            Err(install_failure(
+                &error,
+                format!("failed to replace {}: {error}", install_path.display()),
+            ))
         }
+    }
+}
+
+/// How long a Windows rename waits for another process to close the file.
+/// Antivirus and indexing services open a newly written or newly started
+/// executable for a moment without delete sharing.
+#[cfg(windows)]
+const HELD_FILE_WAIT: Duration = Duration::from_secs(2);
+
+/// Windows' sharing and lock violations: another process has the file open.
+#[cfg(windows)]
+fn held_by_another_process(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+/// `fs::rename`, retried with a growing pause for up to [`HELD_FILE_WAIT`]
+/// while another process holds the file. Any other error, or a hold that
+/// outlasts the wait, is returned as it is.
+#[cfg(windows)]
+fn rename_when_released(from: &Path, to: &Path) -> io::Result<()> {
+    let deadline = std::time::Instant::now() + HELD_FILE_WAIT;
+    let mut pause = Duration::from_millis(10);
+    loop {
+        match fs::rename(from, to) {
+            Err(error)
+                if held_by_another_process(&error) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(200));
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn install_failure(error: &io::Error, message: String) -> UpdateError {
+    if held_by_another_process(error) {
+        UpdateError::InUse(message)
+    } else {
+        UpdateError::Install(message)
     }
 }
 
@@ -1080,6 +1129,86 @@ mod tests {
         drop(locked);
         cleanup_retired_backups(&root.join("raydock.exe"))?;
         assert!(!backup.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// Opens `path` the way a scanner does: readable, but without delete
+    /// sharing, so renaming it fails with a sharing violation while open.
+    #[cfg(windows)]
+    fn hold_without_delete_sharing(path: &Path) -> io::Result<fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 1;
+        fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(path)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_swap_waits_for_another_process_to_release_the_file() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
+        fs::write(&installed, b"original")?;
+        fs::write(&staged, b"new")?;
+        let held = hold_without_delete_sharing(&installed)?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        move_into_place(&staged, &installed)?;
+        release.join().expect("release thread");
+        assert_eq!(fs::read(&installed)?, b"new");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_fresh_install_waits_for_another_process_to_release_the_file() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
+        fs::write(&staged, b"new")?;
+        let held = hold_without_delete_sharing(&staged)?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        move_into_place(&staged, &installed)?;
+        release.join().expect("release thread");
+        assert_eq!(fs::read(&installed)?, b"new");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_swap_held_past_the_wait_is_an_in_use_error_and_changes_nothing() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
+        fs::write(&installed, b"original")?;
+        fs::write(&staged, b"new")?;
+        let held = hold_without_delete_sharing(&installed)?;
+        let Err(UpdateError::InUse(message)) = move_into_place(&staged, &installed) else {
+            panic!("a file held past the wait must be an in-use error");
+        };
+        drop(held);
+        assert!(
+            message.starts_with(&format!(
+                "failed to move existing binary {} aside: ",
+                installed.display()
+            )),
+            "{message}"
+        );
+        assert!(message.contains("(os error 32)"), "{message}");
+        assert_eq!(fs::read(&installed)?, b"original");
+        assert_eq!(fs::read(&staged)?, b"new");
         fs::remove_dir_all(root)?;
         Ok(())
     }
