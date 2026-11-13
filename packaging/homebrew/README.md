@@ -1,8 +1,7 @@
 # Homebrew Packaging
 
-Production Homebrew publishing is owned by `atlasfutures/memex-desktop`:
-its `backend/workshop-cli/homebrew/raydock.rb.template` installs the flat
-`homebrew/` archives produced by that repo's release workflow.
+Production Homebrew publishing is handled by the Rayline release pipeline,
+whose formula installs the flat `homebrew/` archives that pipeline builds.
 
 This directory's template is for the manual fallback workflow in this repo,
 whose archives have the layout below. Do not render it against production's
@@ -33,5 +32,4 @@ brew upgrade raydock
 Set `__RELEASE_BASE_URL__` to
 `https://github.com/rayline-ai/raydock/releases/download/v<version>` for public
 GitHub releases, or the verified mirror archive directory when rendering a
-mirrored formula. Hybrid requires macOS 13+ or Linux; archive platform names
-remain stable for existing update clients.
+mirrored formula. The core needs macOS 13+ or Linux.

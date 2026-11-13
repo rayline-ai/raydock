@@ -32,10 +32,12 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1 | iex
 ```
 
-The installer places `raydock`, its alias `rayline` and `rayline-core` in
-`~/.rayline/bin`. It checks every binary it downloads against the release's
-`SHA256SUMS` file. Both `raydock` and `rayline` run the same CLI, and this
-guide writes `rayline`.
+The installer places `raydock`, its alias `rayline`, `rayline-core` and
+`rayline-core-LICENSE` in `~/.rayline/bin`. It needs
+[`minisign`](https://jedisct1.github.io/minisign/): it verifies the release's
+`SHA256SUMS.minisig` against the pinned release key, then each file it
+downloads against `SHA256SUMS`. Both `raydock` and `rayline` run the same
+CLI, and this guide writes `rayline`.
 
 ## Sign in
 
@@ -184,6 +186,10 @@ rayline update --check
 | `--force` | Installs even when the target version isn't newer. |
 | `--dry-run` | Downloads and verifies the update, then reports what it would install, without installing it. |
 
+If Rayline was installed with Homebrew or comes with Rayline.app,
+`rayline update` installs nothing and tells you to update through Homebrew or
+the app instead.
+
 ## Files
 
 `~/.config/rayline/` holds only two files:
@@ -196,7 +202,8 @@ rayline update --check
 
 ```
 ~/.rayline/
-  bin/                          raydock, rayline -> raydock, rayline-core
+  bin/                          raydock, rayline -> raydock, rayline-core,
+                                rayline-core-LICENSE
   local/                        local process state
   harness/<name>/               files Rayline generates per harness
 ```

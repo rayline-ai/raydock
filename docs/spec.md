@@ -29,7 +29,7 @@ Options:
 Commands:
   auth             Sign in, sign out, show status, print a token
   run              Launch a coding harness on ARC
-  local            Start, stop or inspect the local Rayline process (supports hybrid mode)
+  local            Start, stop or inspect the local Rayline process
   top              Show live request metrics
   update           Check for or install a Rayline update
 
@@ -166,7 +166,7 @@ Your own inference servers, keyed by id.
 | `protocols` | list of `anthropic_messages`, `openai_chat`, `openai_responses` | yes, non-empty | The wire protocols it serves. |
 | `api_key_env` | string | no | Name of the env var holding its key. No secrets in the file. |
 
-Each harness speaks one protocol, the one its Rayline config sets up: `claude`, `claude-desktop`, `pi`, `omp` and `opencode` speak `anthropic_messages`; `codex` and `hermes` speak `openai_responses`; `openclaw` speaks `openai_chat`. In local mode, Rayline sets up only that one protocol for each harness. When the endpoint lists the harness's protocol, requests pass straight through with no translation. When it doesn't, the config is wrong and Rayline refuses to run.
+In local mode each harness speaks one protocol, the only one its Rayline config sets up: `claude`, `claude-desktop`, `pi`, `omp` and `opencode` speak `anthropic_messages`; `codex` and `hermes` speak `openai_responses`; `openclaw` speaks `openai_chat`. When the endpoint lists the harness's protocol, requests pass straight through with no translation. When it doesn't, the config is wrong and Rayline refuses to run. In cloud mode the config Rayline writes for `hermes` defaults to `anthropic_messages`, with an `openai_responses` provider beside it, and the one for `openclaw` adds an `openai_responses` provider beside `openai_chat`. Every other harness uses the same protocol in both modes.
 
 ### 5.3 `models`
 
@@ -343,7 +343,8 @@ Only two files:
 
 ```
 ~/.rayline/
-  bin/                          raydock, rayline -> raydock, rayline-core
+  bin/                          raydock, rayline -> raydock, rayline-core,
+                                rayline-core-LICENSE
   local/                        local process state
     core-config.json            config handed to the core
     gateway-token               secret shared by the CLI and the local process
