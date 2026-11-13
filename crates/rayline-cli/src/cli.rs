@@ -712,9 +712,9 @@ fn parse_update(args: &mut Args<'_>) -> Result<Option<UpdateRequest>, UsageError
             "--version" => {
                 let value = args.value(name, inline, UPDATE)?;
                 let version = Version::parse(value).map_err(|_| {
-                    UPDATE.error(format!(
-                        "invalid `--version` `{value}` (use a release version such as `1.2.3` or `1.2.3-rc.1`)"
-                    ))
+                    UPDATE.error(
+                        "invalid `--version` (use a release version such as `1.2.3` or `1.2.3-rc.1`)",
+                    )
                 })?;
                 set_once(&mut pinned_version, version, name, UPDATE)?;
             }
@@ -1683,9 +1683,7 @@ mod tests {
         ] {
             assert_error(
                 &["update", "--version", version],
-                &format!(
-                    "invalid `--version` `{version}` (use a release version such as `1.2.3` or `1.2.3-rc.1`)"
-                ),
+                "invalid `--version` (use a release version such as `1.2.3` or `1.2.3-rc.1`)",
             );
         }
         for url in [
@@ -1997,6 +1995,8 @@ mod tests {
             &["auth", word],
             &["top", word],
             &["run", "claude-desktop", "status", word],
+            &["update", "--version", word],
+            &["update", "--install-path", word],
             &[&format!("--{word}")],
         ] {
             assert!(!error(args).contains(word), "{args:?}");

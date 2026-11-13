@@ -839,7 +839,7 @@ fn temp_update_dir() -> Result<PathBuf, UpdateError> {
 pub struct Version {
     normalized: String,
     public: String,
-    base_parts: Vec<u64>,
+    base: [u64; 3],
     prerelease: Option<(Prerelease, u64)>,
 }
 
@@ -859,6 +859,7 @@ pub struct VersionParseError;
 
 impl Version {
     /// `X.Y.Z`, optionally followed by `-<main|dev|rc>.<N>` and `+<build>`.
+    /// Every number is a decimal without leading zeros that fits a u64.
     pub fn parse(raw: &str) -> Result<Self, VersionParseError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -883,27 +884,15 @@ impl Version {
         Ok(Self {
             normalized: trimmed.to_ascii_lowercase(),
             public: public.to_owned(),
-            base_parts: parse_base_version(base)?,
+            base: parse_base_version(base)?,
             prerelease,
         })
     }
 
-    fn base_cmp(&self, other: &Self) -> Ordering {
-        let length = self.base_parts.len().max(other.base_parts.len());
-        for index in 0..length {
-            let left = self.base_parts.get(index).copied().unwrap_or(0);
-            let right = other.base_parts.get(index).copied().unwrap_or(0);
-            match left.cmp(&right) {
-                Ordering::Equal => {}
-                ordering => return ordering,
-            }
-        }
-        Ordering::Equal
-    }
-
     /// A pre-release sorts below the release it leads up to.
     fn public_cmp(&self, other: &Self) -> Ordering {
-        self.base_cmp(other)
+        self.base
+            .cmp(&other.base)
             .then_with(|| match (self.prerelease, other.prerelease) {
                 (None, None) => Ordering::Equal,
                 (None, Some(_)) => Ordering::Greater,
@@ -913,19 +902,21 @@ impl Version {
     }
 }
 
-fn parse_base_version(base: &str) -> Result<Vec<u64>, VersionParseError> {
-    base.split('.')
-        .map(|part| {
-            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
-                return Err(VersionParseError);
-            }
-            part.parse::<u64>().map_err(|_| VersionParseError)
-        })
-        .collect()
+/// Exactly `X.Y.Z`.
+fn parse_base_version(base: &str) -> Result<[u64; 3], VersionParseError> {
+    let mut parts = base.split('.');
+    let base = [
+        parse_version_number(parts.next())?,
+        parse_version_number(parts.next())?,
+        parse_version_number(parts.next())?,
+    ];
+    match parts.next() {
+        Some(_) => Err(VersionParseError),
+        None => Ok(base),
+    }
 }
 
-/// `<main|dev|rc>.<N>`: one spelling per label, `N` a decimal without leading
-/// zeros that fits a u64.
+/// `<main|dev|rc>.<N>`, one spelling per label.
 fn parse_prerelease(prerelease: &str) -> Result<(Prerelease, u64), VersionParseError> {
     let (label, number) = prerelease.split_once('.').ok_or(VersionParseError)?;
     let label = match label {
@@ -934,14 +925,19 @@ fn parse_prerelease(prerelease: &str) -> Result<(Prerelease, u64), VersionParseE
         "rc" => Prerelease::Rc,
         _ => return Err(VersionParseError),
     };
+    Ok((label, parse_version_number(Some(number))?))
+}
+
+/// A decimal without leading zeros that fits a u64.
+fn parse_version_number(number: Option<&str>) -> Result<u64, VersionParseError> {
+    let number = number.ok_or(VersionParseError)?;
     if number.is_empty()
         || !number.bytes().all(|byte| byte.is_ascii_digit())
         || (number.len() > 1 && number.starts_with('0'))
     {
         return Err(VersionParseError);
     }
-    let number = number.parse::<u64>().map_err(|_| VersionParseError)?;
-    Ok((label, number))
+    number.parse::<u64>().map_err(|_| VersionParseError)
 }
 
 fn validate_version_label(label: &str) -> Result<(), VersionParseError> {
@@ -1219,7 +1215,6 @@ mod tests {
             "1.2.3rc.1",
             "1.2.3-",
             "1.2.3-rc.18446744073709551616",
-            "18446744073709551616.0.0",
         ] {
             assert_eq!(Version::parse(raw), Err(VersionParseError), "{raw}");
         }
@@ -1228,6 +1223,29 @@ mod tests {
             Some((Prerelease::Rc, u64::MAX))
         );
         assert_eq!(version("1.2.3-rc.0").prerelease, Some((Prerelease::Rc, 0)));
+    }
+
+    #[test]
+    fn a_base_version_is_exactly_three_numbers() {
+        for raw in [
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.2.",
+            ".1.2",
+            "1..2",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2.3a",
+            "v1.2.3",
+            "18446744073709551616.0.0",
+        ] {
+            assert_eq!(Version::parse(raw), Err(VersionParseError), "{raw}");
+        }
+        assert_eq!(version("0.0.0").base, [0, 0, 0]);
+        assert_eq!(version("10.20.30").base, [10, 20, 30]);
+        assert_eq!(version("18446744073709551615.0.0").base, [u64::MAX, 0, 0]);
     }
 
     #[test]
