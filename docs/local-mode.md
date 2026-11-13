@@ -13,6 +13,7 @@ Cloud mode, the default, needs none of this. See
 - Rayline, installed and signed in with `rayline auth login`.
 - A config with a `routing` section: `~/.config/rayline/settings.json`, or a
   file you pass with `--config`.
+- On macOS, macOS 13 or later.
 
 Your own inference servers are optional. With none listed, every model ARC
 picks goes to Rayline cloud. Rayline doesn't start, download or stop your
@@ -99,15 +100,24 @@ keyed by the model id ARC returns.
 |---|---|---|---|
 | `endpoint` | string | yes | An id in `endpoints`. |
 | `model` | string | yes | The name the server knows the model by. |
-| `context_window` | integer > 0 | yes if ARC doesn't know the model | The context window in tokens. |
-| `max_output_tokens` | integer > 0 | yes if ARC doesn't know the model | The output ceiling in tokens. |
+| `context_window` | integer > 0 | yes, when the local process starts | The context window in tokens. |
+| `max_output_tokens` | integer > 0 | yes, when the local process starts | The output ceiling in tokens. |
 | `tokenizer` | string | no | A Hugging Face tokenizer repo, used to count tokens. |
 | `price` | object with `input`, `output`, `cache_read`, `cache_write` (numbers >= 0) | no | Replaces ARC's price for this model only. |
 
 When ARC picks a model listed here, the local process sends the request to
-that model's endpoint under its `model` name. Any other model ARC picks goes
-to Rayline cloud under the id ARC returned, and its limits and price come
-from ARC. Every entry works the same way. No setting marks a model as local.
+that model's endpoint under its `model` name. ARC doesn't publish the models
+it knows yet, so every entry needs `context_window` and `max_output_tokens`,
+and the local process refuses to start without them.
+
+The only other models ARC can pick are three Rayline cloud models:
+`anthropic/claude-opus-5.5`, `anthropic/claude-sonnet-5.5` and
+`anthropic/claude-haiku-5.5`. Each has a 1,000,000-token context window and a
+128,000-token output ceiling, and ARC prices them. When ARC picks one, the
+request goes to Rayline cloud. A `models` entry keyed by one of these ids
+replaces that cloud model.
+
+Every entry works the same way. No setting marks a model as local.
 
 ### `routing`
 
@@ -151,7 +161,7 @@ rayline local stop
 
 | Command | Does |
 |---|---|
-| `rayline local start [--config <file>]` | Starts the local process from the default config file, or from `<file>`. |
+| `rayline local start [--config <file>]` | Starts the local process from the default config file, or from `<file>`. The config must have a `routing` section. |
 | `rayline local status` | Shows whether the local process is running, its address, and the config file and environment it was started from. |
 | `rayline local stop` | Stops the local process. Your inference servers keep running. |
 | `rayline run <HARNESS> --local` | Runs the harness in local mode with `~/.config/rayline/settings.json`. Starts the local process if it isn't running. |
@@ -198,8 +208,9 @@ error that names the key. It refuses:
 Before the local process serves anything, it also refuses:
 
 9. An `api_key_env` that names an env var that isn't set.
-10. A model ARC doesn't know whose entry is missing `context_window` or
-    `max_output_tokens`.
+10. A model entry that is missing `context_window` or `max_output_tokens`.
+11. An `api_key_env` that names `RAYLINE_ROUTER_API_KEY`, which holds the
+    Rayline router key.
 
 ## Files
 
@@ -208,6 +219,7 @@ The local process keeps its state in `~/.rayline/local/`:
 | File | Holds |
 |---|---|
 | `core-config.json` | The config handed to the execution core. |
+| `core-config.counted.json` | The same config with Rayline's token counter added. |
 | `gateway-token` | The secret the CLI and the local process share. |
 | `ready.json` | The local process's address, once it is up. |
 | `supervisor.json` | What is running. |

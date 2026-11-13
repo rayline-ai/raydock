@@ -59,14 +59,18 @@ rayline auth login
 - `-p`, `--paste`: paste the callback URL yourself. If you also pass
   `--no-browser`, `--paste` wins.
 
-If you launch a harness while signed out, Rayline signs you in first, with the
-browser flow.
+If you launch a harness while signed out, and stdin and stdout are both
+terminals, Rayline signs you in first, with the browser flow. Otherwise the
+launch fails because you are signed out. A local-mode run that reuses a running
+local process doesn't read your credentials, so it runs even when you are
+signed out.
 
 Sign-in writes `~/.config/rayline/credentials.json`. The file holds your
 session and your router key, and sign-in creates both together. `rayline auth
 logout` removes them. It is the only place Rayline reads them from: no env var
-or flag overrides it. Treat it as a secret. If it can't be loaded, Rayline
-refuses to run and tells you to run `rayline auth login`.
+or flag overrides it. Treat it as a secret. Without the file you are signed
+out. If it is invalid, a command that reads it stops with an error that tells
+you to run `rayline auth login`, which replaces it.
 
 ## Run a harness
 
@@ -103,6 +107,20 @@ rayline run codex -- exec "summarize this repo"
   `rayline run codex --model`, `rayline run codex app` and
   `rayline run codex configure`. The error says the option isn't available in
   local mode.
+- Local mode also refuses to resume or fork a saved session, before anything
+  starts. It checks the harness arguments before any `--`:
+  - `claude`: `-r`, `-c`, `--resume`, `--continue`, `--fork-session`,
+    `--resume-session-at`;
+  - `codex`: `resume` or `fork` as the first argument, or `exec resume` as the
+    first two;
+  - `pi`: `-r`, `-c`, `--resume`, `--continue`, `--fork`, `--session`,
+    `--session-id`;
+  - `opencode`: `-c`, `-s`, `--continue`, `--session`, `--fork`.
+
+  Other harnesses' arguments are passed on unchecked.
+- Local mode refuses OpenClaw container mode: `rayline run openclaw` with
+  `OPENCLAW_CONTAINER` set to a non-empty value, or with a `--container` or
+  `--container=<value>` argument.
 - Rayline options come right after the harness name. The first argument that
   isn't a Rayline option, and everything after `--`, goes to the harness
   unchanged, including `--help`.
@@ -129,7 +147,7 @@ rayline run claude --isolated
 |---|---|
 | `--model <model>` | The model Codex asks for. |
 | `rayline run codex app [WORKSPACE]` | Launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`, and opens `WORKSPACE` if you give one. |
-| `rayline run codex configure` | Writes a Codex profile to `$CODEX_HOME/rayline.config.toml`. |
+| `rayline run codex configure` | Writes a Codex profile, `rayline.config.toml`, to your Codex home: `CODEX_HOME`, or `~/.codex` if it isn't set. |
 
 ### opencode, pi, oh-my-pi, Hermes Agent and OpenClaw
 
@@ -190,7 +208,8 @@ the app instead.
 
 ## Config errors
 
-Rayline checks `settings.json`, `credentials.json`, env overrides and flags
-once, when it loads. If something is wrong it refuses to run, with an error
-that names the key or flag. [Local mode](local-mode.md#config-errors) lists
+Rayline checks `settings.json`, env overrides and flags once, when it loads,
+before any command runs. A command that uses `credentials.json` checks it
+before it acts. If something is wrong it refuses to run, with an error that
+names the key or flag. [Local mode](local-mode.md#config-errors) lists
 every config check.
