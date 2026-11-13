@@ -69,8 +69,8 @@ and `openclaw` (OpenClaw).
   harness, harness options, updates and files.
 - [Local mode](docs/local-mode.md): `settings.json`, the local process, live
   metrics and config errors.
-- [Acceptance testing](docs/acceptance-testing.md): validating the end-to-end
-  Claude Code path.
+- [Acceptance testing](docs/acceptance-testing.md): one real turn per harness
+  in cloud and local mode.
 - [Release process](docs/release.md): how releases are built and published.
 
 ## Build
