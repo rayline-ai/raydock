@@ -100,6 +100,11 @@ rayline run codex -- exec "summarize this repo"
   the two. The run is in local mode if `<file>` has a `routing` section, and
   in cloud mode if it doesn't.
 - `--local` and `--config` together are a usage error.
+- Local mode refuses `rayline run claude --isolated`,
+  `rayline run claude-desktop`, `rayline run codex --model`,
+  `rayline run codex --auth subscription`, `rayline run codex app` and
+  `rayline run codex configure`. The error says the option isn't available in
+  local mode.
 - Rayline options come right after the harness name. The first argument that
   isn't a Rayline option, and everything after `--`, goes to the harness
   unchanged, including `--help`.
