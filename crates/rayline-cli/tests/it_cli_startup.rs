@@ -2,8 +2,8 @@
 //! anything (docs/spec.md sections 3 and 5.8).
 
 use std::fs;
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Home(PathBuf);
@@ -29,7 +29,13 @@ impl Home {
     /// Runs `raydock` in the home directory with `PATH` empty, so a run that got as far as starting
     /// a harness would fail differently.
     fn run(&self, args: &[&str]) -> Output {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_raydock"));
+        self.run_exe(Path::new(env!("CARGO_BIN_EXE_raydock")), args)
+    }
+
+    /// Like [`Home::run`], with the binary at `exe`. The Hugging Face cache is
+    /// `<home>/hf`.
+    fn run_exe(&self, exe: &Path, args: &[&str]) -> Output {
+        let mut command = Command::new(exe);
         for (name, _) in std::env::vars_os() {
             if name.to_string_lossy().starts_with("RAYLINE_") {
                 command.env_remove(name);
@@ -41,6 +47,8 @@ impl Home {
             .env("HOME", &self.0)
             .env("USERPROFILE", &self.0)
             .env("PATH", "")
+            .env("HF_HOME", self.0.join("hf"))
+            .env_remove("HF_HUB_CACHE")
             .output()
             .expect("run raydock")
     }
@@ -190,5 +198,59 @@ fn local_mode_refuses_the_kept_options_it_does_not_run() {
             1,
             &format!("Error: {option} is not available in local mode"),
         );
+    }
+}
+
+/// A config whose model names a tokenizer, so a start that got past the
+/// router key would download it.
+const LOCAL_WITH_TOKENIZER: &str = r#"{
+    "endpoints": {"ollama": {"base_url": "http://127.0.0.1:9",
+        "protocols": ["anthropic_messages", "openai_chat"]}},
+    "models": {"z-ai/glm-5.3-flash": {"endpoint": "ollama", "model": "glm",
+        "context_window": 1000000, "max_output_tokens": 32000,
+        "tokenizer": "zai-org/GLM-5.3-Flash",
+        "price": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}}},
+    "routing": {"decisions_model": "arc-swift-1.0",
+        "classifier_model": "anthropic/claude-haiku-5.5",
+        "policy": {"preset": "arc-policy.hybrid-default.v1"}}}"#;
+
+#[test]
+fn a_signed_out_local_start_fails_before_it_clears_state_or_downloads() {
+    let home = Home::new();
+    home.settings(LOCAL_WITH_TOKENIZER);
+    // An installed release: `raydock` with `rayline-core` beside it.
+    let bin = home.0.join("bin");
+    fs::create_dir_all(&bin).expect("bin dir");
+    let exe = bin.join(format!("raydock{}", std::env::consts::EXE_SUFFIX));
+    fs::copy(env!("CARGO_BIN_EXE_raydock"), &exe).expect("copy raydock");
+    fs::write(
+        bin.join(format!("rayline-core{}", std::env::consts::EXE_SUFFIX)),
+        "",
+    )
+    .expect("core");
+    // What a local process that has exited left behind.
+    let mut exited = Command::new(&exe)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("run raydock");
+    exited.wait().expect("raydock exits");
+    let state = home.0.join(".rayline").join("local");
+    fs::create_dir_all(&state).expect("state dir");
+    let supervisor = format!(
+        r#"{{"pid": {}, "config": "/c.json", "env": null}}"#,
+        exited.id()
+    );
+    fs::write(state.join("supervisor.json"), &supervisor).expect("supervisor");
+    fs::write(state.join("ready.json"), "{}").expect("ready");
+
+    for args in [&["local", "start"][..], &["run", "pi", "--local"]] {
+        assert_fails(&home.run_exe(&exe, args), 1, "Not logged in to prod");
+        assert_eq!(
+            fs::read_to_string(state.join("supervisor.json")).expect("supervisor kept"),
+            supervisor
+        );
+        assert!(state.join("ready.json").exists());
+        assert!(!home.0.join("hf").exists());
     }
 }

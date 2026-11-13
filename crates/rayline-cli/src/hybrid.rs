@@ -329,7 +329,6 @@ async fn launch(
     settings: &Settings,
     say: &dyn Fn(String),
 ) -> io::Result<()> {
-    clear_state(paths)?;
     let config_file = canonical_config(settings)?;
     let core = installed_binary("rayline-core")?;
     let routing = settings
@@ -348,6 +347,14 @@ async fn launch(
                 hosted.name()
             ))
         })?;
+    // The environment's saved router key, minted on first use after
+    // `rayline auth login`. It is the only key the core gets from Rayline;
+    // every endpoint's own key comes from its `api_key_env`. Loaded before
+    // anything changes state or downloads, so signed out fails first.
+    let router_key = crate::status::router_key(&hosted, home)
+        .await
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    clear_state(paths)?;
     // One counter per tokenizer, named for each deployment of its model.
     let mut token_counters = Vec::new();
     for (id, model) in &settings.models {
@@ -375,12 +382,6 @@ async fn launch(
             ));
         }
     }
-    // The environment's saved router key, minted on first use after
-    // `rayline auth login`. It is the only key the core gets from Rayline;
-    // every endpoint's own key comes from its `api_key_env`.
-    let router_key = crate::status::router_key(&hosted, home)
-        .await
-        .map_err(|error| io::Error::other(error.to_string()))?;
     write_private_json(&paths.core_config(), &config, true)?;
     say(format!(
         "Decisions: {} via {}",

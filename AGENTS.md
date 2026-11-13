@@ -20,9 +20,10 @@ handlers. Prefer focused modules over growing the existing large CLI files.
 
 - `docs/spec.md` is the contract for every command, option, config key, env
   var and file. Implement exactly what it lists. Add nothing it does not list.
-- Fail fast: validate config, env overrides and flags once at load and refuse
-  with an error naming the key or flag. Code after load trusts the parsed
-  config: no checks, defaults or fallbacks at call sites.
+- Fail fast: validate config, env overrides and flags once at load, and
+  credentials before any command that uses them acts. Refuse with an error
+  naming the key or flag. Code after load trusts the parsed config: no checks,
+  defaults or fallbacks at call sites.
 - No fallbacks, aliases, alternative spellings, migrations or compatibility
   code. One name per key and flag, one value per meaning.
 - No hard-coded model ids, context windows, output limits or prices.

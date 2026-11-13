@@ -20,10 +20,8 @@ same files. Do not push `v*` tags by hand.
 
 `.github/workflows/release.yml` is a manual fallback only: it runs from
 `workflow_dispatch` with an existing tag, never on a tag push, and fails if a
-release for that tag already exists. It builds with Rust 1.88 and embeds:
-
-- `RAYLINE_VERSION=<tag without v>`
-- `RAYLINE_CHANNEL=prod`
+release for that tag already exists. It builds with Rust 1.88 and embeds
+`RAYLINE_VERSION=<tag without v>`.
 
 ## GitHub Release Assets
 
@@ -90,9 +88,11 @@ pointer or its signature will no longer match.
 > **Known limitation (replay / freeze).** Signing proves the pointer is
 > *authentic*, not *fresh*. An attacker who can serve content may replay an
 > older, validly-signed `latest.txt` to freeze users on a stale head, or pin
-> them to an old (still validly-signed) version above their installed one. The
-> client refuses to roll *below* the installed version (`target > current`), but
-> full anti-rollback needs freshness — a signed timestamp + expiry or a
+> them to an old (still validly-signed) version above their installed one.
+> Without `--version` or `--force`, the client refuses to roll *below* the
+> installed version (`target > current`). `--version` installs any other
+> version and `--force` installs regardless, so either can install an older
+> version. Full anti-rollback needs freshness — a signed timestamp + expiry or a
 > highest-seen-version floor — which is tracked as a follow-up, not delivered by
 > pointer signing alone.
 
