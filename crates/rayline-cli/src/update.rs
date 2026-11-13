@@ -445,13 +445,6 @@ async fn download_and_verify(
 
 pub(crate) async fn download_to(url: &str, path: &Path) -> Result<(), UpdateError> {
     let part = path.with_extension("part");
-    if let Some(source) = url.strip_prefix("file://") {
-        let source = Path::new(source);
-        fs::copy(source, &part).map_err(io_failed_between("copy", source, &part))?;
-        fs::rename(&part, path).map_err(io_failed_between("move", &part, path))?;
-        return Ok(());
-    }
-
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -518,14 +511,16 @@ fn sha256_file(path: &Path) -> Result<String, UpdateError> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+/// The binary to replace: `--install-path` as given (the parser has checked
+/// it names `raydock`), else the running binary, whose `rayline` alias maps
+/// to the `raydock` beside it.
 fn install_path(option: Option<&Path>) -> io::Result<PathBuf> {
-    let path = match option {
-        Some(path) => path.to_path_buf(),
-        None => std::env::current_exe()?,
-    };
-    Ok(crate::command_alias::primary_path(&resolve_install_path(
-        path,
-    )))
+    match option {
+        Some(path) => Ok(resolve_install_path(path.to_path_buf())),
+        None => Ok(crate::command_alias::primary_path(&resolve_install_path(
+            std::env::current_exe()?,
+        ))),
+    }
 }
 
 /// `current_exe()` may return the invoking symlink rather than its target on
@@ -845,19 +840,25 @@ pub struct Version {
     normalized: String,
     public: String,
     base_parts: Vec<u64>,
-    suffix: Option<String>,
+    prerelease: Option<(Prerelease, u64)>,
+}
+
+/// The pre-release labels releases use, ordered low to high. `main` sits below
+/// `dev` because the release ladder is main (rawest, rolling) -> dev (release
+/// candidate) -> prod: a main build must never be reported as newer than the
+/// dev build it is promoted into. `rc` is a public release candidate.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Prerelease {
+    Main,
+    Dev,
+    Rc,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VersionParseError;
 
-#[derive(Debug, Eq, PartialEq)]
-enum VersionToken {
-    Number(u64),
-    Text(String),
-}
-
 impl Version {
+    /// `X.Y.Z`, optionally followed by `-<main|dev|rc>.<N>` and `+<build>`.
     pub fn parse(raw: &str) -> Result<Self, VersionParseError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -874,13 +875,16 @@ impl Version {
             validate_version_label(local)?;
         }
 
-        let (base_parts, suffix) = parse_public_version(public)?;
+        let (base, prerelease) = match public.split_once('-') {
+            Some((base, prerelease)) => (base, Some(parse_prerelease(prerelease)?)),
+            None => (public, None),
+        };
 
         Ok(Self {
             normalized: trimmed.to_ascii_lowercase(),
             public: public.to_owned(),
-            base_parts,
-            suffix: suffix.map(str::to_ascii_lowercase),
+            base_parts: parse_base_version(base)?,
+            prerelease,
         })
     }
 
@@ -897,45 +901,47 @@ impl Version {
         Ordering::Equal
     }
 
+    /// A pre-release sorts below the release it leads up to.
     fn public_cmp(&self, other: &Self) -> Ordering {
-        match self.base_cmp(other) {
-            Ordering::Equal => compare_suffixes(self.suffix.as_deref(), other.suffix.as_deref()),
-            ordering => ordering,
-        }
+        self.base_cmp(other)
+            .then_with(|| match (self.prerelease, other.prerelease) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(left), Some(right)) => left.cmp(&right),
+            })
     }
 }
 
-fn parse_public_version(public: &str) -> Result<(Vec<u64>, Option<&str>), VersionParseError> {
-    let mut base_parts = Vec::new();
-    let mut index = 0;
-    let bytes = public.as_bytes();
+fn parse_base_version(base: &str) -> Result<Vec<u64>, VersionParseError> {
+    base.split('.')
+        .map(|part| {
+            if part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(VersionParseError);
+            }
+            part.parse::<u64>().map_err(|_| VersionParseError)
+        })
+        .collect()
+}
 
-    loop {
-        let start = index;
-        while index < bytes.len() && bytes[index].is_ascii_digit() {
-            index += 1;
-        }
-        if start == index {
-            return Err(VersionParseError);
-        }
-        base_parts.push(
-            public[start..index]
-                .parse::<u64>()
-                .map_err(|_| VersionParseError)?,
-        );
-
-        if index == bytes.len() {
-            return Ok((base_parts, None));
-        }
-        if bytes[index] == b'.' && index + 1 < bytes.len() && bytes[index + 1].is_ascii_digit() {
-            index += 1;
-            continue;
-        }
-
-        let suffix = &public[index..];
-        validate_version_label(suffix)?;
-        return Ok((base_parts, Some(suffix)));
+/// `<main|dev|rc>.<N>`: one spelling per label, `N` a decimal without leading
+/// zeros that fits a u64.
+fn parse_prerelease(prerelease: &str) -> Result<(Prerelease, u64), VersionParseError> {
+    let (label, number) = prerelease.split_once('.').ok_or(VersionParseError)?;
+    let label = match label {
+        "main" => Prerelease::Main,
+        "dev" => Prerelease::Dev,
+        "rc" => Prerelease::Rc,
+        _ => return Err(VersionParseError),
+    };
+    if number.is_empty()
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+        || (number.len() > 1 && number.starts_with('0'))
+    {
+        return Err(VersionParseError);
     }
+    let number = number.parse::<u64>().map_err(|_| VersionParseError)?;
+    Ok((label, number))
 }
 
 fn validate_version_label(label: &str) -> Result<(), VersionParseError> {
@@ -948,118 +954,6 @@ fn validate_version_label(label: &str) -> Result<(), VersionParseError> {
         return Err(VersionParseError);
     }
     Ok(())
-}
-
-fn compare_suffixes(left: Option<&str>, right: Option<&str>) -> Ordering {
-    match (left, right) {
-        (None, None) => Ordering::Equal,
-        (None, Some(right)) if suffix_is_post_release(right) => Ordering::Less,
-        (Some(left), None) if suffix_is_post_release(left) => Ordering::Greater,
-        (None, Some(_)) => Ordering::Greater,
-        (Some(_), None) => Ordering::Less,
-        (Some(left), Some(right)) => compare_suffix_tokens(left, right),
-    }
-}
-
-fn suffix_is_post_release(suffix: &str) -> bool {
-    suffix_tokens(suffix).first().is_some_and(
-        |token| matches!(token, VersionToken::Text(text) if text_rank(text) == POST_RELEASE_RANK),
-    )
-}
-
-fn compare_suffix_tokens(left: &str, right: &str) -> Ordering {
-    let left_tokens = suffix_tokens(left);
-    let right_tokens = suffix_tokens(right);
-    let length = left_tokens.len().max(right_tokens.len());
-    for index in 0..length {
-        match (left_tokens.get(index), right_tokens.get(index)) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(left), Some(right)) => match compare_version_tokens(left, right) {
-                Ordering::Equal => {}
-                ordering => return ordering,
-            },
-        }
-    }
-    Ordering::Equal
-}
-
-fn compare_version_tokens(left: &VersionToken, right: &VersionToken) -> Ordering {
-    match (left, right) {
-        (VersionToken::Number(left), VersionToken::Number(right)) => left.cmp(right),
-        (VersionToken::Text(left), VersionToken::Text(right)) => {
-            match text_rank(left).cmp(&text_rank(right)) {
-                Ordering::Equal => left.cmp(right),
-                ordering => ordering,
-            }
-        }
-        (VersionToken::Number(_), VersionToken::Text(_)) => Ordering::Less,
-        (VersionToken::Text(_), VersionToken::Number(_)) => Ordering::Greater,
-    }
-}
-
-fn suffix_tokens(suffix: &str) -> Vec<VersionToken> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    let mut current_is_digit = None;
-    for ch in suffix
-        .trim_start_matches(['.', '-', '_'])
-        .chars()
-        .flat_map(char::to_lowercase)
-    {
-        if matches!(ch, '.' | '-' | '_') {
-            push_suffix_token(&mut tokens, &mut current, &mut current_is_digit);
-            continue;
-        }
-        let is_digit = ch.is_ascii_digit();
-        if current_is_digit.is_some_and(|current| current != is_digit) {
-            push_suffix_token(&mut tokens, &mut current, &mut current_is_digit);
-        }
-        current_is_digit = Some(is_digit);
-        current.push(ch);
-    }
-    push_suffix_token(&mut tokens, &mut current, &mut current_is_digit);
-    tokens
-}
-
-fn push_suffix_token(
-    tokens: &mut Vec<VersionToken>,
-    current: &mut String,
-    current_is_digit: &mut Option<bool>,
-) {
-    if current.is_empty() {
-        *current_is_digit = None;
-        return;
-    }
-    if current_is_digit.unwrap_or(false) {
-        let number = current.parse::<u64>().unwrap_or(u64::MAX);
-        tokens.push(VersionToken::Number(number));
-    } else {
-        tokens.push(VersionToken::Text(std::mem::take(current)));
-    }
-    current.clear();
-    *current_is_digit = None;
-}
-
-/// Rank of a post-release label (`1.0.0-post1`), the only suffix family that
-/// sorts *above* a bare release. Kept as a named constant so `text_rank` and
-/// `suffix_is_post_release` cannot drift apart.
-const POST_RELEASE_RANK: u8 = 6;
-
-fn text_rank(text: &str) -> u8 {
-    // Ordered low -> high. `main` sits below `dev` because the release ladder is
-    // main (rawest, rolling) -> dev (release candidate) -> prod: a main build
-    // must never be reported as newer than the dev build it is promoted into.
-    match text {
-        "main" => 0,
-        "dev" => 1,
-        "a" | "alpha" => 2,
-        "b" | "beta" => 3,
-        "c" | "pre" | "preview" | "rc" => 4,
-        "post" | "r" | "rev" => POST_RELEASE_RANK,
-        _ => 5,
-    }
 }
 
 #[cfg(test)]
@@ -1267,6 +1161,76 @@ mod tests {
     }
 
     #[test]
+    fn versions_order_along_the_release_ladder() {
+        // Low to high: the main and dev ladder builds, a public release
+        // candidate, then the release.
+        let ladder = [
+            "0.2.9+ee1afb00b6cd",
+            "0.3.0-main.7+ee1afb00b6cd",
+            "0.3.0-main.100+ee1afb00b6cd",
+            "0.3.0-dev.1+ee1afb00b6cd",
+            "0.3.0-dev.42+ee1afb00b6cd",
+            "0.3.0-rc.1",
+            "0.3.0-rc.2",
+            "0.3.0+ee1afb00b6cd",
+            "0.3.1-main.1+ee1afb00b6cd",
+        ];
+        for (index, lower) in ladder.iter().enumerate() {
+            for higher in &ladder[index + 1..] {
+                assert_eq!(
+                    version(higher).public_cmp(&version(lower)),
+                    Ordering::Greater,
+                    "{higher} > {lower}"
+                );
+                assert_eq!(
+                    version(lower).public_cmp(&version(higher)),
+                    Ordering::Less,
+                    "{lower} < {higher}"
+                );
+            }
+        }
+        assert_eq!(
+            version("0.2.0-rc.1").public_cmp(&version("0.2.0-rc.1")),
+            Ordering::Equal
+        );
+        assert_eq!(
+            version("0.3.0+aaaaaaaaaaaa").public_cmp(&version("0.3.0+bbbbbbbbbbbb")),
+            Ordering::Equal,
+            "the build label does not order releases"
+        );
+    }
+
+    #[test]
+    fn a_pre_release_is_main_dev_or_rc_with_one_number() {
+        for raw in [
+            "0.0.0-sigtest1",
+            "1.2.3-alpha.1",
+            "1.2.3-beta.1",
+            "1.2.3-pre.1",
+            "1.2.3-post.1",
+            "1.2.3-rc",
+            "1.2.3-rc1",
+            "1.2.3-rc.",
+            "1.2.3-rc.01",
+            "1.2.3-rc.1.2",
+            "1.2.3-rc_1",
+            "1.2.3-RC.1",
+            "1.2.3-Dev.1",
+            "1.2.3rc.1",
+            "1.2.3-",
+            "1.2.3-rc.18446744073709551616",
+            "18446744073709551616.0.0",
+        ] {
+            assert_eq!(Version::parse(raw), Err(VersionParseError), "{raw}");
+        }
+        assert_eq!(
+            version("1.2.3-rc.18446744073709551615").prerelease,
+            Some((Prerelease::Rc, u64::MAX))
+        );
+        assert_eq!(version("1.2.3-rc.0").prerelease, Some((Prerelease::Rc, 0)));
+    }
+
+    #[test]
     fn a_missing_bare_version_names_the_full_form() {
         let not_found = || UpdateError::Network("GET x returned HTTP 404".to_owned());
         let UpdateError::Network(message) = bare_version_hint(&version("0.2.12"), not_found())
@@ -1383,58 +1347,6 @@ mod tests {
     // Tamper / missing-signature / unpinned-key rejection is covered by the
     // verify_signature tests above; parse_verified_latest delegates to that same
     // function, so those paths are not re-tested against the pointer payload.
-
-    // ── Integration tests for download_and_verify ─────────────────────────────
-
-    /// download_and_verify returns Err when SHA256SUMS.minisig is absent from
-    /// the release directory. The pipeline must fail closed: no signature means
-    /// no installation, even if SHA256SUMS itself is present.
-    ///
-    /// Setup: a `file://` release server with SHA256SUMS but no .minisig.
-    /// The `file://` short-circuit in `download_to` makes this a pure I/O test
-    /// with no network dependency.
-    #[tokio::test]
-    async fn self_update_fails_closed_without_minisig() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let test_root = std::env::temp_dir().join(format!("rayline-test-no-minisig-{unique}"));
-        let dest_dir = std::env::temp_dir().join(format!("rayline-test-dest-{unique}"));
-
-        // Create the release directory structure that download_and_verify expects.
-        // checksums_url_for("1.0.0") → "<base>/cli/v1.0.0/SHA256SUMS"
-        let release_dir = test_root.join("cli").join("v1.0.0");
-        fs::create_dir_all(&release_dir).expect("create release dir");
-        fs::create_dir_all(&dest_dir).expect("create dest dir");
-
-        // SHA256SUMS is present — intentionally NO SHA256SUMS.minisig.
-        fs::write(
-            release_dir.join("SHA256SUMS"),
-            b"abc123  rayline-macosx_11_0_arm64\ndef456  rayline-core-macosx_11_0_arm64\n",
-        )
-        .expect("write SHA256SUMS");
-
-        // Point download_and_verify at the local file tree.
-        let base_url = format!("file://{}", test_root.display());
-        let result = download_and_verify(
-            &base_url,
-            &version("1.0.0"),
-            "macosx_11_0_arm64",
-            &dest_dir,
-            &[TEST_PUBKEY],
-        )
-        .await;
-
-        // Cleanup best-effort (test trees are small)
-        let _ = fs::remove_dir_all(&test_root);
-        let _ = fs::remove_dir_all(&dest_dir);
-
-        assert!(
-            result.is_err(),
-            "download_and_verify must return Err when SHA256SUMS.minisig is absent"
-        );
-    }
 
     // ── update against a fake release server ─────────────────────────────────
 
@@ -1650,6 +1562,29 @@ mod tests {
             panic!("a release without the core must fail closed: {result:?}");
         };
         assert!(message.contains("rayline-core-"), "{message}");
+        assert_eq!(fs::read_dir(&install)?.count(), 1);
+        assert_eq!(fs::read(exe(&install, crate::CLI_BIN))?, b"installed");
+        fs::remove_dir_all(install)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_refuses_a_release_without_a_signature() -> TestResult {
+        let mut files = release_files("release-SHA256SUMS");
+        let signature = format!("/cli/v{TEST_RELEASE}/SHA256SUMS.minisig");
+        files.remove(&signature);
+        let server = FakeReleaseServer::start(files);
+        let (install, request) = install_from(&server)?;
+        let result = run_on(&request, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await;
+        let Err(UpdateError::Network(message)) = result else {
+            panic!("a release without SHA256SUMS.minisig must fail closed: {result:?}");
+        };
+        assert!(message.contains("SHA256SUMS.minisig"), "{message}");
+        assert_eq!(
+            server.requests(),
+            [format!("/cli/v{TEST_RELEASE}/SHA256SUMS"), signature],
+            "no artifact is downloaded before the signature checks out"
+        );
         assert_eq!(fs::read_dir(&install)?.count(), 1);
         assert_eq!(fs::read(exe(&install, crate::CLI_BIN))?, b"installed");
         fs::remove_dir_all(install)?;

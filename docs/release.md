@@ -123,13 +123,14 @@ scripts/install-rayline.sh --base-url file:///tmp/rayline-release/cli/v0.2.0 \
   --install-dir /tmp/rayline-bin
 ```
 
-For self-update validation without replacing the active binary, point the
-hidden `--base-url` option at a local or staged mirror (`--install-path` picks
-the binary a real update replaces):
+For self-update validation without replacing the active binary, serve the
+staged mirror over HTTP and point the hidden `--base-url` option at it
+(`--install-path` picks the binary a real update replaces):
 
 ```bash
+python3 -m http.server --bind 127.0.0.1 --directory /tmp/rayline-release 8000 &
 /tmp/rayline-bin/raydock update --dry-run --version 0.2.0 \
-  --base-url file:///tmp/rayline-release
+  --base-url http://127.0.0.1:8000
 ```
 
 ## Execution core build
