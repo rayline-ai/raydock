@@ -75,8 +75,6 @@ use super::{CONV_ID_ENV, ConfigFile, Plan, RenderContext, to_yaml, yaml_merge};
 
 pub(crate) const CONFIG_FILE: &str = "config.yaml";
 pub(crate) const MESSAGES_PROVIDER: &str = "rayline";
-/// The Messages provider's name before 0.4.3, removed from existing configs.
-const LEGACY_MESSAGES_PROVIDER: &str = "rayline-anth";
 pub(crate) const RESPONSES_PROVIDER: &str = "rayline-resp";
 /// Hermes' per-provider key naming the header its conversation id rides on.
 pub(crate) const SESSION_AFFINITY_KEY: &str = "session_affinity_header";
@@ -84,16 +82,14 @@ pub(crate) const SESSION_AFFINITY_KEY: &str = "session_affinity_header";
 pub(crate) const PROMPT_CACHING_KEY: &str = "prompt_caching";
 
 /// The keys Rayline sets in `config.yaml`. `fallback_providers` stays empty
-/// and the legacy `fallback_model` is removed, so a failed turn never moves
-/// off the router. The Messages provider's old name is removed too, so an
-/// existing config lists it once, as `rayline`.
+/// and `fallback_model` is removed, so a failed turn never moves off the
+/// router.
 const OWNED: &[&[&str]] = &[
     &["model", "provider"],
     &["model", "default"],
     &["model", "context_length"],
     &["providers", MESSAGES_PROVIDER],
     &["providers", RESPONSES_PROVIDER],
-    &["providers", LEGACY_MESSAGES_PROVIDER],
     &["fallback_providers"],
     &["fallback_model"],
 ];
@@ -288,29 +284,33 @@ pub(crate) fn prepare_home(
     mut run: impl FnMut(&[&str]) -> io::Result<Finished>,
 ) -> Result<(), String> {
     let marker = home.join(READY_MARKER);
-    let record = |launcher: &str| {
-        let environments = environments(home);
-        (!environments.is_empty()).then(|| format!("{launcher}{}\n", environments.join("\n")))
+    let record = || -> Result<Option<String>, String> {
+        let Some(launcher) = launcher else {
+            return Ok(None);
+        };
+        let environments = environments(home)?;
+        Ok((!environments.is_empty()).then(|| format!("{launcher}{}\n", environments.join("\n"))))
     };
-    if let Some(record) = launcher.and_then(record)
+    if let Some(record) = record()?
         && fs::read_to_string(&marker).is_ok_and(|seen| seen == record)
     {
         return Ok(());
     }
-    let remember = || {
-        // Best effort: without the record the next launch probes again.
-        match launcher.and_then(record) {
-            Some(record) => {
-                let _ = fs::write(&marker, record);
-            }
-            None => {
-                let _ = fs::remove_file(&marker);
-            }
+    let remember = || -> Result<(), String> {
+        match record()? {
+            Some(record) => fs::write(&marker, record)
+                .map_err(|error| format!("failed to write {}: {error}", marker.display())),
+            None => match fs::remove_file(&marker) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                    Err(format!("failed to remove {}: {error}", marker.display()))
+                }
+                _ => Ok(()),
+            },
         }
     };
     match run(&["--version"]) {
         Ok(probe) if probe.success => {
-            remember();
+            remember()?;
             return Ok(());
         }
         Ok(probe) if probe.output.contains(REPAIR_COMMAND) => {}
@@ -322,7 +322,7 @@ pub(crate) fn prepare_home(
     );
     match run(&["pm", "repair"]) {
         Ok(repair) if repair.success => {
-            remember();
+            remember()?;
             eprintln!("  Hermes is set up.");
             Ok(())
         }
@@ -332,27 +332,48 @@ pub(crate) fn prepare_home(
 }
 
 /// The Hermes dependency environments `home` records that still exist, one
-/// per install that has one, sorted.
-fn environments(home: &Path) -> Vec<String> {
-    let Ok(installs) = fs::read_dir(home.join(INSTALLS_DIR)) else {
-        return Vec::new();
+/// per install that has one, sorted. A home with no installs dir has none.
+fn environments(home: &Path) -> Result<Vec<String>, String> {
+    let dir = home.join(INSTALLS_DIR);
+    let read_error = |error: io::Error| format!("failed to read {}: {error}", dir.display());
+    let installs = match fs::read_dir(&dir) {
+        Ok(installs) => installs,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(read_error(error)),
     };
-    let mut environments: Vec<String> = installs
-        .flatten()
-        .filter_map(|install| recorded_environment(&install.path().join(FACTS_FILE)))
-        .collect();
+    let mut environments = Vec::new();
+    for install in installs {
+        let facts = install.map_err(read_error)?.path().join(FACTS_FILE);
+        environments.extend(recorded_environment(&facts)?);
+    }
     environments.sort();
-    environments
+    Ok(environments)
 }
 
-fn recorded_environment(facts: &Path) -> Option<String> {
-    let text = fs::read_to_string(facts).ok()?;
-    let facts = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}')).ok()?;
-    let environment = facts.pointer("/packages/venv/environment")?.as_str()?;
-    Path::new(environment)
+/// The environment an install's facts file records, if it records one and its
+/// venv is there. An install with no facts file has none; a facts file that
+/// cannot be read or is not JSON is an error.
+fn recorded_environment(facts: &Path) -> Result<Option<String>, String> {
+    let text = match fs::read_to_string(facts) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read {}: {error}", facts.display())),
+    };
+    let value = serde_json::from_str::<Value>(text.trim_start_matches('\u{feff}'))
+        .map_err(|error| format!("invalid JSON in {}: {error}", facts.display()))?;
+    let Some(environment) = value.pointer("/packages/venv/environment") else {
+        return Ok(None);
+    };
+    let Some(environment) = environment.as_str() else {
+        return Err(format!(
+            "{}: packages.venv.environment is not a string",
+            facts.display()
+        ));
+    };
+    Ok(Path::new(environment)
         .join("pyvenv.cfg")
         .is_file()
-        .then(|| environment.to_owned())
+        .then(|| environment.to_owned()))
 }
 
 fn last_lines(output: &str) -> String {
@@ -530,8 +551,7 @@ mod tests {
         );
     }
 
-    /// The seed holds the Messages provider under its pre-0.4.3 name
-    /// (`rayline-anth`); the launch removes it and writes `rayline`.
+    /// The seed holds a stale `rayline` provider; the launch replaces it.
     #[test]
     fn relaunch_keeps_user_settings_and_is_idempotent() {
         use super::super::tests::{TEST_URL, temp_dir};
@@ -545,7 +565,7 @@ mod tests {
   provider: anthropic
   reasoning_effort: high
 providers:
-  rayline-anth:
+  rayline:
     base_url: https://stale.example
     models:
       arc-sage-1.0:
@@ -593,8 +613,6 @@ fallback_model:
   reasoning_effort: high
   context_length: 1000000
 providers:
-  mine:
-    base_url: https://mine.example
   rayline:
     api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
@@ -607,6 +625,8 @@ providers:
         context_length: 1000000
         prompt_caching: true
     session_affinity_header: \"x-session-affinity\"
+  mine:
+    base_url: https://mine.example
   rayline-resp:
     api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
@@ -830,6 +850,65 @@ providers:
             let mut again = Vec::new();
             prepare_home(&home, LAUNCHER, hermes(&home, &mut again)).unwrap();
             assert_eq!(again, ["--version", "pm repair"]);
+        }
+
+        /// A facts file that cannot be read, or is not JSON, stops the launch
+        /// with its path; Hermes is not run.
+        #[test]
+        fn a_bad_facts_file_is_an_error_naming_it() {
+            for (name, bad) in [("unreadable", None), ("invalid", Some("{not json"))] {
+                let home = temp_dir(&format!("hermes-facts-{name}"));
+                let install = home.join("installs").join("d74c6fbcc1df5714");
+                let facts = install.join("facts.json");
+                match bad {
+                    // A directory where the file belongs cannot be read as one.
+                    None => std::fs::create_dir_all(&facts).unwrap(),
+                    Some(text) => {
+                        std::fs::create_dir_all(&install).unwrap();
+                        std::fs::write(&facts, text).unwrap();
+                    }
+                }
+                let mut calls = Vec::new();
+                let error = prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap_err();
+                assert!(
+                    error.contains(&facts.display().to_string()),
+                    "{name}: {error}"
+                );
+                assert!(calls.is_empty(), "{name}: {calls:?}");
+            }
+        }
+
+        /// An installs dir that cannot be read stops the launch with its path.
+        #[test]
+        fn an_unreadable_installs_dir_is_an_error_naming_it() {
+            let home = temp_dir("hermes-installs-file");
+            let installs = home.join("installs");
+            std::fs::write(&installs, "not a dir").unwrap();
+            let mut calls = Vec::new();
+            let error = prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap_err();
+            assert!(error.contains(&installs.display().to_string()), "{error}");
+            assert!(calls.is_empty(), "{calls:?}");
+        }
+
+        /// A ready marker that cannot be written, or removed, stops the launch
+        /// with its path.
+        #[test]
+        fn a_marker_that_cannot_be_written_or_removed_is_an_error() {
+            let home = temp_dir("hermes-marker-write");
+            commit_environment(&home);
+            // A directory where the marker belongs: writing and removing it as
+            // a file both fail.
+            let marker = home.join(super::super::READY_MARKER);
+            std::fs::create_dir_all(&marker).unwrap();
+            for launcher in [LAUNCHER, None] {
+                let mut calls = Vec::new();
+                let error = prepare_home(&home, launcher, hermes(&home, &mut calls)).unwrap_err();
+                assert!(
+                    error.contains(&marker.display().to_string()),
+                    "{launcher:?}: {error}"
+                );
+                assert_eq!(calls, ["--version"]);
+            }
         }
 
         /// An install that starts without a per-home environment (or fails for

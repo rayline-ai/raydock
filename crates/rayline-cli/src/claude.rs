@@ -19,8 +19,7 @@ const SUBAGENT_MODEL_FORCE_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
 /// Claude Code's model for its `haiku` alias, which its background tasks
 /// (titles, summaries) use.
 const HAIKU_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
-/// Claude Code's `--model` / `ANTHROPIC_MODEL` aliases (each may also carry a
-/// `[1m]` suffix).
+/// Claude Code's `--model` aliases (each may also carry a `[1m]` suffix).
 const CLAUDE_CODE_MODEL_ALIASES: [&str; 7] = [
     "default", "best", "opus", "sonnet", "haiku", "fable", "opusplan",
 ];
@@ -67,7 +66,7 @@ struct RoleModelInputs<'a> {
     /// The models the hosted router lists for the key.
     hosted: &'a crate::harness::LaunchModels,
     /// The main-agent model the user chose: Claude Code's own `--model` after
-    /// `--`, or `ANTHROPIC_MODEL`.
+    /// `--`.
     chosen_main_model: Option<&'a str>,
 }
 
@@ -140,6 +139,7 @@ pub enum RunError {
     Router(String),
     Auth(crate::status::AuthError),
     IsolatedProfile(io::Error),
+    LaunchRecord(io::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -154,6 +154,9 @@ impl std::fmt::Display for RunError {
             Self::Auth(error) => error.fmt(formatter),
             Self::IsolatedProfile(error) => {
                 write!(formatter, "failed to prepare the isolated Claude profile: {error}")
+            }
+            Self::LaunchRecord(error) => {
+                write!(formatter, "Claude Code launch record: {error}")
             }
         }
     }
@@ -201,12 +204,8 @@ async fn run_command_from_home(
     let router_url = hosted.base_url.clone();
     let key = crate::status::router_key(hosted, home).await?;
 
-    // The main model the user chose. Claude Code's own `--model` (after `--`)
-    // wins over `ANTHROPIC_MODEL`.
-    let inherited_model = env::var("ANTHROPIC_MODEL")
-        .ok()
-        .filter(|model| !model.trim().is_empty());
-    let chosen_main_model = forwarded_model_arg(&request.args).or_else(|| inherited_model.clone());
+    // The main model the user chose: Claude Code's own `--model` (after `--`).
+    let chosen_main_model = forwarded_model_arg(&request.args);
     // A hosted launch's ARC defaults are the ids the router lists for the
     // key, which follow the account's data mode.
     let hosted_models = crate::harness::fetch_hosted_models(&router_url, &key)
@@ -290,19 +289,14 @@ async fn run_command_from_home(
     command.env(RAYLINE_ENV_NAME_ENV, &env_name);
     command.env_remove("ANTHROPIC_API_KEY");
     apply_refusal_recovery_env(&mut command, &launch_switches);
-    if let Some(caller_cwd) = env::var_os("RAYLINE_CALLER_CWD") {
-        let caller_cwd = PathBuf::from(caller_cwd);
-        if caller_cwd.is_dir() {
-            command.current_dir(caller_cwd);
-        }
-    }
 
     crate::claude_daemon::record_rayline_claude_launch(LaunchRecord {
         home,
         pid: std::process::id(),
         request: &daemon_request,
         preserve_spawned_by_pid,
-    });
+    })
+    .map_err(RunError::LaunchRecord)?;
     Ok(command)
 }
 
@@ -658,8 +652,7 @@ fn seed_isolated_claude_json(source: &Path, dest: &Path) -> io::Result<()> {
         Err(error) => return Err(error_with_path(source, error)),
     };
     fs::write(dest, contents).map_err(|error| error_with_path(dest, error))?;
-    set_user_private_permissions(dest);
-    Ok(())
+    set_user_private_permissions(dest)
 }
 
 /// Return `raw` (`.claude.json` contents) with the auth keys removed, or `None`
@@ -688,8 +681,7 @@ fn copy_private_file(source: &Path, dest: &Path) -> io::Result<()> {
             format!("copy {} to {}: {error}", source.display(), dest.display()),
         )
     })?;
-    set_user_private_permissions(dest);
-    Ok(())
+    set_user_private_permissions(dest)
 }
 
 fn error_with_path(path: &Path, error: io::Error) -> io::Error {
@@ -783,16 +775,23 @@ fn add_claude_bin_dir_to_child_path(command: &mut Command, claude_bin: &Path) {
     }
 }
 
-fn set_user_private_permissions(path: &Path) {
+/// Makes `path` readable by the user only (`0600`) and its parent dir `0700`.
+/// A failed chmod is an error with the path.
+fn set_user_private_permissions(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
+        let restrict = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .map_err(|error| error_with_path(path, error))
+        };
         if let Some(parent) = path.parent() {
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            restrict(parent, 0o700)?;
         }
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        restrict(path, 0o600)?;
     }
+    Ok(())
 }
 
 fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
@@ -943,7 +942,9 @@ mod refusal_recovery_env_tests {
         unsafe {
             std::env::set_var(CLAUDE_CONFIG_DIR_ENV, home.join(".claude"));
             std::env::set_var(AUTO_COMPACT_WINDOW_ENV, "180000");
-            std::env::remove_var("ANTHROPIC_MODEL");
+            // An exported model is not a model source: the child runs on the
+            // router's main model.
+            std::env::set_var("ANTHROPIC_MODEL", "exported-model");
         }
         let mut seen = Vec::new();
         // The message-threads switch goes through the same launch switches: a
@@ -983,6 +984,10 @@ mod refusal_recovery_env_tests {
                     .flatten()
                     .as_deref(),
                 Some("180000")
+            );
+            assert_eq!(
+                env.get("ANTHROPIC_MODEL").cloned().flatten(),
+                Some(crate::harness::tests::hosted_models().main)
             );
             seen.push((
                 env.get(FALLBACK).cloned().flatten(),
@@ -1142,7 +1147,8 @@ mod claude_command_tests {
                 args: &[],
             },
             preserve_spawned_by_pid: None,
-        });
+        })
+        .unwrap();
         crate::harness::tests::assert_only_harness_files(
             &home,
             "claude-code",
@@ -1447,6 +1453,18 @@ mod isolated_seed_tests {
         assert!(mentions(&error, &failed_dest), "{error}");
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// A chmod that fails is an error with the path, not a file left with
+    /// whatever mode it had.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_chmod_is_an_error_with_the_path() {
+        let dir = temp_dir("chmod");
+        let missing = dir.join("settings.json");
+        let error = set_user_private_permissions(&missing).unwrap_err();
+        assert!(mentions(&error, &missing), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -1528,7 +1546,7 @@ mod arc_default_tests {
         assert!(switches.iter().all(|(_, value)| value.is_some()));
     }
 
-    // Claude Code's `--model X` (after `--`) or `ANTHROPIC_MODEL` puts
+    // Claude Code's `--model X` (after `--`) puts
     // subagents and background tasks on X too.
     #[test]
     fn chosen_main_model_applies_to_subagents_and_background() {

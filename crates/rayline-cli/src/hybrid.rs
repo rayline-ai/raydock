@@ -807,8 +807,7 @@ fn harness_command(
         _ => {
             let harness = crate::harness::Harness::from_command(name)
                 .ok_or_else(|| io::Error::other(format!("unsupported hybrid harness {name:?}")))?;
-            let major_version =
-                harness.major_version(crate::harness::find_on_path(harness.binary()).as_deref());
+            let major_version = harness.major_version(&program).map_err(io::Error::other)?;
             let args = harness.hybrid_args(args, major_version)?;
             let config_dir = paths.dir.join("harness").join(name);
             private_dir(&config_dir)?;

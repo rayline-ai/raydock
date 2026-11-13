@@ -65,7 +65,10 @@ impl LaunchPreflight<'_> {
             return Ok(PreflightOutcome::Proceed(proceed));
         };
 
-        if classify_launch_safety(&state, self.request, self.home) == Safety::Safe {
+        if classify_launch_safety(&state, self.request, self.home)
+            .map_err(RunError::LaunchRecord)?
+            == Safety::Safe
+        {
             return Ok(PreflightOutcome::Proceed(proceed));
         }
 
@@ -333,15 +336,19 @@ enum Safety {
     Conflict,
 }
 
-fn classify_launch_safety(state: &DaemonState, request: &RequestSpec<'_>, home: &Path) -> Safety {
+fn classify_launch_safety(
+    state: &DaemonState,
+    request: &RequestSpec<'_>,
+    home: &Path,
+) -> io::Result<Safety> {
     let env_verified_ours = !state.env_unreadable && daemon_owner_matches_request(state, request);
-    let launch_log_verified_ours = daemon_was_launched_by_wksp(state, home, request);
+    let launch_log_verified_ours = daemon_was_launched_by_wksp(state, home, request)?;
 
-    if env_verified_ours || launch_log_verified_ours {
+    Ok(if env_verified_ours || launch_log_verified_ours {
         Safety::Safe
     } else {
         Safety::Conflict
-    }
+    })
 }
 
 /// Whether a detected daemon conflict was resolved by stopping the other daemon
@@ -460,14 +467,14 @@ fn daemon_was_launched_by_wksp(
     state: &DaemonState,
     home: &Path,
     request: &RequestSpec<'_>,
-) -> bool {
+) -> io::Result<bool> {
     let Some(spawned_by_pid) = state.spawned_by_pid else {
-        return false;
+        return Ok(false);
     };
     let Some(started_at_ms) = state.started_at_ms else {
-        return false;
+        return Ok(false);
     };
-    for entry in read_rayline_claude_launches(home) {
+    for entry in read_rayline_claude_launches(home)? {
         if entry.get("pid").and_then(Value::as_u64) != Some(u64::from(spawned_by_pid)) {
             continue;
         }
@@ -488,10 +495,10 @@ fn daemon_was_launched_by_wksp(
         };
         let delta_ms = started_at_ms - (ts * 1000);
         if (0..=DAEMON_SPAWN_MAX_DELAY_SECONDS * 1000).contains(&delta_ms) {
-            return true;
+            return Ok(true);
         }
     }
-    false
+    Ok(false)
 }
 
 fn format_daemon_conflict_error(
@@ -557,18 +564,36 @@ fn format_daemon_conflict_error(
     }
 }
 
-fn read_rayline_claude_launches(home: &Path) -> Vec<Value> {
-    let raw = match fs::read_to_string(rayline_claude_launches_path(home)) {
+/// The launch records Rayline wrote. A missing file holds none; a file that
+/// cannot be read, or is not a JSON array of objects, is an error with the
+/// path.
+fn read_rayline_claude_launches(home: &Path) -> io::Result<Vec<Value>> {
+    let path = rayline_claude_launches_path(home);
+    let raw = match fs::read_to_string(&path) {
         Ok(raw) => raw,
-        Err(_) => return Vec::new(),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to read {}: {error}", path.display()),
+            ));
+        }
     };
-    serde_json::from_str::<Value>(&raw)
-        .ok()
-        .and_then(|value| value.as_array().cloned())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(Value::is_object)
-        .collect()
+    let invalid = |detail: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: {detail}", path.display()),
+        )
+    };
+    let value = serde_json::from_str::<Value>(&raw)
+        .map_err(|error| invalid(&format!("invalid JSON: {error}")))?;
+    let Value::Array(entries) = value else {
+        return Err(invalid("not a JSON array"));
+    };
+    if !entries.iter().all(Value::is_object) {
+        return Err(invalid("an entry is not a JSON object"));
+    }
+    Ok(entries)
 }
 
 /// One launch record: what `daemon_was_launched_by_wksp` matches a daemon on.
@@ -587,10 +612,12 @@ fn launch_entry(request: &RequestSpec<'_>, pid: u32, ts: i64) -> Value {
     })
 }
 
-pub fn record_rayline_claude_launch(record: LaunchRecord<'_>) {
+/// Adds this launch to the launch records, dropping expired ones. Any failure
+/// to read or write the file is an error with the path.
+pub fn record_rayline_claude_launch(record: LaunchRecord<'_>) -> io::Result<()> {
     let now = unix_now_secs();
     let mut pruned = Vec::new();
-    for entry in read_rayline_claude_launches(record.home) {
+    for entry in read_rayline_claude_launches(record.home)? {
         if record
             .preserve_spawned_by_pid
             .is_some_and(|pid| entry.get("pid").and_then(Value::as_u64) == Some(u64::from(pid)))
@@ -607,20 +634,24 @@ pub fn record_rayline_claude_launch(record: LaunchRecord<'_>) {
     }
     pruned.push(launch_entry(record.request, record.pid, now));
     let path = rayline_claude_launches_path(record.home);
-    let Some(parent) = path.parent() else {
-        return;
+    let failed = |action: String, error: io::Error| {
+        io::Error::new(error.kind(), format!("failed to {action}: {error}"))
     };
-    if fs::create_dir_all(parent).is_err() {
-        return;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| failed(format!("create {}", parent.display()), error))?;
     }
     let tmp_path = path.with_extension("json.tmp");
-    let Ok(contents) = serde_json::to_string(&pruned) else {
-        return;
-    };
-    if fs::write(&tmp_path, contents).is_err() {
-        return;
-    }
-    let _ = fs::rename(tmp_path, path);
+    let contents = serde_json::to_string(&pruned)
+        .map_err(|error| failed(format!("serialise {}", path.display()), error.into()))?;
+    fs::write(&tmp_path, contents)
+        .map_err(|error| failed(format!("write {}", tmp_path.display()), error))?;
+    fs::rename(&tmp_path, &path).map_err(|error| {
+        failed(
+            format!("rename {} to {}", tmp_path.display(), path.display()),
+            error,
+        )
+    })
 }
 
 fn rayline_claude_launches_path(home: &Path) -> PathBuf {
@@ -720,7 +751,7 @@ mod tests {
         let state = unreadable_state(None, None);
 
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Conflict
         );
     }
@@ -732,7 +763,7 @@ mod tests {
         let state = state(BTreeMap::new());
 
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Conflict
         );
     }
@@ -744,7 +775,7 @@ mod tests {
         let state = state(rayline_env());
 
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Safe
         );
     }
@@ -762,7 +793,7 @@ mod tests {
         );
 
         assert_eq!(
-            classify_launch_safety(&state(other), &request, &home),
+            classify_launch_safety(&state(other), &request, &home).unwrap(),
             Safety::Conflict
         );
     }
@@ -776,7 +807,7 @@ mod tests {
         write_launch_log(&home, &recorded, 9005, 1_700_000_040);
 
         assert_eq!(
-            classify_launch_safety(&state, &launch_request(), &home),
+            classify_launch_safety(&state, &launch_request(), &home).unwrap(),
             Safety::Conflict
         );
     }
@@ -790,11 +821,11 @@ mod tests {
         unpinned.remove(AUTO_COMPACT_WINDOW_ENV);
 
         assert_eq!(
-            classify_launch_safety(&state(unpinned), &request, &home),
+            classify_launch_safety(&state(unpinned), &request, &home).unwrap(),
             Safety::Safe
         );
         assert_eq!(
-            classify_launch_safety(&state(rayline_env()), &request, &home),
+            classify_launch_safety(&state(rayline_env()), &request, &home).unwrap(),
             Safety::Conflict
         );
     }
@@ -808,7 +839,7 @@ mod tests {
         write_launch_log(&home, &request, 9004, 1_700_000_030);
 
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Safe
         );
     }
@@ -823,7 +854,7 @@ mod tests {
         write_launch_log(&home, &request, 9001, 1_700_000_000);
 
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Safe
         );
     }
@@ -836,7 +867,7 @@ mod tests {
         write_launch_log(&home, &request, 9003, 1_700_000_020);
 
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Safe
         );
     }
@@ -850,7 +881,7 @@ mod tests {
         let mut env = rayline_env();
         env.remove(RETRY);
         assert_eq!(
-            classify_launch_safety(&state(env), &launch_request(), &home),
+            classify_launch_safety(&state(env), &launch_request(), &home).unwrap(),
             Safety::Conflict
         );
     }
@@ -865,14 +896,14 @@ mod tests {
         });
         request.refusal_recovery = &wanted;
         assert_eq!(
-            classify_launch_safety(&state(rayline_env()), &request, &home),
+            classify_launch_safety(&state(rayline_env()), &request, &home).unwrap(),
             Safety::Conflict
         );
         // Positive control: a daemon holding the switch is reused.
         let mut env = rayline_env();
         env.insert("CLAUDE_CODE_TETHER_LIVE".to_owned(), "0".to_owned());
         assert_eq!(
-            classify_launch_safety(&state(env), &request, &home),
+            classify_launch_safety(&state(env), &request, &home).unwrap(),
             Safety::Safe
         );
     }
@@ -886,14 +917,14 @@ mod tests {
         });
         request.refusal_recovery = &wanted;
         assert_eq!(
-            classify_launch_safety(&state(rayline_env()), &request, &home),
+            classify_launch_safety(&state(rayline_env()), &request, &home).unwrap(),
             Safety::Conflict
         );
         // Positive control: the same daemon holding the override is reused.
         let mut env = rayline_env();
         env.insert(FALLBACK.to_owned(), "0".to_owned());
         assert_eq!(
-            classify_launch_safety(&state(env), &request, &home),
+            classify_launch_safety(&state(env), &request, &home).unwrap(),
             Safety::Safe
         );
     }
@@ -909,7 +940,7 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, Value::Array(vec![entry]).to_string()).unwrap();
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Conflict
         );
     }
@@ -928,7 +959,7 @@ mod tests {
         unset.push(("CLAUDE_CODE_SUBAGENT_MODEL", None));
         request.refusal_recovery = &unset;
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Safe
         );
         let mut set: Vec<_> = recorded.refusal_recovery.to_vec();
@@ -938,7 +969,7 @@ mod tests {
         ));
         request.refusal_recovery = &set;
         assert_eq!(
-            classify_launch_safety(&state, &request, &home),
+            classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Conflict
         );
     }
@@ -954,8 +985,81 @@ mod tests {
         let state = unreadable_state(Some(9005), Some(1_700_000_040_000));
         write_launch_log(&home, &recorded, 9005, 1_700_000_040);
         assert_eq!(
-            classify_launch_safety(&state, &launch_request(), &home),
+            classify_launch_safety(&state, &launch_request(), &home).unwrap(),
             Safety::Conflict
+        );
+    }
+
+    fn record(home: &Path, request: &RequestSpec<'_>) -> io::Result<()> {
+        record_rayline_claude_launch(LaunchRecord {
+            home,
+            pid: 9006,
+            request,
+            preserve_spawned_by_pid: None,
+        })
+    }
+
+    /// No launch record file holds no launches; recording one creates it.
+    #[test]
+    fn a_missing_launch_record_holds_none() {
+        let home = temp_home();
+        assert!(read_rayline_claude_launches(&home).unwrap().is_empty());
+        record(&home, &launch_request()).unwrap();
+        assert_eq!(read_rayline_claude_launches(&home).unwrap().len(), 1);
+    }
+
+    /// A launch record that cannot be read, or is not a JSON array of
+    /// objects, is an error with the path, both when a daemon is checked
+    /// against it and when a launch is added to it.
+    #[test]
+    fn a_bad_launch_record_is_an_error_naming_it() {
+        let request = launch_request();
+        for bad in [None, Some("{not json"), Some("{}"), Some("[1]")] {
+            let home = temp_home();
+            let path = rayline_claude_launches_path(&home);
+            match bad {
+                // A directory where the file belongs cannot be read as one.
+                None => fs::create_dir_all(&path).unwrap(),
+                Some(text) => {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, text).unwrap();
+                }
+            }
+            let state = unreadable_state(Some(9005), Some(1_700_000_040_000));
+            let errors = [
+                classify_launch_safety(&state, &request, &home).unwrap_err(),
+                record(&home, &request).unwrap_err(),
+            ];
+            for error in errors {
+                assert!(
+                    error.to_string().contains(&path.display().to_string()),
+                    "{bad:?}: {error}"
+                );
+            }
+        }
+    }
+
+    /// A launch record that cannot be written is an error with the path.
+    #[test]
+    fn a_launch_record_that_cannot_be_written_is_an_error() {
+        let request = launch_request();
+        // The record's dir cannot be created under a file.
+        let home = temp_home();
+        let dot_dir = home.join(crate::DOT_CONFIG_DIR);
+        fs::write(&dot_dir, "").unwrap();
+        let error = record(&home, &request).unwrap_err();
+        assert!(
+            error.to_string().contains(&dot_dir.display().to_string()),
+            "{error}"
+        );
+        // The temporary file cannot be written over a directory.
+        let home = temp_home();
+        let tmp_path = rayline_claude_launches_path(&home).with_extension("json.tmp");
+        fs::create_dir_all(&tmp_path).unwrap();
+        let error = record(&home, &request).unwrap_err();
+        assert!(
+            error.to_string().contains(&tmp_path.display().to_string()),
+            "{error}"
         );
     }
 }

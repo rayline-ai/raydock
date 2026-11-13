@@ -374,11 +374,12 @@ impl Harness {
     }
 
     /// The installed harness's major version, where a renderer or the launch
-    /// args depend on it (OpenCode); None otherwise or when unreadable.
-    pub(crate) fn major_version(self, binary: Option<&Path>) -> Option<u64> {
+    /// args depend on it: `Some` for OpenCode ([`opencode::major_version`]),
+    /// `None` for every other harness.
+    pub(crate) fn major_version(self, binary: &Path) -> Result<Option<u64>, String> {
         match self {
-            Self::OpenCode => opencode::major_version(binary?),
-            _ => None,
+            Self::OpenCode => opencode::major_version(binary).map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -396,7 +397,7 @@ impl Harness {
                 ));
             }
             Ok(openclaw::launch_args(args))
-        } else if self == Self::OpenCode {
+        } else if let (Self::OpenCode, Some(major_version)) = (self, major_version) {
             Ok(opencode_args(args, major_version))
         } else {
             Ok(args.to_vec())
@@ -544,12 +545,9 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         conversation_id: ConversationIdFallback::new(
             std::env::var(CONV_ID_FALLBACK_ENV).ok().as_deref(),
         ),
-        allow_empty_signature: pi::allow_empty_signature(
-            &env_name,
-            std::env::var(pi::ALLOW_EMPTY_SIGNATURE_ENV).ok().as_deref(),
-        ),
+        allow_empty_signature: pi::allow_empty_signature(&env_name),
         capabilities: None,
-        harness_major_version: harness.major_version(Some(&binary)),
+        harness_major_version: harness.major_version(&binary)?,
         models,
     };
     let plan = harness.plan(&ctx)?;
@@ -572,8 +570,8 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         harness.name(),
         config_dir.display()
     );
-    let args = match harness {
-        Harness::OpenClaw => {
+    let args = match (harness, ctx.harness_major_version) {
+        (Harness::OpenClaw, _) => {
             let env_container =
                 std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
             if env_container || openclaw::uses_container(&request.args) {
@@ -595,7 +593,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             }
             args
         }
-        Harness::OpenCode => opencode_args(&request.args, ctx.harness_major_version),
+        (Harness::OpenCode, Some(major_version)) => opencode_args(&request.args, major_version),
         _ => request.args,
     };
     let command = build_command(&binary, &plan, conv_id.as_deref(), &args);
@@ -607,7 +605,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
 
 /// OpenCode's args with `--standalone` where OpenCode 2 would attach to its
 /// background service ([`opencode::launch_args`]).
-fn opencode_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString> {
+fn opencode_args(args: &[OsString], major_version: u64) -> Vec<OsString> {
     let launched = opencode::launch_args(args, major_version);
     if launched.len() != args.len() {
         eprintln!(
@@ -1104,7 +1102,7 @@ pub(crate) mod tests {
             router_url: TEST_URL,
             config_dir: &dir,
             conversation_id,
-            allow_empty_signature: pi::allow_empty_signature("dev", None),
+            allow_empty_signature: pi::allow_empty_signature("dev"),
             capabilities: None,
             harness_major_version: None,
             models: hosted_models(),
