@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
-# Acceptance test: one real turn per installed harness, in cloud mode
+# Acceptance test: one real turn per harness, in cloud mode
 # (`rayline run <harness>`) and in local mode (`rayline run <harness> --local`).
 # Usage: [CONFIG=<file>] scripts/acceptance.sh [HARNESS...]
-#   (default: every harness)
+#   (default: every harness; a harness that isn't installed fails)
 # Local mode uses ~/.config/rayline/settings.json, or <file> when CONFIG is
 # set; either must have a `routing` section. With CONFIG, local mode runs
 # `rayline local start --config <file>` and `rayline run <harness> --config
 # <file>`; cloud mode always uses the default file. The script writes no
-# config. It starts the local process with `rayline local start` and stops it
-# with `rayline local stop` when done.
+# config. It starts the local process with `rayline local start` and runs
+# `rayline local stop` once on exit, including on Ctrl-C, TERM and HUP.
+# claude-desktop has no path yet in either mode, so it is not covered.
 # See docs/acceptance-testing.md.
 set -uo pipefail
 
@@ -18,7 +19,6 @@ HARNESSES=(claude claude-desktop codex opencode pi omp hermes openclaw)
 PROMPT="Reply with the word ACCEPT immediately followed by the sum of 17 and 25, with no space and nothing else."
 ANSWER=ACCEPT42
 TIMEOUT=600
-DESKTOP_APP=/Applications/Claude.app
 
 usage() {
   echo "usage: [CONFIG=<file>] $0 [HARNESS...]" >&2
@@ -38,25 +38,11 @@ turn_args() {
 }
 
 installed() {
-  if [ "$1" = claude-desktop ]; then
-    [ -d "$DESKTOP_APP" ]
-  else
-    command -v "$1" >/dev/null 2>&1
-  fi
-}
-
-version() {
-  if [ "$1" = claude-desktop ]; then
-    defaults read "$DESKTOP_APP/Contents/Info" CFBundleShortVersionString 2>&1
-  else
-    "$1" --version 2>&1 | head -n 1
-  fi
+  command -v "$1" >/dev/null 2>&1
 }
 
 pass=0
 fail=0
-skip=0
-manual=0
 
 # with_timeout <secs> <cmd...>: runs cmd in its own process group and kills
 # the whole group after <secs> or on Ctrl-C (TERM, then KILL after up to 10s),
@@ -107,17 +93,26 @@ run_turn() {
 run_mode() {
   local mode=$1 harness
   shift
-  for harness in "${selected[@]}"; do
-    if ! installed "$harness"; then
-      echo "SKIP    $harness $mode (not installed)"
-      skip=$((skip + 1))
-    elif [ "$harness" = claude-desktop ]; then
-      echo "MANUAL  claude-desktop $mode: run \`$RAYLINE run claude-desktop${*:+$(printf ' %q' "$@")}\` and send one turn in Code (docs/acceptance-testing.md)"
-      manual=$((manual + 1))
-    else
+  for harness in ${turns[@]+"${turns[@]}"}; do
+    if installed "$harness"; then
       run_turn "$harness" "$mode" "$@"
+    else
+      echo "FAIL    $harness $mode (not installed)"
+      fail=$((fail + 1))
     fi
   done
+}
+
+# stop_local: runs `rayline local stop` the first time it is called; a failed
+# stop is a FAIL.
+stopped=false
+stop_local() {
+  $stopped && return
+  stopped=true
+  if ! "$RAYLINE" local stop; then
+    echo "FAIL    rayline local stop"
+    fail=$((fail + 1))
+  fi
 }
 
 selected=("$@")
@@ -128,6 +123,13 @@ for harness in "${selected[@]}"; do
     [ "$harness" = "$name" ] && known=true
   done
   $known || { echo "unknown harness: $harness" >&2; usage; }
+done
+# The harnesses that run a turn: every selected one but claude-desktop.
+# The loops over it use ${turns[@]+...}: bash 3.2 (macOS) treats an empty
+# array as unset under set -u.
+turns=()
+for harness in "${selected[@]}"; do
+  [ "$harness" = claude-desktop ] || turns+=("$harness")
 done
 
 # `rayline run --config <file>` is in local mode only when <file> has a
@@ -148,31 +150,34 @@ fi
 
 echo "== versions"
 "$RAYLINE" --version || exit 1
-for harness in "${selected[@]}"; do
+for harness in ${turns[@]+"${turns[@]}"}; do
   if installed "$harness"; then
-    echo "$harness: $(version "$harness")"
+    echo "$harness: $("$harness" --version 2>&1 | head -n 1)"
   else
     echo "$harness: not installed"
   fi
 done
+[ ${#turns[@]} -eq ${#selected[@]} ] || echo "claude-desktop: not covered, no path yet"
 
 echo "== cloud mode"
 run_mode cloud
 
 echo "== local mode"
+trap stop_local EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 if "${local_start[@]}"; then
-  trap '"$RAYLINE" local stop; exit 130' INT TERM
-  "$RAYLINE" local status
-  run_mode local "${local_run[@]}"
-  trap - INT TERM
-  if ! "$RAYLINE" local stop; then
-    echo "FAIL    rayline local stop"
+  if ! "$RAYLINE" local status; then
+    echo "FAIL    rayline local status"
     fail=$((fail + 1))
   fi
+  run_mode local "${local_run[@]}"
 else
   echo "FAIL    rayline local start"
   fail=$((fail + 1))
 fi
+stop_local
 
-echo "== pass=$pass fail=$fail skip=$skip manual=$manual"
+echo "== pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
