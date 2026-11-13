@@ -4,11 +4,10 @@ Raydock releases are binary-first. The Rust workspace is not published to
 crates.io yet; all crates are marked `publish = false` until the package split
 is intentionally reviewed.
 
-## Command compatibility
+## Command name
 
-`raydock` is the primary command. `rayline` remains a supported alias with no
-scheduled removal; this migration does not add an expiry. Any future removal
-requires a separate announced breaking change.
+The installed binary is `raydock`. `rayline` is an alias for it
+(`~/.rayline/bin/rayline -> raydock`), and both run the same CLI.
 
 ## Release Tags
 
