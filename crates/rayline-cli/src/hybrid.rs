@@ -1138,52 +1138,70 @@ fn signal_process(pid: i32, signal: i32) -> io::Result<()> {
     Err(error)
 }
 
-/// Whether `pid` is running. A probe that cannot run or that fails is an
-/// error, never an answer.
+/// Whether `pid` is running, asked of Windows directly: no subprocess, no
+/// PATH. A check that fails is an error naming the pid, never an answer.
 #[cfg(windows)]
 fn process_exists(pid: i32) -> io::Result<bool> {
-    if pid <= 0 {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    };
+    let Ok(id) = u32::try_from(pid) else {
+        return Ok(false);
+    };
+    if id == 0 {
         return Ok(false);
     }
-    let mut probe = Command::new("powershell.exe");
-    probe.args([
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        &format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').ProcessId"),
-    ]);
-    process_probe(pid, probe)
+    // Waiting on a process handle needs SYNCHRONIZE.
+    // SAFETY: OpenProcess takes plain values and returns a new handle or null.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            id,
+        )
+    };
+    if handle.is_null() {
+        return open_failure_answer(pid, io::Error::last_os_error());
+    }
+    // A zero timeout only reads the handle's state: signalled once the
+    // process has exited.
+    // SAFETY: `handle` is the open process handle from above.
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    let wait_error = io::Error::last_os_error();
+    // SAFETY: `handle` is open and is closed exactly once, here.
+    unsafe { CloseHandle(handle) };
+    match wait {
+        WAIT_TIMEOUT => Ok(true),
+        WAIT_OBJECT_0 => Ok(false),
+        WAIT_FAILED => Err(probe_failed(pid, &wait_error)),
+        other => Err(probe_failed(
+            pid,
+            &format!("unexpected wait result {other:#x}"),
+        )),
+    }
 }
 
-/// Runs `probe`, which prints `pid` when the process is running and nothing
-/// when it is not.
+/// What a failed `OpenProcess` says: no such process, a process this user may
+/// not open (so it exists), or an error naming the pid.
 #[cfg(windows)]
-fn process_probe(pid: i32, mut probe: Command) -> io::Result<bool> {
-    let failed = |reason: String| {
-        io::Error::other(format!(
-            "could not check whether process {pid} is running: {reason}"
-        ))
-    };
-    let output = probe
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| {
-            failed(format!(
-                "{} did not start: {error}",
-                probe.get_program().to_string_lossy()
-            ))
-        })?;
-    if !output.status.success() {
-        return Err(failed(format!(
-            "{} exited with {}: {}",
-            probe.get_program().to_string_lossy(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
+fn open_failure_answer(pid: i32, error: io::Error) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+    match error
+        .raw_os_error()
+        .and_then(|code| u32::try_from(code).ok())
+    {
+        Some(ERROR_INVALID_PARAMETER) => Ok(false),
+        Some(ERROR_ACCESS_DENIED) => Ok(true),
+        _ => Err(probe_failed(pid, &error)),
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim() == pid.to_string())
+}
+
+#[cfg(windows)]
+fn probe_failed(pid: i32, reason: &dyn std::fmt::Display) -> io::Error {
+    io::Error::other(format!(
+        "could not check whether process {pid} is running: {reason}"
+    ))
 }
 
 #[cfg(windows)]
@@ -1727,28 +1745,38 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn a_failed_windows_process_probe_is_an_error_not_an_answer() {
-        let cmd = |script: &str| {
-            let mut command = Command::new("cmd.exe");
-            command.args(["/D", "/C", script]);
-            command
+    fn the_windows_process_check_answers_from_win32() {
+        let own = i32::try_from(std::process::id()).unwrap();
+        assert!(process_exists(own).unwrap());
+        let mut child = Command::new("cmd.exe")
+            .args(["/D", "/C", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        child.wait().unwrap();
+        // Exited, while this handle still keeps the process object alive.
+        assert!(!process_exists(pid).unwrap());
+        drop(child);
+        // Gone: no process has that pid.
+        assert!(!process_exists(pid).unwrap());
+        assert!(!process_exists(0).unwrap());
+        assert!(!process_exists(-1).unwrap());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_failed_windows_process_check_is_an_error_not_an_answer() {
+        use windows_sys::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_NOT_ENOUGH_MEMORY,
         };
-        assert!(process_probe(42, cmd("echo 42")).unwrap());
-        assert!(!process_probe(42, cmd("rem")).unwrap());
-        let error = process_probe(42, cmd("echo denied 1>&2 & exit 3"))
-            .unwrap_err()
-            .to_string();
-        assert_eq!(
-            error,
-            "could not check whether process 42 is running: cmd.exe exited with exit code: 3: denied"
-        );
-        let error = process_probe(42, Command::new("no-such-probe.exe"))
+        let os = |code: u32| io::Error::from_raw_os_error(i32::try_from(code).unwrap());
+        assert!(!open_failure_answer(42, os(ERROR_INVALID_PARAMETER)).unwrap());
+        assert!(open_failure_answer(42, os(ERROR_ACCESS_DENIED)).unwrap());
+        let error = open_failure_answer(42, os(ERROR_NOT_ENOUGH_MEMORY))
             .unwrap_err()
             .to_string();
         assert!(
-            error.starts_with(
-                "could not check whether process 42 is running: no-such-probe.exe did not start: "
-            ),
+            error.starts_with("could not check whether process 42 is running: "),
             "{error}"
         );
     }
