@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Exercise built CLI/rld processes and a local execution-contract fixture.
+"""Exercise `raydock local` and `run --local` against the execution-contract fixture core.
 
-Run after `cargo build --locked -p rayline-cli -p rayline-daemon`.
+Run after `cargo build --locked -p rayline-cli`.
 This verifies supervision and harness wiring; the VSR core suite verifies routing.
 """
 import json
@@ -16,20 +16,20 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "target/debug/raydock"
-RLD = ROOT / "target/debug/rld"
 
 
 def main():
-    with tempfile.TemporaryDirectory(prefix="rayline-hybrid-cli-") as tmp:
-        root = Path(tmp)
-        # `rayline run <harness> --local` connects to the process in ~/.rayline/hybrid.
-        state = root / ".rayline" / "hybrid"
+    with tempfile.TemporaryDirectory(prefix="rayline-local-cli-") as tmp:
+        root = Path(tmp).resolve()
+        # The local process keeps its state in ~/.rayline/local.
+        state = root / ".rayline" / "local"
         env = dict(os.environ, HOME=str(root))
         env.pop("OPENCLAW_CONTAINER", None)
+        # The local process runs from raydock and finds rayline-core beside it.
         installed = root / "installed"
         installed.mkdir()
-        shutil.copy(CLI, installed / "rayline")
-        shutil.copy(RLD, installed / "rld")
+        raydock = installed / "raydock"
+        shutil.copy(CLI, raydock)
         # The endpoints' own keys come from the shell; the router key comes
         # only from the saved credentials, never from the shell.
         local_env = ["RAYLINE_TEST_LOCAL_ALIAS", "ANTHROPIC_AUTH_TOKEN"]
@@ -79,20 +79,19 @@ def main():
                         "policy": {"preset": "arc-policy.prefer-local.v1"}},
         }))
 
-        def cli(*args, success=True):
-            result = subprocess.run([str(installed / "rayline"), "hybrid", "--state-dir", str(state), *args],
-                                    env=env, capture_output=True, text=True, timeout=75)
+        def raydock_cmd(*args, success=True):
+            result = subprocess.run([str(raydock), *args], env=env, capture_output=True, text=True, timeout=75)
             assert (result.returncode == 0) == success, (args, result.stdout, result.stderr)
             return result.stdout if success else result.stderr
 
+        def local(*args, success=True):
+            return raydock_cmd("local", *args, success=success)
+
         def run(harness, *args, success=True):
-            result = subprocess.run([str(installed / "rayline"), "run", harness, "--local", *args],
-                                    env=env, capture_output=True, text=True, timeout=75)
-            assert (result.returncode == 0) == success, (harness, args, result.stdout, result.stderr)
-            return result.stdout if success else result.stderr
+            return raydock_cmd("--env", "fixture", "run", harness, "--local", *args, success=success)
 
         def start():
-            cli("start", "--env", "fixture", "--port", "0")
+            raydock_cmd("--env", "fixture", "local", "start")
             return json.loads((state / "ready.json").read_text())
 
         def wait_dead(pid):
@@ -106,9 +105,14 @@ def main():
 
         first = start()
         try:
-            status = json.loads(cli("status"))
-            assert status["health"]["instance_id"] == first["instance_id"]
-            cli("start", "--core", str(core), "--env", "fixture", "--port", "0", success=False)
+            assert local("status").splitlines() == [
+                f"Local process: running (pid {first['pid']})",
+                f"Address: {first['listen_url']}",
+                f"Config: {settings}",
+                "Environment: fixture",
+            ]
+            refused = raydock_cmd("--env", "fixture", "local", "start", success=False)
+            assert str(first["pid"]) in refused and str(settings) in refused, refused
             token = (state / "gateway-token").read_text()
             assert token not in json.dumps(first)
             assert token not in (state / "runtime.log").read_text()
@@ -140,11 +144,18 @@ print('harness request reached execution core')
             assert "harness request reached execution core" in run("claude", "--", "-p", "test")
             event = json.loads((root / "events.jsonl").read_text().splitlines()[-1])
             assert event["path"] == "/v1/messages"
-            # rld hands the core the saved router key (Decisions and the cloud
-            # pins) and the endpoints' keys. The fixture lists a name once per
-            # config entry that references it.
+            # The local process hands the core the saved router key (Decisions
+            # and the cloud pins) and the endpoints' keys. The fixture lists a
+            # name once per config entry that references it.
             assert sorted(set(event["credential_env_present"])) == credential_env
             assert json.loads(event["body"])["metadata"]["user_id"] == "session_fixture"
+            # A run whose config file is not the running process's is refused,
+            # even when the contents match.
+            other = root / "other-settings.json"
+            shutil.copy(settings, other)
+            refused = raydock_cmd("--env", "fixture", "run", "claude", "--config", str(other), "--", "-p", "test",
+                                  success=False)
+            assert str(settings) in refused and str(other) in refused, refused
             pi = harness_dir / "pi"
             pi.write_text("""#!/usr/bin/env python3
 import json, os, pathlib
@@ -186,14 +197,17 @@ print(json.dumps(sys.argv[1:]))
             env["OPENCLAW_CONTAINER"] = "box"
             run("openclaw", "--", "agent", "-m", "hello", success=False)
             env.pop("OPENCLAW_CONTAINER")
+            # A running process whose health check fails makes status exit 1.
             request = urllib.request.Request(first["listen_url"] + "/unready", data=b"{}",
                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
             with urllib.request.urlopen(request) as response:
                 assert response.status == 200
-            cli("status", success=False)
-            cli("stop")
+            local("status", success=False)
+            assert local("stop").splitlines() == ["Local process stopped."]
             wait_dead(first["core_pid"])
             assert not (state / "gateway-token").exists()
+            assert local("status").splitlines() == ["Local process: not running"]
+            assert local("stop").splitlines() == ["Local process: not running"]
             second = start()
             assert second["instance_id"] != first["instance_id"]
             assert (state / "gateway-token").read_text() != token
@@ -201,21 +215,21 @@ print(json.dumps(sys.argv[1:]))
             os.kill(second["pid"], signal.SIGKILL)
             wait_dead(second["pid"])
             wait_dead(second["core_pid"])
-            cli("status", success=False)
+            assert local("status").splitlines() == ["Local process: not running"]
             third = start()
-            cli("stop")
+            local("stop")
             wait_dead(third["core_pid"])
-            # An incompatible executable fails startup and leaves no owned process/state.
+            # An incompatible core fails startup and leaves no owned process/state.
             env["RAYLINE_FIXTURE_CONTRACT_VERSION"] = "99"
-            cli("start", "--core", str(core), "--env", "fixture", "--port", "0", success=False)
+            raydock_cmd("--env", "fixture", "local", "start", success=False)
             env.pop("RAYLINE_FIXTURE_CONTRACT_VERSION")
             # The core receives Raydock's composed configuration.
             wait_dead(int((state / "core-config.pid").read_text()))
             assert not (state / "ready.json").exists()
             assert not (state / "gateway-token").exists()
         finally:
-            cli("stop")
-    print("Hybrid CLI lifecycle acceptance passed.")
+            local("stop")
+    print("Local process lifecycle acceptance passed.")
 
 
 if __name__ == "__main__":
