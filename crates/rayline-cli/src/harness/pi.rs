@@ -7,13 +7,10 @@
 //! non-OpenRouter endpoints), which the gateway keys the episode on. `-c` and
 //! `--resume` reuse the session id, so a resumed session keeps its episode.
 //!
-//! `compat.allowEmptySignature` makes pi resend a thinking block that came
-//! back without a signature as thinking (`signature: ""`) rather than as a
-//! visible text block, which is pi's default for Messages. The router serves
-//! some turns from models whose thinking carries no Anthropic signature; as
-//! text, that reasoning would reach the next model as something the assistant
-//! said. As thinking, the router can recognise it and leave it out for a
-//! model that cannot verify it. It is on for every environment.
+//! `compat.allowEmptySignature` is not set, in any environment. pi then resends
+//! a thinking block that came back without a signature as a text block, which
+//! is its default for Messages, so no thinking block with an empty signature
+//! goes upstream.
 
 use serde_json::json;
 
@@ -23,8 +20,7 @@ pub(crate) const PROVIDER_ID: &str = "rayline";
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
     let compat = json!({
-        "sendSessionAffinityHeaders": true,
-        "allowEmptySignature": true
+        "sendSessionAffinityHeaders": true
     });
     let launch = &ctx.models;
     let entries: Vec<_> = launch
@@ -88,7 +84,8 @@ mod tests {
         assert_eq!(provider["api"], "anthropic-messages");
         assert_eq!(provider["apiKey"], super::super::tests::TEST_KEY);
         assert_eq!(provider["compat"]["sendSessionAffinityHeaders"], true);
-        assert_eq!(provider["compat"]["allowEmptySignature"], true);
+        // Unsigned thinking is resent as text, pi's default for Messages.
+        assert_eq!(provider["compat"].get("allowEmptySignature"), None);
         let ids: Vec<_> = provider["models"]
             .as_array()
             .unwrap()
