@@ -151,6 +151,7 @@ pub enum RunError {
     Auth(crate::status::AuthTokenError),
     Login(String),
     KeyProvision(String),
+    IsolatedProfile(io::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -172,6 +173,9 @@ impl std::fmt::Display for RunError {
             Self::Auth(error) => error.fmt(formatter),
             Self::Login(message) => formatter.write_str(message),
             Self::KeyProvision(message) => formatter.write_str(message),
+            Self::IsolatedProfile(error) => {
+                write!(formatter, "failed to prepare the isolated Claude profile: {error}")
+            }
         }
     }
 }
@@ -313,7 +317,7 @@ async fn run_command_from_home(
     add_claude_bin_dir_to_child_path(&mut command, &claude_bin);
     command.args(&request.args);
     if isolated {
-        apply_isolated_config_dir(&mut command, home);
+        apply_isolated_config_dir(&mut command, home).map_err(RunError::IsolatedProfile)?;
     }
     command.env("ANTHROPIC_BASE_URL", &router_url);
     command.env("ANTHROPIC_AUTH_TOKEN", &key);
@@ -656,10 +660,10 @@ const ISOLATED_SEED_FILES: [&str; 1] = ["settings.json"];
 /// Lay down the isolated overlay and point Claude Code at it. Idempotent: safe
 /// to call on every run. The isolated profile needs no Claude login: the launch
 /// authenticates Claude Code through `ANTHROPIC_AUTH_TOKEN`.
-fn apply_isolated_config_dir(command: &mut Command, home: &Path) {
+fn apply_isolated_config_dir(command: &mut Command, home: &Path) -> io::Result<()> {
     let source_dir = claude_config_dir(home, false);
     let isolated_dir = isolated_cc_dir(home);
-    ensure_isolated_overlay(&source_dir, &isolated_dir);
+    ensure_isolated_overlay(&source_dir, &isolated_dir)?;
     // `.claude.json` (global app state, project-trust, personal MCP) lives at
     // $HOME/.claude.json by default, NOT inside ~/.claude. Seed the isolated
     // profile from it so project-trust, MCP servers and settings carry over,
@@ -667,8 +671,9 @@ fn apply_isolated_config_dir(command: &mut Command, home: &Path) {
     seed_isolated_claude_json(
         &global_claude_json_path(home),
         &isolated_dir.join(".claude.json"),
-    );
+    )?;
     command.env(CLAUDE_CONFIG_DIR_ENV, &isolated_dir);
+    Ok(())
 }
 
 /// Path of Claude Code's global `.claude.json` (app state, project-trust,
@@ -683,59 +688,84 @@ fn global_claude_json_path(home: &Path) -> PathBuf {
 
 /// Make `isolated_dir` a thin overlay on `shared_root` (the user's main Claude
 /// config dir): symlink shared content back to the shared root and seed
-/// settings.json / .claude.json as local copies. Best-effort throughout; a
-/// failed link or copy just means that entry is not shared, never a failed
-/// launch.
-fn ensure_isolated_overlay(shared_root: &Path, isolated_dir: &Path) {
+/// settings.json as a local copy. A failed directory, file, link or seed copy
+/// is an error with the path.
+fn ensure_isolated_overlay(shared_root: &Path, isolated_dir: &Path) -> io::Result<()> {
     if shared_root == isolated_dir {
         // The shared root already is the isolated dir (e.g. the user pointed
         // CLAUDE_CONFIG_DIR at it); there is nothing to overlay onto itself.
-        return;
+        return Ok(());
     }
-    if fs::create_dir_all(isolated_dir).is_err() {
-        return;
-    }
+    fs::create_dir_all(isolated_dir).map_err(|error| error_with_path(isolated_dir, error))?;
     for dir in ISOLATED_SHARED_DIRS {
         let source = shared_root.join(dir);
         // Create the shared target first so the symlink always resolves to it,
         // even on a brand-new ~/.claude.
-        let _ = fs::create_dir_all(&source);
-        link_shared_entry(&source, &isolated_dir.join(dir));
+        fs::create_dir_all(&source).map_err(|error| error_with_path(&source, error))?;
+        link_shared_entry(&source, &isolated_dir.join(dir))?;
     }
     for file in ISOLATED_SHARED_FILES {
         let source = shared_root.join(file);
         if !source.exists() {
-            let _ = fs::write(&source, b"");
+            fs::write(&source, b"").map_err(|error| error_with_path(&source, error))?;
         }
-        link_shared_entry(&source, &isolated_dir.join(file));
+        link_shared_entry(&source, &isolated_dir.join(file))?;
     }
     for entry in ISOLATED_OPTIONAL_ENTRIES {
-        link_shared_entry(&shared_root.join(entry), &isolated_dir.join(entry));
+        link_shared_entry(&shared_root.join(entry), &isolated_dir.join(entry))?;
     }
     for file in ISOLATED_SEED_FILES {
-        seed_local_copy(&shared_root.join(file), &isolated_dir.join(file));
+        seed_local_copy(&shared_root.join(file), &isolated_dir.join(file))?;
     }
+    Ok(())
 }
 
 /// Symlink `link` -> `source` when the source exists and the slot is still
-/// empty. An existing file or symlink is left untouched (respect the user).
-fn link_shared_entry(source: &Path, link: &Path) {
+/// empty. An existing file or symlink is left untouched (respect the user),
+/// including one a concurrent isolated launch created first. A failed link is
+/// an error with both paths.
+fn link_shared_entry(source: &Path, link: &Path) -> io::Result<()> {
     if !source.exists() {
-        return;
+        return Ok(());
     }
     if fs::symlink_metadata(link).is_ok() {
-        return;
+        return Ok(());
     }
-    let _ = make_symlink(source, link);
+    match make_symlink(source, link) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(link_error(source, link, error)),
+    }
+}
+
+/// Windows' ERROR_PRIVILEGE_NOT_HELD: the user may not create symlinks.
+#[cfg(windows)]
+const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+
+/// The error for a failed `link` -> `source` symlink, with both paths. On
+/// Windows, a missing symlink privilege also says what `--isolated` needs.
+fn link_error(source: &Path, link: &Path, error: io::Error) -> io::Error {
+    let paths = format!("link {} to {}", link.display(), source.display());
+    #[cfg(windows)]
+    if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) {
+        return io::Error::new(
+            error.kind(),
+            format!(
+                "{paths}: {error}. {} claude --isolated needs symlink rights on Windows: turn on Developer Mode or run it from an elevated shell",
+                crate::CLI_BIN
+            ),
+        );
+    }
+    io::Error::new(error.kind(), format!("{paths}: {error}"))
 }
 
 /// Copy `source` -> `dest` once, when the destination does not yet exist. These
 /// files hold credentials, so keep the copy (and its parent dir) user-private.
-fn seed_local_copy(source: &Path, dest: &Path) {
+fn seed_local_copy(source: &Path, dest: &Path) -> io::Result<()> {
     if fs::symlink_metadata(dest).is_ok() {
-        return;
+        return Ok(());
     }
-    copy_private_file(source, dest);
+    copy_private_file(source, dest)
 }
 
 /// Auth-bearing keys in `.claude.json` — stripped when seeding an isolated
@@ -748,20 +778,29 @@ const CLAUDE_JSON_AUTH_KEYS: [&str; 3] = ["oauthAccount", "customApiKeyResponses
 
 /// Seed the isolated `.claude.json` from the user's profile, minus the auth
 /// keys, so the isolated session inherits project-trust, MCP servers and
-/// settings but starts logged out. Falls back to a minimal onboarding-complete
-/// stub when the source is missing or unreadable. No-op if the destination
-/// already exists (the profile keeps its own state).
-fn seed_isolated_claude_json(source: &Path, dest: &Path) {
+/// settings but starts logged out. A missing source seeds a minimal
+/// onboarding-complete stub. An unreadable source, one that is not a JSON
+/// object, or a failed write is an error with the path. No-op if the
+/// destination already exists (the profile keeps its own state).
+fn seed_isolated_claude_json(source: &Path, dest: &Path) -> io::Result<()> {
     if fs::symlink_metadata(dest).is_ok() {
-        return;
+        return Ok(());
     }
-    let contents = fs::read_to_string(source)
-        .ok()
-        .and_then(|raw| claude_json_without_auth(&raw))
-        .unwrap_or_else(|| "{\n  \"hasCompletedOnboarding\": true\n}".to_owned());
-    if fs::write(dest, contents).is_ok() {
-        set_user_private_permissions(dest);
-    }
+    let contents = match fs::read_to_string(source) {
+        Ok(raw) => claude_json_without_auth(&raw).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: not a JSON object", source.display()),
+            )
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            "{\n  \"hasCompletedOnboarding\": true\n}".to_owned()
+        }
+        Err(error) => return Err(error_with_path(source, error)),
+    };
+    fs::write(dest, contents).map_err(|error| error_with_path(dest, error))?;
+    set_user_private_permissions(dest);
+    Ok(())
 }
 
 /// Return `raw` (`.claude.json` contents) with the auth keys removed, or `None`
@@ -776,13 +815,26 @@ fn claude_json_without_auth(raw: &str) -> Option<String> {
     serde_json::to_string_pretty(&value).ok()
 }
 
-fn copy_private_file(source: &Path, dest: &Path) {
-    if !source.is_file() {
-        return;
+/// Copy `source` to a user-private `dest`. A missing source copies nothing;
+/// any other failure is an error with the path.
+fn copy_private_file(source: &Path, dest: &Path) -> io::Result<()> {
+    match fs::metadata(source) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error_with_path(source, error)),
     }
-    if fs::copy(source, dest).is_ok() {
-        set_user_private_permissions(dest);
-    }
+    fs::copy(source, dest).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("copy {} to {}: {error}", source.display(), dest.display()),
+        )
+    })?;
+    set_user_private_permissions(dest);
+    Ok(())
+}
+
+fn error_with_path(path: &Path, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
 }
 
 #[cfg(unix)]
@@ -1227,7 +1279,7 @@ mod claude_command_tests {
         fs::create_dir_all(home.join(".claude")).unwrap();
         fs::write(home.join(".claude/settings.json"), "{}").unwrap();
         fs::write(home.join(".claude.json"), "{}").unwrap();
-        apply_isolated_config_dir(&mut Command::new("claude"), &home);
+        apply_isolated_config_dir(&mut Command::new("claude"), &home).unwrap();
         crate::claude_daemon::record_rayline_claude_launch(LaunchRecord {
             home: &home,
             pid: 1,
@@ -1378,6 +1430,170 @@ mod claude_json_without_auth_tests {
     fn returns_none_for_non_object() {
         assert!(claude_json_without_auth("[1, 2, 3]").is_none());
         assert!(claude_json_without_auth("not json").is_none());
+    }
+}
+
+#[cfg(test)]
+mod isolated_seed_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rayline-claude-seed-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mentions(error: &io::Error, path: &Path) -> bool {
+        error.to_string().contains(&path.display().to_string())
+    }
+
+    #[test]
+    fn missing_claude_json_seeds_the_onboarding_stub() {
+        let dir = temp_dir("json-missing");
+        let dest = dir.join(".claude.json");
+        seed_isolated_claude_json(&dir.join("absent.json"), &dest).unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(&dest).unwrap()).unwrap();
+        assert_eq!(value, serde_json::json!({"hasCompletedOnboarding": true}));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unreadable_or_invalid_claude_json_fails_with_the_source_path() {
+        let dir = temp_dir("json-bad");
+        let dest = dir.join(".claude.json");
+
+        let unreadable = dir.join("unreadable.json");
+        fs::create_dir(&unreadable).unwrap();
+        let error = seed_isolated_claude_json(&unreadable, &dest).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::NotFound);
+        assert!(mentions(&error, &unreadable), "{error}");
+
+        let invalid = dir.join("invalid.json");
+        fs::write(&invalid, "[1, 2, 3]").unwrap();
+        let error = seed_isolated_claude_json(&invalid, &dest).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(mentions(&error, &invalid), "{error}");
+
+        assert!(fs::symlink_metadata(&dest).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_claude_json_write_fails_with_the_dest_path() {
+        let dir = temp_dir("json-write");
+        let dest = dir.join("no-such-dir").join(".claude.json");
+        let error = seed_isolated_claude_json(&dir.join("absent.json"), &dest).unwrap_err();
+        assert!(mentions(&error, &dest), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn link_skips_a_missing_source_or_a_taken_slot() {
+        let dir = temp_dir("link-skip");
+        link_shared_entry(&dir.join("absent"), &dir.join("link")).unwrap();
+        assert!(fs::symlink_metadata(dir.join("link")).is_err());
+
+        let source = dir.join("source");
+        fs::write(&source, "shared").unwrap();
+        let taken = dir.join("taken");
+        fs::write(&taken, "mine").unwrap();
+        link_shared_entry(&source, &taken).unwrap();
+        assert_eq!(fs::read_to_string(&taken).unwrap(), "mine");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_link_fails_with_both_paths() {
+        let dir = temp_dir("link-fail");
+        let source = dir.join("source");
+        fs::write(&source, "shared").unwrap();
+        let link = dir.join("no-such-dir").join("link");
+        let error = link_shared_entry(&source, &link).unwrap_err();
+        assert!(mentions(&error, &source), "{error}");
+        assert!(mentions(&error, &link), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_windows_symlink_privilege_says_what_isolated_needs() {
+        let source = Path::new(r"C:\shared\skills");
+        let link = Path::new(r"C:\isolated\skills");
+        let error = link_error(
+            source,
+            link,
+            io::Error::from_raw_os_error(ERROR_PRIVILEGE_NOT_HELD),
+        );
+        let message = error.to_string();
+        assert!(mentions(&error, source), "{message}");
+        assert!(mentions(&error, link), "{message}");
+        assert!(
+            message.contains("claude --isolated needs symlink rights on Windows"),
+            "{message}"
+        );
+        assert!(message.contains("Developer Mode"), "{message}");
+        assert!(message.contains("elevated shell"), "{message}");
+    }
+
+    #[test]
+    fn other_link_errors_name_only_the_paths() {
+        let source = Path::new("shared-source");
+        let link = Path::new("isolated-link");
+        let error = link_error(source, link, io::Error::from(io::ErrorKind::NotFound));
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(
+            error
+                .to_string()
+                .starts_with("link isolated-link to shared-source: ")
+        );
+        assert!(!error.to_string().contains("symlink rights"));
+    }
+
+    #[test]
+    fn overlay_fails_with_the_path_when_the_isolated_dir_cannot_be_created() {
+        let dir = temp_dir("overlay-dir");
+        let shared_root = dir.join("shared");
+        fs::create_dir_all(&shared_root).unwrap();
+        // The isolated dir's parent is a file, so the dir cannot be created.
+        let parent = dir.join("parent-file");
+        fs::write(&parent, "").unwrap();
+        let isolated_dir = parent.join("isolated");
+        let error = ensure_isolated_overlay(&shared_root, &isolated_dir).unwrap_err();
+        assert!(mentions(&error, &isolated_dir), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlay_fails_with_the_path_when_a_shared_entry_cannot_be_created() {
+        let dir = temp_dir("overlay-shared");
+        // The shared root is a file, so its shared dirs cannot be created.
+        let shared_root = dir.join("shared-file");
+        fs::write(&shared_root, "").unwrap();
+        let error = ensure_isolated_overlay(&shared_root, &dir.join("isolated")).unwrap_err();
+        let first_shared_dir = shared_root.join(ISOLATED_SHARED_DIRS[0]);
+        assert!(mentions(&error, &first_shared_dir), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_private_file_skips_only_a_missing_source() {
+        let dir = temp_dir("copy");
+        let dest = dir.join("settings.json");
+        copy_private_file(&dir.join("absent.json"), &dest).unwrap();
+        assert!(fs::symlink_metadata(&dest).is_err());
+
+        let source = dir.join("source.json");
+        fs::write(&source, "{}").unwrap();
+        copy_private_file(&source, &dest).unwrap();
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "{}");
+
+        let failed_dest = dir.join("no-such-dir").join("settings.json");
+        let error = copy_private_file(&source, &failed_dest).unwrap_err();
+        assert!(mentions(&error, &source), "{error}");
+        assert!(mentions(&error, &failed_dest), "{error}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 
