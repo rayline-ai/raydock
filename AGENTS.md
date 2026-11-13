@@ -18,20 +18,15 @@ handlers. Prefer focused modules over growing the existing large CLI/proxy files
 
 ## CLI Contracts
 
-- Use the current routing flags in new docs, tests, and examples:
-  `--local`, `--via proxy|env`, and `--route all|subagents`.
-- Treat `--local-router`, `--no-proxy`, and `--routing-mode ...` as deprecated
-  compatibility aliases only.
-- `--local` means local static routing without hosted auth.
-- `--via env` is cloud-only and must not be combined with local inference or
-  selective subagent routing.
-- Local routing defaults to `--route subagents`; cloud routing defaults to
-  `--route all`.
-- Use `--router-config-path` when `routes.subagents` is meant to constrain the
-  transparent proxy allowlist. Do not rely on `RAYLINE_ROUTER_CONFIG` alone for
-  that allowlist.
-- `raydock top` should work for proxy-mode launches when metrics can bind.
-  Metrics bind failures are best-effort and must not break proxy data flow.
+- `docs/spec.md` is the contract for every command, option, config key, env
+  var and file. Implement exactly what it lists. Add nothing it does not list.
+- Fail fast: validate config, env overrides and flags once at load and refuse
+  with an error naming the key or flag. Code after load trusts the parsed
+  config: no checks, defaults or fallbacks at call sites.
+- No fallbacks, aliases, alternative spellings, migrations or compatibility
+  code. One name per key and flag, one value per meaning.
+- No hard-coded model ids, context windows, output limits or prices.
+- Code and comments describe what the code does now, not what it replaced.
 
 ## Commands
 
