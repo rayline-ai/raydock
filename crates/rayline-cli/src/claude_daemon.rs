@@ -37,7 +37,9 @@ pub struct LaunchPreflight<'a> {
     pub config_dir: &'a Path,
     pub request: &'a RequestSpec<'a>,
     pub claude_bin: &'a Path,
-    pub allow_isolated: bool,
+    /// The launch runs in the isolated config dir: `config_dir` is it, and
+    /// the conflict prompt offers no further isolated escape.
+    pub isolated: bool,
 }
 
 pub struct ProceedPreflight {
@@ -46,14 +48,17 @@ pub struct ProceedPreflight {
 
 pub enum PreflightOutcome {
     Proceed(ProceedPreflight),
-    SwitchToIsolated,
+    /// The user chose isolated. Carries this check's spawner pid: the daemon
+    /// it found keeps running, so its starter's record stays kept.
+    SwitchToIsolated(ProceedPreflight),
 }
 
 pub struct LaunchRecord<'a> {
     pub home: &'a Path,
     pub pid: u32,
     pub request: &'a RequestSpec<'a>,
-    pub preserve_spawned_by_pid: Option<u32>,
+    /// Spawner pids whose records are kept whatever their age.
+    pub preserve_spawned_by_pids: &'a [u32],
 }
 
 impl LaunchPreflight<'_> {
@@ -81,18 +86,22 @@ impl LaunchPreflight<'_> {
         } else {
             classify_daemon_owner(&state)
         };
-        let message =
-            format_daemon_conflict_error(self.request, &state, &owner, self.allow_isolated);
+        let message = format_daemon_conflict_error(
+            self.request,
+            &state,
+            &owner,
+            self.isolated.then_some(self.config_dir),
+        );
         match resolve_daemon_conflict(
             state.pid,
             &message,
             self.home,
             self.claude_bin,
             self.config_dir,
-            self.allow_isolated,
+            !self.isolated,
         )? {
             ConflictOutcome::Continue => Ok(PreflightOutcome::Proceed(proceed)),
-            ConflictOutcome::SwitchToIsolated => Ok(PreflightOutcome::SwitchToIsolated),
+            ConflictOutcome::SwitchToIsolated => Ok(PreflightOutcome::SwitchToIsolated(proceed)),
         }
     }
 }
@@ -542,7 +551,7 @@ fn format_daemon_conflict_error(
     request: &RequestSpec<'_>,
     state: &DaemonState,
     owner: &DaemonOwner,
-    allow_isolated: bool,
+    isolated_dir: Option<&Path>,
 ) -> String {
     let env_flag = request
         .env_flag
@@ -558,12 +567,24 @@ fn format_daemon_conflict_error(
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let rerun = format!("{} {env_flag}run claude {arg_str}", crate::CLI_BIN)
-        .trim_end()
-        .to_owned();
+    // An isolated launch's daemon lives in the isolated config dir: the stop
+    // must target it, and the rerun stays isolated.
+    let (stop, isolated_flag) = match isolated_dir {
+        Some(dir) => (
+            format!("{STOP_COMMAND} (with CLAUDE_CONFIG_DIR={})", dir.display()),
+            "--isolated ",
+        ),
+        None => (STOP_COMMAND.to_owned(), ""),
+    };
+    let rerun = format!(
+        "{} {env_flag}run claude {isolated_flag}{arg_str}",
+        crate::CLI_BIN
+    )
+    .trim_end()
+    .to_owned();
     // When isolation is available, surface it as a third path that keeps the
     // other daemon running instead of stopping it.
-    let isolated_alt = if allow_isolated {
+    let isolated_alt = if isolated_dir.is_none() {
         let rerun_isolated = format!(
             "{} {env_flag}run claude --isolated {arg_str}",
             crate::CLI_BIN
@@ -580,14 +601,14 @@ fn format_daemon_conflict_error(
     match owner {
         DaemonOwner::Rayline { env_name } => {
             format!(
-                "A {} {env_name} daemon is running (PID {}).\n\nCannot start a {} daemon while the {env_name} daemon is active.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
+                "A {} {env_name} daemon is running (PID {}).\n\nCannot start a {} daemon while the {env_name} daemon is active.\n\nTo switch:\n  1. Stop the current daemon:   {stop}\n  2. Re-run:                    {rerun}{isolated_alt}",
                 crate::DISPLAY_NAME,
                 state.pid,
                 request.env_name,
             )
         }
         DaemonOwner::NonRayline => format!(
-            "A non-{} Claude Code daemon is running (PID {}).\n\n`{} run claude` needs to start a daemon configured for the\n{} router, but cannot do so while another daemon is active.\nThe current daemon's API calls go directly to Anthropic, not the\n{} router.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
+            "A non-{} Claude Code daemon is running (PID {}).\n\n`{} run claude` needs to start a daemon configured for the\n{} router, but cannot do so while another daemon is active.\nThe current daemon's API calls go directly to Anthropic, not the\n{} router.\n\nTo switch:\n  1. Stop the current daemon:   {stop}\n  2. Re-run:                    {rerun}{isolated_alt}",
             crate::DISPLAY_NAME,
             state.pid,
             crate::CLI_BIN,
@@ -595,7 +616,7 @@ fn format_daemon_conflict_error(
             crate::DISPLAY_NAME
         ),
         DaemonOwner::Unverified => format!(
-            "A Claude Code daemon is running (PID {}), but {} could not verify that it matches this launch.\n\n`{} run claude` needs to start or reuse a daemon configured for the\n{} router, but cannot do so while an unverified daemon is active.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
+            "A Claude Code daemon is running (PID {}), but {} could not verify that it matches this launch.\n\n`{} run claude` needs to start or reuse a daemon configured for the\n{} router, but cannot do so while an unverified daemon is active.\n\nTo switch:\n  1. Stop the current daemon:   {stop}\n  2. Re-run:                    {rerun}{isolated_alt}",
             state.pid,
             crate::DISPLAY_NAME,
             crate::CLI_BIN,
@@ -658,9 +679,11 @@ pub fn record_rayline_claude_launch(record: LaunchRecord<'_>) -> io::Result<()> 
     let now = unix_now_secs();
     let mut pruned = Vec::new();
     for entry in read_rayline_claude_launches(record.home)? {
+        let entry_pid = entry.get("pid").and_then(Value::as_u64);
         if record
-            .preserve_spawned_by_pid
-            .is_some_and(|pid| entry.get("pid").and_then(Value::as_u64) == Some(u64::from(pid)))
+            .preserve_spawned_by_pids
+            .iter()
+            .any(|&pid| entry_pid == Some(u64::from(pid)))
         {
             pruned.push(entry);
             continue;
@@ -787,15 +810,19 @@ mod tests {
         let mut request = launch_request();
         let state = state(rayline_env());
         let owner = DaemonOwner::NonRayline;
-        let prod = format_daemon_conflict_error(&request, &state, &owner, true);
+        let prod = format_daemon_conflict_error(&request, &state, &owner, None);
         assert!(
             prod.contains(&format!("{} run claude agents", crate::CLI_BIN)),
+            "{prod}"
+        );
+        assert!(
+            prod.contains("1. Stop the current daemon:   claude daemon stop --any\n"),
             "{prod}"
         );
 
         request.env_name = "dev";
         request.env_flag = Some("dev");
-        let dev = format_daemon_conflict_error(&request, &state, &owner, true);
+        let dev = format_daemon_conflict_error(&request, &state, &owner, None);
         assert!(
             dev.contains(&format!("{} --env dev run claude agents", crate::CLI_BIN)),
             "{dev}"
@@ -807,6 +834,31 @@ mod tests {
             )),
             "{dev}"
         );
+    }
+
+    #[test]
+    fn an_isolated_conflict_stops_the_isolated_daemon_and_reruns_isolated() {
+        let mut request = launch_request();
+        request.env_name = "dev";
+        request.env_flag = Some("dev");
+        let state = state(rayline_env());
+        let isolated_dir = crate::claude::isolated_cc_dir(&temp_home());
+        for owner in [
+            DaemonOwner::Rayline {
+                env_name: "prod".to_owned(),
+            },
+            DaemonOwner::NonRayline,
+            DaemonOwner::Unverified,
+        ] {
+            let message =
+                format_daemon_conflict_error(&request, &state, &owner, Some(&isolated_dir));
+            let expected = format!(
+                "To switch:\n  1. Stop the current daemon:   claude daemon stop --any (with CLAUDE_CONFIG_DIR={})\n  2. Re-run:                    {} --env dev run claude --isolated agents",
+                isolated_dir.display(),
+                crate::CLI_BIN
+            );
+            assert!(message.ends_with(&expected), "{message}");
+        }
     }
 
     #[test]
@@ -1092,8 +1144,33 @@ mod tests {
             home,
             pid: 9006,
             request,
-            preserve_spawned_by_pid: None,
+            preserve_spawned_by_pids: &[],
         })
+    }
+
+    /// A launch that switched to isolated keeps the records of both checks'
+    /// spawners, however old; other expired records are dropped.
+    #[test]
+    fn a_launch_keeps_every_preserved_spawner_record() {
+        let home = temp_home();
+        let request = launch_request();
+        let path = rayline_claude_launches_path(&home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let expired = [9101, 9102, 9103].map(|pid| launch_entry(&request, pid, 1));
+        fs::write(path, Value::Array(expired.to_vec()).to_string()).unwrap();
+        record_rayline_claude_launch(LaunchRecord {
+            home: &home,
+            pid: 9006,
+            request: &request,
+            preserve_spawned_by_pids: &[9101, 9103],
+        })
+        .unwrap();
+        let pids: Vec<u64> = read_rayline_claude_launches(&home)
+            .unwrap()
+            .iter()
+            .map(|entry| entry["pid"].as_u64().unwrap())
+            .collect();
+        assert_eq!(pids, [9101, 9103, 9006]);
     }
 
     /// No launch record file holds no launches; recording one creates it.

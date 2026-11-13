@@ -103,7 +103,7 @@ Harness-specific options and subcommands are **kept for review** (section 9).
    An image given only by URL, or whose bytes don't decode as an image, counts as the processor's maximum.
 7. The local process passes each request on with a session id and a branch id:
    - session: the request's `x-rayline-session-id`, else the first of `x-conversation-id`, `x-parent-session-id`, `x-session-affinity`, `x-session-id`, `x-claude-code-session-id` that it carries, else none;
-   - branch: the request's `x-rayline-branch-id`, else `thread-id`, else `x-claude-code-agent-id`, else, when it carries `x-parent-session-id`, `x-session-affinity` or `x-session-id`, else `main`.
+   - branch: the request's `x-rayline-branch-id`, else `thread-id`, else `x-claude-code-agent-id`, else, only when the request carries `x-parent-session-id`, its `x-session-affinity`, else its `x-session-id`; else `main`.
 8. When the core fails a turn before any output because its call to the routing service failed, the local process resends the turn once, and only when the service was unavailable (no answer, or HTTP 408, 409 or 5xx) or busy (HTTP 429). It doesn't resend when the service says `x-should-retry: false` or a `retry-after` over 30 seconds. Before the resend it waits the service's `retry-after` (at least 1 second), else about 5 seconds, jittered between 2.5 and 7.5 so sessions don't resend in step.
 
    When the turn still fails, or isn't resent, the harness gets the error with `x-should-retry: false`, so its SDK doesn't resend it again:
@@ -343,7 +343,25 @@ One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `ses
 2. The env var each endpoint's `api_key_env` names.
 3. OS: `PATH`, and the home directory. One function reads it, from `HOME` on unix and `USERPROFILE` on Windows. When that var is unset or empty, it is an error that names the var. There is no other source for the home directory.
 4. Harness homes, read to find a harness's own files: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `OPENCLAW_CONTAINER`.
-5. Values the user set for a harness, passed on unchanged: `CLAUDE_CODE_DISABLE_AGENT_VIEW`.
+5. `CLAUDE_CODE_DISABLE_AGENT_VIEW`, passed on to Claude Code unchanged. When it is `1`, `true`, `yes` or `on` (trimmed, any case, as Claude Code reads it), a cloud `rayline run claude` skips the reuse and conflict steps of the daemon check below: it never prompts or fails because a daemon is running. Rayline still reads `daemon.lock` and checks its `pid`, to keep the records of a running daemon's starter (last point below), so a failed liveness check is still an error.
+
+   The daemon check, before each cloud `rayline run claude`:
+   - A Claude Code daemon is running when `daemon.lock` in the launch's Claude config folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`; with `--isolated`, `~/.rayline/harness/claude-code/`) names a `pid` that is alive. A missing or unreadable `daemon.lock`, or one that isn't JSON naming a positive `pid`, counts as no daemon running (Claude Code writes it non-atomically). When checking whether that process is alive fails, the launch fails with an error that names the pid.
+   - Rayline reuses the running daemon when either:
+     - its environment, where Rayline can read it (Linux and macOS), holds the launch's values of `RAYLINE_ENV_NAME`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK`, `CLAUDE_CODE_DISABLE_REFUSAL_RETRY`, `CLAUDE_CODE_TETHER_LIVE`, `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`. `ANTHROPIC_BASE_URL` is compared without trailing slashes. An empty value of one of the last six counts as unset, so an empty `ANTHROPIC_DEFAULT_HAIKU_MODEL` matches a launch that removes it; or
+     - a record in `daemon-launches.json` (section 8.2) is for the process that started it (`spawnedBy.pid` in `daemon.lock`), with the same environment, router URL, auto-compact window and those switches, and the daemon started within 60 seconds after the record.
+   - Any other running daemon conflicts. When stdin, stdout and stderr are all terminals, Rayline asks whether to stop it (`claude daemon stop --any`) and go on, to run isolated instead (offered only without `--isolated`; the isolated folder gets the same check), or to cancel. Rayline trims the answer and matches it ignoring ASCII case. An empty answer stops it: Enter alone, whitespace only, or end of input (such as Ctrl-D). So do `s`, `y` and `yes`. `i` or `isolated` runs isolated, when offered. Any other answer cancels. When not all three are terminals, on cancel, or when flushing the prompt to stderr or reading the answer fails, the launch fails with an error. Its first lines name the daemon's pid and say whether it is a Rayline daemon (with its environment), a daemon that isn't Rayline's, or one Rayline couldn't verify. It goes on:
+
+     ```
+     To switch:
+       1. Stop the current daemon:   <stop>
+       2. Re-run:                    raydock [--env <name> ]run claude [--isolated ]<args>
+     ```
+
+     `<args>` are the launch's Claude Code arguments, else `agents`, and `--env <name>` is there when the launch passed it. In the isolated folder, `<stop>` is `claude daemon stop --any (with CLAUDE_CONFIG_DIR=<folder>)`, naming the isolated folder, and the rerun keeps `--isolated`. Otherwise `<stop>` is `claude daemon stop --any`, the rerun has no `--isolated`, and the message ends with `Or run alongside it in an isolated config dir (~/.rayline/harness/claude-code):` and that rerun with `--isolated`.
+
+     When the answer is to stop it, Rayline runs `claude daemon stop --any` with `CLAUDE_CONFIG_DIR` set to the checked folder, and goes on when it succeeds. When it exits non-zero, the launch fails with ``` `claude daemon stop --any` exited with code <code>. Stop the daemon manually and re-run. ```, where `<code>` is `-1` when the process has no exit code. When it can't be run, the launch fails with ``` Could not run `claude daemon stop --any`: <error>. Stop the daemon manually and re-run. ```
+   - Each cloud launch adds its record to `daemon-launches.json`. It drops each existing record that has no `ts` or is 24 hours old or older, except that it keeps, whatever their age, every record whose `pid` is a `spawnedBy.pid` that a check read from a live daemon's `daemon.lock`, before that check's prompt. That is the check of the launch's config folder or, when the user chose isolated at the prompt, both the default folder's check and the isolated folder's, since the default folder's daemon keeps running. A record stays kept when the user then stops its daemon at the prompt. A missing `daemon-launches.json` holds no records, and recording the launch creates it. One that exists but can't be read, or isn't a JSON array of objects, is an error. So is failing to write it: creating its folder, writing the temporary file, or renaming that into place. Each of these fails the launch.
 6. Shared Hugging Face cache: `HF_HOME`, `HF_HUB_CACHE`.
 
 ### 7.2 Set by Rayline for a harness
