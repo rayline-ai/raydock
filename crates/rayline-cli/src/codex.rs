@@ -1,4 +1,4 @@
-//! `raydock codex`: run Codex CLI on ARC through the Rayline router.
+//! `rayline run codex`: run Codex CLI on ARC through the Rayline router.
 //!
 //! Codex talks to the environment's router directly over the OpenAI Responses
 //! API. Rayline gives it its own `CODEX_HOME` (`~/.rayline/harness/codex/`),
@@ -21,8 +21,8 @@ impl CodexAuthMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "auto" => Some(Self::Auto),
-            "none" | "no-auth" | "local" => Some(Self::None),
-            "subscription" | "codex-subscription" | "chatgpt" | "codex" => Some(Self::Subscription),
+            "none" => Some(Self::None),
+            "subscription" => Some(Self::Subscription),
             _ => None,
         }
     }
@@ -51,8 +51,6 @@ pub struct RunRequest {
 pub struct ConfigureRequest {
     /// See [`RunRequest::model`].
     pub model: Option<String>,
-    /// `--base-url`. `None` uses the environment's router `/v1`.
-    pub base_url: Option<String>,
     pub auth_mode: CodexAuthMode,
     pub env_name: Option<String>,
 }
@@ -98,7 +96,7 @@ pub(crate) async fn resolve_provider(
     })
 }
 
-/// The `CODEX_HOME` `raydock codex` runs Codex CLI on.
+/// The `CODEX_HOME` `rayline run codex` runs Codex CLI on.
 fn codex_home(home: &Path) -> PathBuf {
     home.join(crate::DOT_CONFIG_DIR)
         .join("harness")
@@ -163,8 +161,8 @@ fn toml_string(value: &str) -> String {
 }
 
 /// The Codex `config.toml` settings that point Codex at the `rayline` provider.
-/// `raydock codex` and `raydock codex app` merge them into their `CODEX_HOME`'s
-/// `config.toml`; `raydock codex configure` writes them as the profile.
+/// `rayline run codex` and `rayline run codex app` merge them into their `CODEX_HOME`'s
+/// `config.toml`; `rayline run codex configure` writes them as the profile.
 pub(crate) fn provider_config_toml(provider: &Provider) -> String {
     format!(
         "model = {}\nmodel_provider = \"rayline\"\n\n[model_providers.rayline]\nname = \"Rayline\"\nbase_url = {}\nwire_api = \"responses\"\nexperimental_bearer_token = {}\n",
@@ -177,16 +175,13 @@ pub(crate) fn provider_config_toml(provider: &Provider) -> String {
 /// Write the `rayline` profile to `$CODEX_HOME/rayline.config.toml` (Codex's
 /// default home is `~/.codex`), owner-only since it holds the router key.
 pub async fn configure(request: &ConfigureRequest) -> io::Result<String> {
-    let mut provider = resolve_provider(
+    let provider = resolve_provider(
         request.auth_mode,
         request.model.as_deref(),
         request.env_name.as_deref(),
     )
     .await
     .map_err(io::Error::other)?;
-    if let Some(base_url) = &request.base_url {
-        provider.base_url.clone_from(base_url);
-    }
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))

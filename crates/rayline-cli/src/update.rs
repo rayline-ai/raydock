@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,9 +9,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use minisign_verify::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
 
+use crate::config::UpdateChannel;
+
 const CORE_LICENSE_NAME: &str = "rayline-core-LICENSE";
-/// Env override of `update.channel` in `settings.json`.
-const CHANNEL_ENV: &str = "RAYLINE_UPDATE_CHANNEL";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateRequest {
@@ -25,33 +25,6 @@ pub struct UpdateRequest {
     pub install_path: Option<PathBuf>,
 }
 
-/// The release channel `update` follows, `update.channel` in `settings.json`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Channel {
-    Prod,
-    Dev,
-    Main,
-}
-
-impl Channel {
-    fn parse(name: &str, value: &str) -> Result<Self, String> {
-        match value {
-            "prod" => Ok(Self::Prod),
-            "dev" => Ok(Self::Dev),
-            "main" => Ok(Self::Main),
-            "" => Err(format!("{name} must not be empty")),
-            _ => Err(format!("{name} must be prod, dev or main, not {value:?}")),
-        }
-    }
-
-    fn latest_pointer(self) -> &'static str {
-        match self {
-            Self::Prod => "cli/latest.txt",
-            Self::Dev => "cli/latest-dev.txt",
-            Self::Main => "cli/latest-main.txt",
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateResult {
@@ -63,7 +36,6 @@ pub struct UpdateResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpdateError {
     Checksum(String),
-    Config(String),
     InvalidVersion(String),
     Install(String),
     Network(String),
@@ -82,7 +54,6 @@ impl std::fmt::Display for UpdateError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Checksum(message)
-            | Self::Config(message)
             | Self::Install(message)
             | Self::Network(message)
             | Self::Signature(message)
@@ -94,18 +65,27 @@ impl std::fmt::Display for UpdateError {
 
 impl std::error::Error for UpdateError {}
 
-pub async fn run(request: &UpdateRequest) -> Result<UpdateResult, UpdateError> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| UpdateError::Config("home directory not found".to_owned()))?;
-    let channel = load_channel(&home)?;
+/// `rayline update` on `channel`, the loaded `update.channel`.
+pub async fn run(
+    request: &UpdateRequest,
+    channel: UpdateChannel,
+) -> Result<UpdateResult, UpdateError> {
     run_on(request, channel, crate::MINISIGN_PUBLIC_KEYS).await
 }
 
-/// `run` with the channel already loaded and the keys release signatures are
-/// checked against.
+/// The pointer file naming the latest release on `channel`.
+fn latest_pointer(channel: UpdateChannel) -> &'static str {
+    match channel {
+        UpdateChannel::Prod => "cli/latest.txt",
+        UpdateChannel::Dev => "cli/latest-dev.txt",
+        UpdateChannel::Main => "cli/latest-main.txt",
+    }
+}
+
+/// `run` with the keys release signatures are checked against.
 async fn run_on(
     request: &UpdateRequest,
-    channel: Channel,
+    channel: UpdateChannel,
     pubkeys: &[&str],
 ) -> Result<UpdateResult, UpdateError> {
     let base_url = request
@@ -301,69 +281,12 @@ pub fn evaluate_check(
     }
 }
 
-/// Load `update.channel`: `prod` unless `settings.json` sets it, and
-/// `RAYLINE_UPDATE_CHANNEL` over both. Any invalid value is a load error.
-fn load_channel(home: &Path) -> Result<Channel, UpdateError> {
-    let path = home
-        .join(".config")
-        .join(crate::CONFIG_DIR)
-        .join("settings.json");
-    let file = match fs::read_to_string(&path) {
-        Ok(text) => settings_channel(&text)
-            .map_err(|error| UpdateError::Config(format!("{}: {error}", path.display())))?,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(UpdateError::Config(format!(
-                "cannot read {}: {error}",
-                path.display()
-            )));
-        }
-    };
-    resolve_channel(file, std::env::var_os(CHANNEL_ENV).as_deref())
-}
-
-/// Validate the `update` section of a `settings.json` and return its channel.
-/// The rest of the file is left to the settings loader.
-fn settings_channel(text: &str) -> Result<Option<Channel>, String> {
-    let settings: serde_json::Value =
-        serde_json::from_str(text).map_err(|error| format!("invalid JSON: {error}"))?;
-    let serde_json::Value::Object(settings) = settings else {
-        return Err("settings must be a JSON object".to_owned());
-    };
-    let Some(update) = settings.get("update") else {
-        return Ok(None);
-    };
-    let serde_json::Value::Object(update) = update else {
-        return Err("`update` must be an object".to_owned());
-    };
-    if let Some(key) = update.keys().find(|key| *key != "channel") {
-        return Err(format!("unknown key `update.{key}`"));
-    }
-    match update.get("channel") {
-        None => Ok(None),
-        Some(serde_json::Value::String(value)) => {
-            Channel::parse("`update.channel`", value).map(Some)
-        }
-        Some(_) => Err("`update.channel` must be a string".to_owned()),
-    }
-}
-
-fn resolve_channel(file: Option<Channel>, env: Option<&OsStr>) -> Result<Channel, UpdateError> {
-    let Some(env) = env else {
-        return Ok(file.unwrap_or(Channel::Prod));
-    };
-    let value = env
-        .to_str()
-        .ok_or_else(|| UpdateError::Config(format!("{CHANNEL_ENV} is not valid UTF-8")))?;
-    Channel::parse(CHANNEL_ENV, value).map_err(UpdateError::Config)
-}
-
 async fn fetch_latest_version(
     base_url: &str,
-    channel: Channel,
+    channel: UpdateChannel,
     pubkeys: &[&str],
 ) -> Result<Version, UpdateError> {
-    let url = format!("{base_url}/{}", channel.latest_pointer());
+    let url = format!("{base_url}/{}", latest_pointer(channel));
     let pointer = fetch_pointer_bytes(&url).await?;
     // Fail closed: the version pointer must carry a verifiable signature before
     // we trust the version it names. This prevents an attacker from FORGING a
@@ -1487,112 +1410,6 @@ mod tests {
         );
     }
 
-    // ── update.channel ────────────────────────────────────────────────────────
-
-    #[test]
-    fn channel_defaults_to_prod() {
-        assert_eq!(resolve_channel(None, None), Ok(Channel::Prod));
-        assert_eq!(settings_channel("{}"), Ok(None));
-        assert_eq!(settings_channel(r#"{"update": {}}"#), Ok(None));
-    }
-
-    #[test]
-    fn channel_comes_from_the_settings_file() {
-        for (value, channel) in [
-            ("prod", Channel::Prod),
-            ("dev", Channel::Dev),
-            ("main", Channel::Main),
-        ] {
-            let settings = format!(r#"{{"update": {{"channel": "{value}"}}}}"#);
-            assert_eq!(settings_channel(&settings), Ok(Some(channel)));
-            assert_eq!(resolve_channel(Some(channel), None), Ok(channel));
-        }
-        // Other sections belong to the settings loader and are not read here.
-        assert_eq!(
-            settings_channel(r#"{"environments": {}, "update": {"channel": "dev"}}"#),
-            Ok(Some(Channel::Dev))
-        );
-    }
-
-    #[test]
-    fn env_override_wins_over_the_settings_file() {
-        assert_eq!(
-            resolve_channel(Some(Channel::Dev), Some(OsStr::new("main"))),
-            Ok(Channel::Main)
-        );
-        assert_eq!(
-            resolve_channel(None, Some(OsStr::new("dev"))),
-            Ok(Channel::Dev)
-        );
-    }
-
-    #[test]
-    fn an_invalid_channel_is_a_load_error_naming_the_key() {
-        for (settings, expected) in [
-            (
-                r#"{"update": {"channel": "local"}}"#,
-                "`update.channel` must be prod, dev or main",
-            ),
-            (
-                r#"{"update": {"channel": "Prod"}}"#,
-                "`update.channel` must be prod, dev or main",
-            ),
-            (
-                r#"{"update": {"channel": ""}}"#,
-                "`update.channel` must not be empty",
-            ),
-            (
-                r#"{"update": {"channel": 1}}"#,
-                "`update.channel` must be a string",
-            ),
-            (
-                r#"{"update": {"channel": null}}"#,
-                "`update.channel` must be a string",
-            ),
-            (
-                r#"{"update": {"channel": "dev", "url": "x"}}"#,
-                "unknown key `update.url`",
-            ),
-            (r#"{"update": "dev"}"#, "`update` must be an object"),
-            (r#"["update"]"#, "settings must be a JSON object"),
-            ("{", "invalid JSON"),
-        ] {
-            let error = settings_channel(settings).expect_err(settings);
-            assert!(error.contains(expected), "{settings}: {error}");
-        }
-        for value in ["local", "", "prod "] {
-            let Err(UpdateError::Config(error)) =
-                resolve_channel(Some(Channel::Prod), Some(OsStr::new(value)))
-            else {
-                panic!("RAYLINE_UPDATE_CHANNEL={value:?} must be a load error");
-            };
-            assert!(error.starts_with("RAYLINE_UPDATE_CHANNEL must"), "{error}");
-        }
-    }
-
-    #[test]
-    fn the_settings_file_is_read_from_the_config_dir() -> Result<(), UpdateError> {
-        let home = temp_update_dir()?;
-        // No file: the built-in default (unless the env override is set).
-        if std::env::var_os(CHANNEL_ENV).is_none() {
-            assert_eq!(load_channel(&home), Ok(Channel::Prod));
-        }
-        let config = home.join(".config").join(crate::CONFIG_DIR);
-        fs::create_dir_all(&config)?;
-        let settings = config.join("settings.json");
-        fs::write(&settings, r#"{"update": {"channel": "local"}}"#)?;
-        let Err(UpdateError::Config(error)) = load_channel(&home) else {
-            panic!("an invalid file channel must fail the load");
-        };
-        assert!(
-            error.starts_with(&settings.display().to_string()),
-            "{error}"
-        );
-        assert!(error.contains("`update.channel`"), "{error}");
-        fs::remove_dir_all(home)?;
-        Ok(())
-    }
-
     // ── update against a fake release server ─────────────────────────────────
 
     // Signs tests/fixtures/release-*SHA256SUMS. Testing only — NOT the
@@ -1712,9 +1529,9 @@ mod tests {
     #[tokio::test]
     async fn check_reads_the_channel_pointer_from_the_base_url() -> Result<(), UpdateError> {
         for (channel, pointer) in [
-            (Channel::Prod, "/cli/latest.txt"),
-            (Channel::Dev, "/cli/latest-dev.txt"),
-            (Channel::Main, "/cli/latest-main.txt"),
+            (UpdateChannel::Prod, "/cli/latest.txt"),
+            (UpdateChannel::Dev, "/cli/latest-dev.txt"),
+            (UpdateChannel::Main, "/cli/latest-main.txt"),
         ] {
             let server = FakeReleaseServer::start(Files::from([
                 (pointer.to_owned(), signed_fixture("latest.txt")),
@@ -1757,7 +1574,7 @@ mod tests {
             dry_run: true,
             ..request.clone()
         };
-        let result = run_on(&dry_run, Channel::Prod, &[RELEASE_TEST_PUBKEY]).await?;
+        let result = run_on(&dry_run, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await?;
         assert!(
             result.message.starts_with("Would install"),
             "{}",
@@ -1770,7 +1587,7 @@ mod tests {
         );
         assert_eq!(fs::read(&installed)?, b"installed");
 
-        let result = run_on(&request, Channel::Prod, &[RELEASE_TEST_PUBKEY]).await?;
+        let result = run_on(&request, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await?;
         assert_eq!(result.exit_code, 0, "{}", result.message);
         assert!(result.message.contains(TEST_RELEASE), "{}", result.message);
         assert_eq!(fs::read(&installed)?, LAUNCHER);
@@ -1796,7 +1613,7 @@ mod tests {
     async fn update_refuses_a_release_without_the_core() -> Result<(), UpdateError> {
         let server = FakeReleaseServer::start(release_files("release-no-core-SHA256SUMS"));
         let (install, request) = install_from(&server)?;
-        let result = run_on(&request, Channel::Prod, &[RELEASE_TEST_PUBKEY]).await;
+        let result = run_on(&request, UpdateChannel::Prod, &[RELEASE_TEST_PUBKEY]).await;
         let Err(UpdateError::Checksum(message)) = result else {
             panic!("a release without the core must fail closed: {result:?}");
         };
@@ -1811,7 +1628,7 @@ mod tests {
     async fn update_refuses_a_release_signed_by_another_key() -> Result<(), UpdateError> {
         let server = FakeReleaseServer::start(release_files("release-SHA256SUMS"));
         let (install, request) = install_from(&server)?;
-        let result = run_on(&request, Channel::Prod, crate::MINISIGN_PUBLIC_KEYS).await;
+        let result = run_on(&request, UpdateChannel::Prod, crate::MINISIGN_PUBLIC_KEYS).await;
         assert!(
             matches!(result, Err(UpdateError::Signature(_))),
             "{result:?}"

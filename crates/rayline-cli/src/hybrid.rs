@@ -68,13 +68,6 @@ enum Action {
     Status,
     /// Stop gateway and execution core; external model servers remain running.
     Stop,
-    /// Connect a coding harness to the running hybrid gateway.
-    Run {
-        /// claude, codex, pi, opencode, omp, hermes or openclaw.
-        harness: String,
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<OsString>,
-    },
 }
 
 struct Paths {
@@ -117,7 +110,66 @@ pub async fn run(args: Vec<OsString>) -> ExitCode {
     }
 }
 
-async fn execute(cli: Cli) -> io::Result<ExitCode> {
+/// `rayline run <harness> --local`: connect `harness` to the running local
+/// process (`~/.rayline/hybrid`), as `rayline run <harness> --local` did.
+pub(crate) async fn run_local(harness: &str, args: &[OsString]) -> ExitCode {
+    match run_harness(harness, args).await {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run_harness(harness: &str, args: &[OsString]) -> io::Result<ExitCode> {
+    require_supported_os()?;
+    let home = dirs::home_dir().ok_or_else(|| io::Error::other("cannot find home directory"))?;
+    let paths = Paths {
+        dir: home.join(".rayline").join("hybrid"),
+    };
+    private_dir(&paths.dir)?;
+    let client = gateway_client()?;
+    let state = ready(&paths)?;
+    health(&client, &paths, &state).await?;
+    let token = fs::read_to_string(paths.token())?;
+    let mut command = harness_command(
+        &paths,
+        harness,
+        args,
+        url(&state)?,
+        &token,
+        &harness_capabilities(model_capabilities(&state)?),
+    )?;
+    for name in credential_env_names(&state)? {
+        // A harness may use the same variable name for its local gateway
+        // token. Preserve that explicit replacement, never the inherited key.
+        let replaced_with_gateway = command
+            .get_envs()
+            .any(|(key, value)| key == name && value == Some(std::ffi::OsStr::new(&token)));
+        if !replaced_with_gateway {
+            command.env_remove(name);
+        }
+    }
+    // Here, not in harness_command: preparing may run Hermes, and the
+    // probe and repair must carry the launch's final environment.
+    if harness == "hermes" && cfg!(windows) {
+        crate::harness::hermes::prepare_launch(&command).map_err(io::Error::other)?;
+    }
+    let status = command.status()?;
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+fn gateway_client() -> io::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(io::Error::other)
+}
+
+fn require_supported_os() -> io::Result<()> {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/usr/bin/sw_vers")
@@ -141,6 +193,11 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             ));
         }
     }
+    Ok(())
+}
+
+async fn execute(cli: Cli) -> io::Result<ExitCode> {
+    require_supported_os()?;
     let home = dirs::home_dir().ok_or_else(|| io::Error::other("cannot find home directory"))?;
     let paths = Paths {
         dir: cli
@@ -148,12 +205,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             .unwrap_or_else(|| home.join(".rayline").join("hybrid")),
     };
     private_dir(&paths.dir)?;
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(3))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(io::Error::other)?;
+    let client = gateway_client()?;
     match cli.command {
         Action::Start {
             core,
@@ -528,36 +580,6 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             }
             fs::remove_file(paths.supervisor())?;
             println!("Hybrid gateway and execution core stopped.");
-        }
-        Action::Run { harness, args } => {
-            let state = ready(&paths)?;
-            health(&client, &paths, &state).await?;
-            let token = fs::read_to_string(paths.token())?;
-            let mut command = harness_command(
-                &paths,
-                &harness,
-                &args,
-                url(&state)?,
-                &token,
-                &harness_capabilities(model_capabilities(&state)?),
-            )?;
-            for name in credential_env_names(&state)? {
-                // A harness may use the same variable name for its local gateway
-                // token. Preserve that explicit replacement, never the inherited key.
-                let replaced_with_gateway = command
-                    .get_envs()
-                    .any(|(key, value)| key == name && value == Some(std::ffi::OsStr::new(&token)));
-                if !replaced_with_gateway {
-                    command.env_remove(name);
-                }
-            }
-            // Here, not in harness_command: preparing may run Hermes, and the
-            // probe and repair must carry the launch's final environment.
-            if harness == "hermes" && cfg!(windows) {
-                crate::harness::hermes::prepare_launch(&command).map_err(io::Error::other)?;
-            }
-            let status = command.status()?;
-            return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -1549,15 +1571,7 @@ mod tests {
             Cli::try_parse_from(["hybrid", "start", "--core", "/core", "--config", "/config"])
                 .is_ok()
         );
-        let argv: Vec<OsString> = ["rayline", "--env=dev", "hybrid", "status"]
-            .into_iter()
-            .map(OsString::from)
-            .collect();
-        assert!(matches!(
-            crate::rayline_dispatch_for_argv(&argv),
-            crate::RaylineDispatch::Usage(_)
-        ));
-        assert!(Cli::try_parse_from(["hybrid", "run", "claude", "--", "-p", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(["hybrid", "run", "claude", "--", "-p", "hello"]).is_err());
     }
     #[test]
     fn cloud_credentials_are_not_exported_to_harnesses() {

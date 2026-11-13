@@ -114,7 +114,7 @@ fn role_model_env_switches(
 
 /// The model a Claude Code argument list selects with `--model X` or
 /// `--model=X` (the last one wins), up to Claude Code's own `--` separator.
-/// `raydock claude -- --model X` forwards the flag to Claude Code, which makes
+/// `rayline run claude -- --model X` forwards the flag to Claude Code, which makes
 /// it the user's choice.
 fn forwarded_model_arg(args: &[OsString]) -> Option<String> {
     let mut found = None;
@@ -1518,7 +1518,7 @@ mod arc_default_tests {
         )
     }
 
-    // `raydock claude`: ARC Swift for every subagent (Explore and Plan
+    // `rayline run claude`: ARC Swift for every subagent (Explore and Plan
     // included, hence the force) and background task.
     #[test]
     fn default_launch_puts_subagents_and_background_on_arc_swift() {

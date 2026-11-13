@@ -29,7 +29,7 @@ impl Home {
             .env_clear()
             .env("HOME", &self.0)
             .env("PATH", "/usr/bin:/bin")
-            .args(["claude-desktop", action])
+            .args(["run", "claude-desktop", action])
             .output()
             .expect("run CLI")
     }

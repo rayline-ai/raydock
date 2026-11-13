@@ -1,7 +1,7 @@
-//! `raydock codex app`: launch the Codex desktop app on ARC through the
+//! `rayline run codex app`: launch the Codex desktop app on ARC through the
 //! Rayline router.
 //!
-//! Takes the same `--auth`/`--model` flags as `raydock codex` and points the
+//! Takes the same `--auth`/`--model` flags as `rayline run codex` and points the
 //! app at the same `rayline` provider. The desktop app-server differs from the
 //! CLI in two ways that shape this module:
 //!
@@ -138,7 +138,7 @@ fn generated_config_differs(existing: &str, generated: &str) -> bool {
         || !provider_table_current(&doc, &generated)
 }
 
-/// Write a Rayline Codex home (`raydock codex`'s or the desktop app's): its
+/// Write a Rayline Codex home (`rayline run codex`'s or the desktop app's): its
 /// `config.toml` is the Rayline settings merged into whatever the file already
 /// holds, written owner-only since it holds the router key. The app writes
 /// this only after the launch is committed, so a declined restart never changes
