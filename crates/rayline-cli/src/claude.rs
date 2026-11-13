@@ -243,7 +243,7 @@ async fn run_command_from_home(
         config_dir: &inspect_dir,
         request: &daemon_request,
         claude_bin: &claude_bin,
-        allow_isolated: !isolated,
+        isolated,
     }
     .resolve()?;
     let preserve_spawned_by_pid = match preflight {
@@ -259,7 +259,7 @@ async fn run_command_from_home(
                 config_dir: &inspect_dir,
                 request: &daemon_request,
                 claude_bin: &claude_bin,
-                allow_isolated: false,
+                isolated: true,
             }
             .resolve()?;
             match isolated_preflight {
