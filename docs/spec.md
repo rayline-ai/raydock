@@ -193,7 +193,7 @@ Required for local mode. Its presence in a `--config` file selects local mode.
 |---|---|---|---|
 | `decisions_model` | string | yes | Which ARC product makes decisions (for example `arc-swift-1.0`). No default in code. |
 | `classifier_model` | string | yes | The model that serves Claude Code's auto-mode safety classifier calls, sent to Rayline cloud. No default in code. |
-| `policy.preset` | string | yes | ARC's preset id (`arc-policy.package-default.v1`, `arc-policy.hybrid-default.v1` or `arc-policy.prefer-local.v1`). Sent to ARC unchanged; no short names. |
+| `policy.preset` | non-empty string | yes | ARC's preset id (`arc-policy.package-default.v1`, `arc-policy.hybrid-default.v1` or `arc-policy.prefer-local.v1`). Sent to ARC unchanged; no short names. |
 | `policy.overrides` | object | no | ARC's own `routing.policy.overrides` shape, sent to ARC unchanged. ARC validates it. |
 
 ### 5.5 Internal: `environments`
@@ -250,15 +250,18 @@ Load refuses, naming the key:
 
 1. An unknown key at any level Rayline defines.
 2. A wrong type, an empty string, or a value out of range.
-3. An endpoint that doesn't list the protocol of the harness being run.
+3. In a local-mode run, an endpoint that doesn't list the protocol of the harness being run. Cloud mode doesn't use endpoints, and `rayline local start` has no harness, so neither checks this.
 4. A model entry whose `endpoint` is not in `endpoints`.
 5. Local mode without `routing`, or `routing` missing a required key.
-6. `--env <name>` with no `environments.<name>` entry.
+6. `--env <name>` with no `environments.<name>` entry. `prod` gets no special case.
+7. A routing env override when the file has no `routing` section. The mode comes from the file only.
+8. A `--config <file>` that doesn't exist. Only the default file is optional.
+9. An empty map key, a URL that isn't absolute `http` or `https`, a duplicate in `protocols`, or a `price` missing any of its four fields.
 
 When the local process starts, before it serves anything, it also refuses:
 
-7. An `api_key_env` naming an env var that isn't set.
-8. A model entry ARC doesn't know that is missing `context_window` or `max_output_tokens`.
+10. An `api_key_env` naming an env var that isn't set.
+11. A model entry ARC doesn't know that is missing `context_window` or `max_output_tokens`.
 
 ## 6. `credentials.json`
 
