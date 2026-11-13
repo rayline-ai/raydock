@@ -85,6 +85,10 @@ pub(crate) struct LaunchModel {
     /// same `arc-sage-1.0` for ARC Sage in every data mode. `None` for a
     /// model that is no ARC product (hybrid's virtual model).
     pub product: Option<String>,
+    /// The input it accepts: `["text", "image"]` for a hosted model whose
+    /// listing has `capabilities.vision: true`, `["text"]` when false; the
+    /// core's admitted modalities under `--local`.
+    pub input_modalities: Vec<String>,
     /// Its row on the price card ([`LaunchModels::apply_arc_prices`]), for a
     /// harness that shows costs (omp); `None` when not read or not on it.
     pub price: Option<ModelPrice>,
@@ -125,13 +129,17 @@ impl LaunchModels {
                         .and_then(Value::as_u64)
                         .ok_or_else(|| format!("{id} has no {field}"))
                 };
+                let vision = entry
+                    .get("capabilities")
+                    .and_then(|capabilities| capabilities.get("vision"))
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| format!("{id} has no capabilities.vision"))?;
                 Ok(LaunchModel {
                     id: id.to_owned(),
-                    // An entry without a display name goes by its id.
                     display_name: entry
                         .get("display_name")
                         .and_then(Value::as_str)
-                        .unwrap_or(id)
+                        .ok_or_else(|| format!("{id} has no display_name"))?
                         .to_owned(),
                     context_window: limit("context_length")?,
                     max_output_tokens: limit("max_output_tokens")?,
@@ -139,6 +147,11 @@ impl LaunchModels {
                         .get("product")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
+                    input_modalities: if vision {
+                        vec!["text".to_owned(), "image".to_owned()]
+                    } else {
+                        vec!["text".to_owned()]
+                    },
                     price: None,
                 })
             })
@@ -172,35 +185,40 @@ impl LaunchModels {
                 context_window: capabilities.context_window,
                 max_output_tokens: capabilities.max_output_tokens,
                 product: None,
+                input_modalities: capabilities.input_modalities.clone(),
                 price: None,
             }],
         }
     }
 
     /// Read a `GET /v1/arc/prices` answer: each offered model's price by its
-    /// own id, since every data mode has its own row. A model without a
-    /// complete row gets no price.
-    pub(crate) fn apply_arc_prices(&mut self, prices: &Value) {
+    /// own id, since every data mode has its own row. The card does not price
+    /// every model, so a model without a row gets no price; a row missing a
+    /// field is an error naming the model and the field.
+    pub(crate) fn apply_arc_prices(&mut self, prices: &Value) -> Result<(), String> {
+        let rows = prices
+            .get("card")
+            .and_then(|card| card.get("prices"))
+            .and_then(Value::as_object)
+            .ok_or("the response has no `card.prices` object")?;
         for model in &mut self.offered {
-            let row = &prices["card"]["prices"][model.id.as_str()];
-            let field = |name: &str| row.get(name).and_then(Value::as_f64);
-            model.price = match (
-                field("input"),
-                field("output"),
-                field("cache_read"),
-                field("cache_write"),
-            ) {
-                (Some(input), Some(output), Some(cache_read), Some(cache_write)) => {
-                    Some(ModelPrice {
-                        input,
-                        output,
-                        cache_read,
-                        cache_write,
-                    })
-                }
-                _ => None,
+            let Some(row) = rows.get(&model.id) else {
+                model.price = None;
+                continue;
             };
+            let field = |name: &str| {
+                row.get(name)
+                    .and_then(Value::as_f64)
+                    .ok_or_else(|| format!("the price row for {} has no {name}", model.id))
+            };
+            model.price = Some(ModelPrice {
+                input: field("input")?,
+                output: field("output")?,
+                cache_read: field("cache_read")?,
+                cache_write: field("cache_write")?,
+            });
         }
+        Ok(())
     }
 
     /// The main agent's model.
@@ -223,11 +241,17 @@ pub(crate) async fn fetch_hosted_models(
         .map_err(|error| format!("couldn't read this key's models from {url}: {error}"))
 }
 
-/// The router's public ARC price card, `GET /v1/arc/prices`.
-pub(crate) async fn fetch_arc_prices(router_url: &str) -> Result<Value, String> {
+/// The router's public ARC price card, `GET /v1/arc/prices`, applied to
+/// `models` ([`LaunchModels::apply_arc_prices`]). Fails the launch when the
+/// card cannot be read, as [`fetch_hosted_models`] does for the listing.
+pub(crate) async fn apply_hosted_prices(
+    router_url: &str,
+    models: &mut LaunchModels,
+) -> Result<(), String> {
     let url = format!("{router_url}/v1/arc/prices");
     get_json(&url, None)
         .await
+        .and_then(|prices| models.apply_arc_prices(&prices))
         .map_err(|error| format!("couldn't read the ARC prices from {url}: {error}"))
 }
 
@@ -251,10 +275,6 @@ async fn get_json(url: &str, bearer: Option<&str>) -> Result<Value, String> {
     }
     Ok(body)
 }
-
-/// Output ceiling for models outside the hosted ARC tiers: the harness
-/// default the router admits.
-pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Harness {
@@ -369,9 +389,6 @@ pub(crate) struct RenderContext<'a> {
     /// (e.g. `https://api-dev.rayline.ai`).
     pub router_url: &'a str,
     pub config_dir: &'a Path,
-    /// pi only: whether to set `compat.allowEmptySignature`
-    /// ([`pi::allow_empty_signature`]).
-    pub allow_empty_signature: bool,
     /// The limits `rayline run <harness> --local` admits (context window the harness may
     /// budget against, the core's output cap, input modalities). `None`: the
     /// hosted router's defaults.
@@ -384,14 +401,6 @@ pub(crate) struct RenderContext<'a> {
 }
 
 impl RenderContext<'_> {
-    /// Input modalities to advertise for the router model.
-    pub fn input_modalities(&self) -> Value {
-        match self.capabilities {
-            Some(caps) => serde_json::json!(caps.input_modalities),
-            None => serde_json::json!(["text", "image"]),
-        }
-    }
-
     /// Base URL for clients that append `/v1/messages` themselves.
     pub fn messages_base(&self) -> String {
         self.router_url.to_owned()
@@ -453,7 +462,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
     // settings.json `environments.<env>.base_url` for `--env`.
     let hosted = &request.hosted;
     let env_name = hosted.name().to_owned();
-    let router_url = normalize_router_url(&hosted.base_url);
+    let router_url = hosted.base_url.clone();
     // The stored `rlk-` key, signing in first when signed out, like `rayline run claude`.
     let key = crate::status::router_key(hosted, &home)
         .await
@@ -466,17 +475,13 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
     let mut models = fetch_hosted_models(&router_url, &key).await?;
     // omp shows each model's cost, from the price card.
     if harness == Harness::Omp {
-        match fetch_arc_prices(&router_url).await {
-            Ok(prices) => models.apply_arc_prices(&prices),
-            Err(error) => eprintln!("warning: {error}; omp shows no model costs"),
-        }
+        apply_hosted_prices(&router_url, &mut models).await?;
     }
     let config_dir = config_dir(&home, harness);
     let ctx = RenderContext {
         key: &key,
         router_url: &router_url,
         config_dir: &config_dir,
-        allow_empty_signature: pi::allow_empty_signature(&env_name),
         capabilities: None,
         harness_major_version: harness.major_version(&binary)?,
         models,
@@ -548,17 +553,6 @@ pub(crate) fn config_dir(home: &Path, harness: Harness) -> PathBuf {
         .join(harness.name())
 }
 
-/// Strip trailing slashes and a trailing `/v1` so renderers can add exactly the
-/// suffix their client expects.
-pub(crate) fn normalize_router_url(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    trimmed
-        .strip_suffix("/v1")
-        .unwrap_or(trimmed)
-        .trim_end_matches('/')
-        .to_owned()
-}
-
 pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -593,6 +587,20 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
 /// 0600 on Unix, an owner-only DACL on Windows, set before anything is
 /// written): the Rayline-owned configs hold the router key. A stale file is
 /// removed first, since an open of an existing file keeps its mode.
+/// A harness home the user exported (`CODEX_HOME`, `CLAUDE_CONFIG_DIR`):
+/// `None` when unset, the path as given otherwise. An empty value is an error
+/// naming the variable.
+pub(crate) fn exported_dir(var: &str) -> io::Result<Option<PathBuf>> {
+    match std::env::var_os(var) {
+        None => Ok(None),
+        Some(value) if value.is_empty() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{var} is set but empty: unset it or set it to a directory"),
+        )),
+        Some(value) => Ok(Some(PathBuf::from(value))),
+    }
+}
+
 pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     use std::io::Write as _;
     match fs::remove_file(path) {
@@ -870,7 +878,8 @@ pub(crate) mod tests {
             json!({
                 "id": id, "object": "model", "owned_by": "rayline",
                 "display_name": name, "product": product,
-                "context_length": 1_000_000, "max_output_tokens": 128_000
+                "context_length": 1_000_000, "max_output_tokens": 128_000,
+                "capabilities": {"vision": true, "tools": true, "reasoning": true}
             })
         };
         json!({
@@ -893,7 +902,8 @@ pub(crate) mod tests {
         body["data"][0]["context_length"] = json!(200_000);
         body["data"].as_array_mut().unwrap().push(json!({
             "id": "other/model", "object": "model", "owned_by": "other",
-            "context_length": 32_000, "max_output_tokens": 4_096
+            "display_name": "Other", "context_length": 32_000, "max_output_tokens": 4_096,
+            "capabilities": {"vision": false, "tools": true, "reasoning": true}
         }));
         let models = LaunchModels::from_listing(&body).unwrap();
         assert_eq!(models.main, "arc-sage-contributor-1.0");
@@ -912,8 +922,10 @@ pub(crate) mod tests {
             ]
         );
         assert_eq!(models.offered[1].context_window, 200_000);
-        assert_eq!(models.offered[2].display_name, "other/model");
+        assert_eq!(models.offered[2].display_name, "Other");
         assert_eq!(models.offered[2].product, None);
+        assert_eq!(models.offered[0].input_modalities, ["text", "image"]);
+        assert_eq!(models.offered[2].input_modalities, ["text"]);
     }
 
     #[test]
@@ -935,17 +947,37 @@ pub(crate) mod tests {
             LaunchModels::from_listing(&body).unwrap_err(),
             "arc-sage-1.0 has no max_output_tokens"
         );
+        let mut body = listing(None);
+        body["data"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("display_name");
+        assert_eq!(
+            LaunchModels::from_listing(&body).unwrap_err(),
+            "arc-swift-1.0 has no display_name"
+        );
+        let mut body = listing(None);
+        body["data"][1]["capabilities"]
+            .as_object_mut()
+            .unwrap()
+            .remove("vision");
+        assert_eq!(
+            LaunchModels::from_listing(&body).unwrap_err(),
+            "arc-sage-1.0 has no capabilities.vision"
+        );
     }
 
     #[test]
     fn prices_come_from_each_ids_card_row() {
         let mut models = LaunchModels::from_listing(&listing(Some("contributor"))).unwrap();
-        models.apply_arc_prices(&json!({"card": {"prices": {
-            "arc-sage-contributor-1.0": {
-                "input": 0.5, "output": 2.5, "cache_read": 0.025, "cache_write": 0.625
-            },
-            "arc-sage-1.0": {"input": 9.0, "output": 9.0, "cache_read": 9.0, "cache_write": 9.0}
-        }}}));
+        models
+            .apply_arc_prices(&json!({"card": {"prices": {
+                "arc-sage-contributor-1.0": {
+                    "input": 0.5, "output": 2.5, "cache_read": 0.025, "cache_write": 0.625
+                },
+                "arc-sage-1.0": {"input": 9.0, "output": 9.0, "cache_read": 9.0, "cache_write": 9.0}
+            }}}))
+            .unwrap();
         assert_eq!(
             models.main_model().price,
             Some(ModelPrice {
@@ -959,13 +991,29 @@ pub(crate) mod tests {
         assert_eq!(models.offered[1].price, None);
     }
 
+    #[test]
+    fn an_incomplete_price_row_or_card_is_an_error() {
+        let mut models = LaunchModels::from_listing(&listing(None)).unwrap();
+        assert_eq!(
+            models
+                .apply_arc_prices(&json!({"card": {"prices": {
+                    "arc-sage-1.0": {"input": 0.5, "output": 2.5, "cache_read": 0.025}
+                }}}))
+                .unwrap_err(),
+            "the price row for arc-sage-1.0 has no cache_write"
+        );
+        assert_eq!(
+            models.apply_arc_prices(&json!({"card": {}})).unwrap_err(),
+            "the response has no `card.prices` object"
+        );
+    }
+
     /// A hosted dev context writing into `dir`.
     pub(crate) fn render_context(dir: &Path) -> RenderContext<'_> {
         RenderContext {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
-            allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
             models: hosted_models(),
@@ -980,7 +1028,6 @@ pub(crate) mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            allow_empty_signature: pi::allow_empty_signature("dev"),
             capabilities: None,
             harness_major_version: None,
             models: hosted_models(),
@@ -1017,15 +1064,18 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn router_url_is_normalized() {
-        for raw in [
-            "https://api-dev.rayline.ai",
-            "https://api-dev.rayline.ai/",
-            "https://api-dev.rayline.ai/v1",
-            "https://api-dev.rayline.ai/v1/",
-        ] {
-            assert_eq!(normalize_router_url(raw), "https://api-dev.rayline.ai");
-        }
+    fn an_empty_exported_dir_is_an_error_naming_the_var() {
+        const VAR: &str = "RAYLINE_TEST_EXPORTED_DIR";
+        // SAFETY: the variable is this test's own; no other code reads it.
+        unsafe { std::env::remove_var(VAR) };
+        assert_eq!(exported_dir(VAR).unwrap(), None);
+        unsafe { std::env::set_var(VAR, "") };
+        let error = exported_dir(VAR).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains(VAR), "{error}");
+        unsafe { std::env::set_var(VAR, "~/x") };
+        assert_eq!(exported_dir(VAR).unwrap(), Some(PathBuf::from("~/x")));
+        unsafe { std::env::remove_var(VAR) };
     }
 
     #[test]

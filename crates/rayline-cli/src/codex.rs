@@ -78,14 +78,14 @@ pub(crate) async fn resolve_provider(
 ) -> Result<Provider, String> {
     auth_mode.require_auto()?;
     let home = crate::home().map_err(|error| error.to_string())?;
-    let router_url = crate::harness::normalize_router_url(&hosted.base_url);
+    let router_url = &hosted.base_url;
     let key = crate::status::router_key(hosted, &home)
         .await
         .map_err(|error| error.to_string())?;
     let model = match model {
         Some(model) => model.to_owned(),
         None => {
-            crate::harness::fetch_hosted_models(&router_url, &key)
+            crate::harness::fetch_hosted_models(router_url, &key)
                 .await?
                 .main
         }
@@ -182,8 +182,8 @@ pub async fn configure(request: &ConfigureRequest) -> io::Result<String> {
     let provider = resolve_provider(request.auth_mode, request.model.as_deref(), &request.hosted)
         .await
         .map_err(io::Error::other)?;
-    let codex_home = match std::env::var_os("CODEX_HOME") {
-        Some(codex_home) => PathBuf::from(codex_home),
+    let codex_home = match crate::harness::exported_dir("CODEX_HOME")? {
+        Some(codex_home) => codex_home,
         None => crate::home()
             .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?
             .join(".codex"),

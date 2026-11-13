@@ -1,4 +1,4 @@
-//! Shared helpers for the local hybrid gateway: the loopback request guard,
+//! Shared helpers for the local process: the loopback request guard,
 //! the inbound token guard, session headers, model capabilities, the Decisions
 //! URL check and owner-only state on Windows.
 

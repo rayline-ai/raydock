@@ -430,7 +430,6 @@ mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
             models: hosted_models(),
@@ -440,7 +439,6 @@ mod tests {
         assert!(config.contains("  rayline:"), "{config}");
 
         let local = RenderContext {
-            allow_empty_signature: true,
             capabilities: Some(&capabilities),
             models: super::super::LaunchModels::hybrid(&capabilities),
             ..cloud
@@ -467,7 +465,6 @@ mod tests {
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
             models: super::super::tests::hosted_models(),
@@ -530,7 +527,6 @@ fallback_model:
                 key: super::super::tests::TEST_KEY,
                 router_url: TEST_URL,
                 config_dir: &dir,
-                allow_empty_signature: false,
                 capabilities: None,
                 harness_major_version: None,
                 models: super::super::tests::hosted_models(),
@@ -597,7 +593,6 @@ fallback_providers: []
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
             models: super::super::tests::hosted_models(),

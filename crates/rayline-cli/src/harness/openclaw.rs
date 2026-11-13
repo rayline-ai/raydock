@@ -120,7 +120,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                     "name": model.display_name,
                     // ARC selects thinking effort; clients must not expose controls.
                     "reasoning": ctx.capabilities.is_some(),
-                    "input": ctx.input_modalities(),
+                    "input": model.input_modalities,
                     "contextWindow": model.context_window,
                     "maxTokens": model.max_output_tokens,
                     "compat": compat
@@ -270,7 +270,6 @@ mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            allow_empty_signature: true,
             capabilities: Some(&capabilities),
             harness_major_version: None,
             models: LaunchModels::hybrid(&capabilities),

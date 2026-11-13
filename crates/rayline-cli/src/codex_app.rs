@@ -109,8 +109,8 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
 /// Resolve the user's real Codex home (`$CODEX_HOME` or `~/.codex`), whose
 /// `config.toml` tables seed a new Rayline Codex home.
 fn user_codex_home() -> io::Result<PathBuf> {
-    match std::env::var_os("CODEX_HOME") {
-        Some(codex_home) => Ok(PathBuf::from(codex_home)),
+    match crate::harness::exported_dir("CODEX_HOME")? {
+        Some(codex_home) => Ok(codex_home),
         None => Ok(crate::home()
             .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?
             .join(".codex")),
@@ -142,7 +142,7 @@ const RAYLINE_PROVIDER: &str = "rayline";
 #[cfg(unix)]
 fn generated_config_differs(existing: &str, generated: &str) -> bool {
     let (Ok(doc), Ok(generated)) = (
-        parse_isolated_config(existing),
+        existing.parse::<DocumentMut>(),
         generated.parse::<DocumentMut>(),
     ) else {
         return true;
@@ -234,7 +234,7 @@ fn read_if_present(path: &Path) -> io::Result<Option<String>> {
 /// own), so the Rayline settings cannot be assumed to be a prefix or to be
 /// anywhere in particular.
 fn apply_rayline_settings(existing: &str, generated: &str) -> Result<String, TomlError> {
-    let mut doc = parse_isolated_config(existing)?;
+    let mut doc: DocumentMut = existing.parse()?;
     let generated: DocumentMut = generated.parse()?;
     for key in RAYLINE_ROOT_KEYS {
         if root_key_current(&doc, &generated, key) {
@@ -290,18 +290,6 @@ fn rayline_provider_table(doc: &DocumentMut) -> Option<&Table> {
         .and_then(Item::as_table)
 }
 
-/// Parse an isolated `config.toml`. A file left with two
-/// `[model_providers.rayline]` tables by an earlier Rayline release fails to
-/// parse; drop every copy textually and retry, since the merge re-emits the
-/// table anyway. Any other error is the caller's to surface.
-fn parse_isolated_config(existing: &str) -> Result<DocumentMut, TomlError> {
-    existing.parse().or_else(|error| {
-        strip_rayline_provider_table(existing)
-            .parse()
-            .map_err(|_| error)
-    })
-}
-
 /// A table's key/value pairs rendered with formatting reset and keys sorted, so
 /// two tables compare equal on content even if the desktop app re-serialised
 /// one of them with different spacing or key order.
@@ -322,31 +310,13 @@ fn canonical(table: &Table) -> String {
 /// config on first creation (`[mcp_servers]`, `[projects]`, …). Root keys are
 /// dropped: the ones we own are overridden anyway, and the rest (`profile`,
 /// `notify`, …) can change routing or run commands and are not carried over
-/// silently. An unparsable or empty seed contributes nothing.
+/// silently. An unparsable seed is an error; an empty one contributes nothing.
 fn seed_tables(seed: &str) -> Result<String, TomlError> {
     let mut doc = seed.parse::<DocumentMut>()?;
     doc.retain(|_, item| {
         item.is_array_of_tables() || item.as_table().is_some_and(|table| !table.is_dotted())
     });
     Ok(doc.to_string())
-}
-
-/// Remove every `[model_providers.rayline]` table (its header through the line
-/// before the next table header / EOF) from `text`.
-fn strip_rayline_provider_table(text: &str) -> String {
-    let mut out = String::new();
-    let mut skipping = false;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('[') {
-            // A new table header ends any table we were skipping.
-            skipping = trimmed.trim_end() == "[model_providers.rayline]";
-        }
-        if !skipping {
-            out.push_str(line);
-        }
-    }
-    out
 }
 
 #[cfg(unix)]
@@ -764,25 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_rayline_tables_from_older_release_are_healed() {
-        // An earlier release composed a fresh block over a suffix that still held
-        // the previous table — invalid TOML the app refuses to load.
-        let existing = format!(
-            "{}\n[tools]\nweb_search = true\n\n[model_providers.rayline]\nname = \"Raydock\"\nbase_url = \"https://api.rayline.ai/v1\"\nwire_api = \"responses\"\n\n[desktop]\nx = 1\n",
-            snippet("arc-sage-1.0")
-        );
-        let generated = snippet("arc-sage-1.0");
-        #[cfg(unix)]
-        assert!(generated_config_differs(&existing, &generated));
-        let merged = apply_rayline_settings(&existing, &generated).unwrap();
-        assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
-        assert!(merged.contains("[tools]"));
-        assert!(merged.contains("[desktop]"));
-        assert!(merged.parse::<DocumentMut>().is_ok());
-    }
-
-    #[test]
-    fn unrelated_parse_error_is_surfaced_not_clobbered() {
+    fn parse_error_is_surfaced_not_clobbered() {
         let dir = unique_tmp_dir("broken");
         fs::write(dir.join("config.toml"), "[desktop\nx = 1\n").unwrap();
         let error = write_codex_home(&dir, &snippet("arc-sage-1.0")).unwrap_err();
@@ -791,6 +743,32 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.join("config.toml")).unwrap(),
             "[desktop\nx = 1\n"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn duplicate_rayline_tables_are_an_error_naming_the_file() {
+        let dir = unique_tmp_dir("duplicate");
+        let existing = format!(
+            "{}
+[model_providers.rayline]
+name = \"Raydock\"
+",
+            snippet("arc-sage-1.0")
+        );
+        fs::write(dir.join("config.toml"), &existing).unwrap();
+        let error = write_codex_home(&dir, &snippet("arc-sage-1.0")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            error
+                .to_string()
+                .contains(&dir.join("config.toml").display().to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("config.toml")).unwrap(),
+            existing
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -900,16 +878,6 @@ mod tests {
         assert_eq!(merged.matches("[model_providers.rayline]").count(), 1);
         assert!(!merged.contains("User Rayline"));
         assert!(merged.contains("[mcp_servers.foo]"));
-    }
-
-    #[test]
-    fn strip_rayline_table_only_removes_that_table() {
-        let text = "[a]\nx = 1\n\n[model_providers.rayline]\nname = \"y\"\nbase_url = \"z\"\n\n[b]\nq = 2\n";
-        let stripped = strip_rayline_provider_table(text);
-        assert!(stripped.contains("[a]"));
-        assert!(stripped.contains("[b]"));
-        assert!(!stripped.contains("[model_providers.rayline]"));
-        assert!(!stripped.contains("base_url = \"z\""));
     }
 
     #[test]

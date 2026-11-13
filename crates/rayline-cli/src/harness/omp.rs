@@ -78,7 +78,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "name": model.display_name,
                 // ARC owns reasoning effort; do not expose omp thinking controls.
                 "reasoning": !hosted_arc,
-                "input": ctx.input_modalities(),
+                "input": model.input_modalities,
                 "contextWindow": model.context_window,
                 "maxTokens": model.max_output_tokens
             });
