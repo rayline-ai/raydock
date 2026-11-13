@@ -17,6 +17,9 @@ const DAEMON_SPAWN_MAX_DELAY_SECONDS: i64 = 60;
 
 pub struct RequestSpec<'a> {
     pub env_name: &'a str,
+    /// The `--env` name the user passed, `None` for the built-in prod. The
+    /// conflict message's rerun hint repeats it.
+    pub env_flag: Option<&'a str>,
     /// The hosted router the launch talks to (`ANTHROPIC_BASE_URL`). Two
     /// environments can share a name (the built-in prod and an `environments`
     /// entry named `prod`), so a daemon is this launch's only on the same router.
@@ -255,30 +258,21 @@ fn is_upper_env_key(key: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_digit())
 }
 
+/// A daemon is Rayline's only when it carries a valid `RAYLINE_ENV_NAME` and
+/// a router URL; anything else is not ours.
 fn classify_daemon_owner(state: &DaemonState) -> DaemonOwner {
-    let explicit_env_name = state
-        .env_vars
-        .get(RAYLINE_ENV_NAME_ENV)
-        .filter(|env_name| crate::status::is_valid_root_env(env_name))
-        .cloned();
-    let base_url = state
+    let has_base_url = state
         .env_vars
         .get("ANTHROPIC_BASE_URL")
-        .map(|url| url.trim_end_matches('/'))
-        .unwrap_or_default();
-    if let Some(env_name) = explicit_env_name {
-        if !base_url.is_empty() {
-            return DaemonOwner::Rayline { env_name };
+        .is_some_and(|url| !url.trim_end_matches('/').is_empty());
+    match state.env_vars.get(RAYLINE_ENV_NAME_ENV) {
+        Some(env_name) if has_base_url && crate::status::is_valid_root_env(env_name) => {
+            DaemonOwner::Rayline {
+                env_name: env_name.clone(),
+            }
         }
+        _ => DaemonOwner::NonRayline,
     }
-    for (env_name, expected_url) in router_urls() {
-        if base_url == expected_url.trim_end_matches('/') {
-            return DaemonOwner::Rayline {
-                env_name: env_name.to_owned(),
-            };
-        }
-    }
-    DaemonOwner::NonRayline
 }
 
 fn daemon_owner_matches_request(state: &DaemonState, request: &RequestSpec<'_>) -> bool {
@@ -509,7 +503,10 @@ fn format_daemon_conflict_error(
     owner: &DaemonOwner,
     allow_isolated: bool,
 ) -> String {
-    let env_flag = String::new();
+    let env_flag = request
+        .env_flag
+        .map(|name| format!("--env {name} "))
+        .unwrap_or_default();
     let arg_str = if request.args.is_empty() {
         "agents".to_owned()
     } else {
@@ -661,10 +658,6 @@ fn rayline_claude_launches_path(home: &Path) -> PathBuf {
     home.join(crate::CLAUDE_LAUNCHES_SUFFIX)
 }
 
-fn router_urls() -> [(&'static str, &'static str); 1] {
-    [("prod", crate::ROUTER_PROD_URL)]
-}
-
 fn unix_now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -695,6 +688,7 @@ mod tests {
     fn launch_request() -> RequestSpec<'static> {
         RequestSpec {
             env_name: "prod",
+            env_flag: None,
             router_url: crate::ROUTER_PROD_URL,
             auto_compact_window: Some("180000"),
             refusal_recovery: Box::leak(
@@ -748,6 +742,33 @@ mod tests {
     }
 
     #[test]
+    fn rerun_hint_repeats_the_env_flag() {
+        let mut request = launch_request();
+        let state = state(rayline_env());
+        let owner = DaemonOwner::NonRayline;
+        let prod = format_daemon_conflict_error(&request, &state, &owner, true);
+        assert!(
+            prod.contains(&format!("{} run claude agents", crate::CLI_BIN)),
+            "{prod}"
+        );
+
+        request.env_name = "dev";
+        request.env_flag = Some("dev");
+        let dev = format_daemon_conflict_error(&request, &state, &owner, true);
+        assert!(
+            dev.contains(&format!("{} --env dev run claude agents", crate::CLI_BIN)),
+            "{dev}"
+        );
+        assert!(
+            dev.contains(&format!(
+                "{} --env dev run claude --isolated agents",
+                crate::CLI_BIN
+            )),
+            "{dev}"
+        );
+    }
+
+    #[test]
     fn the_isolated_choice_names_the_isolated_dir_under_home() {
         let home = temp_home();
         let prompt = conflict_prompt(42, &home, true);
@@ -780,6 +801,24 @@ mod tests {
         let request = launch_request();
         let state = state(BTreeMap::new());
 
+        assert_eq!(
+            classify_launch_safety(&state, &request, &home).unwrap(),
+            Safety::Conflict
+        );
+    }
+
+    #[test]
+    fn prod_router_url_without_env_name_is_not_rayline() {
+        let home = temp_home();
+        let request = launch_request();
+        let mut unnamed = rayline_env();
+        unnamed.remove(RAYLINE_ENV_NAME_ENV);
+        let state = state(unnamed);
+
+        assert!(matches!(
+            classify_daemon_owner(&state),
+            DaemonOwner::NonRayline
+        ));
         assert_eq!(
             classify_launch_safety(&state, &request, &home).unwrap(),
             Safety::Conflict

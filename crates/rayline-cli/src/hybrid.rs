@@ -884,7 +884,6 @@ fn harness_command(
                 key: token,
                 router_url: endpoint,
                 config_dir: &config_dir,
-                allow_empty_signature: true,
                 capabilities: Some(capabilities),
                 harness_major_version: major_version,
                 models: crate::harness::LaunchModels::hybrid(capabilities),

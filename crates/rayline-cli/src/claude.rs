@@ -121,6 +121,7 @@ pub enum RunError {
     DaemonConflict(String),
     Router(String),
     Auth(crate::status::AuthError),
+    ConfigDir(io::Error),
     IsolatedProfile(io::Error),
     LaunchRecord(io::Error),
 }
@@ -135,6 +136,7 @@ impl std::fmt::Display for RunError {
             Self::DaemonConflict(message) => formatter.write_str(message),
             Self::Router(message) => formatter.write_str(message),
             Self::Auth(error) => error.fmt(formatter),
+            Self::ConfigDir(error) => error.fmt(formatter),
             Self::IsolatedProfile(error) => {
                 write!(formatter, "failed to prepare the isolated Claude profile: {error}")
             }
@@ -210,7 +212,7 @@ async fn run_command_from_home(
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
     // config dir. Inspect the matching config dir for a daemon conflict.
     let mut isolated = request.isolated;
-    let mut inspect_dir = claude_config_dir(home, isolated);
+    let mut inspect_dir = claude_config_dir(home, isolated).map_err(RunError::ConfigDir)?;
     let mut launch_switches = launch_env_switches();
     launch_switches.extend(role_model_env_switches(RoleModelInputs {
         hosted: &hosted_models,
@@ -218,6 +220,7 @@ async fn run_command_from_home(
     }));
     let daemon_request = RequestSpec {
         env_name: &env_name,
+        env_flag: hosted.env.as_deref(),
         router_url: &router_url,
         auto_compact_window: auto_compact_window.as_deref(),
         refusal_recovery: &launch_switches,
@@ -238,7 +241,7 @@ async fn run_command_from_home(
             // which may already host a daemon for a different env. No further
             // isolated escape from here.
             isolated = true;
-            inspect_dir = claude_config_dir(home, true);
+            inspect_dir = claude_config_dir(home, true).map_err(RunError::ConfigDir)?;
             let isolated_preflight = LaunchPreflight {
                 home,
                 config_dir: &inspect_dir,
@@ -425,15 +428,16 @@ pub(crate) fn claude_agent_view_disabled() -> bool {
 
 /// Resolve the Claude Code config dir this run targets. In isolated mode that is
 /// Rayline's own dir (`~/.rayline/harness/claude-code`); otherwise it honors an externally
-/// set `CLAUDE_CONFIG_DIR`, falling back to the standard `~/.claude`.
-fn claude_config_dir(home: &Path, isolated: bool) -> PathBuf {
+/// set `CLAUDE_CONFIG_DIR` as given, as Claude Code does, else the standard
+/// `~/.claude`. An empty `CLAUDE_CONFIG_DIR` is an error naming it.
+fn claude_config_dir(home: &Path, isolated: bool) -> io::Result<PathBuf> {
     if isolated {
-        return isolated_cc_dir(home);
+        return Ok(isolated_cc_dir(home));
     }
-    env::var_os(CLAUDE_CONFIG_DIR_ENV)
-        .map(PathBuf::from)
-        .map(|path| expand_user_path(path, Some(home)))
-        .unwrap_or_else(|| home.join(".claude"))
+    Ok(
+        crate::harness::exported_dir(CLAUDE_CONFIG_DIR_ENV)?
+            .unwrap_or_else(|| home.join(".claude")),
+    )
 }
 
 /// The Claude config dir used by `--isolated`: `~/.rayline/harness/claude-code`.
@@ -478,7 +482,7 @@ const ISOLATED_SEED_FILES: [&str; 1] = ["settings.json"];
 /// to call on every run. The isolated profile needs no Claude login: the launch
 /// authenticates Claude Code through `ANTHROPIC_AUTH_TOKEN`.
 fn apply_isolated_config_dir(command: &mut Command, home: &Path) -> io::Result<()> {
-    let source_dir = claude_config_dir(home, false);
+    let source_dir = claude_config_dir(home, false)?;
     let isolated_dir = isolated_cc_dir(home);
     ensure_isolated_overlay(&source_dir, &isolated_dir)?;
     // `.claude.json` (global app state, project-trust, personal MCP) lives at
@@ -486,7 +490,7 @@ fn apply_isolated_config_dir(command: &mut Command, home: &Path) -> io::Result<(
     // profile from it so project-trust, MCP servers and settings carry over,
     // without the auth keys.
     seed_isolated_claude_json(
-        &global_claude_json_path(home),
+        &global_claude_json_path(home)?,
         &isolated_dir.join(".claude.json"),
     )?;
     command.env(CLAUDE_CONFIG_DIR_ENV, &isolated_dir);
@@ -496,11 +500,11 @@ fn apply_isolated_config_dir(command: &mut Command, home: &Path) -> io::Result<(
 /// Path of Claude Code's global `.claude.json` (app state, project-trust,
 /// personal MCP servers, OAuth). It lives inside `CLAUDE_CONFIG_DIR` when that
 /// is set, otherwise at `$HOME/.claude.json` (NOT inside `~/.claude`).
-fn global_claude_json_path(home: &Path) -> PathBuf {
-    match env::var_os(CLAUDE_CONFIG_DIR_ENV) {
-        Some(dir) => expand_user_path(PathBuf::from(dir), Some(home)).join(".claude.json"),
+fn global_claude_json_path(home: &Path) -> io::Result<PathBuf> {
+    Ok(match crate::harness::exported_dir(CLAUDE_CONFIG_DIR_ENV)? {
+        Some(dir) => dir.join(".claude.json"),
         None => home.join(".claude.json"),
-    }
+    })
 }
 
 /// Make `isolated_dir` a thin overlay on `shared_root` (the user's main Claude
@@ -758,19 +762,6 @@ fn set_user_private_permissions(path: &Path) -> io::Result<()> {
         restrict(parent, 0o700)?;
     }
     restrict(path, 0o600)
-}
-
-fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
-    let Some(raw) = path.to_str() else {
-        return path;
-    };
-    if raw == "~" {
-        return home.map_or(path, Path::to_path_buf);
-    }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        return home.map_or(path.clone(), |home| home.join(rest));
-    }
-    path
 }
 
 #[cfg(test)]
@@ -1033,6 +1024,7 @@ mod claude_command_tests {
             pid: 1,
             request: &RequestSpec {
                 env_name: "prod",
+                env_flag: None,
                 router_url: crate::ROUTER_PROD_URL,
                 auto_compact_window: None,
                 refusal_recovery: &[],

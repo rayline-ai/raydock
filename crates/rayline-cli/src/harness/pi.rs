@@ -13,9 +13,7 @@
 //! some turns from models whose thinking carries no Anthropic signature; as
 //! text, that reasoning would reach the next model as something the assistant
 //! said. As thinking, the router can recognise it and leave it out for a
-//! model that cannot verify it. It is on only for envs whose router does that
-//! (dev today): a router that forwards an unsigned thinking block to an
-//! Anthropic upstream gets the request rejected.
+//! model that cannot verify it. It is on for every environment.
 
 use serde_json::json;
 
@@ -23,22 +21,11 @@ use super::{Plan, RenderContext, json_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
 
-/// Envs whose router drops unsigned reasoning before an Anthropic Messages
-/// upstream. Elsewhere an unsigned thinking block would be forwarded as is and
-/// rejected, so the flag stays off.
-/// TODO: add "prod" once the prod router drops unsigned reasoning.
-const UNSIGNED_REASONING_ENVS: &[&str] = &["dev"];
-
-/// Whether `raydock pi` sets `compat.allowEmptySignature` for `env_name`.
-pub(crate) fn allow_empty_signature(env_name: &str) -> bool {
-    UNSIGNED_REASONING_ENVS.contains(&env_name)
-}
-
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
-    let mut compat = json!({ "sendSessionAffinityHeaders": true });
-    if ctx.allow_empty_signature {
-        compat["allowEmptySignature"] = json!(true);
-    }
+    let compat = json!({
+        "sendSessionAffinityHeaders": true,
+        "allowEmptySignature": true
+    });
     let launch = &ctx.models;
     let entries: Vec<_> = launch
         .offered
@@ -85,48 +72,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
 mod tests {
     use super::super::Harness;
     use super::super::tests::{TEST_URL, env_value, render};
-
-    fn render_models(dir: &std::path::Path, allow: bool) -> serde_json::Value {
-        let ctx = super::super::RenderContext {
-            key: super::super::tests::TEST_KEY,
-            router_url: TEST_URL,
-            config_dir: dir,
-            allow_empty_signature: allow,
-            capabilities: None,
-            harness_major_version: None,
-            models: super::super::tests::hosted_models(),
-        };
-        super::super::write_files(dir, &super::plan(&ctx).files).unwrap();
-        serde_json::from_str(&std::fs::read_to_string(dir.join("models.json")).unwrap()).unwrap()
-    }
-
-    #[test]
-    fn allow_empty_signature_follows_the_env() {
-        use super::allow_empty_signature;
-        assert!(allow_empty_signature("dev"));
-        assert!(!allow_empty_signature("prod"));
-        assert!(!allow_empty_signature("staging"));
-    }
-
-    #[test]
-    fn allow_empty_signature_is_rendered_only_when_on_and_rewritten_each_launch() {
-        let dir = super::super::tests::temp_dir("pi-sig");
-        let on = render_models(&dir, true);
-        assert_eq!(
-            on["providers"]["rayline"]["compat"]["allowEmptySignature"],
-            true
-        );
-        // The next launch (prod, or forced off) rewrites models.json without it.
-        let off = render_models(&dir, false);
-        let compat = &off["providers"]["rayline"]["compat"];
-        assert!(compat.get("allowEmptySignature").is_none(), "{compat}");
-        assert_eq!(compat["sendSessionAffinityHeaders"], true);
-        let on_again = render_models(&dir, true);
-        assert_eq!(
-            on_again["providers"]["rayline"]["compat"]["allowEmptySignature"],
-            true
-        );
-    }
 
     #[test]
     fn renders_models_and_default_settings() {

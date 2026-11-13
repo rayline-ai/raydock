@@ -305,7 +305,6 @@ mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            allow_empty_signature: false,
             capabilities: None,
             harness_major_version: Some(1),
             models: super::super::tests::hosted_models(),

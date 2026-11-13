@@ -270,7 +270,6 @@ mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            allow_empty_signature: true,
             capabilities: Some(&capabilities),
             harness_major_version: None,
             models: LaunchModels::hybrid(&capabilities),
