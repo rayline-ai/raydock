@@ -145,7 +145,6 @@ Its options are **kept for review** (section 9). The channel comes from `update.
 ```
 curl -fsSL https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.sh | sh -s -- --version 0.5.0 --install-dir ~/bin
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1))) -Version 0.5.0 -InstallDir C:\tools\rayline
-ayline
 ```
 
 The hidden `--base-url` option is in section 4.4.
