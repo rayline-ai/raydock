@@ -152,7 +152,7 @@ rayline local stop
 | Command | Does |
 |---|---|
 | `rayline local start [--config <file>]` | Starts the local process from the default config file, or from `<file>`. |
-| `rayline local status` | Shows whether the local process is running, its address and the config file it was started from. |
+| `rayline local status` | Shows whether the local process is running, its address, and the config file and environment it was started from. |
 | `rayline local stop` | Stops the local process. Your inference servers keep running. |
 | `rayline run <HARNESS> --local` | Runs the harness in local mode with `~/.config/rayline/settings.json`. Starts the local process if it isn't running. |
 | `rayline run <HARNESS> --config <file>` | Uses `<file>` instead of the default config, never merged with it. The run is in local mode if `<file>` has a `routing` section, and in cloud mode if it doesn't. |
@@ -213,6 +213,7 @@ The local process keeps its state in `~/.rayline/local/`:
 | `supervisor.json` | What is running. |
 | `runtime.lock` | The lock that keeps it to one local process. |
 | `runtime.log` | The local process's log. |
+| `harness/<name>/` | The files Rayline generates for each harness in local mode: `pi`, `hermes`, `omp`, `opencode` and `openclaw`. Cloud mode uses `~/.rayline/harness/<name>/` instead. |
 
 If a local-mode run fails, check `rayline local status` and
 `~/.rayline/local/runtime.log` first.

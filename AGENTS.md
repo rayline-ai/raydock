@@ -6,10 +6,12 @@ repo-specific.
 ## Crate Boundaries
 
 - `rayline-cli`: user commands and CLI UX.
-- `rayline-daemon`: the local hybrid gateway.
-- `rayline-local-router`: shared helpers for the hybrid gateway.
+- `rayline-daemon`: the local process, the execution core supervisor and
+  loopback gateway. It is a library; `raydock` runs it through its internal
+  entry point.
+- `rayline-local-router`: shared helpers for the local process's gateway.
 - `rayline-hf`, `rayline-tokencount`, `rayline-metrics`: model cache, token
-  counting and request metrics for hybrid mode.
+  counting and request metrics for local mode.
 
 Keep protocol and routing logic in shared crates. Do not duplicate it in CLI
 handlers. Prefer focused modules over growing the existing large CLI files.
@@ -30,7 +32,7 @@ handlers. Prefer focused modules over growing the existing large CLI files.
 
 ```bash
 cargo build --workspace --locked
-cargo build --release -p rayline-cli -p rayline-daemon --locked
+cargo build --release -p rayline-cli --locked
 cargo +1.88.0 fmt --all -- --check
 cargo +1.88.0 test --workspace --locked -- --test-threads=1
 cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings
@@ -48,7 +50,7 @@ relevant full gate before handoff.
   generated certs, private keys, or unsanitized logs.
 - Treat `rls_`, `rlr_`, `rlk-`, provider keys, `RAYLINE_ROUTER_API_KEY`, and
   Claude/Anthropic auth env vars as secrets.
-- Changes touching key storage, harness launch environments, hybrid routing,
+- Changes touching key storage, harness launch environments, local-mode routing,
   install/update scripts, release workflows, or auth storage need extra review.
 - Do not log full prompts or credentials in normal output, tests, or diagnostics.
 
