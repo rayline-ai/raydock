@@ -51,6 +51,12 @@ pub(crate) fn state_dir(home: &Path) -> PathBuf {
     home.join(crate::DOT_CONFIG_DIR).join("local")
 }
 
+/// `~/.rayline/local/harness/<name>/`, apart from cloud mode's folder because
+/// each mode writes its own endpoint, key and model list.
+fn harness_dir(home: &Path, harness: crate::harness::Harness) -> PathBuf {
+    state_dir(home).join("harness").join(harness.name())
+}
+
 /// What `supervisor.json` records about the running local process.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -866,7 +872,7 @@ fn harness_command(
             })?;
             let major_version = harness.major_version(&program).map_err(io::Error::other)?;
             let args = harness.hybrid_args(args, major_version);
-            let config_dir = crate::harness::config_dir(home, harness);
+            let config_dir = harness_dir(home, harness);
             private_dir(&config_dir)?;
             let ctx = crate::harness::RenderContext {
                 key: token,
@@ -1436,6 +1442,69 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Every file under `dir`, with its bytes.
+    fn files_under(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(files_under(&path));
+            } else {
+                files.insert(path.clone(), fs::read(&path).unwrap());
+            }
+        }
+        files
+    }
+
+    /// Each mode writes its own endpoint, key and model list (spec 8.2), so a
+    /// launch in one mode never rewrites what the other's harness reads.
+    #[test]
+    fn cloud_and_local_launches_write_apart() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _opencode = FakeOpenCode::install();
+        let capabilities = ModelCapabilities {
+            context_window: 16384,
+            max_output_tokens: 8192,
+            input_modalities: vec!["text".into()],
+        };
+        for harness in crate::harness::Harness::ALL {
+            let home = temp_dir(harness.name());
+            let cloud_dir = crate::harness::config_dir(&home, harness);
+            let local_dir = harness_dir(&home, harness);
+            assert!(
+                !cloud_dir.starts_with(&local_dir) && !local_dir.starts_with(&cloud_dir),
+                "{harness:?}"
+            );
+            let cloud = || {
+                let ctx = crate::harness::tests::render_context(&cloud_dir);
+                let plan = harness.plan(&ctx).unwrap();
+                crate::harness::write_files(&cloud_dir, &plan.files).unwrap();
+            };
+            let local = || {
+                harness_command(
+                    &home,
+                    harness.name(),
+                    &[],
+                    "http://127.0.0.1:1",
+                    "local-token",
+                    &capabilities,
+                )
+                .unwrap();
+            };
+            cloud();
+            let cloud_files = files_under(&cloud_dir);
+            local();
+            let local_files = files_under(&local_dir);
+            assert!(!local_files.is_empty(), "{harness:?}");
+            assert_eq!(files_under(&cloud_dir), cloud_files, "{harness:?}");
+            cloud();
+            assert_eq!(files_under(&local_dir), local_files, "{harness:?}");
+            fs::remove_dir_all(&home).unwrap();
+        }
+    }
+
     #[test]
     fn cloud_credentials_are_not_exported_to_harnesses() {
         for name in ["claude", "codex"] {
@@ -1482,8 +1551,7 @@ mod tests {
         assert_eq!(capabilities.context_window, 1_000_000);
         let _opencode = FakeOpenCode::install();
         let home = temp_dir("limits");
-        let read =
-            |relative: &str| fs::read_to_string(home.join(".rayline").join(relative)).unwrap();
+        let read = |relative: &str| fs::read_to_string(state_dir(&home).join(relative)).unwrap();
         for name in ["pi", "opencode", "omp", "hermes", "openclaw"] {
             harness_command(
                 &home,

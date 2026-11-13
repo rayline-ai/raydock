@@ -351,7 +351,9 @@ Only two files:
     supervisor.json             what is running
     runtime.lock                one local process at a time
     runtime.log                 its log
-  harness/<name>/               files Rayline generates per harness: pi, hermes, omp,
+    harness/<name>/             files Rayline generates per harness in local mode:
+                                pi, hermes, omp, opencode, openclaw
+  harness/<name>/               files Rayline generates per harness in cloud mode: pi, hermes, omp,
                                 opencode, openclaw, codex, codex-app,
                                 claude-desktop, claude-code (only with --isolated)
   harness/claude-code/daemon-launches.json
@@ -359,6 +361,8 @@ Only two files:
   harness/claude-desktop/claude-desktop.lock
                                 one claude-desktop command changing Desktop at a time
 ```
+
+Each mode has its own harness folder because each writes its own endpoint, key and model list there.
 
 Rayline writes nothing else under `~/.rayline` or `~/.config/rayline`. Outside them it writes only the harness's own files named in 9.4 and 9.5. Tests use a temporary home folder.
 

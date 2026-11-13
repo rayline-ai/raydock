@@ -538,7 +538,7 @@ fn opencode_args(args: &[OsString], major_version: u64) -> Vec<OsString> {
     launched
 }
 
-/// `~/.rayline/harness/<name>/`
+/// `~/.rayline/harness/<name>/`, cloud mode's harness folder.
 pub(crate) fn config_dir(home: &Path, harness: Harness) -> PathBuf {
     home.join(crate::DOT_CONFIG_DIR)
         .join("harness")
