@@ -21,7 +21,7 @@
 //!
 //! Neither provider sends the per-launch `x-conversation-id` unless
 //! `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` forces it, including under
-//! `raydock hybrid run`: Hermes sends a session key on both wires (the header
+//! `rayline run <harness> --local`: Hermes sends a session key on both wires (the header
 //! on Messages, `prompt_cache_key` on Responses), so the execution core's
 //! `session_identity_required` check is satisfied without a
 //! per-launch id. A per-launch id would instead put a subagent, the parent and
@@ -37,7 +37,7 @@
 //! refuses that call and Hermes reports the cap with no summary.
 //!
 //! The `rayline-resp` provider (`--provider rayline-resp`, the default under
-//! `raydock hybrid run`) speaks Responses and declares no header: Hermes sends
+//! `rayline run <harness> --local`) speaks Responses and declares no header: Hermes sends
 //! a `prompt_cache_key` there that is distinct per session and per delegate
 //! child, which the router's ladder and the hybrid core both read as the
 //! conversation, so each child lands in its own episode. A header would rank

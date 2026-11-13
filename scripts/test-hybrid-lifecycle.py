@@ -22,8 +22,15 @@ RLD = ROOT / "target/debug/rld"
 def main():
     with tempfile.TemporaryDirectory(prefix="rayline-hybrid-cli-") as tmp:
         root = Path(tmp)
-        state = root / "state"
+        # `rayline run <harness> --local` connects to the process in ~/.rayline/hybrid.
+        state = root / ".rayline" / "hybrid"
         env = dict(os.environ, HOME=str(root))
+        settings = root / ".config" / "rayline" / "settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"routing": {
+            "decisions_model": "arc-swift-1.0",
+            "classifier_model": "anthropic/claude-haiku-5.5",
+            "policy": {"preset": "arc-policy.hybrid-default.v1"}}}))
         env.pop("OPENCLAW_CONTAINER", None)
         installed = root / "installed"
         installed.mkdir()
@@ -47,6 +54,12 @@ def main():
             result = subprocess.run([str(installed / "rayline"), "hybrid", "--state-dir", str(state), *args],
                                     env=env, capture_output=True, text=True, timeout=75)
             assert (result.returncode == 0) == success, (args, result.stdout, result.stderr)
+            return result.stdout
+
+        def run(harness, *args, success=True):
+            result = subprocess.run([str(installed / "rayline"), "run", harness, "--local", *args],
+                                    env=env, capture_output=True, text=True, timeout=75)
+            assert (result.returncode == 0) == success, (harness, args, result.stdout, result.stderr)
             return result.stdout
 
         def start():
@@ -95,7 +108,7 @@ print('harness request reached execution core')
 """)
             harness.chmod(0o700)
             env["PATH"] = str(harness_dir) + os.pathsep + env["PATH"]
-            assert "harness request reached execution core" in cli("run", "claude", "--", "-p", "test")
+            assert "harness request reached execution core" in run("claude", "--", "-p", "test")
             event = json.loads((root / "events.jsonl").read_text().splitlines()[-1])
             assert event["path"] == "/v1/messages"
             assert sorted(event["credential_env_present"]) == sorted(credential_env)
@@ -114,8 +127,8 @@ assert provider['compat']['sendSessionAffinityHeaders'] is True
 print('qualified Pi profile loaded')
 """)
             pi.chmod(0o700)
-            assert "qualified Pi profile loaded" in cli("run", "pi", "--", "--no-session")
-            cli("run", "pi", "--", "--resume", success=False)
+            assert "qualified Pi profile loaded" in run("pi", "--", "--no-session")
+            run("pi", "--", "--resume", success=False)
             # Capture the actual spawned args: an agent must use the config in
             # this process, never an already-running OpenClaw Gateway.
             openclaw = harness_dir / "openclaw"
@@ -131,12 +144,12 @@ print(json.dumps(sys.argv[1:]))
                 (["agent", "--local", "-m", "hello"], ["agent", "--local", "-m", "hello"]),
                 (["agent", "exec", "-m", "hello"], ["agent", "exec", "-m", "hello"]),
             ]:
-                assert json.loads(cli("run", "openclaw", "--", *args)) == expected
+                assert json.loads(run("openclaw", "--", *args)) == expected
             for args in (["--container", "box", "agent", "-m", "hello"],
                          ["--container=box", "agent", "-m", "hello"]):
-                cli("run", "openclaw", "--", *args, success=False)
+                run("openclaw", "--", *args, success=False)
             env["OPENCLAW_CONTAINER"] = "box"
-            cli("run", "openclaw", "--", "agent", "-m", "hello", success=False)
+            run("openclaw", "--", "agent", "-m", "hello", success=False)
             env.pop("OPENCLAW_CONTAINER")
             request = urllib.request.Request(first["listen_url"] + "/unready", data=b"{}",
                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})

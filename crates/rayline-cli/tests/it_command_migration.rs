@@ -72,7 +72,7 @@ fn old_updater_landing_migrates_and_alias_preserves_output_arguments_and_status(
         assert_eq!(direct.stderr, alias.stderr);
     }
     let help = install.run("rayline", &["--help"]);
-    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: raydock"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: rayline"));
     fs::write(install.binary("rayline-core"), "installed execution core").expect("core marker");
     for name in ["rayline", "raydock"] {
         let check = install.run(

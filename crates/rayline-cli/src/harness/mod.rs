@@ -1,8 +1,8 @@
-//! `raydock opencode|pi|omp|hermes|openclaw`: launch a third-party coding harness
+//! `rayline run opencode|pi|omp|hermes|openclaw`: launch a third-party coding harness
 //! against the hosted Rayline router.
 //!
 //! Each launcher resolves the environment's router URL and `rlk-` key the same
-//! way `raydock claude` does, writes a Rayline-owned config under
+//! way `rayline run claude` does, writes a Rayline-owned config under
 //! `~/.rayline/harness/<name>/`, points the harness at it through
 //! the harness's own config env var, and execs the harness with the remaining
 //! args. The key lives only in that config (0600, in a 0700 dir), never in the
@@ -20,7 +20,7 @@
 //! listed ARC Sage (`product: arc-sage-1.0`) and, where the harness has a
 //! separate small/background model role, that role to the listed ARC Swift
 //! (`product: arc-swift-1.0`), so a contributor or ZDR key gets its own ids.
-//! Under `raydock hybrid run` every renderer keeps `rayline-auto` (the execution
+//! Under `rayline run <harness> --local` every renderer keeps `rayline-auto` (the execution
 //! core's virtual model) and advertises the hybrid runtime's admitted limits
 //! instead ([`RenderContext::capabilities`]): a harness that asks for more
 //! output than the execution core admits has every turn refused.
@@ -51,7 +51,7 @@
 //! parent's episode where the harness attaches the header to every request of
 //! the process. The native compat flags and config keys stay on either way;
 //! the gateway ranks `x-conversation-id` first when both arrive. The override
-//! applies to `raydock hybrid run` too, so forcing it there accepts the same
+//! applies to `rayline run <harness> --local` too, so forcing it there accepts the same
 //! episode collapse rather than silently doing nothing on that path; either
 //! path exports [`CONV_ID_ENV`] only when a rendered config references it
 //! ([`conversation_id_for`]).
@@ -83,7 +83,7 @@ pub const CONV_HEADER: &str = "x-conversation-id";
 /// this name on their own; Hermes needs the name written into its config
 /// ([`hermes::SESSION_AFFINITY_KEY`]).
 pub const SESSION_AFFINITY_HEADER: &str = "x-session-affinity";
-/// The execution core's virtual model under `raydock hybrid run`.
+/// The execution core's virtual model under `rayline run <harness> --local`.
 pub const ROUTER_MODEL: &str = crate::VIRTUAL_ROUTER_MODEL;
 
 /// A model's price in USD per million tokens, from the router's
@@ -182,7 +182,7 @@ impl LaunchModels {
         })
     }
 
-    /// `raydock hybrid run`: the execution core serves one virtual model, at
+    /// `rayline run <harness> --local`: the execution core serves one virtual model, at
     /// the limits the hybrid runtime admits.
     pub(crate) fn hybrid(capabilities: &rayline_local_router::ModelCapabilities) -> Self {
         Self {
@@ -337,7 +337,7 @@ impl Harness {
             .find(|harness| harness.name() == command)
     }
 
-    /// The `rayline <name>` subcommand and the config directory name.
+    /// The `rayline run <name>` harness name and the config directory name.
     pub fn name(self) -> &'static str {
         match self {
             Self::OpenCode => "opencode",
@@ -407,8 +407,8 @@ impl Harness {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
     pub harness: Harness,
-    pub env_name: Option<String>,
-    pub root_env_explicit: bool,
+    /// The hosted environment the loaded config selects.
+    pub hosted: crate::status::HostedEnvironment,
     /// Args passed through to the harness unchanged.
     pub args: Vec<OsString>,
 }
@@ -426,14 +426,14 @@ pub(crate) struct RenderContext<'a> {
     /// pi only: whether to set `compat.allowEmptySignature`
     /// ([`pi::allow_empty_signature`]).
     pub allow_empty_signature: bool,
-    /// The limits `raydock hybrid run` admits (context window the harness may
+    /// The limits `rayline run <harness> --local` admits (context window the harness may
     /// budget against, the core's output cap, input modalities). `None`: the
     /// hosted router's defaults.
     pub capabilities: Option<&'a rayline_local_router::ModelCapabilities>,
     /// The installed harness's major version ([`Harness::major_version`]).
     pub harness_major_version: Option<u64>,
     /// The models this launch selects and offers: the router's listing for a
-    /// hosted launch, [`LaunchModels::hybrid`] under `raydock hybrid run`.
+    /// hosted launch, [`LaunchModels::hybrid`] under `rayline run <harness> --local`.
     pub models: LaunchModels,
 }
 
@@ -514,14 +514,13 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    // Same env -> router URL resolution as `raydock claude`: built-in prod, or
+    // Same env -> router URL resolution as `rayline run claude`: built-in prod, or
     // settings.json `environments.<env>.base_url` for `--env`.
-    let hosted = crate::status::resolve_hosted_environment(request.env_name.as_deref(), &home)
-        .map_err(|error| error.to_string())?;
+    let hosted = &request.hosted;
     let env_name = hosted.name().to_owned();
     let router_url = normalize_router_url(&hosted.base_url);
-    // The stored `rlk-` key, signing in first when signed out, like `raydock claude`.
-    let key = crate::status::router_key(&hosted, &home)
+    // The stored `rlk-` key, signing in first when signed out, like `rayline run claude`.
+    let key = crate::status::router_key(hosted, &home)
         .await
         .map_err(|error| error.to_string())?;
 

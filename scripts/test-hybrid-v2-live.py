@@ -92,7 +92,15 @@ def main():
     os.environ.setdefault("RAYLINE_ROUTER_API_KEY", os.environ["RAYLINE_DEV_KEY"])
     args.output_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     output = args.output_dir.resolve()
-    state, home, work = output / "state", output / "home", output / "work"
+    home, work = output / "home", output / "work"
+    state = home / ".rayline" / "hybrid"
+    # `rayline run pi --config <file>` reads this file; its `routing` puts the
+    # run in local mode, which connects to <home>/.rayline/hybrid.
+    routing_file = output / "routing.json"
+    routing_file.write_text(json.dumps({"routing": {
+        "decisions_model": "arc-swift-1.0",
+        "classifier_model": "anthropic/claude-haiku-5.5",
+        "policy": {"preset": "arc-policy.hybrid-default.v1"}}}))
     for path in (home, work):
         path.mkdir(mode=0o700)
     if args.profile:
@@ -172,7 +180,7 @@ def main():
         started = True
         log = state / "runtime.log"
         with (output / "pi.jsonl").open("w") as stdout, (output / "pi.stderr").open("w") as stderr:
-            process = subprocess.Popen(cli + ["run", "pi", "--", "--provider", "rayline", "--model", "rayline-auto",
+            process = subprocess.Popen([str(args.rayline.resolve()), "run", "pi", "--config", str(routing_file), "--", "--provider", "rayline", "--model", "rayline-auto",
                                               "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates",
                                               "--no-context-files", "--tools", tools, "--thinking", "off", "--mode", "json", "--print", *prompts],
                                        env=env, cwd=work, stdout=stdout, stderr=stderr, start_new_session=True)

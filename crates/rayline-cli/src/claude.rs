@@ -46,7 +46,8 @@ pub(crate) const RAYLINE_ENV_NAME_ENV: &str = "RAYLINE_ENV_NAME";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
-    pub env_name: Option<String>,
+    /// The hosted environment the loaded config selects.
+    pub hosted: crate::status::HostedEnvironment,
     pub args: Vec<OsString>,
     /// Run against an isolated Claude config dir (`~/.rayline/harness/claude-code`) so this
     /// session can start its own background-agents supervisor alongside a
@@ -57,7 +58,6 @@ pub struct RunRequest {
     /// mirrored from the selected source profile without its auth keys, and
     /// daemon/runtime state stays local so two live supervisors never collide.
     pub isolated: bool,
-    pub root_env_explicit: bool,
 }
 
 /// What decides the subagent and background models of a launch
@@ -114,7 +114,7 @@ fn role_model_env_switches(
 
 /// The model a Claude Code argument list selects with `--model X` or
 /// `--model=X` (the last one wins), up to Claude Code's own `--` separator.
-/// `raydock claude -- --model X` forwards the flag to Claude Code, which makes
+/// `rayline run claude -- --model X` forwards the flag to Claude Code, which makes
 /// it the user's choice.
 fn forwarded_model_arg(args: &[OsString]) -> Option<String> {
     let mut found = None;
@@ -132,19 +132,12 @@ fn forwarded_model_arg(args: &[OsString]) -> Option<String> {
     found.filter(|model| !model.trim().is_empty())
 }
 
-impl RunRequest {
-    pub fn should_forward_for_invalid_envvar(&self) -> bool {
-        crate::status::should_forward_for_invalid_envvar(self.root_env_explicit)
-    }
-}
-
 #[derive(Debug)]
 pub enum RunError {
     ClaudeMissing,
     HomeNotFound,
     DaemonConflict(String),
     Router(String),
-    HostedEnvironment(String),
     Auth(crate::status::AuthError),
     IsolatedProfile(io::Error),
 }
@@ -158,7 +151,6 @@ impl std::fmt::Display for RunError {
             Self::HomeNotFound => formatter.write_str("home directory not found"),
             Self::DaemonConflict(message) => formatter.write_str(message),
             Self::Router(message) => formatter.write_str(message),
-            Self::HostedEnvironment(message) => formatter.write_str(message),
             Self::Auth(error) => error.fmt(formatter),
             Self::IsolatedProfile(error) => {
                 write!(formatter, "failed to prepare the isolated Claude profile: {error}")
@@ -204,11 +196,10 @@ async fn run_command_from_home(
     home: &Path,
     claude_bin: PathBuf,
 ) -> Result<Command, RunError> {
-    let hosted = crate::status::resolve_hosted_environment(request.env_name.as_deref(), home)
-        .map_err(|error| RunError::HostedEnvironment(error.to_string()))?;
+    let hosted = &request.hosted;
     let env_name = hosted.name().to_owned();
     let router_url = hosted.base_url.clone();
-    let key = crate::status::router_key(&hosted, home).await?;
+    let key = crate::status::router_key(hosted, home).await?;
 
     // The main model the user chose. Claude Code's own `--model` (after `--`)
     // wins over `ANTHROPIC_MODEL`.
@@ -925,24 +916,16 @@ mod refusal_recovery_env_tests {
         let home =
             std::env::temp_dir().join(format!("rayline-cli-refusal-launch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
-        let config_dir = home.join(".config").join(crate::CONFIG_DIR);
-        std::fs::create_dir_all(&config_dir).unwrap();
         crate::credentials::save_test_router_key(&home, Some("stub"), "rlk-test");
         let router_url = listing_stub().await;
-        std::fs::write(
-            config_dir.join("settings.json"),
-            serde_json::json!({"environments": {"stub": {
-                "base_url": router_url,
-                "login_url": "http://127.0.0.1:9/cli-auth"
-            }}})
-            .to_string(),
-        )
-        .unwrap();
         let request = RunRequest {
-            env_name: Some("stub".to_owned()),
+            hosted: crate::status::HostedEnvironment {
+                env: Some("stub".to_owned()),
+                base_url: router_url.clone(),
+                login_url: "http://127.0.0.1:9/cli-auth".to_owned(),
+            },
             args: Vec::new(),
             isolated: false,
-            root_env_explicit: true,
         };
         let saved: Vec<_> = [
             FALLBACK,
@@ -1518,7 +1501,7 @@ mod arc_default_tests {
         )
     }
 
-    // `raydock claude`: ARC Swift for every subagent (Explore and Plan
+    // `rayline run claude`: ARC Swift for every subagent (Explore and Plan
     // included, hence the force) and background task.
     #[test]
     fn default_launch_puts_subagents_and_background_on_arc_swift() {

@@ -511,15 +511,18 @@ fn format_daemon_conflict_error(
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let rerun = format!("{} {env_flag}claude {arg_str}", crate::CLI_BIN)
+    let rerun = format!("{} {env_flag}run claude {arg_str}", crate::CLI_BIN)
         .trim_end()
         .to_owned();
     // When isolation is available, surface it as a third path that keeps the
     // other daemon running instead of stopping it.
     let isolated_alt = if allow_isolated {
-        let rerun_isolated = format!("{} {env_flag}claude --isolated {arg_str}", crate::CLI_BIN)
-            .trim_end()
-            .to_owned();
+        let rerun_isolated = format!(
+            "{} {env_flag}run claude --isolated {arg_str}",
+            crate::CLI_BIN
+        )
+        .trim_end()
+        .to_owned();
         format!(
             "\n\nOr run alongside it in an isolated config dir (~/{}/harness/claude-code):\n  {rerun_isolated}",
             crate::DOT_CONFIG_DIR
@@ -537,7 +540,7 @@ fn format_daemon_conflict_error(
             )
         }
         DaemonOwner::NonRayline => format!(
-            "A non-{} Claude Code daemon is running (PID {}).\n\n{} claude needs to start a daemon configured for the\n{} router, but cannot do so while another daemon is active.\nThe current daemon's API calls go directly to Anthropic, not the\n{} router.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
+            "A non-{} Claude Code daemon is running (PID {}).\n\n`{} run claude` needs to start a daemon configured for the\n{} router, but cannot do so while another daemon is active.\nThe current daemon's API calls go directly to Anthropic, not the\n{} router.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
             crate::DISPLAY_NAME,
             state.pid,
             crate::CLI_BIN,
@@ -545,7 +548,7 @@ fn format_daemon_conflict_error(
             crate::DISPLAY_NAME
         ),
         DaemonOwner::Unverified => format!(
-            "A Claude Code daemon is running (PID {}), but {} could not verify that it matches this launch.\n\n{} claude needs to start or reuse a daemon configured for the\n{} router, but cannot do so while an unverified daemon is active.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
+            "A Claude Code daemon is running (PID {}), but {} could not verify that it matches this launch.\n\n`{} run claude` needs to start or reuse a daemon configured for the\n{} router, but cannot do so while an unverified daemon is active.\n\nTo switch:\n  1. Stop the current daemon:   {STOP_COMMAND}\n  2. Re-run:                    {rerun}{isolated_alt}",
             state.pid,
             crate::DISPLAY_NAME,
             crate::CLI_BIN,

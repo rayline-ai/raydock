@@ -24,26 +24,26 @@ pub(crate) const PROD_ENV: &str = "prod";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatusRequest {
-    pub env_name: Option<String>,
-    pub root_env_explicit: bool,
+    /// The hosted environment the loaded config selects.
+    pub hosted: HostedEnvironment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthTokenRequest {
-    pub env_name: Option<String>,
-    pub root_env_explicit: bool,
+    /// The hosted environment the loaded config selects.
+    pub hosted: HostedEnvironment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthLogoutRequest {
-    pub env_name: Option<String>,
-    pub root_env_explicit: bool,
+    /// The hosted environment the loaded config selects.
+    pub hosted: HostedEnvironment,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthLoginRequest {
-    pub env_name: Option<String>,
-    pub root_env_explicit: bool,
+    /// The hosted environment the loaded config selects.
+    pub hosted: HostedEnvironment,
     pub no_browser: bool,
     pub paste: bool,
 }
@@ -73,7 +73,7 @@ pub enum AuthError {
 /// A hosted Rayline environment. `env` is `None` for the built-in prod, or
 /// the `--env` name whose `environments.<name>` entry the config holds.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct HostedEnvironment {
+pub struct HostedEnvironment {
     pub env: Option<String>,
     pub base_url: String,
     pub login_url: String,
@@ -113,29 +113,7 @@ impl From<CredentialsError> for AuthError {
     }
 }
 
-impl StatusRequest {
-    pub fn should_forward_for_invalid_envvar(&self) -> bool {
-        should_forward_for_invalid_envvar(self.root_env_explicit)
-    }
-}
-
-impl AuthTokenRequest {
-    pub fn should_forward_for_invalid_envvar(&self) -> bool {
-        should_forward_for_invalid_envvar(self.root_env_explicit)
-    }
-}
-
-impl AuthLogoutRequest {
-    pub fn should_forward_for_invalid_envvar(&self) -> bool {
-        should_forward_for_invalid_envvar(self.root_env_explicit)
-    }
-}
-
 impl AuthLoginRequest {
-    pub fn should_forward_for_invalid_envvar(&self) -> bool {
-        should_forward_for_invalid_envvar(self.root_env_explicit)
-    }
-
     fn flow(&self) -> LoginFlow {
         if self.paste {
             LoginFlow::Paste
@@ -173,8 +151,8 @@ fn home_dir() -> Result<PathBuf, AuthError> {
 
 pub(crate) fn render_status(request: &StatusRequest) -> Result<String, AuthError> {
     let home = home_dir()?;
-    let hosted = resolve_hosted_environment(request.env_name.as_deref(), &home)?;
-    render_status_from_home(&hosted, &home, unix_now())
+    let hosted = &request.hosted;
+    render_status_from_home(hosted, &home, unix_now())
 }
 
 fn render_status_from_home(
@@ -225,8 +203,8 @@ fn render_status_from_home(
 /// within the refresh margin. A signed-out slot is an error.
 pub(crate) async fn auth_token(request: &AuthTokenRequest) -> Result<String, AuthError> {
     let home = home_dir()?;
-    let hosted = resolve_hosted_environment(request.env_name.as_deref(), &home)?;
-    access_token(&hosted, &home)
+    let hosted = &request.hosted;
+    access_token(hosted, &home)
         .await?
         .ok_or_else(|| AuthError::SignedOut(hosted.name().to_owned()))
 }
@@ -313,8 +291,8 @@ pub(crate) fn stored_router_key(
 
 pub async fn logout(request: &AuthLogoutRequest) -> Result<String, AuthError> {
     let home = home_dir()?;
-    let hosted = resolve_hosted_environment(request.env_name.as_deref(), &home)?;
-    logout_from_home(&hosted, &home).await
+    let hosted = &request.hosted;
+    logout_from_home(hosted, &home).await
 }
 
 async fn logout_from_home(hosted: &HostedEnvironment, home: &Path) -> Result<String, AuthError> {
@@ -335,8 +313,8 @@ async fn logout_from_home(hosted: &HostedEnvironment, home: &Path) -> Result<Str
 
 pub async fn auth_login(request: &AuthLoginRequest) -> Result<String, AuthError> {
     let home = home_dir()?;
-    let hosted = resolve_hosted_environment(request.env_name.as_deref(), &home)?;
-    login(&hosted, &home, request.flow()).await
+    let hosted = &request.hosted;
+    login(hosted, &home, request.flow()).await
 }
 
 async fn login(
@@ -672,29 +650,14 @@ fn auth_http_client() -> Result<reqwest::Client, reqwest::Error> {
         .build()
 }
 
-pub(crate) fn should_forward_for_invalid_envvar(_root_env_explicit: bool) -> bool {
-    false
-}
-
-/// The environment `--env` selects: `None` is the built-in prod, a name is
-/// the config's `environments.<name>` entry. The whole settings file is loaded
-/// and validated, so any load error stops the command.
-pub(crate) fn resolve_hosted_environment(
-    env: Option<&str>,
-    home: &Path,
-) -> Result<HostedEnvironment, ConfigError> {
-    let settings = config::load_in(
-        home,
-        &config::LoadOptions {
-            mode: config::Mode::Cloud,
-            env,
-            harness_protocol: None,
-        },
-    )?;
-    Ok(match &settings.env {
+/// The environment the loaded config selects: the built-in prod without
+/// `--env`, else the config's `environments.<name>` entry, which the load
+/// checked exists.
+pub(crate) fn hosted_environment(settings: &config::Settings) -> HostedEnvironment {
+    match &settings.env {
         None => prod_hosted_environment(),
         Some(name) => configured_hosted_environment(name, &settings.environments[name]),
-    })
+    }
 }
 
 /// Every hosted environment: the built-in prod, then each `environments`
@@ -1536,6 +1499,19 @@ mod tests {
         ]
     }
 
+    /// The environment a startup load with `--env env` selects.
+    fn resolve(env: Option<&str>, home: &Path) -> Result<HostedEnvironment, ConfigError> {
+        config::load_in(
+            home,
+            &config::LoadOptions {
+                mode: config::Mode::Cloud,
+                env,
+                harness_protocol: None,
+            },
+        )
+        .map(|settings| hosted_environment(&settings))
+    }
+
     #[test]
     fn no_env_is_the_built_in_prod() {
         let home = temp_home("resolve-prod");
@@ -1547,7 +1523,7 @@ mod tests {
                 "login_url": "https://other.example.test/cli-auth"
             }}}),
         );
-        let prod = resolve_hosted_environment(None, &home).unwrap();
+        let prod = resolve(None, &home).unwrap();
         assert_eq!(
             prod,
             HostedEnvironment {
@@ -1558,7 +1534,7 @@ mod tests {
         );
         assert_eq!((prod.name(), prod.slot()), ("prod", None));
 
-        let explicit = resolve_hosted_environment(Some("prod"), &home).unwrap();
+        let explicit = resolve(Some("prod"), &home).unwrap();
         assert_eq!(explicit.base_url, "https://other.example.test");
         assert_eq!((explicit.name(), explicit.slot()), ("prod", Some("prod")));
         let _ = fs::remove_dir_all(&home);
@@ -1574,7 +1550,7 @@ mod tests {
                 "login_url": "https://dev.example.test/cli-auth"
             }}}),
         );
-        let dev = resolve_hosted_environment(Some("dev"), &home).unwrap();
+        let dev = resolve(Some("dev"), &home).unwrap();
         assert_eq!(
             dev,
             HostedEnvironment {
@@ -1590,7 +1566,7 @@ mod tests {
     #[test]
     fn a_wrong_settings_file_is_a_load_error_for_every_env() {
         let home = temp_home("resolve-errors");
-        let key_error = |env: Option<&str>| match resolve_hosted_environment(env, &home) {
+        let key_error = |env: Option<&str>| match resolve(env, &home) {
             Err(ConfigError::Key { key, .. }) => key,
             other => panic!("{other:?}"),
         };
@@ -1610,7 +1586,7 @@ mod tests {
         assert_eq!(key_error(None), "default_model");
 
         fs::write(settings_file(&home), "{\"secret-value\"").unwrap();
-        let error = resolve_hosted_environment(None, &home).unwrap_err();
+        let error = resolve(None, &home).unwrap_err();
         assert!(matches!(error, ConfigError::Parse { .. }), "{error:?}");
         assert!(!error.to_string().contains("secret-value"), "{error}");
         let _ = fs::remove_dir_all(&home);
@@ -1931,8 +1907,7 @@ mod tests {
     #[test]
     fn paste_wins_over_no_browser() {
         let request = |no_browser, paste| AuthLoginRequest {
-            env_name: None,
-            root_env_explicit: false,
+            hosted: hosted(None, UNREACHABLE),
             no_browser,
             paste,
         };

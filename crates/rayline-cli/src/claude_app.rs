@@ -1,4 +1,4 @@
-//! `raydock claude-desktop`: Claude Code inside the Claude desktop app.
+//! `rayline run claude-desktop`: Claude Code inside the Claude desktop app.
 //!
 //! Claude Desktop runs on the shared local process, which is not available
 //! yet, so `start`, `status`, `validate`, `stop`, `install-service` and
@@ -169,7 +169,7 @@ fn run_inner(request: &AppRequest) -> Result<String, String> {
         AppAction::Uninstall => return uninstall(),
     };
     Err(format!(
-        "`raydock claude-desktop {unavailable}` is not available yet"
+        "`rayline run claude-desktop {unavailable}` is not available yet"
     ))
 }
 
@@ -254,7 +254,7 @@ mod tests {
             let error = run_inner(&AppRequest { action }).unwrap_err();
             assert_eq!(
                 error,
-                format!("`raydock claude-desktop {name}` is not available yet")
+                format!("`rayline run claude-desktop {name}` is not available yet")
             );
         }
     }

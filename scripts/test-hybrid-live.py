@@ -190,8 +190,17 @@ def main():
     assert {deployment["kind"] for deployment in config["deployments"]} >= {"local", "cloud"}
     args.output_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
     output = args.output_dir.resolve()
-    state, home = output / "state", output / "home"
+    home = output / "home"
+    state = home / ".rayline" / "hybrid"
     home.mkdir(mode=0o700)
+    # `rayline run pi --local` needs `routing` in the settings file and connects
+    # to the process in <home>/.rayline/hybrid.
+    settings = home / ".config" / "rayline" / "settings.json"
+    settings.parent.mkdir(parents=True, mode=0o700)
+    settings.write_text(json.dumps({"routing": {
+        "decisions_model": "arc-swift-1.0",
+        "classifier_model": "anthropic/claude-haiku-5.5",
+        "policy": {"preset": "arc-policy.hybrid-default.v1"}}}))
     env = dict(os.environ, HOME=str(home), PI_TELEMETRY="0", PI_OFFLINE="1")
     cli = [str(args.rayline.resolve()), "hybrid", "--state-dir", str(state)]
     log = state / "runtime.log"
@@ -229,7 +238,7 @@ def main():
             report["tasks"].append(task_report)
             stdout_path, stderr_path = output / f"{name}-pi.jsonl", output / f"{name}-pi.stderr"
             with stdout_path.open("w") as stdout, stderr_path.open("w") as stderr:
-                process = subprocess.Popen(cli + ["run", "pi", "--", "--provider", "rayline", "--model", "rayline-auto",
+                process = subprocess.Popen([str(args.rayline.resolve()), "run", "pi", "--local", "--", "--provider", "rayline", "--model", "rayline-auto",
                     "--no-session", "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
                     "--tools", "read,write,edit,bash", "--thinking", "off", "--mode", "json", "--print", prompt],
                     env=env, cwd=cwd, stdout=stdout, stderr=stderr, start_new_session=True)

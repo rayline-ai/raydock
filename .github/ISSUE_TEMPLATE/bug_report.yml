@@ -102,7 +102,7 @@ body:
     id: logs
     attributes:
       label: Logs or diagnostics
-      description: Paste sanitized output from `raydock status`, the failing command, or relevant `~/.rayline/hybrid/` log snippets.
+      description: Paste sanitized output from `rayline auth status`, the failing command, or relevant `~/.rayline/hybrid/` log snippets.
       render: text
   - type: textarea
     id: config

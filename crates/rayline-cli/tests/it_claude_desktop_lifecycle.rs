@@ -29,7 +29,7 @@ impl Home {
             .env_clear()
             .env("HOME", &self.0)
             .env("PATH", "/usr/bin:/bin")
-            .args(["claude-desktop", action])
+            .args(["run", "claude-desktop", action])
             .output()
             .expect("run CLI")
     }
@@ -55,7 +55,7 @@ fn local_process_commands_are_not_available_yet() {
         assert!(!output.status.success(), "{action} succeeded");
         assert!(
             String::from_utf8_lossy(&output.stderr).contains(&format!(
-                "`raydock claude-desktop {action}` is not available yet"
+                "`rayline run claude-desktop {action}` is not available yet"
             )),
             "{action} failed for the wrong reason: {}",
             String::from_utf8_lossy(&output.stderr)

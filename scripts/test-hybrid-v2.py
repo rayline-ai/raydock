@@ -157,7 +157,14 @@ def main():
     external = f"http://127.0.0.1:{server.server_port}"
     with tempfile.TemporaryDirectory(prefix="rayline-v2-") as tmp:
         root = Path(tmp)
-        state = root / "state"
+        state = root / ".rayline" / "hybrid"
+        # `rayline run <harness> --config <file>` reads this file; its `routing`
+        # puts the run in local mode, which connects to ~/.rayline/hybrid.
+        routing_file = root / "routing.json"
+        routing_file.write_text(json.dumps({"routing": {
+            "decisions_model": "arc-swift-1.0",
+            "classifier_model": "anthropic/claude-haiku-5.5",
+            "policy": {"preset": "arc-policy.hybrid-default.v1"}}}))
         package = root / "synthetic-package.json"
         package.write_bytes(package_bytes)
         # v2 profile with no policy: Raydock must supply the preset.
@@ -197,6 +204,13 @@ def main():
                 (state / "runtime.log").read_text() if (state / "runtime.log").exists() else "")
             return result.stdout
 
+        def run(harness, *parts):
+            result = subprocess.run([str(args.rayline.resolve()), "run", harness, "--config", str(routing_file), *parts],
+                                    env=env, cwd=root, capture_output=True, text=True, timeout=180)
+            assert result.returncode == 0, (result.stdout, result.stderr,
+                (state / "runtime.log").read_text() if (state / "runtime.log").exists() else "")
+            return result.stdout
+
         started = cli("start", "--core", str(args.core.resolve()), "--config", str(config_path), "--port", "0")
         try:
             assert f"Routing policy: {PRESET} (settings hybrid.routing)" in started, started
@@ -213,7 +227,7 @@ def main():
             pi_dir.mkdir(parents=True, mode=0o700)
             (pi_dir / "settings.json").write_text(json.dumps({"defaultProvider": "rayline", "defaultModel": "rayline-auto",
                                                                "compaction": {"keepRecentTokens": 4000}}))
-            output = cli("run", "pi", "--", "--provider", "rayline", "--model", "rayline-auto", "--no-session",
+            output = run("pi", "--", "--provider", "rayline", "--model", "rayline-auto", "--no-session",
                          "--offline", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files",
                          "--tools", "read", "--thinking", "off", "--print",
                          f"Read {sample} three times, then reply with Synthetic execution complete.")
