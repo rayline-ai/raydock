@@ -169,7 +169,7 @@ const FACTS_FILE: &str = "facts.json";
 /// Rayline CLI's record, in its Hermes home, of the Hermes launcher that last
 /// started there and the environments the home held then (see
 /// [`prepare_home`]).
-const READY_MARKER: &str = ".raydock-hermes-ready";
+const READY_MARKER: &str = ".rayline-hermes-ready";
 /// What Hermes tells the user to run when its home has no environment.
 const REPAIR_COMMAND: &str = "hermes pm repair";
 /// The most lines of a failed repair's output repeated in the error.

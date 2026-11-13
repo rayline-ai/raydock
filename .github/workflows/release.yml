@@ -256,7 +256,7 @@ jobs:
           Rayline CLI ${version}
 
           Assets:
-          - \`rayline-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts. Asset names remain stable for existing updaters.
+          - \`rayline-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts.
           - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain \`rayline\`, \`rayline-core\`, source provenance and license/readme files.
           - \`SHA256SUMS\` covers every uploaded binary, archive and provenance file.
           - \`SHA256SUMS.minisig\` is the minisign signature over \`SHA256SUMS\`.

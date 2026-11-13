@@ -124,7 +124,7 @@ mod tests {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
-    const HELPER_ENV: &str = "RAYDOCK_TEST_DETACH_HELPER";
+    const HELPER_ENV: &str = "RAYLINE_TEST_DETACH_HELPER";
 
     /// Run by `detached_child_does_not_hold_the_callers_stdout`, in a child
     /// test process whose stdout is a pipe: starts a long-lived detached

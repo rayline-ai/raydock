@@ -386,7 +386,7 @@ Set by one Rayline process and read only by a child it starts. Never read from t
 
 ### 7.5 Test builds only
 
-`RAYDOCK_TEST_DETACH_HELPER`. Compiled only into test builds, not into the shipped binary.
+`RAYLINE_TEST_DETACH_HELPER`. Compiled only into test builds, not into the shipped binary.
 
 Every other env var Rayline reads today is gone (section 10).
 
