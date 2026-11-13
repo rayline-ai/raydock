@@ -26,13 +26,29 @@ pub(crate) struct Snapshot {
 /// Hugging Face cache at `hub`. When the Hub does not answer or a file fails
 /// to download, the last complete snapshot is used instead.
 pub(crate) fn fetch(hub: &Path, repo: &str) -> Result<Snapshot, String> {
-    let (commit, cached_commit) = match rayline_hf::hf_api_get_commit(repo) {
+    fetch_with(
+        hub,
+        repo,
+        rayline_hf::hf_api_get_commit(repo),
+        |file, commit| rayline_hf::download_to_hf_cache(hub, repo, file, commit).map(drop),
+    )
+}
+
+/// [`fetch`], given the Hub's answer for the repo's current commit and a
+/// `download` of one file at a commit into `hub`.
+fn fetch_with(
+    hub: &Path,
+    repo: &str,
+    current_commit: Result<String, String>,
+    download: impl Fn(&str, &str) -> Result<(), String>,
+) -> Result<Snapshot, String> {
+    let (commit, cached_commit) = match current_commit {
         Ok(commit) => (commit, false),
         Err(error) => (cached_commit(hub, repo)?.ok_or(error)?, true),
     };
     // Complete only when every optional file is cached or confirmed absent
     // (404); a rate limit or network failure leaves the snapshot unrecorded.
-    let mut complete = true;
+    let mut failed = None;
     for (file, required) in REQUIRED
         .iter()
         .map(|file| (file, true))
@@ -41,14 +57,18 @@ pub(crate) fn fetch(hub: &Path, repo: &str) -> Result<Snapshot, String> {
         if rayline_hf::cached_hf_file(hub, repo, file, &commit).is_some() {
             continue;
         }
-        if let Err(error) = rayline_hf::download_to_hf_cache(hub, repo, file, &commit) {
+        if let Err(error) = download(file, &commit) {
             if required {
                 return cached_or(hub, repo, format!("download {file} from {repo}: {error}"));
             }
             if !is_absent(&error) {
-                complete = false;
+                failed.get_or_insert(format!("download {file} from {repo}: {error}"));
             }
         }
+    }
+    if let Some(error) = failed {
+        // A partial snapshot could miscount; use the last complete one.
+        return cached_or(hub, repo, error);
     }
     let dir = rayline_hf::hf_cache_snapshot_path(hub, repo, "", &commit);
     let has_template = [
@@ -57,16 +77,9 @@ pub(crate) fn fetch(hub: &Path, repo: &str) -> Result<Snapshot, String> {
     ]
     .iter()
     .any(|file| dir.join(file).is_file());
+    // Every candidate was fetched or confirmed absent.
     if !has_template {
         return Err(format!("{repo} publishes no chat template"));
-    }
-    if !complete {
-        // A partial snapshot could miscount; use the last complete one.
-        return cached_or(
-            hub,
-            repo,
-            format!("could not fetch all of {repo}'s tokenizer files"),
-        );
     }
     // `cached_or` uses this snapshot alone.
     let marker = complete_marker(hub, repo);
@@ -216,6 +229,86 @@ mod tests {
         let used = cached_or(&hub, REPO, "unused".to_owned()).unwrap();
         assert_eq!(used.dir, snapshot);
         assert!(used.cached);
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    const RATE_LIMITED: &str = "Download failed with status 429 Too Many Requests";
+    const NOT_FOUND: &str = "Download failed with status 404 Not Found";
+
+    /// A Hub that serves the tokenizer, fails the chat template with
+    /// `template_error`, and has none of the other optional files.
+    fn hub_serving<'a>(
+        hub: &'a Path,
+        template_error: &'static str,
+    ) -> impl Fn(&str, &str) -> Result<(), String> + 'a {
+        move |file, commit| {
+            if file == rayline_tokencount::TEMPLATE_FILE {
+                return Err(template_error.to_owned());
+            }
+            if file != rayline_tokencount::TOKENIZER_FILE {
+                return Err(NOT_FOUND.to_owned());
+            }
+            let path = rayline_hf::hf_cache_snapshot_path(hub, REPO, file, commit);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "{}").map_err(|error| error.to_string())
+        }
+    }
+
+    /// A finished snapshot at `abc123` with a tokenizer and a chat template.
+    fn cache_complete_snapshot(hub: &Path) -> PathBuf {
+        let snapshot = hub
+            .join(rayline_hf::repo_to_folder_name(REPO))
+            .join("snapshots")
+            .join("abc123");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join(rayline_tokencount::TOKENIZER_FILE), "{}").unwrap();
+        std::fs::write(snapshot.join(rayline_tokencount::TEMPLATE_FILE), "").unwrap();
+        std::fs::write(complete_marker(hub, REPO), "abc123\n").unwrap();
+        snapshot
+    }
+
+    fn fetch_current(hub: &Path, template_error: &'static str) -> Result<Snapshot, String> {
+        fetch_with(
+            hub,
+            REPO,
+            Ok("def456".to_owned()),
+            hub_serving(hub, template_error),
+        )
+    }
+
+    #[test]
+    fn a_failed_template_download_uses_the_complete_cached_snapshot() {
+        let hub = temp_hub("template-failed-cached");
+        let snapshot = cache_complete_snapshot(&hub);
+        let used = fetch_current(&hub, RATE_LIMITED).unwrap();
+        assert_eq!(used.dir, snapshot);
+        assert!(used.cached);
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn a_failed_template_download_without_a_cached_snapshot_is_the_download_error() {
+        let hub = temp_hub("template-failed-uncached");
+        assert_eq!(
+            fetch_current(&hub, RATE_LIMITED).err(),
+            Some(format!(
+                "download {} from {REPO}: {RATE_LIMITED}",
+                rayline_tokencount::TEMPLATE_FILE
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&hub);
+    }
+
+    #[test]
+    fn a_repo_with_no_template_candidate_publishes_no_chat_template() {
+        // Every candidate was fetched and none exists, so a cached snapshot
+        // does not stand in.
+        let hub = temp_hub("no-template");
+        cache_complete_snapshot(&hub);
+        assert_eq!(
+            fetch_current(&hub, NOT_FOUND).err(),
+            Some(format!("{REPO} publishes no chat template"))
+        );
         let _ = std::fs::remove_dir_all(&hub);
     }
 
