@@ -897,6 +897,8 @@ mod tests {
         // rerun with new settings updates ours and keeps the app's.
         let dir = unique_tmp_dir("merge-e2e");
         let iso = dir.join("config.toml");
+        // The user's Codex home, with no config.toml to seed from.
+        let user_home = unique_tmp_dir("merge-e2e-user");
         fs::write(
             &iso,
             format!(
@@ -915,13 +917,23 @@ mod tests {
         )
         .unwrap();
 
-        write_codex_home(&dir, &snippet("gpt-5.5")).unwrap();
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+        let rerun = write_codex_home(&dir, &snippet("gpt-5.5"));
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        rerun.unwrap();
         let written = fs::read_to_string(&iso).unwrap();
         assert_eq!(written.matches("[model_providers.rayline]").count(), 1);
         assert!(written.contains("model = \"gpt-5.5\""));
         assert!(written.contains("[mcp_servers.foo]"));
         assert!(written.contains("[desktop]\nqueue = true"));
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&user_home);
     }
 
     #[test]
@@ -941,18 +953,42 @@ mod tests {
     fn codex_home_config_is_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = unique_tmp_dir("owner-only");
-        write_codex_home(&dir, &snippet("arc-sage-1.0")).unwrap();
+        // The user's Codex home, with no config.toml to seed from.
+        let user_home = unique_tmp_dir("owner-only-user");
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+        let written = write_codex_home(&dir, &snippet("arc-sage-1.0"));
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        written.unwrap();
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&dir.join("config.toml")), 0o600);
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&user_home);
     }
 
     #[test]
     fn codex_app_writes_only_under_its_harness_folder() {
         let home = crate::harness::tests::temp_dir("codex-app-home");
-        write_codex_home(&isolated_home_path(&home), &snippet("arc-sage-1.0")).unwrap();
+        // The user's Codex home, with no config.toml to seed from.
+        let user_home = crate::harness::tests::temp_dir("codex-app-home-user");
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+        let written = write_codex_home(&isolated_home_path(&home), &snippet("arc-sage-1.0"));
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        written.unwrap();
         crate::harness::tests::assert_only_harness_files(&home, "codex-app", &[]);
         fs::remove_dir_all(home).unwrap();
+        fs::remove_dir_all(user_home).unwrap();
     }
 }

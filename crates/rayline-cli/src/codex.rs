@@ -274,13 +274,24 @@ pub(crate) mod tests {
     #[test]
     fn codex_writes_only_under_its_harness_folder() {
         let home = crate::harness::tests::temp_dir("codex-home");
-        crate::codex_app::write_codex_home(
+        // The user's Codex home, with no config.toml to seed from.
+        let user_home = crate::harness::tests::temp_dir("codex-home-user");
+        let saved = std::env::var_os("CODEX_HOME");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { std::env::set_var("CODEX_HOME", &user_home) };
+        let written = crate::codex_app::write_codex_home(
             &super::codex_home(&home),
             &provider_config_toml(&provider("arc-sage")),
-        )
-        .unwrap();
+        );
+        // SAFETY: as above.
+        match saved {
+            Some(value) => unsafe { std::env::set_var("CODEX_HOME", value) },
+            None => unsafe { std::env::remove_var("CODEX_HOME") },
+        }
+        written.unwrap();
         crate::harness::tests::assert_only_harness_files(&home, "codex", &[]);
         std::fs::remove_dir_all(home).unwrap();
+        std::fs::remove_dir_all(user_home).unwrap();
     }
 
     /// #84: every Codex child is built by `codex_command`, which withholds the
