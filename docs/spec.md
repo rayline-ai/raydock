@@ -78,6 +78,7 @@ rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...
 
    The arguments of other harnesses are not checked: `hermes --resume` and `openclaw --session-id`, for example, are passed on.
 10. Local mode refuses OpenClaw container mode, before anything starts: `rayline run openclaw` when `OPENCLAW_CONTAINER` is set to a non-empty value, or when any harness argument is `--container` or `--container=<value>`.
+11. Before a cloud-mode `rayline run hermes` launch, on every OS, Rayline runs `hermes pm install --extra anthropic` with the launch's environment (`HERMES_HOME` set to Rayline's Hermes home), once per Hermes install and home; later launches skip it. If the install fails or cannot run, the launch stops with Hermes' last output and the command to run by hand with that home.
 
 Harness-specific options and subcommands are **kept for review** (section 9).
 
