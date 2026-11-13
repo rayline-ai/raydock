@@ -50,6 +50,14 @@
 //! before a Windows launch [`prepare_launch`] builds the environment once with
 //! `HERMES_HOME` set to Raydock's home. Later launches of the same Hermes find
 //! it and skip the repair.
+//!
+//! Anthropic extra (cloud mode, every OS): the Messages provider needs Hermes'
+//! `anthropic` extra. Hermes otherwise installs it on the first Messages turn,
+//! under an install lock it waits on for only a few seconds, and fails the
+//! turn when another Hermes process holds that lock. So before a cloud launch
+//! [`prepare_cloud_launch`] installs it once with `hermes pm install --extra
+//! anthropic`, which waits for the lock, after the Windows step above. Local
+//! mode writes only the Responses provider and does not run it.
 
 use std::{
     fs, io,
@@ -172,6 +180,12 @@ const FACTS_FILE: &str = "facts.json";
 const READY_MARKER: &str = ".raydock-hermes-ready";
 /// What Hermes tells the user to run when its home has no environment.
 const REPAIR_COMMAND: &str = "hermes pm repair";
+/// Raydock's record, in its cloud Hermes home, of the Hermes launcher and the
+/// environments the `anthropic` extra was installed for (see
+/// [`install_extra`]).
+const EXTRA_MARKER: &str = ".raydock-hermes-anthropic";
+/// The Hermes args that install the extra the Messages provider needs.
+const INSTALL_EXTRA: &[&str] = &["pm", "install", "--extra", "anthropic"];
 /// The most lines of a failed repair's output repeated in the error.
 const FAILED_OUTPUT_LINES: usize = 12;
 
@@ -185,17 +199,33 @@ pub(crate) struct Finished {
 /// Hermes can start in the home the command sets as `HERMES_HOME`. The probe
 /// and the repair run the same program with the same environment changes.
 pub(crate) fn prepare_launch(command: &Command) -> Result<(), String> {
-    let Some(home) = command
-        .get_envs()
-        .find(|(name, _)| *name == "HERMES_HOME")
-        .and_then(|(_, value)| value)
-    else {
+    let Some(home) = launch_home(command) else {
         return Ok(());
     };
     let launcher = launcher_identity(Path::new(command.get_program()))?;
-    prepare_home(Path::new(home), &launcher, |args| {
+    prepare_home(home, &launcher, |args| finish(sibling(command, args)))
+}
+
+/// Before a cloud-mode launch of `command` (the Hermes launch itself): on
+/// Windows the home is prepared as for any launch ([`prepare_home`]), then on
+/// every OS the `anthropic` extra is installed ([`install_extra`]). Each Hermes
+/// run uses the same program with the same environment changes.
+pub(crate) fn prepare_cloud_launch(command: &Command) -> Result<(), String> {
+    let home =
+        launch_home(command).ok_or_else(|| "the Hermes launch sets no HERMES_HOME".to_owned())?;
+    let launcher = launcher_identity(Path::new(command.get_program()))?;
+    prepare_cloud_home(home, &launcher, cfg!(windows), |args| {
         finish(sibling(command, args))
     })
+}
+
+/// The `HERMES_HOME` the launch `command` sets.
+fn launch_home(command: &Command) -> Option<&Path> {
+    command
+        .get_envs()
+        .find(|(name, _)| *name == "HERMES_HOME")
+        .and_then(|(_, value)| value)
+        .map(Path::new)
 }
 
 /// `command`'s program and environment changes with other `args`.
@@ -276,36 +306,12 @@ pub(crate) fn prepare_home(
     mut run: impl FnMut(&[&str]) -> io::Result<Finished>,
 ) -> Result<(), String> {
     let marker = home.join(READY_MARKER);
-    let record = || -> Result<Option<String>, String> {
-        let environments = environments(home)?;
-        Ok((!environments.is_empty()).then(|| format!("{launcher}{}\n", environments.join("\n"))))
-    };
-    if let Some(record) = record()? {
-        let seen = match fs::read_to_string(&marker) {
-            Ok(seen) => Some(seen),
-            // Not prepared yet: ask Hermes.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(format!("failed to read {}: {error}", marker.display())),
-        };
-        if seen.as_deref() == Some(record.as_str()) {
-            return Ok(());
-        }
+    if marker_current(&marker, home, launcher)? {
+        return Ok(());
     }
-    let remember = || -> Result<(), String> {
-        match record()? {
-            Some(record) => fs::write(&marker, record)
-                .map_err(|error| format!("failed to write {}: {error}", marker.display())),
-            None => match fs::remove_file(&marker) {
-                Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                    Err(format!("failed to remove {}: {error}", marker.display()))
-                }
-                _ => Ok(()),
-            },
-        }
-    };
     match run(&["--version"]) {
         Ok(probe) if probe.success => {
-            remember()?;
+            remember(&marker, home, launcher)?;
             return Ok(());
         }
         Ok(probe) if probe.output.contains(REPAIR_COMMAND) => {}
@@ -324,12 +330,108 @@ pub(crate) fn prepare_home(
     );
     match run(&["pm", "repair"]) {
         Ok(repair) if repair.success => {
-            remember()?;
+            remember(&marker, home, launcher)?;
             eprintln!("  Hermes is set up.");
             Ok(())
         }
-        Ok(repair) => Err(repair_failed(home, &last_lines(&repair.output))),
-        Err(error) => Err(repair_failed(home, &format!("    {error}"))),
+        Ok(repair) => Err(setup_failed(
+            home,
+            REPAIR_COMMAND,
+            true,
+            &last_lines(&repair.output),
+        )),
+        Err(error) => Err(setup_failed(
+            home,
+            REPAIR_COMMAND,
+            true,
+            &format!("    {error}"),
+        )),
+    }
+}
+
+/// [`prepare_cloud_launch`] for `home`; `windows` runs [`prepare_home`] first.
+fn prepare_cloud_home(
+    home: &Path,
+    launcher: &str,
+    windows: bool,
+    mut run: impl FnMut(&[&str]) -> io::Result<Finished>,
+) -> Result<(), String> {
+    if windows {
+        prepare_home(home, launcher, &mut run)?;
+    }
+    install_extra(home, launcher, windows, run)
+}
+
+/// Installs Hermes' `anthropic` extra into `home` (see the module docs), unless
+/// [`EXTRA_MARKER`] records that this launcher already did with the home's
+/// environments as they are now. A failed install, or one that cannot run, is
+/// an error with Hermes' output and the command to run by hand with the home;
+/// nothing is recorded then.
+fn install_extra(
+    home: &Path,
+    launcher: &str,
+    windows: bool,
+    mut run: impl FnMut(&[&str]) -> io::Result<Finished>,
+) -> Result<(), String> {
+    let marker = home.join(EXTRA_MARKER);
+    if marker_current(&marker, home, launcher)? {
+        return Ok(());
+    }
+    eprintln!(
+        "  Installing Hermes' Anthropic support for {} (one time)...",
+        crate::DISPLAY_NAME
+    );
+    let command = format!("hermes {}", INSTALL_EXTRA.join(" "));
+    match run(INSTALL_EXTRA) {
+        Ok(install) if install.success => remember(&marker, home, launcher),
+        Ok(install) => Err(setup_failed(
+            home,
+            &command,
+            windows,
+            &last_lines(&install.output),
+        )),
+        Err(error) => Err(setup_failed(
+            home,
+            &command,
+            windows,
+            &format!("    {error}"),
+        )),
+    }
+}
+
+/// What a marker records for `home`: `launcher`, then the Hermes environments
+/// the home holds; `None` when it holds none.
+fn home_record(home: &Path, launcher: &str) -> Result<Option<String>, String> {
+    let environments = environments(home)?;
+    Ok((!environments.is_empty()).then(|| format!("{launcher}{}\n", environments.join("\n"))))
+}
+
+/// Whether `marker` records `home` as it is now. A home with no environment
+/// never matches, nor does a missing marker; a marker that exists but cannot
+/// be read is an error.
+fn marker_current(marker: &Path, home: &Path, launcher: &str) -> Result<bool, String> {
+    let Some(record) = home_record(home, launcher)? else {
+        return Ok(false);
+    };
+    match fs::read_to_string(marker) {
+        Ok(seen) => Ok(seen == record),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("failed to read {}: {error}", marker.display())),
+    }
+}
+
+/// Records `home` as it is now in `marker`, or removes the marker when the
+/// home holds no environment to record.
+fn remember(marker: &Path, home: &Path, launcher: &str) -> Result<(), String> {
+    match home_record(home, launcher)? {
+        Some(record) => fs::write(marker, record)
+            .map_err(|error| format!("failed to write {}: {error}", marker.display())),
+        None => match fs::remove_file(marker) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                Err(format!("failed to remove {}: {error}", marker.display()))
+            }
+            _ => Ok(()),
+        },
     }
 }
 
@@ -390,18 +492,26 @@ fn last_lines(output: &str) -> String {
         .join("\n")
 }
 
-/// The error for a failed repair: Hermes' last output, then the command to run
-/// by hand in PowerShell and in Command Prompt, each scoped to Raydock's home
-/// so the user's own Hermes home is untouched afterwards.
-fn repair_failed(home: &Path, output: &str) -> String {
+/// The error for a failed Hermes setup `command`: Hermes' last output, then
+/// the command to run by hand, scoped to Raydock's home so the user's own
+/// Hermes home is untouched afterwards: in PowerShell and in Command Prompt on
+/// Windows, in a POSIX shell elsewhere.
+fn setup_failed(home: &Path, command: &str, windows: bool, output: &str) -> String {
     let home = home.display().to_string();
-    let powershell = home.replace('\'', "''");
+    let by_hand = if windows {
+        let powershell = home.replace('\'', "''");
+        format!(
+            "\x20 PowerShell:     $env:HERMES_HOME = '{powershell}'; {command}; Remove-Item Env:HERMES_HOME\n\
+             \x20 Command Prompt: set \"HERMES_HOME={home}\" & {command} & set \"HERMES_HOME=\""
+        )
+    } else {
+        format!("  HERMES_HOME='{}' {command}", home.replace('\'', "'\\''"))
+    };
     format!(
-        "Hermes setup failed: `{REPAIR_COMMAND}` did not finish for {}'s Hermes home.\n\
+        "Hermes setup failed: `{command}` did not finish for {}'s Hermes home.\n\
          {output}\n\
          Run it yourself with that home, then launch again:\n\
-         \x20 PowerShell:     $env:HERMES_HOME = '{powershell}'; {REPAIR_COMMAND}; Remove-Item Env:HERMES_HOME\n\
-         \x20 Command Prompt: set \"HERMES_HOME={home}\" & {REPAIR_COMMAND} & set \"HERMES_HOME=\"",
+         {by_hand}",
         crate::DISPLAY_NAME
     )
 }
@@ -644,7 +754,10 @@ providers:
 
     mod prepare_home {
         use super::super::super::tests::temp_dir;
-        use super::super::{Finished, finish, launcher_identity, prepare_home, sibling};
+        use super::super::{
+            EXTRA_MARKER, Finished, INSTALL_EXTRA, READY_MARKER, finish, launcher_identity,
+            prepare_cloud_home, prepare_home, sibling,
+        };
         use std::path::Path;
         use std::process::Command;
 
@@ -674,7 +787,9 @@ providers:
         }
 
         /// Hermes as it behaves on a clean Windows home: it refuses until the
-        /// repair has committed an environment. Records each run's args.
+        /// repair has committed an environment. Installing the extra commits
+        /// one too, as the first run in a home does on every OS. Records each
+        /// run's args.
         fn hermes<'a>(
             home: &'a Path,
             calls: &'a mut Vec<String>,
@@ -684,6 +799,9 @@ providers:
                 if args == ["pm", "repair"] {
                     commit_environment(home);
                     finished(true, "hermes: dependency environment repaired")
+                } else if args == INSTALL_EXTRA {
+                    commit_environment(home);
+                    finished(true, "hermes: installed extra anthropic")
                 } else if home.join("installs").is_dir() {
                     finished(true, "Hermes Agent v0.23.1")
                 } else {
@@ -964,6 +1082,107 @@ providers:
             })
             .unwrap_err();
             assert!(error.contains("    cannot start"), "{error}");
+        }
+
+        /// Cloud mode on a fresh home installs the `anthropic` extra once, with
+        /// no other Hermes run off Windows; the next launch of the same Hermes
+        /// runs nothing.
+        #[test]
+        fn a_fresh_cloud_home_installs_the_extra_once() {
+            let home = temp_dir("hermes-cloud-fresh");
+            let mut calls = Vec::new();
+            prepare_cloud_home(&home, LAUNCHER, false, hermes(&home, &mut calls)).unwrap();
+            assert_eq!(calls, ["pm install --extra anthropic"]);
+            assert!(home.join(EXTRA_MARKER).is_file());
+
+            let mut again = Vec::new();
+            prepare_cloud_home(&home, LAUNCHER, false, hermes(&home, &mut again)).unwrap();
+            assert!(again.is_empty(), "{again:?}");
+        }
+
+        /// On Windows the existing repair runs first and the extra install
+        /// after it; the next launch runs neither.
+        #[test]
+        fn on_windows_the_extra_is_installed_after_the_repair() {
+            let home = temp_dir("hermes-cloud-windows");
+            let mut calls = Vec::new();
+            prepare_cloud_home(&home, LAUNCHER, true, hermes(&home, &mut calls)).unwrap();
+            assert_eq!(
+                calls,
+                ["--version", "pm repair", "pm install --extra anthropic"]
+            );
+
+            let mut again = Vec::new();
+            prepare_cloud_home(&home, LAUNCHER, true, hermes(&home, &mut again)).unwrap();
+            assert!(again.is_empty(), "{again:?}");
+        }
+
+        /// A failed extra install, or one that cannot run, stops the launch
+        /// with Hermes' last output and the command with the home, records
+        /// nothing, and is tried again on the next launch.
+        #[test]
+        fn a_failed_extra_install_is_an_error_naming_the_home() {
+            let home = temp_dir("hermes-cloud-fails").join("it's");
+            std::fs::create_dir_all(&home).unwrap();
+            let shown = home.display().to_string();
+            let output = (1..=20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut calls = Vec::new();
+            let error = prepare_cloud_home(&home, LAUNCHER, false, |args| {
+                calls.push(args.join(" "));
+                finished(false, &output)
+            })
+            .unwrap_err();
+            assert_eq!(calls, ["pm install --extra anthropic"]);
+            assert!(
+                error.contains("`hermes pm install --extra anthropic` did not finish"),
+                "{error}"
+            );
+            assert!(error.contains("    line 20"), "{error}");
+            assert!(!error.contains("line 8\n"), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "HERMES_HOME='{}' hermes pm install --extra anthropic",
+                    shown.replace('\'', "'\\''")
+                )),
+                "{error}"
+            );
+            assert!(!home.join(EXTRA_MARKER).exists());
+
+            let error = prepare_cloud_home(&home, LAUNCHER, true, |args| {
+                if args == INSTALL_EXTRA {
+                    Err(std::io::Error::other("cannot start"))
+                } else {
+                    finished(true, "Hermes Agent v0.23.1")
+                }
+            })
+            .unwrap_err();
+            assert!(error.contains("    cannot start"), "{error}");
+            assert!(
+                error.contains(&format!(
+                    "set \"HERMES_HOME={shown}\" & hermes pm install --extra anthropic"
+                )),
+                "{error}"
+            );
+            assert!(!home.join(EXTRA_MARKER).exists());
+
+            let mut retried = Vec::new();
+            prepare_cloud_home(&home, LAUNCHER, false, hermes(&home, &mut retried)).unwrap();
+            assert_eq!(retried, ["pm install --extra anthropic"]);
+        }
+
+        /// Local mode's preparation ([`prepare_home`], Windows only) is
+        /// unchanged: it never installs the extra or records it.
+        #[test]
+        fn local_mode_does_not_install_the_extra() {
+            let home = temp_dir("hermes-local-unchanged");
+            let mut calls = Vec::new();
+            prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap();
+            assert_eq!(calls, ["--version", "pm repair"]);
+            assert!(home.join(READY_MARKER).is_file());
+            assert!(!home.join(EXTRA_MARKER).exists());
         }
 
         /// The probe and repair carry the launch's environment changes (its
