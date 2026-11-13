@@ -130,6 +130,8 @@ rayline update --check
 
 Its options are **kept for review** (section 9). The channel comes from `update.channel` (section 5.6).
 
+`rayline update` refuses Homebrew and Rayline.app installs: it replaces nothing and exits 0, with or without `--check`. When the binary it would replace is inside a `.app` bundle, it prints ``rayline is managed by Rayline.app. Update the app to update the CLI:`` and, on the next line, ``re-download from https://get.rayline.ai``. When that binary is under `brew --prefix` (with `brew` on `PATH`), it prints ``Installed via Homebrew. Run `brew upgrade rayline` to update.``
+
 ## 4. Internal CLI
 
 1. `--env <name>`, hidden, a global option placed before the command: `rayline --env dev run claude`. It selects `environments.<name>` from `settings.json` and from `credentials.json`. Without it, prod (built in). An unknown name is a load error. `rayline local status`, `rayline local stop` and `rayline top` act on the one running local process, so `--env` with them is a usage error.
