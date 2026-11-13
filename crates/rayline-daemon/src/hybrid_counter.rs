@@ -1,5 +1,5 @@
 //! The execution core's `token_counter` for each deployment whose model names
-//! a `tokenizer`: rld loads that model's published tokenizer and chat
+//! a `tokenizer`: the local process loads that model's published tokenizer and chat
 //! template, serves the count on its own loopback listener with its own
 //! credential, and hands the core a copy of its configuration that names it.
 //!

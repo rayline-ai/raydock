@@ -41,7 +41,7 @@ def main():
         # The fixture core writes its requests here.
         env["RAYLINE_FIXTURE_EVENTS"] = str(root / "events.jsonl")
         core = installed / "rayline-core"
-        shutil.copy(ROOT / "crates/rayline-daemon/tests/fixtures/execution-contract.py", core)
+        shutil.copy(ROOT / "crates/rayline-cli/tests/fixtures/execution-contract.py", core)
         core.chmod(0o700)
         # Decisions go to the loopback `fixture` router, which start does not probe.
         settings = root / ".config/rayline/settings.json"

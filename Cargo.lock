@@ -1467,6 +1467,7 @@ dependencies = [
  "minisign-verify",
  "opener",
  "rand 0.9.4",
+ "rayline-daemon",
  "rayline-hf",
  "rayline-local-router",
  "rayline-tokencount",

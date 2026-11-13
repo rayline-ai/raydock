@@ -34,6 +34,7 @@ url = "2"
 rayline-hf = { path = "../rayline-hf" }
 rayline-tokencount = { path = "../rayline-tokencount" }
 rayline-local-router = { path = "../rayline-local-router" }
+rayline-daemon = { path = "../rayline-daemon" }
 zstd = "0.14"
 toml_edit = "0.25.15"
 

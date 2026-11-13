@@ -156,6 +156,10 @@ Options:
   --dry-run            Download and verify without replacing Rayline
 ";
 
+/// The first argument that runs the local process (section 4.3). Only
+/// `rayline local start` passes it; it is in no help text.
+pub(crate) const LOCAL_PROCESS: &str = "__local-process";
+
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Parsed {
@@ -166,6 +170,9 @@ pub(crate) enum Parsed {
     /// The hidden `hybrid start|status|stop` the CI lifecycle scripts drive,
     /// with its arguments. Sub-PR 6b replaces it with `rayline local`.
     Hybrid(Vec<OsString>),
+    /// The internal entry point the local process runs from (section 4.3),
+    /// with the options `rayline local start` passes it.
+    LocalProcess(Vec<OsString>),
     Command {
         /// `--env <name>`. `None` is prod.
         env: Option<String>,
@@ -483,8 +490,13 @@ pub(crate) fn parse(argv: &[OsString]) -> Result<Parsed, UsageError> {
     let mut args = Args {
         args: argv.get(1..).unwrap_or_default(),
     };
-    if args.peek().is_none() {
-        return Ok(Parsed::Help(ROOT_HELP));
+    match args.peek() {
+        None => return Ok(Parsed::Help(ROOT_HELP)),
+        Some(arg) if arg == LOCAL_PROCESS => {
+            args.next();
+            return Ok(Parsed::LocalProcess(args.rest()));
+        }
+        Some(_) => {}
     }
     let mut env = None;
     while let Some(arg) = args.next_str(ROOT)? {
