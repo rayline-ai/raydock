@@ -57,7 +57,7 @@ The script:
 
 1. Prints the Rayline version and each harness's version. Keep them with the results: a harness release can change how it talks to Rayline, so a result only holds for the versions it ran with.
 2. Runs one turn per harness in cloud mode.
-3. Starts the local process with `rayline local start`, runs one turn per harness with `--local`, then stops it with `rayline local stop`. It also runs `rayline local stop` if it exits early, including on Ctrl-C. A failed `rayline local start`, `rayline local status` or `rayline local stop` is a `FAIL`. If a local process is already running, `rayline local start` refuses and local mode fails; stop it first.
+3. Starts the local process with `rayline local start`, runs one turn per harness with `--local`, then stops it with `rayline local stop`. It also runs `rayline local stop` if it exits early, including on Ctrl-C. A failed `rayline local start` or `rayline local stop` is a `FAIL`, and so is a `rayline local status` that fails or doesn't report the process running. When `rayline local start` fails, the script stops nothing. If a local process is already running, `rayline local start` refuses and local mode fails; stop it first.
 
 Each turn is the harness's own non-interactive mode:
 

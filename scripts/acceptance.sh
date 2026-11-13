@@ -8,7 +8,9 @@
 # `rayline local start --config <file>` and `rayline run <harness> --config
 # <file>`; cloud mode always uses the default file. The script writes no
 # config. It starts the local process with `rayline local start` and runs
-# `rayline local stop` once on exit, including on Ctrl-C, TERM and HUP.
+# `rayline local stop` once on exit, including on Ctrl-C, TERM and HUP. If
+# `rayline local start` fails, it stops nothing: a process it didn't start is
+# left alone.
 # claude-desktop has no path yet in either mode, so it is not covered.
 # See docs/acceptance-testing.md.
 set -uo pipefail
@@ -163,21 +165,30 @@ echo "== cloud mode"
 run_mode cloud
 
 echo "== local mode"
+# Set before `rayline local start`, so a signal during start still stops it.
 trap stop_local EXIT
 trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 if "${local_start[@]}"; then
-  if ! "$RAYLINE" local status; then
-    echo "FAIL    rayline local status"
+  # After a start, status must exit 0 and report the process running.
+  status_out=$("$RAYLINE" local status 2>&1)
+  status=$?
+  echo "$status_out"
+  if [ "$status" -ne 0 ] || ! grep -q '^Local process: running' <<<"$status_out"; then
+    echo "FAIL    rayline local status (exit $status)"
     fail=$((fail + 1))
   fi
   run_mode local "${local_run[@]}"
+  stop_local
 else
+  # A refused start (say, a process is already running) must not stop a
+  # process this script didn't start.
+  trap - EXIT
+  stopped=true
   echo "FAIL    rayline local start"
   fail=$((fail + 1))
 fi
-stop_local
 
 echo "== pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
