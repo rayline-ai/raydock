@@ -40,7 +40,7 @@ Local mode reads everything from `~/.config/rayline/settings.json`. The script n
 }
 ```
 
-The endpoint must list the protocol of every harness you run in local mode: `anthropic_messages` for `claude` and `claude-desktop`, `openai_responses` for `codex` and `openai_chat` for the others. `docs/spec.md` section 5 describes every key.
+The endpoint must list the protocol of every harness you run in local mode: `anthropic_messages` for `claude`, `claude-desktop`, `pi`, `omp` and `opencode`; `openai_responses` for `codex` and `hermes`; `openai_chat` for `openclaw`. `docs/spec.md` section 5 describes every key.
 
 ## Run
 
