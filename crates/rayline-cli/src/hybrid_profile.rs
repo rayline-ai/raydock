@@ -26,13 +26,14 @@ pub(crate) const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
 /// and Haiku 5.5 (pricing snapshot 2026-10-16, `context_window_tokens`; Haiku
 /// read from the dev and prod catalogs 2026-11-09, `context_length`).
 const CLOUD_CONTEXT_WINDOW: u64 = 1_000_000;
-/// The Rayline cloud models, as `(wire_model, registry_model,
+/// The Rayline cloud models, as `(cloud_id, registry_model,
 /// max_output_tokens)`. Each has one `model_pin` deployment per protocol, at
 /// the router's path for it.
 ///
-/// `wire_model` is the router's own catalog entry; `registry_model` is the
-/// same model as the core's thinking registry knows it, whose measured cell
-/// supplies the action's controls.
+/// `cloud_id` is the router's own catalog entry; `registry_model` is the same
+/// model as the core's thinking registry knows it, whose measured cell
+/// supplies the action's controls. A pin's `wire_model` is the id the router
+/// serves and echoes on its path ([`cloud_pin_wire_model`]).
 ///
 /// The ceiling is each model's own (catalog figures, 2026-11-06 for Opus and
 /// Sonnet and 2026-11-09 for Haiku, matching dev and prod).
@@ -41,6 +42,21 @@ pub(crate) const CLOUD_MODELS: &[(&str, &str, u64)] = &[
     ("claude-sonnet-5-5", "anthropic/claude-sonnet-5.5", 128_000),
     ("claude-haiku-5-5", "anthropic/claude-haiku-5.5", 128_000),
 ];
+
+/// The `wire_model` of the cloud pin for `(cloud_id, registry_model)` over
+/// `protocol`: the id the router serves and echoes on that path, the Rayline
+/// cloud id on Messages and the registry id on Chat Completions and Responses
+/// (spec 5.3 item 2).
+fn cloud_pin_wire_model<'a>(
+    cloud_id: &'a str,
+    registry_model: &'a str,
+    protocol: Protocol,
+) -> &'a str {
+    match protocol {
+        Protocol::AnthropicMessages => cloud_id,
+        Protocol::OpenaiChat | Protocol::OpenaiResponses => registry_model,
+    }
+}
 
 /// Whether ARC knows `model`, so that its limits may come from ARC (spec 5.3).
 /// ARC doesn't expose the set of models it knows yet, so no model is known
@@ -149,7 +165,7 @@ pub(crate) fn core_config(settings: &Settings, router_url: &str) -> Result<Value
     let router = router_url.trim_end_matches('/');
     // Spec 5.3 items 1 and 2: a model in `models` goes to its endpoint, so
     // its entry replaces the pin for the same id.
-    for &(wire_model, registry, max_output_tokens) in CLOUD_MODELS {
+    for &(cloud_id, registry, max_output_tokens) in CLOUD_MODELS {
         if settings.models.contains_key(registry) {
             continue;
         }
@@ -159,8 +175,8 @@ pub(crate) fn core_config(settings: &Settings, router_url: &str) -> Result<Value
             deployments.push(json!({
                 "id": deployment_id, "kind": "cloud", "cloud_transport": "model_pin",
                 "url": format!("{router}{path}"), "protocol": wire_protocol,
-                "wire_model": wire_model, "registry_model": registry,
-                "registry_provider": "openrouter",
+                "wire_model": cloud_pin_wire_model(cloud_id, registry, protocol),
+                "registry_model": registry, "registry_provider": "openrouter",
                 "runtime_identity": "rayline-catalog-model-pin-v1",
                 "max_output_tokens": max_output_tokens, "context_window": CLOUD_CONTEXT_WINDOW,
                 "input_modalities": ["text"], "clamp_output_allowance": true, "token_units": "",
@@ -229,11 +245,21 @@ mod tests {
     fn cloud_pins(router: &str) -> (Vec<Value>, Vec<Value>) {
         let mut deployments = Vec::new();
         let mut actions = Vec::new();
-        for &(wire, registry, ceiling) in CLOUD_MODELS {
-            for (suffix, path, protocol) in [
-                ("messages", "/v1/messages", "anthropic.messages.v1"),
-                ("chat", "/v1/chat/completions", "openai.chat.v1"),
-                ("responses", "/v1/responses", "openai.responses.v1"),
+        for &(cloud_id, registry, ceiling) in CLOUD_MODELS {
+            for (suffix, path, protocol, wire) in [
+                (
+                    "messages",
+                    "/v1/messages",
+                    "anthropic.messages.v1",
+                    cloud_id,
+                ),
+                ("chat", "/v1/chat/completions", "openai.chat.v1", registry),
+                (
+                    "responses",
+                    "/v1/responses",
+                    "openai.responses.v1",
+                    registry,
+                ),
             ] {
                 let id = format!("{registry}-{suffix}");
                 deployments.push(
@@ -252,6 +278,63 @@ mod tests {
             }
         }
         (deployments, actions)
+    }
+
+    #[test]
+    fn each_cloud_pin_carries_the_id_the_router_echoes_on_its_path() {
+        let settings = load(
+            "cloud-wire",
+            &one_model(
+                r#"{"base_url": "http://127.0.0.1:11434", "protocols": ["openai_chat"]}"#,
+                r#"{"endpoint": "box", "model": "glm", "context_window": 98304,
+                    "max_output_tokens": 24576}"#,
+            ),
+        );
+        let config = core_config(&settings, "https://api.rayline.ai").unwrap();
+        let pins: Vec<(&str, &str)> = config["deployments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|deployment| deployment["kind"] == "cloud")
+            .map(|deployment| {
+                (
+                    deployment["id"].as_str().unwrap(),
+                    deployment["wire_model"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pins,
+            [
+                ("anthropic/claude-opus-5.5-messages", "claude-opus-5-5"),
+                (
+                    "anthropic/claude-opus-5.5-chat",
+                    "anthropic/claude-opus-5.5"
+                ),
+                (
+                    "anthropic/claude-opus-5.5-responses",
+                    "anthropic/claude-opus-5.5"
+                ),
+                ("anthropic/claude-sonnet-5.5-messages", "claude-sonnet-5-5"),
+                (
+                    "anthropic/claude-sonnet-5.5-chat",
+                    "anthropic/claude-sonnet-5.5"
+                ),
+                (
+                    "anthropic/claude-sonnet-5.5-responses",
+                    "anthropic/claude-sonnet-5.5"
+                ),
+                ("anthropic/claude-haiku-5.5-messages", "claude-haiku-5-5"),
+                (
+                    "anthropic/claude-haiku-5.5-chat",
+                    "anthropic/claude-haiku-5.5"
+                ),
+                (
+                    "anthropic/claude-haiku-5.5-responses",
+                    "anthropic/claude-haiku-5.5"
+                ),
+            ]
+        );
     }
 
     #[test]
