@@ -6,8 +6,9 @@
 //! one deployment per protocol the endpoint lists. A model ARC picks that is
 //! not in `models` goes to Rayline cloud: the [`CLOUD_MODELS`] pins, less any
 //! whose id a `models` entry takes. Each deployment has one derived action
-//! named for its model, so the core binds a model's deployments as one action
-//! per control, one deployment per protocol.
+//! named as ARC names the model's actions ([`registry_action_model`]), so the
+//! core binds a model's deployments as one action per control, one deployment
+//! per protocol.
 //!
 //! Decisions go to the environment's router for `routing.decisions_model`,
 //! with `routing.policy` sent unchanged and a `price` for each entry that
@@ -79,6 +80,14 @@ pub(crate) fn deployment_id(model: &str, protocol: Protocol) -> String {
     format!("{model}-{suffix}")
 }
 
+/// A derived action's model and worker for a model id: the id without its
+/// provider (`anthropic/claude-sonnet-5.5` -> `claude-sonnet-5.5`). ARC's
+/// action id hashes `{control_id, model}` with this name, and the core binds
+/// ARC's selection only when its id and worker match.
+fn registry_action_model(id: &str) -> &str {
+    id.split_once('/').map_or(id, |(_, model)| model)
+}
+
 /// The core config for `settings`, with Decisions on `router_url` and, for
 /// development, the Decisions cell `cell`. Refuses what the local process
 /// must refuse before it serves anything (spec 5.8 items 10 and 11).
@@ -129,7 +138,9 @@ pub(crate) fn core_config(
                 deployment["auth_env"] = json!(var);
             }
             deployments.push(deployment);
-            actions.push(json!({"model": id, "worker": id, "deployment_id": deployment_id}));
+            let action = registry_action_model(id);
+            actions
+                .push(json!({"model": action, "worker": action, "deployment_id": deployment_id}));
         }
         if let Some(price) = &model.price {
             prices.insert(
@@ -158,7 +169,8 @@ pub(crate) fn core_config(
                 "max_output_tokens": max_output_tokens, "context_window": CLOUD_CONTEXT_WINDOW,
                 "input_modalities": ["text"], "clamp_output_allowance": true, "token_units": "",
                 "auth_env": ROUTER_KEY_ENV}));
-            actions.push(json!({"model": registry, "worker": registry,
+            let action = registry_action_model(registry);
+            actions.push(json!({"model": action, "worker": action,
                                 "deployment_id": deployment_id, "bases": ["default"]}));
         }
     }
@@ -258,8 +270,8 @@ mod tests {
                            "token_units": "", "auth_env": "RAYLINE_ROUTER_API_KEY"}),
                 );
                 actions.push(
-                    json!({"model": registry, "worker": registry, "deployment_id": id,
-                                    "bases": ["default"]}),
+                    json!({"model": registry_action_model(registry), "worker": registry_action_model(registry),
+                           "deployment_id": id, "bases": ["default"]}),
                 );
             }
         }
@@ -343,11 +355,11 @@ mod tests {
         let mut deployments = vec![qwen, glm_messages, glm_chat];
         deployments.extend(pins);
         let mut actions = vec![
-            json!({"model": "qwen/qwen3.8-27b", "worker": "qwen/qwen3.8-27b",
+            json!({"model": "qwen3.8-27b", "worker": "qwen3.8-27b",
                    "deployment_id": "qwen/qwen3.8-27b-chat"}),
-            json!({"model": "z-ai/glm-5.3-flash", "worker": "z-ai/glm-5.3-flash",
+            json!({"model": "glm-5.3-flash", "worker": "glm-5.3-flash",
                    "deployment_id": "z-ai/glm-5.3-flash-messages"}),
-            json!({"model": "z-ai/glm-5.3-flash", "worker": "z-ai/glm-5.3-flash",
+            json!({"model": "glm-5.3-flash", "worker": "glm-5.3-flash",
                    "deployment_id": "z-ai/glm-5.3-flash-chat"}),
         ];
         actions.extend(pin_actions);
@@ -452,12 +464,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter(|action| action["model"] == "anthropic/claude-haiku-5.5")
+            .filter(|action| action["model"] == "claude-haiku-5.5")
             .collect();
         assert_eq!(
             haiku_actions,
             [
-                &json!({"model": "anthropic/claude-haiku-5.5", "worker": "anthropic/claude-haiku-5.5",
+                &json!({"model": "claude-haiku-5.5", "worker": "claude-haiku-5.5",
                         "deployment_id": "anthropic/claude-haiku-5.5-messages"})
             ]
         );
@@ -605,5 +617,38 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn actions_carry_the_model_names_arc_identifies() {
+        // The pinned core's TestDerivedActionsUseARCActionIdentity binds
+        // ARC's action ids for `qwen3.8-27b` and `claude-sonnet-5.5`: the
+        // registry ids without their provider.
+        let settings = load(
+            "action-names",
+            &format!(
+                r#"{{"endpoints": {{"box": {{"base_url": "http://127.0.0.1:8080", "protocols": ["openai_chat"]}}}},
+                    "models": {{"qwen/qwen3.8-27b": {{"endpoint": "box", "model": "qwen3.8:27b",
+                        "context_window": 98304, "max_output_tokens": 24576}}}}, {ROUTING}}}"#
+            ),
+        );
+        let config = core_config(&settings, "https://api.rayline.ai", None).unwrap();
+        let action = |deployment: &str| {
+            config["derived_actions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|action| action["deployment_id"] == deployment)
+                .map(|action| (action["model"].clone(), action["worker"].clone()))
+        };
+        assert_eq!(
+            action("qwen/qwen3.8-27b-chat"),
+            Some((json!("qwen3.8-27b"), json!("qwen3.8-27b")))
+        );
+        assert_eq!(
+            action("anthropic/claude-sonnet-5.5-messages"),
+            Some((json!("claude-sonnet-5.5"), json!("claude-sonnet-5.5")))
+        );
+        assert_eq!(registry_action_model("qwen3.8-27b"), "qwen3.8-27b");
     }
 }

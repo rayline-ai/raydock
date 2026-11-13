@@ -170,6 +170,7 @@ Each harness speaks one protocol, the one its Rayline config sets up: `claude`, 
 ### 5.3 `models`
 
 Models ARC can pick that are not served by Rayline cloud, keyed by the model id ARC returns.
+The action ARC identifies is the model id after its provider prefix (`qwen/qwen3.8-27b` -> `qwen3.8-27b`).
 
 | Key | Type | Required | Meaning |
 |---|---|---|---|
