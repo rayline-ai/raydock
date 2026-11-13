@@ -122,23 +122,15 @@ fn name_counter(
     if target.get("kind").and_then(Value::as_str) != Some("local") {
         bail!("deployment {deployment} is not local");
     }
-    if target.get("prompt_counter").is_some() {
-        bail!("deployment {deployment} already has a prompt_counter");
+    let modalities = target
+        .get_mut("input_modalities")
+        .and_then(Value::as_array_mut)
+        .with_context(|| format!("deployment {deployment} has no input_modalities"))?;
+    if images && !modalities.iter().any(|modality| modality == "image") {
+        modalities.push(json!("image"));
     }
     target["token_counter"] = json!({"url": url, "auth_env": COUNTER_KEY_ENV});
     target["token_units"] = json!(units);
-    if images {
-        let modalities = target
-            .get_mut("input_modalities")
-            .and_then(Value::as_array_mut);
-        match modalities {
-            Some(modalities) if !modalities.iter().any(|modality| modality == "image") => {
-                modalities.push(json!("image"))
-            }
-            Some(_) => {}
-            None => target["input_modalities"] = json!(["text", "image"]),
-        }
-    }
     Ok(())
 }
 
@@ -310,11 +302,23 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_cloud_or_already_counted_deployment() {
+    fn refuses_a_cloud_or_missing_deployment() {
         assert!(name_counter(&mut profile(), "cloud-opus", "u", "u", false).is_err());
         assert!(name_counter(&mut profile(), "missing", "u", "u", false).is_err());
-        let mut counted = profile();
-        counted["deployments"][0]["prompt_counter"] = json!({});
-        assert!(name_counter(&mut counted, "local", "u", "u", false).is_err());
+    }
+
+    #[test]
+    fn a_local_deployment_without_input_modalities_is_an_error() {
+        for images in [false, true] {
+            let mut value = profile();
+            let local = value["deployments"][0].as_object_mut().unwrap();
+            local.remove("input_modalities");
+            let error = name_counter(&mut value, "local", "u", "u", images).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "deployment local has no input_modalities"
+            );
+            assert!(value["deployments"][0].get("token_counter").is_none());
+        }
     }
 }
