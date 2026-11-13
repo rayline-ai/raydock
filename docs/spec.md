@@ -325,7 +325,7 @@ One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `ses
 1. Claude Code: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK`, `CLAUDE_CODE_DISABLE_REFUSAL_RETRY`, `CLAUDE_CODE_TETHER_LIVE`, `RAYLINE_ENV_NAME`.
    - `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, in cloud mode: set to the router's auto-compact window for the model, or removed when the router gives none.
    - `CLAUDE_CODE_AUTO_MODE_SERVER`, in local mode: always `0`.
-2. Other harnesses: `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `OPENCODE_CONFIG`, `OPENCLAW_CONFIG_PATH`.
+2. Other harnesses: `CODEX_HOME` (cloud-mode Codex and the Codex desktop app, set to Rayline's own folder for it, section 8.2), `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `OPENCODE_CONFIG`, `OPENCLAW_CONFIG_PATH`.
 3. Removed from the Claude Code environment: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`.
 4. Removed from the `omp` environment: `CLAUDE_CONFIG_DIR`, `PI_PROFILE`, `OMP_PROFILE`.
 
