@@ -159,10 +159,10 @@ self-update verifies the binaries and license before installing them.
 
 The macOS platform tags are `macosx_10_12_x86_64` and `macosx_11_0_arm64`; the
 Go core needs macOS 13+ on both. Local mode is supported on Linux and Windows
-too; Windows CI runs the local process integration tests
-(`cargo test -p rayline-cli --test it_local_process`) alongside the lock and
-owner-only ACL unit tests. A successful cross-build of the core is still not
-runtime acceptance on its own. Production Homebrew publishing is handled by
-the Rayline release pipeline. `packaging/homebrew/raydock.rb.template` applies
+too; Windows CI runs clippy and the whole workspace test suite, including the
+local process integration tests (`it_local_process`). A successful
+cross-build of the core is still not runtime acceptance on its own.
+Production Homebrew publishing is handled by the Rayline release pipeline.
+`packaging/homebrew/raydock.rb.template` applies
 only to this repo's manual fallback archives; see the packaging README for the
 different layouts.
