@@ -351,8 +351,7 @@ The exact metadata and deployment-mode writes are a compatibility boundary,
 verified against Desktop 3.6556.2; they are not a public profile-launch API.
 Anthropic does not support routing
 Claude Code to non-Claude models through a gateway, so a Desktop update can
-change this behaviour; `scripts/smoke-claude-app.sh` checks the wire path with
-one headless Claude Code turn per model.
+change this behaviour.
 
 ## Which Model Runs (ARC by Default)
 

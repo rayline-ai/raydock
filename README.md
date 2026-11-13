@@ -244,8 +244,8 @@ cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings
 
 - [Getting Started](docs/getting-started.md) — setup, routing flags, provider
   endpoints, logs, and troubleshooting.
-- [Acceptance testing](docs/acceptance-testing.md) — validating the end-to-end
-  Claude Code path through Raydock.
+- [Acceptance testing](docs/acceptance-testing.md) — one real turn per harness
+  in cloud and local mode.
 - [Release process](docs/release.md) — how releases are built and published.
 
 ## Disclaimers
