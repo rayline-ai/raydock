@@ -1,21 +1,21 @@
 //! Restoring Claude Desktop's documented local profile library to the
 //! selection Rayline recorded. Keep the compatibility boundary here: no app
 //! patching, managed preferences, or subscription cookies.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 use serde_json::{Value, json};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 use std::fs;
 use std::io;
 use std::path::Path;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 use std::path::PathBuf;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const STATE_VERSION: u64 = 1;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 const MAX_JSON_BYTES: u64 = 1024 * 1024;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 pub(super) struct ProfileStore {
     home: PathBuf,
     library: PathBuf,
@@ -23,14 +23,14 @@ pub(super) struct ProfileStore {
     journal: PathBuf,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn invalid(message: &str) -> io::Error {
     io::Error::other(message)
 }
 
 /// Refuse links, oversized files and unknown shapes rather than clobbering
 /// another application's data. Absence is different from unreadable JSON.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn read_object(path: &Path) -> io::Result<Option<Value>> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -50,7 +50,7 @@ fn read_object(path: &Path) -> io::Result<Option<Value>> {
     Ok(Some(value))
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn valid_id(value: &Value) -> bool {
     value.as_str().is_some_and(|id| {
         id.len() == 36
@@ -64,7 +64,7 @@ fn valid_id(value: &Value) -> bool {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn write_json(home: &Path, path: &Path, value: &Value) -> io::Result<()> {
     write_beneath(
         home,
@@ -73,13 +73,13 @@ fn write_json(home: &Path, path: &Path, value: &Value) -> io::Result<()> {
     )
 }
 
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn c_name(name: &std::ffi::OsStr) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(name.as_bytes()).map_err(|_| invalid("Invalid Desktop path component"))
 }
 
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn owned_fd(fd: libc::c_int) -> io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
     if fd < 0 {
@@ -94,7 +94,7 @@ fn owned_fd(fd: libc::c_int) -> io::Result<std::os::fd::OwnedFd> {
     Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn check(result: libc::c_int) -> io::Result<()> {
     if result == 0 {
         Ok(())
@@ -108,7 +108,7 @@ fn check(result: libc::c_int) -> io::Result<()> {
 /// temporary file is created and renamed relative to that descriptor, so a
 /// symlink planted after validation cannot redirect the write. The directory
 /// is synced after the rename so the journal ordering survives a crash.
-#[cfg(all(unix, any(target_os = "macos", test)))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn write_beneath(home: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write;
     use std::os::fd::AsRawFd;
@@ -197,12 +197,7 @@ fn write_beneath(home: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
     fs::File::from(dir).sync_all()
 }
 
-#[cfg(all(not(unix), any(target_os = "macos", test)))]
-fn write_beneath(_home: &Path, _path: &Path, _contents: &[u8]) -> io::Result<()> {
-    Err(invalid("Automatic Desktop setup requires macOS"))
-}
-
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn restore_key(target: &mut Value, key: &str, previous: &Value) {
     if previous.is_null() {
         if let Some(object) = target.as_object_mut() {
@@ -214,7 +209,7 @@ fn restore_key(target: &mut Value, key: &str, previous: &Value) {
 }
 
 /// An absent leaf underneath a symlink must not redirect a later atomic write.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn check_no_symlinks(path: &Path) -> io::Result<()> {
     for ancestor in path.ancestors() {
         match fs::symlink_metadata(ancestor) {
@@ -229,7 +224,7 @@ fn check_no_symlinks(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 impl ProfileStore {
     pub(super) fn new(home: &Path) -> Self {
         let root = home.join("Library/Application Support/Claude-3p");
@@ -376,7 +371,7 @@ impl ProfileStore {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(unix, test)))]
 fn desktop_running_for_user(processes: &str, uid: u32) -> bool {
     processes.lines().any(|line| {
         let Some((owner, command)) = line.trim().split_once(char::is_whitespace) else {
@@ -515,7 +510,7 @@ pub(super) fn restore(home: &Path) -> io::Result<bool> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -773,7 +768,6 @@ mod tests {
         ));
     }
 
-    #[cfg(unix)]
     #[test]
     fn concurrent_profile_changes_are_excluded_until_guard_drops() {
         let f = Fixture::new();
@@ -783,7 +777,6 @@ mod tests {
         assert!(super::super::lifecycle_lock(&f.home).is_ok());
     }
 
-    #[cfg(unix)]
     #[test]
     fn desktop_state_is_written_only_under_its_harness_folder() {
         let f = Fixture::new();
@@ -803,7 +796,6 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
     fn writes_never_follow_a_directory_swapped_for_a_symlink_after_validation() {
         use std::os::unix::fs::{PermissionsExt, symlink};
@@ -830,7 +822,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn symlinked_configuration_paths_are_refused_without_modifying_the_target() {
         use std::os::unix::fs::symlink;

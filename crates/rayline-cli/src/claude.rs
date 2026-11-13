@@ -616,7 +616,9 @@ fn seed_isolated_claude_json(source: &Path, dest: &Path) -> io::Result<()> {
         Err(error) => return Err(error_with_path(source, error)),
     };
     fs::write(dest, contents).map_err(|error| error_with_path(dest, error))?;
-    set_user_private_permissions(dest)
+    #[cfg(unix)]
+    set_user_private_permissions(dest)?;
+    Ok(())
 }
 
 /// Return `raw` (`.claude.json` contents) with the auth keys removed, or `None`
@@ -645,7 +647,9 @@ fn copy_private_file(source: &Path, dest: &Path) -> io::Result<()> {
             format!("copy {} to {}: {error}", source.display(), dest.display()),
         )
     })?;
-    set_user_private_permissions(dest)
+    #[cfg(unix)]
+    set_user_private_permissions(dest)?;
+    Ok(())
 }
 
 fn error_with_path(path: &Path, error: io::Error) -> io::Error {
@@ -740,22 +744,20 @@ fn add_claude_bin_dir_to_child_path(command: &mut Command, claude_bin: &Path) {
 }
 
 /// Makes `path` readable by the user only (`0600`) and its parent dir `0700`.
-/// A failed chmod is an error with the path.
+/// A failed chmod is an error with the path. Unix only: Windows has no mode
+/// bits, and a file in the user's profile keeps the ACL it inherits there.
+#[cfg(unix)]
 fn set_user_private_permissions(path: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-        let restrict = |path: &Path, mode: u32| {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode))
-                .map_err(|error| error_with_path(path, error))
-        };
-        if let Some(parent) = path.parent() {
-            restrict(parent, 0o700)?;
-        }
-        restrict(path, 0o600)?;
+    let restrict = |path: &Path, mode: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(|error| error_with_path(path, error))
+    };
+    if let Some(parent) = path.parent() {
+        restrict(parent, 0o700)?;
     }
-    Ok(())
+    restrict(path, 0o600)
 }
 
 fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
