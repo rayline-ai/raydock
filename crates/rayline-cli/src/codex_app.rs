@@ -29,11 +29,8 @@ pub struct AppRunRequest {
     pub auth_mode: CodexAuthMode,
     /// Extra args passed through to `codex app` (e.g. a workspace path).
     pub codex_args: Vec<OsString>,
-    pub root_env_explicit: bool,
     /// Hosted environment (`--env`) whose router the app talks to.
     pub env_name: Option<String>,
-    /// Account bearer (`--auth-token`) for minting/reading the `rlk-` key.
-    pub auth_token: Option<String>,
 }
 
 pub async fn run(request: AppRunRequest) -> ExitCode {
@@ -41,8 +38,6 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
         request.auth_mode,
         request.model.as_deref(),
         request.env_name.as_deref(),
-        request.auth_token.as_deref(),
-        request.root_env_explicit,
     )
     .await
     {

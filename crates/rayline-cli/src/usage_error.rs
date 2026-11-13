@@ -24,8 +24,7 @@ const PRIVATE_COMMANDS: &[&str] = &[
 ];
 
 pub(crate) const HYBRID_ROOT_OPTIONS: &str = "\
-raydock: `hybrid` reads `--env` after its subcommand (`raydock hybrid start --env dev`) \
-and has no `--auth-token`
+raydock: `hybrid` reads `--env` after its subcommand (`raydock hybrid start --env dev`)
 Run `raydock hybrid --help` for details.";
 
 /// The arguments after the program name, counting how many a parser has
@@ -111,11 +110,6 @@ pub(crate) fn rejected_argv(
         return RaylineDispatch::Usage(with_usage(message, &command));
     };
     let bad = args[stop];
-    // Never echo a token.
-    if stop > 0 && args[stop - 1] == "--auth-token" {
-        let message = "raydock: invalid `--auth-token` value".to_owned();
-        return RaylineDispatch::Usage(with_usage(message, &command));
-    }
 
     if let Some(env) = env_value_at(&args, stop) {
         if !crate::status::is_valid_root_env(env) {
@@ -358,10 +352,7 @@ mod tests {
                 "raydock: `raydock codex configure` rejected `--env` after `--auth`\n"
             )
         );
-        let message = usage_message(&["--auth-token", "secret-value", "top", "--env", "dev"]);
-        assert!(!message.contains("secret-value"), "{message}");
         for args in [
-            &["top", "--auth-token=secret-value"][..],
             &["top", "--api-key=secret-value"][..],
             &["--api-key=secret-value", "top"][..],
         ] {
@@ -406,18 +397,14 @@ mod tests {
         );
         let message = usage_message(&["--env"]);
         assert!(message.starts_with("raydock: `--env` needs a value: `raydock --env <name>`"));
-        let message = usage_message(&["status", "--auth-token"]);
-        assert!(message.starts_with("raydock: `--auth-token` needs a value"));
     }
 
     #[test]
     fn hybrid_with_root_options_says_where_env_goes() {
-        for args in [
-            &["--env", "dev", "hybrid", "status"][..],
-            &["--auth-token", "t", "hybrid"][..],
-        ] {
-            assert_eq!(usage_message(args), super::HYBRID_ROOT_OPTIONS);
-        }
+        assert_eq!(
+            usage_message(&["--env", "dev", "hybrid", "status"]),
+            super::HYBRID_ROOT_OPTIONS
+        );
     }
 
     #[test]
@@ -425,16 +412,14 @@ mod tests {
         for args in [
             &["claude-desktop", "private prompt"][..],
             &["codex", "configure", "--auth", "secret-value"][..],
-            &["top", "--env", "--auth-token=secret-value"][..],
-            &["--env", "--auth-token=secret-value", "status"][..],
-            &["--env=--auth-token=secret-value", "status"][..],
+            &["top", "--env", "--api-key=secret-value"][..],
+            &["--env", "--api-key=secret-value", "status"][..],
+            &["--env=--api-key=secret-value", "status"][..],
             &["top", "--env", "secret-value"][..],
             &["codex", "--auth", "secret-value"][..],
             &["claude-desktop", "--bogus=secret-value"][..],
             &["top", "secret-value"][..],
             &["top", "-nsecret-value"][..],
-            &["status", "--auth-token", "-secret-value", "unexpected"][..],
-            &["status", "--auth-token", "--secret-value", "unexpected"][..],
             &["codex", "--env", "--private prompt"][..],
             &["top", "--Secret-Value"][..],
             &["private prompt"][..],
@@ -444,29 +429,6 @@ mod tests {
                 !message.contains("private prompt") && !message.contains("secret-value"),
                 "{args:?}: {message}"
             );
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn non_utf8_auth_token_is_not_echoed() {
-        use std::os::unix::ffi::OsStringExt;
-
-        for prefix in [&["status"][..], &[][..]] {
-            let mut argv = std::iter::once("raydock")
-                .chain(prefix.iter().copied())
-                .chain(["--auth-token"])
-                .map(OsString::from)
-                .collect::<Vec<_>>();
-            argv.push(OsString::from_vec(b"secret-value\xff".to_vec()));
-            argv.push(OsString::from("status"));
-            match rayline_dispatch_for_argv(&argv) {
-                RaylineDispatch::Usage(message) => {
-                    assert!(!message.contains("secret-value"), "{message}");
-                    assert!(message.starts_with("raydock: invalid `--auth-token` value"));
-                }
-                other => panic!("expected a usage error, got {other:?}"),
-            }
         }
     }
 

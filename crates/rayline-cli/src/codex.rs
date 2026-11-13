@@ -43,11 +43,8 @@ pub struct RunRequest {
     pub model: Option<String>,
     pub auth_mode: CodexAuthMode,
     pub codex_args: Vec<OsString>,
-    pub root_env_explicit: bool,
     /// Hosted environment (`--env`) whose router Codex talks to.
     pub env_name: Option<String>,
-    /// Account bearer (`--auth-token`) used to mint or read the `rlk-` router key.
-    pub auth_token: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,8 +55,6 @@ pub struct ConfigureRequest {
     pub base_url: Option<String>,
     pub auth_mode: CodexAuthMode,
     pub env_name: Option<String>,
-    pub auth_token: Option<String>,
-    pub root_env_explicit: bool,
 }
 
 /// The `rayline` provider Codex is configured with.
@@ -73,27 +68,21 @@ pub(crate) struct Provider {
 }
 
 /// Resolve the provider for a Codex launch: the environment's router, the
-/// user's router key (an explicit `RAYLINE_ROUTER_API_KEY`, else the stored or
-/// minted `rlk-` key) and the model (`--model`, else the key's main model).
+/// stored `rlk-` router key (see [`crate::status::router_key`]) and the
+/// model (`--model`, else the key's main model).
 pub(crate) async fn resolve_provider(
     auth_mode: CodexAuthMode,
     model: Option<&str>,
     env_name: Option<&str>,
-    auth_token: Option<&str>,
-    root_env_explicit: bool,
 ) -> Result<Provider, String> {
     auth_mode.require_auto()?;
     let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_owned())?;
-    let env = crate::status::resolve_env(env_name, Some(&home));
-    let hosted = crate::status::resolve_hosted_environment(&env, Some(&home))
+    let hosted = crate::status::resolve_hosted_environment(env_name, &home)
         .map_err(|error| error.to_string())?;
-    let router_url = crate::harness::normalize_router_url(&hosted.router_url);
-    let key = match explicit_router_key() {
-        Some(key) => key,
-        None => crate::claude::ensure_router_key(&env, &home, auth_token, root_env_explicit)
-            .await
-            .map_err(|error| error.to_string())?,
-    };
+    let router_url = crate::harness::normalize_router_url(&hosted.base_url);
+    let key = crate::status::router_key(&hosted, &home)
+        .await
+        .map_err(|error| error.to_string())?;
     let model = match model {
         Some(model) => model.to_owned(),
         None => {
@@ -109,13 +98,6 @@ pub(crate) async fn resolve_provider(
     })
 }
 
-/// A non-empty `RAYLINE_ROUTER_API_KEY` the user set explicitly.
-fn explicit_router_key() -> Option<String> {
-    std::env::var_os("RAYLINE_ROUTER_API_KEY")
-        .and_then(|value| value.into_string().ok())
-        .filter(|value| !value.is_empty())
-}
-
 /// The `CODEX_HOME` `raydock codex` runs Codex CLI on.
 fn codex_home(home: &Path) -> PathBuf {
     home.join(crate::DOT_CONFIG_DIR)
@@ -128,8 +110,6 @@ pub async fn run(request: RunRequest) -> ExitCode {
         request.auth_mode,
         request.model.as_deref(),
         request.env_name.as_deref(),
-        request.auth_token.as_deref(),
-        request.root_env_explicit,
     )
     .await
     {
@@ -160,11 +140,9 @@ pub async fn run(request: RunRequest) -> ExitCode {
 /// from its owner-only `config.toml`, so it never needs it in the environment.
 /// Codex snapshots its environment for the shells it spawns
 /// (`$CODEX_HOME/shell_snapshots`), so a key it inherited would be written to
-/// disk in plain text. The launcher reads an explicit `RAYLINE_ROUTER_API_KEY`
-/// before this, when it resolves the key. `RAYLINE_KEY` goes too.
+/// disk in plain text.
 pub(crate) fn withhold_router_key(command: &mut Command) {
     command.env_remove("RAYLINE_ROUTER_API_KEY");
-    command.env_remove(crate::harness::KEY_ENV);
 }
 
 /// A `codex` child process with the router key withheld (#84). Every Codex
@@ -203,8 +181,6 @@ pub async fn configure(request: &ConfigureRequest) -> io::Result<String> {
         request.auth_mode,
         request.model.as_deref(),
         request.env_name.as_deref(),
-        request.auth_token.as_deref(),
-        request.root_env_explicit,
     )
     .await
     .map_err(io::Error::other)?;
@@ -291,7 +267,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn subscription_and_none_fail_before_reading_a_key() {
         for mode in [CodexAuthMode::Subscription, CodexAuthMode::None] {
-            let error = super::resolve_provider(mode, None, Some("no-such-env"), None, false)
+            let error = super::resolve_provider(mode, None, Some("no-such-env"))
                 .await
                 .unwrap_err();
             assert!(error.contains("not available yet"), "{error}");
@@ -362,14 +338,12 @@ pub(crate) mod tests {
     #[test]
     fn codex_command_withholds_the_router_key() {
         let command = codex_command();
-        for var in ["RAYLINE_ROUTER_API_KEY", "RAYLINE_KEY"] {
-            assert!(
-                command
-                    .get_envs()
-                    .any(|(key, value)| key == var && value.is_none()),
-                "codex_command does not remove {var}"
-            );
-        }
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == "RAYLINE_ROUTER_API_KEY" && value.is_none()),
+            "codex_command does not remove RAYLINE_ROUTER_API_KEY"
+        );
     }
 
     /// #84: a router key in the launcher's environment must not reach Codex,

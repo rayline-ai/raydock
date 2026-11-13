@@ -17,6 +17,10 @@ const DAEMON_SPAWN_MAX_DELAY_SECONDS: i64 = 60;
 
 pub struct RequestSpec<'a> {
     pub env_name: &'a str,
+    /// The hosted router the launch talks to (`ANTHROPIC_BASE_URL`). Two
+    /// environments can share a name (the built-in prod and an `environments`
+    /// entry named `prod`), so a daemon is this launch's only on the same router.
+    pub router_url: &'a str,
     pub auto_compact_window: Option<&'a str>,
     /// The effective refusal-recovery switches (`refusal_recovery_values`). A
     /// reused daemon's background workers inherit its env, so a daemon that
@@ -283,6 +287,14 @@ fn daemon_owner_matches_request(state: &DaemonState, request: &RequestSpec<'_>) 
     }
     if state
         .env_vars
+        .get("ANTHROPIC_BASE_URL")
+        .map(|url| url.trim_end_matches('/'))
+        != Some(request.router_url.trim_end_matches('/'))
+    {
+        return false;
+    }
+    if state
+        .env_vars
         .get(AUTO_COMPACT_WINDOW_ENV)
         .map(String::as_str)
         != request.auto_compact_window
@@ -462,6 +474,9 @@ fn daemon_was_launched_by_wksp(
         if entry.get("env").and_then(Value::as_str) != Some(request.env_name) {
             continue;
         }
+        if entry.get("router_url").and_then(Value::as_str) != Some(request.router_url) {
+            continue;
+        }
         if entry.get("auto_compact_window").and_then(Value::as_str) != request.auto_compact_window {
             continue;
         }
@@ -558,6 +573,7 @@ fn launch_entry(request: &RequestSpec<'_>, pid: u32, ts: i64) -> Value {
     serde_json::json!({
         "pid": pid,
         "env": request.env_name,
+        "router_url": request.router_url,
         "auto_compact_window": request.auto_compact_window,
         "refusal_recovery": request
             .refusal_recovery
@@ -642,6 +658,7 @@ mod tests {
     fn launch_request() -> RequestSpec<'static> {
         RequestSpec {
             env_name: "prod",
+            router_url: crate::ROUTER_PROD_URL,
             auto_compact_window: Some("180000"),
             refusal_recovery: Box::leak(
                 crate::claude::refusal_recovery_values(|_| None).into_boxed_slice(),
@@ -726,6 +743,38 @@ mod tests {
         assert_eq!(
             classify_launch_safety(&state, &request, &home),
             Safety::Safe
+        );
+    }
+
+    // The built-in prod and an `environments` entry named `prod` share the
+    // name, so a daemon on the other router is not this launch's.
+    #[test]
+    fn daemon_on_another_router_with_the_same_name_conflicts() {
+        let home = temp_home();
+        let request = launch_request();
+        let mut other = rayline_env();
+        other.insert(
+            "ANTHROPIC_BASE_URL".to_owned(),
+            "https://router.example.test".to_owned(),
+        );
+
+        assert_eq!(
+            classify_launch_safety(&state(other), &request, &home),
+            Safety::Conflict
+        );
+    }
+
+    #[test]
+    fn launch_record_for_another_router_does_not_attribute() {
+        let home = temp_home();
+        let mut recorded = launch_request();
+        recorded.router_url = "https://router.example.test";
+        let state = unreadable_state(Some(9005), Some(1_700_000_040_000));
+        write_launch_log(&home, &recorded, 9005, 1_700_000_040);
+
+        assert_eq!(
+            classify_launch_safety(&state, &launch_request(), &home),
+            Safety::Conflict
         );
     }
 

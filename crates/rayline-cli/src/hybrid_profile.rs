@@ -1170,14 +1170,8 @@ pub(crate) fn saved_credentials(
         }
         all_references.push((deployment.get("auth_env"), deployment.get("url")));
     }
-    let mut environments = vec![crate::status::PROD_ENV.to_owned()];
-    if let Some(configured) = crate::status::read_settings(home)
-        .as_ref()
-        .and_then(|settings| settings.get("environments"))
-        .and_then(Value::as_object)
-    {
-        environments.extend(configured.keys().cloned());
-    }
+    let environments =
+        crate::status::hosted_environments(home).map_err(|error| error.to_string())?;
     let mut result: Vec<(String, String)> = Vec::new();
     for &(name, url) in &references {
         let (Some(name), Some(url)) = (name.and_then(Value::as_str), url.and_then(Value::as_str))
@@ -1190,14 +1184,13 @@ pub(crate) fn saved_credentials(
         let Some(host) = https_host(url) else {
             continue;
         };
-        for env_name in &environments {
-            let Ok(hosted) = crate::status::resolve_hosted_environment(env_name, Some(home)) else {
-                continue;
-            };
-            if https_host(&hosted.router_url).as_deref() != Some(host.as_str()) {
+        for hosted in &environments {
+            if https_host(&hosted.base_url).as_deref() != Some(host.as_str()) {
                 continue;
             }
-            let Some(key) = crate::status::load_claude_key_from_home(env_name, home) else {
+            let Some(key) = crate::status::stored_router_key(hosted, home)
+                .map_err(|error| error.to_string())?
+            else {
                 continue;
             };
             match result.iter().find(|(existing, _)| existing == name) {
@@ -1233,45 +1226,32 @@ fn https_host(url: &str) -> Option<String> {
     rayline_local_router::decisions_url::https_authority(url)
 }
 
-/// Router URLs of every configured Rayline environment: the built-in `prod`
-/// plus each valid `environments` entry in settings.json.
-pub(crate) fn configured_router_urls(home: &Path) -> Vec<String> {
-    let mut names = vec![crate::status::PROD_ENV.to_owned()];
-    if let Some(configured) = crate::status::read_settings(home)
-        .as_ref()
-        .and_then(|settings| settings.get("environments"))
-        .and_then(Value::as_object)
-    {
-        names.extend(configured.keys().cloned());
-    }
-    names
+/// Router URLs of every hosted Rayline environment: the built-in prod plus
+/// each `environments` entry of the config.
+pub(crate) fn configured_router_urls(
+    home: &Path,
+) -> Result<Vec<String>, crate::config::ConfigError> {
+    Ok(crate::status::hosted_environments(home)?
         .iter()
-        .filter_map(|name| crate::status::resolve_hosted_environment(name, Some(home)).ok())
         // Only the origin: a router URL's path, query or userinfo never
         // reaches `rld`'s arguments, and one with credentials is dropped.
-        .filter_map(|hosted| https_host(&hosted.router_url))
+        .filter_map(|hosted| https_host(&hosted.base_url))
         .map(|authority| format!("https://{authority}"))
-        .collect()
+        .collect())
 }
 
-/// The configured environment whose router serves `url` (same HTTPS host
-/// and port), e.g. to name the right `raydock --env <env> auth login`.
-pub(crate) fn environment_for_url(home: &Path, url: &str) -> Option<String> {
-    let target = https_host(url)?;
-    let mut names = vec![crate::status::PROD_ENV.to_owned()];
-    if let Some(configured) = crate::status::read_settings(home)
-        .as_ref()
-        .and_then(|settings| settings.get("environments"))
-        .and_then(Value::as_object)
-    {
-        names.extend(configured.keys().cloned());
-    }
-    names.into_iter().find(|name| {
-        crate::status::resolve_hosted_environment(name, Some(home))
-            .ok()
-            .and_then(|hosted| https_host(&hosted.router_url))
-            .is_some_and(|authority| authority == target)
-    })
+/// The hosted environment whose router serves `url` (same HTTPS host and
+/// port), e.g. to name the right `raydock --env <env> auth login`.
+pub(crate) fn environment_for_url(
+    home: &Path,
+    url: &str,
+) -> Result<Option<crate::status::HostedEnvironment>, crate::config::ConfigError> {
+    let Some(target) = https_host(url) else {
+        return Ok(None);
+    };
+    Ok(crate::status::hosted_environments(home)?
+        .into_iter()
+        .find(|hosted| https_host(&hosted.base_url).as_deref() == Some(target.as_str())))
 }
 
 /// Refuse a configuration whose `decisions.url` is not a Rayline router of a
@@ -1527,12 +1507,8 @@ mod tests {
             std::env::temp_dir().join(format!("rayline-hybrid-default-{}", std::process::id()));
         let dir = home.join(".config").join(crate::CONFIG_DIR);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.json"), r#"{"environments":{"dev":{"router_url":"https://api-dev.rayline.ai","cli_auth_url":"https://dev.example/cli-auth"}}}"#).unwrap();
-        std::fs::write(
-            dir.join("credentials.json"),
-            r#"{"router_keys":{"dev":{"apiKey":"rlk-dev-synthetic"}}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"environments":{"dev":{"base_url":"https://api-dev.rayline.ai","login_url":"https://dev.example/cli-auth"}}}"#).unwrap();
+        crate::credentials::save_test_router_key(&home, Some("dev"), "rlk-dev-synthetic");
         let found = saved_credentials(config, &home, |_| None).unwrap();
         assert_eq!(
             found,
@@ -1968,12 +1944,8 @@ mod tests {
             std::env::temp_dir().join(format!("rayline-hybrid-localvar-{}", std::process::id()));
         let dir = home.join(".config").join(crate::CONFIG_DIR);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("settings.json"), r#"{"environments":{"dev":{"router_url":"https://api-dev.rayline.ai","cli_auth_url":"https://dev.example/cli-auth"}}}"#).unwrap();
-        std::fs::write(
-            dir.join("credentials.json"),
-            r#"{"router_keys":{"dev":{"apiKey":"rlk-dev-synthetic"}}}"#,
-        )
-        .unwrap();
+        std::fs::write(dir.join("settings.json"), r#"{"environments":{"dev":{"base_url":"https://api-dev.rayline.ai","login_url":"https://dev.example/cli-auth"}}}"#).unwrap();
+        crate::credentials::save_test_router_key(&home, Some("dev"), "rlk-dev-synthetic");
         let mut shared = profile();
         shared["deployments"][0]["auth_env"] = json!("RAYLINE_ROUTER_API_KEY");
         shared["deployments"][0]["url"] = json!("https://remote.example/v1/chat/completions");
@@ -2136,14 +2108,11 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("settings.json"),
-            r#"{"environments":{"dev":{"router_url":"https://api-dev.rayline.ai","cli_auth_url":"https://dev.example/cli-auth"}}}"#,
+            r#"{"environments":{"dev":{"base_url":"https://api-dev.rayline.ai","login_url":"https://dev.example/cli-auth"}}}"#,
         )
         .unwrap();
-        std::fs::write(
-            config_dir.join("credentials.json"),
-            r#"{"router_keys":{"dev":{"apiKey":"rlk-dev-synthetic"},"prod":{"apiKey":"rlk-prod-synthetic"}}}"#,
-        )
-        .unwrap();
+        crate::credentials::save_test_router_key(&home, Some("dev"), "rlk-dev-synthetic");
+        crate::credentials::save_test_router_key(&home, None, "rlk-prod-synthetic");
         let unset = |_: &str| None;
         let found = saved_credentials(&profile(), &home, unset).unwrap();
         assert_eq!(
@@ -2174,6 +2143,43 @@ mod tests {
         let mut port = profile();
         port["deployments"][1]["url"] = json!("https://api-dev.rayline.ai:8443/v1/messages");
         assert!(saved_credentials(&port, &home, unset).is_err());
+        // A credentials file that does not load stops the launch with its error.
+        std::fs::write(config_dir.join("credentials.json"), r#"{"session":{}}"#).unwrap();
+        let error = saved_credentials(&profile(), &home, unset).unwrap_err();
+        assert!(error.contains("auth login"), "{error}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_environment_named_prod_is_not_the_built_in_prod() {
+        let home = std::env::temp_dir().join(format!(
+            "rayline-hybrid-configured-prod-{}",
+            std::process::id()
+        ));
+        let config_dir = home.join(".config").join(crate::CONFIG_DIR);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("settings.json"),
+            r#"{"environments":{"prod":{"base_url":"https://router.other.example","login_url":"https://other.example/cli-auth"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured_router_urls(&home).unwrap(),
+            vec![
+                "https://api.rayline.ai:443".to_owned(),
+                "https://router.other.example:443".to_owned()
+            ]
+        );
+        let slot = |url| {
+            environment_for_url(&home, url)
+                .unwrap()
+                .map(|hosted| hosted.env)
+        };
+        assert_eq!(slot("https://api.rayline.ai/v1/decisions"), Some(None));
+        assert_eq!(
+            slot("https://router.other.example/v1/decisions"),
+            Some(Some("prod".to_owned()))
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -2185,10 +2191,10 @@ mod tests {
         std::fs::create_dir_all(&config_dir).unwrap();
         std::fs::write(
             config_dir.join("settings.json"),
-            r#"{"environments":{"stage":{"router_url":"https://router.stage.example:8443","cli_auth_url":"https://stage.example/cli-auth"}}}"#,
+            r#"{"environments":{"stage":{"base_url":"https://router.stage.example:8443","login_url":"https://stage.example/cli-auth"}}}"#,
         )
         .unwrap();
-        let routers = configured_router_urls(&home);
+        let routers = configured_router_urls(&home).unwrap();
         assert_eq!(
             routers,
             vec![

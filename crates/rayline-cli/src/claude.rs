@@ -1,7 +1,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -19,7 +19,6 @@ const SUBAGENT_MODEL_FORCE_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
 /// Claude Code's model for its `haiku` alias, which its background tasks
 /// (titles, summaries) use.
 const HAIKU_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
-const DEFAULT_ROUTER_KEY_NAME: &str = "rayline-cli";
 /// Claude Code's `--model` / `ANTHROPIC_MODEL` aliases (each may also carry a
 /// `[1m]` suffix).
 const CLAUDE_CODE_MODEL_ALIASES: [&str; 7] = [
@@ -48,7 +47,6 @@ pub(crate) const RAYLINE_ENV_NAME_ENV: &str = "RAYLINE_ENV_NAME";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
     pub env_name: Option<String>,
-    pub auth_token: Option<String>,
     pub args: Vec<OsString>,
     /// Run against an isolated Claude config dir (`~/.rayline/harness/claude-code`) so this
     /// session can start its own background-agents supervisor alongside a
@@ -145,12 +143,9 @@ pub enum RunError {
     ClaudeMissing,
     HomeNotFound,
     DaemonConflict(String),
-    MissingRouterKey(String),
     Router(String),
     HostedEnvironment(String),
-    Auth(crate::status::AuthTokenError),
-    Login(String),
-    KeyProvision(String),
+    Auth(crate::status::AuthError),
     IsolatedProfile(io::Error),
 }
 
@@ -162,17 +157,9 @@ impl std::fmt::Display for RunError {
             ),
             Self::HomeNotFound => formatter.write_str("home directory not found"),
             Self::DaemonConflict(message) => formatter.write_str(message),
-            Self::MissingRouterKey(env_name) => write!(
-                formatter,
-                "No {} router key stored for {env_name}. Run: {} auth login",
-                crate::DISPLAY_NAME,
-                crate::CLI_BIN
-            ),
             Self::Router(message) => formatter.write_str(message),
             Self::HostedEnvironment(message) => formatter.write_str(message),
             Self::Auth(error) => error.fmt(formatter),
-            Self::Login(message) => formatter.write_str(message),
-            Self::KeyProvision(message) => formatter.write_str(message),
             Self::IsolatedProfile(error) => {
                 write!(formatter, "failed to prepare the isolated Claude profile: {error}")
             }
@@ -182,8 +169,8 @@ impl std::fmt::Display for RunError {
 
 impl std::error::Error for RunError {}
 
-impl From<crate::status::AuthTokenError> for RunError {
-    fn from(error: crate::status::AuthTokenError) -> Self {
+impl From<crate::status::AuthError> for RunError {
+    fn from(error: crate::status::AuthError) -> Self {
         Self::Auth(error)
     }
 }
@@ -217,17 +204,11 @@ async fn run_command_from_home(
     home: &Path,
     claude_bin: PathBuf,
 ) -> Result<Command, RunError> {
-    let env_name = crate::status::resolve_env(request.env_name.as_deref(), Some(home));
-    let router_url = crate::status::resolve_hosted_environment(&env_name, Some(home))
-        .map_err(|error| RunError::HostedEnvironment(error.to_string()))?
-        .router_url;
-    let key = ensure_router_key(
-        &env_name,
-        home,
-        request.auth_token.as_deref(),
-        request.root_env_explicit,
-    )
-    .await?;
+    let hosted = crate::status::resolve_hosted_environment(request.env_name.as_deref(), home)
+        .map_err(|error| RunError::HostedEnvironment(error.to_string()))?;
+    let env_name = hosted.name().to_owned();
+    let router_url = hosted.base_url.clone();
+    let key = crate::status::router_key(&hosted, home).await?;
 
     // The main model the user chose. Claude Code's own `--model` (after `--`)
     // wins over `ANTHROPIC_MODEL`.
@@ -250,16 +231,7 @@ async fn run_command_from_home(
     let auto_compact_window = match explicit_auto_compact_window() {
         Some(window) => Some(window),
         None if is_claude_code_model_alias(&model) => None,
-        None => {
-            router_auto_compact_window(
-                &env_name,
-                &router_url,
-                request.auth_token.as_deref(),
-                &key,
-                &model,
-            )
-            .await?
-        }
+        None => router_auto_compact_window(&router_url, &key, &model).await?,
     };
 
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
@@ -276,6 +248,7 @@ async fn run_command_from_home(
     ));
     let daemon_request = RequestSpec {
         env_name: &env_name,
+        router_url: &router_url,
         auto_compact_window: auto_compact_window.as_deref(),
         refusal_recovery: &launch_switches,
         args: &request.args,
@@ -340,93 +313,6 @@ async fn run_command_from_home(
         preserve_spawned_by_pid,
     });
     Ok(command)
-}
-
-/// Provision (mint or read) the hosted router key (`rlk-`) for `env_name`.
-///
-/// Walks the onboarding ladder so a bare `claude` run is all a new user needs:
-/// if no key is stored it mints one, signing in first when the user is not yet
-/// authenticated (the `auth login` step). Interactive sign-in only fires on a
-/// real terminal; non-interactive callers get an error instead of blocking on
-/// a browser. Shared by the Claude, Codex and hybrid launches.
-pub(crate) async fn ensure_router_key(
-    env_name: &str,
-    home: &Path,
-    auth_token: Option<&str>,
-    root_env_explicit: bool,
-) -> Result<String, RunError> {
-    if let Some(token) = auth_token.filter(|token| !token.is_empty()) {
-        eprintln!("Provisioning {} router key...", crate::DISPLAY_NAME);
-        return crate::status::provision_router_key(env_name, home, DEFAULT_ROUTER_KEY_NAME, token)
-            .await
-            .map_err(|error| RunError::KeyProvision(error.to_string()));
-    }
-
-    if let Some(key) = crate::status::load_claude_key_from_home(env_name, home) {
-        return Ok(key);
-    }
-
-    let Some(token) = resolve_auth_token_or_login(env_name, auth_token, root_env_explicit).await?
-    else {
-        return Err(RunError::MissingRouterKey(env_name.to_owned()));
-    };
-
-    eprintln!("Provisioning {} router key...", crate::DISPLAY_NAME);
-    crate::status::provision_router_key(env_name, home, DEFAULT_ROUTER_KEY_NAME, &token)
-        .await
-        .map_err(|error| RunError::KeyProvision(error.to_string()))
-}
-
-/// Return an account bearer token for `env_name`, launching the interactive
-/// sign-in flow when no usable credentials are stored. Returns `Ok(None)` when
-/// no token is available and we cannot prompt (non-interactive session), so the
-/// caller can report that no key is stored.
-async fn resolve_auth_token_or_login(
-    env_name: &str,
-    auth_token: Option<&str>,
-    root_env_explicit: bool,
-) -> Result<Option<String>, RunError> {
-    let token_request = crate::status::AuthTokenRequest {
-        env_name: Some(env_name.to_owned()),
-        auth_token: auth_token.map(ToOwned::to_owned),
-        root_env_explicit,
-    };
-
-    // Auto sign-in only makes sense when we can actually drive a browser/device
-    // prompt, so require both stdin and stdout to be a terminal. Print-mode
-    // pipelines (`claude -p ... | cmd`) get the non-interactive error.
-    let interactive = io::stdin().is_terminal() && io::stdout().is_terminal();
-
-    match crate::status::resolve_auth_token(&token_request).await {
-        Ok(crate::status::AuthTokenOutcome::Available(token)) => return Ok(Some(token)),
-        // Credentials are missing or stale (expired/revoked refresh token). On a
-        // terminal, re-running sign-in repairs both; otherwise report the
-        // missing key, or surface the refresh failure.
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) if !interactive => {
-            return Ok(None);
-        }
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) => {}
-        Err(error) if !interactive => return Err(error.into()),
-        Err(_) => {}
-    }
-
-    eprintln!("Signing in to {}...", crate::DISPLAY_NAME);
-    let login_request = crate::status::AuthLoginRequest {
-        env_name: Some(env_name.to_owned()),
-        root_env_explicit,
-        no_browser: false,
-        paste: false,
-    };
-    let message = crate::status::auth_login(&login_request)
-        .await
-        .map_err(|error| RunError::Login(error.to_string()))?;
-    crate::status::write_auth_message(&message)
-        .map_err(|error| RunError::Login(format!("failed to write login output: {error}")))?;
-
-    match crate::status::resolve_auth_token(&token_request).await? {
-        crate::status::AuthTokenOutcome::Available(token) => Ok(Some(token)),
-        crate::status::AuthTokenOutcome::NotLoggedIn => Ok(None),
-    }
 }
 
 /// The refusal-recovery switches the child runs with and a reused daemon must
@@ -520,13 +406,11 @@ fn set_auto_compact_window_env(command: &mut Command, auto_compact_window: Optio
 /// for one Claude Code sizes itself, which is `None` here. A failed request or a
 /// window that isn't a positive integer fails the launch rather than guessing.
 async fn router_auto_compact_window(
-    env_name: &str,
     router_base: &str,
-    auth_token: Option<&str>,
     router_key: &str,
     model: &str,
 ) -> Result<Option<String>, RunError> {
-    get_router_settings(env_name, router_base, auth_token, router_key, model)
+    get_router_settings(router_base, router_key, model)
         .await
         .and_then(|body| match body.get("autoCompactWindow") {
             None | Some(Value::Null) => Ok(None),
@@ -546,34 +430,18 @@ async fn router_auto_compact_window(
         })
 }
 
-/// `GET /v1/settings?model=<model>`. Prefer account credentials when
-/// available, but fall back to the already-provisioned router key because the
-/// router accepts either bearer form.
+/// `GET /v1/settings?model=<model>` with the router key.
 async fn get_router_settings(
-    env_name: &str,
     router_base: &str,
-    auth_token: Option<&str>,
     router_key: &str,
     model: &str,
 ) -> Result<Value, String> {
-    let token_request = crate::status::AuthTokenRequest {
-        env_name: Some(env_name.to_owned()),
-        // Honor an explicit `--auth-token` first; when account credentials are
-        // absent or expired, the stored router key below can still read settings.
-        auth_token: auth_token.map(ToOwned::to_owned),
-        root_env_explicit: false,
-    };
-    let bearer_token = match crate::status::resolve_auth_token(&token_request).await {
-        Ok(crate::status::AuthTokenOutcome::Available(token)) => token,
-        Ok(crate::status::AuthTokenOutcome::NotLoggedIn) => router_key.to_owned(),
-        Err(_) => router_key.to_owned(),
-    };
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|error| error.to_string())?
         .get(format!("{router_base}/v1/settings"))
-        .bearer_auth(bearer_token)
+        .bearer_auth(router_key)
         // `client_sizes=1` tells the router this client accepts a null window
         // (Claude Code sizes the model itself).
         .query(&[("model", model), ("client_sizes", "1")])
@@ -1059,24 +927,19 @@ mod refusal_recovery_env_tests {
         let _ = std::fs::remove_dir_all(&home);
         let config_dir = home.join(".config").join(crate::CONFIG_DIR);
         std::fs::create_dir_all(&config_dir).unwrap();
-        std::fs::write(
-            config_dir.join("credentials.json"),
-            r#"{"router_keys":{"stub":{"apiKey":"rlk-test"}}}"#,
-        )
-        .unwrap();
+        crate::credentials::save_test_router_key(&home, Some("stub"), "rlk-test");
         let router_url = listing_stub().await;
         std::fs::write(
             config_dir.join("settings.json"),
             serde_json::json!({"environments": {"stub": {
-                "router_url": router_url,
-                "cli_auth_url": "http://127.0.0.1:9/cli-auth"
+                "base_url": router_url,
+                "login_url": "http://127.0.0.1:9/cli-auth"
             }}})
             .to_string(),
         )
         .unwrap();
         let request = RunRequest {
             env_name: Some("stub".to_owned()),
-            auth_token: None,
             args: Vec::new(),
             isolated: false,
             root_env_explicit: true,
@@ -1183,7 +1046,7 @@ mod router_auto_compact_window_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A `/v1/settings` stub answering one request with `status` and `body`;
-    /// the join handle yields the request line it received.
+    /// the join handle yields the request it received.
     async fn settings_stub(
         status: &'static str,
         body: &'static str,
@@ -1200,7 +1063,7 @@ mod router_auto_compact_window_tests {
                 body.len()
             );
             stream.write_all(response.as_bytes()).await.unwrap();
-            request.lines().next().unwrap_or_default().to_owned()
+            request
         });
         (base, served)
     }
@@ -1210,21 +1073,26 @@ mod router_auto_compact_window_tests {
         body: &'static str,
     ) -> (Result<Option<String>, String>, String) {
         let (base, served) = settings_stub(status, body).await;
-        let window =
-            router_auto_compact_window("dev", &base, Some("token"), "key", "arc-sage-1.0[1m]")
-                .await
-                .map_err(|error| error.to_string());
+        let window = router_auto_compact_window(&base, "key", "arc-sage-1.0[1m]")
+            .await
+            .map_err(|error| error.to_string());
         (window, served.await.unwrap())
     }
 
     #[tokio::test]
     async fn asks_the_router_with_the_launch_model_and_returns_its_window() {
-        let (window, request_line) =
+        let (window, request) =
             window("200 OK", r#"{"settings":{},"autoCompactWindow":262144}"#).await;
         assert_eq!(window, Ok(Some("262144".to_owned())));
         assert!(
-            request_line.starts_with("GET /v1/settings?model=arc-sage-1.0%5B1m%5D&client_sizes=1 "),
-            "{request_line}"
+            request.starts_with("GET /v1/settings?model=arc-sage-1.0%5B1m%5D&client_sizes=1 "),
+            "{request}"
+        );
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("authorization: Bearer key")),
+            "{request}"
         );
     }
 
@@ -1285,6 +1153,7 @@ mod claude_command_tests {
             pid: 1,
             request: &RequestSpec {
                 env_name: "prod",
+                router_url: crate::ROUTER_PROD_URL,
                 auto_compact_window: None,
                 refusal_recovery: &[],
                 args: &[],
@@ -1308,7 +1177,7 @@ mod claude_command_tests {
     #[cfg(unix)]
     #[test]
     fn claude_session_never_inherits_a_router_key() {
-        let vars = ["RAYLINE_ROUTER_API_KEY", crate::harness::KEY_ENV];
+        let vars = ["RAYLINE_ROUTER_API_KEY"];
         let previous: Vec<_> = vars.iter().map(env::var_os).collect();
         for var in vars {
             // SAFETY: tests run with --test-threads=1 (AGENTS.md), so no other
