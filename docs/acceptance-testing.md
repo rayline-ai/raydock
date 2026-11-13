@@ -57,7 +57,7 @@ The script:
 
 1. Prints the Rayline version and each harness's version. Keep them with the results: a harness release can change how it talks to Rayline, so a result only holds for the versions it ran with.
 2. Runs one turn per harness in cloud mode.
-3. Starts the local process with `rayline local start`, runs one turn per harness with `--local`, then stops it with `rayline local stop`. It also runs `rayline local stop` if it exits early, including on Ctrl-C. A failed `rayline local start` or `rayline local stop` is a `FAIL`, and so is a `rayline local status` that fails or doesn't report the process running. When `rayline local start` fails, the script stops nothing. If a local process is already running when the script starts, it prints `a local process is already running; stop it first` and exits 1 before any turn runs.
+3. Starts the local process with `rayline local start`, runs one turn per harness with `--local`, then stops it with `rayline local stop`. It also runs `rayline local stop` if it exits early, including on Ctrl-C. A failed `rayline local start` or `rayline local stop` is a `FAIL`, and so is a `rayline local status` that fails or doesn't report the process running. When `rayline local start` fails, the script stops nothing. Before any turn runs, it checks `rayline local status`: if a local process is already running, it prints `a local process is already running; stop it first` and exits 1, and if `rayline local status` fails, it prints its output and `rayline local status failed` and exits 1.
 
 Each turn is the harness's own non-interactive mode:
 
@@ -79,7 +79,7 @@ Each run prints one line:
 - `FAIL`: the harness exited non-zero, timed out, or never printed the answer. The exit status and the last 15 lines of output follow.
 - `FAIL ... (not installed)`: the harness isn't on `PATH`.
 
-The script exits 0 when nothing failed, 1 on any `FAIL` or when a local process is already running, and 2 on a usage error.
+The script exits 0 when nothing failed, 1 on any `FAIL`, when a local process is already running or when `rayline local status` fails before any turn, and 2 on a usage error.
 
 A pass shows that the turn completed. It doesn't show which model served it. In local mode, `rayline top` and `~/.rayline/local/runtime.log` show each decision and the model that ran.
 
