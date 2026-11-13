@@ -15,7 +15,7 @@ Usage:
   install-rayline.sh [--version <version>] [--install-dir <path>]
 
 Options:
-  --version      Release version to install, for example 0.2.0.
+  --version      Release version to install, for example 0.5.0.
                  Defaults to the latest GitHub release.
   --install-dir  Directory for rayline, rayline-core and rayline-core-LICENSE.
                  Defaults to ~/.rayline/bin.
