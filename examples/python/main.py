@@ -30,8 +30,7 @@ if not API_KEY:
 client = Anthropic(base_url=BASE_URL, auth_token=API_KEY)
 
 message = client.messages.create(
-    # "arc-sage-1.0" lets ARC pick the concrete model. You can also pass
-    # a concrete id such as "claude-sonnet-5".
+    # "arc-sage-1.0" lets ARC pick the concrete model.
     model="arc-sage-1.0",
     max_tokens=2048,
     messages=[
