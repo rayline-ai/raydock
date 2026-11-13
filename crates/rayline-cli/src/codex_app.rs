@@ -27,12 +27,9 @@ use std::process::ExitCode;
 
 use toml_edit::{DocumentMut, Item, Table, TomlError, Value};
 
-use crate::codex::CodexAuthMode;
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppRunRequest {
     pub model: Option<String>,
-    pub auth_mode: CodexAuthMode,
     /// Extra args passed through to `codex app` (e.g. a workspace path).
     pub codex_args: Vec<OsString>,
     /// The hosted environment the loaded config selects, whose router the
@@ -41,19 +38,14 @@ pub struct AppRunRequest {
 }
 
 pub async fn run(request: AppRunRequest) -> ExitCode {
-    let provider = match crate::codex::resolve_provider(
-        request.auth_mode,
-        request.model.as_deref(),
-        &request.hosted,
-    )
-    .await
-    {
-        Ok(provider) => provider,
-        Err(error) => {
-            eprintln!("Error: {error}");
-            return ExitCode::from(1);
-        }
-    };
+    let provider =
+        match crate::codex::resolve_provider(request.model.as_deref(), &request.hosted).await {
+            Ok(provider) => provider,
+            Err(error) => {
+                eprintln!("Error: {error}");
+                return ExitCode::from(1);
+            }
+        };
 
     // 1. Compute the config to write. Nothing changes on disk yet, so a
     //    declined restart below leaves everything untouched.

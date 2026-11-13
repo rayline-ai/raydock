@@ -9,7 +9,6 @@ use std::fmt;
 use std::path::PathBuf;
 
 use crate::claude_app::AppAction;
-use crate::codex::CodexAuthMode;
 use crate::config::Protocol;
 use crate::harness::Harness;
 use crate::update::{UpdateRequest, Version};
@@ -116,9 +115,6 @@ running on a different config, you'll be prompted to restart it.
 
 Options:
   --model <model>         Model to request (default: your key's ARC Sage)
-  --auth <mode>           Codex auth source: auto|subscription|none
-                          (default: auto, your Rayline router key).
-                          subscription and none are not available yet.
   --help                  Show this message and exit
 ";
 
@@ -130,9 +126,6 @@ reaches ARC through the Rayline router with your router key.
 
 Options:
   --model <model>         Model to request (default: your key's ARC Sage)
-  --auth <mode>           Codex auth source: auto|subscription|none
-                          (default: auto, your Rayline router key).
-                          subscription and none are not available yet.
   --help                  Show this message and exit
 ";
 
@@ -282,12 +275,10 @@ pub(crate) enum Launch {
     },
 }
 
-/// `--model` and `--auth` of `run codex`, `run codex app` and
-/// `run codex configure`.
+/// `--model` of `run codex`, `run codex app` and `run codex configure`.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct CodexOptions {
     pub model: Option<String>,
-    pub auth: Option<CodexAuthMode>,
 }
 
 impl Run {
@@ -316,8 +307,7 @@ impl Launch {
     }
 
     /// The kept option or command that local mode does not run: the deleted
-    /// `hybrid run` had none of them. Codex's `--auth auto` and `--auth none`
-    /// both send only the gateway token there.
+    /// `hybrid run` had none of them.
     fn not_in_local_mode(&self) -> Option<&'static str> {
         match self {
             Launch::Claude { isolated: true, .. } => Some("`--isolated`"),
@@ -325,9 +315,6 @@ impl Launch {
             Launch::CodexApp { .. } => Some("`run codex app`"),
             Launch::CodexConfigure(_) => Some("`run codex configure`"),
             Launch::Codex { options, .. } if options.model.is_some() => Some("`--model`"),
-            Launch::Codex { options, .. } if options.auth == Some(CodexAuthMode::Subscription) => {
-                Some("`--auth subscription`")
-            }
             Launch::Claude { .. } | Launch::Codex { .. } | Launch::Harness { .. } => None,
         }
     }
@@ -768,7 +755,7 @@ struct RunGrammar {
     passthrough: bool,
     /// Reads `--isolated` (`run claude`).
     isolated: bool,
-    /// Reads `--model` and `--auth` (`run codex`).
+    /// Reads `--model` (`run codex`).
     codex: bool,
 }
 
@@ -939,13 +926,6 @@ fn run_options(args: &mut Args<'_>, grammar: RunGrammar) -> Result<Option<RunOpt
                 args.next();
                 let model = args.value(name, inline, help)?;
                 set_once(&mut options.codex.model, model.to_owned(), name, help)?;
-            }
-            "--auth" if grammar.codex => {
-                args.next();
-                let value = args.value(name, inline, help)?;
-                let mode = CodexAuthMode::parse(value)
-                    .ok_or_else(|| help.error("`--auth` must be auto, subscription or none"))?;
-                set_once(&mut options.codex.auth, mode, name, help)?;
             }
             "--help" if flag && grammar.own_help => return Ok(None),
             _ if grammar.passthrough => break,
@@ -1445,23 +1425,12 @@ mod tests {
     }
 
     #[test]
-    fn codex_takes_model_and_auth_before_its_own_arguments() {
+    fn codex_takes_model_before_its_own_arguments() {
         assert_eq!(
-            run(&[
-                "run",
-                "codex",
-                "--model",
-                "m",
-                "--auth=none",
-                "exec",
-                "--model",
-                "x"
-            ])
-            .launch,
+            run(&["run", "codex", "--model", "m", "exec", "--model", "x"]).launch,
             Launch::Codex {
                 options: CodexOptions {
                     model: Some("m".to_owned()),
-                    auth: Some(CodexAuthMode::None),
                 },
                 args: os(&["exec", "--model", "x"]),
             }
@@ -1469,29 +1438,27 @@ mod tests {
     }
 
     #[test]
-    fn codex_auth_takes_only_auto_subscription_and_none() {
-        for (value, mode) in [
-            ("auto", CodexAuthMode::Auto),
-            ("subscription", CodexAuthMode::Subscription),
-            ("none", CodexAuthMode::None),
-        ] {
-            assert_eq!(
-                run(&["run", "codex", "--auth", value]).launch,
-                Launch::Codex {
-                    options: CodexOptions {
-                        model: None,
-                        auth: Some(mode),
-                    },
-                    args: Vec::new(),
-                }
-            );
-        }
-        for alias in ["no-auth", "local", "codex-subscription", "chatgpt", "codex"] {
-            assert_error(
-                &["run", "codex", "--auth", alias],
-                "`--auth` must be auto, subscription or none",
-            );
-        }
+    fn auth_is_not_a_codex_option() {
+        // Like any other unknown option, it goes to Codex where Codex takes
+        // its own arguments, and is an error where it does not.
+        assert_eq!(
+            run(&["run", "codex", "--auth", "none"]).launch,
+            Launch::Codex {
+                options: CodexOptions::default(),
+                args: os(&["--auth", "none"]),
+            }
+        );
+        assert_eq!(
+            run(&["run", "codex", "app", "--auth", "none"]).launch,
+            Launch::CodexApp {
+                options: CodexOptions::default(),
+                args: os(&["--auth", "none"]),
+            }
+        );
+        assert_error(
+            &["run", "codex", "configure", "--auth", "none"],
+            "unexpected `--auth`",
+        );
     }
 
     #[test]
@@ -1503,7 +1470,6 @@ mod tests {
                 launch: Launch::CodexApp {
                     options: CodexOptions {
                         model: Some("m".to_owned()),
-                        auth: None,
                     },
                     args: os(&["~/work"]),
                 },
@@ -1523,12 +1489,11 @@ mod tests {
     }
 
     #[test]
-    fn codex_configure_takes_only_model_and_auth() {
+    fn codex_configure_takes_only_model() {
         assert_eq!(
-            run(&["run", "codex", "configure", "--auth", "auto"]).launch,
+            run(&["run", "codex", "configure", "--model", "m"]).launch,
             Launch::CodexConfigure(CodexOptions {
-                model: None,
-                auth: Some(CodexAuthMode::Auto),
+                model: Some("m".to_owned()),
             })
         );
         assert_error(
@@ -1558,15 +1523,9 @@ mod tests {
             Some("`run codex configure`")
         );
         assert_eq!(local(&["run", "codex", "--model", "m"]), Some("`--model`"));
-        assert_eq!(
-            local(&["run", "codex", "--auth", "subscription"]),
-            Some("`--auth subscription`")
-        );
         for args in [
             &["run", "claude", "-p", "hi"][..],
             &["run", "codex", "exec"],
-            &["run", "codex", "--auth", "auto"],
-            &["run", "codex", "--auth", "none"],
             &["run", "pi"],
             &["run", "pi", "--config", "routing.json"],
         ] {
@@ -1761,19 +1720,13 @@ mod tests {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 assert_error(&args, problem);
             };
-            for name in ["--model", "--auth"] {
-                let needs = format!("`{name}` needs a value");
-                check(&[name], &needs);
-                check(&[&format!("{name}=")], &needs);
-                check(&[name, "--local"], &needs);
-            }
+            let needs = "`--model` needs a value";
+            check(&["--model"], needs);
+            check(&["--model="], needs);
+            check(&["--model", "--local"], needs);
             check(
                 &["--model", "a", "--model=b"],
                 "`--model` given more than once",
-            );
-            check(
-                &["--auth", "auto", "--auth=none"],
-                "`--auth` given more than once",
             );
         }
     }

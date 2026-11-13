@@ -10,38 +10,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CodexAuthMode {
-    Auto,
-    None,
-    Subscription,
-}
-
-impl CodexAuthMode {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "auto" => Some(Self::Auto),
-            "none" => Some(Self::None),
-            "subscription" => Some(Self::Subscription),
-            _ => None,
-        }
-    }
-
-    /// `auto` runs on the router with the user's key. The other modes fail.
-    fn require_auto(self) -> Result<(), String> {
-        match self {
-            Self::Auto => Ok(()),
-            Self::Subscription => Err("`--auth subscription` is not available yet".to_owned()),
-            Self::None => Err("`--auth none` is not available yet".to_owned()),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunRequest {
     /// The `--model` the user picked. `None` runs the key's main model.
     pub model: Option<String>,
-    pub auth_mode: CodexAuthMode,
     pub codex_args: Vec<OsString>,
     /// The hosted environment the loaded config selects, whose router Codex
     /// talks to.
@@ -52,7 +24,6 @@ pub struct RunRequest {
 pub struct ConfigureRequest {
     /// See [`RunRequest::model`].
     pub model: Option<String>,
-    pub auth_mode: CodexAuthMode,
     /// The hosted environment the loaded config selects, whose router Codex
     /// talks to.
     pub hosted: crate::status::HostedEnvironment,
@@ -72,11 +43,9 @@ pub(crate) struct Provider {
 /// stored `rlk-` router key (see [`crate::status::router_key`]) and the
 /// model (`--model`, else the key's main model).
 pub(crate) async fn resolve_provider(
-    auth_mode: CodexAuthMode,
     model: Option<&str>,
     hosted: &crate::status::HostedEnvironment,
 ) -> Result<Provider, String> {
-    auth_mode.require_auto()?;
     let home = crate::home().map_err(|error| error.to_string())?;
     let router_url = &hosted.base_url;
     let key = crate::status::router_key(hosted, &home)
@@ -105,13 +74,7 @@ fn codex_home(home: &Path) -> PathBuf {
 }
 
 pub async fn run(request: RunRequest) -> ExitCode {
-    let provider = match resolve_provider(
-        request.auth_mode,
-        request.model.as_deref(),
-        &request.hosted,
-    )
-    .await
-    {
+    let provider = match resolve_provider(request.model.as_deref(), &request.hosted).await {
         Ok(provider) => provider,
         Err(error) => {
             eprintln!("Error: {error}");
@@ -179,7 +142,7 @@ pub(crate) fn provider_config_toml(provider: &Provider) -> String {
 /// Write the `rayline` profile to `$CODEX_HOME/rayline.config.toml` (Codex's
 /// default home is `~/.codex`), owner-only since it holds the router key.
 pub async fn configure(request: &ConfigureRequest) -> io::Result<String> {
-    let provider = resolve_provider(request.auth_mode, request.model.as_deref(), &request.hosted)
+    let provider = resolve_provider(request.model.as_deref(), &request.hosted)
         .await
         .map_err(io::Error::other)?;
     let codex_home = match crate::harness::exported_dir("CODEX_HOME")? {
@@ -220,7 +183,7 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::{CodexAuthMode, Provider, codex_command, codex_command_on, provider_config_toml};
+    use super::{Provider, codex_command, codex_command_on, provider_config_toml};
 
     /// A provider as a launch resolves it, with a placeholder key.
     pub(crate) fn provider(model: &str) -> Provider {
@@ -249,30 +212,6 @@ pub(crate) mod tests {
         );
         for absent in ["requires_openai_auth", "forced_login_method", "127.0.0.1"] {
             assert!(!toml.contains(absent), "{absent}");
-        }
-    }
-
-    #[test]
-    fn only_auto_auth_runs() {
-        assert!(CodexAuthMode::Auto.require_auto().is_ok());
-        for mode in [CodexAuthMode::Subscription, CodexAuthMode::None] {
-            let error = mode.require_auto().unwrap_err();
-            assert!(error.contains("not available yet"), "{error}");
-        }
-    }
-
-    #[tokio::test]
-    async fn subscription_and_none_fail_before_reading_a_key() {
-        for mode in [CodexAuthMode::Subscription, CodexAuthMode::None] {
-            let hosted = crate::status::HostedEnvironment {
-                env: None,
-                base_url: "http://127.0.0.1:9".to_owned(),
-                login_url: "http://127.0.0.1:9/cli-auth".to_owned(),
-            };
-            let error = super::resolve_provider(mode, None, &hosted)
-                .await
-                .unwrap_err();
-            assert!(error.contains("not available yet"), "{error}");
         }
     }
 

@@ -102,8 +102,7 @@ rayline run codex -- exec "summarize this repo"
 - `--local` and `--config` together are a usage error.
 - Local mode refuses `rayline run claude --isolated`,
   `rayline run claude-desktop`, `rayline run codex --model`,
-  `rayline run codex --auth subscription`, `rayline run codex app` and
-  `rayline run codex configure`. The error says the option isn't available in
+  `rayline run codex app` and `rayline run codex configure`. The error says the option isn't available in
   local mode.
 - Rayline options come right after the harness name. The first argument that
   isn't a Rayline option, and everything after `--`, goes to the harness
@@ -130,7 +129,6 @@ rayline run claude --isolated
 | Option or subcommand | Does |
 |---|---|
 | `--model <model>` | The model Codex asks for. |
-| `--auth auto\|subscription\|none` | How Codex authenticates. `auto` works in both modes: in cloud mode Codex uses your Rayline router key, and in local mode it sends only the local process's token. In local mode `none` does the same as `auto`, and `subscription` is refused. In cloud mode `subscription` and `none` aren't available yet, and Rayline refuses them. |
 | `rayline run codex app [WORKSPACE]` | Launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`, and opens `WORKSPACE` if you give one. |
 | `rayline run codex configure` | Writes a Codex profile to `$CODEX_HOME/rayline.config.toml`. |
 
