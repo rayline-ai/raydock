@@ -10,7 +10,7 @@ Sections marked **Internal** are real but stay out of public docs and `--help`. 
 2. **No silent fallback.** A missing or invalid value is an error. It is never skipped, guessed or replaced by another source.
 3. **One spelling, one value.** Each key, flag and env var has one name and each meaning has one value. No aliases, no alternative spellings, no deprecated names.
 4. **No compatibility code.** No migration of old files, keys, names or install layouts. Old files are ignored, not read and not moved.
-5. **No hard-coded models.** Model ids, context windows, output limits and prices come from ARC or from `settings.json`, never from constants in code.
+5. **No hard-coded models in the local process.** The candidates ARC picks from, their context windows, output limits and prices come from ARC or from `settings.json`, never from constants in code. The model a harness asks for in cloud mode is today's default and is unchanged.
 6. **No new surface.** Nothing is added that this spec does not list.
 
 ## 2. Command name
