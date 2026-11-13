@@ -7,7 +7,8 @@
 # set; either must have a `routing` section. With CONFIG, local mode runs
 # `rayline local start --config <file>` and `rayline run <harness> --config
 # <file>`; cloud mode always uses the default file. The script writes no
-# config. It starts the local process with `rayline local start` and runs
+# config. If a local process is already running, it exits 1 before any turn.
+# It starts the local process with `rayline local start` and runs
 # `rayline local stop` once on exit, including on Ctrl-C, TERM and HUP. If
 # `rayline local start` fails, it stops nothing: a process it didn't start is
 # left alone.
@@ -160,6 +161,14 @@ for harness in ${turns[@]+"${turns[@]}"}; do
   fi
 done
 [ ${#turns[@]} -eq ${#selected[@]} ] || echo "claude-desktop: not covered, no path yet"
+
+# The cleanup trap below stops the local process, so the script must not run
+# while one it didn't start is running.
+status_out=$("$RAYLINE" local status 2>&1)
+if grep -q '^Local process: running' <<<"$status_out"; then
+  echo "a local process is already running; stop it first" >&2
+  exit 1
+fi
 
 echo "== cloud mode"
 run_mode cloud
