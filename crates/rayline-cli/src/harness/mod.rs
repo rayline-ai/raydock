@@ -124,10 +124,6 @@ pub(crate) struct LaunchModels {
     pub background: String,
     /// Every model the provider entry lists, default first.
     pub offered: Vec<LaunchModel>,
-    /// The ARC product of each id the price card's catalog names
-    /// ([`LaunchModels::apply_arc_prices`]), mode ids included, so a saved
-    /// pick from another data mode finds its product's listed id.
-    pub products: std::collections::BTreeMap<String, String>,
 }
 
 impl LaunchModels {
@@ -186,7 +182,6 @@ impl LaunchModels {
             main,
             background,
             offered,
-            products: Default::default(),
         })
     }
 
@@ -204,24 +199,13 @@ impl LaunchModels {
                 product: None,
                 price: None,
             }],
-            products: Default::default(),
         }
     }
 
-    /// Read a `GET /v1/arc/prices` answer: each id's product from its catalog
-    /// (`arc_mode.product`; a base id is its own product), and each offered
-    /// model's price by its own id, since every data mode has its own row. A
-    /// model without a complete row gets no price.
+    /// Read a `GET /v1/arc/prices` answer: each offered model's price by its
+    /// own id, since every data mode has its own row. A model without a
+    /// complete row gets no price.
     pub(crate) fn apply_arc_prices(&mut self, prices: &Value) {
-        if let Some(catalog) = prices["catalog"].as_object() {
-            self.products = catalog
-                .iter()
-                .map(|(id, entry)| {
-                    let product = entry.pointer("/arc_mode/product").and_then(Value::as_str);
-                    (id.clone(), product.unwrap_or(id).to_owned())
-                })
-                .collect();
-        }
         for model in &mut self.offered {
             let row = &prices["card"]["prices"][model.id.as_str()];
             let field = |name: &str| row.get(name).and_then(Value::as_f64);
@@ -247,24 +231,6 @@ impl LaunchModels {
     /// The main agent's model.
     pub(crate) fn main_model(&self) -> &LaunchModel {
         &self.offered[0]
-    }
-
-    /// What a harness's saved pick of `id` becomes: `None` while the key lists
-    /// `id`; otherwise the listed model of `id`'s product (a seeded
-    /// `arc-sage-1.0` on a contributor key is `arc-sage-contributor-1.0`, and
-    /// a saved `arc-swift-contributor-1.0` on a standard key `arc-swift-1.0`),
-    /// else `default` (the retired Legacy `rayline-router`).
-    pub(crate) fn stale_pick<'a>(&'a self, id: &str, default: &'a str) -> Option<&'a str> {
-        if self.offered.iter().any(|model| model.id == id) {
-            return None;
-        }
-        let product = self.products.get(id).map_or(id, String::as_str);
-        Some(
-            self.offered
-                .iter()
-                .find(|model| model.product.as_deref() == Some(product))
-                .map_or(default, |model| model.id.as_str()),
-        )
     }
 }
 
@@ -520,11 +486,6 @@ pub(crate) struct ConfigFile {
     /// reads exactly this when it is replaced (the harness saved a setting
     /// meanwhile), the write is refused rather than losing that edit.
     pub merged_from: Option<String>,
-    /// For a create-once file (`overwrite: false`): the seed an earlier
-    /// release wrote with a default that has since changed. A file that still
-    /// reads exactly this was never edited, so it holds no choice and is
-    /// replaced with `contents`; any other text is kept.
-    pub replaces_seed: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -582,16 +543,11 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
     }
 
     let mut models = fetch_hosted_models(&router_url, &key).await?;
-    // omp shows each model's cost, and omp and pi move a saved pick from
-    // another data mode to its product's listed id: both from the price card.
-    if matches!(harness, Harness::Omp | Harness::Pi) {
+    // omp shows each model's cost, from the price card.
+    if harness == Harness::Omp {
         match fetch_arc_prices(&router_url).await {
             Ok(prices) => models.apply_arc_prices(&prices),
-            Err(error) => eprintln!(
-                "warning: {error}; {} shows no model costs, and a saved pick from another \
-                 data mode moves to its default model",
-                harness.name()
-            ),
+            Err(error) => eprintln!("warning: {error}; omp shows no model costs"),
         }
     }
     let config_dir = config_dir(&home, harness);
@@ -711,13 +667,7 @@ pub(crate) fn write_files(dir: &Path, files: &[ConfigFile]) -> io::Result<()> {
     for file in files {
         let path = dir.join(file.name);
         if !file.overwrite && path.exists() {
-            let untouched_old_seed = file
-                .replaces_seed
-                .as_ref()
-                .is_some_and(|seed| fs::read_to_string(&path).ok().as_ref() == Some(seed));
-            if !untouched_old_seed {
-                continue;
-            }
+            continue;
         }
         let tmp = dir.join(format!(".{}.tmp-{}", file.name, std::process::id()));
         write_private(&tmp, &file.contents)?;
@@ -819,7 +769,6 @@ pub(crate) fn json_file(name: &'static str, value: &Value, overwrite: bool) -> C
         contents,
         overwrite,
         merged_from: None,
-        replaces_seed: None,
     }
 }
 
@@ -829,7 +778,6 @@ pub(crate) fn yaml_file(name: &'static str, value: &Value, overwrite: bool) -> C
         contents: to_yaml(value),
         overwrite,
         merged_from: None,
-        replaces_seed: None,
     }
 }
 
@@ -1260,7 +1208,6 @@ pub(crate) mod tests {
             contents: "secret = 1\n".to_owned(),
             overwrite: true,
             merged_from: None,
-            replaces_seed: None,
         }];
         write_files(&dir, &files).unwrap();
         assert!(is_owner_only(&dir).unwrap());
@@ -1277,14 +1224,12 @@ pub(crate) mod tests {
                     contents: text.to_owned(),
                     overwrite: true,
                     merged_from: None,
-                    replaces_seed: None,
                 },
                 ConfigFile {
                     name: "default.json",
                     contents: text.to_owned(),
                     overwrite: false,
                     merged_from: None,
-                    replaces_seed: None,
                 },
             ]
         };
@@ -1483,7 +1428,6 @@ pub(crate) mod tests {
             contents: "new".to_owned(),
             overwrite: true,
             merged_from: None,
-            replaces_seed: None,
         }];
         write_files(&dir, &files).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
