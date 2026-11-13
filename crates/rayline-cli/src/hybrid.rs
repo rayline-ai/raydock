@@ -257,6 +257,7 @@ async fn run_harness(
     let state = ready(&paths)?;
     health(&client, &paths, &state).await?;
     let token = fs::read_to_string(paths.token())?;
+    let withheld = endpoint_key_envs(settings);
     let mut command = harness_command(
         &home,
         harness,
@@ -264,8 +265,9 @@ async fn run_harness(
         url(&state)?,
         &token,
         &harness_capabilities(model_capabilities(&state)?),
+        &withheld,
     )?;
-    for name in credential_env_names(&state)? {
+    for name in withheld {
         // A harness may use the same variable name for its local gateway
         // token. Preserve that explicit replacement, never the inherited key.
         let replaced_with_gateway = command
@@ -651,7 +653,6 @@ fn ready(paths: &Paths) -> io::Result<Value> {
     {
         return Err(io::Error::other("incompatible local process metadata"));
     }
-    credential_env_names(&state)?;
     model_capabilities(&state)?;
     if state
         .get("instance_id")
@@ -720,23 +721,13 @@ pub(crate) async fn top_connection(
     Ok((client, format!("{endpoint}/v1/router/top/snapshot"), state))
 }
 
-fn credential_env_names(state: &Value) -> io::Result<Vec<&str>> {
-    let values = state
-        .get("credential_env")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            io::Error::other("missing local process credential environment references")
-        })?;
-    values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .filter(|name| !name.is_empty() && !name.contains(['=', '\0']))
-                .ok_or_else(|| {
-                    io::Error::other("invalid local process credential environment reference")
-                })
-        })
+/// The env var each endpoint's `api_key_env` names, whether or not a `models`
+/// entry uses the endpoint (spec 7.2 item 6).
+fn endpoint_key_envs(settings: &Settings) -> Vec<&str> {
+    settings
+        .endpoints
+        .values()
+        .filter_map(|endpoint| endpoint.api_key_env.as_deref())
         .collect()
 }
 
@@ -800,6 +791,21 @@ async fn health(client: &reqwest::Client, paths: &Paths, state: &Value) -> io::R
     Ok(health)
 }
 
+/// `program` without the credentials a local-mode harness must not inherit:
+/// the router key, the core's token and each endpoint's key (`withheld`).
+/// The launch and the harness's version probe both start from it.
+fn withheld_command(program: &Path, withheld: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    crate::codex::withhold_router_key(&mut command);
+    command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
+    for name in withheld {
+        command.env_remove(name);
+    }
+    command
+}
+
+/// `withheld` names each endpoint's key variable. [`run_harness`] removes
+/// them from the launch, except one the harness sets to `token`.
 fn harness_command(
     home: &Path,
     name: &str,
@@ -807,11 +813,10 @@ fn harness_command(
     endpoint: &str,
     token: &str,
     capabilities: &ModelCapabilities,
+    withheld: &[&str],
 ) -> io::Result<Command> {
     let program = crate::harness::launch_program(name, std::env::var_os("PATH"));
-    let mut command = Command::new(&program);
-    crate::codex::withhold_router_key(&mut command);
-    command.env_remove("RAYLINE_EXEC_AUTH_TOKEN");
+    let mut command = withheld_command(&program, withheld);
     match name {
         "claude" => {
             command
@@ -862,7 +867,9 @@ fn harness_command(
             let harness = crate::harness::Harness::from_command(name).ok_or_else(|| {
                 io::Error::other(format!("unsupported local-mode harness {name:?}"))
             })?;
-            let major_version = harness.major_version(&program).map_err(io::Error::other)?;
+            let major_version = harness
+                .major_version(withheld_command(&program, withheld))
+                .map_err(io::Error::other)?;
             let args = harness.hybrid_args(args, major_version);
             let config_dir = harness_dir(home, harness);
             private_dir(&config_dir)?;
@@ -1311,18 +1318,33 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Puts an `opencode` that reports version 2 first on `PATH`, so a hybrid
-    /// OpenCode launch can read its version without OpenCode installed. The
-    /// caller holds ENV_LOCK; Drop restores `PATH`.
-    struct FakeOpenCode(Option<std::ffi::OsString>);
+    /// OpenCode launch can read its version without OpenCode installed. Each
+    /// run writes the names (not the values) of its environment to
+    /// `env-names.txt` beside it. The caller holds ENV_LOCK; Drop restores
+    /// `PATH`.
+    struct FakeOpenCode {
+        dir: PathBuf,
+        prior: Option<std::ffi::OsString>,
+    }
 
     impl FakeOpenCode {
         fn install() -> Self {
             let dir = temp_dir("fake-opencode");
             if cfg!(windows) {
-                fs::write(dir.join("opencode.cmd"), "@echo opencode v2.0.25\r\n").unwrap();
+                fs::write(
+                    dir.join("opencode.cmd"),
+                    "@(for /f \"delims==\" %%v in ('set') do @echo %%v) > \"%~dp0env-names.txt\"\r\n\
+                     @echo opencode v2.0.25\r\n",
+                )
+                .unwrap();
             } else {
                 let binary = dir.join("opencode");
-                fs::write(&binary, "#!/bin/sh\necho 'opencode v2.0.25'\n").unwrap();
+                fs::write(
+                    &binary,
+                    "#!/bin/sh\nenv | cut -d= -f1 > \"$(dirname \"$0\")/env-names.txt\"\n\
+                     echo 'opencode v2.0.25'\n",
+                )
+                .unwrap();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
@@ -1330,11 +1352,20 @@ mod tests {
                 }
             }
             let prior = std::env::var_os("PATH");
-            let mut dirs = vec![dir];
+            let mut dirs = vec![dir.clone()];
             dirs.extend(prior.iter().flat_map(std::env::split_paths));
             // SAFETY: serialized by ENV_LOCK; restored by Drop.
             unsafe { std::env::set_var("PATH", std::env::join_paths(dirs).unwrap()) };
-            Self(prior)
+            Self { dir, prior }
+        }
+
+        /// The environment names of the last run.
+        fn env_names(&self) -> Vec<String> {
+            fs::read_to_string(self.dir.join("env-names.txt"))
+                .unwrap()
+                .lines()
+                .map(|line| line.trim().to_owned())
+                .collect()
         }
     }
 
@@ -1342,7 +1373,7 @@ mod tests {
         fn drop(&mut self) {
             // SAFETY: serialized as above; ENV_LOCK is still held by the caller.
             unsafe {
-                match &self.0 {
+                match &self.prior {
                     Some(prior) => std::env::set_var("PATH", prior),
                     None => std::env::remove_var("PATH"),
                 }
@@ -1529,6 +1560,7 @@ mod tests {
                     "http://127.0.0.1:1",
                     "local-token",
                     &capabilities,
+                    &[],
                 )
                 .unwrap();
             };
@@ -1542,6 +1574,86 @@ mod tests {
             assert_eq!(files_under(&local_dir), local_files, "{harness:?}");
             fs::remove_dir_all(&home).unwrap();
         }
+    }
+
+    /// OpenCode's `--version` probe runs before the launch, from the same
+    /// environment: no endpoint key, router key or core token reaches it.
+    /// The endpoint keys come from settings, so the key of an endpoint that
+    /// no `models` entry uses is withheld too.
+    #[test]
+    fn the_opencode_version_probe_withholds_what_the_launch_withholds() {
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let opencode = FakeOpenCode::install();
+        let home = temp_dir("probe-env");
+        let file = home.join("settings.json");
+        fs::write(
+            &file,
+            r#"{"routing": {"decisions_model": "arc-swift-1.0",
+                "classifier_model": "anthropic/claude-haiku-5.5",
+                "policy": {"preset": "arc-policy.hybrid-default.v1"}},
+              "endpoints": {
+                "box": {"base_url": "http://127.0.0.1:1", "protocols": ["openai_chat"],
+                  "api_key_env": "RAYLINE_TEST_USED_ENDPOINT_KEY"},
+                "spare": {"base_url": "http://127.0.0.1:2", "protocols": ["openai_chat"],
+                  "api_key_env": "RAYLINE_TEST_UNUSED_ENDPOINT_KEY"}},
+              "models": {"local/box-model": {"endpoint": "box", "model": "box-model",
+                "context_window": 16384, "max_output_tokens": 8192}}}"#,
+        )
+        .unwrap();
+        let settings = crate::config::load(&crate::config::LoadOptions {
+            mode: crate::config::Mode::LocalFile(&file),
+            env: None,
+            harness_protocol: None,
+        })
+        .unwrap();
+        let withheld = [
+            "RAYLINE_TEST_USED_ENDPOINT_KEY",
+            "RAYLINE_TEST_UNUSED_ENDPOINT_KEY",
+            "RAYLINE_ROUTER_API_KEY",
+            "RAYLINE_EXEC_AUTH_TOKEN",
+        ];
+        let kept = "RAYLINE_TEST_KEPT";
+        let vars: Vec<_> = withheld.iter().chain([&kept]).copied().collect();
+        let prior: Vec<_> = vars.iter().map(std::env::var_os).collect();
+        for var in &vars {
+            // SAFETY: serialized by ENV_LOCK, and tests run with
+            // --test-threads=1 (AGENTS.md); restored below.
+            unsafe { std::env::set_var(var, "test-value-not-a-real-key") };
+        }
+        let command = harness_command(
+            &home,
+            "opencode",
+            &[],
+            "http://127.0.0.1:1",
+            "local-token",
+            &ModelCapabilities {
+                context_window: 16384,
+                max_output_tokens: 8192,
+                input_modalities: vec!["text".into()],
+            },
+            &endpoint_key_envs(&settings),
+        );
+        for (var, value) in vars.iter().zip(prior) {
+            // SAFETY: as above.
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+        command.unwrap();
+        let names = opencode.env_names();
+        assert!(names.iter().any(|name| name == kept), "{names:?}");
+        for name in withheld {
+            assert!(
+                !names.iter().any(|seen| seen == name),
+                "{name} reached the probe"
+            );
+        }
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -1558,6 +1670,7 @@ mod tests {
                     max_output_tokens: 8192,
                     input_modalities: vec!["text".into()],
                 },
+                &[],
             )
             .unwrap();
             let env: std::collections::HashMap<_, _> = command.get_envs().collect();
@@ -1599,6 +1712,7 @@ mod tests {
                 "http://127.0.0.1:20815",
                 "local-token",
                 &capabilities,
+                &[],
             )
             .unwrap();
         }
@@ -1651,6 +1765,7 @@ mod tests {
             "http://127.0.0.1:20815",
             "local-token",
             &capabilities,
+            &[],
         )
         .unwrap();
         assert!(
@@ -1695,6 +1810,7 @@ mod tests {
             "http://127.0.0.1:20815",
             "local-token",
             &capabilities,
+            &[],
         )
         .unwrap();
         let args: Vec<_> = codex.get_args().map(|arg| arg.to_string_lossy()).collect();

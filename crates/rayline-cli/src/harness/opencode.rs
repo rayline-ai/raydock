@@ -126,13 +126,12 @@ const VALUE_FLAGS: &[&str] = &[
     "--format",
 ];
 
-/// The major version `opencode --version` reports (`opencode v2.0.25`). A
-/// command that cannot run, exits non-zero or prints no version is an error
-/// naming it.
-pub(crate) fn major_version(binary: &Path) -> Result<u64, String> {
-    let shown = format!("`{} --version`", binary.display());
-    let mut command = Command::new(binary);
-    crate::codex::withhold_router_key(&mut command);
+/// The major version `opencode --version` reports (`opencode v2.0.25`).
+/// `command` is OpenCode with the launch's environment, so the probe inherits
+/// nothing the launch withholds. A command that cannot run, exits non-zero or
+/// prints no version is an error naming it.
+pub(crate) fn major_version(mut command: Command) -> Result<u64, String> {
+    let shown = format!("`{} --version`", Path::new(command.get_program()).display());
     let output = command
         .arg("--version")
         .stdin(Stdio::null())
@@ -329,7 +328,7 @@ mod tests {
     fn an_unreadable_version_is_an_error_naming_the_command() {
         let dir = super::super::tests::temp_dir("opencode-version");
         let missing = dir.join("opencode");
-        let error = super::major_version(&missing).unwrap_err();
+        let error = super::major_version(Command::new(&missing)).unwrap_err();
         assert!(error.contains(&missing.display().to_string()), "{error}");
         #[cfg(unix)]
         {
@@ -342,7 +341,7 @@ mod tests {
                 let binary = dir.join(name);
                 std::fs::write(&binary, script).unwrap();
                 std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-                let version = super::major_version(&binary);
+                let version = super::major_version(Command::new(&binary));
                 if name == "works" {
                     assert_eq!(version, Ok(2));
                 } else {

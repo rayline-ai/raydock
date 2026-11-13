@@ -338,10 +338,11 @@ impl Harness {
 
     /// The installed harness's major version, where a renderer or the launch
     /// args depend on it: `Some` for OpenCode ([`opencode::major_version`]),
-    /// `None` for every other harness.
-    pub(crate) fn major_version(self, binary: &Path) -> Result<Option<u64>, String> {
+    /// run as `probe`, the harness with the launch's environment; `None` for
+    /// every other harness.
+    pub(crate) fn major_version(self, probe: Command) -> Result<Option<u64>, String> {
         match self {
-            Self::OpenCode => opencode::major_version(binary).map(Some),
+            Self::OpenCode => opencode::major_version(probe).map(Some),
             _ => Ok(None),
         }
     }
@@ -483,7 +484,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         router_url: &router_url,
         config_dir: &config_dir,
         capabilities: None,
-        harness_major_version: harness.major_version(&binary)?,
+        harness_major_version: harness.major_version(cloud_probe(&binary))?,
         models,
     };
     let plan = harness.plan(&ctx)?;
@@ -619,6 +620,14 @@ pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     #[cfg(windows)]
     rayline_local_router::windows_state::restrict_to_owner(path, false)?;
     file.write_all(contents.as_bytes())
+}
+
+/// `binary` without the router key, as [`build_command`] launches it, for a
+/// probe that runs before the plan exists.
+fn cloud_probe(binary: &Path) -> Command {
+    let mut command = Command::new(binary);
+    command.env_remove(ROUTER_KEY_ENV);
+    command
 }
 
 pub(crate) fn build_command(binary: &Path, plan: &Plan, args: &[OsString]) -> Command {

@@ -95,6 +95,22 @@ Harness-specific options and subcommands are **kept for review** (section 9).
 3. A `rayline run ... --local` or `--config` run whose config file differs from the one the running process was started from, or whose `--env` differs, is an error. It never silently uses the running process's config.
 4. On macOS, `rayline local` and local-mode runs require macOS 13 or later.
 5. Starting the local process downloads the tokenizer of each `models` entry that names one (section 5.3) into the Hugging Face cache (section 8.2). When Hugging Face doesn't answer within 20 seconds or a file fails to download, it uses the last complete copy in the cache and says that it is the cached copy. With no complete cached copy, start fails with an error that names the config file, the `models` entry and the tokenizer.
+6. The token counter reads the tokenizer repo's files in the layouts Hugging Face models publish:
+   - `tokenizer.json`;
+   - the chat template: `chat_template.jinja`, else the `chat_template` key of `tokenizer_config.json` (a string, or named templates `default` and `tool_use`);
+   - image sizing: `processor_config.json`, else `preprocessor_config.json`. In its `image_processor` object, else at its top level: `patch_size` and `merge_size`, and the image limits `min_image_tokens` and `max_image_tokens`, else `min_pixels` and `max_pixels`, else `size.min_pixels` and `size.max_pixels`, else `size.shortest_edge` and `size.longest_edge`.
+
+   An image given only by URL, or whose bytes don't decode as an image, counts as the processor's maximum.
+7. The local process passes each request on with a session id and a branch id:
+   - session: the request's `x-rayline-session-id`, else the first of `x-conversation-id`, `x-parent-session-id`, `x-session-affinity`, `x-session-id`, `x-claude-code-session-id` that it carries, else none;
+   - branch: the request's `x-rayline-branch-id`, else `thread-id`, else `x-claude-code-agent-id`, else, when it carries `x-parent-session-id`, `x-session-affinity` or `x-session-id`, else `main`.
+8. When the core fails a turn before any output because its call to the routing service failed, the local process resends the turn once, and only when the service was unavailable (no answer, or HTTP 408, 409 or 5xx) or busy (HTTP 429). It doesn't resend when the service says `x-should-retry: false` or a `retry-after` over 30 seconds. Before the resend it waits the service's `retry-after` (at least 1 second), else about 5 seconds, jittered between 2.5 and 7.5 so sessions don't resend in step.
+
+   When the turn still fails, or isn't resent, the harness gets the error with `x-should-retry: false`, so its SDK doesn't resend it again:
+   - unavailable: 503, and busy: 429. Both carry `retry-after`: the service's (which the core caps at 300 seconds, and the local process raises to at least 1), else 30 seconds.
+   - a rejected router key: 403, and any other refusal: 400. Neither is resent, and neither carries `retry-after`.
+
+   The core passes on the service's two headers separately: `Retry-After` only as delta-seconds, and `X-Should-Retry` only as exactly `true` or `false`. A refusal can carry one without the other, and the local process uses the one it gets. A missing header takes its own default, and only for an unavailable or busy service. Without `retry-after`, the local process waits about 5 seconds for its resend and tells the harness `retry-after: 30`. Without `x-should-retry`, the turn may be resent. When the service doesn't answer, the core passes on neither.
 
 ### 3.4 `rayline top`
 
@@ -328,6 +344,8 @@ One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `ses
 2. Other harnesses: `CODEX_HOME` (cloud-mode Codex and the Codex desktop app, set to Rayline's own folder for it, section 8.2), `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `OPENCODE_CONFIG`, `OPENCLAW_CONFIG_PATH`.
 3. Removed from the Claude Code environment: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`.
 4. Removed from the `omp` environment: `CLAUDE_CONFIG_DIR`, `PI_PROFILE`, `OMP_PROFILE`.
+5. Removed from every harness command Rayline starts: `RAYLINE_ROUTER_API_KEY`.
+6. Removed in local mode: `RAYLINE_EXEC_AUTH_TOKEN`, and the env var each endpoint's `api_key_env` names, unless the harness's Rayline config sets that var to the local process's gateway token.
 
 ### 7.3 Internal: handoff between Rayline's own processes
 
@@ -384,6 +402,7 @@ Each mode has its own harness folder because each writes its own endpoint, key a
 Rayline writes nothing else under `~/.rayline` or `~/.config/rayline`. Outside them it writes only:
 - the harness's own files named in 9.4 and 9.5;
 - tokenizer files in the Hugging Face cache: `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `<home>/.cache/huggingface/hub`;
+- with `rayline run codex configure` (9.4), `rayline.config.toml` in the user's Codex home (`CODEX_HOME`, else `~/.codex`, Codex's own default);
 - with `rayline run claude --isolated` (9.3), in the user's Claude config folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`): the folders `projects/`, `sessions/`, `plans/` and `paste-cache/` and an empty `history.jsonl`, each only if missing, which the isolated folder links to.
 
 Tests use a temporary home folder.
@@ -395,7 +414,7 @@ These keep today's behaviour for now, under the new command shape. Their aliases
 1. `rayline auth login`: `-b, --no-browser` (device-code login) and `-p, --paste` (paste the callback URL). `--paste` with `--no-browser` behaves as today (`--paste` wins). Launching a harness while signed out signs in on the spot with the default flow when stdin and stdout are both terminals. Otherwise the launch fails as signed out. A local-mode launch that reuses a running local process doesn't read the credentials, so it runs even when signed out.
 2. `rayline update`: `--check`, `--version <version>`, `--force`, `--dry-run`.
 3. `rayline run claude --isolated`: gives Claude Code its own config folder (`~/.rayline/harness/claude-code/`) so it can run beside other sessions.
-4. `rayline run codex`: `--model <model>` and `--auth auto|subscription|none`; the subcommands `rayline run codex app [WORKSPACE]` (launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`) and `rayline run codex configure` (writes a Codex profile to `$CODEX_HOME/rayline.config.toml`).
+4. `rayline run codex`: `--model <model>` and `--auth auto|subscription|none`; the subcommands `rayline run codex app [WORKSPACE]` (launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`) and `rayline run codex configure` (writes a Codex profile, `rayline.config.toml`, to the user's Codex home: `CODEX_HOME`, else `~/.codex`, Codex's own default).
 5. `rayline run claude-desktop [COMMAND]`: `start` (default), `status`, `validate`, `stop`, `install-service`, `uninstall-service`, `off`, `uninstall`, and `--manual`, `--prefixed-ids`, `--desktop-config <path>`. Desktop runs on the shared local process; its own router copy is gone. Its model ids are unchanged.
 
 ## 10. Removed

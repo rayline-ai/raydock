@@ -99,7 +99,6 @@ struct Ready {
     pid: u32,
     core_pid: u32,
     instance_id: String,
-    credential_env: Vec<String>,
     capabilities: ModelCapabilities,
 }
 
@@ -125,7 +124,6 @@ type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 
 pub async fn run(args: Args) -> Result<()> {
     check_decisions_url(&args.config, &args.router_url)?;
-    let credential_env = credential_env_names(&args.config)?;
     let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
     let routing_metadata = RoutingMetadata::from_config(&config).map_err(anyhow::Error::msg)?;
     let classifier = crate::hybrid_classifier::route(&config, &args.classifier_model)
@@ -221,7 +219,6 @@ pub async fn run(args: Args) -> Result<()> {
             pid: std::process::id(),
             core_pid: handshake.pid,
             instance_id,
-            credential_env,
             capabilities,
         };
         write_private_new(&args.ready_file, &serde_json::to_vec(&ready)?)?;
@@ -253,33 +250,6 @@ pub async fn run(args: Args) -> Result<()> {
 fn check_decisions_url(path: &Path, router_url: &str) -> Result<()> {
     rayline_local_router::decisions_url::check_config_bytes(&std::fs::read(path)?, [router_url])
         .map_err(anyhow::Error::msg)
-}
-
-fn credential_env_names(path: &Path) -> Result<Vec<String>> {
-    // Read only environment references; the core owns full config validation.
-    #[derive(Default, Deserialize)]
-    struct Auth {
-        auth_env: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct References {
-        #[serde(default)]
-        decisions: Auth,
-        #[serde(default)]
-        deployments: Vec<Auth>,
-    }
-    let references: References = serde_json::from_slice(&std::fs::read(path)?)?;
-    let mut names: Vec<_> = std::iter::once(references.decisions)
-        .chain(references.deployments)
-        .filter_map(|auth| auth.auth_env)
-        .filter(|name| !name.is_empty())
-        .collect();
-    if names.iter().any(|name| name.contains(['=', '\0'])) {
-        bail!("credential environment reference is not a valid variable name");
-    }
-    names.sort();
-    names.dedup();
-    Ok(names)
 }
 
 async fn read_handshake(child: &mut Child) -> Result<CoreHandshake> {
@@ -930,8 +900,11 @@ fn decisions_failure(body: &[u8]) -> Option<DecisionsFailure> {
 
 /// The routing service's retry advice, as the core passes it on with its 502:
 /// `retry-after` (delta-seconds) and `x-should-retry` (`true`/`false`, the
-/// Anthropic and OpenAI SDKs' own header). Absent from a core that does not
-/// forward them, and then the gateway's defaults apply.
+/// Anthropic and OpenAI SDKs' own header). The core passes each on by itself:
+/// `retry-after` when the routing service sent delta-seconds (capped at
+/// 300 s), `x-should-retry` when it sent exactly `true` or `false`. On a
+/// transport failure it passes on neither. A missing one takes the gateway's
+/// default for that header alone, for an unavailable or busy service.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct RetryHint {
     retry_after: Option<Duration>,
@@ -975,6 +948,7 @@ fn gateway_retry_delay(failure: DecisionsFailure, hint: RetryHint) -> Option<Dur
     match hint.retry_after {
         Some(wait) if wait > DECISIONS_MAX_RETRY_WAIT => None,
         Some(wait) => Some(wait.max(Duration::from_secs(1))),
+        // No `retry-after`: a transport failure, or a refusal without one.
         None => Some(jittered(DECISIONS_RETRY_DELAY, rand::random::<f64>())),
     }
 }
@@ -1028,7 +1002,9 @@ fn buffered_response(
             }
             response = response.header("x-should-retry", "false");
             if retryable {
-                // At least the second the gateway waits itself.
+                // At least the second the gateway waits itself. The service's
+                // own, else the default: the core sends none on a transport
+                // failure, or on a refusal without one.
                 let wait = hint
                     .retry_after
                     .unwrap_or(DEFAULT_HARNESS_RETRY_AFTER)
