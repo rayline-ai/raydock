@@ -665,7 +665,7 @@ mod tests {
                 "http://router.stage.example:8443",
             ),
             (
-                "https://api-dev.rayline.ai",
+                "https://router.stage.example",
                 "https://router.stage.example:8443",
             ),
         ] {

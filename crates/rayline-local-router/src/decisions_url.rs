@@ -316,9 +316,7 @@ mod tests {
             ("http://[::1]:9/decisions", true),
             ("http://localhost:9/decisions", true),
             ("http://LOCALHOST:9/decisions", true),
-            // Not a router: Modal and other hosts.
-            ("https://rayline--decisions.modal.run/v1/routes", false),
-            ("https://api-dev.rayline.ai/v1/routes", false),
+            // Not a router: other hosts.
             ("https://decisions.example.com/v1/routes", false),
             ("https://router.example.test/v1/routes", false),
             ("https://api.rayline.ai.evil.test/v1/routes", false),

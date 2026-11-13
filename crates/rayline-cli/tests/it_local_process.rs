@@ -559,7 +559,7 @@ async fn non_router_decisions_url_never_starts_the_core() {
     // A hand-edited core configuration cannot send decisions (and the router
     // key) to a non-router host: the local process refuses before spawning the core.
     for url in [
-        "https://rayline--decisions.modal.run/v1/routes",
+        "https://decisions.example.com/v1/routes",
         "https://api.rayline.ai:8443/v1/routes",
         "https://evil.test@api.rayline.ai/v1/routes",
         "http://api.rayline.ai/v1/routes",

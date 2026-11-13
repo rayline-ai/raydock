@@ -546,7 +546,7 @@ providers:
   rayline:
     api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
-    base_url: \"https://api-dev.rayline.ai\"
+    base_url: \"https://router.example.test\"
     models:
       arc-sage-1.0:
         context_length: 1000000
@@ -560,7 +560,7 @@ providers:
   rayline-resp:
     api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
-    base_url: \"https://api-dev.rayline.ai/v1\"
+    base_url: \"https://router.example.test/v1\"
     models:
       arc-sage-1.0:
         context_length: 1000000
@@ -620,7 +620,7 @@ providers:
   rayline:
     api_key: \"rlk-test\"
     api_mode: \"anthropic_messages\"
-    base_url: \"https://api-dev.rayline.ai\"
+    base_url: \"https://router.example.test\"
     models:
       arc-sage-1.0:
         context_length: 1000000
@@ -632,7 +632,7 @@ providers:
   rayline-resp:
     api_key: \"rlk-test\"
     api_mode: \"codex_responses\"
-    base_url: \"https://api-dev.rayline.ai/v1\"
+    base_url: \"https://router.example.test/v1\"
     models:
       arc-sage-1.0:
         context_length: 1000000
