@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, RenderContext, json_file};
+use super::{Plan, RenderContext, json_file};
 
 pub(crate) const CONFIG_FILE: &str = "opencode.json";
 pub(crate) const PROVIDER_ID: &str = "rayline";
@@ -70,7 +70,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "options": {
                     "baseURL": ctx.v1_base(),
                     "apiKey": ctx.key,
-                    "headers": ctx.conversation_headers(&format!("{{env:{CONV_ID_ENV}}}")),
                 },
                 "models": entries
             }
@@ -127,9 +126,11 @@ const VALUE_FLAGS: &[&str] = &[
     "--format",
 ];
 
-/// The major version `opencode --version` reports (`opencode v2.0.25`), or
-/// None when it cannot be read.
-pub(crate) fn major_version(binary: &Path) -> Option<u64> {
+/// The major version `opencode --version` reports (`opencode v2.0.25`). A
+/// command that cannot run, exits non-zero or prints no version is an error
+/// naming it.
+pub(crate) fn major_version(binary: &Path) -> Result<u64, String> {
+    let shown = format!("`{} --version`", binary.display());
     let mut command = Command::new(binary);
     crate::codex::withhold_router_key(&mut command);
     let output = command
@@ -137,8 +138,12 @@ pub(crate) fn major_version(binary: &Path) -> Option<u64> {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
-        .ok()?;
-    parse_major(&String::from_utf8_lossy(&output.stdout))
+        .map_err(|error| format!("failed to run {shown}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("{shown} failed: {}", output.status));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_major(&stdout).ok_or_else(|| format!("{shown} printed no version: {:?}", stdout.trim()))
 }
 
 fn parse_major(text: &str) -> Option<u64> {
@@ -151,11 +156,11 @@ fn parse_major(text: &str) -> Option<u64> {
 
 /// The args OpenCode runs with: `--standalone` added where OpenCode 2 would
 /// otherwise attach to its background service (see the module docs). Left
-/// as given for OpenCode 1 or an unknown version, for any other subcommand,
-/// and when the args already pick a server (`--standalone`, `--server`).
-pub(crate) fn launch_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString> {
+/// as given for OpenCode 1, for any other subcommand, and when the args
+/// already pick a server (`--standalone`, `--server`).
+pub(crate) fn launch_args(args: &[OsString], major_version: u64) -> Vec<OsString> {
     let mut args = args.to_vec();
-    if major_version.is_none_or(|major| major < 2) {
+    if major_version < 2 {
         return args;
     }
     let before_separator = || args.iter().take_while(|arg| *arg != "--");
@@ -219,7 +224,6 @@ mod tests {
         assert_eq!(provider["npm"], "@ai-sdk/anthropic");
         assert_eq!(provider["options"]["baseURL"], format!("{TEST_URL}/v1"));
         assert_eq!(provider["options"]["apiKey"], TEST_KEY);
-        assert_eq!(provider["options"]["headers"], serde_json::json!({}));
         // OpenCode's hosted Rayline provider exposes only the two ARC tiers.
         let ids: Vec<_> = provider["models"].as_object().unwrap().keys().collect();
         assert_eq!(ids.len(), 2);
@@ -282,18 +286,16 @@ mod tests {
         ];
         for (given, expected) in cases {
             assert_eq!(
-                launch_args(&strings(given), Some(2)),
+                launch_args(&strings(given), 2),
                 strings(expected),
                 "{given:?}"
             );
         }
-        // OpenCode 1 has no background service; an unknown version is left alone.
-        for version in [Some(1), None] {
-            assert_eq!(
-                launch_args(&strings(&["run", "hi"]), version),
-                strings(&["run", "hi"])
-            );
-        }
+        // OpenCode 1 has no background service.
+        assert_eq!(
+            launch_args(&strings(&["run", "hi"]), 1),
+            strings(&["run", "hi"])
+        );
     }
 
     #[test]
@@ -303,7 +305,6 @@ mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id: super::super::ConversationIdFallback::new(None),
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: Some(1),
@@ -320,6 +321,36 @@ mod tests {
                 (&model["attachment"], &model["reasoning"]),
                 (&serde_json::json!(true), &serde_json::json!(true))
             );
+        }
+    }
+
+    /// `opencode --version` that cannot run, fails or prints no version is an
+    /// error naming the command, not a guess at the version.
+    #[test]
+    fn an_unreadable_version_is_an_error_naming_the_command() {
+        let dir = super::super::tests::temp_dir("opencode-version");
+        let missing = dir.join("opencode");
+        let error = super::major_version(&missing).unwrap_err();
+        assert!(error.contains(&missing.display().to_string()), "{error}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for (name, script) in [
+                ("fails", "#!/bin/sh\necho 'opencode v2.0.25'\nexit 1\n"),
+                ("no-version", "#!/bin/sh\necho 'no version here'\n"),
+                ("works", "#!/bin/sh\necho 'opencode v2.0.25'\n"),
+            ] {
+                let binary = dir.join(name);
+                std::fs::write(&binary, script).unwrap();
+                std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let version = super::major_version(&binary);
+                if name == "works" {
+                    assert_eq!(version, Ok(2));
+                } else {
+                    let error = version.unwrap_err();
+                    assert!(error.contains(&binary.display().to_string()), "{error}");
+                }
+            }
         }
     }
 

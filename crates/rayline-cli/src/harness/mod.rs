@@ -41,20 +41,6 @@
 //! the hosted Rayline router. Where that router translates the request to
 //! another protocol, a body-only `session_id` or Responses `prompt_cache_key`
 //! reaches the hosted router as `x-session-affinity`.
-//!
-//! The per-launch conversation id ([`ConversationIdFallback`]) is off by
-//! default on every wire: `RAYLINE_HARNESS_CONV_ID_FALLBACK=1` turns it on,
-//! and then each launch gets a fresh `RAYLINE_CONV_ID` (a UUID) sent as
-//! `x-conversation-id`, so one launch is one episode and a resume in a new
-//! launch starts a new one (for Hermes only when the launch starts its shared
-//! gateway, see [`hermes`]). That also collapses a subagent's turns into its
-//! parent's episode where the harness attaches the header to every request of
-//! the process. The native compat flags and config keys stay on either way;
-//! the gateway ranks `x-conversation-id` first when both arrive. The override
-//! applies to `rayline run <harness> --local` too, so forcing it there accepts the same
-//! episode collapse rather than silently doing nothing on that path; either
-//! path exports [`CONV_ID_ENV`] only when a rendered config references it
-//! ([`conversation_id_for`]).
 
 pub(crate) mod hermes;
 mod omp;
@@ -74,14 +60,9 @@ use serde_json::Value;
 /// The router key a parent launch hands its child processes. Removed from the
 /// harness's environment so it never reaches the harness's tools.
 const ROUTER_KEY_ENV: &str = "RAYLINE_ROUTER_API_KEY";
-/// Env var that carries the per-launch conversation id (fallback only).
-pub const CONV_ID_ENV: &str = "RAYLINE_CONV_ID";
-/// Header the gateway reads as the conversation (episode) key.
-pub const CONV_HEADER: &str = "x-conversation-id";
 /// Header a harness's own session id rides on, which the gateway keys the
-/// episode on when no [`CONV_HEADER`] arrives. Most harnesses send it under
-/// this name on their own; Hermes needs the name written into its config
-/// ([`hermes::SESSION_AFFINITY_KEY`]).
+/// episode on. Most harnesses send it under this name on their own; Hermes
+/// needs the name written into its config ([`hermes::SESSION_AFFINITY_KEY`]).
 pub const SESSION_AFFINITY_HEADER: &str = "x-session-affinity";
 /// The execution core's virtual model under `rayline run <harness> --local`.
 pub const ROUTER_MODEL: &str = crate::VIRTUAL_ROUTER_MODEL;
@@ -277,41 +258,6 @@ async fn get_json(url: &str, bearer: Option<&str>) -> Result<Value, String> {
 /// Output ceiling for models outside the hosted ARC tiers: the harness
 /// default the router admits.
 pub const MAX_OUTPUT_TOKENS: u64 = 32_000;
-/// Runtime override for [`ConversationIdFallback`]: `1` or `0`.
-pub const CONV_ID_FALLBACK_ENV: &str = "RAYLINE_HARNESS_CONV_ID_FALLBACK";
-
-/// When a config sends the per-launch `x-conversation-id`: only when
-/// [`CONV_ID_FALLBACK_ENV`] forces it. The router keys episodes on native
-/// harness session ids, or derives one where a wire has none.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConversationIdFallback {
-    /// [`CONV_ID_FALLBACK_ENV`]: `Some(true)` always, `Some(false)` never.
-    pub forced: Option<bool>,
-}
-
-impl ConversationIdFallback {
-    /// `override_value` is [`CONV_ID_FALLBACK_ENV`] (`1`/`true`/`on` or
-    /// `0`/`false`/`off`; anything else is ignored).
-    pub(crate) fn new(override_value: Option<&str>) -> Self {
-        Self {
-            forced: parse_switch(override_value),
-        }
-    }
-
-    /// Whether a config sends the header.
-    pub(crate) fn enabled(self) -> bool {
-        self.forced == Some(true)
-    }
-}
-
-/// A `1`/`true`/`on` or `0`/`false`/`off` override; anything else is `None`.
-pub(crate) fn parse_switch(value: Option<&str>) -> Option<bool> {
-    match value.map(|value| value.trim().to_ascii_lowercase()) {
-        Some(value) if matches!(value.as_str(), "1" | "true" | "on") => Some(true),
-        Some(value) if matches!(value.as_str(), "0" | "false" | "off") => Some(false),
-        _ => None,
-    }
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Harness {
@@ -374,11 +320,12 @@ impl Harness {
     }
 
     /// The installed harness's major version, where a renderer or the launch
-    /// args depend on it (OpenCode); None otherwise or when unreadable.
-    pub(crate) fn major_version(self, binary: Option<&Path>) -> Option<u64> {
+    /// args depend on it: `Some` for OpenCode ([`opencode::major_version`]),
+    /// `None` for every other harness.
+    pub(crate) fn major_version(self, binary: &Path) -> Result<Option<u64>, String> {
         match self {
-            Self::OpenCode => opencode::major_version(binary?),
-            _ => None,
+            Self::OpenCode => opencode::major_version(binary).map(Some),
+            _ => Ok(None),
         }
     }
 
@@ -396,7 +343,7 @@ impl Harness {
                 ));
             }
             Ok(openclaw::launch_args(args))
-        } else if self == Self::OpenCode {
+        } else if let (Self::OpenCode, Some(major_version)) = (self, major_version) {
             Ok(opencode_args(args, major_version))
         } else {
             Ok(args.to_vec())
@@ -421,8 +368,6 @@ pub(crate) struct RenderContext<'a> {
     /// (e.g. `https://api-dev.rayline.ai`).
     pub router_url: &'a str,
     pub config_dir: &'a Path,
-    /// When configs carry the per-launch `x-conversation-id` header.
-    pub conversation_id: ConversationIdFallback,
     /// pi only: whether to set `compat.allowEmptySignature`
     /// ([`pi::allow_empty_signature`]).
     pub allow_empty_signature: bool,
@@ -454,17 +399,6 @@ impl RenderContext<'_> {
     /// Base URL for clients that expect the `/v1` prefix in the base.
     pub fn v1_base(&self) -> String {
         format!("{}/v1", self.router_url)
-    }
-
-    /// Conversation-id headers: `{CONV_HEADER: value}` (`value` is the
-    /// harness's reference to [`CONV_ID_ENV`]) when the fallback is forced
-    /// on, else `{}`.
-    pub fn conversation_headers(&self, value: &str) -> Value {
-        if self.conversation_id.enabled() {
-            serde_json::json!({ CONV_HEADER: value })
-        } else {
-            serde_json::json!({})
-        }
     }
 }
 
@@ -541,15 +475,9 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         key: &key,
         router_url: &router_url,
         config_dir: &config_dir,
-        conversation_id: ConversationIdFallback::new(
-            std::env::var(CONV_ID_FALLBACK_ENV).ok().as_deref(),
-        ),
-        allow_empty_signature: pi::allow_empty_signature(
-            &env_name,
-            std::env::var(pi::ALLOW_EMPTY_SIGNATURE_ENV).ok().as_deref(),
-        ),
+        allow_empty_signature: pi::allow_empty_signature(&env_name),
         capabilities: None,
-        harness_major_version: harness.major_version(Some(&binary)),
+        harness_major_version: harness.major_version(&binary)?,
         models,
     };
     let plan = harness.plan(&ctx)?;
@@ -561,19 +489,14 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
         )
     })?;
 
-    let conv_id = conversation_id_for(&plan, new_conversation_id);
-    let episode = match &conv_id {
-        Some(id) => format!("conversation {id}"),
-        None => "episode keyed on the harness session".to_owned(),
-    };
     eprintln!(
-        "{}: {} -> {router_url} (env {env_name}, {episode})\n  config: {}",
+        "{}: {} -> {router_url} (env {env_name})\n  config: {}",
         crate::DISPLAY_NAME,
         harness.name(),
         config_dir.display()
     );
-    let args = match harness {
-        Harness::OpenClaw => {
+    let args = match (harness, ctx.harness_major_version) {
+        (Harness::OpenClaw, _) => {
             let env_container =
                 std::env::var_os("OPENCLAW_CONTAINER").is_some_and(|value| !value.is_empty());
             if env_container || openclaw::uses_container(&request.args) {
@@ -595,10 +518,10 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
             }
             args
         }
-        Harness::OpenCode => opencode_args(&request.args, ctx.harness_major_version),
+        (Harness::OpenCode, Some(major_version)) => opencode_args(&request.args, major_version),
         _ => request.args,
     };
-    let command = build_command(&binary, &plan, conv_id.as_deref(), &args);
+    let command = build_command(&binary, &plan, &args);
     if harness == Harness::Hermes && cfg!(windows) {
         hermes::prepare_launch(&command)?;
     }
@@ -607,7 +530,7 @@ async fn prepare(request: RunRequest) -> Result<Command, String> {
 
 /// OpenCode's args with `--standalone` where OpenCode 2 would attach to its
 /// background service ([`opencode::launch_args`]).
-fn opencode_args(args: &[OsString], major_version: Option<u64>) -> Vec<OsString> {
+fn opencode_args(args: &[OsString], major_version: u64) -> Vec<OsString> {
     let launched = opencode::launch_args(args, major_version);
     if launched.len() != args.len() {
         eprintln!(
@@ -689,12 +612,7 @@ pub(crate) fn write_private(path: &Path, contents: &str) -> io::Result<()> {
     file.write_all(contents.as_bytes())
 }
 
-pub(crate) fn build_command(
-    binary: &Path,
-    plan: &Plan,
-    conv_id: Option<&str>,
-    args: &[OsString],
-) -> Command {
+pub(crate) fn build_command(binary: &Path, plan: &Plan, args: &[OsString]) -> Command {
     let mut command = Command::new(binary);
     command.args(args);
     // The key reaches the harness through its config only (see the module docs).
@@ -705,39 +623,7 @@ pub(crate) fn build_command(
     for (name, value) in &plan.env_set {
         command.env(name, value);
     }
-    match conv_id {
-        Some(conv_id) => command.env(CONV_ID_ENV, conv_id),
-        // An inherited id (e.g. from a parent launch) must not leak in.
-        None => command.env_remove(CONV_ID_ENV),
-    };
     command
-}
-
-/// The per-launch id to export, minted by `mint` only when a rendered config
-/// actually references [`CONV_ID_ENV`]. A harness that keys the episode on its
-/// own session id references nothing, and then exporting an id would leave an
-/// unused variable in the environment every tool subprocess inherits.
-pub(crate) fn conversation_id_for(plan: &Plan, mint: impl FnOnce() -> String) -> Option<String> {
-    plan.files
-        .iter()
-        .any(|file| file.contents.contains(CONV_ID_ENV))
-        .then(mint)
-}
-
-/// A random (v4) UUID. One per launch; see [`ConversationIdFallback`].
-pub(crate) fn new_conversation_id() -> String {
-    let mut bytes: [u8; 16] = rand::random();
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    )
 }
 
 pub(crate) fn json_file(name: &'static str, value: &Value, overwrite: bool) -> ConfigFile {
@@ -1078,7 +964,6 @@ pub(crate) mod tests {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
-            conversation_id: ConversationIdFallback::new(None),
             allow_empty_signature: false,
             capabilities: None,
             harness_major_version: None,
@@ -1086,25 +971,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// Render `harness` with no override into a temp dir and return
-    /// (dir, plan).
+    /// Render `harness` into a temp dir and return (dir, plan).
     pub(crate) fn render(harness: Harness) -> (PathBuf, Plan) {
-        render_with(harness, ConversationIdFallback::new(None))
-    }
-
-    /// Render `harness` with the given fallback policy.
-    pub(crate) fn render_with(
-        harness: Harness,
-        conversation_id: ConversationIdFallback,
-    ) -> (PathBuf, Plan) {
         let home = temp_dir(harness.name());
         let dir = config_dir(&home, harness);
         let ctx = RenderContext {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
-            conversation_id,
-            allow_empty_signature: pi::allow_empty_signature("dev", None),
+            allow_empty_signature: pi::allow_empty_signature("dev"),
             capabilities: None,
             harness_major_version: None,
             models: hosted_models(),
@@ -1160,23 +1035,6 @@ pub(crate) mod tests {
         assert_eq!(Harness::from_command("claude"), None);
     }
 
-    #[test]
-    fn conversation_id_is_a_v4_uuid() {
-        let id = new_conversation_id();
-        assert_eq!(id.len(), 36);
-        let parts: Vec<&str> = id.split('-').collect();
-        assert_eq!(
-            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
-            [8, 4, 4, 4, 12]
-        );
-        assert!(parts[2].starts_with('4'));
-        assert!(matches!(
-            parts[3].chars().next(),
-            Some('8' | '9' | 'a' | 'b')
-        ));
-        assert_ne!(id, new_conversation_id());
-    }
-
     #[cfg(windows)]
     #[test]
     fn write_files_restricts_the_dir_and_files_to_the_owner() {
@@ -1225,7 +1083,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn command_carries_conversation_id_and_removes_keys() {
+    fn command_sets_the_plan_env_and_removes_keys() {
         let plan = Plan {
             files: Vec::new(),
             env_set: vec![("OPENCODE_CONFIG", OsString::from("/x/opencode.json"))],
@@ -1234,7 +1092,6 @@ pub(crate) mod tests {
         let command = build_command(
             Path::new("/bin/true"),
             &plan,
-            Some("conv-1"),
             &[OsString::from("run"), OsString::from("hi")],
         );
         let envs: Vec<(String, Option<String>)> = command
@@ -1252,84 +1109,10 @@ pub(crate) mod tests {
                 .iter()
                 .any(|(_, value)| value.as_deref() == Some(TEST_KEY))
         );
-        assert!(envs.contains(&("RAYLINE_CONV_ID".into(), Some("conv-1".into()))));
         assert!(envs.contains(&("OPENCODE_CONFIG".into(), Some("/x/opencode.json".into()))));
         assert!(envs.contains(&("CLAUDE_CONFIG_DIR".into(), None)));
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["run", "hi"]);
-    }
-
-    #[test]
-    fn conversation_id_fallback_is_off_by_default() {
-        assert!(!ConversationIdFallback::new(None).enabled());
-    }
-
-    #[test]
-    fn conversation_id_fallback_override() {
-        for on in ["1", "true", "ON", " on "] {
-            assert!(ConversationIdFallback::new(Some(on)).enabled(), "{on:?}");
-        }
-        for off in ["0", "false", "Off"] {
-            assert!(!ConversationIdFallback::new(Some(off)).enabled(), "{off:?}");
-        }
-        // Unrecognized or empty values keep the default (off).
-        assert!(!ConversationIdFallback::new(Some("")).enabled());
-        assert!(!ConversationIdFallback::new(Some("maybe")).enabled());
-    }
-
-    #[test]
-    fn native_session_keys_are_the_default() {
-        let command = build_command(Path::new("/bin/true"), &Plan::default(), None, &[]);
-        let conv = command
-            .get_envs()
-            .find(|(k, _)| *k == std::ffi::OsStr::new(CONV_ID_ENV));
-        assert_eq!(conv, Some((std::ffi::OsStr::new(CONV_ID_ENV), None)));
-        for harness in Harness::ALL {
-            let (dir, plan) = render(harness);
-            for file in &plan.files {
-                let text = fs::read_to_string(dir.join(file.name)).unwrap();
-                assert!(
-                    !text.contains(CONV_HEADER) && !text.contains(CONV_ID_ENV),
-                    "{}: {} still sends the per-launch id",
-                    harness.name(),
-                    file.name
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn forced_fallback_sends_the_conversation_header() {
-        for harness in Harness::ALL {
-            let (dir, plan) = render_with(harness, ConversationIdFallback::new(Some("1")));
-            let sends = plan.files.iter().any(|file| {
-                let text = fs::read_to_string(dir.join(file.name)).unwrap();
-                text.contains(CONV_HEADER) && text.contains(CONV_ID_ENV)
-            });
-            assert!(sends, "{} must send {CONV_HEADER}", harness.name());
-        }
-    }
-
-    #[test]
-    fn create_once_files_never_reference_the_conversation_id() {
-        // RAYLINE_CONV_ID is set from the rendered plan, so a file that is not
-        // rewritten each launch must never reference it.
-        for harness in Harness::ALL {
-            for fallback in [
-                ConversationIdFallback::new(None),
-                ConversationIdFallback::new(Some("1")),
-            ] {
-                let (_dir, plan) = render_with(harness, fallback);
-                for file in plan.files.iter().filter(|file| !file.overwrite) {
-                    assert!(
-                        !file.contents.contains(CONV_ID_ENV),
-                        "{}: {}",
-                        harness.name(),
-                        file.name
-                    );
-                }
-            }
-        }
     }
 
     /// The key reaches each harness through an owner-only Rayline config file,
@@ -1373,7 +1156,7 @@ pub(crate) mod tests {
             // thread reads the environment concurrently.
             unsafe { std::env::set_var(var, "rlk-test-not-a-real-key") };
         }
-        let output = build_command(Path::new("/usr/bin/env"), &Plan::default(), None, &[])
+        let output = build_command(Path::new("/usr/bin/env"), &Plan::default(), &[])
             .output()
             .expect("run env");
         for (var, value) in vars.iter().zip(previous) {

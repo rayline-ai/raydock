@@ -19,15 +19,14 @@ const SUBAGENT_MODEL_FORCE_ENV: &str = "CLAUDE_CODE_SUBAGENT_MODEL_FORCE";
 /// Claude Code's model for its `haiku` alias, which its background tasks
 /// (titles, summaries) use.
 const HAIKU_MODEL_ENV: &str = "ANTHROPIC_DEFAULT_HAIKU_MODEL";
-/// Claude Code's `--model` / `ANTHROPIC_MODEL` aliases (each may also carry a
-/// `[1m]` suffix).
+/// Claude Code's `--model` aliases (each may also carry a `[1m]` suffix).
 const CLAUDE_CODE_MODEL_ALIASES: [&str; 7] = [
     "default", "best", "opus", "sonnet", "haiku", "fable", "opusplan",
 ];
 pub(crate) const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
 /// Claude Code's switch for message threads ("tether"): server-held history
-/// that later requests continue by `previous_message_id`. Raydock leaves it to
-/// the user; a value they set is part of what a reused daemon must hold.
+/// that later requests continue by `previous_message_id`. Always `0`: the
+/// router holds no message-thread history.
 const MESSAGE_THREADS_ENV: &str = "CLAUDE_CODE_TETHER_LIVE";
 pub(crate) const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const CLAUDE_DISABLE_AGENT_VIEW_ENV: &str = "CLAUDE_CODE_DISABLE_AGENT_VIEW";
@@ -67,48 +66,31 @@ struct RoleModelInputs<'a> {
     /// The models the hosted router lists for the key.
     hosted: &'a crate::harness::LaunchModels,
     /// The main-agent model the user chose: Claude Code's own `--model` after
-    /// `--`, or `ANTHROPIC_MODEL`.
+    /// `--`.
     chosen_main_model: Option<&'a str>,
 }
 
 /// The subagent and background-task models, as `(env var, value)`: the child
-/// runs with each `Some`, and a reused Claude Code daemon must already hold
-/// it. A value the user exported (non-empty) is always kept.
+/// runs with each `Some` and without each `None`, and a reused Claude Code
+/// daemon must hold the same.
 ///
-/// Raydock, not Claude Code, decides the subagent model: subagents and
-/// background tasks run on the main model the user chose (`--model X` puts
-/// everything on X), else ARC Swift (the key's id for it).
-///
-/// Whenever Raydock sets the subagent model it also sets
-/// `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`, so the model reaches every subagent:
-/// Claude Code's built-in Explore and Plan agents (defined with `inherit`), a
-/// custom agent's own `model`, and a model the main agent names when it
-/// spawns one. A subagent model the user exported keeps Claude Code's own
-/// precedence. A Claude Code alias (`opus`, `sonnet[1m]`, ...) is not a model
-/// id, so it is not used for the haiku model.
-fn role_model_env_switches(
-    inputs: RoleModelInputs<'_>,
-    inherited: impl Fn(&str) -> Option<OsString>,
-) -> Vec<(&'static str, Option<String>)> {
-    let user = |key: &str| {
-        inherited(key)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_string_lossy().into_owned())
-    };
+/// Raydock decides them: subagents and background tasks run on the main model
+/// the user chose (`--model X` puts everything on X), else ARC Swift (the key's
+/// id for it). `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` makes the model reach every
+/// subagent: Claude Code's built-in Explore and Plan agents (defined with
+/// `inherit`), a custom agent's own `model`, and a model the main agent names
+/// when it spawns one. A Claude Code alias (`opus`, `sonnet[1m]`, ...) is not a
+/// model id, so the haiku model is then unset.
+fn role_model_env_switches(inputs: RoleModelInputs<'_>) -> Vec<(&'static str, Option<String>)> {
     let subagents = inputs
         .chosen_main_model
         .unwrap_or(&inputs.hosted.background)
         .to_owned();
     let haiku = Some(subagents.clone()).filter(|model| !is_claude_code_model_alias(model));
-    let user_subagents = user(SUBAGENT_MODEL_ENV);
-    let force = user_subagents.is_none().then(|| "1".to_owned());
     vec![
-        (SUBAGENT_MODEL_ENV, user_subagents.or(Some(subagents))),
-        (
-            SUBAGENT_MODEL_FORCE_ENV,
-            user(SUBAGENT_MODEL_FORCE_ENV).or(force),
-        ),
-        (HAIKU_MODEL_ENV, user(HAIKU_MODEL_ENV).or(haiku)),
+        (SUBAGENT_MODEL_ENV, Some(subagents)),
+        (SUBAGENT_MODEL_FORCE_ENV, Some("1".to_owned())),
+        (HAIKU_MODEL_ENV, haiku),
     ]
 }
 
@@ -140,6 +122,7 @@ pub enum RunError {
     Router(String),
     Auth(crate::status::AuthError),
     IsolatedProfile(io::Error),
+    LaunchRecord(io::Error),
 }
 
 impl std::fmt::Display for RunError {
@@ -154,6 +137,9 @@ impl std::fmt::Display for RunError {
             Self::Auth(error) => error.fmt(formatter),
             Self::IsolatedProfile(error) => {
                 write!(formatter, "failed to prepare the isolated Claude profile: {error}")
+            }
+            Self::LaunchRecord(error) => {
+                write!(formatter, "Claude Code launch record: {error}")
             }
         }
     }
@@ -201,12 +187,8 @@ async fn run_command_from_home(
     let router_url = hosted.base_url.clone();
     let key = crate::status::router_key(hosted, home).await?;
 
-    // The main model the user chose. Claude Code's own `--model` (after `--`)
-    // wins over `ANTHROPIC_MODEL`.
-    let inherited_model = env::var("ANTHROPIC_MODEL")
-        .ok()
-        .filter(|model| !model.trim().is_empty());
-    let chosen_main_model = forwarded_model_arg(&request.args).or_else(|| inherited_model.clone());
+    // The main model the user chose: Claude Code's own `--model` (after `--`).
+    let chosen_main_model = forwarded_model_arg(&request.args);
     // A hosted launch's ARC defaults are the ids the router lists for the
     // key, which follow the account's data mode.
     let hosted_models = crate::harness::fetch_hosted_models(&router_url, &key)
@@ -229,14 +211,11 @@ async fn run_command_from_home(
     // config dir. Inspect the matching config dir for a daemon conflict.
     let mut isolated = request.isolated;
     let mut inspect_dir = claude_config_dir(home, isolated);
-    let mut launch_switches = launch_env_switches(|key| env::var_os(key));
-    launch_switches.extend(role_model_env_switches(
-        RoleModelInputs {
-            hosted: &hosted_models,
-            chosen_main_model: chosen_main_model.as_deref(),
-        },
-        |key| env::var_os(key),
-    ));
+    let mut launch_switches = launch_env_switches();
+    launch_switches.extend(role_model_env_switches(RoleModelInputs {
+        hosted: &hosted_models,
+        chosen_main_model: chosen_main_model.as_deref(),
+    }));
     let daemon_request = RequestSpec {
         env_name: &env_name,
         router_url: &router_url,
@@ -290,67 +269,46 @@ async fn run_command_from_home(
     command.env(RAYLINE_ENV_NAME_ENV, &env_name);
     command.env_remove("ANTHROPIC_API_KEY");
     apply_refusal_recovery_env(&mut command, &launch_switches);
-    if let Some(caller_cwd) = env::var_os("RAYLINE_CALLER_CWD") {
-        let caller_cwd = PathBuf::from(caller_cwd);
-        if caller_cwd.is_dir() {
-            command.current_dir(caller_cwd);
-        }
-    }
 
     crate::claude_daemon::record_rayline_claude_launch(LaunchRecord {
         home,
         pid: std::process::id(),
         request: &daemon_request,
         preserve_spawned_by_pid,
-    });
+    })
+    .map_err(RunError::LaunchRecord)?;
     Ok(command)
 }
 
-/// The refusal-recovery switches the child runs with and a reused daemon must
-/// hold, since its background workers inherit the daemon's env. A switch is the
-/// user's non-empty value or `1`. An empty value is unset, as for the compact
-/// window: Claude Code reads it as "not disabled".
-pub(crate) fn refusal_recovery_values(
-    inherited: impl Fn(&str) -> Option<OsString>,
-) -> Vec<(&'static str, Option<String>)> {
+/// The refusal-recovery switches, both `1`: the child runs with them and a
+/// reused daemon must hold them, since its background workers inherit the
+/// daemon's env.
+pub(crate) fn refusal_recovery_values() -> Vec<(&'static str, Option<String>)> {
     CLAUDE_REFUSAL_RECOVERY_OFF_ENV
         .into_iter()
-        .map(|key| {
-            let value = inherited(key)
-                .filter(|value| !value.is_empty())
-                .map_or_else(
-                    || "1".to_owned(),
-                    |value| value.to_string_lossy().into_owned(),
-                );
-            (key, Some(value))
-        })
+        .map(|key| (key, Some("1".to_owned())))
         .collect()
 }
 
-/// The refusal-recovery switches plus the message-threads switch: every env
-/// switch the child runs with and a reused daemon must already hold. Message
-/// threads are the user's non-empty value, else Claude Code's default.
-pub(crate) fn launch_env_switches(
-    inherited: impl Fn(&str) -> Option<OsString>,
-) -> Vec<(&'static str, Option<String>)> {
-    let mut values = refusal_recovery_values(&inherited);
-    let threads = inherited(MESSAGE_THREADS_ENV)
-        .filter(|value| !value.is_empty())
-        .map(|value| value.to_string_lossy().into_owned());
-    values.push((MESSAGE_THREADS_ENV, threads));
+/// The refusal-recovery switches plus the message-threads switch (`0`):
+/// every env switch the child runs with and a reused daemon must hold.
+pub(crate) fn launch_env_switches() -> Vec<(&'static str, Option<String>)> {
+    let mut values = refusal_recovery_values();
+    values.push((MESSAGE_THREADS_ENV, Some("0".to_owned())));
     values
 }
 
-/// Sets the launch switches on the child: a value with a `Some` goes on the
-/// child, a `None` leaves the inherited env alone.
+/// Sets the launch switches on the child: a `Some` is set and a `None` is
+/// removed, so a value in the user's env never reaches it.
 pub(crate) fn apply_refusal_recovery_env(
     command: &mut Command,
     values: &[(&'static str, Option<String>)],
 ) {
     for (key, value) in values {
-        if let Some(value) = value {
-            command.env(key, value);
-        }
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
     }
 }
 
@@ -658,8 +616,7 @@ fn seed_isolated_claude_json(source: &Path, dest: &Path) -> io::Result<()> {
         Err(error) => return Err(error_with_path(source, error)),
     };
     fs::write(dest, contents).map_err(|error| error_with_path(dest, error))?;
-    set_user_private_permissions(dest);
-    Ok(())
+    set_user_private_permissions(dest)
 }
 
 /// Return `raw` (`.claude.json` contents) with the auth keys removed, or `None`
@@ -688,8 +645,7 @@ fn copy_private_file(source: &Path, dest: &Path) -> io::Result<()> {
             format!("copy {} to {}: {error}", source.display(), dest.display()),
         )
     })?;
-    set_user_private_permissions(dest);
-    Ok(())
+    set_user_private_permissions(dest)
 }
 
 fn error_with_path(path: &Path, error: io::Error) -> io::Error {
@@ -783,16 +739,23 @@ fn add_claude_bin_dir_to_child_path(command: &mut Command, claude_bin: &Path) {
     }
 }
 
-fn set_user_private_permissions(path: &Path) {
+/// Makes `path` readable by the user only (`0600`) and its parent dir `0700`.
+/// A failed chmod is an error with the path.
+fn set_user_private_permissions(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
 
+        let restrict = |path: &Path, mode: u32| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))
+                .map_err(|error| error_with_path(path, error))
+        };
         if let Some(parent) = path.parent() {
-            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+            restrict(parent, 0o700)?;
         }
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        restrict(path, 0o600)?;
     }
+    Ok(())
 }
 
 fn expand_user_path(path: PathBuf, home: Option<&Path>) -> PathBuf {
@@ -815,17 +778,6 @@ mod refusal_recovery_env_tests {
     const FALLBACK: &str = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK";
     const RETRY: &str = "CLAUDE_CODE_DISABLE_REFUSAL_RETRY";
 
-    fn values(fallback: Option<&str>, retry: Option<&str>) -> Vec<(&'static str, Option<String>)> {
-        refusal_recovery_values(|key| {
-            match key {
-                FALLBACK => fallback,
-                RETRY => retry,
-                _ => None,
-            }
-            .map(OsString::from)
-        })
-    }
-
     fn child_env(values: &[(&'static str, Option<String>)]) -> Vec<(String, Option<String>)> {
         let mut command = Command::new("claude");
         apply_refusal_recovery_env(&mut command, values);
@@ -838,51 +790,6 @@ mod refusal_recovery_env_tests {
                 )
             })
             .collect()
-    }
-
-    #[test]
-    fn each_switch_is_off_unless_the_user_set_it() {
-        // Each switch on its own: unset and empty become "1"; a non-empty value is kept.
-        for (inherited, expected) in [
-            (None, "1"),
-            (Some(""), "1"),
-            (Some("0"), "0"),
-            (Some("1"), "1"),
-        ] {
-            assert_eq!(
-                values(inherited, None),
-                vec![
-                    (FALLBACK, Some(expected.to_owned())),
-                    (RETRY, Some("1".to_owned()))
-                ]
-            );
-            assert_eq!(
-                values(None, inherited),
-                vec![
-                    (FALLBACK, Some("1".to_owned())),
-                    (RETRY, Some(expected.to_owned()))
-                ]
-            );
-        }
-    }
-
-    #[test]
-    fn message_threads_are_the_users_value_or_claude_codes_default() {
-        let threads = |user: Option<&str>| {
-            launch_env_switches(|key| {
-                (key == MESSAGE_THREADS_ENV)
-                    .then_some(user)
-                    .flatten()
-                    .map(OsString::from)
-            })
-            .into_iter()
-            .find(|(key, _)| *key == MESSAGE_THREADS_ENV)
-            .and_then(|(_, value)| value)
-        };
-        assert_eq!(threads(None), None);
-        assert_eq!(threads(Some("")), None);
-        assert_eq!(threads(Some("0")).as_deref(), Some("0"));
-        assert_eq!(threads(Some("1")).as_deref(), Some("1"));
     }
 
     /// A router answering every request with a standard key's `/v1/models`.
@@ -907,8 +814,8 @@ mod refusal_recovery_env_tests {
 
     /// The real launcher against a hosted router stub that lists the key's
     /// models: with a stored key and an exported compact window it starts no
-    /// process, so the child command it builds can be read directly. Each
-    /// switch is driven independently through the inherited env.
+    /// process, so the child command it builds can be read directly. Every
+    /// switch is exported with another value, which the child must not get.
     #[tokio::test]
     async fn the_launcher_sets_the_switches_on_the_child_it_builds() {
         static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -927,69 +834,44 @@ mod refusal_recovery_env_tests {
             args: Vec::new(),
             isolated: false,
         };
-        let saved: Vec<_> = [
-            FALLBACK,
-            RETRY,
-            MESSAGE_THREADS_ENV,
-            CLAUDE_CONFIG_DIR_ENV,
-            AUTO_COMPACT_WINDOW_ENV,
-            "ANTHROPIC_MODEL",
-        ]
-        .map(|key| (key, std::env::var_os(key)))
-        .into();
+        let exported = [
+            (FALLBACK, "0"),
+            (RETRY, "0"),
+            (MESSAGE_THREADS_ENV, "1"),
+            (SUBAGENT_MODEL_ENV, "exported-model"),
+            (SUBAGENT_MODEL_FORCE_ENV, "0"),
+            (HAIKU_MODEL_ENV, "exported-model"),
+            // An exported model is not a model source: the child runs on the
+            // router's main model.
+            ("ANTHROPIC_MODEL", "exported-model"),
+        ];
+        let saved: Vec<_> = [CLAUDE_CONFIG_DIR_ENV, AUTO_COMPACT_WINDOW_ENV]
+            .into_iter()
+            .chain(exported.iter().map(|(key, _)| *key))
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
         // A private Claude config dir, so no real daemon on this machine is
         // inspected, and an exported window, so no settings lookup runs.
         // SAFETY: serialized by ENV_LOCK; restored below.
         unsafe {
             std::env::set_var(CLAUDE_CONFIG_DIR_ENV, home.join(".claude"));
             std::env::set_var(AUTO_COMPACT_WINDOW_ENV, "180000");
-            std::env::remove_var("ANTHROPIC_MODEL");
-        }
-        let mut seen = Vec::new();
-        // The message-threads switch goes through the same launch switches: a
-        // user value is carried onto the child (and so into daemon reuse).
-        for (fallback, retry, threads) in [(None, Some(""), None), (Some("0"), None, Some("1"))] {
-            for (key, value) in [
-                (FALLBACK, fallback),
-                (RETRY, retry),
-                (MESSAGE_THREADS_ENV, threads),
-            ] {
-                // SAFETY: serialized by ENV_LOCK; restored below.
-                match value {
-                    Some(value) => unsafe { std::env::set_var(key, value) },
-                    None => unsafe { std::env::remove_var(key) },
-                }
+            for (key, value) in exported {
+                std::env::set_var(key, value);
             }
-            let command =
-                run_command_from_home(&request, &home, PathBuf::from("/nonexistent/claude"))
-                    .await
-                    .expect("the launch builds its command");
-            let env: std::collections::BTreeMap<String, Option<String>> = command
-                .get_envs()
-                .map(|(key, value)| {
-                    (
-                        key.to_string_lossy().into_owned(),
-                        value.map(|value| value.to_string_lossy().into_owned()),
-                    )
-                })
-                .collect();
-            assert_eq!(
-                env.get("ANTHROPIC_BASE_URL").cloned().flatten().as_deref(),
-                Some(router_url.as_str())
-            );
-            assert_eq!(
-                env.get(AUTO_COMPACT_WINDOW_ENV)
-                    .cloned()
-                    .flatten()
-                    .as_deref(),
-                Some("180000")
-            );
-            seen.push((
-                env.get(FALLBACK).cloned().flatten(),
-                env.get(RETRY).cloned().flatten(),
-                env.get(MESSAGE_THREADS_ENV).cloned().flatten(),
-            ));
         }
+        let command = run_command_from_home(&request, &home, PathBuf::from("/nonexistent/claude"))
+            .await
+            .expect("the launch builds its command");
+        let env: std::collections::BTreeMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
         for (key, value) in saved {
             // SAFETY: serialized by ENV_LOCK.
             match value {
@@ -998,26 +880,39 @@ mod refusal_recovery_env_tests {
             }
         }
         let _ = std::fs::remove_dir_all(&home);
-        assert_eq!(
-            seen,
-            vec![
-                (Some("1".to_owned()), Some("1".to_owned()), None),
-                (
-                    Some("0".to_owned()),
-                    Some("1".to_owned()),
-                    Some("1".to_owned())
-                ),
-            ]
-        );
+        let value = |key: &str| env.get(key).cloned().flatten();
+        let hosted = crate::harness::tests::hosted_models();
+        assert_eq!(value("ANTHROPIC_BASE_URL"), Some(router_url));
+        assert_eq!(value(AUTO_COMPACT_WINDOW_ENV).as_deref(), Some("180000"));
+        assert_eq!(value("ANTHROPIC_MODEL"), Some(hosted.main));
+        assert_eq!(value(FALLBACK).as_deref(), Some("1"));
+        assert_eq!(value(RETRY).as_deref(), Some("1"));
+        assert_eq!(value(MESSAGE_THREADS_ENV).as_deref(), Some("0"));
+        assert_eq!(value(SUBAGENT_MODEL_ENV), Some(hosted.background.clone()));
+        assert_eq!(value(SUBAGENT_MODEL_FORCE_ENV).as_deref(), Some("1"));
+        assert_eq!(value(HAIKU_MODEL_ENV), Some(hosted.background));
     }
 
     #[test]
-    fn the_child_command_carries_the_effective_values() {
+    fn the_child_command_sets_each_switch_and_removes_the_unset_ones() {
+        // The haiku model is unset under a Claude Code alias.
         assert_eq!(
-            child_env(&values(Some(""), Some("0"))),
+            child_env(&[(HAIKU_MODEL_ENV, None)]),
+            vec![(HAIKU_MODEL_ENV.to_owned(), None)]
+        );
+        assert_eq!(
+            refusal_recovery_values(),
+            vec![
+                (FALLBACK, Some("1".to_owned())),
+                (RETRY, Some("1".to_owned()))
+            ]
+        );
+        assert_eq!(
+            child_env(&launch_env_switches()),
             vec![
                 (FALLBACK.to_owned(), Some("1".to_owned())),
-                (RETRY.to_owned(), Some("0".to_owned()))
+                (RETRY.to_owned(), Some("1".to_owned())),
+                (MESSAGE_THREADS_ENV.to_owned(), Some("0".to_owned()))
             ]
         );
     }
@@ -1142,7 +1037,8 @@ mod claude_command_tests {
                 args: &[],
             },
             preserve_spawned_by_pid: None,
-        });
+        })
+        .unwrap();
         crate::harness::tests::assert_only_harness_files(
             &home,
             "claude-code",
@@ -1447,6 +1343,18 @@ mod isolated_seed_tests {
         assert!(mentions(&error, &failed_dest), "{error}");
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// A chmod that fails is an error with the path, not a file left with
+    /// whatever mode it had.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_chmod_is_an_error_with_the_path() {
+        let dir = temp_dir("chmod");
+        let missing = dir.join("settings.json");
+        let error = set_user_private_permissions(&missing).unwrap_err();
+        assert!(mentions(&error, &missing), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
@@ -1458,7 +1366,6 @@ mod arc_default_tests {
         /// The key's data mode (`None`: standard).
         mode: Option<&'a str>,
         chosen: Option<&'a str>,
-        inherited: &'a [(&'a str, &'a str)],
     }
 
     /// `(subagent model, force, haiku model)` for a launch.
@@ -1467,19 +1374,10 @@ mod arc_default_tests {
             launch.mode,
         ))
         .unwrap();
-        let switches = role_model_env_switches(
-            RoleModelInputs {
-                hosted: &models,
-                chosen_main_model: launch.chosen,
-            },
-            |key| {
-                launch
-                    .inherited
-                    .iter()
-                    .find(|(name, _)| *name == key)
-                    .map(|(_, value)| OsString::from(value))
-            },
-        );
+        let switches = role_model_env_switches(RoleModelInputs {
+            hosted: &models,
+            chosen_main_model: launch.chosen,
+        });
         let value = |key: &str| {
             switches
                 .iter()
@@ -1517,18 +1415,15 @@ mod arc_default_tests {
             );
         }
         let models = crate::harness::tests::hosted_models();
-        let switches = role_model_env_switches(
-            RoleModelInputs {
-                hosted: &models,
-                chosen_main_model: None,
-            },
-            |_| None,
-        );
+        let switches = role_model_env_switches(RoleModelInputs {
+            hosted: &models,
+            chosen_main_model: None,
+        });
         assert_eq!(switches.len(), 3);
         assert!(switches.iter().all(|(_, value)| value.is_some()));
     }
 
-    // Claude Code's `--model X` (after `--`) or `ANTHROPIC_MODEL` puts
+    // Claude Code's `--model X` (after `--`) puts
     // subagents and background tasks on X too.
     #[test]
     fn chosen_main_model_applies_to_subagents_and_background() {
@@ -1546,37 +1441,6 @@ mod arc_default_tests {
                 ..Launch::default()
             }),
             (Some("opus[1m]".to_owned()), Some("1".to_owned()), None)
-        );
-    }
-
-    // A value the user exported wins; a subagent model of their own keeps
-    // Claude Code's precedence (no force).
-    #[test]
-    fn exported_values_are_kept() {
-        assert_eq!(
-            roles(Launch {
-                inherited: &[(SUBAGENT_MODEL_ENV, "z-ai/glm-5.2")],
-                ..Launch::default()
-            }),
-            (
-                Some("z-ai/glm-5.2".to_owned()),
-                None,
-                Some("arc-swift-1.0".to_owned())
-            )
-        );
-        assert_eq!(
-            roles(Launch {
-                inherited: &[
-                    (SUBAGENT_MODEL_FORCE_ENV, "0"),
-                    (HAIKU_MODEL_ENV, "claude-haiku-5")
-                ],
-                ..Launch::default()
-            }),
-            (
-                Some("arc-swift-1.0".to_owned()),
-                Some("0".to_owned()),
-                Some("claude-haiku-5".to_owned())
-            )
         );
     }
 

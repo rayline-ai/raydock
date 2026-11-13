@@ -14,17 +14,14 @@
 //! text, that reasoning would reach the next model as something the assistant
 //! said. As thinking, the router can recognise it and leave it out for a
 //! model that cannot verify it. It is on only for envs whose router does that
-//! (dev today; `RAYLINE_PI_ALLOW_EMPTY_SIGNATURE=1|0` overrides): a router
-//! that forwards an unsigned thinking block to an Anthropic upstream gets the
-//! request rejected.
+//! (dev today): a router that forwards an unsigned thinking block to an
+//! Anthropic upstream gets the request rejected.
 
 use serde_json::json;
 
-use super::{CONV_ID_ENV, Plan, RenderContext, json_file};
+use super::{Plan, RenderContext, json_file};
 
 pub(crate) const PROVIDER_ID: &str = "rayline";
-/// Runtime override for [`allow_empty_signature`]: `1` or `0`.
-pub(crate) const ALLOW_EMPTY_SIGNATURE_ENV: &str = "RAYLINE_PI_ALLOW_EMPTY_SIGNATURE";
 
 /// Envs whose router drops unsigned reasoning before an Anthropic Messages
 /// upstream. Elsewhere an unsigned thinking block would be forwarded as is and
@@ -32,10 +29,9 @@ pub(crate) const ALLOW_EMPTY_SIGNATURE_ENV: &str = "RAYLINE_PI_ALLOW_EMPTY_SIGNA
 /// TODO: add "prod" once the prod router drops unsigned reasoning.
 const UNSIGNED_REASONING_ENVS: &[&str] = &["dev"];
 
-/// Whether `raydock pi` sets `compat.allowEmptySignature` for `env_name`:
-/// [`ALLOW_EMPTY_SIGNATURE_ENV`] if set to `1`/`0`, else the env default.
-pub(crate) fn allow_empty_signature(env_name: &str, override_value: Option<&str>) -> bool {
-    super::parse_switch(override_value).unwrap_or(UNSIGNED_REASONING_ENVS.contains(&env_name))
+/// Whether `raydock pi` sets `compat.allowEmptySignature` for `env_name`.
+pub(crate) fn allow_empty_signature(env_name: &str) -> bool {
+    UNSIGNED_REASONING_ENVS.contains(&env_name)
 }
 
 pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
@@ -65,7 +61,6 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Plan {
                 "baseUrl": ctx.messages_base(),
                 "api": "anthropic-messages",
                 "apiKey": ctx.key,
-                "headers": ctx.conversation_headers(&format!("${CONV_ID_ENV}")),
                 "compat": compat,
                 "models": entries
             }
@@ -96,7 +91,6 @@ mod tests {
             key: super::super::tests::TEST_KEY,
             router_url: TEST_URL,
             config_dir: dir,
-            conversation_id: super::super::ConversationIdFallback::new(None),
             allow_empty_signature: allow,
             capabilities: None,
             harness_major_version: None,
@@ -107,15 +101,11 @@ mod tests {
     }
 
     #[test]
-    fn allow_empty_signature_defaults_by_env_and_override() {
+    fn allow_empty_signature_follows_the_env() {
         use super::allow_empty_signature;
-        assert!(allow_empty_signature("dev", None));
-        assert!(!allow_empty_signature("prod", None));
-        assert!(!allow_empty_signature("staging", None));
-        assert!(allow_empty_signature("prod", Some("1")));
-        assert!(!allow_empty_signature("dev", Some("0")));
-        // Unrecognized values keep the env default.
-        assert!(!allow_empty_signature("prod", Some("maybe")));
+        assert!(allow_empty_signature("dev"));
+        assert!(!allow_empty_signature("prod"));
+        assert!(!allow_empty_signature("staging"));
     }
 
     #[test]
@@ -154,7 +144,6 @@ mod tests {
         assert_eq!(provider["apiKey"], super::super::tests::TEST_KEY);
         assert_eq!(provider["compat"]["sendSessionAffinityHeaders"], true);
         assert_eq!(provider["compat"]["allowEmptySignature"], true);
-        assert_eq!(provider["headers"], serde_json::json!({}));
         let ids: Vec<_> = provider["models"]
             .as_array()
             .unwrap()
