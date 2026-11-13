@@ -144,6 +144,24 @@ fn a_bad_update_channel_fails_before_update_runs() {
 }
 
 #[test]
+fn local_mode_refuses_harness_args_before_starting_the_local_process() {
+    let home = Home::new();
+    home.settings(ROUTING);
+    for (args, message) in [
+        (
+            &["run", "pi", "--local", "--", "--resume"][..],
+            "local mode requires a fresh harness session",
+        ),
+        (
+            &["run", "openclaw", "--local", "--", "--container", "c"],
+            "OpenClaw container mode cannot use the hybrid gateway configuration",
+        ),
+    ] {
+        assert_fails(&home.run(args), 1, message);
+    }
+}
+
+#[test]
 fn local_mode_refuses_the_kept_options_it_does_not_run() {
     let home = Home::new();
     home.settings(ROUTING);

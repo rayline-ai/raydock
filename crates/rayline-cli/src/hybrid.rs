@@ -237,6 +237,7 @@ async fn run_harness(
     harness: &str,
     args: &[OsString],
 ) -> io::Result<ExitCode> {
+    require_local_args(harness, args)?;
     let (home, paths) = local_paths()?;
     {
         let _lock = acquire_lock(&paths.lock())?;
@@ -797,7 +798,6 @@ fn harness_command(
     token: &str,
     capabilities: &ModelCapabilities,
 ) -> io::Result<Command> {
-    require_fresh_session(name, args)?;
     let program = crate::harness::launch_program(name, std::env::var_os("PATH"));
     let mut command = Command::new(&program);
     crate::codex::withhold_router_key(&mut command);
@@ -865,7 +865,7 @@ fn harness_command(
                 io::Error::other(format!("unsupported local-mode harness {name:?}"))
             })?;
             let major_version = harness.major_version(&program).map_err(io::Error::other)?;
-            let args = harness.hybrid_args(args, major_version)?;
+            let args = harness.hybrid_args(args, major_version);
             let config_dir = crate::harness::config_dir(home, harness);
             private_dir(&config_dir)?;
             let ctx = crate::harness::RenderContext {
@@ -886,6 +886,15 @@ fn harness_command(
     }
     command.args(args);
     Ok(command)
+}
+
+/// Refuse a command line local mode can't run, before anything starts.
+fn require_local_args(harness: &str, args: &[OsString]) -> io::Result<()> {
+    require_fresh_session(harness, args)?;
+    match crate::harness::Harness::from_command(harness) {
+        Some(harness) => harness.require_hybrid_args(args),
+        None => Ok(()),
+    }
 }
 
 fn require_fresh_session(harness: &str, args: &[OsString]) -> io::Result<()> {
