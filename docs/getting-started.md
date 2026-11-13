@@ -121,7 +121,7 @@ rayline run claude --isolated
 | Option or subcommand | Does |
 |---|---|
 | `--model <model>` | The model Codex asks for. |
-| `--auth auto\|subscription\|none` | How Codex authenticates. `subscription` uses your existing ChatGPT login, and `none` uses no Codex login. |
+| `--auth auto\|subscription\|none` | How Codex authenticates. `auto` uses Rayline cloud with your Rayline router key, `subscription` uses your existing ChatGPT login, and `none` uses no Codex login. |
 | `rayline run codex app [WORKSPACE]` | Launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`, and opens `WORKSPACE` if you give one. |
 | `rayline run codex configure` | Writes a Codex profile to `$CODEX_HOME/rayline.config.toml`. |
 
