@@ -51,9 +51,12 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
 
     // 1. Compute the config to write. Nothing changes on disk yet, so a
     //    declined restart below leaves everything untouched.
-    let Some(user_home) = dirs::home_dir() else {
-        eprintln!("Error: failed to resolve Codex app home: home directory not found");
-        return ExitCode::from(1);
+    let user_home = match crate::home() {
+        Ok(home) => home,
+        Err(error) => {
+            eprintln!("Error: failed to resolve Codex app home: {error}");
+            return ExitCode::from(1);
+        }
     };
     let home = isolated_home_path(&user_home);
     let config = crate::codex::provider_config_toml(&provider);
@@ -85,9 +88,7 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
     command.env("CODEX_HOME", &home).arg("app");
     command.args(&request.codex_args);
     match command.status() {
-        // A missing code means the child was killed by a signal: treat it as
-        // failure (matching the Codex CLI path), not silent success.
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Ok(status) => crate::child_exit_code(status),
         Err(error) => {
             eprintln!("raydock: failed to launch codex app: {error}");
             ExitCode::from(127)
@@ -98,10 +99,12 @@ pub async fn run(request: AppRunRequest) -> ExitCode {
 /// Resolve the user's real Codex home (`$CODEX_HOME` or `~/.codex`), whose
 /// `config.toml` tables seed a new Rayline Codex home.
 fn user_codex_home() -> io::Result<PathBuf> {
-    std::env::var_os("CODEX_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|home| home.join(".codex")))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))
+    match std::env::var_os("CODEX_HOME") {
+        Some(codex_home) => Ok(PathBuf::from(codex_home)),
+        None => Ok(crate::home()
+            .map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?
+            .join(".codex")),
+    }
 }
 
 /// The stable isolated home Rayline points the desktop app at:

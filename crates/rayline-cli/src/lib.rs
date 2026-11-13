@@ -1,6 +1,8 @@
 mod command_alias;
 use std::env;
 use std::ffi::OsString;
+use std::fmt;
+use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 pub(crate) mod auth_callback_page;
@@ -44,6 +46,36 @@ pub const UPDATE_BASE_URL: &str = "https://get.rayline.ai";
 pub const INSTALLER_URL: &str = "https://get.rayline.ai/install.sh";
 pub const CLAUDE_LAUNCHES_SUFFIX: &str = ".rayline/harness/claude-code/daemon-launches.json";
 pub const RAYLINE_VERSION: &str = env!("RAYLINE_VERSION");
+
+/// The env var the home directory comes from.
+#[cfg(not(windows))]
+const HOME_VAR: &str = "HOME";
+/// The env var the home directory comes from.
+#[cfg(windows)]
+const HOME_VAR: &str = "USERPROFILE";
+
+/// The home directory is unknown: its env var is unset or empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HomeError;
+
+impl fmt::Display for HomeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "`{HOME_VAR}` is not set, so the home directory is unknown"
+        )
+    }
+}
+
+impl std::error::Error for HomeError {}
+
+/// The user's home directory: `HOME` on unix, `USERPROFILE` on Windows.
+pub(crate) fn home() -> Result<PathBuf, HomeError> {
+    match env::var_os(HOME_VAR) {
+        Some(home) if !home.is_empty() => Ok(PathBuf::from(home)),
+        _ => Err(HomeError),
+    }
+}
 
 // Production minisign public key(s) for release / self-update signature verification.
 // The matching secret key lives only in the GitHub `release` environment secret
@@ -280,6 +312,18 @@ async fn run_cloud(launch: cli::Launch, hosted: status::HostedEnvironment) -> Ex
     }
 }
 
+/// The exit code to pass on for a harness that exited with `status`: its own
+/// code when it fits in 0..=255, else 1. A harness killed by a signal has no
+/// code, and a Windows code above 255 (such as a crash status) is not
+/// truncated to its low byte.
+pub(crate) fn child_exit_code(status: std::process::ExitStatus) -> ExitCode {
+    ExitCode::from(exit_code_byte(status.code()))
+}
+
+fn exit_code_byte(code: Option<i32>) -> u8 {
+    code.and_then(|code| u8::try_from(code).ok()).unwrap_or(1)
+}
+
 fn terminal_output_text(value: &str) -> String {
     value.chars().collect()
 }
@@ -320,10 +364,53 @@ fn exec_or_status(command: &mut Command) -> ExitCode {
 #[cfg(not(unix))]
 fn exec_or_status(command: &mut Command) -> ExitCode {
     match command.status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Ok(status) => crate::child_exit_code(status),
         Err(error) => {
             eprintln!("raydock: failed to run claude: {error}");
             ExitCode::from(127)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_harness_exit_code_outside_a_byte_is_1() {
+        assert_eq!(exit_code_byte(Some(0)), 0);
+        assert_eq!(exit_code_byte(Some(3)), 3);
+        assert_eq!(exit_code_byte(Some(255)), 255);
+        assert_eq!(exit_code_byte(Some(256)), 1);
+        assert_eq!(exit_code_byte(Some(257)), 1);
+        assert_eq!(exit_code_byte(Some(-1)), 1);
+        // STATUS_ACCESS_VIOLATION, whose low byte is 5.
+        assert_eq!(exit_code_byte(Some(0xC000_0005_u32 as i32)), 1);
+        assert_eq!(exit_code_byte(None), 1);
+    }
+
+    #[test]
+    fn home_comes_only_from_its_env_var() {
+        let saved = env::var_os(HOME_VAR);
+        let dir = env::temp_dir().join("rayline-home-var");
+        // SAFETY: the workspace tests run with --test-threads=1; restored below.
+        unsafe { env::remove_var(HOME_VAR) };
+        let unset = home();
+        unsafe { env::set_var(HOME_VAR, "") };
+        let empty = home();
+        unsafe { env::set_var(HOME_VAR, &dir) };
+        let set = home();
+        match saved {
+            Some(value) => unsafe { env::set_var(HOME_VAR, value) },
+            None => unsafe { env::remove_var(HOME_VAR) },
+        }
+
+        assert_eq!(unset, Err(HomeError));
+        assert_eq!(empty, Err(HomeError));
+        assert_eq!(set, Ok(dir));
+        assert_eq!(
+            HomeError.to_string(),
+            format!("`{HOME_VAR}` is not set, so the home directory is unknown")
+        );
     }
 }

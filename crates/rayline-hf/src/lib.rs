@@ -246,18 +246,13 @@ fn download_to_hf_cache_at(
     f.write_all(commit.as_bytes())
         .map_err(|e| format!("Failed to write refs/main: {e}"))?;
 
-    let depth = filename.matches('/').count();
-    let mut rel_prefix = String::from("../../");
-    for _ in 0..depth {
-        rel_prefix.push_str("../");
-    }
-    let symlink_target = format!("{rel_prefix}blobs/{blob_name}");
+    let symlink_target = snapshot_symlink_target(filename, &blob_name);
 
     let _ = fs::remove_file(&snapshot_file);
     create_symlink_or_copy(&symlink_target, &snapshot_file, &blob_path)?;
 
     info!(
-        "[HfCache] Cache entry created: {:?} -> {}",
+        "[HfCache] Cache entry created: {:?} -> {:?}",
         snapshot_file, symlink_target
     );
 
@@ -268,8 +263,22 @@ fn download_to_hf_cache_at(
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+/// The snapshot file's link to its blob, relative to the snapshot file's
+/// directory (`snapshots/<commit>/` plus one level per `/` in `filename`).
+/// It is built from path components, so it uses the platform's separator.
+fn snapshot_symlink_target(filename: &str, blob_name: &str) -> PathBuf {
+    let mut target = PathBuf::from("..");
+    target.push("..");
+    for _ in 0..filename.matches('/').count() {
+        target.push("..");
+    }
+    target.push("blobs");
+    target.push(blob_name);
+    target
+}
+
 fn create_symlink_or_copy(
-    symlink_target: &str,
+    symlink_target: &Path,
     symlink_path: &Path,
     _blob_path: &Path,
 ) -> Result<(), String> {
@@ -289,7 +298,7 @@ fn create_symlink_or_copy(
                     e
                 );
                 fs::copy(_blob_path, symlink_path)
-                    .map_err(|e| format!("Failed to copy blob to snapshot: {}", e))?;
+                    .map_err(|e| format!("Failed to copy blob to snapshot: {e}"))?;
             }
         }
     }
@@ -297,7 +306,7 @@ fn create_symlink_or_copy(
     #[cfg(not(any(unix, windows)))]
     {
         fs::copy(_blob_path, symlink_path)
-            .map_err(|e| format!("Failed to copy blob to snapshot: {}", e))?;
+            .map_err(|e| format!("Failed to copy blob to snapshot: {e}"))?;
     }
 
     Ok(())
@@ -531,6 +540,23 @@ mod tests {
         assert_eq!(fs::read(&dest_path).unwrap(), b"hello world");
 
         let _ = fs::remove_dir_all(test_dir);
+    }
+
+    #[test]
+    fn snapshot_symlink_target_uses_native_separators() {
+        let native = |parts: &[&str]| parts.join(std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(
+            snapshot_symlink_target("tokenizer.json", "sha256-ab")
+                .to_str()
+                .unwrap(),
+            native(&["..", "..", "blobs", "sha256-ab"])
+        );
+        assert_eq!(
+            snapshot_symlink_target("onnx/model.onnx", "sha256-ab")
+                .to_str()
+                .unwrap(),
+            native(&["..", "..", "..", "blobs", "sha256-ab"])
+        );
     }
 
     #[test]

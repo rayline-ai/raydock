@@ -108,7 +108,7 @@ pub(crate) async fn run_local(harness: &str, args: &[OsString]) -> ExitCode {
 
 async fn run_harness(harness: &str, args: &[OsString]) -> io::Result<ExitCode> {
     require_supported_os()?;
-    let home = dirs::home_dir().ok_or_else(|| io::Error::other("cannot find home directory"))?;
+    let home = crate::home().map_err(io::Error::other)?;
     let paths = Paths {
         dir: home.join(".rayline").join("hybrid"),
     };
@@ -141,7 +141,7 @@ async fn run_harness(harness: &str, args: &[OsString]) -> io::Result<ExitCode> {
         crate::harness::hermes::prepare_launch(&command).map_err(io::Error::other)?;
     }
     let status = command.status()?;
-    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+    Ok(crate::child_exit_code(status))
 }
 
 fn gateway_client() -> io::Result<reqwest::Client> {
@@ -182,7 +182,7 @@ fn require_supported_os() -> io::Result<()> {
 
 async fn execute(cli: Cli) -> io::Result<ExitCode> {
     require_supported_os()?;
-    let home = dirs::home_dir().ok_or_else(|| io::Error::other("cannot find home directory"))?;
+    let home = crate::home().map_err(io::Error::other)?;
     let paths = Paths {
         dir: cli
             .state_dir
@@ -573,8 +573,16 @@ fn installed_binary(name: &str) -> io::Result<PathBuf> {
     let directory = executable
         .parent()
         .ok_or_else(|| io::Error::other("rayline executable has no parent directory"))?;
-    fs::canonicalize(directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX)))
-        .map_err(|error| io::Error::new(error.kind(), format!("installed {name} is unavailable; run `raydock update` or reinstall the complete Raydock release: {error}")))
+    let path = directory.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+    fs::canonicalize(&path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "installed {name} is missing at {}: {error}. Reinstall the complete release with `raydock update --force`",
+                path.display()
+            ),
+        )
+    })
 }
 
 fn ready(paths: &Paths) -> io::Result<Value> {
@@ -1171,6 +1179,28 @@ fn acquire_lock(lock_path: &Path) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_installed_binary_is_an_error_naming_its_path() {
+        let name = "rayline-no-such-binary";
+        let path = fs::canonicalize(std::env::current_exe().unwrap())
+            .unwrap()
+            .with_file_name(format!("{name}{}", std::env::consts::EXE_SUFFIX));
+        let error = installed_binary(name).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "installed {name} is missing at {}: ",
+                path.display()
+            )),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("Reinstall the complete release with `raydock update --force`"),
+            "{message}"
+        );
+    }
 
     // The built-in prod takes no `--env`: `--env prod` selects a configured
     // `environments.prod` instead.

@@ -1463,7 +1463,6 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "crossterm",
- "dirs",
  "libc",
  "minisign-verify",
  "opener",

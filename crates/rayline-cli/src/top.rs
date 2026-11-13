@@ -19,8 +19,7 @@ pub struct TopRequest {
 }
 
 pub async fn render_top(request: &TopRequest) -> io::Result<String> {
-    let home = dirs::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "home directory not found"))?;
+    let home = crate::home().map_err(|error| io::Error::new(io::ErrorKind::NotFound, error))?;
     render_top_from_home(&home, request).await
 }
 

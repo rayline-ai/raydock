@@ -504,7 +504,7 @@ pub async fn run(request: RunRequest) -> ExitCode {
 }
 
 async fn prepare(request: RunRequest) -> Result<Command, String> {
-    let home = dirs::home_dir().ok_or("home directory not found")?;
+    let home = crate::home().map_err(|error| error.to_string())?;
     let harness = request.harness;
     let binary = find_on_path(harness.binary()).ok_or_else(|| {
         format!(
@@ -911,7 +911,7 @@ fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
 #[cfg(not(unix))]
 fn exec_or_status(command: &mut Command, harness: Harness) -> ExitCode {
     match command.status() {
-        Ok(status) => ExitCode::from(status.code().unwrap_or(1) as u8),
+        Ok(status) => crate::child_exit_code(status),
         Err(error) => {
             eprintln!("raydock: failed to run {}: {error}", harness.binary());
             ExitCode::from(127)

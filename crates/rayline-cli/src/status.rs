@@ -59,13 +59,19 @@ pub(crate) enum LoginFlow {
 
 #[derive(Debug)]
 pub enum AuthError {
-    HomeNotFound,
+    HomeNotFound(crate::HomeError),
     Config(ConfigError),
     Credentials(CredentialsError),
     InvalidPaste(String),
     LoginFailed(String),
     MintFailed(String),
     RefreshFailed(String),
+    /// Logout removed the local session, but revoking it remotely failed:
+    /// the environment name and the revoke error.
+    RevokeFailed {
+        env_name: String,
+        error: String,
+    },
     SignedOut(String),
     WriteFailed(io::Error),
 }
@@ -82,13 +88,17 @@ pub struct HostedEnvironment {
 impl std::fmt::Display for AuthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::HomeNotFound => formatter.write_str("home directory not found"),
+            Self::HomeNotFound(error) => error.fmt(formatter),
             Self::Config(error) => error.fmt(formatter),
             Self::Credentials(error) => error.fmt(formatter),
             Self::InvalidPaste(message)
             | Self::LoginFailed(message)
             | Self::MintFailed(message)
             | Self::RefreshFailed(message) => formatter.write_str(message),
+            Self::RevokeFailed { env_name, error } => write!(
+                formatter,
+                "Logged out of {env_name} on this machine, but revoking the session failed: {error}"
+            ),
             Self::SignedOut(env_name) => write!(
                 formatter,
                 "Not logged in to {env_name}. Run: {}",
@@ -146,7 +156,7 @@ pub fn is_valid_root_env(value: &str) -> bool {
 }
 
 fn home_dir() -> Result<PathBuf, AuthError> {
-    dirs::home_dir().ok_or(AuthError::HomeNotFound)
+    crate::home().map_err(AuthError::HomeNotFound)
 }
 
 pub(crate) fn render_status(request: &StatusRequest) -> Result<String, AuthError> {
@@ -302,13 +312,13 @@ async fn logout_from_home(hosted: &HostedEnvironment, home: &Path) -> Result<Str
     };
     credentials::save(home, &credentials).map_err(AuthError::WriteFailed)?;
 
-    let mut message = format!("Logged out ({})\n", hosted.name());
-    if let Err(error) =
-        revoke_rayline_session(&hosted.base_url, &account.session.refresh_token).await
-    {
-        message.push_str(&format!("Remote session revoke failed: {error}\n"));
-    }
-    Ok(message)
+    revoke_rayline_session(&hosted.base_url, &account.session.refresh_token)
+        .await
+        .map_err(|error| AuthError::RevokeFailed {
+            env_name: hosted.name().to_owned(),
+            error,
+        })?;
+    Ok(format!("Logged out ({})\n", hosted.name()))
 }
 
 pub async fn auth_login(request: &AuthLoginRequest) -> Result<String, AuthError> {
@@ -1915,17 +1925,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_revoke_still_logs_out() {
+    async fn a_failed_revoke_logs_out_locally_and_is_an_error() {
         let api = FakeApi::start(&[("/v1/auth/cli/revoke", 500, json!({}))]);
         let home = temp_home("logout-revoke-fails");
         save_account(&home, None, account(LATER));
-        let message = logout_from_home(&hosted(None, &api.base_url), &home)
+        let error = logout_from_home(&hosted(None, &api.base_url), &home)
             .await
-            .unwrap();
-        assert!(message.starts_with("Logged out (prod)\n"), "{message}");
-        assert!(
-            message.contains("Remote session revoke failed"),
-            "{message}"
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Logged out of prod on this machine, but revoking the session failed: \
+             session revoke failed: HTTP 500: {}"
         );
         assert_eq!(stored(&home, None), None);
         let _ = fs::remove_dir_all(&home);
