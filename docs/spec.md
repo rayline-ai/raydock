@@ -6,7 +6,7 @@ Sections marked **Internal** are real but stay out of public docs and `--help`. 
 
 ## 1. Rules
 
-1. **Fail fast.** Rayline validates `settings.json`, `credentials.json`, env overrides and flags once, at load, and refuses to run with a clear error that names the key or flag. After load, the code trusts the parsed config: no checks, defaults or fallbacks at call sites.
+1. **Fail fast.** Rayline validates `settings.json`, env overrides and flags once, at load, before any command runs. Every command that uses `credentials.json` (`rayline auth status`, `rayline auth logout`, a harness launch, starting the local process) loads and validates it before it acts; `rayline local status`, `rayline local stop`, `rayline top` and `rayline update` don't read it. `rayline auth login` replaces an invalid `credentials.json` with the new session and says so, because signing in is how the user repairs it (section 6). Otherwise an invalid value stops Rayline with a clear error that names the key or flag. After load, the code trusts the parsed config: no checks, defaults or fallbacks at call sites.
 2. **No silent fallback.** A missing or invalid value is an error. It is never skipped, guessed or replaced by another source.
 3. **One spelling, one value.** Each key, flag and env var has one name and each meaning has one value. No aliases, no alternative spellings, no deprecated names.
 4. **No compatibility code.** No migration of old files, keys, names or install layouts. Old files are ignored, not read and not moved.
@@ -70,12 +70,14 @@ rayline run <HARNESS> [--local | --config <file>] [HARNESS ARGS]...
 5. Rayline options come first, right after the harness name. The first argument that is not a Rayline option, or everything after `--`, goes to the harness unchanged, including `--help`.
 6. `rayline run --help` prints the usage above. `rayline run <HARNESS>` with an unknown harness is a usage error.
 7. Each harness keeps today's behaviour in both modes, apart from what this spec removes.
-8. Local mode refuses these kept options and commands (section 9) before anything starts: `rayline run claude --isolated`, `rayline run claude-desktop`, `rayline run codex app`, `rayline run codex configure`, and `rayline run codex` with `--model` or `--auth subscription`.
-9. Local mode runs only a fresh harness session and refuses one that resumes or forks a saved session, before anything starts. It looks at the harness arguments before any `--`, in both the `--flag` and `--flag=value` forms:
+8. Local mode refuses these kept options and commands (section 9) before anything starts: `rayline run claude --isolated`, `rayline run claude-desktop`, `rayline run codex app`, `rayline run codex configure`, and `rayline run codex` with `--model` or `--auth subscription`. `app` and `configure` are Rayline commands only as the word right after `rayline run codex`. After Rayline's options they are codex arguments, so `rayline run codex --local app` passes `app` to codex.
+9. For `claude`, `codex`, `pi` and `opencode`, local mode refuses a command line that resumes or forks a saved session, before anything starts. It looks at the harness arguments before any `--`, in both the `--flag` and `--flag=value` forms, and refuses these:
    - `claude`: `-r`, `-c`, `--resume`, `--continue`, `--fork-session`, `--resume-session-at`;
-   - `codex`: the `resume` and `fork` subcommands, and `exec resume`;
+   - `codex`: `resume` or `fork` as the first argument, or `exec resume` as the first two;
    - `pi`: `-r`, `-c`, `--resume`, `--continue`, `--fork`, `--session`, `--session-id`;
    - `opencode`: `-c`, `-s`, `--continue`, `--session`, `--fork`.
+
+   The arguments of other harnesses are not checked: `hermes --resume` and `openclaw --session-id`, for example, are passed on.
 10. Local mode refuses OpenClaw container mode, before anything starts: `rayline run openclaw` when `OPENCLAW_CONTAINER` is set to a non-empty value, or when any harness argument is `--container` or `--container=<value>`.
 
 Harness-specific options and subcommands are **kept for review** (section 9).
@@ -322,8 +324,9 @@ One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `ses
 1. Claude Code: `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE`, `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK`, `CLAUDE_CODE_DISABLE_REFUSAL_RETRY`, `CLAUDE_CODE_TETHER_LIVE`, `RAYLINE_ENV_NAME`.
    - `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, in cloud mode: set to the router's auto-compact window for the model, or removed when the router gives none.
    - `CLAUDE_CODE_AUTO_MODE_SERVER`, in local mode: always `0`.
-2. Other harnesses: `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `PI_PROFILE`, `OMP_PROFILE`, `OPENCODE_CONFIG`, `OPENCLAW_CONFIG_PATH`.
+2. Other harnesses: `HERMES_HOME`, `PI_CODING_AGENT_DIR`, `OPENCODE_CONFIG`, `OPENCLAW_CONFIG_PATH`.
 3. Removed from the harness environment: `ANTHROPIC_API_KEY`, `CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_USE_VERTEX`, `CLAUDE_CODE_USE_FOUNDRY`.
+4. Removed from the `omp` environment: `PI_PROFILE`, `OMP_PROFILE`.
 
 ### 7.3 Internal: handoff between Rayline's own processes
 
@@ -358,6 +361,7 @@ Only two files:
                                 rayline-core-LICENSE
   local/                        local process state
     core-config.json            config handed to the core
+    core-config.counted.json    the same config with Rayline's token counter added
     gateway-token               secret shared by the CLI and the local process
     ready.json                  local process address once it is up
     supervisor.json             what is running
@@ -376,13 +380,18 @@ Only two files:
 
 Each mode has its own harness folder because each writes its own endpoint, key and model list there.
 
-Rayline writes nothing else under `~/.rayline` or `~/.config/rayline`. Outside them it writes only the harness's own files named in 9.4 and 9.5. Tests use a temporary home folder.
+Rayline writes nothing else under `~/.rayline` or `~/.config/rayline`. Outside them it writes only:
+- the harness's own files named in 9.4 and 9.5;
+- tokenizer files in the Hugging Face cache: `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `<home>/.cache/huggingface/hub`;
+- with `rayline run claude --isolated` (9.3), in the user's Claude config folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`): the folders `projects/`, `sessions/`, `plans/` and `paste-cache/` and an empty `history.jsonl`, each only if missing, which the isolated folder links to.
+
+Tests use a temporary home folder.
 
 ## 9. Kept for review
 
 These keep today's behaviour for now, under the new command shape. Their aliases and extra values are still removed (section 10.4).
 
-1. `rayline auth login`: `-b, --no-browser` (device-code login) and `-p, --paste` (paste the callback URL). `--paste` with `--no-browser` behaves as today (`--paste` wins). Launching a harness while signed out signs in on the spot with the default flow.
+1. `rayline auth login`: `-b, --no-browser` (device-code login) and `-p, --paste` (paste the callback URL). `--paste` with `--no-browser` behaves as today (`--paste` wins). Launching a harness while signed out signs in on the spot with the default flow when stdin and stdout are both terminals. Otherwise the launch fails as signed out.
 2. `rayline update`: `--check`, `--version <version>`, `--force`, `--dry-run`.
 3. `rayline run claude --isolated`: gives Claude Code its own config folder (`~/.rayline/harness/claude-code/`) so it can run beside other sessions.
 4. `rayline run codex`: `--model <model>` and `--auth auto|subscription|none`; the subcommands `rayline run codex app [WORKSPACE]` (launches the Codex desktop app on its own `CODEX_HOME`, `~/.rayline/harness/codex-app/`) and `rayline run codex configure` (writes a Codex profile to `$CODEX_HOME/rayline.config.toml`).
