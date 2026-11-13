@@ -255,10 +255,10 @@ fn print_or_fail<E: std::fmt::Display>(result: Result<String, E>, prefix: &str) 
 }
 
 /// A local-mode run on the local process. The kept options it does not run
-/// yet are refused here, in one place.
+/// are refused here, in one place.
 async fn run_local(run: cli::Run, settings: &config::Settings) -> ExitCode {
     if let Some(option) = run.not_in_local_mode() {
-        eprintln!("Error: {option} is not available in local mode yet");
+        eprintln!("Error: {option} is not available in local mode");
         return ExitCode::from(1);
     }
     let (name, args) = match run.launch {

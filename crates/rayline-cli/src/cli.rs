@@ -291,8 +291,8 @@ pub(crate) struct CodexOptions {
 }
 
 impl Run {
-    /// The option or command that local mode does not run yet, if this run
-    /// uses one.
+    /// The option or command that local mode does not run, if this run uses
+    /// one.
     pub(crate) fn not_in_local_mode(&self) -> Option<&'static str> {
         self.launch.not_in_local_mode()
     }
@@ -315,8 +315,9 @@ impl Launch {
         }
     }
 
-    /// The kept option or command that local mode does not run yet: the
-    /// deleted `hybrid run` had none of them.
+    /// The kept option or command that local mode does not run: the deleted
+    /// `hybrid run` had none of them. Codex's `--auth auto` and `--auth none`
+    /// both send only the gateway token there.
     fn not_in_local_mode(&self) -> Option<&'static str> {
         match self {
             Launch::Claude { isolated: true, .. } => Some("`--isolated`"),
@@ -324,7 +325,9 @@ impl Launch {
             Launch::CodexApp { .. } => Some("`run codex app`"),
             Launch::CodexConfigure(_) => Some("`run codex configure`"),
             Launch::Codex { options, .. } if options.model.is_some() => Some("`--model`"),
-            Launch::Codex { options, .. } if options.auth.is_some() => Some("`--auth`"),
+            Launch::Codex { options, .. } if options.auth == Some(CodexAuthMode::Subscription) => {
+                Some("`--auth subscription`")
+            }
             Launch::Claude { .. } | Launch::Codex { .. } | Launch::Harness { .. } => None,
         }
     }
@@ -1529,7 +1532,7 @@ mod tests {
     }
 
     #[test]
-    fn local_mode_names_the_kept_options_it_does_not_run_yet() {
+    fn local_mode_names_the_kept_options_it_does_not_run() {
         let local = |args: &[&str]| run(args).not_in_local_mode();
         assert_eq!(
             local(&["run", "claude", "--isolated"]),
@@ -1545,10 +1548,15 @@ mod tests {
             Some("`run codex configure`")
         );
         assert_eq!(local(&["run", "codex", "--model", "m"]), Some("`--model`"));
-        assert_eq!(local(&["run", "codex", "--auth", "auto"]), Some("`--auth`"));
+        assert_eq!(
+            local(&["run", "codex", "--auth", "subscription"]),
+            Some("`--auth subscription`")
+        );
         for args in [
             &["run", "claude", "-p", "hi"][..],
             &["run", "codex", "exec"],
+            &["run", "codex", "--auth", "auto"],
+            &["run", "codex", "--auth", "none"],
             &["run", "pi"],
             &["run", "pi", "--config", "routing.json"],
         ] {

@@ -113,6 +113,9 @@ fn a_config_file_starts_the_local_process_from_it() {
     for args in [
         &["run", "pi", "--config", ROUTING_FILE][..],
         &["local", "start", "--config", ROUTING_FILE],
+        // Both send Codex only the gateway token.
+        &["run", "codex", "--config", ROUTING_FILE, "--auth", "auto"],
+        &["run", "codex", "--config", ROUTING_FILE, "--auth", "none"],
     ] {
         assert_fails(&home.run(args), 1, "installed rayline-core is unavailable");
     }
@@ -141,7 +144,7 @@ fn a_bad_update_channel_fails_before_update_runs() {
 }
 
 #[test]
-fn local_mode_refuses_the_kept_options_it_does_not_run_yet() {
+fn local_mode_refuses_the_kept_options_it_does_not_run() {
     let home = Home::new();
     home.settings(ROUTING);
     for (args, option) in [
@@ -159,11 +162,15 @@ fn local_mode_refuses_the_kept_options_it_does_not_run_yet() {
             "`run codex configure`",
         ),
         (&["run", "codex", "--local", "--model", "m"], "`--model`"),
+        (
+            &["run", "codex", "--local", "--auth", "subscription"],
+            "`--auth subscription`",
+        ),
     ] {
         assert_fails(
             &home.run(args),
             1,
-            &format!("Error: {option} is not available in local mode yet"),
+            &format!("Error: {option} is not available in local mode"),
         );
     }
 }
