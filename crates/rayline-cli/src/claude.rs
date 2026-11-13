@@ -24,6 +24,15 @@ const CLAUDE_CODE_MODEL_ALIASES: [&str; 7] = [
     "default", "best", "opus", "sonnet", "haiku", "fable", "opusplan",
 ];
 pub(crate) const AUTO_COMPACT_WINDOW_ENV: &str = "CLAUDE_CODE_AUTO_COMPACT_WINDOW";
+/// Removed from every Claude Code launch, cloud and local: the token Rayline
+/// sets is the only credential, and a vendor switch would send requests
+/// around Rayline.
+const CLAUDE_REMOVED_ENV: [&str; 4] = [
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+];
 /// Claude Code's switch for message threads ("tether"): server-held history
 /// that later requests continue by `previous_message_id`. Always `0`: the
 /// router holds no message-thread history.
@@ -199,14 +208,15 @@ async fn run_command_from_home(
     let model = chosen_main_model
         .clone()
         .unwrap_or_else(|| hosted_models.main.clone());
-    // An exported window wins. Otherwise Claude Code sizes the session itself
-    // unless the hosted router knows a window for a launch model Claude Code
-    // doesn't (an ARC id, another provider's model). A Claude Code alias
-    // (`opus`, `sonnet[1m]`, ...) is Claude Code's own, so it skips the lookup.
-    let auto_compact_window = match explicit_auto_compact_window() {
-        Some(window) => Some(window),
-        None if is_claude_code_model_alias(&model) => None,
-        None => router_auto_compact_window(&router_url, &key, &model).await?,
+    // Claude Code sizes the session itself unless the hosted router knows a
+    // window for a launch model Claude Code doesn't (an ARC id, another
+    // provider's model). A Claude Code alias (`opus`, `sonnet[1m]`, ...) is
+    // Claude Code's own, so it skips the lookup. A window in the user's
+    // environment is not read: the child gets the router's or none.
+    let auto_compact_window = if is_claude_code_model_alias(&model) {
+        None
+    } else {
+        router_auto_compact_window(&router_url, &key, &model).await?
     };
 
     // `--isolated` (or choosing `[i]` at the conflict prompt) targets a private
@@ -270,7 +280,7 @@ async fn run_command_from_home(
     command.env("ANTHROPIC_MODEL", &model);
     set_auto_compact_window_env(&mut command, auto_compact_window.as_deref());
     command.env(RAYLINE_ENV_NAME_ENV, &env_name);
-    command.env_remove("ANTHROPIC_API_KEY");
+    remove_claude_env(&mut command);
     apply_refusal_recovery_env(&mut command, &launch_switches);
 
     crate::claude_daemon::record_rayline_claude_launch(LaunchRecord {
@@ -326,12 +336,11 @@ pub(crate) fn claude_command(claude_bin: &Path) -> Command {
     command
 }
 
-/// The auto-compact window the user exported in
-/// `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, if any.
-fn explicit_auto_compact_window() -> Option<String> {
-    env::var(AUTO_COMPACT_WINDOW_ENV)
-        .ok()
-        .filter(|value| !value.is_empty())
+/// Removes [`CLAUDE_REMOVED_ENV`] from a Claude Code launch.
+pub(crate) fn remove_claude_env(command: &mut Command) {
+    for name in CLAUDE_REMOVED_ENV {
+        command.env_remove(name);
+    }
 }
 
 /// Whether `model` is a Claude Code model alias (`opus`, `sonnet[1m]`,
@@ -377,7 +386,7 @@ async fn router_auto_compact_window(
         .map_err(|error| {
             RunError::Router(format!(
                 "Couldn't read the auto-compact window for {model} from {router_base}/v1/settings: \
-                 {error}. Export {AUTO_COMPACT_WINDOW_ENV}=<tokens> to set it."
+                 {error}"
             ))
         })
 }
@@ -767,6 +776,7 @@ fn set_user_private_permissions(path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod refusal_recovery_env_tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     const FALLBACK: &str = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK";
     const RETRY: &str = "CLAUDE_CODE_DISABLE_REFUSAL_RETRY";
@@ -785,18 +795,31 @@ mod refusal_recovery_env_tests {
             .collect()
     }
 
-    /// A router answering every request with a standard key's `/v1/models`.
-    async fn listing_stub() -> String {
+    /// A router answering `/v1/settings` with `window` as its
+    /// `autoCompactWindow` and every other request with a standard key's
+    /// `/v1/models`.
+    async fn router_stub(window: Value) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let body = crate::harness::tests::listing(None).to_string();
+        let listing = crate::harness::tests::listing(None).to_string();
+        let settings = serde_json::json!({ "autoCompactWindow": window }).to_string();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf).await;
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let body = if buf[..read].starts_with(b"GET /v1/settings") {
+                    &settings
+                } else {
+                    &listing
+                };
                 let response = format!(
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 200 OK
+content-type: application/json
+content-length: {}
+connection: close
+
+{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes()).await;
@@ -805,19 +828,19 @@ mod refusal_recovery_env_tests {
         base
     }
 
-    /// The real launcher against a hosted router stub that lists the key's
-    /// models: with a stored key and an exported compact window it starts no
-    /// process, so the child command it builds can be read directly. Every
-    /// switch is exported with another value, which the child must not get.
-    #[tokio::test]
-    async fn the_launcher_sets_the_switches_on_the_child_it_builds() {
+    /// The env of the child the real launcher builds against [`router_stub`]
+    /// answering `window`, and the stub's URL. With a stored key it starts no
+    /// process, so the command can be read directly. Every switch, a compact
+    /// window, an API key and the vendor switches are exported with values
+    /// the child must not get.
+    async fn launched_env(window: Value) -> (BTreeMap<String, Option<String>>, String) {
         static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
         let _guard = ENV_LOCK.lock().await;
         let home =
             std::env::temp_dir().join(format!("rayline-cli-refusal-launch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         crate::credentials::save_test_router_key(&home, Some("stub"), "rlk-test");
-        let router_url = listing_stub().await;
+        let router_url = router_stub(window).await;
         let request = RunRequest {
             hosted: crate::status::HostedEnvironment {
                 env: Some("stub".to_owned()),
@@ -837,18 +860,23 @@ mod refusal_recovery_env_tests {
             // An exported model is not a model source: the child runs on the
             // router's main model.
             ("ANTHROPIC_MODEL", "exported-model"),
+            // An exported window is not read: the child gets the router's.
+            (AUTO_COMPACT_WINDOW_ENV, "180000"),
+            ("ANTHROPIC_API_KEY", "exported-key"),
+            ("CLAUDE_CODE_USE_BEDROCK", "1"),
+            ("CLAUDE_CODE_USE_VERTEX", "1"),
+            ("CLAUDE_CODE_USE_FOUNDRY", "1"),
         ];
-        let saved: Vec<_> = [CLAUDE_CONFIG_DIR_ENV, AUTO_COMPACT_WINDOW_ENV]
+        let saved: Vec<_> = [CLAUDE_CONFIG_DIR_ENV]
             .into_iter()
             .chain(exported.iter().map(|(key, _)| *key))
             .map(|key| (key, std::env::var_os(key)))
             .collect();
         // A private Claude config dir, so no real daemon on this machine is
-        // inspected, and an exported window, so no settings lookup runs.
+        // inspected.
         // SAFETY: serialized by ENV_LOCK; restored below.
         unsafe {
             std::env::set_var(CLAUDE_CONFIG_DIR_ENV, home.join(".claude"));
-            std::env::set_var(AUTO_COMPACT_WINDOW_ENV, "180000");
             for (key, value) in exported {
                 std::env::set_var(key, value);
             }
@@ -856,7 +884,7 @@ mod refusal_recovery_env_tests {
         let command = run_command_from_home(&request, &home, PathBuf::from("/nonexistent/claude"))
             .await
             .expect("the launch builds its command");
-        let env: std::collections::BTreeMap<String, Option<String>> = command
+        let env = command
             .get_envs()
             .map(|(key, value)| {
                 (
@@ -873,10 +901,16 @@ mod refusal_recovery_env_tests {
             }
         }
         let _ = std::fs::remove_dir_all(&home);
+        (env, router_url)
+    }
+
+    #[tokio::test]
+    async fn the_launcher_sets_the_switches_on_the_child_it_builds() {
+        let (env, router_url) = launched_env(serde_json::json!(250_000)).await;
         let value = |key: &str| env.get(key).cloned().flatten();
         let hosted = crate::harness::tests::hosted_models();
         assert_eq!(value("ANTHROPIC_BASE_URL"), Some(router_url));
-        assert_eq!(value(AUTO_COMPACT_WINDOW_ENV).as_deref(), Some("180000"));
+        assert_eq!(value(AUTO_COMPACT_WINDOW_ENV).as_deref(), Some("250000"));
         assert_eq!(value("ANTHROPIC_MODEL"), Some(hosted.main));
         assert_eq!(value(FALLBACK).as_deref(), Some("1"));
         assert_eq!(value(RETRY).as_deref(), Some("1"));
@@ -884,6 +918,15 @@ mod refusal_recovery_env_tests {
         assert_eq!(value(SUBAGENT_MODEL_ENV), Some(hosted.background.clone()));
         assert_eq!(value(SUBAGENT_MODEL_FORCE_ENV).as_deref(), Some("1"));
         assert_eq!(value(HAIKU_MODEL_ENV), Some(hosted.background));
+        for name in CLAUDE_REMOVED_ENV {
+            assert_eq!(env.get(name), Some(&None), "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_launcher_removes_an_exported_window_the_router_does_not_set() {
+        let (env, _) = launched_env(Value::Null).await;
+        assert_eq!(env.get(AUTO_COMPACT_WINDOW_ENV), Some(&None));
     }
 
     #[test]
@@ -1000,8 +1043,9 @@ mod router_auto_compact_window_tests {
             let (window, _) = window(status, body).await;
             let error = window.unwrap_err();
             assert!(error.contains(reason), "{error}");
+            // The user's window is not read, so the error offers none.
             assert!(
-                error.contains("Export CLAUDE_CODE_AUTO_COMPACT_WINDOW=<tokens>"),
+                !error.contains("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
                 "{error}"
             );
         }

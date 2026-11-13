@@ -90,7 +90,7 @@ fn registry_action_model(id: &str) -> &str {
 
 /// The core config for `settings`, with Decisions on `router_url`. Refuses
 /// what the local process must refuse before it serves anything (spec 5.8
-/// items 10 and 11).
+/// items 10 to 12).
 pub(crate) fn core_config(settings: &Settings, router_url: &str) -> Result<Value, ConfigError> {
     for (id, endpoint) in &settings.endpoints {
         if endpoint.api_key_env.as_deref() == Some(ROUTER_KEY_ENV) {

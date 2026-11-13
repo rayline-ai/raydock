@@ -753,11 +753,6 @@ fn model_capabilities(state: &Value) -> io::Result<ModelCapabilities> {
 /// own classifier requests (code.claude.com auto-mode classifier docs).
 const AUTO_MODE_SERVER_ENV: &str = "CLAUDE_CODE_AUTO_MODE_SERVER";
 
-/// The value to set for [`AUTO_MODE_SERVER_ENV`]: `0` unless the user's
-/// environment already names one (an empty value included), which is kept.
-fn auto_mode_server_default(inherited: Option<&std::ffi::OsStr>) -> Option<&'static str> {
-    inherited.is_none().then_some("0")
-}
 /// Context window every harness is told under hybrid routing. The runtime
 /// carries any prompt up to this size: a turn too large for the local model
 /// hands off to cloud, and a prompt larger than the cloud window is refused
@@ -819,7 +814,6 @@ fn harness_command(
             command
                 .env("ANTHROPIC_BASE_URL", endpoint)
                 .env("ANTHROPIC_AUTH_TOKEN", token)
-                .env_remove("ANTHROPIC_API_KEY")
                 // Claude Code otherwise asks for its own output default
                 // (32k), which the core refuses.
                 .env(
@@ -840,22 +834,11 @@ fn harness_command(
             // A turn the local model serves carries no verdict, so every
             // checked action is denied. Its own classifier requests, which the
             // gateway sends to the cloud classifier pin, judge them instead.
-            // A value the user set is kept.
-            if let Some(value) =
-                auto_mode_server_default(std::env::var_os(AUTO_MODE_SERVER_ENV).as_deref())
-            {
-                command.env(AUTO_MODE_SERVER_ENV, value);
-            }
+            // Always `0`: a value in the user's environment is not read.
+            command.env(AUTO_MODE_SERVER_ENV, "0");
             let recovery = crate::claude::refusal_recovery_values();
             crate::claude::apply_refusal_recovery_env(&mut command, &recovery);
-            // Inherited cloud/vendor modes must not bypass the explicit gateway.
-            for name in [
-                "CLAUDE_CODE_USE_BEDROCK",
-                "CLAUDE_CODE_USE_VERTEX",
-                "CLAUDE_CODE_USE_FOUNDRY",
-            ] {
-                command.env_remove(name);
-            }
+            crate::claude::remove_claude_env(&mut command);
         }
         "codex" => {
             command.env("RAYLINE_HYBRID_GATEWAY_TOKEN", token);
@@ -1634,14 +1617,24 @@ mod tests {
                     && value == Some(std::ffi::OsStr::new("1000000")))
         );
         // Auto mode's checks come from Claude Code's own classifier requests,
-        // not from the API inside a turn the local model may serve; a value
-        // the user set is kept.
-        assert_eq!(auto_mode_server_default(None), Some("0"));
-        for kept in ["0", "1", ""] {
+        // not from the API inside a turn the local model may serve, so the
+        // child always gets `0`.
+        let claude_env: std::collections::BTreeMap<_, _> = claude.get_envs().collect();
+        assert_eq!(
+            claude_env.get(std::ffi::OsStr::new(AUTO_MODE_SERVER_ENV)),
+            Some(&Some(std::ffi::OsStr::new("0")))
+        );
+        // The same removals as a cloud launch.
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_USE_VERTEX",
+            "CLAUDE_CODE_USE_FOUNDRY",
+        ] {
             assert_eq!(
-                auto_mode_server_default(Some(std::ffi::OsStr::new(kept))),
-                None,
-                "{kept:?}"
+                claude_env.get(std::ffi::OsStr::new(name)),
+                Some(&None),
+                "{name}"
             );
         }
         let codex = harness_command(
