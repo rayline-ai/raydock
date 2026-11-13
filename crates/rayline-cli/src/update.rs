@@ -644,8 +644,8 @@ fn replace_file(
 /// locks a running `.exe` and rejects renaming over it, but it *does* allow
 /// renaming the running file out of the way — so we move the current binary to
 /// a sidecar path first, then move the update into place, restoring the
-/// original if the second move fails. On Windows both moves wait briefly while
-/// another process holds the file ([`rename_when_released`]).
+/// original if the second move fails. On Windows every rename waits briefly
+/// while another process holds the file ([`rename_when_released`]).
 #[cfg(not(windows))]
 pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     fs::rename(staged, install_path).map_err(|error| {
@@ -659,11 +659,11 @@ pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), 
 #[cfg(windows)]
 pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), UpdateError> {
     if !install_path.exists() {
-        return fs::rename(staged, install_path).map_err(|error| {
-            UpdateError::Install(format!(
-                "failed to install {}: {error}",
-                install_path.display()
-            ))
+        return rename_when_released(staged, install_path).map_err(|error| {
+            install_failure(
+                &error,
+                format!("failed to install {}: {error}", install_path.display()),
+            )
         });
     }
 
@@ -685,7 +685,7 @@ pub(crate) fn move_into_place(staged: &Path, install_path: &Path) -> Result<(), 
         }
         Err(error) => {
             // Restore the original so a failed update never leaves a hole.
-            fs::rename(&backup, install_path).map_err(|restore_error| {
+            rename_when_released(&backup, install_path).map_err(|restore_error| {
                 UpdateError::Install(format!(
                     "failed to replace {}: {error}; restore also failed: {restore_error}. Original preserved at {}",
                     install_path.display(),
