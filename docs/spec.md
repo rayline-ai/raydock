@@ -265,7 +265,7 @@ When the local process starts, before it serves anything, it also refuses:
 
 ## 6. `credentials.json`
 
-One file: `~/.config/rayline/credentials.json`, written only by `rayline auth login` and `rayline auth logout`. It is the only source for Rayline's session and router key: no env var or flag overrides it.
+One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `session` and `router_key` together (it mints the router key at sign-in), `rayline auth logout` removes them, and a token refresh rewrites `session` only, because refresh tokens rotate. Nothing else writes it. It is the only source for Rayline's session and router key: no env var or flag overrides it.
 
 ```json
 {
@@ -290,7 +290,7 @@ One file: `~/.config/rayline/credentials.json`, written only by `rayline auth lo
 
 1. Prod sits at the top level. `environments.<name>` holds the same two objects for an internal environment.
 2. snake_case only. No `version` field, no `authKind`.
-3. Every field shown is required in its object. A missing or invalid field is a load error that tells the user to run `rayline auth login`.
+3. Each slot (the top level for prod, or `environments.<name>`) is either absent, meaning signed out, or holds both objects with every field shown. A slot with only one object, or a missing or invalid field, is a load error that tells the user to run `rayline auth login`. A missing file means signed out everywhere.
 4. A file in today's shape is invalid: it is a load error that tells the user to run `rayline auth login`. It is not migrated.
 
 ## 7. Env vars
