@@ -204,15 +204,25 @@ The action ARC identifies is the model id after its provider prefix (`qwen/qwen3
 |---|---|---|---|
 | `endpoint` | string | yes | An id in `endpoints`. |
 | `model` | string | yes | The name that server knows the model by. |
-| `context_window` | integer > 0 | yes if ARC doesn't know the model | Context window in tokens. |
-| `max_output_tokens` | integer > 0 | yes if ARC doesn't know the model | Output ceiling in tokens. |
+| `context_window` | integer > 0 | yes, when the local process starts (item 5) | Context window in tokens. |
+| `max_output_tokens` | integer > 0 | yes, when the local process starts (item 5) | Output ceiling in tokens. |
 | `tokenizer` | string | no | Hugging Face tokenizer repo for token counting. |
 | `price` | object `input`, `output`, `cache_read`, `cache_write` (numbers >= 0) | no | Overrides ARC's price for this model only. |
 
 1. When ARC picks a model in `models`, the local process sends the request to its endpoint under its `model` name.
-2. Any model ARC picks that is not in `models` goes to Rayline cloud under the id ARC returned. Its limits and price come from ARC.
+2. The only models ARC can pick that are not in `models` are these three Rayline cloud models. When ARC picks one, it goes to Rayline cloud under its Rayline cloud id:
+
+   | Rayline cloud id | Id in the core's registry | Context window | Output ceiling |
+   |---|---|---|---|
+   | `claude-opus-5-5` | `anthropic/claude-opus-5.5` | 1,000,000 | 128,000 |
+   | `claude-sonnet-5-5` | `anthropic/claude-sonnet-5.5` | 1,000,000 | 128,000 |
+   | `claude-haiku-5-5` | `anthropic/claude-haiku-5.5` | 1,000,000 | 128,000 |
+
+   A `models` entry keyed by one of the registry ids replaces that cloud model. ARC prices the cloud models. This list goes when the Rayline router publishes ARC's model set (section 10.4 item 14).
 3. Nothing marks a model as "local". Every entry works the same way.
 4. Main/subagent routes are not supported.
+5. ARC doesn't publish the models it knows yet, so it knows no model's limits. Every entry must state `context_window` and `max_output_tokens`, and the local process refuses to start without them (section 5.8 item 11).
+6. In local mode Rayline tells every harness a context window of 1,000,000 tokens, whichever model serves the turn.
 
 ### 5.4 `routing`
 
@@ -292,7 +302,7 @@ Load refuses, naming the key:
 When the local process starts, before it serves anything, it also refuses:
 
 10. An `api_key_env` naming an env var that isn't set.
-11. A model entry ARC doesn't know that is missing `context_window` or `max_output_tokens`.
+11. A model entry that is missing `context_window` or `max_output_tokens`. ARC knows no model today, so this applies to every entry (section 5.3 item 5).
 12. An `api_key_env` naming `RAYLINE_ROUTER_API_KEY`, which holds the Rayline router key.
 
 ## 6. `credentials.json`
@@ -464,7 +474,7 @@ Everything below is deleted outright: code, tests, docs and help text.
 11. A missing classifier key or model silently skipping the classifier route.
 12. The model taken from `--model`, then the request, then `ANTHROPIC_MODEL`.
 13. Lowercase proxy env var fallbacks.
-14. Hard-coded model constants: `CLOUD_MODELS`, `CLOUD_CONTEXT_WINDOW`, `DECISIONS_MODEL`, `LOCAL_REGISTRY_MODEL`, `DEFAULT_LOCAL_CONTEXT_WINDOW`, `CLASSIFIER_MODEL`. ARC chooses from its full model set.
+14. Hard-coded model constants: `DECISIONS_MODEL`, `LOCAL_REGISTRY_MODEL`, `DEFAULT_LOCAL_CONTEXT_WINDOW`, `CLASSIFIER_MODEL`. `CLOUD_MODELS` and `CLOUD_CONTEXT_WINDOW` stay for now: in local mode, the models ARC can pick that are not in `models` are exactly the three Rayline cloud models in section 5.3 item 2, each with a 1,000,000-token window and a 128,000-token output ceiling. They go when the Rayline router publishes ARC's model set.
 15. The second copy of ARC's preset list in the core.
 16. Install leftovers: cleanup of the old uv install and handling for releases from before the core.
 
