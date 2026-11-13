@@ -24,7 +24,6 @@ def main():
         root = Path(tmp)
         state = root / "state"
         env = dict(os.environ, HOME=str(root))
-        env.pop("RLD_BIN", None)
         env.pop("OPENCLAW_CONTAINER", None)
         installed = root / "installed"
         installed.mkdir()

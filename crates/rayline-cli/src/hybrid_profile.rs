@@ -27,7 +27,7 @@
 //! embedded registry does not know when it starts.
 //!
 //! A profile deployment marked `"from_local_model": true` takes its endpoint
-//! and served model from the `local_model` entry (`raydock local custom …`).
+//! and served model from the `local_model` entry in settings.json.
 //! Its runtime identity, protocol and thinking-control qualification still come
 //! from the profile; a configured prompt counter verifies the served model.
 //!
@@ -711,7 +711,7 @@ fn apply_local_model(
             return Err("from_local_model applies only to a local deployment".to_owned());
         }
         let (base_url, model) = custom_local_model(settings).ok_or(
-            "this profile takes its local endpoint from local_model; run `raydock local custom --url <URL> --model <NAME>` first",
+            "this profile takes its local endpoint from local_model; set local_model.base_url and local_model.model in settings.json",
         )?;
         let path = match deployment.get("protocol").and_then(Value::as_str) {
             Some("openai.chat.v1") => "/v1/chat/completions",
@@ -719,10 +719,7 @@ fn apply_local_model(
             Some("openai.responses.v1") => "/v1/responses",
             _ => return Err("local deployment protocol is missing or unsupported".to_owned()),
         };
-        let url = format!(
-            "{}{path}",
-            crate::local_model::normalize_base_url(&base_url)
-        );
+        let url = format!("{}{path}", normalize_base_url(&base_url));
         let id = deployment
             .get("id")
             .and_then(Value::as_str)
@@ -786,10 +783,7 @@ pub(crate) fn default_profile(
         ));
     }
     let router = router_url.trim_end_matches('/');
-    let local_url = format!(
-        "{}/v1/chat/completions",
-        crate::local_model::normalize_base_url(base_url)
-    );
+    let local_url = format!("{}/v1/chat/completions", normalize_base_url(base_url));
     let max_output = local_max_output(context_window);
     let cloud = |id: &str, wire: &str, registry: &str, max_output_tokens: u64| {
         json!({"id": id, "kind": "cloud", "cloud_transport": "model_pin", "url": format!("{router}/v1/messages"),
@@ -939,7 +933,7 @@ pub(crate) async fn read_local_runtime(
     base_url: &str,
     model: &str,
 ) -> LocalRuntime {
-    let base = crate::local_model::normalize_base_url(base_url);
+    let base = normalize_base_url(base_url);
     async fn answer(request: reqwest::RequestBuilder) -> Option<Value> {
         request
             .send()
@@ -1288,6 +1282,16 @@ pub(crate) fn check_decisions_url(config: &Value, router_urls: &[String]) -> Res
         config,
         router_urls.iter().map(String::as_str),
     )
+}
+
+/// Strip the noise that distinguishes equivalent endpoints so a user can paste
+/// either `http://host:port` or `http://host:port/v1`. Claude Code (and the
+/// probe) append `/v1/messages` themselves, so the stored value is the server
+/// root.
+fn normalize_base_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let stripped = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    stripped.trim_end_matches('/').to_owned()
 }
 
 #[cfg(test)]

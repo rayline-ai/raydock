@@ -20,7 +20,6 @@ pub const REQUEST_ID_HEADER: &str = "x-rayline-request-id";
 /// make `upstream_request_id` mean "a cloud route" sometimes and "an OpenAI
 /// request" other times, which is exactly the ambiguity this field removes.
 pub const UPSTREAM_ROUTE_ID_HEADER: &str = "x-rayline-route-id";
-pub const DEFAULT_METRICS_PORT: u16 = 20813;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -43,7 +42,6 @@ pub struct MetricsSnapshot {
     pub active: Vec<RequestSnapshot>,
     pub recent: Vec<RequestSnapshot>,
     pub totals: RouterTotals,
-    pub llama_perf: Option<LlamaPerfSnapshot>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -55,11 +53,6 @@ pub struct RouterTotals {
     pub remote_requests: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
-    /// Incremented each time an `agent-id` header was present but `agentType`
-    /// resolution exhausted all retries without finding the meta file.
-    /// Non-zero means Claude Code's internal schema may have changed (or a
-    /// timing/path issue). Surface in `rld status` so operators notice.
-    pub routing_uncertain: u64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -108,13 +101,6 @@ pub struct RequestSnapshot {
     pub prompt_cache_tokens: Option<u64>,
     pub prompt_processed_tokens: Option<u64>,
     pub cache_hit_ratio: Option<f64>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct LlamaPerfSnapshot {
-    pub prefill_tokens_per_second: Option<f64>,
-    pub generation_tokens_per_second: Option<f64>,
-    pub updated_at_unix_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,12 +172,6 @@ pub enum MetricsUpdate {
         status_code: Option<u16>,
         error: String,
     },
-    LlamaPerf(LlamaPerfSnapshot),
-    /// Emitted when an `agent-id` header was present but `agentType` resolution
-    /// exhausted all retries. Increments the `routing_uncertain` counter.
-    RoutingUncertain {
-        agent_id: String,
-    },
 }
 
 pub struct RouterMetrics {
@@ -200,7 +180,6 @@ pub struct RouterMetrics {
     active: Mutex<HashMap<String, RequestRecord>>,
     recent: Mutex<VecDeque<RequestRecord>>,
     totals: Mutex<RouterTotals>,
-    llama_perf: Mutex<Option<LlamaPerfSnapshot>>,
     updates: broadcast::Sender<MetricsUpdate>,
     recent_capacity: usize,
 }
@@ -214,7 +193,6 @@ impl RouterMetrics {
             active: Mutex::new(HashMap::new()),
             recent: Mutex::new(VecDeque::new()),
             totals: Mutex::new(RouterTotals::default()),
-            llama_perf: Mutex::new(None),
             updates,
             recent_capacity: 200,
         })
@@ -250,11 +228,6 @@ impl RouterMetrics {
             active,
             recent,
             totals,
-            llama_perf: self
-                .llama_perf
-                .lock()
-                .expect("metrics llama lock poisoned")
-                .clone(),
         }
     }
 
@@ -450,46 +423,8 @@ impl RouterMetrics {
                 }
                 self.push_recent(record);
             }
-            MetricsUpdate::LlamaPerf(snapshot) => {
-                if let Some(prefill_tps) = snapshot.prefill_tokens_per_second {
-                    self.apply_single_active_local_prefill(prefill_tps);
-                }
-                let mut llama_perf = self.llama_perf.lock().expect("metrics llama lock poisoned");
-                let mut merged = llama_perf.clone().unwrap_or(LlamaPerfSnapshot {
-                    prefill_tokens_per_second: None,
-                    generation_tokens_per_second: None,
-                    updated_at_unix_ms: snapshot.updated_at_unix_ms,
-                });
-                if snapshot.prefill_tokens_per_second.is_some() {
-                    merged.prefill_tokens_per_second = snapshot.prefill_tokens_per_second;
-                }
-                if snapshot.generation_tokens_per_second.is_some() {
-                    merged.generation_tokens_per_second = snapshot.generation_tokens_per_second;
-                }
-                merged.updated_at_unix_ms = snapshot.updated_at_unix_ms;
-                *llama_perf = Some(merged);
-            }
-            MetricsUpdate::RoutingUncertain { .. } => {
-                let mut totals = self.totals.lock().expect("metrics totals lock poisoned");
-                totals.routing_uncertain = totals.routing_uncertain.saturating_add(1);
-            }
         }
         let _ = self.updates.send(update);
-    }
-
-    fn apply_single_active_local_prefill(&self, prefill_tps: f64) {
-        let mut active = self.active.lock().expect("metrics active lock poisoned");
-        let local_request_ids = active
-            .iter()
-            .filter(|(_, record)| record.target.as_deref() == Some("local"))
-            .map(|(request_id, _)| request_id.clone())
-            .collect::<Vec<_>>();
-        if local_request_ids.len() != 1 {
-            return;
-        }
-        if let Some(record) = active.get_mut(&local_request_ids[0]) {
-            record.prompt_tps = Some(prefill_tps);
-        }
     }
 
     fn merge_recent_token_usage(
@@ -828,7 +763,7 @@ mod tests {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "identity".into(),
-            source: "proxy".into(),
+            source: "hybrid".into(),
             requested_model: None,
             agent_id: None,
             agent_type: None,
@@ -901,7 +836,7 @@ mod tests {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "req-1".to_owned(),
-            source: "proxy".to_owned(),
+            source: "hybrid".to_owned(),
             requested_model: Some("rayline-auto".to_owned()),
             agent_id: Some("agent-1".to_owned()),
             agent_type: Some("Explore".to_owned()),
@@ -949,7 +884,7 @@ mod tests {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "req-1".to_owned(),
-            source: "proxy".to_owned(),
+            source: "hybrid".to_owned(),
             requested_model: Some("rayline-auto".to_owned()),
             agent_id: None,
             agent_type: None,
@@ -1009,7 +944,7 @@ mod tests {
         let metrics = RouterMetrics::new("test-router");
         metrics.record(MetricsUpdate::RequestStarted {
             request_id: "req-1".to_owned(),
-            source: "local-router".to_owned(),
+            source: "hybrid".to_owned(),
             requested_model: None,
             agent_id: None,
             agent_type: None,
@@ -1175,26 +1110,6 @@ mod tests {
     }
 
     #[test]
-    fn merges_partial_llama_perf_updates() {
-        let metrics = RouterMetrics::new("test-router");
-        metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
-            prefill_tokens_per_second: Some(123.4),
-            generation_tokens_per_second: None,
-            updated_at_unix_ms: 10,
-        }));
-        metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
-            prefill_tokens_per_second: None,
-            generation_tokens_per_second: Some(56.7),
-            updated_at_unix_ms: 20,
-        }));
-
-        let snapshot = metrics.snapshot().llama_perf.expect("llama perf");
-        assert_eq!(snapshot.prefill_tokens_per_second, Some(123.4));
-        assert_eq!(snapshot.generation_tokens_per_second, Some(56.7));
-        assert_eq!(snapshot.updated_at_unix_ms, 20);
-    }
-
-    #[test]
     fn calculates_live_prefill_and_generation_rates() {
         let mut record = RequestRecord::new("req-1".to_owned(), 1_000);
         record.target = Some("anthropic".to_owned());
@@ -1233,64 +1148,5 @@ mod tests {
 
         let snapshot = record.snapshot(2_000);
         assert_eq!(snapshot.prefill_tps, None);
-    }
-
-    #[test]
-    fn applies_llama_prefill_to_single_active_local_request() {
-        let metrics = RouterMetrics::new("test-router");
-        metrics.record(MetricsUpdate::RequestStarted {
-            request_id: "req-1".to_owned(),
-            source: "adapter".to_owned(),
-            requested_model: Some("local-router".to_owned()),
-            agent_id: None,
-            agent_type: None,
-        });
-        metrics.record(MetricsUpdate::RouteDecided {
-            request_id: "req-1".to_owned(),
-            route_id: Some("route-1".to_owned()),
-            target: "local".to_owned(),
-            endpoint_id: Some("local".to_owned()),
-            selected_model: Some("qwen".to_owned()),
-            requested_model: Some("local-router".to_owned()),
-            policy: Some("local-adapter".to_owned()),
-            task_class: None,
-            agent_id: None,
-            agent_type: Some("Explore".to_owned()),
-        });
-        metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
-            prefill_tokens_per_second: Some(321.0),
-            generation_tokens_per_second: None,
-            updated_at_unix_ms: 20,
-        }));
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.active[0].prefill_tps, Some(321.0));
-    }
-
-    #[test]
-    fn skips_llama_prefill_when_multiple_local_requests_are_active() {
-        let metrics = RouterMetrics::new("test-router");
-        for request_id in ["req-1", "req-2"] {
-            metrics.record(MetricsUpdate::RouteDecided {
-                request_id: request_id.to_owned(),
-                route_id: None,
-                target: "local".to_owned(),
-                endpoint_id: Some("local".to_owned()),
-                selected_model: Some("qwen".to_owned()),
-                requested_model: Some("local-router".to_owned()),
-                policy: Some("local-adapter".to_owned()),
-                task_class: None,
-                agent_id: None,
-                agent_type: Some("Explore".to_owned()),
-            });
-        }
-        metrics.record(MetricsUpdate::LlamaPerf(LlamaPerfSnapshot {
-            prefill_tokens_per_second: Some(321.0),
-            generation_tokens_per_second: None,
-            updated_at_unix_ms: 20,
-        }));
-
-        let snapshot = metrics.snapshot();
-        assert!(snapshot.active.iter().all(|row| row.prefill_tps.is_none()));
     }
 }

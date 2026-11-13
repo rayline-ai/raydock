@@ -165,7 +165,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             port,
             startup_timeout_secs,
         } => {
-            let _lock = crate::router::acquire_router_lock(&paths.dir.join("runtime.lock"))?;
+            let _lock = acquire_lock(&paths.dir.join("runtime.lock"))?;
             clear_stopped_state(&paths)?;
             let core = match core {
                 Some(path) => fs::canonicalize(path)?,
@@ -217,7 +217,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                     let (base_url, model) =
                         crate::hybrid_profile::custom_local_model(settings.as_ref()).ok_or_else(
                             || io::Error::other(
-                                "hybrid routing needs your local model: run `raydock local custom --url <URL> --model <NAME>` first",
+                                "hybrid routing needs your local model: set local_model.base_url and local_model.model in settings.json",
                             ),
                         )?;
                     let configured = match local_context_window {
@@ -395,11 +395,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
                 startup_timeout_secs,
             )
             .await?;
-            let rld = if std::env::var_os("RLD_BIN").is_some() {
-                crate::router::resolve_rld_bin(&home)?
-            } else {
-                installed_binary(crate::DAEMON_BIN)?
-            };
+            let rld = installed_binary(crate::DAEMON_BIN)?;
             let log = private_log(&paths.log())?;
             let mut command = Command::new(rld);
             command
@@ -486,7 +482,7 @@ async fn execute(cli: Cli) -> io::Result<ExitCode> {
             );
         }
         Action::Stop => {
-            let _lock = crate::router::acquire_router_lock(&paths.dir.join("runtime.lock"))?;
+            let _lock = acquire_lock(&paths.dir.join("runtime.lock"))?;
             if stopped(&paths)? {
                 clear_stopped_state(&paths)?;
                 println!("Hybrid runtime is stopped; stale state removed.");
@@ -763,7 +759,7 @@ pub(crate) async fn top_connection(
             .get(key)
             .and_then(Value::as_i64)
             .and_then(|pid| i32::try_from(pid).ok())
-            .filter(|pid| crate::router::process_exists(*pid))
+            .filter(|pid| process_exists(*pid))
             .ok_or_else(|| io::Error::other("hybrid runtime process is not live"))?;
     }
     let token = fs::read_to_string(paths.token())
@@ -917,10 +913,7 @@ fn harness_command(
             {
                 command.env(AUTO_MODE_SERVER_ENV, value);
             }
-            let recovery = crate::claude::refusal_recovery_values(
-                crate::claude::RoutingMode::Override,
-                |name| std::env::var_os(name),
-            );
+            let recovery = crate::claude::refusal_recovery_values(|name| std::env::var_os(name));
             crate::claude::apply_refusal_recovery_env(&mut command, &recovery);
             // Inherited cloud/vendor modes must not bypass the explicit gateway.
             for name in [
@@ -1045,7 +1038,7 @@ fn stopped(paths: &Paths) -> io::Result<bool> {
         .and_then(|pid| i32::try_from(pid).ok())
         .filter(|pid| *pid > 0)
         .ok_or_else(|| io::Error::other("invalid hybrid supervisor identity"))?;
-    Ok(!crate::router::process_exists(pid))
+    Ok(!process_exists(pid))
 }
 
 fn clear_stopped_state(paths: &Paths) -> io::Result<()> {
@@ -1077,7 +1070,7 @@ async fn stop_spawned(child: &mut Child) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_secs(7);
     while child.try_wait()?.is_none() {
         if Instant::now() >= deadline {
-            crate::router::force_stop_process_group(pid)?;
+            force_stop_process_group(pid)?;
             child.wait()?;
             break;
         }
@@ -1092,7 +1085,7 @@ async fn stop_spawned(child: &mut Child) -> io::Result<()> {
 fn request_supervisor_stop(pid: i32) -> io::Result<()> {
     #[cfg(unix)]
     {
-        crate::router::terminate_process(pid)
+        terminate_process(pid)
     }
     #[cfg(windows)]
     {
@@ -1183,6 +1176,153 @@ fn private_log(path: &Path) -> io::Result<fs::File> {
     }
     #[cfg(windows)]
     rayline_local_router::windows_state::restrict_to_owner(path, false)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn process_exists(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // Mirrors POSIX kill(pid, 0): no signal is delivered; errno tells
+    // us whether the process is absent or merely owned by another user.
+    // SAFETY: kill with signal 0 only checks the pid; it touches no memory.
+    let result = unsafe { libc::kill(pid, 0) };
+    if result == 0 {
+        return !process_is_zombie(pid);
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn process_is_zombie(pid: i32) -> bool {
+    Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .and_then(|output| output.status.success().then_some(output.stdout))
+        .map(|stdout| String::from_utf8_lossy(&stdout).contains('Z'))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn terminate_process(pid: i32) -> io::Result<()> {
+    signal_process(pid, libc::SIGTERM)
+}
+
+#[cfg(unix)]
+fn force_stop_process_group(pid: i32) -> io::Result<()> {
+    // SAFETY: killpg takes plain integers and touches no memory.
+    let result = unsafe { libc::killpg(pid, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(error)
+}
+
+#[cfg(unix)]
+fn signal_process(pid: i32, signal: i32) -> io::Result<()> {
+    // SAFETY: kill takes plain integers and touches no memory.
+    let result = unsafe { libc::kill(pid, signal) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Err(io::Error::new(io::ErrorKind::NotFound, error));
+    }
+    Err(error)
+}
+
+#[cfg(windows)]
+fn process_exists(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    let query = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}').ProcessId");
+    Command::new("powershell.exe")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &query])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .is_ok_and(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).trim() == pid.to_string()
+        })
+}
+
+#[cfg(windows)]
+fn force_stop_process_group(pid: i32) -> io::Result<()> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "taskkill /T /F failed with status {status}"
+        )))
+    }
+}
+
+/// Acquire an exclusive advisory lock on `lock_path`, blocking until it is
+/// available.  The lock is automatically released when the returned `File`
+/// is dropped (i.e. when the guard goes out of scope or the process dies).
+///
+/// Unix uses `flock`; Windows uses `LockFileEx`, which blocks the same way and
+/// is released when the handle closes.
+#[cfg(unix)]
+fn acquire_lock(lock_path: &Path) -> io::Result<std::fs::File> {
+    use std::os::unix::io::AsRawFd;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    // SAFETY: a valid file descriptor owned by `file` for this call.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn acquire_lock(lock_path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    // Lock the whole range; nothing reads or writes the lock file's bytes.
+    // SAFETY: a valid file handle and a zeroed OVERLAPPED (offset 0), used
+    // synchronously because the file was not opened for overlapped I/O.
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked == 0 {
+        return Err(io::Error::last_os_error());
+    }
     Ok(file)
 }
 
@@ -1308,12 +1448,12 @@ mod tests {
     fn second_lock_holder_waits_for_the_first() {
         let dir = temp_dir("lock");
         let path = dir.join("runtime.lock");
-        let first = crate::router::acquire_router_lock(&path).unwrap();
+        let first = acquire_lock(&path).unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = {
             let path = path.clone();
             std::thread::spawn(move || {
-                let _second = crate::router::acquire_router_lock(&path).unwrap();
+                let _second = acquire_lock(&path).unwrap();
                 tx.send(()).unwrap();
             })
         };

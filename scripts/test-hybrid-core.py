@@ -35,7 +35,6 @@ def main():
     parser.add_argument("--core", type=Path, required=True)
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
-    parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     parser.add_argument("--claude", action="store_true", help="also run the installed Claude Code harness")
     parser.add_argument("--pi", action="store_true", help="also run the installed Pi harness")
     parser.add_argument("--gateway-fixture-control-url", help="loopback test bootstrap for the real exact-dispatch app")
@@ -252,7 +251,7 @@ def main():
             previous_usage_ids = {row["id"] for row in json.load(response)["rows"]}
     with tempfile.TemporaryDirectory(prefix="rayline-real-core-") as tmp:
         root = Path(tmp)
-        state = root / "state"
+        state = root / ".rayline" / "hybrid"
         package = root / "synthetic-package.json"
         package.write_bytes(package_bytes)
         config = {"contract_version": 1, "package_path": str(package), "package_sha256": package_sha,
@@ -276,7 +275,7 @@ def main():
             config["deployments"].append(deployment)
         config_path = root / "execution.json"
         config_path.write_bytes(encoded(config))
-        env = dict(os.environ, HOME=str(root), RLD_BIN=str(args.rld.resolve()),
+        env = dict(os.environ, HOME=str(root),
             RAYLINE_TEST_DECISIONS_KEY="synthetic-decisions-credential", RAYLINE_TEST_CLOUD_KEY=cloud_key,
             CLAUDE_CONFIG_DIR=str(root / "claude"), CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1")
         env.pop("RAYLINE_ROUTER_API_KEY", None)
@@ -421,7 +420,7 @@ def main():
             _, headers = request("/v1/messages", dict(base, messages=messages))
             routing_headers(headers, "local")
             gateway_top = completed_snapshot(["local", "cloud", "cloud", "local"])
-            cli_top = json.loads(run_cli("top", "--hybrid", "--state-dir", str(state), "--json"))
+            cli_top = json.loads(run_cli("top", "--json"))
             assert cli_top["runtime"] in ("hybrid", "rayline-hybrid"), cli_top
             for key in ("pid", "core_pid", "instance_id", "totals", "active"):
                 assert cli_top[key] == gateway_top[key], key

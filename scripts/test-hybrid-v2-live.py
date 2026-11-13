@@ -82,7 +82,6 @@ def main():
     parser.add_argument("--schedule-model", nargs="+", help="settings hybrid.routing.schedule.model (e.g. cache_boundaries user_messages)")
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--rayline", type=Path, default=ROOT / "target/debug/raydock")
-    parser.add_argument("--rld", type=Path, default=ROOT / "target/debug/rld")
     parser.add_argument("--no-warmup", action="store_true", help="scenario b: send only the scheduler prompt (task start is the boundary)")
     parser.add_argument("--max-generations", type=int, default=12)
     parser.add_argument("--task-timeout-secs", type=int, default=600)
@@ -152,7 +151,7 @@ def main():
                    "containing only {\"keys\": [the four words in file order]}. Then report completion."]
         oracle = lambda: json.loads((work / "answer.json").read_text()) == {"keys": KEYWORDS}
 
-    env = dict(os.environ, HOME=str(home), RLD_BIN=str(args.rld.resolve()), PI_TELEMETRY="0", PI_OFFLINE="1")
+    env = dict(os.environ, HOME=str(home), PI_TELEMETRY="0", PI_OFFLINE="1")
     cli = [str(args.rayline.resolve()), "hybrid", "--state-dir", str(state)]
     report = {"scenario": args.scenario, "profile": args.profile.name if args.profile else "default (no profile file)",
               "schedule_model": args.schedule_model, "settings_routing": routing, "passed": False}

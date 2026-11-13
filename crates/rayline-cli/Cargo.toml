@@ -33,9 +33,7 @@ tokio.workspace = true
 url = "2"
 rayline-hf = { path = "../rayline-hf" }
 rayline-tokencount = { path = "../rayline-tokencount" }
-rayline-llama = { path = "../rayline-llama" }
 rayline-local-router = { path = "../rayline-local-router" }
-rayline-metrics = { path = "../rayline-metrics" }
 zstd = "0.14"
 toml_edit = "0.25.15"
 xxhash-rust = { version = "=0.8.15", features = ["xxh64"] }

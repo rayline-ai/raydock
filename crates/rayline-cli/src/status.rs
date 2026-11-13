@@ -2853,13 +2853,6 @@ pub(crate) fn read_settings_checked(home: &Path) -> io::Result<Option<(PathBuf, 
     Ok(None)
 }
 
-/// Persist `value` as the canonical settings file (`~/.config/<brand>/
-/// settings.json`), atomically. Writes always target the canonical path even
-/// when only the legacy location existed, migrating it forward on first write.
-pub(crate) fn write_settings(home: &Path, value: &Value) -> io::Result<()> {
-    write_json_atomic(&settings_file(home), value)
-}
-
 fn read_json(path: &Path) -> Option<Value> {
     let contents = fs::read_to_string(path).ok()?;
     serde_json::from_str(&contents).ok()
@@ -3060,6 +3053,10 @@ enum CallbackQueryError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_settings(home: &Path, value: &Value) -> io::Result<()> {
+        write_json_atomic(&settings_file(home), value)
+    }
 
     fn temp_home(name: &str) -> PathBuf {
         let unique = SystemTime::now()

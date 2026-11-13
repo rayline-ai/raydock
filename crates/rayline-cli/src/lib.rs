@@ -1,12 +1,10 @@
 mod command_alias;
 use std::env;
 use std::ffi::OsString;
-use std::io::IsTerminal as _;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
 pub(crate) mod auth_callback_page;
-pub mod catalog;
 pub mod claude;
 pub mod claude_app;
 pub(crate) mod claude_daemon;
@@ -14,17 +12,12 @@ pub mod codex;
 pub mod codex_app;
 pub mod config;
 pub(crate) mod detach;
-pub mod discover;
 pub mod harness;
 pub mod hybrid;
 pub(crate) mod hybrid_profile;
 pub(crate) mod hybrid_tokenizer;
-pub mod local_model;
-pub mod onboarding;
-pub mod providers;
-pub mod router;
-pub mod router_config;
 pub mod status;
+mod top;
 pub mod update;
 mod usage_error;
 
@@ -35,8 +28,6 @@ pub const DAEMON_BIN: &str = "rld";
 pub const DISPLAY_NAME: &str = "Raydock";
 pub const CONFIG_DIR: &str = "rayline";
 pub const DOT_CONFIG_DIR: &str = ".rayline";
-pub const ROUTER_STATE_DIR: &str = ".rayline/rld";
-pub const ROUTER_FILE_PREFIX: &str = "rl-rld";
 pub const ROUTER_PROD_URL: &str = "https://api.rayline.ai";
 /// The model a hosted harness launch gives its main agent when the user picks
 /// none: ARC Sage, by its canonical public id (not the bare `arc-sage` alias,
@@ -74,8 +65,8 @@ Commands:
   auth       Sign in to hosted Rayline
   status     Show current CLI auth status
   claude     Run Claude Code on ARC (Sage main agent, Swift subagents)
-  claude-desktop  Run Claude Desktop's Code sessions on ARC (local router)
-  codex      Run Codex CLI through Raydock Responses routing
+  claude-desktop  Run Claude Desktop's Code sessions on ARC
+  codex      Run Codex CLI on ARC through the Rayline router
   opencode   Run opencode on ARC through the Rayline router
   pi         Run pi on ARC through the Rayline router
   omp        Run oh-my-pi (omp) on ARC through the Rayline router
@@ -85,10 +76,8 @@ Commands:
 Harness launches default to ARC: the ARC Sage your key lists for the main
 agent and its ARC Swift for subagents and background tasks where the harness
 has a separate role for them.
-  router     Start, inspect, or stop the local Rayline router runtime
   hybrid     Start the ARC execution core or connect a harness to it
-  top        Show live router request metrics
-  local      Configure local model routing
+  top        Show live request metrics from the local process
   update     Check for or install a Raydock launcher update
 ";
 
@@ -139,77 +128,39 @@ const CLAUDE_HELP: &str = "\
 Usage: raydock claude [OPTIONS] [--] [CLAUDE_ARGS]...
        raydock claude run [OPTIONS] [--] [CLAUDE_ARGS]...
 
-Run Claude Code through Rayline hosted routing. Use --local for the
-local static router path.
+Run Claude Code on ARC through the Rayline router.
 
-Hosted routing defaults to ARC: the main agent on the ARC Sage your key lists,
-subagents and background tasks on its ARC Swift (CLAUDE_CODE_SUBAGENT_MODEL, forced on
-every subagent, and ANTHROPIC_DEFAULT_HAIKU_MODEL, unless you set them). With
---model X and --route all, subagents and background tasks run on X too.
+The main agent runs on the ARC Sage your key lists, subagents and background
+tasks on its ARC Swift (CLAUDE_CODE_SUBAGENT_MODEL, forced on every subagent,
+and ANTHROPIC_DEFAULT_HAIKU_MODEL, unless you set them).
 
 Options:
-  -m, --model <model>               Main-agent model (default: your key's ARC Sage)
-  --auto-compact-window <tokens>    Override Claude auto-compact threshold
-  --local                           Use local static routing without hosted auth
-                                    (no login; forces the proxy)
-  --local-provider <provider>       Use a local provider for subagents
-                                    (ollama, lmstudio, llamacpp)
-  --isolated                        Use a separate Claude config dir so this
-                                    session can run beside other Claude Code
-                                    background agents
-  --route <all|subagents>           What the proxy routes through the router
-                                    (default: all for cloud, subagents for local)
-  --via <proxy|env>                 How Claude Code connects to the router
-                                    (default: proxy; env is lightweight,
-                                    cloud-only, no background process)
-  --local-injector-port <port>      Local injector port
-  --statusline/--no-statusline      Show proxy picked model in status line
-  --diagnose                        Print routing diagnostics before exec
-  --upstream-ca-path <path>         CA bundle for upstream proxy mode
-  --config <path>                   Routing config (endpoints + routes) driving
-                                    BOTH the main agent and subagents. Scope is
-                                    derived from routes.main (a `subscription`
-                                    main passes through; any endpoint routes it).
-  --router-config-path <path>       Local-router static router JSON config
-                                    (refines `--local`'s subagent allowlist)
-  --help                            Show this message and exit
+  --isolated    Use a separate Claude config dir so this session can run
+                beside other Claude Code background agents
+  --help        Show this message and exit
 ";
 
 const CLAUDE_APP_HELP: &str = "\
 Usage: raydock claude-desktop [COMMAND] [OPTIONS]
 
-Run Claude Code inside the Claude desktop app on ARC. The import adds two
-models to Desktop's picker: arc-sage (default) and arc-swift (cheaper). ARC is
-not a Claude model, and Rayline is not affiliated with Anthropic. Starts a dedicated
-local router (its own ports and state in ~/.rayline/claude-desktop, separate
-from `raydock claude` and `raydock codex`), selects a recoverable Rayline ARC
-profile, and opens Claude Desktop. A running Desktop is gracefully restarted
-when its configuration changes. --manual prints import instructions instead.
-Your Rayline key stays in the router; Desktop gets a gateway
-token that only unlocks this local router. macOS only (the router also runs on
-Linux, for testing).
-
-Third-party mode applies to the whole Desktop app and switches away from your
-claude.ai subscription; `raydock claude-desktop off` restores the previous mode.
+Run Claude Code inside the Claude desktop app on ARC. Desktop runs on the
+shared local process, which is not available yet: start, status, validate,
+stop, install-service and uninstall-service fail until it is. off and
+uninstall restore the Desktop profile and mode selected before Rayline ARC.
 
 Commands:
   start              Configure and launch Desktop with ARC (default)
-  status             Show router health, request totals and the Desktop check
-  validate           Check Desktop's applied configuration against the router
-  stop               Stop the router (and unload the login service)
-  install-service    Start the router at login (macOS LaunchAgent)
+  status             Show the Desktop check
+  validate           Check Desktop's applied configuration
+  stop               Stop serving Desktop
+  install-service    Serve Desktop at login
   uninstall-service  Remove the login service
-  off                Restore the previous Desktop profile and mode; stop
-  uninstall          Remove the service, the router state and its files
+  off                Restore the previous Desktop profile and mode
+  uninstall          Restore the previous Desktop profile and mode, and show
+                     how to remove the Rayline ARC gateway from Desktop
 
 Options:
-  --manual                  start: router only; print manual import instructions
-  --prefixed-ids            start/install-service: forward the prefixed
-                            rayline/arc-* aliases instead of the bare
-                            arc-sage/arc-swift ids (for a router that does
-                            not serve the bare ids yet)
-  --desktop-config <path>   validate: check this file instead of Desktop's
-  --help                    Show this message and exit
+  --help             Show this message and exit
 ";
 
 const CODEX_HELP: &str = "\
@@ -217,19 +168,15 @@ Usage: raydock codex [OPTIONS] [--] [CODEX_ARGS]...
        raydock codex app [OPTIONS] [WORKSPACE]
        raydock codex configure [OPTIONS]
 
-Start Raydock's local OpenAI Responses router and run Codex CLI against it.
+Run Codex CLI on ARC through the Rayline router. Codex runs on its own
+CODEX_HOME (~/.rayline/harness/codex), whose config.toml holds the Rayline
+provider and your router key.
 
 Options:
-  --model <model>         Real model to request (e.g. gpt-5.6-luna). Omit to let the
-                          router config decide (main/subagent routing).
-  --config <path>         Rayline router config (endpoints + routes)
-  --auth <mode>           Codex auth source: auto|subscription|none.
-                          auto with no --config defaults to Rc-Rc (route
-                          everything to the hosted cloud router on ARC:
-                          your key's ARC Sage main, ARC Swift subagents, via
-                          ~/.config/rayline/router.json);
-                          with --config it follows the config. subscription
-                          uses your ChatGPT subscription; none runs local.
+  --model <model>         Model to request (default: your key's ARC Sage)
+  --auth <mode>           Codex auth source: auto|subscription|none
+                          (default: auto, your Rayline router key).
+                          subscription and none are not available yet.
   --subscription          Alias for --auth subscription
   --help                  Show this message and exit
 ";
@@ -237,22 +184,18 @@ Options:
 const CODEX_APP_HELP: &str = "\
 Usage: raydock codex app [OPTIONS] [WORKSPACE]
 
-Start Raydock's local router and launch the Codex desktop app against it.
+Launch the Codex desktop app on ARC through the Rayline router.
 
-Unlike the CLI, the desktop app-server ignores -c overrides and is
-single-instance, so this writes the Rayline provider into an isolated
-CODEX_HOME (~/.rayline/codex-app-home) and launches the app there. If the app
-is already running on a different config, you'll be prompted to restart it.
+The desktop app-server ignores -c overrides and is single-instance, so this
+writes the Rayline provider into an isolated CODEX_HOME
+(~/.rayline/codex-app-home) and launches the app there. If the app is already
+running on a different config, you'll be prompted to restart it.
 
 Options:
-  --model <model>         Real model to request (e.g. gpt-5.6-luna). Omit to let the
-                          router config decide (main/subagent routing).
-  --config <path>         Rayline router config (endpoints + routes)
-  --auth <mode>           Codex auth source: auto|subscription|none.
-                          auto with no --config defaults to Rc-Rc (route
-                          everything to the hosted cloud router on ARC, as
-                          for `raydock codex`). subscription
-                          uses your ChatGPT subscription; none runs local.
+  --model <model>         Model to request (default: your key's ARC Sage)
+  --auth <mode>           Codex auth source: auto|subscription|none
+                          (default: auto, your Rayline router key).
+                          subscription and none are not available yet.
   --subscription          Alias for --auth subscription
   --help                  Show this message and exit
 ";
@@ -260,197 +203,28 @@ Options:
 const CODEX_CONFIGURE_HELP: &str = "\
 Usage: raydock codex configure [OPTIONS]
 
-Write a Codex profile at $CODEX_HOME/rayline.config.toml (or ~/.codex).
+Write a Codex profile at $CODEX_HOME/rayline.config.toml (or ~/.codex) that
+reaches ARC through the Rayline router with your router key.
 
 Options:
-  --model <model>         Real model to request (e.g. gpt-5.6-luna). Omit to let the
-                          router config decide (main/subagent routing).
+  --model <model>         Model to request (default: your key's ARC Sage)
   --base-url <url>        Rayline OpenAI Responses base URL
-                          (default: http://127.0.0.1:20811/v1)
-  --auth <mode>           Codex auth source: subscription|none
-                          (default: subscription)
+                          (default: the environment's router /v1)
+  --auth <mode>           Codex auth source: auto|subscription|none
+                          (default: auto, your Rayline router key).
+                          subscription and none are not available yet.
   --subscription          Alias for --auth subscription
   --help                  Show this message and exit
 ";
 
-const ROUTER_HELP: &str = "\
-Usage: raydock router COMMAND
+const TOP_HELP: &str = "\
+Usage: raydock top [--json]
 
-Commands:
-  start    Start router processes
-  status   Show router status
-  logs     Print router logs
-  top      Show live router request metrics
-  stop     Stop router processes
-";
-
-const ROUTER_START_HELP: &str = "\
-Usage: raydock router start [--mode <anthropic|codex>] [--route <all|subagents>] [--config <path>]
-
-Start the local router + transparent proxy daemon and exit, leaving it running.
-Point an Anthropic SDK client at the proxy on http://127.0.0.1:20810 (and trust
-the proxy CA cert) to route requests through it. The on-device model comes from
-your `raydock local` configuration.
+Show live request metrics from the local process.
 
 Options:
-  --mode <anthropic|codex>  Inbound API surface (default: anthropic). `codex`
-                            exposes OpenAI Responses at http://127.0.0.1:20811/v1.
-  --auth <mode>             Codex auth source when --mode codex:
-                            auto|subscription|none. auto uses subscription
-                            when --config is absent and no client auth when
-                            --config is present.
-  --subscription            Alias for --auth subscription
-  --route <all|subagents>   What the proxy routes through the router
-                            (default: all). With `all`, request model
-                            `rayline-local` to reach the on-device model.
-  --config <path>           Routing config (endpoints + routes) driving BOTH
-                            main and subagents; scope derived from routes.main.
-                            Overrides --route.
-  --help                    Show this message and exit
-";
-
-const ROUTER_STATUS_HELP: &str = "\
-Usage: raydock router status
-
-Show local router process status.
-";
-
-const ROUTER_LOGS_HELP: &str = "\
-Usage: raydock router logs [--lines <count>]
-
-Print local router logs.
-";
-
-const ROUTER_TOP_HELP: &str = "\
-Usage: raydock top [--hybrid [--state-dir <path>] | --legacy] [--json] [--all]
-       raydock router top [--hybrid [--state-dir <path>] | --legacy] [--json] [--all]
-
-Show live LLM request metrics. Automatically selects a live default hybrid
-runtime when no legacy metrics are available; both live is an ambiguity error.
-
-Options:
-  --hybrid    Select hybrid explicitly (never falls back to legacy)
-  --legacy    Select legacy metrics explicitly (never discovers hybrid)
-  --state-dir <path>  Hybrid runtime directory (requires --hybrid)
-  --json      Print one snapshot as JSON
-  --all       Include proxied Anthropic sideband traffic
-";
-
-const ROUTER_STOP_HELP: &str = "\
-Usage: raydock router stop
-
-Stop local router processes.
-";
-
-const LOCAL_HELP: &str = "\
-Usage: raydock local COMMAND
-
-Configure local model routing for this machine.
-
-Commands:
-  models    List provider and recommended models with hardware fit
-  download  Download a recommended model without selecting it
-  use       Select a recommended model, downloading it first if needed
-  remove    Delete a downloaded model from disk
-  custom    Use a custom endpoint URL + model name
-  show      Show the configured mode, endpoint, and account routing state
-  test      Probe a custom/provider endpoint for a compatible API response
-  clear     Remove the local model configuration
-  on        Turn local routing on for your account
-  off       Turn local routing off for your account
-  onboard   Set up or re-pick a local model for `raydock claude --local`
-  subagents Discover your subagents and map each to local or cloud
-";
-
-const LOCAL_MODELS_HELP: &str = "\
-Usage: raydock local models [--json]
-
-List provider and recommended local models.
-";
-
-const LOCAL_DOWNLOAD_HELP: &str = "\
-Usage: raydock local download <model-id> [--json]
-
-Download a recommended model into the local cache without selecting it.
-";
-
-const LOCAL_USE_HELP: &str = "\
-Usage: raydock local use <number|model-id>
-
-Select a provider model or recommended built-in model.
-Numbers come from `raydock local models`.
-";
-
-const LOCAL_REMOVE_HELP: &str = "\
-Usage: raydock local remove <model-id>
-
-Delete a downloaded model's file from the local cache.
-";
-
-const LOCAL_CUSTOM_HELP: &str = "\
-Usage: raydock local custom [--url <URL>] [--model <NAME>]
-
-Use a custom local inference endpoint.
-";
-
-const LOCAL_SHOW_HELP: &str = "\
-Usage: raydock local show
-
-Show the configured local model mode and account routing state.
-";
-
-const LOCAL_TEST_HELP: &str = "\
-Usage: raydock local test [--url <URL>] [--model <NAME>]
-
-Probe a custom endpoint for protocol compatibility.
-";
-
-const LOCAL_CLEAR_HELP: &str = "\
-Usage: raydock local clear
-
-Remove the local model configuration.
-";
-
-const LOCAL_ON_HELP: &str = "\
-Usage: raydock local on
-
-Turn local routing on for your account.
-";
-
-const LOCAL_OFF_HELP: &str = "\
-Usage: raydock local off
-
-Turn local routing off for your account.
-";
-
-const LOCAL_ONBOARD_HELP: &str = "\
-Usage: raydock local onboard [--reset]
-
-Set up (or re-pick) a local model for `raydock claude --local`.
-
-Options:
-  --reset    Clear the current local model first, then run the wizard
-";
-
-const LOCAL_SUBAGENTS_HELP: &str = "\
-Usage: raydock local subagents [--json] [--all]
-
-Scan your Claude Code history for the subagents you use and map each to a
-routing target (local or cloud) for `raydock claude --local`. Read-only agents
-are pre-selected for local. The mapping is saved to settings.json and applied
-on the next `--local` launch.
-
-The interactive picker is single-keypress (no Enter needed): 16 rows per page
-labeled 0-9a-f cycle that row's target; n/p page; k cycles the kind filter
-(all / read-only / has-edit / unknown); / searches by agent name; L/C send the
-whole filtered set to local/cloud; s (or Enter) saves; q (or Esc) quits.
-
-Settings stay compact: only agents that differ from the default (cloud) are
-saved, so a long tail of rarely-used agents costs nothing.
-
-Options:
-  --json    Print discovered agents and their default target as JSON; no prompt
-  --all     Include rarely-used agents (otherwise the long tail is hidden)
+  --json    Print one snapshot as JSON
+  --help    Show this message and exit
 ";
 
 const UPDATE_HELP: &str = "\
@@ -553,7 +327,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
         RaylineDispatch::CodexApp(request) => codex_app::run(request).await,
         RaylineDispatch::Harness(request) => harness::run(request).await,
         RaylineDispatch::Hybrid(args) => hybrid::run(args).await,
-        RaylineDispatch::CodexConfigure(request) => match codex::configure(&request) {
+        RaylineDispatch::CodexConfigure(request) => match codex::configure(&request).await {
             Ok(message) => {
                 print!("{message}");
                 ExitCode::SUCCESS
@@ -563,41 +337,7 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        RaylineDispatch::RouterStart(request) => {
-            match crate::router::start_from_cli(&request).await {
-                Ok(message) => {
-                    print!("{message}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
-        RaylineDispatch::RouterStatus(request) => {
-            match crate::router::render_status(&request).await {
-                Ok(message) => {
-                    print!("{message}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
-        RaylineDispatch::RouterLogs(request) => match crate::router::render_logs(&request) {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::from(1)
-            }
-        },
-        RaylineDispatch::RouterTop(request) => match crate::router::render_top(&request).await {
+        RaylineDispatch::Top(request) => match top::render_top(&request).await {
             Ok(message) => {
                 print!("{message}");
                 ExitCode::SUCCESS
@@ -607,157 +347,6 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        RaylineDispatch::RouterStop(request) => match crate::router::stop(&request).await {
-            Ok(message) => {
-                print!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::from(1)
-            }
-        },
-        RaylineDispatch::LocalModels { env_name, json } => {
-            let color =
-                !json && std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
-            match catalog::models_command(env_name.as_deref(), json, color).await {
-                Ok(message) => {
-                    print!("{message}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => local_error(error, json),
-            }
-        }
-        RaylineDispatch::LocalDownload {
-            env_name,
-            model_id,
-            json,
-        } => match catalog::download_command(env_name.as_deref(), &model_id, json).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => local_error(error, json),
-        },
-        RaylineDispatch::LocalUse { env_name, model_id } => {
-            match catalog::use_command(env_name.as_deref(), &model_id).await {
-                Ok(message) => {
-                    println!("{message}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
-        RaylineDispatch::LocalRemove { env_name, model_id } => {
-            match catalog::remove_command(env_name.as_deref(), &model_id).await {
-                Ok(message) => {
-                    println!("{message}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
-        RaylineDispatch::LocalCustom(request) => match local_model::set_custom(&request) {
-            Ok(config) => {
-                let url = config.base_url.as_deref().unwrap_or("(not set)");
-                let model = config.model.as_deref().unwrap_or("(not set)");
-                println!("Local model set to custom endpoint.\n  URL:    {url}\n  Model:  {model}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::from(1)
-            }
-        },
-        RaylineDispatch::LocalShow {
-            env_name,
-            auth_token,
-        } => {
-            print!(
-                "{}",
-                local_model::render_show(env_name.as_deref(), auth_token.as_deref()).await
-            );
-            ExitCode::SUCCESS
-        }
-        RaylineDispatch::LocalTest(request) => match local_model::test(&request).await {
-            Ok(message) => {
-                println!("{message}");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::from(1)
-            }
-        },
-        RaylineDispatch::LocalClear => match local_model::clear() {
-            Ok(true) => {
-                println!("Local model configuration cleared.");
-                ExitCode::SUCCESS
-            }
-            Ok(false) => {
-                println!("No local model configuration was set.");
-                ExitCode::SUCCESS
-            }
-            Err(error) => {
-                eprintln!("Error: {error}");
-                ExitCode::from(1)
-            }
-        },
-        RaylineDispatch::LocalOn {
-            env_name,
-            auth_token,
-        } => {
-            match local_model::set_router_enabled(true, env_name.as_deref(), auth_token.as_deref())
-                .await
-            {
-                Ok(message) => {
-                    println!("{message}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
-        RaylineDispatch::LocalOff {
-            env_name,
-            auth_token,
-        } => {
-            match local_model::set_router_enabled(false, env_name.as_deref(), auth_token.as_deref())
-                .await
-            {
-                Ok(message) => {
-                    println!("{message}");
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
-        RaylineDispatch::LocalOnboard { env_name, reset } => {
-            match onboarding::run_onboard_command(env_name.as_deref(), reset).await {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
-        RaylineDispatch::LocalSubagents { json, all } => {
-            match discover::run_subagents_command(json, all).await {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("Error: {error}");
-                    ExitCode::from(1)
-                }
-            }
-        }
         RaylineDispatch::Update(request) => match update::run(&request).await {
             Ok(result) => {
                 if result.stderr {
@@ -783,15 +372,6 @@ pub async fn run_argv(original_argv: &[OsString]) -> ExitCode {
     }
 }
 
-fn local_error(error: String, json: bool) -> ExitCode {
-    if json {
-        catalog::emit_error_json(&error);
-    } else {
-        eprintln!("Error: {error}");
-    }
-    ExitCode::from(1)
-}
-
 fn terminal_output_text(value: &str) -> String {
     value.chars().collect()
 }
@@ -810,51 +390,7 @@ pub enum RaylineDispatch {
     CodexConfigure(codex::ConfigureRequest),
     Harness(harness::RunRequest),
     Hybrid(Vec<OsString>),
-    RouterStart(router::RouterStartCliRequest),
-    RouterStatus(router::RouterStatusRequest),
-    RouterLogs(router::RouterLogsRequest),
-    RouterTop(router::RouterTopRequest),
-    RouterStop(router::RouterStopRequest),
-    LocalModels {
-        env_name: Option<String>,
-        json: bool,
-    },
-    LocalDownload {
-        env_name: Option<String>,
-        model_id: String,
-        json: bool,
-    },
-    LocalUse {
-        env_name: Option<String>,
-        model_id: String,
-    },
-    LocalRemove {
-        env_name: Option<String>,
-        model_id: String,
-    },
-    LocalCustom(local_model::LocalCustomRequest),
-    LocalShow {
-        env_name: Option<String>,
-        auth_token: Option<String>,
-    },
-    LocalTest(local_model::LocalTestRequest),
-    LocalClear,
-    LocalOn {
-        env_name: Option<String>,
-        auth_token: Option<String>,
-    },
-    LocalOff {
-        env_name: Option<String>,
-        auth_token: Option<String>,
-    },
-    LocalOnboard {
-        env_name: Option<String>,
-        reset: bool,
-    },
-    LocalSubagents {
-        json: bool,
-        all: bool,
-    },
+    Top(top::TopRequest),
     Update(update::UpdateRequest),
     /// A command that exists only in non-public builds; holds its words.
     Unavailable(String),
@@ -938,19 +474,12 @@ where
                 usage_error::HYBRID_ROOT_OPTIONS.to_owned(),
             )),
             "auth" => parse_auth_dispatch(args, root_env, root_auth_token, root_env_explicit),
-            "claude-desktop" => {
-                parse_claude_app_request(args, root_env, root_auth_token, root_env_explicit)
-                    .map(RaylineDispatch::ClaudeApp)
-            }
+            "claude-desktop" => parse_claude_app_request(args).map(RaylineDispatch::ClaudeApp),
             "claude" => parse_claude_dispatch(args, root_env, root_auth_token, root_env_explicit),
             "codex" => parse_codex_dispatch(args, root_env, root_auth_token, root_env_explicit),
-            "local" => parse_local_dispatch(args, root_env, root_auth_token),
-            "router" => parse_router_dispatch(args, root_env_explicit),
             "status" => parse_status_request(args, root_env, root_auth_token, root_env_explicit)
                 .map(RaylineDispatch::Status),
-            "top" => {
-                parse_router_top_request(args, root_env_explicit).map(RaylineDispatch::RouterTop)
-            }
+            "top" => parse_top_request(args).map(RaylineDispatch::Top),
             "update" => parse_update_request(args).map(RaylineDispatch::Update),
             command => harness::Harness::from_command(command).and_then(|harness| {
                 parse_harness_request(harness, args, root_env, root_auth_token, root_env_explicit)
@@ -1202,25 +731,7 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     let mut env_name = root_env;
-    let mut model = None;
-    let mut auto_compact_window = None;
-    let mut local_provider = None;
-    let mut local_router = false;
     let mut isolated = false;
-    let mut local_injector_port = None;
-    // Two-axis routing intent, resolved into a RoutingMode at the end. `via`
-    // selects the connection mechanism (proxy is the default; env is opt-in);
-    // `route_scope` selects what the proxy routes (all vs subagents-only).
-    let mut via: Option<ViaArg> = None;
-    let mut route_scope: Option<RouteScope> = None;
-    let mut route_statusline_enabled = true;
-    let mut diagnose = false;
-    let mut upstream_ca_path = None;
-    let mut router_config_path = None;
-    // v2: `--config <file>` drives BOTH main + subagents via a RouterConfig file,
-    // engaging the on-device router without `--local`. Distinct from the legacy
-    // `--router-config-path` (which only refines `--local`'s subagent allowlist).
-    let mut config_path = None;
     let mut claude_args = Vec::new();
 
     if args
@@ -1250,129 +761,17 @@ where
             claude_args.extend(args.cloned());
             break;
         }
-        if let Some((option, value)) = arg_str.split_once('=') {
-            match option {
-                "--env" => {
-                    env_name = Some(value.to_owned());
-                    continue;
-                }
-                "--model" => {
-                    model = Some(value.to_owned());
-                    continue;
-                }
-                "--auto-compact-window" => {
-                    auto_compact_window = Some(value.parse().ok()?);
-                    continue;
-                }
-                "--local-provider" => {
-                    local_provider = Some(crate::providers::ProviderId::parse(value)?);
-                    local_router = true;
-                    continue;
-                }
-                "--via" => {
-                    via = Some(parse_via(value)?);
-                    continue;
-                }
-                "--route" => {
-                    route_scope = Some(parse_route_scope(value)?);
-                    continue;
-                }
-                "--routing-mode" => {
-                    apply_deprecated_routing_mode(value, &mut via, &mut route_scope)?;
-                    continue;
-                }
-                "--local-injector-port" => {
-                    local_injector_port = Some(value.parse().ok()?);
-                    continue;
-                }
-                "--upstream-ca-path" => {
-                    upstream_ca_path = Some(PathBuf::from(value));
-                    continue;
-                }
-                "--router-config-path" => {
-                    router_config_path = Some(PathBuf::from(value));
-                    continue;
-                }
-                "--config" => {
-                    config_path = Some(PathBuf::from(value));
-                    continue;
-                }
-                _ => {}
-            }
+        if let Some(value) = arg_str.strip_prefix("--env=") {
+            env_name = Some(value.to_owned());
+            continue;
         }
         match arg_str {
             "--env" => {
                 env_name = Some(args.next()?.to_str()?.to_owned());
                 continue;
             }
-            "--model" | "-m" => {
-                model = Some(args.next()?.to_str()?.to_owned());
-                continue;
-            }
-            "--auto-compact-window" => {
-                auto_compact_window = Some(args.next()?.to_str()?.parse().ok()?);
-                continue;
-            }
-            "--local-provider" => {
-                local_provider = Some(crate::providers::ProviderId::parse(args.next()?.to_str()?)?);
-                local_router = true;
-                continue;
-            }
-            "--via" => {
-                via = Some(parse_via(args.next()?.to_str()?)?);
-                continue;
-            }
-            "--route" => {
-                route_scope = Some(parse_route_scope(args.next()?.to_str()?)?);
-                continue;
-            }
-            "--routing-mode" => {
-                apply_deprecated_routing_mode(args.next()?.to_str()?, &mut via, &mut route_scope)?;
-                continue;
-            }
-            "--local" | "--local-router" => {
-                local_router = true;
-                continue;
-            }
             "--isolated" => {
                 isolated = true;
-                continue;
-            }
-            "--no-proxy" => {
-                // Deprecated alias for `--via env`.
-                eprintln!("Warning: `--no-proxy` is deprecated; use `{CLI_BIN} claude --via env`.");
-                via = Some(ViaArg::Env);
-                continue;
-            }
-            "--diagnose" => {
-                diagnose = true;
-                continue;
-            }
-            "--local-injector-port" => {
-                local_injector_port = Some(args.next()?.to_str()?.parse().ok()?);
-                continue;
-            }
-            "--upstream-ca-path" => {
-                upstream_ca_path = Some(PathBuf::from(args.next()?));
-                continue;
-            }
-            "--router-config-path" => {
-                router_config_path = Some(PathBuf::from(args.next()?));
-                continue;
-            }
-            "--config" => {
-                config_path = Some(PathBuf::from(args.next()?));
-                continue;
-            }
-            "--no-telemetry" => {
-                return None;
-            }
-            "--statusline" => {
-                route_statusline_enabled = true;
-                continue;
-            }
-            "--no-statusline" => {
-                route_statusline_enabled = false;
                 continue;
             }
             _ => {}
@@ -1384,153 +783,13 @@ where
         claude_args.push(arg.clone());
     }
 
-    let local_provider_model = if matches!(
-        local_provider,
-        Some(crate::providers::ProviderId::Ollama | crate::providers::ProviderId::LmStudio)
-    ) {
-        model.take()
-    } else {
-        None
-    };
-    // `--config` engages the on-device router; `--via env` is cloud-only by
-    // contract (it sets ANTHROPIC_BASE_URL directly and cannot reach local
-    // inference). Reject the combination, mirroring `--via env` + `--local`.
-    if config_path.is_some() && matches!(via, Some(ViaArg::Env)) {
-        return None;
-    }
-    let routing_mode = resolve_routing_mode(local_router, via, route_scope)?;
-
     Some(crate::claude::RunRequest {
         env_name,
         auth_token: root_auth_token,
         args: claude_args,
-        model,
-        local_provider,
-        local_provider_model,
-        auto_compact_window,
-        local_router,
         isolated,
-        local_injector_port,
-        routing_mode,
-        route_scope_explicit: route_scope.is_some(),
-        route_statusline_enabled,
-        diagnose,
-        upstream_ca_path,
-        router_config_path,
-        config_path,
         root_env_explicit,
     })
-}
-
-/// Connection mechanism wiring Claude Code to the router (the `--via` axis).
-/// `proxy` is the default; `env` is the lightweight, cloud-only opt-in.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ViaArg {
-    Env,
-    Proxy,
-}
-
-/// What the proxy routes (the `--route` axis).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RouteScope {
-    All,
-    Subagents,
-}
-
-fn parse_via(value: &str) -> Option<ViaArg> {
-    match value {
-        "env" => Some(ViaArg::Env),
-        "proxy" => Some(ViaArg::Proxy),
-        _ => None,
-    }
-}
-
-fn parse_route_scope(value: &str) -> Option<RouteScope> {
-    match value {
-        "all" => Some(RouteScope::All),
-        "subagents" => Some(RouteScope::Subagents),
-        _ => None,
-    }
-}
-
-/// Map the deprecated `--routing-mode <value>` onto the two new axes, emitting a
-/// one-line deprecation warning that names the replacement.
-fn apply_deprecated_routing_mode(
-    value: &str,
-    via: &mut Option<ViaArg>,
-    route_scope: &mut Option<RouteScope>,
-) -> Option<()> {
-    match value {
-        "override" => {
-            eprintln!(
-                "Warning: `--routing-mode override` is deprecated; use `{CLI_BIN} claude --via env`."
-            );
-            *via = Some(ViaArg::Env);
-        }
-        "proxy" => {
-            eprintln!(
-                "Warning: `--routing-mode proxy` is deprecated; use `{CLI_BIN} claude --route all`."
-            );
-            // Full-mode alias: restore the proxy mechanism so it overrides an
-            // earlier `--no-proxy`/`--routing-mode override` (last-value-wins).
-            *via = Some(ViaArg::Proxy);
-            *route_scope = Some(RouteScope::All);
-        }
-        "proxy-subagents" => {
-            eprintln!(
-                "Warning: `--routing-mode proxy-subagents` is deprecated; use `{CLI_BIN} claude --route subagents`."
-            );
-            // Full-mode alias: restore the proxy mechanism so it overrides an
-            // earlier `--no-proxy`/`--routing-mode override` (last-value-wins).
-            *via = Some(ViaArg::Proxy);
-            *route_scope = Some(RouteScope::Subagents);
-        }
-        _ => return None,
-    }
-    Some(())
-}
-
-/// Resolve the two-axis routing intent into the internal [`RoutingMode`].
-///
-/// The connection mechanism defaults to the proxy; `--via env` is the only way
-/// to reach the env-override path, and it is rejected when the session needs
-/// the proxy (local inference or selective routing). The proxy scope default is
-/// router-dependent: cloud routes everything, local routes subagents only.
-fn resolve_routing_mode(
-    local_router: bool,
-    via: Option<ViaArg>,
-    route_scope: Option<RouteScope>,
-) -> Option<crate::claude::RoutingMode> {
-    use crate::claude::RoutingMode;
-
-    let scope = route_scope.unwrap_or(if local_router {
-        RouteScope::Subagents
-    } else {
-        RouteScope::All
-    });
-
-    match via {
-        Some(ViaArg::Env) => {
-            // The env mechanism is cloud-only and cannot route selectively.
-            if local_router {
-                eprintln!(
-                    "Error: `--via env` cannot reach local inference; drop `--local` or `--via env`."
-                );
-                return None;
-            }
-            if matches!(route_scope, Some(RouteScope::Subagents)) {
-                eprintln!(
-                    "Error: `--via env` cannot route selectively; selective routing needs the proxy."
-                );
-                return None;
-            }
-            Some(RoutingMode::Override)
-        }
-        Some(ViaArg::Proxy) | None => Some(match scope {
-            RouteScope::All => RoutingMode::Proxy,
-            RouteScope::Subagents => RoutingMode::ProxySubagents,
-        }),
-    }
 }
 
 fn is_claude_management_subcommand(arg: &str) -> bool {
@@ -1554,65 +813,19 @@ where
 }
 
 fn parse_claude_app_request<'a, I>(
-    args: std::iter::Peekable<I>,
-    root_env: Option<String>,
-    root_auth_token: Option<String>,
-    root_env_explicit: bool,
+    mut args: std::iter::Peekable<I>,
 ) -> Option<crate::claude_app::AppRequest>
 where
     I: Iterator<Item = &'a OsString>,
 {
-    let mut action = None;
-    let mut desktop_config = None;
-    let mut manual = false;
-    let mut id_style = crate::claude_app::IdStyle::Bare;
-    let mut args = args;
-    while let Some(arg) = args.next() {
-        let arg_str = arg.to_str()?;
-        if let Some((option, value)) = arg_str.split_once('=') {
-            match option {
-                "--desktop-config" => {
-                    desktop_config = Some(PathBuf::from(value));
-                    continue;
-                }
-                _ => return None,
-            }
-        }
-        match arg_str {
-            "--desktop-config" => desktop_config = Some(PathBuf::from(args.next()?)),
-            "--prefixed-ids" => id_style = crate::claude_app::IdStyle::Prefixed,
-            "--manual" => manual = true,
-            _ if arg_str.starts_with('-') => return None,
-            _ if action.is_none() => action = Some(crate::claude_app::AppAction::parse(arg_str)?),
-            _ => return None,
-        }
-    }
-    let action = action.unwrap_or(crate::claude_app::AppAction::Start);
-    if manual && action != crate::claude_app::AppAction::Start {
+    let action = match args.next() {
+        Some(arg) => crate::claude_app::AppAction::parse(arg.to_str()?)?,
+        None => crate::claude_app::AppAction::Start,
+    };
+    if args.next().is_some() {
         return None;
     }
-    if desktop_config.is_some() && !matches!(action, crate::claude_app::AppAction::Validate) {
-        return None;
-    }
-    if id_style == crate::claude_app::IdStyle::Prefixed
-        && !matches!(
-            action,
-            crate::claude_app::AppAction::Start
-                | crate::claude_app::AppAction::Serve
-                | crate::claude_app::AppAction::InstallService
-        )
-    {
-        return None;
-    }
-    Some(crate::claude_app::AppRequest {
-        action,
-        manual,
-        desktop_config,
-        id_style,
-        env_name: root_env,
-        auth_token: root_auth_token,
-        root_env_explicit,
-    })
+    Some(crate::claude_app::AppRequest { action })
 }
 
 fn parse_codex_dispatch<'a, I>(
@@ -1627,7 +840,8 @@ where
     match args.peek().and_then(|arg| arg.to_str()) {
         Some("configure") => {
             let _ = args.next();
-            parse_codex_configure_request(args).map(RaylineDispatch::CodexConfigure)
+            parse_codex_configure_request(args, root_env, root_auth_token, root_env_explicit)
+                .map(RaylineDispatch::CodexConfigure)
         }
         Some("app") => {
             let _ = args.next();
@@ -1649,7 +863,6 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     let mut model = None;
-    let mut config_path = None;
     let mut auth_mode = crate::codex::CodexAuthMode::Auto;
     let mut codex_args = Vec::new();
 
@@ -1677,10 +890,6 @@ where
                     model = Some(value.to_owned());
                     continue;
                 }
-                "--config" => {
-                    config_path = Some(PathBuf::from(value));
-                    continue;
-                }
                 "--auth" => {
                     auth_mode = crate::codex::CodexAuthMode::parse(value)?;
                     continue;
@@ -1694,7 +903,6 @@ where
                 root_env_explicit = true;
             }
             "--model" => model = Some(args.next()?.to_str()?.to_owned()),
-            "--config" => config_path = Some(PathBuf::from(args.next()?)),
             "--auth" => auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?,
             "--subscription" => auth_mode = crate::codex::CodexAuthMode::Subscription,
             _ => {
@@ -1707,7 +915,6 @@ where
 
     Some(crate::codex_app::AppRunRequest {
         model,
-        config_path,
         auth_mode,
         codex_args,
         root_env_explicit,
@@ -1726,7 +933,6 @@ where
     I: Iterator<Item = &'a OsString>,
 {
     let mut model = None;
-    let mut config_path = None;
     let mut auth_mode = crate::codex::CodexAuthMode::Auto;
     let mut codex_args = Vec::new();
 
@@ -1754,10 +960,6 @@ where
                     model = Some(value.to_owned());
                     continue;
                 }
-                "--config" => {
-                    config_path = Some(PathBuf::from(value));
-                    continue;
-                }
                 "--auth" => {
                     auth_mode = crate::codex::CodexAuthMode::parse(value)?;
                     continue;
@@ -1772,9 +974,6 @@ where
             }
             "--model" => {
                 model = Some(args.next()?.to_str()?.to_owned());
-            }
-            "--config" => {
-                config_path = Some(PathBuf::from(args.next()?));
             }
             "--auth" => {
                 auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?;
@@ -1792,7 +991,6 @@ where
 
     Some(crate::codex::RunRequest {
         model,
-        config_path,
         auth_mode,
         codex_args,
         root_env_explicit,
@@ -1807,13 +1005,16 @@ fn valid_env(value: &str) -> Option<String> {
 
 fn parse_codex_configure_request<'a, I>(
     mut args: std::iter::Peekable<I>,
+    env_name: Option<String>,
+    auth_token: Option<String>,
+    root_env_explicit: bool,
 ) -> Option<crate::codex::ConfigureRequest>
 where
     I: Iterator<Item = &'a OsString>,
 {
     let mut model = None;
     let mut base_url = None;
-    let mut auth_mode = crate::codex::CodexAuthMode::Subscription;
+    let mut auth_mode = crate::codex::CodexAuthMode::Auto;
     while let Some(arg) = args.next() {
         let arg = arg.to_str()?;
         if arg == "--help" {
@@ -1848,231 +1049,25 @@ where
         model,
         base_url,
         auth_mode,
-    })
-}
-
-fn parse_router_dispatch<'a, I>(
-    mut args: std::iter::Peekable<I>,
-    root_env_explicit: bool,
-) -> Option<RaylineDispatch>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    let first_arg = args.next()?;
-    match first_arg.to_str()? {
-        "start" => {
-            parse_router_start_request(args, root_env_explicit).map(RaylineDispatch::RouterStart)
-        }
-        "status" => {
-            if args.next().is_some() {
-                return None;
-            }
-            Some(RaylineDispatch::RouterStatus(
-                crate::router::RouterStatusRequest { root_env_explicit },
-            ))
-        }
-        "logs" => {
-            parse_router_logs_request(args, root_env_explicit).map(RaylineDispatch::RouterLogs)
-        }
-        "top" => parse_router_top_request(args, root_env_explicit).map(RaylineDispatch::RouterTop),
-        "stop" => {
-            if args.next().is_some() {
-                return None;
-            }
-            Some(RaylineDispatch::RouterStop(
-                crate::router::RouterStopRequest { root_env_explicit },
-            ))
-        }
-        // Chained, not collected, so a rejection still points at its argument.
-        value if value.starts_with("--") => parse_router_start_request(
-            std::iter::once(first_arg).chain(args).peekable(),
-            root_env_explicit,
-        )
-        .map(RaylineDispatch::RouterStart),
-        _ => None,
-    }
-}
-
-fn parse_router_start_request<'a, I>(
-    mut args: std::iter::Peekable<I>,
-    root_env_explicit: bool,
-) -> Option<crate::router::RouterStartCliRequest>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    // `router start` is always local; default to routing everything so a plain
-    // SDK client can reach the on-device model via model-name routing.
-    let mut route_scope = RouteScope::All;
-    // v2: `--config <file>` drives BOTH main + subagents for headless/agent use;
-    // scope is then derived from the config's `routes.main`, so `--route` is ignored.
-    let mut config_path = None;
-    let mut api_mode = crate::router::ROUTER_API_MODE_ANTHROPIC.to_owned();
-    let mut codex_auth_mode = crate::codex::CodexAuthMode::Auto;
-    while let Some(arg) = args.next() {
-        let arg = arg.to_str()?;
-        if arg == "--help" {
-            return None;
-        }
-        // Accepted for symmetry with the routing surface; the router daemon is
-        // inherently local, so this is a no-op.
-        if arg == "--local" {
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--mode=") {
-            api_mode = parse_router_api_mode(value)?;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--auth=") {
-            codex_auth_mode = crate::codex::CodexAuthMode::parse(value)?;
-            continue;
-        }
-        if arg == "--mode" {
-            api_mode = parse_router_api_mode(args.next()?.to_str()?)?;
-            continue;
-        }
-        if arg == "--auth" {
-            codex_auth_mode = crate::codex::CodexAuthMode::parse(args.next()?.to_str()?)?;
-            continue;
-        }
-        if arg == "--subscription" {
-            codex_auth_mode = crate::codex::CodexAuthMode::Subscription;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--route=") {
-            route_scope = parse_route_scope(value)?;
-            continue;
-        }
-        if arg == "--route" {
-            route_scope = parse_route_scope(args.next()?.to_str()?)?;
-            continue;
-        }
-        if let Some(value) = arg.strip_prefix("--config=") {
-            config_path = Some(PathBuf::from(value));
-            continue;
-        }
-        if arg == "--config" {
-            config_path = Some(PathBuf::from(args.next()?));
-            continue;
-        }
-        return None;
-    }
-    let proxy_routing_mode = match route_scope {
-        RouteScope::All => crate::router::PROXY_ROUTING_MODE_ALL,
-        RouteScope::Subagents => crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS,
-    }
-    .to_owned();
-    Some(crate::router::RouterStartCliRequest {
-        api_mode,
-        proxy_routing_mode,
-        config_path,
-        codex_auth_mode,
-        root_env_explicit,
-        router_api_key_override: None,
-    })
-}
-
-fn parse_router_api_mode(value: &str) -> Option<String> {
-    match value {
-        "anthropic" | "claude" => Some(crate::router::ROUTER_API_MODE_ANTHROPIC.to_owned()),
-        "codex" | "openai" | "responses" | "openai_responses" => {
-            Some(crate::router::ROUTER_API_MODE_CODEX.to_owned())
-        }
-        _ => None,
-    }
-}
-
-fn parse_router_logs_request<'a, I>(
-    mut args: std::iter::Peekable<I>,
-    root_env_explicit: bool,
-) -> Option<crate::router::RouterLogsRequest>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    let mut lines = 40;
-    while let Some(arg) = args.next() {
-        let arg = arg.to_str()?;
-
-        if arg == "--help" {
-            return None;
-        }
-        if let Some(value) = arg.strip_prefix("-n") {
-            if value.is_empty() {
-                lines = args.next()?.to_str()?.parse().ok()?;
-            } else {
-                lines = value.parse().ok()?;
-            }
-            continue;
-        }
-        if let Some((option, value)) = arg.split_once('=') {
-            if option == "--lines" {
-                lines = value.parse().ok()?;
-                continue;
-            }
-        }
-        if arg == "--lines" {
-            lines = args.next()?.to_str()?.parse().ok()?;
-            continue;
-        }
-
-        return None;
-    }
-
-    Some(crate::router::RouterLogsRequest {
-        lines,
+        env_name,
+        auth_token,
         root_env_explicit,
     })
 }
 
-fn parse_router_top_request<'a, I>(
-    mut args: std::iter::Peekable<I>,
-    root_env_explicit: bool,
-) -> Option<crate::router::RouterTopRequest>
+/// `raydock top [--json]`.
+fn parse_top_request<'a, I>(args: std::iter::Peekable<I>) -> Option<top::TopRequest>
 where
     I: Iterator<Item = &'a OsString>,
 {
     let mut json = false;
-    let mut show_all = false;
-    let mut hybrid = false;
-    let mut legacy = false;
-    let mut state_dir = None;
-    while let Some(arg) = args.next() {
-        if arg == "--state-dir" {
-            let path = args.next()?;
-            if path.is_empty() {
-                return None;
-            }
-            state_dir = Some(std::path::PathBuf::from(path));
-            continue;
-        }
-        let arg = arg.to_str()?;
-        if let Some(path) = arg.strip_prefix("--state-dir=") {
-            if path.is_empty() {
-                return None;
-            }
-            state_dir = Some(std::path::PathBuf::from(path));
-            continue;
-        }
-        match arg {
+    for arg in args {
+        match arg.to_str()? {
             "--json" => json = true,
-            "--all" => show_all = true,
-            "--hybrid" => hybrid = true,
-            "--legacy" => legacy = true,
-            "--help" => return None,
             _ => return None,
         }
     }
-    if (hybrid && legacy) || (!hybrid && state_dir.is_some()) {
-        return None;
-    }
-
-    Some(crate::router::RouterTopRequest {
-        json,
-        show_all,
-        hybrid,
-        legacy,
-        state_dir,
-        root_env_explicit,
-    })
+    Some(top::TopRequest { json })
 }
 
 fn parse_update_request<'a, I>(mut args: std::iter::Peekable<I>) -> Option<update::UpdateRequest>
@@ -2126,196 +1121,6 @@ where
         base_url,
         install_path,
     })
-}
-
-fn parse_local_dispatch<'a, I>(
-    mut args: std::iter::Peekable<I>,
-    root_env: Option<String>,
-    root_auth_token: Option<String>,
-) -> Option<RaylineDispatch>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    match args.next()?.to_str()? {
-        "models" => parse_local_json_flag(args).map(|json| RaylineDispatch::LocalModels {
-            env_name: root_env,
-            json,
-        }),
-        "download" => {
-            parse_local_model_id_arg(args).map(|(model_id, json)| RaylineDispatch::LocalDownload {
-                env_name: root_env,
-                model_id,
-                json,
-            })
-        }
-        "use" => parse_local_model_id_arg(args).and_then(|(model_id, json)| {
-            (!json).then_some(RaylineDispatch::LocalUse {
-                env_name: root_env,
-                model_id,
-            })
-        }),
-        "remove" => parse_local_model_id_arg(args).and_then(|(model_id, json)| {
-            (!json).then_some(RaylineDispatch::LocalRemove {
-                env_name: root_env,
-                model_id,
-            })
-        }),
-        "custom" => parse_local_custom_request(args).map(RaylineDispatch::LocalCustom),
-        "show" => parse_local_no_arg(args).map(|()| RaylineDispatch::LocalShow {
-            env_name: root_env,
-            auth_token: root_auth_token,
-        }),
-        "test" => parse_local_test_request(args).map(RaylineDispatch::LocalTest),
-        "clear" => parse_local_no_arg(args).map(|()| RaylineDispatch::LocalClear),
-        "on" => parse_local_no_arg(args).map(|()| RaylineDispatch::LocalOn {
-            env_name: root_env,
-            auth_token: root_auth_token,
-        }),
-        "off" => parse_local_no_arg(args).map(|()| RaylineDispatch::LocalOff {
-            env_name: root_env,
-            auth_token: root_auth_token,
-        }),
-        "onboard" => parse_local_onboard(args).map(|reset| RaylineDispatch::LocalOnboard {
-            env_name: root_env,
-            reset,
-        }),
-        "subagents" => parse_local_subagents(args)
-            .map(|(json, all)| RaylineDispatch::LocalSubagents { json, all }),
-        _ => None,
-    }
-}
-
-fn parse_local_subagents<'a, I>(mut args: std::iter::Peekable<I>) -> Option<(bool, bool)>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    let mut json = false;
-    let mut all = false;
-    for arg in args.by_ref() {
-        match arg.to_str()? {
-            "--json" => json = true,
-            "--all" => all = true,
-            "--help" => return None,
-            _ => return None,
-        }
-    }
-    Some((json, all))
-}
-
-fn parse_local_no_arg<'a, I>(mut args: std::iter::Peekable<I>) -> Option<()>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    args.next().is_none().then_some(())
-}
-
-fn parse_local_onboard<'a, I>(mut args: std::iter::Peekable<I>) -> Option<bool>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    let mut reset = false;
-    for arg in args.by_ref() {
-        match arg.to_str()? {
-            "--reset" => reset = true,
-            "--help" => return None,
-            _ => return None,
-        }
-    }
-    Some(reset)
-}
-
-fn parse_local_json_flag<'a, I>(mut args: std::iter::Peekable<I>) -> Option<bool>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    let mut json = false;
-    for arg in args.by_ref() {
-        match arg.to_str()? {
-            "--json" => json = true,
-            "--help" => return None,
-            _ => return None,
-        }
-    }
-    Some(json)
-}
-
-fn parse_local_model_id_arg<'a, I>(mut args: std::iter::Peekable<I>) -> Option<(String, bool)>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    let mut model_id = None;
-    let mut json = false;
-    for arg in args.by_ref() {
-        match arg.to_str()? {
-            "--json" => json = true,
-            "--help" => return None,
-            value if !value.starts_with('-') && model_id.is_none() => {
-                model_id = Some(value.to_owned());
-            }
-            _ => return None,
-        }
-    }
-    Some((model_id?, json))
-}
-
-fn parse_local_custom_request<'a, I>(
-    mut args: std::iter::Peekable<I>,
-) -> Option<local_model::LocalCustomRequest>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    let mut base_url = None;
-    let mut model = None;
-    while let Some(arg) = args.next() {
-        let arg = arg.to_str()?;
-        if arg == "--help" {
-            return None;
-        }
-        if let Some((option, value)) = arg.split_once('=') {
-            match option {
-                "--url" | "--base-url" => base_url = Some(value.to_owned()),
-                "--model" => model = Some(value.to_owned()),
-                _ => return None,
-            }
-            continue;
-        }
-        match arg {
-            "--url" | "--base-url" => base_url = Some(args.next()?.to_str()?.to_owned()),
-            "--model" => model = Some(args.next()?.to_str()?.to_owned()),
-            _ => return None,
-        }
-    }
-    Some(local_model::LocalCustomRequest { base_url, model })
-}
-
-fn parse_local_test_request<'a, I>(
-    mut args: std::iter::Peekable<I>,
-) -> Option<local_model::LocalTestRequest>
-where
-    I: Iterator<Item = &'a OsString>,
-{
-    let mut base_url = None;
-    let mut model = None;
-    while let Some(arg) = args.next() {
-        let arg = arg.to_str()?;
-        if arg == "--help" {
-            return None;
-        }
-        if let Some((option, value)) = arg.split_once('=') {
-            match option {
-                "--url" | "--base-url" => base_url = Some(value.to_owned()),
-                "--model" => model = Some(value.to_owned()),
-                _ => return None,
-            }
-            continue;
-        }
-        match arg {
-            "--url" | "--base-url" => base_url = Some(args.next()?.to_str()?.to_owned()),
-            "--model" => model = Some(args.next()?.to_str()?.to_owned()),
-            _ => return None,
-        }
-    }
-    Some(local_model::LocalTestRequest { base_url, model })
 }
 
 fn root_version_requested(original_argv: &[OsString]) -> bool {
@@ -2405,27 +1210,8 @@ fn help_for_command_path(command: &[&str]) -> Option<&'static str> {
         ["codex"] => Some(CODEX_HELP),
         ["codex", "app"] => Some(CODEX_APP_HELP),
         ["codex", "configure"] => Some(CODEX_CONFIGURE_HELP),
-        ["local"] => Some(LOCAL_HELP),
-        ["local", "models"] => Some(LOCAL_MODELS_HELP),
-        ["local", "download"] => Some(LOCAL_DOWNLOAD_HELP),
-        ["local", "use"] => Some(LOCAL_USE_HELP),
-        ["local", "remove"] => Some(LOCAL_REMOVE_HELP),
-        ["local", "custom"] => Some(LOCAL_CUSTOM_HELP),
-        ["local", "show"] => Some(LOCAL_SHOW_HELP),
-        ["local", "test"] => Some(LOCAL_TEST_HELP),
-        ["local", "clear"] => Some(LOCAL_CLEAR_HELP),
-        ["local", "on"] => Some(LOCAL_ON_HELP),
-        ["local", "off"] => Some(LOCAL_OFF_HELP),
-        ["local", "onboard"] => Some(LOCAL_ONBOARD_HELP),
-        ["local", "subagents"] => Some(LOCAL_SUBAGENTS_HELP),
-        ["router"] => Some(ROUTER_HELP),
-        ["router", "start"] => Some(ROUTER_START_HELP),
-        ["router", "status"] => Some(ROUTER_STATUS_HELP),
-        ["router", "logs"] => Some(ROUTER_LOGS_HELP),
-        ["router", "top"] => Some(ROUTER_TOP_HELP),
-        ["router", "stop"] => Some(ROUTER_STOP_HELP),
         ["status"] => Some(STATUS_HELP),
-        ["top"] => Some(ROUTER_TOP_HELP),
+        ["top"] => Some(TOP_HELP),
         ["update"] => Some(UPDATE_HELP),
         _ => None,
     }
@@ -2452,19 +1238,13 @@ fn command_path_before_help(original_argv: &[OsString]) -> Option<Vec<&str>> {
             }
             continue;
         }
-        if let Some(rest) = arg.strip_prefix("-m") {
-            if rest.is_empty() {
-                args.next()?;
-            }
-            continue;
-        }
         if arg.starts_with('-') {
             continue;
         }
         command.push(arg);
     }
 
-    if command.is_empty() || matches!(command.as_slice(), ["auth"] | ["local"] | ["router"]) {
+    if command.is_empty() || matches!(command.as_slice(), ["auth"]) {
         Some(command)
     } else {
         None
@@ -2474,22 +1254,7 @@ fn command_path_before_help(original_argv: &[OsString]) -> Option<Vec<&str>> {
 fn is_value_option(arg: &str) -> bool {
     matches!(
         arg.split_once('=').map_or(arg, |(name, _)| name),
-        "--env"
-            | "--auth-token"
-            | "--model"
-            | "--local-provider"
-            | "--auto-compact-window"
-            | "--routing-mode"
-            | "--via"
-            | "--route"
-            | "--local-injector-port"
-            | "--upstream-ca-path"
-            | "--router-config-path"
-            | "--lines"
-            | "--url"
-            | "--base-url"
-            | "--install-path"
-            | "--desktop-config"
+        "--env" | "--auth-token" | "--model" | "--base-url" | "--install-path"
     )
 }
 
@@ -2501,8 +1266,6 @@ mod tests {
         args.iter().map(OsString::from).collect()
     }
 
-    use crate::claude::RoutingMode;
-
     fn claude_run(args: &[&str]) -> crate::claude::RunRequest {
         let RaylineDispatch::ClaudeRun(request) = rayline_dispatch_for_argv(&argv(args)) else {
             panic!("expected ClaudeRun for {args:?}");
@@ -2510,270 +1273,72 @@ mod tests {
         request
     }
 
-    // ── Connection mechanism resolution (the two-axis model) ──────────────
-
-    #[test]
-    fn resolve_cloud_default_is_proxy_all() {
-        assert_eq!(
-            resolve_routing_mode(false, None, None),
-            Some(RoutingMode::Proxy)
-        );
-    }
-
-    #[test]
-    fn resolve_cloud_route_subagents_is_proxy_subagents() {
-        assert_eq!(
-            resolve_routing_mode(false, None, Some(RouteScope::Subagents)),
-            Some(RoutingMode::ProxySubagents)
-        );
-    }
-
-    #[test]
-    fn resolve_local_default_is_proxy_subagents() {
-        assert_eq!(
-            resolve_routing_mode(true, None, None),
-            Some(RoutingMode::ProxySubagents)
-        );
-    }
-
-    #[test]
-    fn resolve_local_route_all_is_proxy_all() {
-        assert_eq!(
-            resolve_routing_mode(true, None, Some(RouteScope::All)),
-            Some(RoutingMode::Proxy)
-        );
-    }
-
-    #[test]
-    fn resolve_via_env_cloud_is_override() {
-        assert_eq!(
-            resolve_routing_mode(false, Some(ViaArg::Env), None),
-            Some(RoutingMode::Override)
-        );
-    }
-
-    #[test]
-    fn resolve_via_proxy_cloud_is_proxy_all() {
-        assert_eq!(
-            resolve_routing_mode(false, Some(ViaArg::Proxy), None),
-            Some(RoutingMode::Proxy)
-        );
-    }
-
-    #[test]
-    fn resolve_via_env_with_local_is_rejected() {
-        // Local inference is unreachable via the env mechanism.
-        assert_eq!(resolve_routing_mode(true, Some(ViaArg::Env), None), None);
-    }
-
-    #[test]
-    fn resolve_via_env_with_route_subagents_is_rejected() {
-        // Selective routing needs the proxy.
-        assert_eq!(
-            resolve_routing_mode(false, Some(ViaArg::Env), Some(RouteScope::Subagents)),
-            None
-        );
-    }
-
     // ── Parser surface ────────────────────────────────────────────────────
 
     #[test]
-    fn bare_claude_defaults_to_proxy_all() {
-        assert_eq!(
-            claude_run(&["rayline", "claude"]).routing_mode,
-            RoutingMode::Proxy
-        );
+    fn claude_help_lists_only_its_own_options() {
+        let help =
+            rayline_help_for_argv(&argv(&["rayline", "claude", "--help"])).expect("claude help");
+        let options = help
+            .lines()
+            .filter_map(|line| line.trim_start().strip_prefix("--"))
+            .filter_map(|line| line.split_whitespace().next())
+            .collect::<Vec<_>>();
+        assert_eq!(options, ["isolated", "help"]);
     }
 
     #[test]
-    fn via_env_flag_selects_override() {
-        assert_eq!(
-            claude_run(&["rayline", "claude", "--via", "env"]).routing_mode,
-            RoutingMode::Override
-        );
+    fn claude_passes_every_other_option_to_claude_code() {
+        let request = claude_run(&["rayline", "claude", "--model", "opus", "--isolated", "-p"]);
+        assert!(request.isolated);
+        assert_eq!(request.args, argv(&["--model", "opus", "-p"]));
     }
 
     #[test]
-    fn local_flag_forces_proxy_subagents() {
-        let request = claude_run(&["rayline", "claude", "--local"]);
-        assert!(request.local_router);
-        assert_eq!(request.routing_mode, RoutingMode::ProxySubagents);
-    }
-
-    #[test]
-    fn claude_accepts_local_provider() {
-        let request = claude_run(&["rayline", "claude", "--local", "--local-provider", "ollama"]);
-        assert!(request.local_router);
+    fn top_takes_only_json() {
         assert_eq!(
-            request.local_provider,
-            Some(crate::providers::ProviderId::Ollama)
-        );
-    }
-
-    #[test]
-    fn claude_local_provider_implies_local() {
-        let request = claude_run(&["rayline", "claude", "--local-provider", "lmstudio"]);
-        assert!(request.local_router);
-        assert_eq!(
-            request.local_provider,
-            Some(crate::providers::ProviderId::LmStudio)
-        );
-        assert_eq!(request.routing_mode, RoutingMode::ProxySubagents);
-    }
-
-    #[test]
-    fn claude_local_provider_consumes_model_as_provider_model() {
-        let request = claude_run(&[
-            "rayline",
-            "claude",
-            "--local-provider",
-            "ollama",
-            "--model",
-            "qwen3-coder:30b",
-        ]);
-        assert_eq!(
-            request.local_provider,
-            Some(crate::providers::ProviderId::Ollama)
+            rayline_dispatch_for_argv(&argv(&["raydock", "top"])),
+            RaylineDispatch::Top(top::TopRequest { json: false })
         );
         assert_eq!(
-            request.local_provider_model.as_deref(),
-            Some("qwen3-coder:30b")
+            rayline_dispatch_for_argv(&argv(&["raydock", "top", "--json"])),
+            RaylineDispatch::Top(top::TopRequest { json: true })
         );
-        assert_eq!(request.model, None);
-    }
-
-    #[test]
-    fn claude_local_provider_llamacpp_uses_builtin_path() {
-        let request = claude_run(&[
-            "rayline",
-            "claude",
-            "--local-provider",
-            "llamacpp",
-            "--model",
-            "claude-sonnet-4-20250514",
-        ]);
-        assert!(request.local_router);
-        assert_eq!(
-            request.local_provider,
-            Some(crate::providers::ProviderId::LlamaCpp)
-        );
-        assert_eq!(request.model.as_deref(), Some("claude-sonnet-4-20250514"));
-        assert_eq!(request.local_provider_model, None);
-    }
-
-    #[test]
-    fn claude_rejects_unknown_local_provider() {
-        assert!(matches!(
-            rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--local-provider", "bogus"])),
-            RaylineDispatch::Usage(_)
-        ));
-    }
-
-    #[test]
-    fn claude_rejects_local_provider_with_via_env() {
-        assert!(matches!(
-            rayline_dispatch_for_argv(&argv(&[
-                "rayline",
-                "claude",
-                "--local-provider",
-                "ollama",
-                "--via",
-                "env"
-            ])),
-            RaylineDispatch::Usage(_)
-        ));
-    }
-
-    #[test]
-    fn route_subagents_flag_selects_proxy_subagents() {
-        assert_eq!(
-            claude_run(&["rayline", "claude", "--route", "subagents"]).routing_mode,
-            RoutingMode::ProxySubagents
-        );
-    }
-
-    #[test]
-    fn deprecated_no_proxy_maps_to_override() {
-        assert_eq!(
-            claude_run(&["rayline", "claude", "--no-proxy"]).routing_mode,
-            RoutingMode::Override
-        );
-    }
-
-    #[test]
-    fn deprecated_no_proxy_then_routing_mode_proxy_restores_proxy() {
-        // Last-value-wins: a later deprecated full-mode alias must override an
-        // earlier `--no-proxy`, restoring the proxy mechanism (not stay Override).
-        assert_eq!(
-            claude_run(&["rayline", "claude", "--no-proxy", "--routing-mode", "proxy"])
-                .routing_mode,
-            RoutingMode::Proxy
-        );
-        assert_eq!(
-            claude_run(&[
-                "rayline",
-                "claude",
-                "--no-proxy",
-                "--routing-mode",
-                "proxy-subagents"
-            ])
-            .routing_mode,
-            RoutingMode::ProxySubagents
-        );
-    }
-
-    #[test]
-    fn via_env_with_local_is_rejected() {
-        assert!(matches!(
-            rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--via", "env", "--local"])),
-            RaylineDispatch::Usage(_)
-        ));
-    }
-
-    #[test]
-    fn claude_config_flag_parses_as_claude_run() {
-        match rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "claude",
-            "--config",
-            "/tmp/router.json",
-        ])) {
-            RaylineDispatch::ClaudeRun(request) => {
-                assert_eq!(
-                    request.config_path.as_deref(),
-                    Some(std::path::Path::new("/tmp/router.json"))
-                );
-            }
-            other => panic!("expected ClaudeRun, got {other:?}"),
+        assert!(rayline_help_for_argv(&argv(&["raydock", "top"])).is_none());
+        for args in [
+            vec!["raydock", "top", "--bogus"],
+            vec!["raydock", "top", "--json", "extra"],
+        ] {
+            assert!(
+                matches!(
+                    rayline_dispatch_for_argv(&argv(&args)),
+                    RaylineDispatch::Usage(_)
+                ),
+                "{args:?} should be rejected"
+            );
         }
     }
 
     #[test]
-    fn claude_config_flag_accepts_equals_form() {
-        match rayline_dispatch_for_argv(&argv(&["rayline", "claude", "--config=/tmp/r.json"])) {
-            RaylineDispatch::ClaudeRun(request) => {
-                assert_eq!(
-                    request.config_path.as_deref(),
-                    Some(std::path::Path::new("/tmp/r.json"))
-                );
-            }
-            other => panic!("expected ClaudeRun, got {other:?}"),
+    fn router_and_local_are_not_commands() {
+        for args in [
+            vec!["raydock", "router", "start"],
+            vec!["raydock", "router", "top"],
+            vec!["raydock", "local", "models"],
+        ] {
+            assert!(
+                !matches!(
+                    rayline_dispatch_for_argv(&argv(&args)),
+                    RaylineDispatch::Top(_) | RaylineDispatch::Harness(_)
+                ),
+                "{args:?} should be rejected"
+            );
+            assert!(rayline_help_for_argv(&argv(&args)).is_none());
         }
-    }
-
-    #[test]
-    fn claude_via_env_with_config_is_unavailable() {
-        assert!(matches!(
-            rayline_dispatch_for_argv(&argv(&[
-                "rayline",
-                "claude",
-                "--via",
-                "env",
-                "--config",
-                "/tmp/router.json",
-            ])),
-            RaylineDispatch::Usage(_)
-        ));
+        assert_eq!(
+            rayline_help_for_argv(&argv(&["raydock", "router", "--help"])),
+            None
+        );
     }
 
     #[test]
@@ -2789,24 +1354,7 @@ mod tests {
         for (args, needle) in [
             (&["rayline", "--help"][..], "Commands:"),
             (&["rayline", "update", "--help"][..], "raydock update"),
-            (
-                &["rayline", "router", "status", "--help"][..],
-                "raydock router status",
-            ),
-            (
-                &["rayline", "router", "logs", "--help"][..],
-                "raydock router logs",
-            ),
-            (
-                &["rayline", "router", "top", "--help"][..],
-                "raydock router top",
-            ),
             (&["rayline", "top", "--help"][..], "raydock top"),
-            (
-                &["rayline", "router", "stop", "--help"][..],
-                "raydock router stop",
-            ),
-            (&["rayline", "local", "--help"][..], "raydock local"),
         ] {
             let help = rayline_help_for_argv(&argv(args)).expect("native help");
             assert!(help.contains(needle), "{args:?} should mention {needle:?}");
@@ -2815,18 +1363,6 @@ mod tests {
                 "{args:?} should not expose hidden env selection"
             );
         }
-    }
-
-    #[test]
-    fn claude_help_documents_hosted_and_local_router_modes() {
-        let help =
-            rayline_help_for_argv(&argv(&["rayline", "claude", "--help"])).expect("claude help");
-
-        assert!(help.contains("hosted routing"));
-        assert!(help.contains("local static router"));
-        assert!(help.contains("--local"));
-        assert!(help.contains("--via"));
-        assert!(help.contains("--route"));
     }
 
     #[test]
@@ -2839,7 +1375,6 @@ mod tests {
             panic!("expected ClaudeRun");
         };
         assert_eq!(request.env_name.as_deref(), Some("foo"));
-        assert!(!request.local_router);
         assert_eq!(
             request
                 .args
@@ -2851,33 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn public_parser_accepts_local_router_claude() {
-        let dispatch = rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "claude",
-            "--local-router",
-            "--isolated",
-            "-p",
-            "hi",
-        ]));
-
-        let RaylineDispatch::ClaudeRun(request) = dispatch else {
-            panic!("expected ClaudeRun");
-        };
-        assert!(request.local_router);
-        assert!(request.isolated);
-        assert_eq!(
-            request
-                .args
-                .iter()
-                .map(|arg| arg.to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            vec!["-p", "hi"]
-        );
-    }
-
-    #[test]
-    fn public_parser_accepts_auth_status_update_and_local() {
+    fn public_parser_accepts_auth_status_and_update() {
         assert!(matches!(
             rayline_dispatch_for_argv(&argv(&["rayline", "auth", "login", "--no-browser"])),
             RaylineDispatch::AuthLogin(status::AuthLoginRequest {
@@ -2911,13 +1420,6 @@ mod tests {
                 base_url: None,
                 install_path: None,
             })
-        );
-        assert_eq!(
-            rayline_dispatch_for_argv(&argv(&["rayline", "local", "models", "--json"])),
-            RaylineDispatch::LocalModels {
-                env_name: None,
-                json: true,
-            }
         );
     }
 
@@ -2983,7 +1485,7 @@ mod tests {
             "rayline",
             "claude",
             "run",
-            "--local-router",
+            "--isolated",
             "--",
             "--debug",
         ]));
@@ -2991,7 +1493,7 @@ mod tests {
         let RaylineDispatch::ClaudeRun(request) = dispatch else {
             panic!("expected ClaudeRun");
         };
-        assert!(request.local_router);
+        assert!(request.isolated);
         assert_eq!(
             request
                 .args
@@ -3000,100 +1502,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["--debug"]
         );
-    }
-
-    #[test]
-    fn public_parser_accepts_router_logs_lines() {
-        assert_eq!(
-            rayline_dispatch_for_argv(&argv(&["rayline", "router", "logs", "--lines=7"])),
-            RaylineDispatch::RouterLogs(crate::router::RouterLogsRequest {
-                lines: 7,
-                root_env_explicit: false,
-            })
-        );
-    }
-
-    #[test]
-    fn public_parser_accepts_router_top_json() {
-        assert_eq!(
-            rayline_dispatch_for_argv(&argv(&[
-                "rayline", "--env", "foo", "router", "top", "--json"
-            ])),
-            RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
-                json: true,
-                show_all: false,
-                hybrid: false,
-                legacy: false,
-                state_dir: None,
-                root_env_explicit: true,
-            })
-        );
-    }
-
-    #[test]
-    fn public_parser_accepts_top_alias_json() {
-        assert!(
-            rayline_help_for_argv(&argv(&["rayline", "top"])).is_none(),
-            "top alias should execute without requiring a subcommand"
-        );
-        assert_eq!(
-            rayline_dispatch_for_argv(&argv(&[
-                "rayline", "--env", "foo", "top", "--json", "--all"
-            ])),
-            RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
-                json: true,
-                show_all: true,
-                hybrid: false,
-                legacy: false,
-                state_dir: None,
-                root_env_explicit: true,
-            })
-        );
-    }
-
-    #[test]
-    fn public_parser_selects_hybrid_top_and_requires_explicit_state_scope() {
-        assert_eq!(
-            rayline_dispatch_for_argv(&argv(&["raydock", "top", "--legacy", "--json"])),
-            RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
-                json: true,
-                show_all: false,
-                hybrid: false,
-                legacy: true,
-                state_dir: None,
-                root_env_explicit: false,
-            })
-        );
-        for state_args in [
-            vec!["--state-dir", "/private/hybrid"],
-            vec!["--state-dir=/private/hybrid"],
-        ] {
-            let mut args = vec!["raydock", "top", "--hybrid", "--json"];
-            args.extend(state_args);
-            assert_eq!(
-                rayline_dispatch_for_argv(&argv(&args)),
-                RaylineDispatch::RouterTop(crate::router::RouterTopRequest {
-                    json: true,
-                    show_all: false,
-                    hybrid: true,
-                    legacy: false,
-                    state_dir: Some(std::path::PathBuf::from("/private/hybrid")),
-                    root_env_explicit: false,
-                })
-            );
-        }
-        for args in [
-            vec!["raydock", "top", "--state-dir", "/private/hybrid"],
-            vec!["raydock", "top", "--hybrid", "--state-dir"],
-            vec!["raydock", "top", "--hybrid", "--state-dir="],
-            vec!["raydock", "top", "--hybrid", "--legacy"],
-            vec!["raydock", "top", "--legacy", "--state-dir=/private/hybrid"],
-        ] {
-            assert!(matches!(
-                rayline_dispatch_for_argv(&argv(&args)),
-                RaylineDispatch::Usage(_)
-            ));
-        }
     }
 
     #[test]
@@ -3110,29 +1518,6 @@ mod tests {
     }
 
     #[test]
-    fn public_parser_accepts_local_onboard() {
-        assert_eq!(
-            rayline_dispatch_for_argv(&argv(&["rayline", "local", "onboard"])),
-            RaylineDispatch::LocalOnboard {
-                env_name: None,
-                reset: false
-            }
-        );
-        assert_eq!(
-            rayline_dispatch_for_argv(&argv(&["rayline", "local", "onboard", "--reset"])),
-            RaylineDispatch::LocalOnboard {
-                env_name: None,
-                reset: true
-            }
-        );
-    }
-
-    #[test]
-    fn local_onboard_has_native_help() {
-        assert!(rayline_help_for_argv(&argv(&["rayline", "local", "onboard", "--help"])).is_some());
-    }
-
-    #[test]
     fn public_parser_rejects_private_command_groups() {
         for args in [
             &["rayline", "internal", "status"][..],
@@ -3145,7 +1530,6 @@ mod tests {
             &["rayline", "claude", "telemetry", "status"][..],
             &["rayline", "claude", "setup"][..],
             &["rayline", "claude", "run", "setup"][..],
-            &["rayline", "claude", "--model", "x", "hooks", "status"][..],
         ] {
             assert!(
                 matches!(
@@ -3158,122 +1542,10 @@ mod tests {
     }
 
     #[test]
-    fn router_start_dispatch_defaults_to_all_route() {
-        match rayline_dispatch_for_argv(&argv(&["rayline", "router", "start"])) {
-            RaylineDispatch::RouterStart(request) => {
-                assert_eq!(
-                    request.proxy_routing_mode,
-                    crate::router::PROXY_ROUTING_MODE_ALL
-                );
-                assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_ANTHROPIC);
-                assert_eq!(request.codex_auth_mode, crate::codex::CodexAuthMode::Auto);
-            }
-            other => panic!("expected RouterStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn router_start_accepts_codex_mode_aliases() {
-        for mode in ["codex", "openai", "responses"] {
-            match rayline_dispatch_for_argv(&argv(&["rayline", "router", "start", "--mode", mode]))
-            {
-                RaylineDispatch::RouterStart(request) => {
-                    assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_CODEX);
-                }
-                other => panic!("expected RouterStart for {mode}, got {other:?}"),
-            }
-        }
-    }
-
-    #[test]
-    fn router_mode_shorthand_starts_router() {
-        match rayline_dispatch_for_argv(&argv(&["rayline", "router", "--mode", "openai"])) {
-            RaylineDispatch::RouterStart(request) => {
-                assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_CODEX);
-            }
-            other => panic!("expected RouterStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn router_start_accepts_codex_subscription_auth() {
-        match rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "router",
-            "start",
-            "--mode",
-            "codex",
-            "--auth",
-            "subscription",
-        ])) {
-            RaylineDispatch::RouterStart(request) => {
-                assert_eq!(request.api_mode, crate::router::ROUTER_API_MODE_CODEX);
-                assert_eq!(
-                    request.codex_auth_mode,
-                    crate::codex::CodexAuthMode::Subscription
-                );
-            }
-            other => panic!("expected RouterStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn router_start_dispatch_accepts_route_subagents() {
-        match rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "router",
-            "start",
-            "--route",
-            "subagents",
-        ])) {
-            RaylineDispatch::RouterStart(request) => {
-                assert_eq!(
-                    request.proxy_routing_mode,
-                    crate::router::PROXY_ROUTING_MODE_SELECTIVE_SUBAGENTS
-                );
-            }
-            other => panic!("expected RouterStart, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn router_start_help_is_available() {
-        assert!(rayline_help_for_argv(&argv(&["rayline", "router", "start", "--help"])).is_some());
-    }
-
-    #[test]
-    fn router_start_rejects_unknown_route() {
-        assert!(matches!(
-            rayline_dispatch_for_argv(&argv(&["rayline", "router", "start", "--route", "bogus"])),
-            RaylineDispatch::Usage(_)
-        ));
-    }
-
-    #[test]
-    fn router_start_accepts_config_flag() {
-        match rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "router",
-            "start",
-            "--config",
-            "/tmp/router.json",
-        ])) {
-            RaylineDispatch::RouterStart(request) => {
-                assert_eq!(
-                    request.config_path.as_deref(),
-                    Some(std::path::Path::new("/tmp/router.json"))
-                );
-            }
-            other => panic!("expected RouterStart, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn codex_dispatch_defaults_to_no_model_and_passes_args() {
         match rayline_dispatch_for_argv(&argv(&["rayline", "codex", "--", "exec", "hello"])) {
             RaylineDispatch::CodexRun(request) => {
-                // No `--model` → None, so the CLI stamps the virtual-marker sentinel
-                // internally and the router applies config-driven routing.
+                // No `--model`: the launch asks for the key's main model.
                 assert_eq!(request.model, None);
                 assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Auto);
                 assert_eq!(request.codex_args, argv(&["exec", "hello"]));
@@ -3315,23 +1587,16 @@ mod tests {
 
     #[test]
     fn claude_app_dispatch_defaults_to_start() {
-        for args in [
-            vec!["rayline", "claude-desktop"],
-            vec!["rayline", "claude-desktop", "--manual"],
-        ] {
-            match rayline_dispatch_for_argv(&argv(&args)) {
-                RaylineDispatch::ClaudeApp(request) => {
-                    assert_eq!(request.action, crate::claude_app::AppAction::Start);
-                    assert!(!request.root_env_explicit);
-                    assert_eq!(request.manual, args.contains(&"--manual"));
-                }
-                other => panic!("expected ClaudeApp, got {other:?}"),
+        match rayline_dispatch_for_argv(&argv(&["rayline", "claude-desktop"])) {
+            RaylineDispatch::ClaudeApp(request) => {
+                assert_eq!(request.action, crate::claude_app::AppAction::Start);
             }
+            other => panic!("expected ClaudeApp, got {other:?}"),
         }
     }
 
     #[test]
-    fn claude_app_dispatch_parses_subcommands_and_env() {
+    fn claude_app_dispatch_parses_subcommands() {
         match rayline_dispatch_for_argv(&argv(&[
             "rayline",
             "--env",
@@ -3341,70 +1606,24 @@ mod tests {
         ])) {
             RaylineDispatch::ClaudeApp(request) => {
                 assert_eq!(request.action, crate::claude_app::AppAction::Status);
-                assert_eq!(request.env_name.as_deref(), Some("dev"));
-                assert!(request.root_env_explicit);
             }
             other => panic!("expected ClaudeApp, got {other:?}"),
         }
-        match rayline_dispatch_for_argv(&argv(&[
-            "rayline",
-            "claude-desktop",
-            "validate",
-            "--desktop-config",
-            "/tmp/d.json",
-        ])) {
+        match rayline_dispatch_for_argv(&argv(&["rayline", "claude-desktop", "validate"])) {
             RaylineDispatch::ClaudeApp(request) => {
                 assert_eq!(request.action, crate::claude_app::AppAction::Validate);
-                assert_eq!(
-                    request.desktop_config.as_deref(),
-                    Some(std::path::Path::new("/tmp/d.json"))
-                );
             }
             other => panic!("expected ClaudeApp, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn claude_app_dispatch_parses_prefixed_ids_fallback() {
-        match rayline_dispatch_for_argv(&argv(&["rayline", "claude-desktop", "--prefixed-ids"])) {
-            RaylineDispatch::ClaudeApp(request) => {
-                assert_eq!(request.action, crate::claude_app::AppAction::Start);
-                assert_eq!(request.id_style, crate::claude_app::IdStyle::Prefixed);
-            }
-            other => panic!("expected ClaudeApp, got {other:?}"),
-        }
-        match rayline_dispatch_for_argv(&argv(&["rayline", "claude-desktop"])) {
-            RaylineDispatch::ClaudeApp(request) => {
-                assert_eq!(request.id_style, crate::claude_app::IdStyle::Bare);
-            }
-            other => panic!("expected ClaudeApp, got {other:?}"),
-        }
-        assert!(matches!(
-            rayline_dispatch_for_argv(&argv(&[
-                "rayline",
-                "claude-desktop",
-                "status",
-                "--prefixed-ids"
-            ])),
-            RaylineDispatch::Usage(_)
-        ));
     }
 
     #[test]
     fn claude_app_dispatch_rejects_unknown_input() {
         for args in [
             &["rayline", "claude-desktop", "bogus"][..],
-            &["rayline", "claude-desktop", "off", "--manual"][..],
             &["rayline", "claude-desktop", "start", "stop"][..],
-            &["rayline", "claude-desktop", "--local"][..],
-            &["rayline", "claude-desktop", "--model", "rayline/arc-swift"][..],
-            &[
-                "rayline",
-                "claude-desktop",
-                "start",
-                "--desktop-config",
-                "/x",
-            ][..],
+            &["rayline", "claude-desktop", "--bogus"][..],
+            &["rayline", "claude-desktop", "off", "--bogus"][..],
         ] {
             assert!(
                 matches!(
@@ -3456,17 +1675,14 @@ mod tests {
             "rayline",
             "codex",
             "app",
-            "--config",
-            "/tmp/cfg.json",
+            "--model",
+            "gpt-5.5",
             "--subscription",
             "/work/space",
         ])) {
             RaylineDispatch::CodexApp(request) => {
                 assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Subscription);
-                assert_eq!(
-                    request.config_path.as_deref(),
-                    Some(std::path::Path::new("/tmp/cfg.json"))
-                );
+                assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
                 // The workspace path is passed through to `codex app`.
                 assert_eq!(request.codex_args, argv(&["/work/space"]));
             }
@@ -3499,7 +1715,7 @@ mod tests {
         ])) {
             RaylineDispatch::CodexConfigure(request) => {
                 assert_eq!(request.model.as_deref(), Some("gpt-5.5"));
-                assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Subscription);
+                assert_eq!(request.auth_mode, crate::codex::CodexAuthMode::Auto);
                 assert_eq!(
                     request.base_url.as_deref(),
                     Some("http://127.0.0.1:29999/v1")
