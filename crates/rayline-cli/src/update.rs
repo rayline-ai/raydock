@@ -1168,6 +1168,26 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_fresh_install_waits_for_another_process_to_release_the_file() -> TestResult {
+        let root = temp_update_dir()?;
+        let installed = root.join("raydock.exe");
+        let staged = root.join("staged.exe");
+        fs::write(&staged, b"new")?;
+        let held = hold_without_delete_sharing(&staged)?;
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(held);
+        });
+        move_into_place(&staged, &installed)?;
+        release.join().expect("release thread");
+        assert_eq!(fs::read(&installed)?, b"new");
+        assert!(!staged.exists());
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_swap_held_past_the_wait_is_an_in_use_error_and_changes_nothing() -> TestResult {
         let root = temp_update_dir()?;
         let installed = root.join("raydock.exe");
