@@ -1624,6 +1624,103 @@ mod tests {
         assert_eq!(probe_verdict(Ok(429)), ProbeVerdict::RateLimited);
     }
 
+    /// The config file `name` in `dir`, with `routing` and an `environments.dev`
+    /// entry, loaded in local mode for `env`.
+    fn local_settings(dir: &Path, name: &str, env: Option<&str>) -> Settings {
+        let file = dir.join(name);
+        fs::write(
+            &file,
+            r#"{"routing": {"decisions_model": "arc-swift-1.0",
+                "classifier_model": "anthropic/claude-haiku-5.5",
+                "policy": {"preset": "arc-policy.hybrid-default.v1"}},
+              "environments": {"dev": {"base_url": "https://router.example.test",
+                "login_url": "https://router.example.test/cli-auth"}}}"#,
+        )
+        .unwrap();
+        crate::config::load(&crate::config::LoadOptions {
+            mode: crate::config::Mode::LocalFile(&file),
+            env,
+            harness_protocol: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_run_on_another_config_or_env_is_refused() {
+        let dir = temp_dir("serves");
+        let started = local_settings(&dir, "a.json", None);
+        let supervisor = Supervisor {
+            pid: 7,
+            config: fs::canonicalize(&started.file).unwrap(),
+            env: None,
+        };
+        supervisor.check_serves(&started).unwrap();
+
+        let other = local_settings(&dir, "b.json", None);
+        let error = supervisor.check_serves(&other).unwrap_err().to_string();
+        for part in [
+            "the local process (pid 7) runs from ",
+            "a.json, not ",
+            "b.json; stop it with `rayline local stop` first",
+        ] {
+            assert!(error.contains(part), "{error}");
+        }
+
+        let dev = local_settings(&dir, "a.json", Some("dev"));
+        assert_eq!(
+            supervisor.check_serves(&dev).unwrap_err().to_string(),
+            "the local process (pid 7) was started with no `--env`, and this run has \
+             `--env dev`; stop it with `rayline local stop` first"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn running_reads_the_record_of_a_live_process_only() {
+        let dir = temp_dir("running");
+        let paths = Paths { dir: dir.clone() };
+        assert_eq!(running(&paths).unwrap(), None);
+
+        fs::write(paths.ready(), "{}").unwrap();
+        let error = running(&paths).unwrap_err().to_string();
+        assert!(error.contains("supervisor.json"), "{error}");
+        fs::remove_file(paths.ready()).unwrap();
+
+        let record = |pid: u64| {
+            fs::write(
+                paths.supervisor(),
+                json!({"pid": pid, "config": "/c.json", "env": "dev"}).to_string(),
+            )
+            .unwrap();
+            running(&paths)
+        };
+        assert_eq!(
+            record(u64::from(std::process::id())).unwrap(),
+            Some(Supervisor {
+                pid: std::process::id(),
+                config: PathBuf::from("/c.json"),
+                env: Some("dev".to_owned()),
+            })
+        );
+        let error = record(u64::from(u32::MAX)).unwrap_err().to_string();
+        assert!(error.contains("invalid pid"), "{error}");
+        #[cfg(unix)]
+        {
+            let mut child = Command::new("true").spawn().unwrap();
+            child.wait().unwrap();
+            assert_eq!(record(u64::from(child.id())).unwrap(), None);
+        }
+
+        fs::write(
+            paths.supervisor(),
+            r#"{"pid": 1, "config": "/c.json", "env": null, "port": 9}"#,
+        )
+        .unwrap();
+        let error = running(&paths).unwrap_err().to_string();
+        assert!(error.contains("supervisor.json"), "{error}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn historical_sessions_require_an_explicit_restore_contract() {
         for (harness, arg) in [

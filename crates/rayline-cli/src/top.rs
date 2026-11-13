@@ -124,15 +124,36 @@ fn validate_top_snapshot(snapshot: &Value) -> io::Result<()> {
     };
     for key in ["active", "recent"] {
         match object.get(key) {
-            None => {}
             Some(Value::Array(rows)) if rows.iter().all(Value::is_object) => {}
-            Some(_) => return invalid(&format!("`{key}` is not an array of objects")),
+            _ => return invalid(&format!("`{key}` is not an array of objects")),
         }
     }
-    match object.get("totals") {
-        None | Some(Value::Object(_)) => Ok(()),
-        Some(_) => invalid("`totals` is not an object"),
+    let Some(Value::Object(totals)) = object.get("totals") else {
+        return invalid("`totals` is not an object");
+    };
+    for key in TOTALS {
+        if !totals.get(*key).is_some_and(Value::is_u64) {
+            return invalid(&format!("`totals.{key}` is not a count"));
+        }
     }
+    Ok(())
+}
+
+/// The `totals` counts top shows.
+const TOTALS: &[&str] = &[
+    "completed_requests",
+    "errored_requests",
+    "local_requests",
+    "remote_requests",
+    "input_tokens",
+    "output_tokens",
+];
+
+/// The `key` rows of a snapshot `validate_top_snapshot` accepted.
+fn rows<'a>(snapshot: &'a Value, key: &str) -> &'a [Value] {
+    snapshot[key]
+        .as_array()
+        .expect("validate_top_snapshot checked the rows")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -310,7 +331,7 @@ fn draw_top_summary(
     paused: bool,
     sort: TopSort,
 ) -> io::Result<u16> {
-    let totals = snapshot.get("totals").unwrap_or(&Value::Null);
+    let totals = &snapshot["totals"];
     y = draw_line(
         stdout,
         y,
@@ -442,18 +463,11 @@ fn top_row_color(row: &Value) -> Option<Color> {
 }
 
 fn row_count(snapshot: &Value, key: &str) -> usize {
-    snapshot
-        .get(key)
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len)
+    rows(snapshot, key).len()
 }
 
 fn sorted_top_rows(snapshot: &Value, key: &str, sort: TopSort) -> Vec<Value> {
-    let mut rows = snapshot
-        .get(key)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let mut rows = rows(snapshot, key).to_vec();
     rows.sort_by(|left, right| {
         top_sort_value(right, sort)
             .partial_cmp(&top_sort_value(left, sort))
@@ -533,16 +547,14 @@ fn top_table_row(row: &Value, width: u16) -> String {
 fn format_top_snapshot(snapshot: &Value) -> String {
     let active = row_count(snapshot, "active");
     let recent = row_count(snapshot, "recent");
-    let totals = snapshot.get("totals").unwrap_or(&Value::Null);
+    let totals = &snapshot["totals"];
     let mut output = format!(
         "Raydock top snapshot\nactive: {active}  recent: {recent}  completed: {}  errors: {}\n",
         totals_u64(totals, "completed_requests"),
         totals_u64(totals, "errored_requests"),
     );
-    if let Some(rows) = snapshot.get("active").and_then(Value::as_array) {
-        for row in rows {
-            output.push_str(&format_top_row(row));
-        }
+    for row in rows(snapshot, "active") {
+        output.push_str(&format_top_row(row));
     }
     if active == 0 {
         output.push_str("no active requests\n");
@@ -575,7 +587,9 @@ fn value_str<'a>(row: &'a Value, key: &str) -> &'a str {
 }
 
 fn totals_u64(totals: &Value, key: &str) -> u64 {
-    totals.get(key).and_then(Value::as_u64).unwrap_or(0)
+    totals[key]
+        .as_u64()
+        .expect("validate_top_snapshot checked the totals")
 }
 
 fn count_cell(row: &Value, key: &str) -> String {
@@ -749,7 +763,8 @@ mod tests {
                 } else {
                     serde_json::json!({"runtime": "rayline-local", "instance_id": "test-core",
                         "pid": std::process::id(), "core_pid": std::process::id(),
-                        "totals": {"completed_requests": 1, "output_tokens": 12}, "active": [],
+                        "totals": {"completed_requests": 1, "errored_requests": 0, "local_requests": 0,
+                            "remote_requests": 1, "input_tokens": 0, "output_tokens": 12}, "active": [],
                         "recent": [{"request_id": "hybrid_1", "target": "remote", "state": "completed",
                             "selected_model": null, "requested_model": "virtual-model", "output_tokens": 12}]})
                 };
@@ -867,13 +882,27 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_snapshots_are_errors_never_panics() {
-        let head = serde_json::json!({"runtime": "rayline-local", "pid": std::process::id(),
-            "core_pid": std::process::id(), "instance_id": "test-core"});
+        let totals = serde_json::json!({"completed_requests": 0, "errored_requests": 0,
+            "local_requests": 0, "remote_requests": 0, "input_tokens": 0, "output_tokens": 0});
+        let valid = serde_json::json!({"runtime": "rayline-local", "pid": std::process::id(),
+            "core_pid": std::process::id(), "instance_id": "test-core",
+            "active": [], "recent": [], "totals": totals});
+        validate_top_snapshot(&valid).unwrap();
         let with = |key: &str, value: Value| {
-            let mut body = head.clone();
+            let mut body = valid.clone();
             body[key] = value;
             body
         };
+        let without = |key: &str| {
+            let mut body = valid.clone();
+            body.as_object_mut().unwrap().remove(key);
+            body
+        };
+        let mut partial_totals = totals.clone();
+        partial_totals
+            .as_object_mut()
+            .unwrap()
+            .remove("errored_requests");
         for body in [
             serde_json::json!([]),
             serde_json::json!(0),
@@ -881,6 +910,11 @@ mod tests {
             with("active", serde_json::json!([1])),
             with("recent", serde_json::json!("x")),
             with("totals", serde_json::json!(3)),
+            without("active"),
+            without("recent"),
+            without("totals"),
+            with("totals", partial_totals),
+            with("totals", serde_json::json!({"completed_requests": -1})),
         ] {
             let home = unique_test_dir("top-malformed");
             let server =
