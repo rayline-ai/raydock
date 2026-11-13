@@ -3,6 +3,15 @@
 User-facing changes in each Rayline release. Install commands and signed
 assets are listed on each [GitHub release](https://github.com/rayline-ai/raydock/releases).
 
+## 0.5.1 (2026-11-13)
+
+### Changed
+
+- **The installers no longer need minisign.** `install.sh` and `install.ps1`
+  check each file they download against the release's `SHA256SUMS`, and
+  refuse to install on a mismatch. `rayline update` still checks the release
+  signature itself, with no extra tool.
+
 ## 0.4.5 (2026-11-12)
 
 ### Fixed
