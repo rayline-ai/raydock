@@ -493,7 +493,6 @@ async fn derived_models_sharing_a_worker_attribute_the_executed_deployment() {
         let row = &snapshot["recent"][0];
         assert_eq!(row["state"], "completed");
         assert_eq!(row["decision_model"], "fixture-model");
-        assert_eq!(row["selected_model"], model);
         assert_eq!(row["executed_model"], model);
         assert_eq!(row["executed_worker"], "shared");
         assert_eq!(row["endpoint_id"], deployment);

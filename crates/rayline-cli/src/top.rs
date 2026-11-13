@@ -566,7 +566,7 @@ fn format_top_row(row: &Value) -> String {
     let upstream = value_str(row, "upstream_request_id");
     let agent = value_str(row, "agent_type");
     let target = top_target_cell(row);
-    let model = value_str(row, "selected_model");
+    let model = value_str(row, "executed_model");
     let state = value_str(row, "state");
     let ttft = ms_cell(row, "ttft_ms");
     let output_tokens = count_cell(row, "output_tokens");
@@ -638,7 +638,7 @@ fn top_target_cell(row: &Value) -> &str {
 /// The model that served the row, then the routing preset when there is one.
 /// A row whose execution model is unknown shows `-`, never the requested model.
 fn top_model_cell(row: &Value) -> String {
-    let model = value_str(row, "selected_model");
+    let model = value_str(row, "executed_model");
     match value_str(row, "policy") {
         "-" => model.to_owned(),
         policy => format!("{model} / {policy}"),
@@ -765,7 +765,7 @@ mod tests {
                         "totals": {"completed_requests": 1, "errored_requests": 0, "local_requests": 0,
                             "remote_requests": 1, "input_tokens": 0, "output_tokens": 12}, "active": [],
                         "recent": [{"request_id": "hybrid_1", "target": "remote", "state": "completed",
-                            "selected_model": null, "requested_model": "virtual-model", "output_tokens": 12}]})
+                            "executed_model": null, "requested_model": "virtual-model", "output_tokens": 12}]})
                 };
                 if !health_request {
                     snapshots += 1;
@@ -798,7 +798,7 @@ mod tests {
         let rendered = render_top_from_home(&home, &JSON).await.unwrap();
         let snapshot: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(snapshot["runtime"], "rayline-local");
-        assert_eq!(snapshot["recent"][0]["selected_model"], Value::Null);
+        assert_eq!(snapshot["recent"][0]["executed_model"], Value::Null);
         assert_eq!(snapshot["recent"][0]["output_tokens"], 12);
         assert_eq!(top_target_cell(&snapshot["recent"][0]), "cloud");
         assert!(!top_model_cell(&snapshot["recent"][0]).contains("virtual-model"));
@@ -965,7 +965,7 @@ mod tests {
             "agent_type": "main",
             "target": "local",
             "state": "done",
-            "selected_model": "model",
+            "executed_model": "model",
             "input_tokens": 10_200,
             "output_tokens": 1_200_000,
             "duration_ms": 10_200,
@@ -1002,7 +1002,7 @@ mod tests {
             "agent_type": "main",
             "target": "remote",
             "state": "completed",
-            "selected_model": "model",
+            "executed_model": "model",
         });
         let cells = top_table_row(&row, 140)
             .split_whitespace()
@@ -1026,9 +1026,9 @@ mod tests {
 
     #[test]
     fn top_model_cell_shows_the_routing_preset() {
-        let row = serde_json::json!({"selected_model": "model", "policy": "balanced"});
+        let row = serde_json::json!({"executed_model": "model", "policy": "balanced"});
         assert_eq!(top_model_cell(&row), "model / balanced");
-        let row = serde_json::json!({"selected_model": "model"});
+        let row = serde_json::json!({"executed_model": "model"});
         assert_eq!(top_model_cell(&row), "model");
     }
 

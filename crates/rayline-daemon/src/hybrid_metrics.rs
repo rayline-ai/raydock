@@ -133,8 +133,8 @@ impl RoutingMetadata {
             .metrics
             .record(MetricsUpdate::ExecutionIdentity {
                 request_id: observation.id.clone(),
-                selected_model: header(headers, "x-rayline-selected-model"),
-                executed_model: executed_model.clone(),
+                decision_model: header(headers, "x-rayline-selected-model"),
+                executed_model,
                 executed_worker: worker,
                 executed_action_id: action,
                 selected_action_id: header(headers, "x-rayline-action-id"),
@@ -153,7 +153,6 @@ impl RoutingMetadata {
             route_id: header(headers, "x-rayline-route-id"),
             target: target.to_owned(),
             endpoint_id: deployment.map(|deployment| deployment.id.clone()),
-            selected_model: executed_model,
             requested_model: None,
             policy: self.policy.clone(),
             task_class: header(headers, "x-rayline-event"),
@@ -214,12 +213,22 @@ impl RequestObservation {
     }
 
     pub(super) fn record_classifier(&self, model: &str) {
+        // A cloud pin: no routing decision, only the model that serves it.
+        self.metrics.record(MetricsUpdate::ExecutionIdentity {
+            request_id: self.id.clone(),
+            decision_model: None,
+            executed_model: Some(model.to_owned()),
+            executed_worker: None,
+            executed_action_id: None,
+            selected_action_id: None,
+            executed_control_id: None,
+            wire_model: None,
+        });
         self.metrics.record(MetricsUpdate::RouteDecided {
             request_id: self.id.clone(),
             route_id: None,
             target: "remote".to_owned(),
             endpoint_id: None,
-            selected_model: Some(model.to_owned()),
             requested_model: None,
             policy: Some("classifier cloud pin".to_owned()),
             task_class: Some("sidecall".to_owned()),
@@ -245,7 +254,6 @@ impl RequestObservation {
                 status_code: Some(status),
                 input_tokens: None,
                 output_tokens: None,
-                selected_model: None,
             });
         }
     }
@@ -290,7 +298,11 @@ mod tests {
         metadata.record(&observation, &headers, "instance");
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.active[0].target.as_deref(), Some("local"));
-        assert_eq!(snapshot.active[0].selected_model.as_deref(), Some("glm"));
+        assert_eq!(snapshot.active[0].executed_model.as_deref(), Some("glm"));
+        assert_eq!(
+            snapshot.active[0].decision_model.as_deref(),
+            Some("cloud-model")
+        );
         assert_eq!(snapshot.active[0].endpoint_id.as_deref(), Some("spark"));
         drop(observation);
         let snapshot = metrics.snapshot();
