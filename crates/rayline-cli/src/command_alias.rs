@@ -51,6 +51,23 @@ pub(crate) fn migrate_legacy_payload() -> Result<Option<PathBuf>, UpdateError> {
         ));
     }
     let primary = primary_path(&executable);
+    // Concurrent first invocations take turns on the legacy payload, and only
+    // the first one replaces it. macOS fails an open through a symlink while a
+    // rename replaces that symlink, so the alias must be replaced only once.
+    #[cfg(unix)]
+    let _payload = {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::io::AsRawFd;
+        let payload = std::fs::File::open(&executable)?;
+        // SAFETY: flock receives a live descriptor and does not retain pointers.
+        if unsafe { libc::flock(payload.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        if std::fs::symlink_metadata(&executable)?.ino() != payload.metadata()?.ino() {
+            return Ok(Some(primary));
+        }
+        payload
+    };
     update::replace_binary(&executable, &primary)
         .and_then(|()| install_alias(&primary))
         .map_err(|error| {
