@@ -99,7 +99,6 @@ struct Ready {
     pid: u32,
     core_pid: u32,
     instance_id: String,
-    credential_env: Vec<String>,
     capabilities: ModelCapabilities,
 }
 
@@ -125,7 +124,6 @@ type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 
 pub async fn run(args: Args) -> Result<()> {
     check_decisions_url(&args.config, &args.router_url)?;
-    let credential_env = credential_env_names(&args.config)?;
     let config = serde_json::from_slice(&std::fs::read(&args.config)?)?;
     let routing_metadata = RoutingMetadata::from_config(&config).map_err(anyhow::Error::msg)?;
     let classifier = crate::hybrid_classifier::route(&config, &args.classifier_model)
@@ -221,7 +219,6 @@ pub async fn run(args: Args) -> Result<()> {
             pid: std::process::id(),
             core_pid: handshake.pid,
             instance_id,
-            credential_env,
             capabilities,
         };
         write_private_new(&args.ready_file, &serde_json::to_vec(&ready)?)?;
@@ -253,33 +250,6 @@ pub async fn run(args: Args) -> Result<()> {
 fn check_decisions_url(path: &Path, router_url: &str) -> Result<()> {
     rayline_local_router::decisions_url::check_config_bytes(&std::fs::read(path)?, [router_url])
         .map_err(anyhow::Error::msg)
-}
-
-fn credential_env_names(path: &Path) -> Result<Vec<String>> {
-    // Read only environment references; the core owns full config validation.
-    #[derive(Default, Deserialize)]
-    struct Auth {
-        auth_env: Option<String>,
-    }
-    #[derive(Deserialize)]
-    struct References {
-        #[serde(default)]
-        decisions: Auth,
-        #[serde(default)]
-        deployments: Vec<Auth>,
-    }
-    let references: References = serde_json::from_slice(&std::fs::read(path)?)?;
-    let mut names: Vec<_> = std::iter::once(references.decisions)
-        .chain(references.deployments)
-        .filter_map(|auth| auth.auth_env)
-        .filter(|name| !name.is_empty())
-        .collect();
-    if names.iter().any(|name| name.contains(['=', '\0'])) {
-        bail!("credential environment reference is not a valid variable name");
-    }
-    names.sort();
-    names.dedup();
-    Ok(names)
 }
 
 async fn read_handshake(child: &mut Child) -> Result<CoreHandshake> {

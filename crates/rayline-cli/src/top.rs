@@ -730,7 +730,7 @@ mod tests {
         let mut state = serde_json::json!({
             "contract_version": 1, "ready": true,
             "pid": std::process::id(), "core_pid": std::process::id(),
-            "instance_id": "test-core", "credential_env": [],
+            "instance_id": "test-core",
             "capabilities": {"context_window": 98304, "max_output_tokens": 4096, "input_modalities": ["text"]},
             "listen_url": format!("http://{}", listener.local_addr().unwrap())
         });

@@ -125,7 +125,6 @@ def main():
             token = (state / "gateway-token").read_text()
             assert token not in json.dumps(first)
             assert token not in (state / "runtime.log").read_text()
-            assert first["credential_env"] == credential_env
             assert all(env[name] not in json.dumps(first) for name in local_env)
             assert "synthetic-saved-router-key" not in json.dumps(first)
 

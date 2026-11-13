@@ -257,7 +257,7 @@ async fn run_harness(
     let state = ready(&paths)?;
     health(&client, &paths, &state).await?;
     let token = fs::read_to_string(paths.token())?;
-    let withheld = credential_env_names(&state)?;
+    let withheld = endpoint_key_envs(settings);
     let mut command = harness_command(
         &home,
         harness,
@@ -653,7 +653,6 @@ fn ready(paths: &Paths) -> io::Result<Value> {
     {
         return Err(io::Error::other("incompatible local process metadata"));
     }
-    credential_env_names(&state)?;
     model_capabilities(&state)?;
     if state
         .get("instance_id")
@@ -722,23 +721,13 @@ pub(crate) async fn top_connection(
     Ok((client, format!("{endpoint}/v1/router/top/snapshot"), state))
 }
 
-fn credential_env_names(state: &Value) -> io::Result<Vec<&str>> {
-    let values = state
-        .get("credential_env")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            io::Error::other("missing local process credential environment references")
-        })?;
-    values
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .filter(|name| !name.is_empty() && !name.contains(['=', '\0']))
-                .ok_or_else(|| {
-                    io::Error::other("invalid local process credential environment reference")
-                })
-        })
+/// The env var each endpoint's `api_key_env` names, whether or not a `models`
+/// entry uses the endpoint (spec 7.2 item 6).
+fn endpoint_key_envs(settings: &Settings) -> Vec<&str> {
+    settings
+        .endpoints
+        .values()
+        .filter_map(|endpoint| endpoint.api_key_env.as_deref())
         .collect()
 }
 
@@ -1571,14 +1560,39 @@ mod tests {
 
     /// OpenCode's `--version` probe runs before the launch, from the same
     /// environment: no endpoint key, router key or core token reaches it.
+    /// The endpoint keys come from settings, so the key of an endpoint that
+    /// no `models` entry uses is withheld too.
     #[test]
     fn the_opencode_version_probe_withholds_what_the_launch_withholds() {
         let _guard = ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let opencode = FakeOpenCode::install();
+        let home = temp_dir("probe-env");
+        let file = home.join("settings.json");
+        fs::write(
+            &file,
+            r#"{"routing": {"decisions_model": "arc-swift-1.0",
+                "classifier_model": "anthropic/claude-haiku-5.5",
+                "policy": {"preset": "arc-policy.hybrid-default.v1"}},
+              "endpoints": {
+                "box": {"base_url": "http://127.0.0.1:1", "protocols": ["openai_chat"],
+                  "api_key_env": "RAYLINE_TEST_USED_ENDPOINT_KEY"},
+                "spare": {"base_url": "http://127.0.0.1:2", "protocols": ["openai_chat"],
+                  "api_key_env": "RAYLINE_TEST_UNUSED_ENDPOINT_KEY"}},
+              "models": {"local/box-model": {"endpoint": "box", "model": "box-model",
+                "context_window": 16384, "max_output_tokens": 8192}}}"#,
+        )
+        .unwrap();
+        let settings = crate::config::load(&crate::config::LoadOptions {
+            mode: crate::config::Mode::LocalFile(&file),
+            env: None,
+            harness_protocol: None,
+        })
+        .unwrap();
         let withheld = [
-            "RAYLINE_TEST_ENDPOINT_KEY",
+            "RAYLINE_TEST_USED_ENDPOINT_KEY",
+            "RAYLINE_TEST_UNUSED_ENDPOINT_KEY",
             "RAYLINE_ROUTER_API_KEY",
             "RAYLINE_EXEC_AUTH_TOKEN",
         ];
@@ -1590,7 +1604,6 @@ mod tests {
             // --test-threads=1 (AGENTS.md); restored below.
             unsafe { std::env::set_var(var, "test-value-not-a-real-key") };
         }
-        let home = temp_dir("probe-env");
         let command = harness_command(
             &home,
             "opencode",
@@ -1602,7 +1615,7 @@ mod tests {
                 max_output_tokens: 8192,
                 input_modalities: vec!["text".into()],
             },
-            &["RAYLINE_TEST_ENDPOINT_KEY"],
+            &endpoint_key_envs(&settings),
         );
         for (var, value) in vars.iter().zip(prior) {
             // SAFETY: as above.
