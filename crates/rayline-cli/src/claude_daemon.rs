@@ -48,14 +48,17 @@ pub struct ProceedPreflight {
 
 pub enum PreflightOutcome {
     Proceed(ProceedPreflight),
-    SwitchToIsolated,
+    /// The user chose isolated. Carries this check's spawner pid: the daemon
+    /// it found keeps running, so its starter's record stays kept.
+    SwitchToIsolated(ProceedPreflight),
 }
 
 pub struct LaunchRecord<'a> {
     pub home: &'a Path,
     pub pid: u32,
     pub request: &'a RequestSpec<'a>,
-    pub preserve_spawned_by_pid: Option<u32>,
+    /// Spawner pids whose records are kept whatever their age.
+    pub preserve_spawned_by_pids: &'a [u32],
 }
 
 impl LaunchPreflight<'_> {
@@ -98,7 +101,7 @@ impl LaunchPreflight<'_> {
             !self.isolated,
         )? {
             ConflictOutcome::Continue => Ok(PreflightOutcome::Proceed(proceed)),
-            ConflictOutcome::SwitchToIsolated => Ok(PreflightOutcome::SwitchToIsolated),
+            ConflictOutcome::SwitchToIsolated => Ok(PreflightOutcome::SwitchToIsolated(proceed)),
         }
     }
 }
@@ -676,9 +679,11 @@ pub fn record_rayline_claude_launch(record: LaunchRecord<'_>) -> io::Result<()> 
     let now = unix_now_secs();
     let mut pruned = Vec::new();
     for entry in read_rayline_claude_launches(record.home)? {
+        let entry_pid = entry.get("pid").and_then(Value::as_u64);
         if record
-            .preserve_spawned_by_pid
-            .is_some_and(|pid| entry.get("pid").and_then(Value::as_u64) == Some(u64::from(pid)))
+            .preserve_spawned_by_pids
+            .iter()
+            .any(|&pid| entry_pid == Some(u64::from(pid)))
         {
             pruned.push(entry);
             continue;
@@ -1139,8 +1144,33 @@ mod tests {
             home,
             pid: 9006,
             request,
-            preserve_spawned_by_pid: None,
+            preserve_spawned_by_pids: &[],
         })
+    }
+
+    /// A launch that switched to isolated keeps the records of both checks'
+    /// spawners, however old; other expired records are dropped.
+    #[test]
+    fn a_launch_keeps_every_preserved_spawner_record() {
+        let home = temp_home();
+        let request = launch_request();
+        let path = rayline_claude_launches_path(&home);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let expired = [9101, 9102, 9103].map(|pid| launch_entry(&request, pid, 1));
+        fs::write(path, Value::Array(expired.to_vec()).to_string()).unwrap();
+        record_rayline_claude_launch(LaunchRecord {
+            home: &home,
+            pid: 9006,
+            request: &request,
+            preserve_spawned_by_pids: &[9101, 9103],
+        })
+        .unwrap();
+        let pids: Vec<u64> = read_rayline_claude_launches(&home)
+            .unwrap()
+            .iter()
+            .map(|entry| entry["pid"].as_u64().unwrap())
+            .collect();
+        assert_eq!(pids, [9101, 9103, 9006]);
     }
 
     /// No launch record file holds no launches; recording one creates it.

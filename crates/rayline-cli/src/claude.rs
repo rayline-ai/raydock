@@ -246,12 +246,15 @@ async fn run_command_from_home(
         isolated,
     }
     .resolve()?;
-    let preserve_spawned_by_pid = match preflight {
-        PreflightOutcome::Proceed(preflight) => preflight.preserve_spawned_by_pid,
-        PreflightOutcome::SwitchToIsolated => {
+    let preserve_spawned_by_pids: Vec<u32> = match preflight {
+        PreflightOutcome::Proceed(preflight) => {
+            preflight.preserve_spawned_by_pid.into_iter().collect()
+        }
+        PreflightOutcome::SwitchToIsolated(default_preflight) => {
             // The user chose to run isolated: re-check the isolated config dir,
             // which may already host a daemon for a different env. No further
-            // isolated escape from here.
+            // isolated escape from here. The default folder's daemon keeps
+            // running, so its spawner's record stays kept too.
             isolated = true;
             inspect_dir = claude_config_dir(home, true).map_err(RunError::ConfigDir)?;
             let isolated_preflight = LaunchPreflight {
@@ -263,8 +266,12 @@ async fn run_command_from_home(
             }
             .resolve()?;
             match isolated_preflight {
-                PreflightOutcome::Proceed(preflight) => preflight.preserve_spawned_by_pid,
-                PreflightOutcome::SwitchToIsolated => {
+                PreflightOutcome::Proceed(preflight) => default_preflight
+                    .preserve_spawned_by_pid
+                    .into_iter()
+                    .chain(preflight.preserve_spawned_by_pid)
+                    .collect(),
+                PreflightOutcome::SwitchToIsolated(_) => {
                     unreachable!("isolated re-check cannot isolate")
                 }
             }
@@ -288,7 +295,7 @@ async fn run_command_from_home(
         home,
         pid: std::process::id(),
         request: &daemon_request,
-        preserve_spawned_by_pid,
+        preserve_spawned_by_pids: &preserve_spawned_by_pids,
     })
     .map_err(RunError::LaunchRecord)?;
     Ok(command)
@@ -1011,7 +1018,7 @@ mod claude_command_tests {
                 refusal_recovery: &[],
                 args: &[],
             },
-            preserve_spawned_by_pid: None,
+            preserve_spawned_by_pids: &[],
         })
         .unwrap();
         crate::harness::tests::assert_only_harness_files(
