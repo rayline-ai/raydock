@@ -26,7 +26,6 @@ pub mod update;
 pub const CLI_BIN: &str = "raydock";
 /// Immutable download identifier; existing updaters verify these filenames.
 pub const CLI_ASSET: &str = "rayline";
-pub const DAEMON_BIN: &str = "rld";
 pub const DISPLAY_NAME: &str = "Raydock";
 pub const CONFIG_DIR: &str = "rayline";
 pub const DOT_CONFIG_DIR: &str = ".rayline";
