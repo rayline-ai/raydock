@@ -22,7 +22,7 @@ mod top;
 pub mod update;
 
 pub const CLI_BIN: &str = "rayline";
-/// Immutable download identifier; existing updaters verify these filenames.
+/// The release asset name.
 pub const CLI_ASSET: &str = "rayline";
 pub const DISPLAY_NAME: &str = "Rayline CLI";
 pub const CONFIG_DIR: &str = "rayline";

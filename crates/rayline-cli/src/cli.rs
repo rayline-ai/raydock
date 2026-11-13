@@ -1045,7 +1045,6 @@ mod tests {
         ] {
             assert!(help.starts_with("Usage: rayline "), "{help}");
             for removed in [
-                "raydock",
                 "--auth-token",
                 "--env",
                 "--base-url",

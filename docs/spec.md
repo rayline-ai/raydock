@@ -143,8 +143,8 @@ Its options are **kept for review** (section 9). The channel comes from `update.
 3. To pass options to a piped installer:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.sh | sh -s -- --version 0.5.0 --install-dir ~/bin
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1))) -Version 0.5.0 -InstallDir C:\tools\rayline
+curl -fsSL https://get.rayline.ai/install.sh | bash -s -- --version 0.5.0 --install-dir ~/bin
+& ([scriptblock]::Create((irm https://get.rayline.ai/install.ps1))) -Version 0.5.0 -InstallDir C:\tools\rayline
 ```
 
 The hidden `--base-url` option is in section 4.4.
