@@ -35,9 +35,57 @@ function Remove-RetiredBackups {
     }
 }
 
+function Install-StagedFile {
+    param([string]$Staged, [string]$Dest)
+    # Windows refuses to overwrite a running executable but allows renaming
+    # it, so move the current file aside before renaming the staged one in.
+    $Dir = Split-Path -Parent $Dest
+    $Name = Split-Path -Leaf $Dest
+    $Nonce = [Guid]::NewGuid().ToString('N')
+    $Backup = $null
+    if (Test-Path -LiteralPath $Dest) {
+        $Backup = Join-Path $Dir ".$Name.tmp-$PID-$Nonce"
+        try { [System.IO.File]::Move($Dest, $Backup) }
+        catch { throw "Failed to install ${Dest}: could not move the current file aside: $($_.Exception.Message)" }
+    }
+    try {
+        # File.Move refuses an existing target rather than overwriting it.
+        [System.IO.File]::Move($Staged, $Dest)
+    } catch {
+        $InstallError = $_.Exception.Message
+        if ($Backup) {
+            try { [System.IO.File]::Move($Backup, $Dest) }
+            catch { throw "Failed to install ${Dest}: $InstallError. Restore also failed: $($_.Exception.Message). Original preserved at $Backup" }
+        }
+        throw "Failed to install ${Dest}: $InstallError"
+    }
+    if ($Backup) {
+        $Retired = Join-Path $Dir ".$Name.old-$PID-$Nonce"
+        try { [System.IO.File]::Move($Backup, $Retired) }
+        catch { Write-Warning "Installed ${Dest}; retained previous file at ${Backup}: $($_.Exception.Message). Remove it manually after older sessions and installers exit." }
+        # The previous image can still be running. A later installer or update
+        # deletes committed .old backups; this invocation only marks them.
+    }
+}
+
+function Install-File {
+    param([string]$Source, [string]$Dest)
+    # Stage next to the destination so the swap is a rename on one volume.
+    $Staged = Join-Path (Split-Path -Parent $Dest) ".$(Split-Path -Leaf $Dest).tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
+    try {
+        Copy-Item -LiteralPath $Source -Destination $Staged
+        Install-StagedFile -Staged $Staged -Dest $Dest
+    } finally {
+        if (Test-Path -LiteralPath $Staged) { Remove-Item -LiteralPath $Staged -Force }
+    }
+}
+
 $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 switch ($arch) {
     "X64" { $Platform = "windows_x86_64" }
+    # Only x64 binaries are published; Windows on ARM runs them under x64
+    # emulation.
+    "Arm64" { $Platform = "windows_x86_64" }
     default { Fail "unsupported Windows architecture: $arch" }
 }
 
@@ -101,37 +149,23 @@ try {
         }
     }
 
-    New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
+    # A full path: the .NET file calls below resolve relative paths against the
+    # process directory, not the PowerShell location.
+    $InstallDir = (New-Item -ItemType Directory -Force -Path $InstallDir).FullName
     Remove-RetiredBackups $InstallDir
-    Copy-Item -Force $LicensePath (Join-Path $InstallDir "rayline-core-LICENSE")
-    Copy-Item -Force $RaylinePath (Join-Path $InstallDir "raydock.exe")
+    Install-File -Source $LicensePath -Dest (Join-Path $InstallDir "rayline-core-LICENSE")
+    Install-File -Source $RaylinePath -Dest (Join-Path $InstallDir "raydock.exe")
     $alias = Join-Path $InstallDir 'rayline.exe'
-    $AliasBackup = $null
-    $AliasNonce = [Guid]::NewGuid().ToString('N')
-    if (Test-Path -LiteralPath $alias) {
-        $AliasBackup = Join-Path $InstallDir ".rayline.exe.tmp-$PID-$AliasNonce"
-        Move-Item -LiteralPath $alias -Destination $AliasBackup
-    }
-    # Hard links need no administrator or Developer Mode privileges. The new
-    # launcher turns this initial alias into a forwarding EXE on first use.
+    $AliasStaged = Join-Path $InstallDir ".rayline.exe.tmp-$PID-$([Guid]::NewGuid().ToString('N'))"
     try {
-        New-Item -ItemType HardLink -Path $alias -Target (Join-Path $InstallDir 'raydock.exe') | Out-Null
-    } catch {
-        $InstallError = $_
-        if ($AliasBackup) {
-            try { Move-Item -LiteralPath $AliasBackup -Destination $alias }
-            catch { throw "Failed to install alias: $InstallError. Restore also failed: $_. Original preserved at $AliasBackup" }
-        }
-        throw $InstallError
+        # Hard links need no administrator or Developer Mode privileges. The new
+        # launcher turns this initial alias into a forwarding EXE on first use.
+        New-Item -ItemType HardLink -Path $AliasStaged -Target (Join-Path $InstallDir 'raydock.exe') | Out-Null
+        Install-StagedFile -Staged $AliasStaged -Dest $alias
+    } finally {
+        if (Test-Path -LiteralPath $AliasStaged) { Remove-Item -LiteralPath $AliasStaged -Force }
     }
-    if ($AliasBackup) {
-        $Retired = Join-Path $InstallDir ".rayline.exe.old-$PID-$AliasNonce"
-        try { Move-Item -LiteralPath $AliasBackup -Destination $Retired }
-        catch { Write-Warning "Installed alias; retained previous file at ${AliasBackup}: $($_.Exception.Message). Remove it manually after older sessions and installers exit." }
-        # The previous image can still be running. A later installer or update
-        # deletes committed .old backups; this invocation only marks them.
-    }
-    Copy-Item -Force $CorePath (Join-Path $InstallDir "rayline-core.exe")
+    Install-File -Source $CorePath -Dest (Join-Path $InstallDir "rayline-core.exe")
 
     Write-Host "Installed Raydock to $InstallDir"
     $PathEntries = $env:PATH -split [System.IO.Path]::PathSeparator
