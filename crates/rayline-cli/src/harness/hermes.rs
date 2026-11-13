@@ -268,7 +268,8 @@ fn launcher_identity(program: &Path) -> Result<String, String> {
 /// `hermes --version` asks Hermes itself: only when it refuses and names
 /// `hermes pm repair` does the repair run, so an install that ships its own
 /// environment is left alone. A probe that cannot run, or that fails without
-/// naming the repair, is an error.
+/// naming the repair, is an error, and so is a marker that exists but cannot
+/// be read.
 pub(crate) fn prepare_home(
     home: &Path,
     launcher: &str,
@@ -279,10 +280,16 @@ pub(crate) fn prepare_home(
         let environments = environments(home)?;
         Ok((!environments.is_empty()).then(|| format!("{launcher}{}\n", environments.join("\n"))))
     };
-    if let Some(record) = record()?
-        && fs::read_to_string(&marker).is_ok_and(|seen| seen == record)
-    {
-        return Ok(());
+    if let Some(record) = record()? {
+        let seen = match fs::read_to_string(&marker) {
+            Ok(seen) => Some(seen),
+            // Not prepared yet: ask Hermes.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("failed to read {}: {error}", marker.display())),
+        };
+        if seen.as_deref() == Some(record.as_str()) {
+            return Ok(());
+        }
     }
     let remember = || -> Result<(), String> {
         match record()? {
@@ -815,27 +822,53 @@ providers:
         /// with its path.
         #[test]
         fn a_marker_that_cannot_be_written_or_removed_is_an_error() {
-            // A directory where the marker belongs: writing and removing it as
-            // a file both fail.
-            let marker_dir = |home: &Path| {
-                let marker = home.join(super::super::READY_MARKER);
-                std::fs::create_dir_all(&marker).unwrap();
-                marker
-            };
-            // Written: the probe passes over a recorded environment.
+            // Written: a read-only marker from another launcher, so the probe
+            // runs and passes over a recorded environment, then the write fails.
             let home = temp_dir("hermes-marker-write");
             commit_environment(&home);
-            let marker = marker_dir(&home);
+            let marker = home.join(super::super::READY_MARKER);
+            std::fs::write(&marker, "another launcher\n").unwrap();
+            let mut permissions = std::fs::metadata(&marker).unwrap().permissions();
+            permissions.set_readonly(true);
+            std::fs::set_permissions(&marker, permissions.clone()).unwrap();
             let mut calls = Vec::new();
             let error = prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap_err();
+            #[allow(clippy::permissions_set_readonly_false)]
+            permissions.set_readonly(false);
+            std::fs::set_permissions(&marker, permissions).unwrap();
             assert!(error.contains(&marker.display().to_string()), "{error}");
             assert_eq!(calls, ["--version"]);
-            // Removed: the probe passes with no environment to record.
+            // Removed: a directory where the marker belongs, and the probe
+            // passes with no environment to record.
             let home = temp_dir("hermes-marker-remove");
-            let marker = marker_dir(&home);
+            let marker = home.join(super::super::READY_MARKER);
+            std::fs::create_dir_all(&marker).unwrap();
             let error = prepare_home(&home, LAUNCHER, |_| finished(true, "Hermes Agent v0.23.1"))
                 .unwrap_err();
             assert!(error.contains(&marker.display().to_string()), "{error}");
+        }
+
+        /// A marker that exists but cannot be read stops the launch with its
+        /// path before Hermes runs; a missing one only means "ask Hermes".
+        #[test]
+        fn an_unreadable_marker_is_an_error_naming_it() {
+            let home = temp_dir("hermes-marker-read");
+            commit_environment(&home);
+            // A directory where the marker belongs cannot be read as a file.
+            let marker = home.join(super::super::READY_MARKER);
+            std::fs::create_dir_all(&marker).unwrap();
+            let mut calls = Vec::new();
+            let error = prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap_err();
+            assert!(error.contains("failed to read"), "{error}");
+            assert!(error.contains(&marker.display().to_string()), "{error}");
+            assert!(calls.is_empty(), "{calls:?}");
+            // Positive control: with no marker, Hermes is asked and the
+            // marker is written.
+            std::fs::remove_dir(&marker).unwrap();
+            let mut calls = Vec::new();
+            prepare_home(&home, LAUNCHER, hermes(&home, &mut calls)).unwrap();
+            assert_eq!(calls, ["--version"]);
+            assert!(marker.is_file());
         }
 
         /// An install that starts without a per-home environment is not

@@ -311,10 +311,8 @@ fn daemon_owner_matches_request(state: &DaemonState, request: &RequestSpec<'_>) 
 }
 
 /// The refusal-recovery switches a launch record names, as `{key: value|null}`.
-/// A record without them (written before they existed) matches no launch. A
-/// record that lacks one switch matches it only when this launch leaves that
-/// switch unset too: the record's launch could not have set a switch it did
-/// not know (the ARC model defaults added in 0.3.0).
+/// A record must name every switch of this launch with the same value; a
+/// record without them, or without one of them, matches no launch.
 fn launch_refusal_recovery_matches(entry: &Value, request: &RequestSpec<'_>) -> bool {
     let Some(recorded) = entry.get("refusal_recovery").and_then(Value::as_object) else {
         return false;
@@ -325,7 +323,6 @@ fn launch_refusal_recovery_matches(entry: &Value, request: &RequestSpec<'_>) -> 
         .all(|(key, value)| match recorded.get(*key) {
             Some(Value::Null) => value.is_none(),
             Some(Value::String(held)) => value.as_deref() == Some(held.as_str()),
-            None => value.is_none(),
             _ => false,
         })
 }
@@ -940,22 +937,26 @@ mod tests {
         );
     }
 
-    // A record from before a switch existed attributes the daemon only to a
-    // launch that leaves that switch unset (an ARC model default on a launch
-    // that does not set one), never to a launch that sets it.
+    // A record that lacks one of the launch's switches attributes the daemon
+    // to no launch, whether the launch sets that switch or leaves it unset.
     #[test]
-    fn launch_record_missing_a_switch_attributes_only_when_unset() {
+    fn launch_record_missing_a_switch_does_not_attribute() {
         let home = temp_home();
         let recorded = launch_request();
         let state = unreadable_state(Some(9006), Some(1_700_000_050_000));
         write_launch_log(&home, &recorded, 9006, 1_700_000_050);
+        // Positive control: the record names every switch of its own launch.
+        assert_eq!(
+            classify_launch_safety(&state, &recorded, &home).unwrap(),
+            Safety::Safe
+        );
         let mut request = launch_request();
         let mut unset: Vec<_> = recorded.refusal_recovery.to_vec();
         unset.push(("CLAUDE_CODE_SUBAGENT_MODEL", None));
         request.refusal_recovery = &unset;
         assert_eq!(
             classify_launch_safety(&state, &request, &home).unwrap(),
-            Safety::Safe
+            Safety::Conflict
         );
         let mut set: Vec<_> = recorded.refusal_recovery.to_vec();
         set.push((
