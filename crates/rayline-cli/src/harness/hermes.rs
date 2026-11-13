@@ -183,7 +183,7 @@ const REPAIR_COMMAND: &str = "hermes pm repair";
 /// Raydock's record, in its cloud Hermes home, of the Hermes launcher and the
 /// environments the `anthropic` extra was installed for (see
 /// [`install_extra`]).
-const EXTRA_MARKER: &str = ".raydock-hermes-anthropic";
+const EXTRA_MARKER: &str = ".rayline-hermes-anthropic";
 /// The Hermes args that install the extra the Messages provider needs.
 const INSTALL_EXTRA: &[&str] = &["pm", "install", "--extra", "anthropic"];
 /// The most lines of a failed repair's output repeated in the error.
