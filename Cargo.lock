@@ -1422,7 +1422,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-cli"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-daemon"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -1474,7 +1474,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-hf"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -1486,7 +1486,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-local-router"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "http-body-util",
@@ -1499,7 +1499,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-metrics"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "rayline-tokencount"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
