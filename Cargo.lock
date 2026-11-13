@@ -1801,6 +1801,7 @@ dependencies = [
  "rayline-metrics",
  "rayline-tokencount",
  "reqwest",
+ "serde",
  "serde_json",
  "sha2",
  "tar",

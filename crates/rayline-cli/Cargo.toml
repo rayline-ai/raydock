@@ -25,6 +25,7 @@ dirs.workspace = true
 minisign-verify = "0.2.5"
 rand = "0.9"
 reqwest.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 tar = "0.4"

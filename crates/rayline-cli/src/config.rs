@@ -7,12 +7,14 @@
 //! trusts it. [`check_local_start`] runs the checks the local process makes
 //! before it serves anything.
 
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 use url::Url;
 
@@ -281,9 +283,16 @@ fn load_from(
         }
     };
     let root = match text {
-        Some(text) => serde_json::from_str(&text).map_err(|error| ConfigError::Parse {
-            file: file.clone(),
-            error: format!("invalid JSON: {error}"),
+        Some(text) => parse_json(&text).map_err(|failure| match failure {
+            JsonFailure::Syntax(error) => ConfigError::Parse {
+                file: file.clone(),
+                error: format!("invalid JSON: {error}"),
+            },
+            JsonFailure::DuplicateKey(key) => ConfigError::Key {
+                file: file.clone(),
+                key,
+                problem: "appears more than once".to_owned(),
+            },
         })?,
         None => Value::Object(Map::new()),
     };
@@ -305,7 +314,7 @@ fn load_from(
     for (id, model) in &raw.models {
         if !raw.endpoints.contains_key(&model.endpoint) {
             return Err(doc.err(
-                format!("{}.endpoint", entry_key("models", id)),
+                format!("{}.endpoint", child("models", id)),
                 format!("names `{}`, which is not in `endpoints`", model.endpoint),
             ));
         }
@@ -314,7 +323,7 @@ fn load_from(
         for (id, endpoint) in &raw.endpoints {
             if !endpoint.protocols.contains(&protocol) {
                 return Err(doc.err(
-                    format!("{}.protocols", entry_key("endpoints", id)),
+                    format!("{}.protocols", child("endpoints", id)),
                     format!(
                         "does not list `{}`, the protocol of the harness being run",
                         protocol.as_str()
@@ -327,7 +336,7 @@ fn load_from(
         && !raw.environments.contains_key(name)
     {
         return Err(doc.err(
-            entry_key("environments", name),
+            child("environments", name),
             format!("is not defined, and `--env {name}` selects it"),
         ));
     }
@@ -357,7 +366,7 @@ fn check_local_start_with(
             && env(var).is_none()
         {
             return Err(doc.err(
-                format!("{}.api_key_env", entry_key("endpoints", id)),
+                format!("{}.api_key_env", child("endpoints", id)),
                 format!("names `{var}`, which is not set"),
             ));
         }
@@ -372,7 +381,7 @@ fn check_local_start_with(
         ] {
             if value.is_none() {
                 return Err(doc.err(
-                    format!("{}.{key}", entry_key("models", id)),
+                    format!("{}.{key}", child("models", id)),
                     "is required: ARC doesn't know this model",
                 ));
             }
@@ -472,19 +481,6 @@ fn env_string(
     })
 }
 
-/// `section.id`, with the id quoted when it is not a plain word.
-fn entry_key(section: &str, id: &str) -> String {
-    let plain = !id.is_empty()
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if plain {
-        format!("{section}.{id}")
-    } else {
-        format!("{section}.{}", Value::String(id.to_owned()))
-    }
-}
-
 fn one_of<const N: usize>(names: [&str; N]) -> String {
     let names = names.map(|name| format!("`{name}`"));
     format!("must be one of {}", names.join(", "))
@@ -548,7 +544,7 @@ impl<'a> Doc<'a> {
         let entries = self.object(value, section)?;
         let mut parsed = BTreeMap::new();
         for (id, value) in entries {
-            let key = entry_key(section, id);
+            let key = child(section, id);
             if id.is_empty() {
                 return Err(self.err(key, "has an empty id"));
             }
@@ -806,11 +802,125 @@ impl<'a> Doc<'a> {
     }
 }
 
+/// The key of `name` inside `key`, e.g. `endpoints.gpu-box`. A name that is
+/// not a plain word is quoted: `models."z-ai/glm-5.3-flash"`.
 fn child(key: &str, name: &str) -> String {
-    if key.is_empty() {
+    let plain = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    let name = if plain {
         name.to_owned()
     } else {
+        Value::String(name.to_owned()).to_string()
+    };
+    if key.is_empty() {
+        name
+    } else {
         format!("{key}.{name}")
+    }
+}
+
+/// Why the file's text is not a config document.
+enum JsonFailure {
+    Syntax(serde_json::Error),
+    /// An object repeats a key: the repeated key.
+    DuplicateKey(String),
+}
+
+/// Parses JSON text, refusing any object that repeats a key.
+fn parse_json(text: &str) -> Result<Value, JsonFailure> {
+    let duplicate = RefCell::new(None);
+    let mut deserializer = serde_json::Deserializer::from_str(text);
+    let parsed = StrictValue {
+        key: String::new(),
+        duplicate: &duplicate,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|value| deserializer.end().map(|()| value));
+    match (parsed, duplicate.into_inner()) {
+        (_, Some(key)) => Err(JsonFailure::DuplicateKey(key)),
+        (Ok(value), None) => Ok(value),
+        (Err(error), None) => Err(JsonFailure::Syntax(error)),
+    }
+}
+
+/// Deserializes one JSON value at `key`. A repeated key in an object is
+/// recorded in `duplicate` and stops the parse.
+struct StrictValue<'a> {
+    key: String,
+    duplicate: &'a RefCell<Option<String>>,
+}
+
+impl<'de> DeserializeSeed<'de> for StrictValue<'_> {
+    type Value = Value;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+}
+
+impl<'de> Visitor<'de> for StrictValue<'_> {
+    type Value = Value;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+        Ok(Value::from(value))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Value, A::Error> {
+        let mut values = Vec::new();
+        while let Some(value) = seq.next_element_seed(StrictValue {
+            key: format!("{}[{}]", self.key, values.len()),
+            duplicate: self.duplicate,
+        })? {
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+        let mut object = Map::new();
+        while let Some(name) = map.next_key::<String>()? {
+            let key = child(&self.key, &name);
+            if object.contains_key(&name) {
+                *self.duplicate.borrow_mut() = Some(key);
+                return Err(de::Error::custom("duplicate key"));
+            }
+            let value = map.next_value_seed(StrictValue {
+                key,
+                duplicate: self.duplicate,
+            })?;
+            object.insert(name, value);
+        }
+        Ok(Value::Object(object))
     }
 }
 
@@ -1114,6 +1224,55 @@ mod tests {
                 "{text:?}"
             );
         }
+    }
+
+    #[test]
+    fn duplicate_keys_are_load_errors_naming_the_key() {
+        let cases = [
+            (r#"{"update": {}, "update": {}}"#, "update"),
+            (
+                r#"{"update": {"channel": "dev", "channel": "main"}}"#,
+                "update.channel",
+            ),
+            (
+                r#"{"endpoints": {"box": {"base_url": "http://a", "base_url": "http://b"}}}"#,
+                "endpoints.box.base_url",
+            ),
+            (
+                r#"{"models": {"z-ai/glm-5.3-flash": {}, "z-ai/glm-5.3-flash": {}}}"#,
+                "models.\"z-ai/glm-5.3-flash\"",
+            ),
+            (
+                r#"{"routing": {"policy": {"overrides": {"selection": {"min_p_pass": 0.5, "min_p_pass": 0.6}}}}}"#,
+                "routing.policy.overrides.selection.min_p_pass",
+            ),
+            (
+                r#"{"routing": {"policy": {"overrides": {"rules": [{}, {"a": 1, "a": 2}]}}}}"#,
+                "routing.policy.overrides.rules[1].a",
+            ),
+        ];
+        let home = temp_home();
+        let file = settings_file(&home);
+        fs::create_dir_all(file.parent().expect("settings dir")).expect("create settings dir");
+        for (text, key) in cases {
+            fs::write(&file, text).expect("write settings");
+            assert_eq!(
+                key_error(load(&home, opts(Mode::Cloud))),
+                (key.to_owned(), "appears more than once".to_owned()),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_parses_to_the_same_values_as_serde_json() {
+        let text = r#"{"a": [1, -2, 3.5, 1e3, true, false, null, "sé", [], {}],
+            "b": {"c": {"d": 18446744073709551615}}, "e": ""}"#;
+        let expected: Value = serde_json::from_str(text).expect("serde_json parses it");
+        assert!(matches!(parse_json(text), Ok(value) if value == expected));
+        let doc = example();
+        assert!(matches!(parse_json(&doc.to_string()), Ok(value) if value == doc));
+        assert!(matches!(parse_json("{} x"), Err(JsonFailure::Syntax(_))));
     }
 
     #[test]
