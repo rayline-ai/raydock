@@ -15,7 +15,9 @@ parser.add_argument("--config", required=True)
 parser.add_argument("--listen", required=True)
 args = parser.parse_args()
 config = json.loads(pathlib.Path(args.config).read_text())
-events = pathlib.Path(config["events"])
+# A config `raydock hybrid start` builds names no fixture files; the launch
+# environment does.
+events = pathlib.Path(config["events"] if "events" in config else os.environ["RAYLINE_FIXTURE_EVENTS"])
 token = os.environ["RAYLINE_EXEC_AUTH_TOKEN"]
 credential_env = [entry["auth_env"] for entry in
                   [config.get("decisions", {})] + config.get("deployments", []) if entry.get("auth_env")]
@@ -162,12 +164,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("x-rayline-selected-model", "fixture-model")
         if config.get("derived_actions"):
-            requested = json.loads(body)["model"]
-            entry = next(row for row in config["derived_actions"] if row["model"] == requested)
-            self.send_header("x-rayline-instance-id", f"fixture-{os.getpid()}")
-            self.send_header("x-rayline-executed-model", entry["model"])
-            self.send_header("x-rayline-executed-worker", entry["worker"])
-            self.send_header("x-rayline-executed-action-id", "dynamic-registry-action")
+            requested = json.loads(body).get("model")
+            # A routed model such as rayline-auto, or none, names no action.
+            entry = next((row for row in config["derived_actions"] if row["model"] == requested), None)
+            if entry is not None:
+                self.send_header("x-rayline-instance-id", f"fixture-{os.getpid()}")
+                self.send_header("x-rayline-executed-model", entry["model"])
+                self.send_header("x-rayline-executed-worker", entry["worker"])
+                self.send_header("x-rayline-executed-action-id", "dynamic-registry-action")
         self.end_headers()
         self.wfile.write(body)
 
@@ -180,7 +184,8 @@ class Server(http.server.ThreadingHTTPServer):
 
 server = Server(("127.0.0.1", 0), Handler)
 time.sleep(config.get("handshake_delay", 0))
-print(json.dumps({"contract_version": config.get("contract_version", 1),
+contract_version = int(os.environ.get("RAYLINE_FIXTURE_CONTRACT_VERSION", config.get("contract_version", 1)))
+print(json.dumps({"contract_version": contract_version,
                   "listen_url": "http://127.0.0.1:" + str(server.server_port),
                   "pid": core_pid}), flush=True)
 server.serve_forever()

@@ -1,7 +1,7 @@
-//! The execution core's `token_counter` for the local deployment: rld loads
-//! the local model's published tokenizer and chat template, serves the
-//! count on its own loopback listener with its own credential, and hands the
-//! core a copy of its configuration that names it.
+//! The execution core's `token_counter` for each deployment whose model names
+//! a `tokenizer`: rld loads that model's published tokenizer and chat
+//! template, serves the count on its own loopback listener with its own
+//! credential, and hands the core a copy of its configuration that names it.
 //!
 //! Without a counter the core sizes a model it has no tokenizer for by bytes,
 //! several times its real token count, and an image in the history makes that
@@ -42,49 +42,63 @@ pub(crate) struct Counter {
     remembered: Mutex<VecDeque<([u8; 32], usize)>>,
 }
 
-/// A loaded counter, its listener, and the core configuration that names it.
+/// The loaded counters, each with its listener, and the core configuration
+/// that names them.
 pub(crate) struct Prepared {
-    pub(crate) counter: Arc<Counter>,
-    pub(crate) listener: TcpListener,
+    pub(crate) counters: Vec<(Arc<Counter>, TcpListener)>,
     pub(crate) config: PathBuf,
 }
 
-/// Loads the model files in `dir` and writes `<config>.counted.json`: the
-/// core configuration with the deployment's `token_counter`, `token_units`
-/// and, for a model with an image processor, image input.
+/// Loads the model files of each `(deployment, dir)` and writes
+/// `<config>.counted.json`: the core configuration with each deployment's
+/// `token_counter`, `token_units` and, for a model with an image processor,
+/// image input.
 pub(crate) async fn prepare(
-    dir: &Path,
+    counters: &[(String, PathBuf)],
     config: &Path,
-    deployment: &str,
     token: String,
 ) -> Result<Prepared> {
-    let dir = dir.to_owned();
-    let counter = tokio::task::spawn_blocking(move || PromptCounter::from_dir(&dir))
-        .await
-        .context("load the prompt counter")??;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
-    let url = format!(
-        "http://127.0.0.1:{}{COUNTER_PATH}",
-        listener.local_addr()?.port()
-    );
     let mut profile: Value = serde_json::from_slice(&std::fs::read(config)?)?;
-    name_counter(
-        &mut profile,
-        deployment,
-        &url,
-        counter.units(),
-        counter.accepts_images(),
-    )?;
+    let mut prepared = Vec::with_capacity(counters.len());
+    for (deployment, dir) in counters {
+        let counter = tokio::task::spawn_blocking({
+            let dir = dir.clone();
+            move || PromptCounter::from_dir(&dir)
+        })
+        .await
+        .context("load the prompt counter")?
+        .with_context(|| {
+            format!(
+                "load the prompt counter for {deployment} from {}",
+                dir.display()
+            )
+        })?;
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let url = format!(
+            "http://127.0.0.1:{}{COUNTER_PATH}",
+            listener.local_addr()?.port()
+        );
+        name_counter(
+            &mut profile,
+            deployment,
+            &url,
+            counter.units(),
+            counter.accepts_images(),
+        )?;
+        prepared.push((
+            Arc::new(Counter {
+                counter: Arc::new(counter),
+                token: token.clone(),
+                remembered: Mutex::new(VecDeque::new()),
+            }),
+            listener,
+        ));
+    }
     let counted = config.with_extension("counted.json");
     let _ = std::fs::remove_file(&counted);
     crate::hybrid::write_private_new(&counted, &serde_json::to_vec_pretty(&profile)?)?;
     Ok(Prepared {
-        counter: Arc::new(Counter {
-            counter: Arc::new(counter),
-            token,
-            remembered: Mutex::new(VecDeque::new()),
-        }),
-        listener,
+        counters: prepared,
         config: counted,
     })
 }

@@ -33,11 +33,10 @@
 //! earlier launch sends the literal `${RAYLINE_CONV_ID}` instead, which the
 //! router then keys every such launch on. One Hermes call skips
 //! the affinity merge: the summary it requests on reaching its iteration cap,
-//! on Messages only. Under hybrid on `--provider rayline` the core
-//! refuses that call and Hermes reports the cap with no summary.
+//! on Messages only.
 //!
-//! The `rayline-resp` provider (`--provider rayline-resp`, the default under
-//! `rayline run <harness> --local`) speaks Responses and declares no header: Hermes sends
+//! The `rayline-resp` provider (`--provider rayline-resp`, the only provider
+//! under `rayline run <harness> --local`) speaks Responses and declares no header: Hermes sends
 //! a `prompt_cache_key` there that is distinct per session and per delegate
 //! child, which the router's ladder and the hybrid core both read as the
 //! conversation, so each child lands in its own episode. A header would rank
@@ -142,14 +141,15 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
         responses["extra_headers"] = header.clone();
         messages["extra_headers"] = header;
     }
-    // Under hybrid routing the default is Responses: on Messages Hermes always
-    // asks for its model's full output ceiling (128k for an unknown model; it
-    // has no setting to lower it), which the execution core refuses. On
-    // Responses it sends no output cap and the core applies its own.
-    let default_provider = if ctx.capabilities.is_some() {
-        RESPONSES_PROVIDER
+    // In local mode Hermes speaks only Responses, its one protocol (spec
+    // section 5.2), so the Messages provider is not written.
+    let (default_provider, providers) = if ctx.capabilities.is_some() {
+        (RESPONSES_PROVIDER, json!({ RESPONSES_PROVIDER: responses }))
     } else {
-        MESSAGES_PROVIDER
+        (
+            MESSAGES_PROVIDER,
+            json!({ MESSAGES_PROVIDER: messages, RESPONSES_PROVIDER: responses }),
+        )
     };
     let config = json!({
         "model": {
@@ -157,10 +157,7 @@ pub(crate) fn plan(ctx: &RenderContext<'_>) -> Result<Plan, String> {
             "default": launch.main,
             "context_length": launch.main_model().context_window
         },
-        "providers": {
-            MESSAGES_PROVIDER: messages,
-            RESPONSES_PROVIDER: responses
-        },
+        "providers": providers,
         "fallback_providers": []
     });
     let path = ctx.config_dir.join(CONFIG_FILE);
@@ -426,14 +423,13 @@ mod tests {
         );
     }
 
-    /// Under hybrid the rendered config carries no per-launch id: the Messages
-    /// provider declares the header and the Responses provider relies on
-    /// Hermes' `prompt_cache_key`, which the core reads as identity. (The one
-    /// Hermes request that sends neither is documented in the module docs;
-    /// this checks the config contract, not runtime identity.)
+    /// In local mode Hermes speaks only Responses: the render writes only
+    /// `rayline-resp`, removes a `rayline` Messages provider an earlier cloud
+    /// launch wrote, and carries no per-launch id (Hermes' `prompt_cache_key`
+    /// is the identity the core reads).
     #[test]
-    fn hybrid_config_carries_no_per_launch_id() {
-        use super::super::tests::{TEST_KEY, TEST_URL, temp_dir};
+    fn local_mode_writes_only_the_responses_provider() {
+        use super::super::tests::{TEST_KEY, TEST_URL, hosted_models, temp_dir};
         use super::super::{ConversationIdFallback, RenderContext, write_files};
         let dir = temp_dir("hermes-hybrid");
         let capabilities = rayline_local_router::ModelCapabilities {
@@ -441,29 +437,34 @@ mod tests {
             max_output_tokens: 8192,
             input_modalities: vec!["text".into()],
         };
-        let ctx = RenderContext {
+        let cloud = RenderContext {
             key: TEST_KEY,
             router_url: TEST_URL,
             config_dir: &dir,
             conversation_id: ConversationIdFallback { forced: None },
+            allow_empty_signature: false,
+            capabilities: None,
+            harness_major_version: None,
+            models: hosted_models(),
+        };
+        write_files(&dir, &super::plan(&cloud).unwrap().files).unwrap();
+        let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
+        assert!(config.contains("  rayline:"), "{config}");
+
+        let local = RenderContext {
             allow_empty_signature: true,
             capabilities: Some(&capabilities),
-            harness_major_version: None,
             models: super::super::LaunchModels::hybrid(&capabilities),
+            ..cloud
         };
-        write_files(&dir, &super::plan(&ctx).unwrap().files).unwrap();
+        write_files(&dir, &super::plan(&local).unwrap().files).unwrap();
         let config = std::fs::read_to_string(dir.join(CONFIG_FILE)).unwrap();
-        let (messages, responses) = config.split_once("  rayline-resp:").unwrap();
-        assert!(!config.contains("x-conversation-id"));
-        assert!(
-            messages.contains("session_affinity_header: \"x-session-affinity\""),
-            "{messages}"
-        );
-        assert!(
-            !responses.contains("session_affinity_header"),
-            "{responses}"
-        );
+        assert!(!config.contains("  rayline:"), "{config}");
+        assert!(!config.contains("anthropic_messages"), "{config}");
+        assert!(config.contains("  rayline-resp:"), "{config}");
         assert!(config.contains("provider: \"custom:rayline-resp\""));
+        assert!(!config.contains("x-conversation-id"));
+        assert!(!config.contains("session_affinity_header"), "{config}");
     }
 
     /// Turning the fallback off after a forced launch drops the stale
