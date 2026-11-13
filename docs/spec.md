@@ -103,7 +103,7 @@ Harness-specific options and subcommands are **kept for review** (section 9).
    An image given only by URL, or whose bytes don't decode as an image, counts as the processor's maximum.
 7. The local process passes each request on with a session id and a branch id:
    - session: the request's `x-rayline-session-id`, else the first of `x-conversation-id`, `x-parent-session-id`, `x-session-affinity`, `x-session-id`, `x-claude-code-session-id` that it carries, else none;
-   - branch: the request's `x-rayline-branch-id`, else `thread-id`, else `x-claude-code-agent-id`, else, when it carries `x-parent-session-id`, `x-session-affinity` or `x-session-id`, else `main`.
+   - branch: the request's `x-rayline-branch-id`, else `thread-id`, else `x-claude-code-agent-id`, else, only when the request carries `x-parent-session-id`, its `x-session-affinity`, else its `x-session-id`; else `main`.
 8. When the core fails a turn before any output because its call to the routing service failed, the local process resends the turn once, and only when the service was unavailable (no answer, or HTTP 408, 409 or 5xx) or busy (HTTP 429). It doesn't resend when the service says `x-should-retry: false` or a `retry-after` over 30 seconds. Before the resend it waits the service's `retry-after` (at least 1 second), else about 5 seconds, jittered between 2.5 and 7.5 so sessions don't resend in step.
 
    When the turn still fails, or isn't resent, the harness gets the error with `x-should-retry: false`, so its SDK doesn't resend it again:
@@ -333,7 +333,15 @@ One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `ses
 2. The env var each endpoint's `api_key_env` names.
 3. OS: `PATH`, and the home directory. One function reads it, from `HOME` on unix and `USERPROFILE` on Windows. When that var is unset or empty, it is an error that names the var. There is no other source for the home directory.
 4. Harness homes, read to find a harness's own files: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `OPENCLAW_CONTAINER`.
-5. Values the user set for a harness, passed on unchanged: `CLAUDE_CODE_DISABLE_AGENT_VIEW`.
+5. `CLAUDE_CODE_DISABLE_AGENT_VIEW`, passed on to Claude Code unchanged. When it is `1`, `true`, `yes` or `on` (trimmed, any case, as Claude Code reads it), a cloud `rayline run claude` skips the daemon check below. Rayline still reads `daemon.lock` then, to keep the launch record of a running daemon (last point below).
+
+   The daemon check, before each cloud `rayline run claude`:
+   - A Claude Code daemon is running when `daemon.lock` in the launch's Claude config folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`; with `--isolated`, `~/.rayline/harness/claude-code/`) names a `pid` that is alive. When checking whether that process is alive fails, the launch fails with an error that names the pid.
+   - Rayline reuses the running daemon when either:
+     - its environment, where Rayline can read it (Linux and macOS), holds the launch's values of `RAYLINE_ENV_NAME`, `ANTHROPIC_BASE_URL`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK`, `CLAUDE_CODE_DISABLE_REFUSAL_RETRY`, `CLAUDE_CODE_TETHER_LIVE`, `CLAUDE_CODE_SUBAGENT_MODEL`, `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` and `ANTHROPIC_DEFAULT_HAIKU_MODEL`; or
+     - a record in `daemon-launches.json` (section 8.1) is for the process that started it (`spawnedBy.pid` in `daemon.lock`), with the same environment, router URL, auto-compact window and those switches, and the daemon started within 60 seconds after the record.
+   - Any other running daemon conflicts. When stdin, stdout and stderr are all terminals, Rayline asks whether to stop it (`claude daemon stop --any`) and go on, to run isolated instead (offered only without `--isolated`; the isolated folder gets the same check), or to cancel. Otherwise, or on cancel, the launch fails with an error that names the daemon's pid and says how to stop it and rerun.
+   - Each cloud launch adds its record to `daemon-launches.json` and drops records older than 24 hours, except the one for the process that started the running daemon. A records file that can't be read or isn't a JSON array of objects is an error.
 6. Shared Hugging Face cache: `HF_HOME`, `HF_HUB_CACHE`.
 
 ### 7.2 Set by Rayline for a harness
