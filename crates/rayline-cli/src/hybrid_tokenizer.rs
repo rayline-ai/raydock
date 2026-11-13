@@ -23,12 +23,12 @@ pub(crate) struct Snapshot {
 }
 
 /// Downloads the counter's files at the repo's current commit into the
-/// Hugging Face cache. When the Hub does not answer or a file fails to
-/// download, the last complete snapshot is used instead.
-pub(crate) fn fetch(repo: &str) -> Result<Snapshot, String> {
+/// Hugging Face cache at `hub`. When the Hub does not answer or a file fails
+/// to download, the last complete snapshot is used instead.
+pub(crate) fn fetch(hub: &Path, repo: &str) -> Result<Snapshot, String> {
     let (commit, cached_commit) = match rayline_hf::hf_api_get_commit(repo) {
         Ok(commit) => (commit, false),
-        Err(error) => (cached_commit(repo)?.ok_or(error)?, true),
+        Err(error) => (cached_commit(hub, repo)?.ok_or(error)?, true),
     };
     // Complete only when every optional file is cached or confirmed absent
     // (404); a rate limit or network failure leaves the snapshot unrecorded.
@@ -38,19 +38,19 @@ pub(crate) fn fetch(repo: &str) -> Result<Snapshot, String> {
         .map(|file| (file, true))
         .chain(OPTIONAL.iter().map(|file| (file, false)))
     {
-        if rayline_hf::cached_hf_file(repo, file, &commit).is_some() {
+        if rayline_hf::cached_hf_file(hub, repo, file, &commit).is_some() {
             continue;
         }
-        if let Err(error) = rayline_hf::download_to_hf_cache(repo, file, &commit) {
+        if let Err(error) = rayline_hf::download_to_hf_cache(hub, repo, file, &commit) {
             if required {
-                return cached_or(repo, format!("download {file} from {repo}: {error}"));
+                return cached_or(hub, repo, format!("download {file} from {repo}: {error}"));
             }
             if !is_absent(&error) {
                 complete = false;
             }
         }
     }
-    let dir = rayline_hf::hf_cache_snapshot_path(repo, "", &commit);
+    let dir = rayline_hf::hf_cache_snapshot_path(hub, repo, "", &commit);
     let has_template = [
         rayline_tokencount::TEMPLATE_FILE,
         rayline_tokencount::TOKENIZER_CONFIG_FILE,
@@ -63,12 +63,13 @@ pub(crate) fn fetch(repo: &str) -> Result<Snapshot, String> {
     if !complete {
         // A partial snapshot could miscount; use the last complete one.
         return cached_or(
+            hub,
             repo,
             format!("could not fetch all of {repo}'s tokenizer files"),
         );
     }
     // `cached_or` uses this snapshot alone.
-    let marker = complete_marker(&rayline_hf::hf_cache_dir(), repo);
+    let marker = complete_marker(hub, repo);
     std::fs::write(&marker, &commit).map_err(|error| format!("{}: {error}", marker.display()))?;
     Ok(Snapshot {
         dir,
@@ -88,16 +89,12 @@ fn complete_marker(hub: &Path, repo: &str) -> PathBuf {
         .join("rayline-counter-complete")
 }
 
-/// The last complete snapshot, marked cached, when the Hub did not serve the
-/// current one; when `fetch` never finished one, `error`. A marker that cannot
-/// be read, or names no commit or an incomplete snapshot, is an error naming
-/// it. What `start` uses when the Hub does not answer in time or a download
-/// fails.
-pub(crate) fn cached_or(repo: &str, error: String) -> Result<Snapshot, String> {
-    cached_in(&rayline_hf::hf_cache_dir(), repo, error)
-}
-
-fn cached_in(hub: &Path, repo: &str, error: String) -> Result<Snapshot, String> {
+/// The last complete snapshot in `hub`, marked cached, when the Hub did not
+/// serve the current one; when `fetch` never finished one, `error`. A marker
+/// that cannot be read, or names no commit or an incomplete snapshot, is an
+/// error naming it. What `start` uses when the Hub does not answer in time or
+/// a download fails.
+pub(crate) fn cached_or(hub: &Path, repo: &str, error: String) -> Result<Snapshot, String> {
     let marker = complete_marker(hub, repo);
     let Some(commit) = read_commit(&marker)? else {
         return Err(error);
@@ -126,11 +123,10 @@ fn cached_in(hub: &Path, repo: &str, error: String) -> Result<Snapshot, String> 
     Ok(Snapshot { dir, cached: true })
 }
 
-/// The commit `refs/main` names in the Hugging Face cache.
-fn cached_commit(repo: &str) -> Result<Option<String>, String> {
+/// The commit `refs/main` names in the Hugging Face cache at `hub`.
+fn cached_commit(hub: &Path, repo: &str) -> Result<Option<String>, String> {
     read_commit(
-        &rayline_hf::hf_cache_dir()
-            .join(rayline_hf::repo_to_folder_name(repo))
+        &hub.join(rayline_hf::repo_to_folder_name(repo))
             .join("refs")
             .join("main"),
     )
@@ -169,7 +165,7 @@ mod tests {
         let hub = temp_hub("none");
         let error = "download tokenizer.json from example/model: status 500".to_owned();
         assert_eq!(
-            cached_in(&hub, REPO, error.clone()).err(),
+            cached_or(&hub, REPO, error.clone()).err(),
             Some(error.clone())
         );
         let _ = std::fs::remove_dir_all(&hub);
@@ -185,7 +181,7 @@ mod tests {
         std::fs::create_dir_all(&snapshot).unwrap();
         std::fs::write(snapshot.join(rayline_tokencount::TOKENIZER_FILE), "{}").unwrap();
         let marker = complete_marker(&hub, REPO);
-        let cached = || cached_in(&hub, REPO, "unused".to_owned()).err().unwrap();
+        let cached = || cached_or(&hub, REPO, "unused".to_owned()).err().unwrap();
         // A marked snapshot that lacks its chat template is incomplete.
         std::fs::write(&marker, "abc123").unwrap();
         assert_eq!(
@@ -217,7 +213,7 @@ mod tests {
         std::fs::write(snapshot.join(rayline_tokencount::TOKENIZER_FILE), "{}").unwrap();
         std::fs::write(snapshot.join(rayline_tokencount::TEMPLATE_FILE), "").unwrap();
         std::fs::write(complete_marker(&hub, REPO), "abc123\n").unwrap();
-        let used = cached_in(&hub, REPO, "unused".to_owned()).unwrap();
+        let used = cached_or(&hub, REPO, "unused".to_owned()).unwrap();
         assert_eq!(used.dir, snapshot);
         assert!(used.cached);
         let _ = std::fs::remove_dir_all(&hub);

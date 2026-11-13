@@ -62,23 +62,24 @@ pub struct ChatTemplates {
 impl PromptCounter {
     /// Loads `tokenizer.json`, the chat template (`chat_template.jinja`, else
     /// `tokenizer_config.json`'s `chat_template`) and, when present,
-    /// `processor_config.json` from a model snapshot directory.
+    /// `processor_config.json` (else `preprocessor_config.json`) from a model
+    /// snapshot directory.
     pub fn from_dir(dir: &Path) -> Result<Self> {
         let tokenizer_bytes = std::fs::read(dir.join(TOKENIZER_FILE))
             .with_context(|| format!("read {}", dir.join(TOKENIZER_FILE).display()))?;
         let config = read_json(&dir.join(TOKENIZER_CONFIG_FILE))?;
         let templates = read_templates(dir, config.as_ref())?;
-        let processor = match read_json(&dir.join(PROCESSOR_FILE))? {
-            Some(processor) => Some(processor),
-            None => read_json(&dir.join(PREPROCESSOR_FILE))?,
-        };
+        let mut images = None;
+        for file in [PROCESSOR_FILE, PREPROCESSOR_FILE] {
+            let path = dir.join(file);
+            if let Some(processor) = read_json(&path)? {
+                images = ImageSizing::from_processor_config(&processor)
+                    .with_context(|| format!("read {}", path.display()))?;
+                break;
+            }
+        }
         let special_tokens = config.as_ref().map(special_tokens).unwrap_or_default();
-        Self::build(
-            &tokenizer_bytes,
-            &templates,
-            processor.as_ref(),
-            special_tokens,
-        )
+        Self::build(&tokenizer_bytes, &templates, images, special_tokens)
     }
 
     pub fn new(tokenizer_json: &[u8], template: &str, processor: Option<&Value>) -> Result<Self> {
@@ -86,13 +87,17 @@ impl PromptCounter {
             default: template.to_owned(),
             tool_use: None,
         };
-        Self::build(tokenizer_json, &templates, processor, Map::new())
+        let images = processor
+            .map(ImageSizing::from_processor_config)
+            .transpose()?
+            .flatten();
+        Self::build(tokenizer_json, &templates, images, Map::new())
     }
 
     pub fn build(
         tokenizer_json: &[u8],
         templates: &ChatTemplates,
-        processor: Option<&Value>,
+        images: Option<ImageSizing>,
         special_tokens: Map<String, Value>,
     ) -> Result<Self> {
         let mut tokenizer = Tokenizer::from_bytes(tokenizer_json)
@@ -109,10 +114,6 @@ impl PromptCounter {
             env.add_template_owned("tool_use", without_generation_tags(tool_use))
                 .context("compile the tool_use chat template")?;
         }
-        let images = processor
-            .map(ImageSizing::from_processor_config)
-            .transpose()?
-            .flatten();
         let mut digest = Sha256::new();
         digest.update(Sha256::digest(tokenizer_json));
         digest.update(Sha256::digest(templates.default.as_bytes()));

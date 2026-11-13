@@ -48,17 +48,16 @@ impl Source {
 }
 
 impl ImageSizing {
-    /// Reads `image_processor` (or the top level) of `processor_config.json`.
+    /// Reads `image_processor` (or the top level) of a processor config.
     /// A config with no patch size describes no image input: `None`.
     pub fn from_processor_config(config: &Value) -> Result<Option<Self>> {
         let processor = config.get("image_processor").unwrap_or(config);
         let Some(patch) = processor.get("patch_size").and_then(Value::as_u64) else {
             return Ok(None);
         };
-        let merge = processor
-            .get("merge_size")
-            .and_then(Value::as_u64)
-            .unwrap_or(1);
+        let Some(merge) = processor.get("merge_size").and_then(Value::as_u64) else {
+            bail!("the image processor has a `patch_size` but no integer `merge_size`");
+        };
         let factor = patch * merge;
         let area = factor * factor;
         // Qwen2-VL-style processors name their pixel limits
@@ -89,10 +88,10 @@ impl ImageSizing {
             tokens("min_image_tokens", "min_pixels"),
             tokens("max_image_tokens", "max_pixels"),
         ) else {
-            bail!("processor_config.json has a patch size but no image token limits");
+            bail!("the image processor has a patch size but no image token limits");
         };
         if factor == 0 || min_tokens == 0 || max_tokens < min_tokens {
-            bail!("processor_config.json has inconsistent image limits");
+            bail!("the image processor has inconsistent image limits");
         }
         Ok(Some(Self {
             factor,
@@ -200,6 +199,17 @@ mod tests {
             (sizing.factor, sizing.min_tokens, sizing.max_tokens),
             (32, 64, 16384)
         );
+    }
+
+    #[test]
+    fn a_patch_size_without_a_merge_size_is_an_error_naming_it() {
+        for processor in [
+            json!({"patch_size": 14, "min_image_tokens": 16, "max_image_tokens": 8000}),
+            json!({"patch_size": 14, "merge_size": "2", "min_image_tokens": 16, "max_image_tokens": 8000}),
+        ] {
+            let error = ImageSizing::from_processor_config(&processor).unwrap_err();
+            assert!(error.to_string().contains("`merge_size`"), "{error}");
+        }
     }
 
     #[test]

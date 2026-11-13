@@ -329,8 +329,6 @@ fn chat_output(value: &Value) -> bool {
                         || nonempty(call.pointer("/function/name"))
                 })
             })
-        || nonempty(value.pointer("/function_call/arguments"))
-        || nonempty(value.pointer("/function_call/name"))
 }
 
 fn generated_output(value: &Value, kind: &str) -> bool {

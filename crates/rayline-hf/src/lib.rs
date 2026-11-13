@@ -6,6 +6,7 @@
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -50,19 +51,34 @@ fn is_retryable_reqwest_error(e: &reqwest::Error) -> bool {
 // Cache directory resolution
 // ---------------------------------------------------------------------------
 
-/// Resolve the HF cache directory. Priority: `HF_HUB_CACHE`, `HF_HOME`/hub,
-/// then `~/.cache/huggingface/hub` (or `%LOCALAPPDATA%\huggingface\hub` on
-/// Windows).
-pub fn hf_cache_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("HF_HUB_CACHE") {
-        return PathBuf::from(dir);
+/// The HF cache directory: `HF_HUB_CACHE`, else `HF_HOME`/hub, else
+/// `<home>/.cache/huggingface/hub`. A set but empty or non-unicode var is an
+/// error naming it.
+pub fn hf_cache_dir(home: &Path) -> Result<PathBuf, String> {
+    hf_cache_dir_from(home, |name| std::env::var_os(name))
+}
+
+fn hf_cache_dir_from(
+    home: &Path,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf, String> {
+    let read = |name: &str| -> Result<Option<PathBuf>, String> {
+        let Some(value) = var(name) else {
+            return Ok(None);
+        };
+        match value.into_string() {
+            Ok(value) if value.is_empty() => Err(format!("{name} is set but empty")),
+            Ok(value) => Ok(Some(PathBuf::from(value))),
+            Err(_) => Err(format!("{name} is not valid unicode")),
+        }
+    };
+    if let Some(dir) = read("HF_HUB_CACHE")? {
+        return Ok(dir);
     }
-    if let Ok(home) = std::env::var("HF_HOME") {
-        return PathBuf::from(home).join("hub");
+    if let Some(hf_home) = read("HF_HOME")? {
+        return Ok(hf_home.join("hub"));
     }
-    let cache =
-        dirs::cache_dir().unwrap_or_else(|| dirs::home_dir().expect("no home dir").join(".cache"));
-    cache.join("huggingface").join("hub")
+    Ok(home.join(".cache").join("huggingface").join("hub"))
 }
 
 /// "org/repo" → "models--org--repo".
@@ -126,17 +142,16 @@ fn sha256_blob_name(digest: &str) -> String {
     format!("sha256-{digest}")
 }
 
-pub fn hf_cache_snapshot_path(repo: &str, filename: &str, commit: &str) -> PathBuf {
-    hf_cache_dir()
-        .join(repo_to_folder_name(repo))
+pub fn hf_cache_snapshot_path(hub: &Path, repo: &str, filename: &str, commit: &str) -> PathBuf {
+    hub.join(repo_to_folder_name(repo))
         .join("snapshots")
         .join(commit)
         .join(filename)
 }
 
 /// The pinned snapshot file, when it is in the cache.
-pub fn cached_hf_file(repo: &str, filename: &str, commit: &str) -> Option<PathBuf> {
-    let snapshot = hf_cache_snapshot_path(repo, filename, commit);
+pub fn cached_hf_file(hub: &Path, repo: &str, filename: &str, commit: &str) -> Option<PathBuf> {
+    let snapshot = hf_cache_snapshot_path(hub, repo, filename, commit);
     snapshot.is_file().then_some(snapshot)
 }
 
@@ -144,18 +159,17 @@ pub fn cached_hf_file(repo: &str, filename: &str, commit: &str) -> Option<PathBu
 // Download to HF cache
 // ---------------------------------------------------------------------------
 
-/// Download a file into the HF cache structure. Returns the snapshot symlink
+/// Download a file into the HF cache at `hub`. Returns the snapshot symlink
 /// path. Steps mirror `huggingface_hub`: write to `blobs/.download-*`,
 /// SHA256-rename to `blobs/sha256-{hash}`, write `refs/main`, symlink
 /// `snapshots/{commit}/{filename}` → blob.
-pub fn download_to_hf_cache(repo: &str, filename: &str, commit: &str) -> Result<PathBuf, String> {
-    download_to_hf_cache_at(
-        &hf_cache_dir(),
-        "https://huggingface.co",
-        repo,
-        filename,
-        commit,
-    )
+pub fn download_to_hf_cache(
+    hub: &Path,
+    repo: &str,
+    filename: &str,
+    commit: &str,
+) -> Result<PathBuf, String> {
+    download_to_hf_cache_at(hub, "https://huggingface.co", repo, filename, commit)
 }
 
 fn download_to_hf_cache_at(
@@ -489,6 +503,58 @@ mod tests {
             repo_to_folder_name("unsloth/Qwen3.5-2B-GGUF"),
             "models--unsloth--Qwen3.5-2B-GGUF"
         );
+    }
+
+    #[test]
+    fn the_cache_dir_comes_from_hf_vars_else_home() {
+        let home = Path::new("home");
+        let vars = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| OsString::from(value))
+            }
+        };
+        assert_eq!(
+            hf_cache_dir_from(home, vars(&[])).unwrap(),
+            home.join(".cache").join("huggingface").join("hub")
+        );
+        assert_eq!(
+            hf_cache_dir_from(home, vars(&[("HF_HOME", "hf")])).unwrap(),
+            Path::new("hf").join("hub")
+        );
+        assert_eq!(
+            hf_cache_dir_from(home, vars(&[("HF_HUB_CACHE", "hub"), ("HF_HOME", "hf")])).unwrap(),
+            Path::new("hub")
+        );
+        assert_eq!(
+            hf_cache_dir_from(home, vars(&[("HF_HUB_CACHE", "")])).unwrap_err(),
+            "HF_HUB_CACHE is set but empty"
+        );
+        assert_eq!(
+            hf_cache_dir_from(home, vars(&[("HF_HOME", "")])).unwrap_err(),
+            "HF_HOME is set but empty"
+        );
+    }
+
+    #[test]
+    fn a_non_unicode_hf_var_is_an_error_naming_it() {
+        #[cfg(unix)]
+        let bad = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(vec![0xff])
+        };
+        #[cfg(windows)]
+        let bad = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0xd800])
+        };
+        let error = hf_cache_dir_from(Path::new("home"), |name| {
+            (name == "HF_HOME").then(|| bad.clone())
+        })
+        .unwrap_err();
+        assert_eq!(error, "HF_HOME is not valid unicode");
     }
 
     #[test]
