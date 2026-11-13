@@ -11,10 +11,12 @@ Cloud mode, the default, needs none of this. See
 ## What you need
 
 - Rayline, installed and signed in with `rayline auth login`.
-- One or more inference servers that you run yourself. Rayline doesn't start,
-  download or stop them, and `rayline local stop` leaves them running.
 - A config with a `routing` section: `~/.config/rayline/settings.json`, or a
   file you pass with `--config`.
+
+Your own inference servers are optional. With none listed, every model ARC
+picks goes to Rayline cloud. Rayline doesn't start, download or stop your
+servers, and `rayline local stop` leaves them running.
 
 ARC makes every routing decision. See
 [ARC pricing](https://docs.rayline.ai/arc/pricing) for how sessions are billed.

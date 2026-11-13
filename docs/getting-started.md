@@ -152,8 +152,8 @@ process.
 
 ### opencode, pi, oh-my-pi, Hermes Agent and OpenClaw
 
-These have no Rayline options. Everything after the harness name goes to the
-harness:
+These take only the options every harness has, `--local` and `--config`. Every
+other argument goes to the harness:
 
 ```bash
 rayline run omp
