@@ -408,49 +408,47 @@ impl rayline_arc_routes::Decider for LocalDecider {
 }
 
 /// Serve the Routes API for the core on a free loopback port, deciding with
-/// `package` and `release` through `encoder`; any other path goes to
-/// `upstream` (the environment's router). Returns its `/v1/routes` URL.
+/// `release` (loaded from `release_dir`) through `encoder`; any other path
+/// goes to `upstream` (the environment's router). Returns its `/v1/routes`
+/// URL.
 pub async fn serve_routes(
-    package: &Path,
+    release_dir: &Path,
     alias: &str,
     release: Arc<rayline_arc_decide::Release>,
     encoder: &Encoder,
     upstream: &str,
     access: RoutesAccess,
 ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
-    let manifest = std::fs::read(package).with_context(|| format!("read {}", package.display()))?;
-    let catalog =
-        if package.file_name() == Some(std::ffi::OsStr::new(rayline_arc_decide::RUNTIME_FILE)) {
-            let runtime = rayline_arc_decide::runtime_catalog(&manifest)
-                .with_context(|| format!("read {}", package.display()))?;
+    let catalog = match &release.runtime_catalog {
+        Some(runtime) => {
             let mut catalog = rayline_arc_routes::Catalog::from_parts(
                 alias,
-                runtime.package_sha256,
-                runtime.thinking_controls_sha256,
-                runtime.actions.into_iter().map(|action| {
+                runtime.package_sha256.clone(),
+                runtime.thinking_controls_sha256.clone(),
+                runtime.actions.iter().map(|action| {
                     let entry = rayline_arc_routes::Action {
-                        model: action.model,
-                        control_id: Some(action.control_id),
-                        level: action.level,
+                        model: action.model.clone(),
+                        control_id: Some(action.control_id.clone()),
+                        level: action.level.clone(),
                     };
-                    (action.id, entry)
+                    (action.id.clone(), entry)
                 }),
             );
             // The release's own wire ids name its models in answers.
-            catalog.public_ids.extend(runtime.wire_ids);
+            catalog.public_ids.extend(runtime.wire_ids.clone());
             catalog
-        } else {
+        }
+        None => {
+            let package = release_dir.join("package.json");
+            let manifest =
+                std::fs::read(&package).with_context(|| format!("read {}", package.display()))?;
             rayline_arc_routes::Catalog::from_manifest(&manifest, alias)?
-        };
+        }
+    };
     let mut config = rayline_arc_routes::RouterConfig::new(catalog, upstream);
     config.salt = format!("{:032x}", rand::random::<u128>());
     config.access_token = Some(access.token);
     config.upstream_authorization = access.upstream_authorization;
-    anyhow::ensure!(
-        config.catalog.package_sha256 == release.package_sha256,
-        "{} is not the package of the ARC release",
-        package.display()
-    );
     let decider = Arc::new(LocalDecider {
         release,
         encoder: encoder.client(),
@@ -471,20 +469,10 @@ pub async fn serve_routes(
 pub fn load_release(dir: &Path) -> Result<rayline_arc_decide::Release> {
     let release = rayline_arc_decide::Release::load(dir)
         .with_context(|| format!("load the ARC release in {}", dir.display()))?;
+    // A full release has no manifest; its card is read as it is.
     let card = dir.join("prices.json");
-    if !card.is_file() {
+    if release.runtime_catalog.is_some() || !card.is_file() {
         return Ok(release);
-    }
-    let manifest: serde_json::Value = std::fs::read(dir.join("manifest.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    if let Some(files) = manifest.get("files").and_then(serde_json::Value::as_object) {
-        anyhow::ensure!(
-            files.contains_key("prices.json"),
-            "{} is not listed in the ARC release's manifest.json, so it can't be checked",
-            card.display()
-        );
     }
     release
         .with_model_prices(&card)
@@ -513,15 +501,14 @@ pub struct SkippedModel {
 
 /// Removes from the core `config` every `models` entry (its `local`
 /// deployments, their actions and its price row) that the ARC release
-/// doesn't know, or that neither the entry (when the release takes caller
-/// prices, `caller_prices`) nor the release prices: ARC can't
-/// decide for it, and its price row would make ARC refuse every turn.
-/// Refuses when that leaves no `models` entry.
+/// doesn't know, or that neither its price row nor the release prices: ARC
+/// can't decide for it, and its price row would make ARC refuse every turn.
+/// Price rows are only present for a release that takes them. Refuses when
+/// that leaves no `models` entry.
 pub fn skip_unroutable(
     config: &mut serde_json::Value,
     knows: impl Fn(&str) -> bool,
     prices: impl Fn(&str) -> bool,
-    caller_prices: bool,
 ) -> Result<Vec<SkippedModel>> {
     use std::collections::{BTreeSet, HashSet};
     let deployments = config
@@ -543,7 +530,7 @@ pub fn skip_unroutable(
         .filter_map(|id| {
             let reason = if !knows(id) {
                 "not_in_release"
-            } else if !(prices(id) || caller_prices && priced.contains(id)) {
+            } else if !(prices(id) || priced.contains(id)) {
                 "no_price"
             } else {
                 return None;
@@ -635,14 +622,9 @@ pub fn with_local_decisions(
     let mut value: serde_json::Value = serde_json::from_slice(&std::fs::read(config)?)?;
     let skipped = match release {
         Some(release) => {
-            let skipped = skip_unroutable(
-                &mut value,
-                |id| release.knows_model(id),
-                |id| release.prices_model(id),
-                release.accepts_caller_prices(),
-            )?;
             // A release that doesn't take caller prices refuses every
-            // request that carries them: refuse the overrides at start.
+            // request that carries them: refuse the overrides at start,
+            // before any model is skipped with its price.
             if !release.accepts_caller_prices() {
                 let overrides: Vec<String> = value
                     .pointer("/decisions/routing/prices")
@@ -660,13 +642,17 @@ pub fn with_local_decisions(
                     overrides.join(", ")
                 );
             }
+            let skipped = skip_unroutable(
+                &mut value,
+                |id| release.knows_model(id),
+                |id| release.prices_model(id),
+            )?;
             // ARC weighs cost, so it must price some model: the release's
             // own prices, or `models` prices it takes.
-            let caller_priced = release.accepts_caller_prices()
-                && value
-                    .pointer("/decisions/routing/prices")
-                    .and_then(serde_json::Value::as_object)
-                    .is_some_and(|prices| !prices.is_empty());
+            let caller_priced = value
+                .pointer("/decisions/routing/prices")
+                .and_then(serde_json::Value::as_object)
+                .is_some_and(|prices| !prices.is_empty());
             anyhow::ensure!(
                 release.has_prices() || caller_priced,
                 "the ARC release prices no model and `models` gives no price it can use; \
@@ -748,13 +734,8 @@ mod tests {
     #[test]
     fn a_model_the_release_does_not_know_or_price_is_skipped_with_its_deployments_and_price() {
         let mut config = core_config();
-        let skipped = skip_unroutable(
-            &mut config,
-            |id| id != "x/other",
-            |id| id == "x/known",
-            true,
-        )
-        .expect("two models are left");
+        let skipped = skip_unroutable(&mut config, |id| id != "x/other", |id| id == "x/known")
+            .expect("two models are left");
         assert_eq!(
             skipped,
             vec![SkippedModel {
@@ -780,8 +761,7 @@ mod tests {
 
         // Known but priced neither by its entry nor by the release.
         let mut config = core_config();
-        let skipped =
-            skip_unroutable(&mut config, |_| true, |_| false, true).expect("two are priced");
+        let skipped = skip_unroutable(&mut config, |_| true, |_| false).expect("two are priced");
         assert_eq!(
             skipped,
             vec![SkippedModel {
@@ -792,18 +772,9 @@ mod tests {
     }
 
     #[test]
-    fn a_config_price_counts_only_when_the_release_takes_caller_prices() {
-        let mut config = core_config();
-        let skipped =
-            skip_unroutable(&mut config, |_| true, |id| id == "x/known", false).expect("one left");
-        let ids: Vec<&str> = skipped.iter().map(|model| model.id.as_str()).collect();
-        assert_eq!(ids, ["x/other", "z-ai/glm"]);
-    }
-
-    #[test]
     fn every_model_skipped_refuses_naming_them() {
         let mut config = core_config();
-        let error = skip_unroutable(&mut config, |_| false, |_| false, true)
+        let error = skip_unroutable(&mut config, |_| false, |_| false)
             .expect_err("nothing left")
             .to_string();
         assert!(error.contains("x/known, x/other, z-ai/glm"), "{error}");
@@ -814,7 +785,7 @@ mod tests {
         let mut config = core_config();
         let before = config.clone();
         assert!(
-            skip_unroutable(&mut config, |_| true, |_| true, true)
+            skip_unroutable(&mut config, |_| true, |_| true)
                 .unwrap()
                 .is_empty()
         );
@@ -990,7 +961,7 @@ mod tests {
         std::fs::remove_file(&config).expect("config removed");
         // A card the manifest doesn't list isn't read.
         std::fs::copy(source.join("prices.json"), dir.join("prices.json")).expect("card");
-        let error = load_release(&dir).expect_err("unlisted").to_string();
+        let error = format!("{:#}", load_release(&dir).expect_err("unlisted"));
         assert!(error.contains("not listed"), "{error}");
         std::fs::write(dir.join("manifest.json"), manifest.to_string()).expect("manifest");
         assert!(load_release(&dir).expect("priced").has_prices());

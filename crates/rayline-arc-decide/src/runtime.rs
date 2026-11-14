@@ -39,6 +39,8 @@ const MANIFEST_SCHEMA: &str = "rayline.arc-runtime-manifest.v1";
 const HEADS_FILE: &str = "heads.safetensors";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const TOKENIZER_CONFIG_FILE: &str = "tokenizer_config.json";
+/// The per-model price card a release may carry.
+const PRICES_FILE: &str = "prices.json";
 const REQUIRED: [&str; 4] = [
     RUNTIME_FILE,
     HEADS_FILE,
@@ -174,16 +176,44 @@ struct StageTwoV1 {
 #[serde(deny_unknown_fields)]
 struct Manifest {
     schema: String,
-    #[serde(default)]
-    release: Option<String>,
+    /// The release's name; read by people, not by Rayline.
+    #[serde(default, rename = "release")]
+    _release: Option<String>,
     files: BTreeMap<String, ManifestFile>,
 }
 
-#[derive(Debug, Deserialize)]
+/// A file `manifest.json` lists: its size and sha256.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ManifestFile {
-    sha256: String,
-    bytes: u64,
+pub struct ManifestFile {
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// The files a runtime release's `manifest.json` lists, by plain file name
+/// in the release directory. Refuses another schema, a path, and a listing
+/// of `manifest.json` itself.
+pub fn manifest_files(raw: &[u8]) -> Result<BTreeMap<String, ManifestFile>, ReleaseError> {
+    let manifest: Manifest =
+        serde_json::from_slice(raw).map_err(|e| malformed(format!("{MANIFEST_FILE}: {e}")))?;
+    if manifest.schema != MANIFEST_SCHEMA {
+        return Err(ReleaseError::Unsupported(format!(
+            "{MANIFEST_FILE} schema {} is not {MANIFEST_SCHEMA}",
+            manifest.schema
+        )));
+    }
+    for name in manifest.files.keys() {
+        let plain = name != MANIFEST_FILE
+            && Path::new(name)
+                .file_name()
+                .is_some_and(|base| base == name.as_str());
+        if !plain {
+            return Err(malformed(format!(
+                "{MANIFEST_FILE} lists a path outside the release"
+            )));
+        }
+    }
+    Ok(manifest.files)
 }
 
 /// Whether `directory` holds a runtime file set.
@@ -201,18 +231,6 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Runtime, ReleaseError> {
         )));
     }
     Ok(runtime)
-}
-
-/// The stage-one encoder's chunk size a runtime release names.
-pub(crate) fn chunk_tokens(directory: &Path) -> Result<u32, ReleaseError> {
-    let path = directory.join(RUNTIME_FILE);
-    let bytes =
-        std::fs::read(&path).map_err(|e| ReleaseError::Read(format!("{}: {e}", path.display())))?;
-    let tokens = parse(&bytes)?.encoder.chunk_tokens;
-    if tokens == 0 {
-        return Err(malformed("the runtime release names no encoder chunk size"));
-    }
-    Ok(tokens)
 }
 
 /// The largest `manifest.json` read.
@@ -250,33 +268,18 @@ fn verified_files(directory: &Path) -> Result<HashMap<&'static str, Vec<u8>>, Re
     let mut raw = Vec::new();
     file.read_to_end(&mut raw)
         .map_err(|e| read_error(MANIFEST_FILE, e))?;
-    let manifest: Manifest =
-        serde_json::from_slice(&raw).map_err(|e| malformed(format!("{MANIFEST_FILE}: {e}")))?;
-    if manifest.schema != MANIFEST_SCHEMA {
-        return Err(ReleaseError::Unsupported(format!(
-            "{MANIFEST_FILE} schema {} is not {MANIFEST_SCHEMA}",
-            manifest.schema
-        )));
-    }
-    let _ = manifest.release;
+    let files = manifest_files(&raw)?;
     for name in REQUIRED {
-        if !manifest.files.contains_key(name) {
+        if !files.contains_key(name) {
             return Err(malformed(format!("{MANIFEST_FILE} does not list {name}")));
         }
     }
     let mut kept = HashMap::new();
-    for (name, want) in &manifest.files {
-        let plain = Path::new(name)
-            .file_name()
-            .is_some_and(|base| base == name.as_str());
-        if !plain {
-            return Err(malformed(format!(
-                "{MANIFEST_FILE} lists a path outside the release"
-            )));
-        }
+    for (name, want) in &files {
         let not_named = || malformed(format!("{name} is not the file {MANIFEST_FILE} names"));
         let kept_as = REQUIRED
             .iter()
+            .chain([&PRICES_FILE])
             .find(|r| **r == name.as_str() && **r != HEADS_FILE);
         let max = if kept_as.is_some() {
             MAX_PARSED_BYTES
@@ -384,6 +387,7 @@ impl Release {
     /// Loads a runtime release directory (`rayline.arc-runtime.v1`).
     pub fn from_runtime(directory: &Path) -> Result<Self, ReleaseError> {
         let mut files = verified_files(directory)?;
+        let card = files.remove(PRICES_FILE);
         let mut take = |name: &str| {
             files
                 .remove(name)
@@ -391,7 +395,23 @@ impl Release {
         };
         let runtime_bytes = take(RUNTIME_FILE)?;
         let runtime = parse(&runtime_bytes)?;
-        runtime_catalog(&runtime_bytes)?;
+        let catalog = runtime_catalog(&runtime_bytes)?;
+        if runtime.encoder.chunk_tokens == 0 {
+            return Err(malformed("the runtime release names no encoder chunk size"));
+        }
+        // Only a card the manifest lists was checked.
+        let card = match card {
+            Some(bytes) => Some(
+                serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .map_err(|e| malformed(format!("{PRICES_FILE}: {e}")))?,
+            ),
+            None if directory.join(PRICES_FILE).exists() => {
+                return Err(malformed(format!(
+                    "{PRICES_FILE} is not listed in {MANIFEST_FILE}, so it can't be checked"
+                )));
+            }
+            None => None,
+        };
         let tokenizer = ArcTokenizer::from_release(
             &take(TOKENIZER_FILE)?,
             &String::from_utf8(take(TOKENIZER_CONFIG_FILE)?)
@@ -404,13 +424,18 @@ impl Release {
             &Tensors::read(&heads, "stage_two.")?,
             &runtime.stage_two.support_columns,
         )?;
-        build(
+        let mut release = build(
             runtime,
             canon::sha256_hex(&runtime_bytes),
             tokenizer,
             head,
             stage_two,
-        )
+        )?;
+        release.runtime_catalog = Some(catalog);
+        match card {
+            Some(card) => release.with_price_card(&card),
+            None => Ok(release),
+        }
     }
 }
 
@@ -584,6 +609,8 @@ fn build(
         ));
     }
     Ok(Release {
+        chunk_tokens: runtime.encoder.chunk_tokens,
+        runtime_catalog: None,
         name: runtime.release,
         package_sha256,
         tokenizer,
@@ -670,18 +697,6 @@ mod tests {
             parse(other.as_bytes()),
             Err(ReleaseError::Unsupported(_))
         ));
-    }
-
-    #[test]
-    fn the_chunk_size_is_read_from_the_runtime_file() {
-        let dir = scratch("chunk");
-        std::fs::write(dir.join(RUNTIME_FILE), MINIMAL).expect("write");
-        assert!(is_runtime_release(&dir));
-        assert_eq!(
-            crate::stage_one_chunk_tokens(&dir).expect("a chunk size"),
-            512
-        );
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

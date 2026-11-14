@@ -168,14 +168,18 @@ fn a_runtime_release_decides_as_its_full_release() {
     let mut failures = Vec::new();
     for line in goldens.lines().filter(|l| !l.trim().is_empty()) {
         let golden: Golden = serde_json::from_str(line).expect("a golden line");
-        let request: Value = serde_json::from_str(golden.request.get()).expect("a request");
         let mut full_input: DecideInput =
             serde_json::from_str(golden.request.get()).expect("a decide request");
         full_input.stage_one_held = golden.stage_one_held.clone();
-        let translated = serde_json::to_string(&rename(&request, &to_runtime)).expect("json");
-        let mut runtime_input: DecideInput =
-            serde_json::from_str(&translated).expect("a decide request");
-        runtime_input.stage_one_held = golden.stage_one_held.clone();
+        // The same request text; only the attributed arm ids are renamed.
+        let mut runtime_input = full_input.clone();
+        for attribution in &mut runtime_input.attribution {
+            if let Some(id) = attribution.arm_id.as_mut() {
+                if let Some(runtime_id) = to_runtime.get(id.as_str()) {
+                    id.clone_from(runtime_id);
+                }
+            }
+        }
         cases += 1;
         match (
             decide(&full, &full_input, &source),

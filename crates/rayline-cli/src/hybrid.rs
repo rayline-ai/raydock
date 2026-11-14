@@ -66,11 +66,67 @@ struct Supervisor {
     config: PathBuf,
     /// The `--env` it was started with. `None` is prod.
     env: Option<String>,
-    /// Where it gets its decisions ([`decisions_words`]). Absent in a
-    /// record from a Rayline that didn't record them: such a process
-    /// serves no run, and `rayline local stop` still stops it.
+    /// Where it gets its decisions. Absent in a record from a Rayline that
+    /// didn't record them: such a process serves no run, and `rayline local
+    /// stop` still stops it.
     #[serde(default)]
-    decisions: Option<String>,
+    decisions: Option<DecisionsSource>,
+}
+
+/// `routing.decisions`, and for `local` the ARC release with the built-in
+/// pin resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum DecisionsSource {
+    Hosted,
+    Local {
+        repo: String,
+        revision: String,
+        manifest_sha256: String,
+        dir: Option<String>,
+    },
+}
+
+impl DecisionsSource {
+    fn of(settings: &Settings) -> Self {
+        let Some(routing) = settings
+            .routing
+            .as_ref()
+            .filter(|routing| routing.decisions == crate::config::Decisions::Local)
+        else {
+            return Self::Hosted;
+        };
+        let release = routing
+            .arc_release
+            .clone()
+            .unwrap_or_else(crate::arc_release::built_in);
+        Self::Local {
+            repo: release.repo,
+            revision: release.revision,
+            manifest_sha256: release.manifest_sha256,
+            dir: release.dir,
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hosted => f.write_str("hosted decisions"),
+            Self::Local {
+                repo,
+                revision,
+                manifest_sha256,
+                dir,
+            } => {
+                write!(f, "local decisions from {repo} at {revision}")?;
+                if let Some(dir) = dir {
+                    write!(f, " in {dir}")?;
+                }
+                write!(f, " (manifest sha256 {manifest_sha256})")
+            }
+        }
+    }
 }
 
 impl Supervisor {
@@ -94,42 +150,18 @@ impl Supervisor {
                 env_words(settings.env.as_deref())
             )));
         }
-        let decisions = decisions_words(settings);
-        if self.decisions.as_deref() != Some(decisions.as_str()) {
-            let started = self
-                .decisions
-                .as_deref()
-                .unwrap_or("decisions it didn't record (an earlier Rayline started it)");
+        let decisions = DecisionsSource::of(settings);
+        if self.decisions.as_ref() != Some(&decisions) {
+            let started = self.decisions.as_ref().map_or_else(
+                || "decisions it didn't record (an earlier Rayline started it)".to_owned(),
+                ToString::to_string,
+            );
             return Err(io::Error::other(format!(
                 "the local process (pid {}) was started with {started}, and this run has {decisions}; stop it with `rayline local stop` first",
                 self.pid
             )));
         }
         Ok(())
-    }
-}
-
-/// `routing.decisions`, and for `local` the ARC release, as an error names
-/// them.
-fn decisions_words(settings: &Settings) -> String {
-    use crate::config::Decisions;
-    let Some(routing) = settings.routing.as_ref() else {
-        return "hosted decisions".to_owned();
-    };
-    match (routing.decisions, &routing.arc_release) {
-        (Decisions::Hosted, _) => "hosted decisions".to_owned(),
-        (Decisions::Local, None) => "local decisions from the built-in ARC release".to_owned(),
-        (Decisions::Local, Some(release)) => format!(
-            "local decisions from {} at {}{} (manifest sha256 {})",
-            release.repo,
-            release.revision,
-            release
-                .dir
-                .as_deref()
-                .map(|dir| format!(" in {dir}"))
-                .unwrap_or_default(),
-            release.manifest_sha256
-        ),
     }
 }
 
@@ -504,8 +536,6 @@ async fn launch(
             .arg(&arc.encoder)
             .arg("--arc-model")
             .arg(&arc.model)
-            .arg("--arc-package")
-            .arg(&arc.package)
             .arg("--arc-release")
             .arg(&arc.release);
     }
@@ -519,7 +549,7 @@ async fn launch(
             pid: child.id(),
             config: config_file,
             env: settings.env.clone(),
-            decisions: Some(decisions_words(settings)),
+            decisions: Some(DecisionsSource::of(settings)),
         };
         write_private_json(
             &paths.supervisor(),
@@ -719,7 +749,6 @@ struct LocalArc {
     source: String,
     encoder: PathBuf,
     model: PathBuf,
-    package: PathBuf,
     release: PathBuf,
 }
 
@@ -732,47 +761,21 @@ const ARC_ENCODER_FILE: &str = "gguf/arc-1.0-20261111-encoder-bf16.gguf";
 const ARC_ENCODER_BYTES: u64 = 1_018_125_184;
 const ARC_ENCODER_SHA256: &str = "6aa526ff86148c34977781117a7cf80987583f6797290ee7ea33c4a0fa7a8bb0";
 
-/// The lowercase hex SHA-256 of the file at `path`, read in chunks.
-fn file_sha256(path: &Path) -> io::Result<String> {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    io::copy(&mut fs::File::open(path)?, &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
 /// The pinned encoder weights in the Hugging Face cache, downloaded on first
 /// use and checked against [`ARC_ENCODER_SHA256`].
 fn arc_encoder_weights(home: &Path) -> io::Result<PathBuf> {
     let hub = rayline_hf::hf_cache_dir(home).map_err(io::Error::other)?;
-    let path = match rayline_hf::cached_hf_file(&hub, ARC_REPO, ARC_ENCODER_FILE, ARC_COMMIT) {
-        Some(path) => path,
-        None => rayline_hf::download_to_hf_cache_at(
-            &hub,
-            &rayline_hf::hf_endpoint().map_err(io::Error::other)?,
-            rayline_hf::Download {
-                token: None,
-                max_bytes: Some(ARC_ENCODER_BYTES),
-                pinned: true,
-            },
-            ARC_REPO,
-            ARC_ENCODER_FILE,
-            ARC_COMMIT,
-        )
-        .map_err(|error| {
-            io::Error::other(format!(
-                "cannot download the ARC encoder from {ARC_REPO}: {error}"
-            ))
-        })?,
+    let hub_url = rayline_hf::hf_endpoint().map_err(io::Error::other)?;
+    let weights = crate::arc_release::Pinned {
+        repo: ARC_REPO,
+        revision: ARC_COMMIT,
+        path: ARC_ENCODER_FILE.to_owned(),
+        max_bytes: ARC_ENCODER_BYTES,
+        sha256: ARC_ENCODER_SHA256.to_owned(),
     };
-    // Hashed on every start: the blob's name alone doesn't prove its bytes.
-    let blob = fs::canonicalize(&path)?;
-    if file_sha256(&blob)? != ARC_ENCODER_SHA256 {
-        return Err(io::Error::other(format!(
-            "the cached ARC encoder {} is not the pinned file (sha256 {ARC_ENCODER_SHA256}); delete it to download it again",
-            blob.display()
-        )));
-    }
-    Ok(blob)
+    let path = crate::arc_release::fetch_file(&hub, &hub_url, None, &weights)
+        .map_err(|error| io::Error::other(format!("cannot load the ARC encoder: {error}")))?;
+    fs::canonicalize(path)
 }
 
 fn local_arc(home: &Path, routing: &crate::config::Routing) -> io::Result<Option<LocalArc>> {
@@ -781,7 +784,7 @@ fn local_arc(home: &Path, routing: &crate::config::Routing) -> io::Result<Option
     }
     // Development overrides: `RAYLINE_ARC_MODEL` and `RAYLINE_ARC_ENCODER`
     // name the encoder weights and binary, `RAYLINE_ARC_RELEASE` a release
-    // directory and `RAYLINE_ARC_PACKAGE` its catalog. Without them, the
+    // directory. Without them, the
     // pinned encoder and release are downloaded.
     let (release, source) = match std::env::var_os("RAYLINE_ARC_RELEASE") {
         Some(dir) => {
@@ -823,19 +826,11 @@ fn local_arc(home: &Path, routing: &crate::config::Routing) -> io::Result<Option
             )
         })?,
     };
-    // The package manifest sits in the release directory unless named; a
-    // runtime release's catalog is its arc-runtime.json.
-    let package = match std::env::var_os("RAYLINE_ARC_PACKAGE") {
-        Some(package) => PathBuf::from(package),
-        None if release.join("arc-runtime.json").is_file() => release.join("arc-runtime.json"),
-        None => release.join("package.json"),
-    };
     Ok(Some(LocalArc {
         source,
         encoder,
         model,
         // Beside the local process's state, which each start clears.
-        package,
         release,
     }))
 }
@@ -2219,10 +2214,10 @@ mod tests {
             pid: 7,
             config: fs::canonicalize(&started.file).unwrap(),
             env: None,
-            decisions: Some(decisions_words(&started)),
+            decisions: Some(DecisionsSource::of(&started)),
         };
         supervisor.check_serves(&started).unwrap();
-        assert_eq!(supervisor.decisions.as_deref(), Some("hosted decisions"));
+        assert_eq!(supervisor.decisions, Some(DecisionsSource::Hosted));
 
         // A record from a Rayline that didn't record decisions serves no run.
         let earlier: Supervisor =
@@ -2244,11 +2239,25 @@ mod tests {
         if let Some(routing) = local.routing.as_mut() {
             routing.decisions = crate::config::Decisions::Local;
         }
+        let built_in = crate::arc_release::built_in();
         assert_eq!(
             supervisor.check_serves(&local).unwrap_err().to_string(),
-            "the local process (pid 7) was started with hosted decisions, and this run has \
-             local decisions from the built-in ARC release; stop it with `rayline local stop` first"
+            format!(
+                "the local process (pid 7) was started with hosted decisions, and this run has \
+                 local decisions from {} at {} in runtime (manifest sha256 {}); stop it with \
+                 `rayline local stop` first",
+                built_in.repo, built_in.revision, built_in.manifest_sha256
+            )
         );
+        // Another release is another process.
+        let mut pinned = local.clone();
+        if let Some(routing) = pinned.routing.as_mut() {
+            routing.arc_release = Some(crate::config::ArcRelease {
+                revision: "1".repeat(40),
+                ..built_in
+            });
+        }
+        assert_ne!(DecisionsSource::of(&pinned), DecisionsSource::of(&local));
 
         let other = local_settings(&dir, "b.json", None);
         let error = supervisor.check_serves(&other).unwrap_err().to_string();
@@ -2284,7 +2293,7 @@ mod tests {
             fs::write(
                 paths.supervisor(),
                 json!({"pid": pid, "config": "/c.json", "env": "dev",
-                       "decisions": "hosted decisions"})
+                       "decisions": {"mode": "hosted"}})
                 .to_string(),
             )
             .unwrap();
@@ -2296,7 +2305,7 @@ mod tests {
                 pid: std::process::id(),
                 config: PathBuf::from("/c.json"),
                 env: Some("dev".to_owned()),
-                decisions: Some("hosted decisions".to_owned()),
+                decisions: Some(DecisionsSource::Hosted),
             })
         );
         let error = record(u64::from(u32::MAX)).unwrap_err().to_string();

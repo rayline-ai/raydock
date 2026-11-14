@@ -2,12 +2,8 @@
 //! Hugging Face repo and commit into the Hugging Face cache, and checked
 //! file by file against its `manifest.json`, whose own sha256 is pinned.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use crate::config::ArcRelease;
 
@@ -33,21 +29,6 @@ const PLACEHOLDER_REVISION: &str = "0000000000000000000000000000000000000000";
 const PLACEHOLDER_MANIFEST_SHA256: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-#[derive(Deserialize)]
-struct Manifest {
-    files: BTreeMap<String, ManifestFile>,
-}
-
-#[derive(Deserialize)]
-struct ManifestFile {
-    sha256: String,
-    bytes: u64,
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 /// The release's directory in the cache at `hub`, with every file its
 /// manifest lists present and matching. Files already cached at the pinned
 /// commit are not downloaded again, so a complete cache works offline. A
@@ -66,33 +47,34 @@ pub fn fetch(
             release.repo
         ));
     }
-    let source = Source {
-        hub,
-        hub_url,
-        token,
-        release,
+    let in_release = |name: &str| match &release.dir {
+        Some(dir) => format!("{dir}/{name}"),
+        None => name.to_owned(),
     };
-    let manifest_bytes = source.file(MANIFEST_FILE, MAX_MANIFEST_BYTES, |bytes| {
-        sha256_hex(bytes) == release.manifest_sha256
-    })?;
-    let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| format!("{} of {}: {e}", source.path(MANIFEST_FILE), release.repo))?;
-    for (name, want) in &manifest.files {
-        let plain = !name.is_empty()
-            && name != MANIFEST_FILE
-            && Path::new(name)
-                .file_name()
-                .is_some_and(|base| base == name.as_str());
-        if !plain {
-            return Err(format!(
-                "{} of {} lists a path outside the release: {name}",
-                source.path(MANIFEST_FILE),
-                release.repo
-            ));
-        }
-        source.file(name, want.bytes, |bytes| {
-            bytes.len() as u64 == want.bytes && sha256_hex(bytes) == want.sha256
-        })?;
+    let pinned = |path: String, max_bytes: u64, sha256: &str| Pinned {
+        repo: &release.repo,
+        revision: &release.revision,
+        path,
+        max_bytes,
+        sha256: sha256.to_owned(),
+    };
+    let manifest = pinned(
+        in_release(MANIFEST_FILE),
+        MAX_MANIFEST_BYTES,
+        &release.manifest_sha256,
+    );
+    let at = fetch_file(hub, hub_url, token, &manifest)?;
+    let files = fs::read(&at)
+        .map_err(|e| e.to_string())
+        .and_then(|raw| rayline_arc_decide::manifest_files(&raw).map_err(|e| e.to_string()))
+        .map_err(|e| format!("{} of {}: {e}", manifest.path, release.repo))?;
+    for (name, want) in &files {
+        fetch_file(
+            hub,
+            hub_url,
+            token,
+            &pinned(in_release(name), want.bytes, &want.sha256),
+        )?;
     }
     Ok(rayline_hf::hf_cache_snapshot_path(
         hub,
@@ -102,67 +84,57 @@ pub fn fetch(
     ))
 }
 
-struct Source<'a> {
-    hub: &'a Path,
-    hub_url: &'a str,
-    token: Option<&'a str>,
-    release: &'a ArcRelease,
+/// One file pinned by repo, commit, path and sha256, at most `max_bytes`
+/// long.
+pub struct Pinned<'a> {
+    pub repo: &'a str,
+    pub revision: &'a str,
+    pub path: String,
+    pub max_bytes: u64,
+    pub sha256: String,
 }
 
-impl Source<'_> {
-    /// `name`'s path in the repo.
-    fn path(&self, name: &str) -> String {
-        match &self.release.dir {
-            Some(dir) => format!("{dir}/{name}"),
-            None => name.to_owned(),
+/// The pinned file's path in the cache at `hub`: the cached copy when it
+/// matches (hashed on every call: a blob's name doesn't prove its bytes),
+/// else downloaded. A copy that doesn't match is removed; a download that
+/// doesn't match is refused.
+pub fn fetch_file(
+    hub: &Path,
+    hub_url: &str,
+    token: Option<&str>,
+    file: &Pinned<'_>,
+) -> Result<PathBuf, String> {
+    let (repo, revision, path) = (file.repo, file.revision, file.path.as_str());
+    let matches = |at: &Path| {
+        fs::metadata(at).is_ok_and(|meta| meta.len() <= file.max_bytes)
+            && file_sha256(at).is_some_and(|sha| sha == file.sha256)
+    };
+    if let Some(cached) = rayline_hf::cached_hf_file(hub, repo, path, revision) {
+        if matches(&cached) {
+            return Ok(cached);
         }
+        discard(&cached);
     }
-
-    /// One file of the release, at most `max_bytes` long, from the cache or
-    /// else downloaded, with bytes that pass `good`.
-    fn file(
-        &self,
-        name: &str,
-        max_bytes: u64,
-        good: impl Fn(&[u8]) -> bool,
-    ) -> Result<Vec<u8>, String> {
-        let path = self.path(name);
-        let (repo, revision) = (self.release.repo.as_str(), self.release.revision.as_str());
-        let read = |file: &Path| -> Option<Vec<u8>> {
-            fs::metadata(file)
-                .is_ok_and(|meta| meta.len() <= max_bytes)
-                .then(|| fs::read(file).ok())
-                .flatten()
-        };
-        if let Some(cached) = rayline_hf::cached_hf_file(self.hub, repo, &path, revision) {
-            if let Some(bytes) = read(&cached).filter(|bytes| good(bytes)) {
-                return Ok(bytes);
-            }
-            discard(&cached);
-        }
-        let downloaded = rayline_hf::download_to_hf_cache_at(
-            self.hub,
-            self.hub_url,
-            rayline_hf::Download {
-                token: self.token,
-                max_bytes: Some(max_bytes),
-                pinned: true,
-            },
-            repo,
-            &path,
-            revision,
-        )
-        .map_err(|e| format!("cannot download {path} from {repo} at {revision}: {e}"))?;
-        match read(&downloaded) {
-            Some(bytes) if good(&bytes) => Ok(bytes),
-            _ => {
-                discard(&downloaded);
-                Err(format!(
-                    "{path} from {repo} at {revision} is not the pinned file; it was removed from the cache"
-                ))
-            }
-        }
+    let downloaded = rayline_hf::download_to_hf_cache_at(
+        hub,
+        hub_url,
+        rayline_hf::Download {
+            token,
+            max_bytes: Some(file.max_bytes),
+            pinned: true,
+        },
+        repo,
+        path,
+        revision,
+    )
+    .map_err(|e| format!("cannot download {path} from {repo} at {revision}: {e}"))?;
+    if matches(&downloaded) {
+        return Ok(downloaded);
     }
+    discard(&downloaded);
+    Err(format!(
+        "{path} from {repo} at {revision} is not the pinned file; it was removed from the cache"
+    ))
 }
 
 /// The SHA-256 of the file at `path`, read in chunks.
@@ -200,6 +172,12 @@ fn discard(snapshot: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::Digest as _;
+    use std::collections::BTreeMap;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", sha2::Sha256::digest(bytes))
+    }
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};

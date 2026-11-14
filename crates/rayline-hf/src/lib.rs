@@ -260,18 +260,24 @@ fn hf_endpoint_from(value: Option<OsString>) -> Result<String, String> {
     let value = value
         .into_string()
         .map_err(|_| "HF_ENDPOINT is not valid unicode".to_owned())?;
-    let rest = value
-        .strip_prefix("https://")
-        .or_else(|| value.strip_prefix("http://"));
-    let Some(rest) = rest.filter(|rest| !rest.is_empty() && !rest.starts_with('/')) else {
-        return Err("HF_ENDPOINT is not an absolute http or https URL".to_owned());
-    };
+    let url = reqwest::Url::parse(&value)
+        .ok()
+        // The parser reads `https:///x` as host `x`; a host must follow `//`.
+        .filter(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.has_host()
+                && !value[url.scheme().len()..].starts_with(":///")
+        })
+        .ok_or_else(|| "HF_ENDPOINT is not an absolute http or https URL".to_owned())?;
     // A user name or password in the URL would reach logs and cache files.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
-    if authority.contains('@') {
+    if !url.username().is_empty() || url.password().is_some() {
         return Err(
             "HF_ENDPOINT carries a user name or password; give the Hub's address only".to_owned(),
         );
+    }
+    // Repo paths are appended to it.
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("HF_ENDPOINT has a query or fragment; give the Hub's address only".to_owned());
     }
     Ok(value.trim_end_matches('/').to_owned())
 }
@@ -956,9 +962,13 @@ mod tests {
             assert!(error.contains("user name or password"), "{error}");
             assert!(!error.contains("secret"), "{error}");
         }
+        for value in ["https://hub.example/path?a=b@c", "https://hub.example/#x"] {
+            let error = hf_endpoint_from(Some(value.into())).unwrap_err();
+            assert!(error.contains("query or fragment"), "{error}");
+        }
         assert_eq!(
-            hf_endpoint_from(Some("https://hub.example/path?a=b@c".into())).unwrap(),
-            "https://hub.example/path?a=b@c"
+            hf_endpoint_from(Some("https://hub.example/mirror/".into())).unwrap(),
+            "https://hub.example/mirror"
         );
         let error = hf_endpoint_from(Some("ftp://secret".into())).unwrap_err();
         assert!(!error.contains("secret"), "{error}");
