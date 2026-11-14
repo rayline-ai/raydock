@@ -453,6 +453,26 @@ async fn an_unavailable_decider_never_falls_back_to_a_target_that_does_not_fit()
 }
 
 #[tokio::test]
+async fn an_unavailable_decider_keeps_a_held_local_target_whose_fit_is_unknown() {
+    let harness = harness(unavailable()).await;
+    let mut request = request();
+    let execution = &mut request["routing"]["execution"];
+    execution["targets"][2]["capacity"] = Value::Null;
+    execution["hold"] = json!({"scope": "action", "action_id": common::id('c')});
+    let response = harness
+        .routes("conversation")
+        .json(&request)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["policy_action_id"], json!(common::id('c')));
+    assert_eq!(body["receipt"]["decided_by"]["model"], "held");
+}
+
+#[tokio::test]
 async fn an_unavailable_decider_without_a_package_fallback_still_routes() {
     // The fixture package names no fallback action, and the turn has no
     // history: an offered action is served rather than failing the turn.

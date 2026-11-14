@@ -59,20 +59,22 @@ impl Fallback {
         Self {
             preference,
             conversation,
-            // A fallback is only a target known to fit: never one the
-            // request's capacity facts say does not, nor a local one whose
-            // fit is unknown (as the policy's own admission).
+            // A fallback never serves a target the request's capacity facts
+            // say does not fit, nor a local one whose fit is unknown (as the
+            // policy's own admission), unless it is the held action: a hold
+            // is the only action the executor may run.
             offered: selection
                 .available_action_ids
                 .iter()
                 .filter(|action| {
+                    let held = selection.held_action_id.as_ref() == Some(*action);
                     decide
                         .capacity
                         .iter()
                         .filter(|fact| &fact.action_id == *action)
                         .all(|fact| match fact.fits {
                             Some(fits) => fits,
-                            None => fact.placement != "local",
+                            None => held || fact.placement != "local",
                         })
                 })
                 .cloned()
