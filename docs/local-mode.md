@@ -154,6 +154,12 @@ Warning: models entry example/my-model isn't in the ARC release's catalog; ARC w
 and turns route among the other models. If every `models` entry is
 skipped, `rayline local start` fails and names them.
 
+Local decisions read Claude Code, OpenCode, Pi and omp turns (Anthropic
+Messages requests). Codex, Hermes and OpenClaw turns aren't decided
+locally: they keep the model the conversation holds (or, on a first turn,
+the release's fallback model), and `rayline run` warns of it. Use `hosted`
+decisions for those harnesses.
+
 Local decisions also need the ARC encoder binary, `rayline-arc-encoder`,
 installed beside `rayline`. Rayline releases don't ship it yet. The
 built-in ARC release isn't published yet either, so for now `local`
