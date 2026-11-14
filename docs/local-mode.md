@@ -137,6 +137,18 @@ release, and the encoder weights against their pinned sha256. Later starts
 use the cached copy without contacting Hugging Face. Start still needs
 Rayline cloud, as with `hosted` decisions.
 
+With `local` decisions, ARC can route only to models its release knows and
+prices. A `models` entry it doesn't know, or that neither the entry's
+`price` nor the release prices, is skipped: `rayline local start` prints a
+warning naming it, for example
+
+```text
+Warning: models entry example/my-model isn't in the ARC release's catalog; ARC won't route to it
+```
+
+and turns route among the other models. If every `models` entry is
+skipped, `rayline local start` fails and names them.
+
 Local decisions also need the ARC encoder binary, `rayline-arc-encoder`,
 installed beside `rayline`. It will ship with the Rayline release; until it
 does, use `"decisions": "hosted"`. The default ARC release is not published
