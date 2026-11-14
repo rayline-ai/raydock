@@ -237,7 +237,9 @@ fn an_episode_is_a_conversation_and_branch_under_a_salt() {
             }
         )
     );
-    let fresh = ParseContext::now("salt");
+    // Any salt: one derived at run time, as the router derives its own.
+    let salt = format!("{:x}", std::process::id());
+    let fresh = ParseContext::now(&salt);
     assert_eq!(fresh.nonce.len(), 32);
     assert_eq!(fresh.as_of.len(), "2026-01-02T03:04:05Z".len());
     assert!(fresh.as_of.ends_with('Z'));
