@@ -74,14 +74,14 @@ The script:
 
 ## Cases
 
-Every cell runs in its own working directory under `WORK`, and every turn is the harness's own non-interactive mode with the model and reasoning flags from the table below.
+Every cell has its own directory under `WORK`; the harness runs in its `work/` subdirectory, and the turn logs stay in the cell directory. Every turn is the harness's own non-interactive mode with the model and reasoning flags from the table below.
 
 | Case | What the model must do | Catches |
 |---|---|---|
 | `plain` | Answer `ACCEPT` followed by 17 + 25. | The request path as such. |
 | `tool` | Read `answer.txt` (two random integers) with a tool and answer `ACCEPT` followed by their sum, reasoning on. | A reasoning stream that aborts when a tool call follows it. |
 | `heavy` | Call `lookup_record` from an MCP server (`scripts/acceptance/mcp_tools.py`) whose tool schemas carry top-level `oneOf`, `anyOf` and `allOf` with `$ref` branches, as the Codex Computer Use plugin's do, and answer `ACCEPT` followed by the value it returns. | A router or provider that refuses such schemas. |
-| `multi` | Turn 1: read `answer.txt` and remember the two integers. Turn 2, in the same session: answer `ACCEPT` followed by their sum. | Reasoning or thinking that is not carried into the next turn. |
+| `multi` | Turn 1: read `answer.txt` and remember the two integers. Turn 2, in the same session and with the file removed: answer `ACCEPT` followed by their sum. | Reasoning or thinking that is not carried into the next turn. A harness that loses the session cannot recover the integers. |
 
 The answer never appears in the prompt: the sum and the MCP value change every run, so an error that echoes the prompt can't pass.
 
@@ -89,7 +89,7 @@ The answer never appears in the prompt: the sum and the MCP value change every r
 |---|---|---|---|---|
 | claude | `-p "<prompt>"` with `MAX_THINKING_TOKENS=8000` | `--model <id>` | `--session-id <uuid>`, then `--resume <uuid>` | skipped: Claude Code drops tools with top-level `oneOf`/`anyOf`/`allOf` before any request |
 | codex | `exec --skip-git-repo-check "<prompt>"` | `-m <id> -c model_reasoning_effort=high` | `session id:` from turn 1, then `exec ... resume <id>` | `-c mcp_servers.acceptance.command/args` |
-| opencode | `run "<prompt>"` | `-m rayline/<id> --thinking`, models declared in a project `opencode.json` the script writes | `-s ses_<id>` on both turns | skipped: OpenCode wraps MCP tools in its Code Mode `execute` tool, so their schemas never leave the harness |
+| opencode | `run "<prompt>"` | `-m rayline/<id> --thinking`, models declared in a project `opencode.json` the script writes (no limits: the router and the local process enforce their own) | `-s ses_<id>` on both turns | skipped: OpenCode wraps MCP tools in its Code Mode `execute` tool, so their schemas never leave the harness |
 | pi | `-p "<prompt>"` | `--model rayline/<id> --thinking high` | `--session-id <id>` on both turns | `.pi/mcp.json` in the working directory, `--approve` |
 | omp | `-p "<prompt>"` | none: omp runs only the models in its catalog, so it runs once per case as `default` | `-c` on turn 2 | skipped: persistent config only |
 | hermes | `chat -q "<prompt>"` | `-m <id> --reasoning high` (turn 1 only: Hermes refuses them on resume) | `Session:` from turn 1, then `--resume <id>` | skipped: persistent config only |
@@ -108,6 +108,6 @@ Each cell prints one line:
 - `FAIL ... : not installed`: the harness isn't on `PATH`.
 - `SKIP ... : <reason>`: the harness cannot run the cell (see the table above), or `rayline run` refused it by design. Skips don't fail the run.
 
-`WORK/results.tsv` has one row per cell (`harness mode model case result executed cause`), and each cell's directory holds its turn output as `turn.log`, or `turn-1.log` and `turn-2.log`. Router keys are redacted from the output.
+`WORK/results.tsv` has one row per cell (`harness mode model case result executed cause`), and each cell's directory holds its turn output as `turn.log`, or `turn-1.log` and `turn-2.log`, next to the harness's `work/` directory. Router keys are redacted from the output. `RAYLINE`, `CONFIG` and `WORK` may be relative to the directory you run the script from.
 
 The script exits 0 when nothing failed, 1 on any `FAIL`, when a local process is already running or when `rayline local status` fails before any turn, and 2 on a usage or config error.

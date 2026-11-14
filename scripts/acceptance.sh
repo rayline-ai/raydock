@@ -167,6 +167,8 @@ session_args() {
 # write_opencode_config <dir>: OpenCode only runs models its config declares,
 # and only takes a project config from the working directory, so every
 # OpenCode cell gets one that declares the selected models with thinking on.
+# It sets no limits: OpenCode runs without them, and the router and the local
+# process enforce their own.
 write_opencode_config() {
   python3 - "$1/opencode.json" "${models[@]}" <<'EOF'
 import json, sys
@@ -178,7 +180,6 @@ config = {
             "name": model,
             "tool_call": True,
             "reasoning": True,
-            "limit": {"context": 200000, "output": 32000},
             "options": {"thinking": {"type": "enabled", "budgetTokens": 4000}},
         }
         for model in models
@@ -226,17 +227,17 @@ with_timeout() {
   ' "$@"
 }
 
-# run_turn <harness> <dir> <log> <prompt> [args...]: one harness turn in
-# <dir>; output (router keys redacted) goes to <log> and `out`, exit status to
+# run_turn <harness> <cwd> <log> <prompt> [args...]: one harness turn in
+# <cwd>; output (router keys redacted) goes to <log> and `out`, exit status to
 # `status`. In local mode `executed` collects the models the local process
 # ran for this turn.
 run_turn() {
-  local harness=$1 dir=$2 log=$3 prompt=$4 offset=0
+  local harness=$1 cwd=$2 log=$3 prompt=$4 offset=0
   shift 4
   harness_cmd "$harness" "$prompt" ${model_flags[@]+"${model_flags[@]}"} "$@"
   harness_env "$harness"
   [ "$mode" = local ] && offset=$(wc -l <"$RUNTIME_LOG")
-  out=$(cd "$dir" && with_timeout "$TIMEOUT" env ${turn_env[@]+"${turn_env[@]}"} \
+  out=$(cd "$cwd" && with_timeout "$TIMEOUT" env ${turn_env[@]+"${turn_env[@]}"} \
     "$RAYLINE" run "$harness" ${mode_flags[@]+"${mode_flags[@]}"} -- "${cmd[@]}" </dev/null 2>&1 |
     sed -E 's/rlk-[A-Za-z0-9_-]+/rlk-<redacted>/g')
   status=${PIPESTATUS[0]}
@@ -291,11 +292,14 @@ report_skip() {
   record SKIP "$1"
 }
 
-# run_cell: one cell for the current `harness`, `mode`, `model`, `case`.
+# run_cell: one cell for the current `harness`, `mode`, `model`, `case`. The
+# harness runs in <cell dir>/work; the turn logs stay in <cell dir>, where the
+# harness has no reason to look.
 run_cell() {
-  local dir=$WORK/$harness-$mode-${model//\//_}-$case a b log
+  local dir=$WORK/$harness-$mode-${model//\//_}-$case cwd a b log
   local -a args
-  mkdir -p "$dir"
+  cwd=$dir/work
+  mkdir -p "$cwd"
   executed=
   model_flags=()
   if ! model_args "$harness" "$model"; then
@@ -303,25 +307,25 @@ run_cell() {
   else
     model_flags=(${args[@]+"${args[@]}"})
   fi
-  [ "$harness" = opencode ] && write_opencode_config "$dir"
+  [ "$harness" = opencode ] && write_opencode_config "$cwd"
   a=$((RANDOM % 90 + 10))
   b=$((RANDOM % 90 + 10))
-  printf '%s\n%s\n' "$a" "$b" >"$dir/answer.txt"
+  printf '%s\n%s\n' "$a" "$b" >"$cwd/answer.txt"
   case $case in
     plain)
-      run_turn "$harness" "$dir" "$dir/turn.log" \
+      run_turn "$harness" "$cwd" "$dir/turn.log" \
         "Reply with the word ACCEPT immediately followed by the sum of 17 and 25, with no space and nothing else."
       check ACCEPT42
       ;;
     tool)
-      run_turn "$harness" "$dir" "$dir/turn.log" \
-        "Read the file $dir/answer.txt. It holds two integers, one per line. Reply with the word ACCEPT immediately followed by their sum, with no space and nothing else."
+      run_turn "$harness" "$cwd" "$dir/turn.log" \
+        "Read the file $cwd/answer.txt. It holds two integers, one per line. Reply with the word ACCEPT immediately followed by their sum, with no space and nothing else."
       check "ACCEPT$((a + b))"
       ;;
     heavy)
       heavy_args "$harness" "$dir"
       [ -z "$skip" ] || { report_skip "$skip"; return; }
-      run_turn "$harness" "$dir" "$dir/turn.log" \
+      run_turn "$harness" "$cwd" "$dir/turn.log" \
         "Call the lookup_record tool with id 7 and reply with the word ACCEPT immediately followed by the value it returns, with no space and nothing else." \
         ${args[@]+"${args[@]}"}
       check "ACCEPT$RUN_TOKEN"
@@ -329,15 +333,17 @@ run_cell() {
     multi)
       turn_tag=$RANDOM
       session_args "$harness" 1 "$dir"
-      run_turn "$harness" "$dir" "$dir/turn-1.log" \
-        "Read the file $dir/answer.txt, which holds two integers, one per line, and remember them. Reply with the word OK and nothing else." \
+      run_turn "$harness" "$cwd" "$dir/turn-1.log" \
+        "Read the file $cwd/answer.txt, which holds two integers, one per line, and remember them. Reply with the word OK and nothing else." \
         ${args[@]+"${args[@]}"}
       [ "$status" -eq 0 ] || { multi_fail "turn 1: $(cause OK)"; return; }
       session_out=$out
       session_args "$harness" 2 "$dir" || { report_fail "turn 1 printed no session id"; return; }
       # Hermes refuses model and reasoning flags on resume: the session keeps its own.
       [ "$harness" = hermes ] && model_flags=()
-      run_turn "$harness" "$dir" "$dir/turn-2.log" \
+      # Without the file, turn 2 can only get the integers from the session.
+      rm "$cwd/answer.txt"
+      run_turn "$harness" "$cwd" "$dir/turn-2.log" \
         "Reply with the word ACCEPT immediately followed by the sum of the two integers from the file you read earlier, with no space and nothing else." \
         ${args[@]+"${args[@]}"}
       [ "$status" -eq 0 ] || { multi_fail "$(cause "ACCEPT$((a + b))")"; return; }
@@ -426,11 +432,17 @@ done
 installed python3 || { echo "python3 is needed (MCP tool server, session ids)" >&2; exit 2; }
 [ -f "$MCP_SERVER" ] || { echo "missing $MCP_SERVER" >&2; exit 2; }
 
+# Turns run in each cell's working directory, so paths given relative to the
+# current directory are made absolute first.
+case $RAYLINE in
+  */*) RAYLINE=$(cd "$(dirname "$RAYLINE")" && pwd)/$(basename "$RAYLINE") || exit 2 ;;
+esac
 # `rayline run --config <file>` is in local mode only when <file> has a
 # `routing` section, so a CONFIG without one would run no local turn.
 local_start=("$RAYLINE" local start)
 local_run=(--local)
 if [ -n "$CONFIG" ]; then
+  CONFIG=$(cd "$(dirname "$CONFIG")" && pwd)/$(basename "$CONFIG") || exit 2
   perl -MJSON::PP -e '
     my $file = shift;
     open my $fh, "<", $file or die "CONFIG=$file: $!\n";
@@ -445,6 +457,7 @@ RUNTIME_LOG=$HOME/.rayline/local/runtime.log
 
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK" || exit 2
+WORK=$(cd "$WORK" && pwd) || exit 2
 RESULTS=$WORK/results.tsv
 printf 'harness\tmode\tmodel\tcase\tresult\texecuted\tcause\n' >"$RESULTS"
 echo "== work dir: $WORK"
