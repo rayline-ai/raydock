@@ -119,8 +119,11 @@ async fn wait_healthy(url: &str, timeout: Duration) -> Result<()> {
     let client = reqwest::Client::builder().no_proxy().build()?;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match client.get(format!("{url}/health")).send().await {
-            Ok(response) if response.status().is_success() => return Ok(()),
+        // Each request ends by the deadline, so a hung encoder can't stall it.
+        let health =
+            tokio::time::timeout_at(deadline, client.get(format!("{url}/health")).send()).await;
+        match health {
+            Ok(Ok(response)) if response.status().is_success() => return Ok(()),
             _ if tokio::time::Instant::now() >= deadline => {
                 bail!("the ARC encoder at {url} is not healthy")
             }
@@ -393,6 +396,12 @@ pub async fn serve_routes(
         anyhow::Ok(release)
     })
     .await??;
+    anyhow::ensure!(
+        config.catalog.package_sha256 == release.package_sha256,
+        "{} is not the package of the ARC release in {}",
+        package.display(),
+        release_dir.display()
+    );
     let decider = Arc::new(LocalDecider {
         release: Arc::new(release),
         encoder: encoder.client(),
@@ -503,6 +512,28 @@ mod tests {
         assert_eq!(grown.len(), 1);
         assert_ne!(encoder.pid(), first_pid);
         assert_eq!(encoder.context, encoder.full_context());
+    }
+
+    #[tokio::test]
+    async fn a_health_check_that_never_answers_ends_by_its_deadline() {
+        // Accepts and never answers.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        let _held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                open.push(stream);
+            }
+        });
+        let checked = tokio::time::timeout(
+            Duration::from_secs(5),
+            wait_healthy(&url, Duration::from_millis(300)),
+        )
+        .await
+        .expect("ends by its deadline");
+        assert!(checked.is_err());
     }
 
     #[test]

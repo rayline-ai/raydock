@@ -599,8 +599,10 @@ mod tests {
         let within = |what: &str, body: &str| {
             let started = Instant::now();
             let result = project_request(body, &[]);
+            // Generous for unoptimized builds on slow CI runners; an
+            // unbounded case takes hours.
             assert!(
-                started.elapsed() < Duration::from_secs(5),
+                started.elapsed() < Duration::from_secs(30),
                 "{what} took {:?}",
                 started.elapsed()
             );
