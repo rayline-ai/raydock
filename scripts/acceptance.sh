@@ -117,8 +117,10 @@ heavy_args() {
     codex) args=(-c "mcp_servers.acceptance.command=\"python3\"" -c "mcp_servers.acceptance.args=$(mcp_args_json)") ;;
     opencode) skip="OpenCode exposes MCP tools through its Code Mode execute tool; the schemas never leave the harness" ;;
     pi)
+      # Pi's default exposure is codemode, which keeps the schemas inside the
+      # harness; direct puts them in the model's tool declarations.
       mkdir -p "$dir/.pi"
-      printf '{"mcpServers":{"acceptance":{"command":"python3","args":%s}}}\n' "$(mcp_args_json)" >"$dir/.pi/mcp.json"
+      printf '{"mcpServers":{"acceptance":{"command":"python3","args":%s,"exposure":"direct"}}}\n' "$(mcp_args_json)" >"$dir/.pi/mcp.json"
       args=(--approve)
       ;;
     omp | hermes | openclaw) skip="$harness takes MCP servers only from its persistent config" ;;
@@ -323,7 +325,7 @@ run_cell() {
       check "ACCEPT$((a + b))"
       ;;
     heavy)
-      heavy_args "$harness" "$dir"
+      heavy_args "$harness" "$cwd"
       [ -z "$skip" ] || { report_skip "$skip"; return; }
       run_turn "$harness" "$cwd" "$dir/turn.log" \
         "Call the lookup_record tool with id 7 and reply with the word ACCEPT immediately followed by the value it returns, with no space and nothing else." \
