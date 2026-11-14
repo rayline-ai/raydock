@@ -163,7 +163,7 @@ struct Server {
                 e.tokens = j.at("tokens").get<std::vector<llama_token>>();
                 e.offsets = j.at("offsets").get<std::vector<int32_t>>();
                 if (!rows_file_ok(base.string() + ".rows", e.offsets.size())) continue;
-                e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
+                e.bytes = stored_bytes(base, ".json");
                 e.mtime = j.value("saved", (int64_t) 0);
                 entries.push_back(std::move(e));
             } catch (const std::exception & ex) {
@@ -225,6 +225,19 @@ struct Server {
         return false;
     }
 
+    // Bytes an entry holds on disk: its state, rows and index (`json_ext`: ".json", or ".json.tmp" before publishing).
+    static uint64_t stored_bytes(const fs::path & base, const char * json_ext) {
+        uint64_t total = 0;
+        for (const std::string ext : {std::string(".state"), std::string(".rows"), std::string(json_ext)}) {
+            std::error_code ec;
+            const auto size = fs::file_size(base.string() + ext, ec);
+            if (!ec) total += size;
+        }
+        return total;
+    }
+
+    bool warned_too_big = false;
+
     void persist(const std::string & id, Session & s) {
         if (args.state_dir.empty() || (s.n_past < args.persist_min && !is_checkpoint(id)) || s.n_past == s.saved_at) return;
         const auto t0 = std::chrono::steady_clock::now();
@@ -258,18 +271,30 @@ struct Server {
             meta.close();
             if (!meta) return discard();
         }
+        e.bytes = stored_bytes(base, ".json.tmp");
+        const uint64_t limit = (uint64_t) (args.state_max_gb * 1e9);
+        if (e.bytes > limit) {
+            // Larger than the whole disk budget: never saved, so the budget holds. Not retried until the session grows.
+            for (const char * ext : {".state", ".rows", ".json.tmp"}) { std::error_code ec; fs::remove(base.string() + ext, ec); }
+            if (!warned_too_big) {
+                std::fprintf(stderr, "warning: a %.2f GB saved session exceeds --state-max-gb; such sessions are not saved\n",
+                             (double) e.bytes / 1e9);
+                warned_too_big = true;
+            }
+            s.saved_at = s.n_past;
+            return;
+        }
         {
             std::error_code ec;
             fs::rename(base.string() + ".json.tmp", base.string() + ".json", ec);
             if (ec) return discard();
         }
-        e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
         // drop older entries of this session (a session only grows), then enforce the disk budget, oldest first
         for (size_t i = entries.size(); i-- > 0;) if (entries[i].session == id) remove_entry(i);
         entries.push_back(std::move(e));
         uint64_t total = 0;
         for (const auto & x : entries) total += x.bytes;
-        while (total > (uint64_t) (args.state_max_gb * 1e9) && entries.size() > 1) {
+        while (total > limit && entries.size() > 1) {  // the newest entry fits on its own (checked above)
             size_t oldest = 0;
             for (size_t i = 1; i < entries.size(); ++i) if (entries[i].mtime < entries[oldest].mtime) oldest = i;
             total -= entries[oldest].bytes;
@@ -572,7 +597,7 @@ bool parse_args(int argc, char ** argv, Args & a) {
         else if (k == "--help") { usage(); return false; }
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); usage(); return false; }
     }
-    if (a.model.empty() || a.budget <= 0 || a.sessions <= 0 || a.n_ctx <= 0 || a.checkpoint < 0 ||
+    if (a.model.empty() || a.budget <= 0 || a.sessions <= 0 || a.n_ctx <= 0 || a.budget > a.n_ctx || a.checkpoint < 0 ||
         a.checkpoint % a.budget != 0 || (a.checkpoint > 0 && a.state_dir.empty())) {
         usage();
         return false;
@@ -648,6 +673,12 @@ int main(int argc, char ** argv) {
     if (a.threads > 0) { cp.n_threads = a.threads; cp.n_threads_batch = a.threads; }
     s.ctx = llama_init_from_model(s.model, cp);
     if (s.ctx == nullptr) { std::fprintf(stderr, "failed to create the context\n"); return 1; }
+    // llama.cpp clamps n_batch to the context; a decode call larger than n_batch aborts. Serve exactly --budget or refuse.
+    if ((int) llama_n_batch(s.ctx) != a.budget) {
+        std::fprintf(stderr, "--budget %d does not fit the context (n_batch %u); use --budget <= --ctx\n", a.budget,
+                     llama_n_batch(s.ctx));
+        return 1;
+    }
     s.seq_used.assign(a.sessions, false);
     const std::string backend = backend_name();
     s.engine = "llamacpp@b11669-arc+" + backend + "+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + tensor_tag(backend) +

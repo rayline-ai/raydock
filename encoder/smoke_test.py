@@ -131,6 +131,17 @@ def saved_sessions(binary, model):
             os.chmod(shared, 0o777)
             refused_state_dir(binary, model, shared, "that others can write to")
 
+        # A session larger than the whole --state-max-gb budget is never saved.
+        with tempfile.TemporaryDirectory() as small:
+            server, port = start(binary, model, "--state-dir", small, "--persist-min", "1", "--state-max-gb", "0.000001")
+            try:
+                post(port, "/encode", {"base": 0, "tokens": tokens, "offsets": [39], "session": "big", "owner": "big"})
+                post(port, "/close", {"owner": "big"})
+            finally:
+                stop(server)
+            saved = [f for d in os.scandir(small) if d.is_dir() for f in os.listdir(d.path) if f != "lock"]
+            check(saved == [], f"nothing is saved beyond --state-max-gb {saved}")
+
         server, port = start(binary, model, *state, "--ubatch", "32")
         try:
             status, _, _ = post(port, "/encode", {"base": 41, "tokens": [8], "offsets": [41], "session": "A"})
@@ -163,6 +174,19 @@ def main():
     if len(sys.argv) == 2:
         return
     model = sys.argv[2]
+
+    # A decode chunk (--budget) larger than the context is refused at start, not aborted on the first long request.
+    too_big = subprocess.run(
+        [binary, "--model", model, "--port", "0", "--ctx", "200", "--budget", "256", "--parent-pipe"],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    check(too_big.returncode != 0 and too_big.stdout == "", "--budget larger than --ctx is refused at start")
+    # --budget equal to an unpadded --ctx: a request filling the (padded) context is served or refused, never aborts.
+    server, port = start(binary, model, "--ctx", "250", "--budget", "250")
+    try:
+        status, _, _ = post(port, "/encode", {"base": 0, "tokens": [2] * 256, "offsets": [255], "retain": False})
+        check(status in (200, 422) and server.poll() is None, f"a context-filling request answers {status}, no abort")
+    finally:
+        stop(server)
     server = subprocess.Popen(
         [binary, "--model", model, "--port", "0", "--ctx", "256", "--budget", "64", "--ubatch", "64", "--parent-pipe"],
         stdin=subprocess.PIPE,

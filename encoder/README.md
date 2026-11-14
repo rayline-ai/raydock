@@ -43,7 +43,7 @@ rayline-arc-encoder --model arc-encoder-bf16.gguf --port 0 --budget 8192 --ctx 1
 
 `--port 0` binds a free loopback port and prints `{"listening": PORT}` as the first stdout line. `--parent-pipe` stops
 the server (saving its sessions) when its stdin closes. `--budget` is the tokens per decode call and must equal the
-encoder release's chunk size (8192 for ARC 1.0). `--threads N` sets the CPU threads. `--help` lists every flag.
+encoder release's chunk size (8192 for ARC 1.0); it may not exceed `--ctx`, or the encoder refuses to start. `--threads N` sets the CPU threads. `--help` lists every flag.
 
 `rayline` finds the encoder beside its own executable; `RAYLINE_ARC_ENCODER` names another binary.
 
@@ -89,6 +89,8 @@ fit beside the sessions held evicts the least recently used ones (saving them, w
 
 With `--state-dir DIR` (and `--persist-min`, default 16,384 tokens; `--state-max-gb`, default 32), a retained session
 is saved when it is evicted, closed, or the server stops: its sequence state, its tokens and the rows it returned.
+`--state-max-gb` counts every saved file; the oldest entries go first, and a session larger than the whole budget is
+not saved.
 Trust model: `--state-dir` is private to the user who runs the encoder; it is never a shared directory (`rayline`
 passes one under `~/.rayline`). Saved sessions hold token ids, which encode the prompt:
 - **Checks at start:** on POSIX, `--state-dir` must be the user's own directory, not a symlink, and not writable by
