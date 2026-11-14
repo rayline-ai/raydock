@@ -200,13 +200,10 @@ impl Encoder {
         }
     }
 
-    async fn restart(&mut self, context: u32) -> Result<()> {
-        tracing::info!(
-            from = self.context,
-            to = context,
-            "local ARC encoder context full; restarting it"
-        );
-        // Closing the pipe stops it after it saves its sessions.
+    /// Stop the encoder so it saves its sessions: close its parent pipe
+    /// (it exits when the pipe closes, on every platform) and wait for it,
+    /// killing it only when it doesn't exit in time.
+    pub async fn stop(&mut self) -> Result<()> {
         drop(self.parent_pipe.take());
         if tokio::time::timeout(SAVE_TIMEOUT, self.child.wait())
             .await
@@ -215,6 +212,16 @@ impl Encoder {
             tracing::warn!("local ARC encoder did not stop in time; killing it");
             self.child.kill().await?;
         }
+        Ok(())
+    }
+
+    async fn restart(&mut self, context: u32) -> Result<()> {
+        tracing::info!(
+            from = self.context,
+            to = context,
+            "local ARC encoder context full; restarting it"
+        );
+        self.stop().await?;
         let (child, parent_pipe, url) =
             spawn(&self.files, self.launch, context, self.timeout).await?;
         self.client.set_url(&url).map_err(anyhow::Error::msg)?;
@@ -506,6 +513,44 @@ mod tests {
         // its saved state instead of being encoded again.
         let sent: Vec<usize> = client.take_stats().iter().map(|s| s.tokens).collect();
         assert_eq!(sent, [second - first], "the saved session resumed");
+        // Stopping saves the session too: a new encoder resumes it.
+        encoder.stop().await.expect("the encoder stops");
+        let encoder = Encoder::start_at(
+            &files,
+            DEFAULT_BUDGET_TOKENS,
+            Duration::from_secs(120),
+            encoder.full_context(),
+        )
+        .await
+        .expect("the encoder starts again");
+        let client = encoder.client().with_stats();
+        let more = second + 2_000;
+        let tokens: Arc<Vec<u32>> =
+            Arc::new((0..more as u32).map(|i| 1_000 + i * 7 % 90_000).collect());
+        tokio::task::spawn_blocking({
+            let client = client.clone();
+            move || {
+                client.readouts(&ReadoutRequest {
+                    episode: Some("grow"),
+                    tokens: &tokens,
+                    offsets: &[more - 1],
+                })
+            }
+        })
+        .await
+        .expect("join")
+        .expect("rows after a stop");
+        // A new process's client sends the whole input; the encoder
+        // restores what it saved at stop instead of encoding it again.
+        let restored: Vec<Option<usize>> = client
+            .take_stats()
+            .iter()
+            .map(|s| s.restored_tokens)
+            .collect();
+        assert!(
+            restored.iter().flatten().any(|tokens| *tokens >= second),
+            "the session saved at stop resumed: restored {restored:?}"
+        );
         drop(encoder);
         let _ = std::fs::remove_dir_all(&state);
     }

@@ -344,6 +344,11 @@ pub async fn run(args: Args) -> Result<()> {
     stop_child(&mut child, &mut parent_pipe)
         .await
         .context("stop execution core")?;
+    // The encoder saves its sessions as it stops, so a resumed conversation
+    // isn't encoded again.
+    if let Some(encoder) = arc_encoder.as_mut() {
+        encoder.stop().await.context("stop the local ARC encoder")?;
+    }
     drop(cleanup);
     outcome
 }
