@@ -32,7 +32,7 @@ encoder/build.sh --backend cpu
 system frameworks, embeds its Metal shaders, needs macOS 13+, and never downloads anything. The server binds only
 loopback and refuses any other `--host`. `--budget` (tokens per decode call) must equal the release's chunk size
 (8192 for ARC 1.0) and not exceed `--ctx`. On Apple M4, `GGML_METAL_TENSOR_ENABLE=1` speeds up flash attention.
-`--state-dir` (saved sessions) must be a private directory of the user who runs the encoder, never a shared one.
+Retained sessions live in memory only and share one KV cache of `--ctx` tokens.
 
 ## Adding a platform
 
@@ -58,11 +58,10 @@ A new platform ships only after all seven steps pass on its target hardware.
 Follow upstream llama.cpp's Windows builds ([release.yml](https://github.com/ggml-org/llama.cpp/blob/master/.github/workflows/release.yml), [docs/build.md](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)):
 - **Build:** MSVC for CUDA, clang-cl for CPU variants, Ninja; `GGML_NATIVE=OFF`, `GGML_OPENMP=OFF`, static CRT (`/MT`).
 - **CUDA:** install the toolkit from NVIDIA's redist zips ([windows-setup-cuda](https://github.com/ggml-org/llama.cpp/blob/master/.github/actions/windows-setup-cuda/action.yml)) and set an explicit `CMAKE_CUDA_ARCHITECTURES` list.
-- **cuBLAS:** Windows has no static cuBLAS, so ship `cublas` and `cublasLt` DLLs beside the `.exe`.
+- **cuBLAS:** Windows has no static cuBLAS, so ship `cublas64_12.dll` (102.5 MB) and `cublasLt64_12.dll` (668.7 MB) beside the `.exe` (57.6 MB). With `/MT` no VC++ redistributable is needed.
 - **Drivers:** CUDA 12 builds need driver ≥ 525, CUDA 13 builds ≥ 580 ([release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/)).
-- **Unicode paths:** use a UTF-8 argv (`wmain`/`GetCommandLineW`) or a UTF-8 `activeCodePage` manifest ([#18571](https://github.com/ggml-org/llama.cpp/issues/18571)). Expect long paths too.
+- **Unicode and long paths:** embed an app manifest with `activeCodePage` UTF-8 and `longPathAware` ([#18571](https://github.com/ggml-org/llama.cpp/issues/18571)). Measured: a wide argv alone fails, because `std::filesystem::path` still uses the ANSI code page. The manifest goes in with the Windows build job.
 - **Process:** the parent puts the encoder in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; closing stdin (`--parent-pipe`) gives the graceful exit, since there is no SIGTERM.
-- **State dir:** `--state-dir` must be under `%USERPROFILE%`; its ACL keeps saved sessions private, and no mode check applies.
 - **Model cache:** Hugging Face cache symlinks need Developer Mode, or a fallback that copies files.
 - **Signing:** Authenticode-sign the `.exe` and the DLLs, with a timestamp. EV certificates no longer bypass SmartScreen ([Microsoft Learn](https://learn.microsoft.com/windows/apps/package-and-deploy/smartscreen-reputation)).
 - **Later:** Vulkan and Windows arm64 are phase 2.
@@ -74,6 +73,7 @@ Follow upstream llama.cpp's Windows builds ([release.yml](https://github.com/ggm
 | macOS arm64 | Metal | M4 Max | 256/265 | yes |
 | Linux aarch64 | CUDA | GB10 | 258/265 | no |
 | Linux x86_64 | CUDA | L4 (sm_89) | 258/265 | no |
+| Windows x86_64 | CUDA | L4 (sm_89) | 258/265 (bit-identical to Linux L4; 10–20% slower) | no |
 | Linux | CPU | any | not run | no: 77 s for an 8k first encode |
 
 ## Performance reference
@@ -93,8 +93,7 @@ of 2–4 calls (1 at 262k), `--ctx 24576` up to 21.5k and `--ctx 270000` above. 
 
 Memory is fixed mostly by `--ctx`: at 24,576 the M4 Max uses 1.72 GB RSS (0.86 GB footprint) and GB10/L4 about
 1.3 GB RSS plus 1.6 GB GPU; at 270,000, 5.2 GB RSS on the M4 Max and 4.0 GB GPU on GB10/L4. On M4 the tensor kernels
-cut a 64k first encode from ~20 s to ~12 s. Restoring a saved 21.5k session plus a +2k append takes 0.24 s, against
-1.8 s to re-encode it.
+cut a 64k first encode from ~20 s to ~12 s.
 
 ## License
 
