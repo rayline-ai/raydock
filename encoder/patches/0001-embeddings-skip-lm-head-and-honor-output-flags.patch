@@ -1,0 +1,28 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 9ee64b5..69baa9e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1841,7 +1841,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     const int64_t n_vocab = vocab.n_tokens();
+ 
+     // when computing embeddings, all tokens are output
+-    const bool output_all   = cparams.embeddings;
++    // arc-encoder patch: per-token (pooling NONE) embeddings honor the batch output flags, like logits do
++    const bool output_all   = cparams.embeddings && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE;
+     // non-causal attention needs the whole sequence in one ubatch
+     const bool embd_all     = output_all || !cparams.causal_attn;
+     const bool has_samplers = !sampling.samplers.empty();
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 6cadda9..3ab9f99 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4073,7 +4073,8 @@ void llm_graph_context::build_pooling(
+ 
+ void llm_graph_context::build_logits() const {
+     // a pooled embeddings context outputs one vector per sequence, so its graph skips the LM head
+-    if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE) {
++    // arc-encoder patch: an embeddings context never reads logits, so skip the LM head for per-token embeddings too
++    if (cparams.embeddings) {
+         res->t_logits = nullptr;
+     }
+ 

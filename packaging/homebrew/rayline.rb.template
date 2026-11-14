@@ -40,6 +40,12 @@ class Rayline < Formula
       bin.install "rayline-core"
       pkgshare.install "rayline-core-LICENSE"
     end
+    # The local ARC encoder ships in the macOS arm64 archive only.
+    encoder_root = archive_root || "."
+    if File.exist?("#{encoder_root}/rayline-arc-encoder")
+      bin.install "#{encoder_root}/rayline-arc-encoder"
+      pkgshare.install "#{encoder_root}/rayline-arc-encoder-LICENSE"
+    end
   end
 
   test do

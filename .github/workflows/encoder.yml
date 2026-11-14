@@ -1,0 +1,49 @@
+name: ARC encoder
+
+# Builds rayline-arc-encoder from the pinned llama.cpp source and smoke-tests it. Runs only when the encoder or its
+# pin changes, so Rust-only changes do not wait on it.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "encoder/**"
+      - "release/encoder-source.json"
+      - ".github/workflows/encoder.yml"
+  pull_request:
+    paths:
+      - "encoder/**"
+      - "release/encoder-source.json"
+      - ".github/workflows/encoder.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # A 1.2 MB llama GGUF, pinned by revision and sha256: the smoke test needs any model, not the ARC encoder.
+  SMOKE_MODEL_URL: https://huggingface.co/ggml-org/models-moved/resolve/499bc8821c6b12b4e53c5bffcb21ec206f212d81/tinyllamas/stories260K.gguf
+  SMOKE_MODEL_SHA256: 270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d
+
+jobs:
+  build:
+    name: Build and smoke test (macOS arm64)
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          persist-credentials: false
+
+      - name: Build
+        run: encoder/build.sh --output-dir "$RUNNER_TEMP/encoder"
+
+      - name: Fetch the smoke-test model
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/smoke.gguf" "$SMOKE_MODEL_URL"
+          echo "$SMOKE_MODEL_SHA256  $RUNNER_TEMP/smoke.gguf" | shasum -a 256 -c -
+
+      - name: Smoke test
+        run: python3 -I encoder/smoke_test.py "$RUNNER_TEMP/encoder/rayline-arc-encoder" "$RUNNER_TEMP/smoke.gguf"

@@ -108,6 +108,19 @@ jobs:
         shell: bash
         run: python3 scripts/build-hybrid-core.py --source-dir core-source --platform '${{ matrix.platform_tag }}' --output-dir dist
 
+      # macOS arm64 only: the local ARC encoder runs on Metal. Built from the
+      # llama.cpp commit and patches pinned in release/encoder-source.json.
+      - name: Build ARC encoder
+        if: matrix.platform_tag == 'macosx_11_0_arm64'
+        shell: bash
+        env:
+          PLATFORM_TAG: ${{ matrix.platform_tag }}
+        run: |
+          set -euo pipefail
+          encoder/build.sh --output-dir "$RUNNER_TEMP/encoder"
+          cp "$RUNNER_TEMP/encoder/rayline-arc-encoder" "dist/rayline-arc-encoder-${PLATFORM_TAG}"
+          cp "$RUNNER_TEMP/encoder/rayline-arc-encoder-LICENSE" dist/rayline-arc-encoder-LICENSE
+
       - name: Install Rust
         shell: bash
         run: |
@@ -143,6 +156,12 @@ jobs:
           cp "dist/rayline-core-${PLATFORM_TAG}" "package/${package_dir}/rayline-core${EXE_SUFFIX}"
           cp dist/rayline-core-source.json dist/rayline-core-LICENSE "package/${package_dir}/"
           cp README.md LICENSE NOTICE "package/${package_dir}/"
+          encoder_asset="dist/rayline-arc-encoder-${PLATFORM_TAG}"
+          if [[ -f "$encoder_asset" ]]; then
+            cp "$encoder_asset" "package/${package_dir}/rayline-arc-encoder"
+            cp dist/rayline-arc-encoder-LICENSE "package/${package_dir}/"
+            chmod 0755 "$encoder_asset" "package/${package_dir}/rayline-arc-encoder"
+          fi
 
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             pwsh -NoProfile -Command \
@@ -258,6 +277,7 @@ jobs:
           Assets:
           - \`rayline-<platform>\` and \`rayline-core-<platform>\` are the bare binaries used by \`rayline update\` and the install scripts.
           - \`rayline-${version}-<platform>.tar.gz\` / \`.zip\` archives contain \`rayline\`, \`rayline-core\`, source provenance and license/readme files.
+          - \`rayline-arc-encoder-macosx_11_0_arm64\` is the local ARC encoder (macOS arm64 only; also in that archive), with its third-party licenses in \`rayline-arc-encoder-LICENSE\`.
           - \`SHA256SUMS\` covers every uploaded binary, archive and provenance file.
           - \`SHA256SUMS.minisig\` is the minisign signature over \`SHA256SUMS\`.
           EOF
