@@ -329,6 +329,18 @@ prompt tokens. Source: https://huggingface.co/Qwen/Qwen3.8-27B at revision
     Licensed under the Apache License, Version 2.0 (see rayline-core-LICENSE).
 
 --------------------------------------------------------------------------------
+ARC encoder (rayline-arc-encoder, macOS arm64 only)
+--------------------------------------------------------------------------------
+
+rayline-arc-encoder statically links llama.cpp and ggml
+(https://github.com/ggml-org/llama.cpp, MIT License, Copyright (c) 2023-2026
+The ggml authors), with cpp-httplib (MIT License, Copyright (c) 2017 yhirose)
+and nlohmann/json (MIT License, Copyright (c) 2013-2025 Niels Lohmann) from
+that source. The exact commit and patches are pinned in
+release/encoder-source.json; the full license texts ship beside the binary in
+rayline-arc-encoder-LICENSE.
+
+--------------------------------------------------------------------------------
 Design Attributions
 --------------------------------------------------------------------------------
 

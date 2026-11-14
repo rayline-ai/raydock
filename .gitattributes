@@ -1,1 +1,3 @@
 crates/rayline-cli/tests/fixtures/** -text
+# Patches are pinned by sha256 and their context lines carry the source's whitespace.
+encoder/patches/*.patch -text -whitespace

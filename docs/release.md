@@ -30,6 +30,10 @@ The release workflow uploads:
 - `rayline-<version>-windows_x86_64.zip` for Windows;
 - `rayline-core-LICENSE`, the execution core's license;
 - `rayline-core-source.json` with the pinned public source and toolchain;
+- `rayline-arc-encoder-macosx_11_0_arm64`, the local ARC encoder, and
+  `rayline-arc-encoder-LICENSE`, the licenses of the llama.cpp code it bundles
+  (macOS arm64 only; the macOS arm64 archive carries both, and other platforms
+  ship without them);
 - `SHA256SUMS` covering every uploaded binary, archive, license and provenance
   file, and `SHA256SUMS.minisig`, its minisign signature;
 - `latest.txt`, the release's version pointer, and `latest.txt.minisig`, its
@@ -58,6 +62,8 @@ https://get.rayline.ai/cli/v<version>/rayline-<platform>
 https://get.rayline.ai/cli/v<version>/rayline-core-<platform>
 https://get.rayline.ai/cli/v<version>/rayline-core-LICENSE
 https://get.rayline.ai/cli/v<version>/rayline-core-source.json
+https://get.rayline.ai/cli/v<version>/rayline-arc-encoder-macosx_11_0_arm64
+https://get.rayline.ai/cli/v<version>/rayline-arc-encoder-LICENSE
 https://get.rayline.ai/cli/v<version>/SHA256SUMS
 https://get.rayline.ai/cli/v<version>/SHA256SUMS.minisig
 ```
@@ -164,3 +170,24 @@ Production Homebrew publishing is handled by the Rayline release pipeline.
 `packaging/homebrew/rayline.rb.template` applies
 only to this repo's manual fallback archives; see the packaging README for the
 different layouts.
+
+## ARC encoder build
+
+`rayline-arc-encoder` is the local ARC encoder: `encoder/arc_encoder_server.cpp`
+linked against a static llama.cpp with the Metal shaders embedded. It ships for
+macOS arm64 only. `release/encoder-source.json` pins the llama.cpp repository,
+the exact commit and the sha256 of every patch in `encoder/patches/`; both
+release pipelines build it with:
+
+```bash
+encoder/build.sh --output-dir dist-encoder
+```
+
+The script fetches the pinned commit, refuses another commit, local changes or
+a patch whose sha256 differs from the pin, applies the patches and writes
+`rayline-arc-encoder` and `rayline-arc-encoder-LICENSE`. The install scripts and
+`rayline update` install both beside `rayline` when the release's `SHA256SUMS`
+lists `rayline-arc-encoder-<platform>`, and skip them otherwise. `rayline` looks
+for the encoder beside its own executable unless `RAYLINE_ARC_ENCODER` names
+another binary. The `ARC encoder` CI workflow builds and smoke-tests it when
+`encoder/` or the pin changes.

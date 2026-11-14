@@ -1,0 +1,599 @@
+// rayline-arc-encoder: a loopback HTTP server that runs the ARC encoder (a GGUF model) on llama.cpp and returns
+// its final-layer state at requested token offsets. Rayline's local routing starts it and reads those rows.
+//
+// Protocol (JSON requests; every response but a successful /encode is JSON):
+//
+//   GET  /health  -> {"engine","depth","budget","rope","max_model_len","layer","dim","sessions",
+//                     "capabilities","checkpoint"}
+//   POST /encode  {"tokens": [id...], "offsets": [abs...], "base": N,
+//                  "session": "id" | "retain": false, ["owner": "id"], ["images": [...]]}
+//                 `tokens` are the token ids at positions base..; `offsets` are absolute positions in
+//                 [base, base + len(tokens)), strictly ascending. With "session", the tokens are kept as a retained
+//                 session: base 0 starts (or replaces) it, base N appends to a session that holds exactly N tokens.
+//                 With "retain": false (base 0 only), nothing is kept.
+//                 -> 200 raw little-endian float32 rows, one per offset (headers x-rows, x-dim, x-timing-ms,
+//                    x-restored-tokens);
+//                    409 {"error":"unknown_session"}: an append to a session not held at that base;
+//                    422 {"error": code}: invalid_body, offsets_out_of_range, invalid_retain, images_not_served,
+//                    exceeds_kv_budget (input longer than --ctx);
+//                    503 {"error":"decode_failed"}.
+//   POST /close   {"owner"} -> {"closed": n}: drop (and save, with --state-dir) that owner's sessions.
+//
+// With --port 0 the server binds a free port and prints {"listening": PORT} as its first stdout line. With
+// --parent-pipe it stops when its stdin closes, so it never outlives the process that started it.
+//
+// With --state-dir, a retained session of at least --persist-min tokens is saved to disk when it is evicted, closed
+// or the server stops (SIGINT/SIGTERM, or stdin closing with --parent-pipe): its llama sequence state (full-attention
+// KV plus GatedDeltaNet state), its tokens, and the readout rows it returned. A later request restores instead of
+// re-encoding:
+//   - an append (base > 0) to a session this process does not hold resumes the saved state of that session at base;
+//   - a full encode (base 0) whose tokens start with a saved entry's tokens restores the longest such entry and encodes
+//     only the rest, provided every requested offset inside the saved prefix has a saved row.
+// The recurrent state cannot be truncated, so an entry only ever resumes from its exact end.
+//
+// Readouts are llama.cpp's per-token embeddings with pooling NONE: the final norm's output, read at each requested
+// absolute offset. A retained session is one llama sequence id holding both the full-attention KV and the
+// GatedDeltaNet recurrent state, so an append continues it; an unretained encode uses a scratch sequence that is
+// cleared afterwards. Text only: images are refused (images_not_served).
+
+#include "llama.h"
+#include "httplib.h"
+#include "nlohmann/json.hpp"
+
+#include <chrono>
+#include <csignal>
+#include <filesystem>
+#include <fstream>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+using json = nlohmann::json;
+
+namespace {
+
+namespace fs = std::filesystem;
+
+struct Session {
+    llama_seq_id seq = -1;
+    int32_t n_past = 0;          // tokens held: the next append's base
+    std::string owner;
+    uint64_t last_used = 0;
+    std::vector<llama_token> tokens;           // every token held (kept for persistence)
+    std::map<int32_t, std::vector<float>> rows; // readouts returned, by absolute offset
+    int32_t saved_at = 0;                      // n_past when last persisted (0: never)
+};
+
+// A persisted session on disk: <stem>.state (llama sequence state + tokens), <stem>.rows, <stem>.json.
+struct Entry {
+    std::string stem;
+    std::string session;
+    std::vector<llama_token> tokens;
+    std::vector<int32_t> offsets;  // offsets of the saved rows, ascending
+    uint64_t bytes = 0;
+    int64_t mtime = 0;
+};
+
+struct Args {
+    std::string model;
+    std::string host = "127.0.0.1";
+    int port = 18555;
+    int n_ctx = 65536;           // shared (unified) KV over every session
+    int budget = 8192;           // tokens per llama_decode call (the encoder identity's chunk_tokens)
+    int ubatch = 2048;           // physical batch llama.cpp splits each call into (compute buffer size)
+    int sessions = 4;            // retained sessions; one more sequence is the unretained scratch
+    std::string kv_type = "f16"; // f16 | bf16 | f32
+    bool flash_attn = true;
+    std::string engine_suffix;
+    std::string state_dir;       // empty: no persistence
+    int persist_min = 16384;     // smallest session worth saving
+    double state_max_gb = 32.0;  // disk budget; the oldest entries go first
+    bool parent_pipe = false;    // exit when stdin closes (a supervising parent went away)
+    bool tensor = true;          // false: never use Metal tensor-API kernels (GGML_METAL_TENSOR_DISABLE)
+    // > 0: a full encode longer than this many tokens saves its state at this length (a shared
+    // prefix: an agent's system prompt and tools), so other sessions with the same first tokens restore it.
+    // A multiple of `budget`, so the decode chunks are the ones an uninterrupted encode uses.
+    int checkpoint = 0;
+};
+
+struct Server {
+    Args args;
+    llama_model * model = nullptr;
+    llama_context * ctx = nullptr;
+    int dim = 0;
+    std::mutex mu;
+    std::map<std::string, Session> sessions;
+    std::vector<bool> seq_used;
+    uint64_t clock = 0;
+    std::string engine;
+
+    std::vector<Entry> entries;
+
+    llama_seq_id scratch() const { return args.sessions; }
+
+    static std::string stem_for(const std::string & session, int32_t n) {
+        return std::to_string(std::hash<std::string>{}(session)) + "-" + std::to_string(n);
+    }
+
+    void load_index() {
+        if (args.state_dir.empty()) return;
+        fs::create_directories(args.state_dir);
+        for (const auto & f : fs::directory_iterator(args.state_dir)) {
+            if (f.path().extension() != ".json") continue;
+            std::ifstream in(f.path());
+            json j = json::parse(in, nullptr, false);
+            const fs::path base = f.path().parent_path() / f.path().stem();
+            if (j.is_discarded() || !fs::exists(base.string() + ".state") || !fs::exists(base.string() + ".rows")) continue;
+            Entry e;
+            e.stem = f.path().stem().string();
+            e.session = j.value("session", "");
+            e.tokens = j["tokens"].get<std::vector<llama_token>>();
+            e.offsets = j["offsets"].get<std::vector<int32_t>>();
+            e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
+            e.mtime = j.value("saved", (int64_t) 0);
+            entries.push_back(std::move(e));
+        }
+        std::fprintf(stderr, "rayline-arc-encoder: %zu saved sessions in %s\n", entries.size(), args.state_dir.c_str());
+    }
+
+    void remove_entry(size_t i) {
+        const fs::path base = fs::path(args.state_dir) / entries[i].stem;
+        for (const char * ext : {".json", ".state", ".rows"}) { std::error_code ec; fs::remove(base.string() + ext, ec); }
+        entries.erase(entries.begin() + (long) i);
+    }
+
+    // Save a retained session (if persistence is on and it is big enough and has grown since its last save).
+    static bool is_checkpoint(const std::string & session) { return session.rfind("checkpoint-", 0) == 0; }
+
+    // The session id of the checkpoint for these first tokens.
+    static std::string checkpoint_id(const std::vector<llama_token> & tokens, int32_t n) {
+        uint64_t h = 1469598103934665603ull;  // FNV-1a over the token ids
+        for (int32_t i = 0; i < n; ++i) { h ^= (uint32_t) tokens[i]; h *= 1099511628211ull; }
+        return "checkpoint-" + std::to_string(h) + "-" + std::to_string(n);
+    }
+
+    bool has_checkpoint(const std::vector<llama_token> & tokens, int32_t n) const {
+        const std::string id = checkpoint_id(tokens, n);
+        for (const auto & e : entries)
+            if (e.session == id && std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) return true;
+        return false;
+    }
+
+    void persist(const std::string & id, Session & s) {
+        if (args.state_dir.empty() || (s.n_past < args.persist_min && !is_checkpoint(id)) || s.n_past == s.saved_at) return;
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string stem = stem_for(id, s.n_past);
+        const fs::path base = fs::path(args.state_dir) / stem;
+        if (llama_state_seq_save_file(ctx, (base.string() + ".state").c_str(), s.seq, s.tokens.data(), s.tokens.size()) == 0) {
+            std::fprintf(stderr, "persist %s failed\n", id.c_str());
+            return;
+        }
+        Entry e;
+        e.stem = stem;
+        e.session = id;
+        e.tokens = s.tokens;
+        {
+            std::ofstream rows(base.string() + ".rows", std::ios::binary);
+            for (const auto & [off, row] : s.rows) {
+                e.offsets.push_back(off);
+                rows.write(reinterpret_cast<const char *>(row.data()), (std::streamsize) (row.size() * sizeof(float)));
+            }
+        }
+        e.mtime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+        {
+            std::ofstream meta(base.string() + ".json");
+            meta << json{{"session", id}, {"tokens", e.tokens}, {"offsets", e.offsets}, {"saved", e.mtime}}.dump();
+        }
+        e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
+        // drop older entries of this session (a session only grows), then enforce the disk budget, oldest first
+        for (size_t i = entries.size(); i-- > 0;) if (entries[i].session == id) remove_entry(i);
+        entries.push_back(std::move(e));
+        uint64_t total = 0;
+        for (const auto & x : entries) total += x.bytes;
+        while (total > (uint64_t) (args.state_max_gb * 1e9) && entries.size() > 1) {
+            size_t oldest = 0;
+            for (size_t i = 1; i < entries.size(); ++i) if (entries[i].mtime < entries[oldest].mtime) oldest = i;
+            total -= entries[oldest].bytes;
+            remove_entry(oldest);
+        }
+        s.saved_at = s.n_past;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "persisted %s: %d tokens in %.0f ms\n", id.c_str(), s.n_past, ms);
+    }
+
+    // Restore entry `e` into `seq`, filling the session's tokens and rows. False if llama.cpp refuses the state.
+    bool restore(const Entry & e, llama_seq_id seq, Session & s) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const fs::path base = fs::path(args.state_dir) / e.stem;
+        llama_memory_seq_rm(llama_get_memory(ctx), seq, -1, -1);
+        std::vector<llama_token> toks(e.tokens.size());
+        size_t n = 0;
+        if (llama_state_seq_load_file(ctx, (base.string() + ".state").c_str(), seq, toks.data(), toks.size(), &n) == 0 ||
+            n != e.tokens.size()) {
+            llama_memory_seq_rm(llama_get_memory(ctx), seq, -1, -1);
+            std::fprintf(stderr, "restore %s failed\n", e.stem.c_str());
+            return false;
+        }
+        std::ifstream rows(base.string() + ".rows", std::ios::binary);
+        s.rows.clear();
+        for (int32_t off : e.offsets) {
+            std::vector<float> row(dim);
+            rows.read(reinterpret_cast<char *>(row.data()), (std::streamsize) (dim * sizeof(float)));
+            s.rows[off] = std::move(row);
+        }
+        s.tokens = e.tokens;
+        s.n_past = (int32_t) e.tokens.size();
+        s.saved_at = s.n_past;
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "restored %s: %d tokens in %.0f ms\n", e.stem.c_str(), s.n_past, ms);
+        return true;
+    }
+
+    // The longest saved entry whose tokens prefix `tokens` and that holds a row for every offset below its end.
+    const Entry * best_prefix(const std::vector<llama_token> & tokens, const std::vector<int32_t> & offsets) const {
+        const Entry * best = nullptr;
+        for (const auto & e : entries) {
+            const size_t n = e.tokens.size();
+            if (n > tokens.size() || (best && n <= best->tokens.size()) || ((int) n < args.persist_min && !is_checkpoint(e.session))) continue;
+            if (!std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) continue;
+            bool covered = true;
+            for (int32_t off : offsets) {
+                if (off >= (int32_t) n) break;
+                if (!std::binary_search(e.offsets.begin(), e.offsets.end(), off)) { covered = false; break; }
+            }
+            if (covered) best = &e;
+        }
+        return best;
+    }
+
+    void drop(const Session & s) { llama_memory_seq_rm(llama_get_memory(ctx), s.seq, -1, -1); seq_used[s.seq] = false; }
+
+    // A free sequence id for a new retained session, evicting the least recently used one when all are taken.
+    llama_seq_id take_seq() {
+        for (int i = 0; i < args.sessions; ++i) {
+            if (!seq_used[i]) { seq_used[i] = true; return i; }
+        }
+        auto lru = sessions.begin();
+        for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+            if (it->second.last_used < lru->second.last_used) lru = it;
+        }
+        llama_seq_id seq = lru->second.seq;
+        persist(lru->first, lru->second);
+        drop(lru->second);
+        sessions.erase(lru);
+        seq_used[seq] = true;
+        return seq;
+    }
+
+    // Decode `tokens` at positions base.. on `seq`, returning the rows at `offsets` (absolute, sorted ascending,
+    // each in [base, base + tokens.size())). Empty optional on a decode failure (the caller clears the sequence).
+    std::optional<std::vector<float>> run(llama_seq_id seq, int32_t base, const std::vector<llama_token> & tokens,
+                                          const std::vector<int32_t> & offsets) {
+        std::vector<float> rows;
+        rows.reserve(offsets.size() * dim);
+        size_t next = 0;
+        const int32_t n = (int32_t) tokens.size();
+        llama_batch batch = llama_batch_init(args.budget, 0, 1);
+        for (int32_t start = 0; start < n; start += args.budget) {
+            const int32_t stop = std::min(n, start + args.budget);
+            batch.n_tokens = 0;
+            std::vector<int32_t> wanted;
+            for (int32_t i = start; i < stop; ++i) {
+                const int32_t k = batch.n_tokens++;
+                batch.token[k] = tokens[i];
+                batch.pos[k] = base + i;
+                batch.n_seq_id[k] = 1;
+                batch.seq_id[k][0] = seq;
+                const bool out = next < offsets.size() && offsets[next] == base + i;
+                batch.logits[k] = out;
+                if (out) { wanted.push_back(k); ++next; }
+            }
+            if (llama_decode(ctx, batch) != 0) { llama_batch_free(batch); return std::nullopt; }
+            for (int32_t k : wanted) {
+                const float * e = llama_get_embeddings_ith(ctx, k);
+                if (e == nullptr) { llama_batch_free(batch); return std::nullopt; }
+                rows.insert(rows.end(), e, e + dim);
+            }
+        }
+        llama_batch_free(batch);
+        return rows;
+    }
+};
+
+void refuse(httplib::Response & res, int status, const std::string & code) {
+    res.status = status;
+    res.set_content(json{{"error", code}}.dump(), "application/json");
+}
+
+// A supervisor reads this (`--help`) to learn which optional flags the build takes.
+void usage() {
+    std::fprintf(stderr, "usage: rayline-arc-encoder --model F.gguf [--port P] [--ctx N] [--budget N] "
+                         "[--ubatch N] [--sessions N] [--kv-type f16|bf16|f32] [--no-flash-attn] [--no-tensor]\n"
+                         "       [--state-dir DIR] [--persist-min N] [--state-max-gb G] [--parent-pipe]\n"
+                         "       [--checkpoint N (a multiple of --budget; needs --state-dir)]\n");
+}
+
+bool parse_args(int argc, char ** argv, Args & a) {
+    for (int i = 1; i < argc; ++i) {
+        std::string k = argv[i];
+        auto val = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
+        if (k == "--model") a.model = val();
+        else if (k == "--host") a.host = val();
+        else if (k == "--port") a.port = std::atoi(val().c_str());
+        else if (k == "--ctx") a.n_ctx = std::atoi(val().c_str());
+        else if (k == "--budget") a.budget = std::atoi(val().c_str());
+        else if (k == "--ubatch") a.ubatch = std::atoi(val().c_str());
+        else if (k == "--sessions") a.sessions = std::atoi(val().c_str());
+        else if (k == "--kv-type") a.kv_type = val();
+        else if (k == "--no-flash-attn") a.flash_attn = false;
+        else if (k == "--engine-suffix") a.engine_suffix = val();
+        else if (k == "--state-dir") a.state_dir = val();
+        else if (k == "--persist-min") a.persist_min = std::atoi(val().c_str());
+        else if (k == "--state-max-gb") a.state_max_gb = std::atof(val().c_str());
+        else if (k == "--no-tensor") a.tensor = false;
+        else if (k == "--parent-pipe") a.parent_pipe = true;
+        else if (k == "--checkpoint") a.checkpoint = std::atoi(val().c_str());
+        else if (k == "--help") { usage(); return false; }
+        else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); usage(); return false; }
+    }
+    if (a.model.empty() || a.budget <= 0 || a.sessions <= 0 || a.n_ctx <= 0 || a.checkpoint < 0 ||
+        a.checkpoint % a.budget != 0 || (a.checkpoint > 0 && a.state_dir.empty())) {
+        usage();
+        return false;
+    }
+    return true;
+}
+
+httplib::Server * g_http = nullptr;
+void on_signal(int) { if (g_http) g_http->stop(); }
+
+}  // namespace
+
+int main(int argc, char ** argv) {
+    Server s;
+    if (!parse_args(argc, argv, s.args)) return 2;
+    const Args & a = s.args;
+
+    // llama.cpp uses the Metal tensor API on M5 and later, or when GGML_METAL_TENSOR_ENABLE is set (a launcher sets
+    // it on M4, where this model's flash attention is faster with it); --no-tensor turns it off everywhere.
+    if (!a.tensor) setenv("GGML_METAL_TENSOR_DISABLE", "1", 1);
+    llama_backend_init();
+    llama_model_params mp = llama_model_default_params();
+    mp.n_gpu_layers = 999;
+    s.model = llama_model_load_from_file(a.model.c_str(), mp);
+    if (s.model == nullptr) { std::fprintf(stderr, "failed to load %s\n", a.model.c_str()); return 1; }
+    s.dim = llama_model_n_embd(s.model);
+
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = a.n_ctx;
+    cp.n_batch = a.budget;
+    cp.n_ubatch = std::min(a.ubatch, a.budget);
+    cp.n_seq_max = a.sessions + 1;
+    cp.kv_unified = true;
+    cp.embeddings = true;
+    cp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+    cp.flash_attn_type = a.flash_attn ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    const ggml_type kv = a.kv_type == "bf16" ? GGML_TYPE_BF16 : a.kv_type == "f32" ? GGML_TYPE_F32 : GGML_TYPE_F16;
+    cp.type_k = kv;
+    cp.type_v = kv;
+    s.ctx = llama_init_from_model(s.model, cp);
+    if (s.ctx == nullptr) { std::fprintf(stderr, "failed to create the context\n"); return 1; }
+    s.seq_used.assign(a.sessions, false);
+    s.engine = "llamacpp@b11669-arc+metal+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + (a.tensor && std::getenv("GGML_METAL_TENSOR_ENABLE") ? "+tensor" : "") +
+               a.engine_suffix;
+    s.load_index();
+
+    httplib::Server http;
+
+    http.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
+        std::lock_guard<std::mutex> lock(s.mu);
+        json h = {{"engine", s.engine}, {"depth", llama_model_n_layer(s.model)}, {"budget", a.budget},
+                  {"rope", "yarn-f4"}, {"max_model_len", (int) llama_n_ctx(s.ctx)}, {"dim", s.dim},
+                  {"layer", "block_" + std::to_string(llama_model_n_layer(s.model) - 1)},
+                  {"sessions", (int) s.sessions.size()},
+                  // Optional flags this build accepts, so a supervisor passes only those.
+                  {"capabilities", json::array({"checkpoint"})}, {"checkpoint", a.checkpoint}};
+        res.set_content(h.dump(), "application/json");
+    });
+
+    http.Post("/encode", [&](const httplib::Request & req, httplib::Response & res) {
+        json body = json::parse(req.body, nullptr, false);
+        if (body.is_discarded() || !body.is_object() || !body.contains("tokens") || !body.contains("offsets"))
+            return refuse(res, 422, "invalid_body");
+        if (body.contains("images") && !body["images"].empty()) return refuse(res, 422, "images_not_served");
+        std::vector<llama_token> tokens;
+        std::vector<int32_t> offsets;
+        int32_t base = 0;
+        try {
+            tokens = body["tokens"].get<std::vector<llama_token>>();
+            offsets = body["offsets"].get<std::vector<int32_t>>();
+            base = body.value("base", 0);
+        } catch (const std::exception &) {
+            return refuse(res, 422, "invalid_body");
+        }
+        if (tokens.empty() || offsets.empty()) return refuse(res, 422, "invalid_body");
+        for (size_t i = 0; i < offsets.size(); ++i) {
+            if (offsets[i] < base || offsets[i] >= base + (int32_t) tokens.size() || (i && offsets[i] <= offsets[i - 1]))
+                return refuse(res, 422, "offsets_out_of_range");
+        }
+        const bool retained = body.contains("session") && body["session"].is_string();
+        if (!retained && body.value("retain", true)) return refuse(res, 422, "invalid_retain");
+
+        std::lock_guard<std::mutex> lock(s.mu);
+        if (base + (int64_t) tokens.size() > (int64_t) llama_n_ctx(s.ctx)) {
+            res.status = 422;
+            res.set_content(json{{"error", "exceeds_kv_budget"}, {"tokens", base + (int) tokens.size()}}.dump(),
+                            "application/json");
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        llama_seq_id seq;
+        Session * session = nullptr;
+        Session scratch_session;  // an unretained encode's view of a restored prefix
+        const std::string id = retained ? body["session"].get<std::string>() : "";
+        if (retained) {
+            auto it = s.sessions.find(id);
+            if (base == 0) {
+                if (it != s.sessions.end()) { s.drop(it->second); s.sessions.erase(it); }
+                Session fresh;
+                fresh.seq = s.take_seq();
+                fresh.owner = body.value("owner", "");
+                session = &(s.sessions[id] = fresh);
+            } else if (it != s.sessions.end() && it->second.n_past == base) {
+                session = &it->second;
+            } else {
+                // not held (or held at another length): resume a saved state of this session that ends at base
+                const Entry * saved = nullptr;
+                for (const auto & e : s.entries) if (e.session == id && (int32_t) e.tokens.size() == base) saved = &e;
+                if (saved == nullptr) return refuse(res, 409, "unknown_session");
+                if (it != s.sessions.end()) { s.drop(it->second); s.sessions.erase(it); }
+                Session fresh;
+                fresh.seq = s.take_seq();
+                fresh.owner = body.value("owner", "");
+                if (!s.restore(*saved, fresh.seq, fresh)) { s.seq_used[fresh.seq] = false; return refuse(res, 409, "unknown_session"); }
+                session = &(s.sessions[id] = std::move(fresh));
+            }
+            seq = session->seq;
+        } else {
+            if (base != 0) return refuse(res, 422, "invalid_retain");
+            seq = s.scratch();
+            llama_memory_seq_rm(llama_get_memory(s.ctx), seq, -1, -1);
+            scratch_session.seq = seq;
+        }
+        Session & held = session != nullptr ? *session : scratch_session;
+
+        // a full encode may start from a saved prefix
+        int32_t start = base;
+        if (base == 0) {
+            if (const Entry * e = s.best_prefix(tokens, offsets)) {
+                if (s.restore(*e, seq, held)) start = held.n_past;
+            }
+        }
+
+        std::vector<float> out;
+        out.reserve(offsets.size() * s.dim);
+        std::vector<int32_t> fresh_offsets;
+        for (int32_t off : offsets) {
+            if (off < start) {
+                const auto & row = held.rows.at(off);
+                out.insert(out.end(), row.begin(), row.end());
+            } else {
+                fresh_offsets.push_back(off);
+            }
+        }
+        // Decode `part` at positions from.. and return the rows at `offs` (none: no rows).
+        auto decode = [&](int32_t from, const std::vector<llama_token> & part, const std::vector<int32_t> & offs) {
+            if (!offs.empty()) return s.run(seq, from, part, offs);
+            // llama.cpp needs at least one output per decode call chain; ask for the last token and discard it
+            auto r = s.run(seq, from, part, {from + (int32_t) part.size() - 1});
+            if (r) r->clear();
+            return r;
+        };
+        std::optional<std::vector<float>> rows = std::vector<float>{};
+        const int32_t ck = s.args.checkpoint;
+        // Retained or not: either way the sequence holds exactly the first `ck` tokens when it is saved.
+        const bool checkpoint = ck > 0 && base == 0 && start < ck &&
+                                ck < (int32_t) tokens.size() && !s.has_checkpoint(tokens, ck);
+        if (checkpoint) {
+            // Decode up to the checkpoint, save the sequence there as its own entry, then decode the rest.
+            const std::vector<llama_token> head(tokens.begin() + start, tokens.begin() + ck);
+            const std::vector<llama_token> tail(tokens.begin() + ck, tokens.end());
+            std::vector<int32_t> lo, hi;
+            for (int32_t off : fresh_offsets) (off < ck ? lo : hi).push_back(off);
+            auto first = decode(start, head, lo);
+            if (first) {
+                Session view;
+                view.seq = seq;
+                view.n_past = ck;
+                view.tokens.assign(tokens.begin(), tokens.begin() + ck);
+                for (const auto & [off, row] : held.rows) if (off < start) view.rows[off] = row;
+                for (size_t i = 0; i < lo.size(); ++i)
+                    view.rows[lo[i]] = std::vector<float>(first->begin() + (long) (i * s.dim), first->begin() + (long) ((i + 1) * s.dim));
+                s.persist(Server::checkpoint_id(tokens, ck), view);
+                auto second = decode(ck, tail, hi);
+                if (second) first->insert(first->end(), second->begin(), second->end());
+                rows = second ? first : std::nullopt;
+            } else {
+                rows = std::nullopt;
+            }
+        } else if (start < base + (int32_t) tokens.size()) {
+            const std::vector<llama_token> rest(tokens.begin() + (start - base), tokens.end());
+            rows = decode(start, rest, fresh_offsets);
+        }
+        if (!retained) llama_memory_seq_rm(llama_get_memory(s.ctx), seq, -1, -1);
+        if (!rows) {
+            if (session != nullptr) {
+                s.drop(*session);
+                s.sessions.erase(id);
+            }
+            return refuse(res, 503, "decode_failed");
+        }
+        out.insert(out.end(), rows->begin(), rows->end());
+        if (session != nullptr) {
+            session->tokens.resize(start);
+            session->tokens.insert(session->tokens.end(), tokens.begin() + (start - base), tokens.end());
+            for (size_t i = 0; i < fresh_offsets.size(); ++i)
+                session->rows[fresh_offsets[i]] = std::vector<float>(rows->begin() + (long) (i * s.dim), rows->begin() + (long) ((i + 1) * s.dim));
+            session->n_past = base + (int32_t) tokens.size();
+            session->last_used = ++s.clock;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        res.set_header("x-rows", std::to_string(offsets.size()));
+        res.set_header("x-dim", std::to_string(s.dim));
+        res.set_header("x-timing-ms", std::to_string(ms));
+        res.set_header("x-restored-tokens", std::to_string(start - base));
+        res.set_content(std::string(reinterpret_cast<const char *>(out.data()), out.size() * sizeof(float)),
+                        "application/octet-stream");
+    });
+
+    http.Post("/close", [&](const httplib::Request & req, httplib::Response & res) {
+        json body = json::parse(req.body, nullptr, false);
+        const std::string owner = body.is_object() ? body.value("owner", "") : "";
+        std::lock_guard<std::mutex> lock(s.mu);
+        int closed = 0;
+        for (auto it = s.sessions.begin(); it != s.sessions.end();) {
+            if (!owner.empty() && it->second.owner == owner) {
+                s.persist(it->first, it->second);
+                s.drop(it->second);
+                it = s.sessions.erase(it);
+                ++closed;
+            }
+            else ++it;
+        }
+        res.set_content(json{{"closed", closed}}.dump(), "application/json");
+    });
+
+    // --port 0 binds a free port; the bound port is the first stdout line, for a supervising parent.
+    const int port = a.port == 0 ? http.bind_to_any_port(a.host) : (http.bind_to_port(a.host, a.port) ? a.port : -1);
+    if (port <= 0) { std::fprintf(stderr, "cannot bind %s:%d\n", a.host.c_str(), a.port); return 1; }
+    std::fprintf(stderr, "rayline-arc-encoder: %s dim=%d ctx=%u on %s:%d\n", s.engine.c_str(), s.dim,
+                 llama_n_ctx(s.ctx), a.host.c_str(), port);
+    std::printf("{\"listening\":%d}\n", port);
+    std::fflush(stdout);
+    g_http = &http;
+    std::signal(SIGINT, on_signal);
+    std::signal(SIGTERM, on_signal);
+    if (a.parent_pipe) {
+        // The parent holds stdin open; EOF means it is gone, so stop (saving sessions) instead of lingering.
+        std::thread([] {
+            char buf[64];
+            while (std::fread(buf, 1, sizeof buf, stdin) > 0) {}
+            if (g_http) g_http->stop();
+        }).detach();
+    }
+    http.listen_after_bind();
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        for (auto & [id, session] : s.sessions) s.persist(id, session);
+    }
+    llama_free(s.ctx);
+    llama_model_free(s.model);
+    llama_backend_free();
+    return 0;
+}

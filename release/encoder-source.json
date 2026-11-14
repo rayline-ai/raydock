@@ -1,0 +1,9 @@
+{
+  "repository": "https://github.com/ggml-org/llama.cpp.git",
+  "commit": "620d2225cc436ab0b001e3200e590e3b286ef9ab",
+  "tag": "b11669",
+  "patches": {
+    "0001-embeddings-skip-lm-head-and-honor-output-flags.patch": "c957cf5dd5d58133d8c0d6ff14299259a7cf9daeccdfbacba36d7495e256bd13"
+  },
+  "min_macos": "13.0"
+}

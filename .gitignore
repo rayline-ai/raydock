@@ -16,3 +16,6 @@ __pycache__/
 
 # local wrangler upload artifacts
 .wrangler/
+
+# rayline-arc-encoder build output (encoder/build.sh)
+/encoder/build/

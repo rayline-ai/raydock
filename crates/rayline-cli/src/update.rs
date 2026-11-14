@@ -13,6 +13,9 @@ use url::Url;
 use crate::config::UpdateChannel;
 
 const CORE_LICENSE_NAME: &str = "rayline-core-LICENSE";
+/// The local ARC encoder; releases ship it for macOS arm64 only.
+const ENCODER_NAME: &str = "rayline-arc-encoder";
+const ENCODER_LICENSE_NAME: &str = "rayline-arc-encoder-LICENSE";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpdateRequest {
@@ -49,6 +52,15 @@ pub enum UpdateError {
 struct UpdateArtifacts {
     launcher: PathBuf,
     core: PathBuf,
+    license: PathBuf,
+    /// The encoder and its license, when the release lists them for this
+    /// platform.
+    encoder: Option<EncoderArtifacts>,
+}
+
+#[derive(Debug)]
+struct EncoderArtifacts {
+    binary: PathBuf,
     license: PathBuf,
 }
 
@@ -168,10 +180,18 @@ async fn run_on(
             if request.dry_run {
                 Ok(UpdateResult {
                     message: format!(
-                        "Would install {}, {} and {}.\n",
+                        "Would install {}, {} and {}{}.\n",
                         artifacts.launcher.display(),
                         artifacts.core.display(),
-                        artifacts.license.display()
+                        artifacts.license.display(),
+                        artifacts
+                            .encoder
+                            .as_ref()
+                            .map_or(String::new(), |encoder| format!(
+                                ", and {} with {}",
+                                encoder.binary.display(),
+                                encoder.license.display()
+                            ))
                     ),
                     exit_code: 0,
                     stderr: false,
@@ -187,6 +207,16 @@ async fn run_on(
                     );
                 }
                 replace_file(&artifacts.license, &license_install_path, false)?;
+                if let Some(encoder) = &artifacts.encoder {
+                    let encoder_install_path = install_path
+                        .with_file_name(format!("{ENCODER_NAME}{}", std::env::consts::EXE_SUFFIX));
+                    replace_file(
+                        &encoder.license,
+                        &encoder_install_path.with_file_name(ENCODER_LICENSE_NAME),
+                        false,
+                    )?;
+                    replace_binary(&encoder.binary, &encoder_install_path)?;
+                }
                 replace_binary(&artifacts.core, &core_install_path)?;
                 replace_binary(&artifacts.launcher, &install_path)?;
                 Ok(UpdateResult {
@@ -433,12 +463,45 @@ async fn download_and_verify(
     verify_checksum(&sums, &launcher_name, &launcher_path)?;
     verify_checksum(&sums, &core_name, &core_path)?;
     verify_checksum(&sums, CORE_LICENSE_NAME, &license_path)?;
+    let encoder = download_encoder(base_url, version, platform_tag, &sums, dest_dir).await?;
 
     Ok(UpdateArtifacts {
         launcher: launcher_path,
         core: core_path,
         license: license_path,
+        encoder,
     })
+}
+
+/// The local ARC encoder and its license, verified against `sums` (already
+/// signature-checked), when the release lists the encoder for this platform.
+/// A release without it (every platform but macOS arm64) updates without it.
+async fn download_encoder(
+    base_url: &str,
+    version: &str,
+    platform_tag: &str,
+    sums: &str,
+    dest_dir: &Path,
+) -> Result<Option<EncoderArtifacts>, UpdateError> {
+    let name = format!("{ENCODER_NAME}-{platform_tag}");
+    if expected_sha256(sums, &name).is_err() {
+        return Ok(None);
+    }
+    let binary = dest_dir.join(&name);
+    let license = dest_dir.join(ENCODER_LICENSE_NAME);
+    download_to(
+        &artifact_url_for(base_url, version, platform_tag, ENCODER_NAME),
+        &binary,
+    )
+    .await?;
+    download_to(
+        &format!("{base_url}/cli/v{version}/{ENCODER_LICENSE_NAME}"),
+        &license,
+    )
+    .await?;
+    verify_checksum(sums, &name, &binary)?;
+    verify_checksum(sums, ENCODER_LICENSE_NAME, &license)?;
+    Ok(Some(EncoderArtifacts { binary, license }))
 }
 
 pub(crate) async fn download_to(url: &str, path: &Path) -> Result<(), UpdateError> {
@@ -1772,6 +1835,50 @@ mod tests {
             server.requests()
         );
         fs::remove_dir_all(install)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_encoder_is_downloaded_only_when_the_release_lists_it() -> TestResult {
+        const ENCODER: &[u8] = b"fixture encoder\n";
+        const ENCODER_LICENSE: &[u8] = b"fixture encoder license\n";
+        let platform = "macosx_11_0_arm64";
+        let release = format!("/cli/v{TEST_RELEASE}");
+        let server = FakeReleaseServer::start(Files::from([
+            (
+                format!("{release}/{ENCODER_NAME}-{platform}"),
+                ENCODER.to_vec(),
+            ),
+            (
+                format!("{release}/{ENCODER_LICENSE_NAME}"),
+                ENCODER_LICENSE.to_vec(),
+            ),
+        ]));
+        let sums = format!(
+            "{:x}  {ENCODER_NAME}-{platform}\n{:x}  {ENCODER_LICENSE_NAME}\n",
+            Sha256::digest(ENCODER),
+            Sha256::digest(ENCODER_LICENSE)
+        );
+        let dir = temp_update_dir()?;
+
+        let unlisted = download_encoder(&server.base_url, TEST_RELEASE, platform, "", &dir).await?;
+        assert!(unlisted.is_none());
+        assert!(server.requests().is_empty(), "{:?}", server.requests());
+
+        let listed = download_encoder(&server.base_url, TEST_RELEASE, platform, &sums, &dir)
+            .await?
+            .expect("a listed encoder");
+        assert_eq!(fs::read(&listed.binary)?, ENCODER);
+        assert_eq!(fs::read(&listed.license)?, ENCODER_LICENSE);
+
+        let tampered = sums.replace(&format!("{:x}", Sha256::digest(ENCODER)), &"0".repeat(64));
+        let result =
+            download_encoder(&server.base_url, TEST_RELEASE, platform, &tampered, &dir).await;
+        assert!(
+            matches!(result, Err(UpdateError::Checksum(_))),
+            "{result:?}"
+        );
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 

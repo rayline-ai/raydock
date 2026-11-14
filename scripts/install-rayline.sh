@@ -17,7 +17,8 @@ Usage:
 Options:
   --version      Release version to install, for example 0.5.0.
                  Defaults to the latest GitHub release.
-  --install-dir  Directory for rayline, rayline-core and rayline-core-LICENSE.
+  --install-dir  Directory for rayline, rayline-core and rayline-core-LICENSE
+                 (and, on macOS arm64, rayline-arc-encoder and its LICENSE).
                  Defaults to ~/.rayline/bin.
 EOF
 }
@@ -128,8 +129,19 @@ download "$base_url/SHA256SUMS" "$tmp_dir/SHA256SUMS"
 download "$base_url/$rayline_asset" "$tmp_dir/$rayline_asset"
 download "$base_url/$core_asset" "$tmp_dir/$core_asset"
 download "$base_url/rayline-core-LICENSE" "$tmp_dir/rayline-core-LICENSE"
+assets="$rayline_asset $core_asset rayline-core-LICENSE"
 
-for asset in "$rayline_asset" "$core_asset" rayline-core-LICENSE; do
+# The local ARC encoder ships for macOS arm64 only, and only in releases that list it.
+encoder_asset="rayline-arc-encoder-$platform"
+encoder=false
+if awk -v asset="$encoder_asset" '$2 == asset { found = 1 } END { exit !found }' "$tmp_dir/SHA256SUMS"; then
+  encoder=true
+  download "$base_url/$encoder_asset" "$tmp_dir/$encoder_asset"
+  download "$base_url/rayline-arc-encoder-LICENSE" "$tmp_dir/rayline-arc-encoder-LICENSE"
+  assets="$assets $encoder_asset rayline-arc-encoder-LICENSE"
+fi
+
+for asset in $assets; do
   awk -v asset="$asset" '$1 ~ /^[0-9a-f]+$/ && length($1) == 64 && $0 == $1 "  " asset { print; count++ } END { if (count != 1) exit 1 }' \
     "$tmp_dir/SHA256SUMS" >> "$tmp_dir/SHA256SUMS.selected" || {
       echo "release checksums must include exactly one entry for $asset" >&2
@@ -153,6 +165,10 @@ mkdir -p "$INSTALL_DIR"
 install -m 0644 "$tmp_dir/rayline-core-LICENSE" "$INSTALL_DIR/rayline-core-LICENSE"
 install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/rayline"
 install -m 0755 "$tmp_dir/$core_asset" "$INSTALL_DIR/rayline-core"
+if $encoder; then
+  install -m 0644 "$tmp_dir/rayline-arc-encoder-LICENSE" "$INSTALL_DIR/rayline-arc-encoder-LICENSE"
+  install -m 0755 "$tmp_dir/$encoder_asset" "$INSTALL_DIR/rayline-arc-encoder"
+fi
 
 echo "Installed Rayline CLI to $INSTALL_DIR"
 if ! command -v rayline >/dev/null 2>&1; then
