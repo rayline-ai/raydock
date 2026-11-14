@@ -102,17 +102,11 @@ model_args() {
     pi) args=(--model "rayline/$model" --thinking high) ;;
     omp) return 1 ;; # omp only runs models in its catalog, which Rayline writes
     hermes) args=(-m "$model" --reasoning high) ;;
-    openclaw)
-      # OpenClaw sends the session header the local process keys the episode
-      # on only for a model its config declares, and in local mode Rayline
-      # declares one, the local process's own, so a cell runs on it as `default`.
-      if [ "$mode" = local ]; then
-        [ "$model" = default ] || return 1
-        args=(--thinking high)
-      else
-        args=(--model "rayline/$model" --thinking high)
-      fi
-      ;;
+    # OpenClaw sends the session header the router keys the episode on only
+    # for a model its config declares, and Rayline declares the ARC models
+    # (cloud) or the local process's own (local), which pick their own
+    # thinking effort (OpenClaw refuses a level for them).
+    openclaw) return 1 ;;
   esac
 }
 
