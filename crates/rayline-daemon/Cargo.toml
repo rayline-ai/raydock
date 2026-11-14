@@ -28,7 +28,12 @@ http-body-util.workspace = true
 futures.workspace = true
 rand = "0.9"
 rayline-metrics = { path = "../rayline-metrics" }
+rayline-arc-decide = { path = "../rayline-arc-decide" }
+rayline-arc-routes = { path = "../rayline-arc-routes" }
 rayline-local-router = { path = "../rayline-local-router" }
 rayline-tokencount = { path = "../rayline-tokencount" }
 sha2 = "0.10"
 reqwest = { workspace = true, features = ["json", "rustls-tls-native-roots"] }
+
+[dev-dependencies]
+rayline-arc-input = { path = "../rayline-arc-input" }

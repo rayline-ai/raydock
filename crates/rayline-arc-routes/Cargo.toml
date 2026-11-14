@@ -1,0 +1,33 @@
+[package]
+name = "rayline-arc-routes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Routes API V1 (POST /v1/routes) answered by a local ARC policy"
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+rand = "0.9"
+reqwest.workspace = true
+serde.workspace = true
+# `raw_value`: the request members are also kept as sent (key order).
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = "0.10"
+time = { version = "0.3.47", default-features = false, features = ["std", "formatting"] }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

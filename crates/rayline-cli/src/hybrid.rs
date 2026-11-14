@@ -186,6 +186,8 @@ pub(crate) async fn stop() -> ExitCode {
             {
                 return Err(io::Error::other("local process shutdown identity mismatch"));
             }
+            // The local process gives its core up to 5 seconds to stop,
+            // then the ARC encoder up to 3.
             let deadline = Instant::now() + Duration::from_secs(10);
             while paths.ready().exists() {
                 if Instant::now() >= deadline {
@@ -340,6 +342,17 @@ async fn launch(
     let hosted = crate::status::hosted_environment(settings);
     let config =
         crate::hybrid_profile::core_config(settings, &hosted.base_url).map_err(io::Error::other)?;
+    // Local ARC (prototype): with `RAYLINE_ARC_MODEL` or `RAYLINE_ARC_LOCAL`,
+    // the local process decides each turn itself and points the core at its
+    // loopback routes service; the config keeps the router, which the
+    // classifier still uses. The encoder download is blocking HTTP, which
+    // may not run on the async runtime.
+    let local_arc = {
+        let home = home.to_path_buf();
+        tokio::task::spawn_blocking(move || local_arc(&home))
+            .await
+            .map_err(io::Error::other)??
+    };
     // The local process refuses Decisions anywhere but this router or a
     // loopback address; refuse a router it would refuse here, by name.
     rayline_local_router::decisions_url::check_config(&config, [hosted.base_url.as_str()])
@@ -385,10 +398,19 @@ async fn launch(
         }
     }
     write_private_json(&paths.core_config(), &config, true)?;
-    say(format!(
-        "Decisions: {} via {}",
-        routing.decisions_model, hosted.base_url
-    ));
+    match &local_arc {
+        Some(_) => say(format!(
+            "Decisions: {} on this machine (local ARC)",
+            routing.decisions_model
+        )),
+        None => say(format!(
+            "Decisions: {} via {}",
+            routing.decisions_model,
+            config["decisions"]["url"]
+                .as_str()
+                .unwrap_or(&hosted.base_url)
+        )),
+    }
     say(format!("Routing policy: {}", routing.policy.preset));
     for (id, model) in &settings.models {
         say(format!(
@@ -402,8 +424,11 @@ async fn launch(
     ));
     say(format!("Rayline key: the saved key for {}", hosted.name()));
     // One Decisions call before reporting ready: a refused key or an
-    // unreachable router fails here, not on the harness's first turn.
-    probe_decisions(&config, &router_key, settings.env.as_deref(), say).await?;
+    // unreachable router fails here, not on the harness's first turn. Local
+    // decisions never ask the router, so its outage must not stop them.
+    if local_arc.is_none() {
+        probe_decisions(&config, &router_key, settings.env.as_deref(), say).await?;
+    }
     let log = private_log(&paths.log())?;
     let mut command = Command::new(current_exe()?);
     command
@@ -427,6 +452,17 @@ async fn launch(
         .stderr(Stdio::from(log));
     if let Some(env_name) = &settings.env {
         command.arg("--env-name").arg(env_name);
+    }
+    if let Some(arc) = &local_arc {
+        command
+            .arg("--arc-encoder")
+            .arg(&arc.encoder)
+            .arg("--arc-model")
+            .arg(&arc.model)
+            .arg("--arc-package")
+            .arg(&arc.package)
+            .arg("--arc-release")
+            .arg(&arc.release);
     }
     for (deployment, dir) in &token_counters {
         command.arg("--token-counter-dir").arg(deployment).arg(dir);
@@ -626,6 +662,80 @@ fn probe_verdict(outcome: Result<u16, ()>) -> ProbeVerdict {
 /// This `rayline`, with symlinks resolved: the local process runs from it.
 fn current_exe() -> io::Result<PathBuf> {
     fs::canonicalize(std::env::current_exe()?)
+}
+
+/// The local ARC files, when `RAYLINE_ARC_MODEL` names the encoder weights
+/// or `RAYLINE_ARC_LOCAL` asks for the pinned ones (prototype; settings and
+/// a download replace it).
+struct LocalArc {
+    encoder: PathBuf,
+    model: PathBuf,
+    package: PathBuf,
+    release: PathBuf,
+}
+
+/// The ARC encoder weights `rayline` downloads: the public release's text
+/// encoder in GGUF, pinned by commit and checked by its SHA-256.
+const ARC_REPO: &str = "rayline-ai/ARC-1.0";
+const ARC_COMMIT: &str = "9e69b28174c07adc6ba76c1258e21526e2f3e7af";
+const ARC_ENCODER_FILE: &str = "gguf/arc-1.0-20261111-encoder-bf16.gguf";
+const ARC_ENCODER_SHA256: &str = "6aa526ff86148c34977781117a7cf80987583f6797290ee7ea33c4a0fa7a8bb0";
+
+/// The lowercase hex SHA-256 of the file at `path`, read in chunks.
+fn file_sha256(path: &Path) -> io::Result<String> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    io::copy(&mut fs::File::open(path)?, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The pinned encoder weights in the Hugging Face cache, downloaded on first
+/// use and checked against [`ARC_ENCODER_SHA256`].
+fn arc_encoder_weights(home: &Path) -> io::Result<PathBuf> {
+    let hub = rayline_hf::hf_cache_dir(home).map_err(io::Error::other)?;
+    let path = match rayline_hf::cached_hf_file(&hub, ARC_REPO, ARC_ENCODER_FILE, ARC_COMMIT) {
+        Some(path) => path,
+        None => rayline_hf::download_to_hf_cache(&hub, ARC_REPO, ARC_ENCODER_FILE, ARC_COMMIT)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "cannot download the ARC encoder from {ARC_REPO}: {error}"
+                ))
+            })?,
+    };
+    // Hashed on every start: the blob's name alone doesn't prove its bytes.
+    let blob = fs::canonicalize(&path)?;
+    if file_sha256(&blob)? != ARC_ENCODER_SHA256 {
+        return Err(io::Error::other(format!(
+            "the cached ARC encoder {} is not the pinned file (sha256 {ARC_ENCODER_SHA256}); delete it to download it again",
+            blob.display()
+        )));
+    }
+    Ok(blob)
+}
+
+fn local_arc(home: &Path) -> io::Result<Option<LocalArc>> {
+    let model = match std::env::var_os("RAYLINE_ARC_MODEL") {
+        Some(model) => PathBuf::from(model),
+        None if std::env::var_os("RAYLINE_ARC_LOCAL").is_some() => arc_encoder_weights(home)?,
+        None => return Ok(None),
+    };
+    let encoder = match std::env::var_os("RAYLINE_ARC_ENCODER") {
+        Some(path) => PathBuf::from(path),
+        None => installed_binary("rayline-arc-encoder")?,
+    };
+    let release = std::env::var_os("RAYLINE_ARC_RELEASE")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("local ARC needs RAYLINE_ARC_RELEASE"))?;
+    // The package manifest sits in the release directory unless named.
+    let package = std::env::var_os("RAYLINE_ARC_PACKAGE")
+        .map_or_else(|| release.join("package.json"), PathBuf::from);
+    Ok(Some(LocalArc {
+        encoder,
+        model,
+        // Beside the local process's state, which each start clears.
+        package,
+        release,
+    }))
 }
 
 /// `name`, installed beside [`current_exe`].

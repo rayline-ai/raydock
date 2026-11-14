@@ -10,8 +10,15 @@ repo-specific.
   loopback gateway. It is a library; `rayline` runs it through its internal
   entry point.
 - `rayline-local-router`: shared helpers for the local process's gateway.
+- `rayline-arc-routes`: the Routes API V1 (`POST /v1/routes`) contract and a
+  loopback router that answers it from a local ARC policy.
 - `rayline-hf`, `rayline-tokencount`, `rayline-metrics`: model cache, token
   counting and request metrics for local mode.
+- `rayline-arc-decide`: the local ARC decision from a release's tensors and
+  the encoder's readouts (prototype, behind `RAYLINE_ARC_LOCAL`).
+- `rayline-arc-input`: the ARC encoder's input (request to token ids and
+  readout offsets). It must stay token-for-token equal to the reference:
+  change it only with the parity tests in its `tests/parity.rs`.
 
 Keep protocol and routing logic in shared crates. Do not duplicate it in CLI
 handlers. Prefer focused modules over growing the existing large CLI files.

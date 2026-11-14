@@ -3,8 +3,11 @@ resolver = "3"
 members = [
     "crates/rayline-hf",
     "crates/rayline-tokencount",
+    "crates/rayline-arc-input",
+    "crates/rayline-arc-decide",
     "crates/rayline-metrics",
     "crates/rayline-local-router",
+    "crates/rayline-arc-routes",
     "crates/rayline-cli",
     "crates/rayline-daemon",
 ]

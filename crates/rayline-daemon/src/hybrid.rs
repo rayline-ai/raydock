@@ -82,6 +82,23 @@ pub struct Args {
     /// core. Once per deployment with a `tokenizer`.
     #[arg(long = "token-counter-dir", num_args = 2, value_names = ["DEPLOYMENT", "DIR"])]
     token_counters: Vec<String>,
+    /// Local ARC: the encoder binary. With the other `--arc-*` flags,
+    /// routing decisions are made on this machine.
+    #[arg(long, requires_all = ["arc_model", "arc_package", "arc_release"])]
+    arc_encoder: Option<PathBuf>,
+    /// Local ARC: the encoder weights (GGUF).
+    #[arg(long)]
+    arc_model: Option<PathBuf>,
+    /// Local ARC: the policy package manifest (`package.json`) the routes
+    /// service decides with.
+    #[arg(long)]
+    arc_package: Option<PathBuf>,
+    /// Local ARC: the package's alias as the decide service knows it.
+    #[arg(long, default_value = "rayline/arc-1.0-20261107")]
+    arc_alias: String,
+    /// Local ARC: the release directory decisions are made with.
+    #[arg(long)]
+    arc_release: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -169,8 +186,63 @@ pub async fn run(args: Args) -> Result<()> {
                 )));
         }
     }
-    let (mut child, mut parent_pipe) =
-        spawn_core(&args.core, &core_config, &core_token, &counter_token)?;
+    // Local ARC: start the encoder and point the core's Decisions at the
+    // loopback routes service. The classifier route above was taken from the
+    // original config, so it still goes to the router.
+    let mut arc_encoder = None;
+    let mut arc_routes = None;
+    let mut arc_routes_token: Option<String> = None;
+    if let (Some(binary), Some(model), Some(package), Some(release)) = (
+        &args.arc_encoder,
+        &args.arc_model,
+        &args.arc_package,
+        &args.arc_release,
+    ) {
+        let files = crate::hybrid_arc::EncoderFiles {
+            binary: binary.clone(),
+            model: model.clone(),
+        };
+        // The encoder must chunk as the release's stage one was fit.
+        let budget = rayline_arc_decide::stage_one_chunk_tokens(release)
+            .with_context(|| format!("read the ARC release in {}", release.display()))?;
+        let encoder = crate::hybrid_arc::Encoder::start(&files, budget, startup_timeout).await?;
+        tracing::info!(url = %encoder.url, pid = ?encoder.pid(), "local ARC encoder ready");
+        let access = crate::hybrid_arc::RoutesAccess::for_core(&core_config)?;
+        arc_routes_token = Some(access.token.clone());
+        let (routes_url, task) = crate::hybrid_arc::serve_routes(
+            package,
+            &args.arc_alias,
+            release,
+            &encoder,
+            &args.router_url,
+            access,
+        )
+        .await?;
+        arc_routes = Some(task);
+        let local = args.ready_file.with_extension("arc-core.json");
+        crate::hybrid_arc::with_local_decisions(
+            &core_config,
+            &routes_url,
+            Some(crate::hybrid_arc::ROUTES_TOKEN_ENV),
+            &local,
+        )?;
+        // The rewritten Decisions URL gets the same check as the config's:
+        // only the router or a loopback address.
+        rayline_local_router::decisions_url::check_config_bytes(
+            &std::fs::read(&local).with_context(|| format!("read {}", local.display()))?,
+            [args.router_url.as_str()],
+        )
+        .map_err(|error| anyhow::anyhow!("local ARC Decisions URL: {error}"))?;
+        core_config = local;
+        arc_encoder = Some(encoder);
+    }
+    let (mut child, mut parent_pipe) = spawn_core(
+        &args.core,
+        &core_config,
+        &core_token,
+        &counter_token,
+        arc_routes_token.as_deref(),
+    )?;
     let handshake = tokio::select! {
         result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
             result.context("execution core startup timed out")??
@@ -231,6 +303,12 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::select! {
             result = serve(listener, state) => result,
             status = child.wait() => bail!("execution core exited: {}", status?),
+            () = crate::hybrid_arc::supervise_encoder(&mut arc_encoder) => {
+                bail!("local ARC encoder supervision ended")
+            }
+            result = crate::hybrid_arc::wait_routes(&mut arc_routes) => {
+                bail!("local ARC routes service stopped: {result:?}")
+            }
             result = &mut signals => result,
             _ = shutdown_rx.recv() => Ok(()),
         }
@@ -240,6 +318,9 @@ pub async fn run(args: Args) -> Result<()> {
     stop_child(&mut child, &mut parent_pipe)
         .await
         .context("stop execution core")?;
+    if let Some(encoder) = arc_encoder.as_mut() {
+        encoder.stop().await.context("stop the local ARC encoder")?;
+    }
     drop(cleanup);
     outcome
 }
@@ -1115,8 +1196,13 @@ fn spawn_core(
     config: &Path,
     core_token: &str,
     counter_token: &str,
+    arc_routes_token: Option<&str>,
 ) -> Result<(Child, Option<tokio::process::ChildStdin>)> {
-    let mut child = Command::new(core)
+    let mut command = Command::new(core);
+    if let Some(token) = arc_routes_token {
+        command.env(crate::hybrid_arc::ROUTES_TOKEN_ENV, token);
+    }
+    let mut child = command
         .arg("--config")
         .arg(config)
         .args(["--listen", "127.0.0.1:0"])

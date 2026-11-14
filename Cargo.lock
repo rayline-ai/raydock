@@ -1421,6 +1421,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "rayline-arc-decide"
+version = "0.5.1"
+dependencies = [
+ "rayline-arc-input",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "rayline-arc-input"
+version = "0.5.1"
+dependencies = [
+ "fancy-regex",
+ "serde_json",
+ "tokenizers",
+]
+
+[[package]]
+name = "rayline-arc-routes"
+version = "0.5.1"
+dependencies = [
+ "bytes",
+ "futures",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rand 0.9.4",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "rayline-cli"
 version = "0.5.1"
 dependencies = [
@@ -1460,6 +1499,9 @@ dependencies = [
  "hyper",
  "hyper-util",
  "rand 0.9.4",
+ "rayline-arc-decide",
+ "rayline-arc-input",
+ "rayline-arc-routes",
  "rayline-local-router",
  "rayline-metrics",
  "rayline-tokencount",
