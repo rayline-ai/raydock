@@ -366,11 +366,6 @@ async fn encoded_response_preserves_wire_bytes_and_completes_without_body_teleme
     let mut runtime = Runtime::start(1);
     let (url, token) = runtime.ready().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let expected = [
-        31, 139, 8, 0, 0, 0, 0, 0, 2, 255, 171, 86, 42, 45, 78, 76, 79, 85, 178, 170, 86, 202, 204,
-        43, 40, 45, 137, 47, 201, 207, 78, 205, 43, 86, 178, 50, 215, 81, 202, 47, 45, 65, 22, 49,
-        174, 173, 5, 0, 174, 189, 157, 210, 46, 0, 0, 0,
-    ];
     for eof in [false, true] {
         let response = client
             .post(format!("{url}/v1/messages"))
@@ -381,7 +376,10 @@ async fn encoded_response_preserves_wire_bytes_and_completes_without_body_teleme
             .unwrap();
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers()["content-encoding"], "gzip");
-        assert_eq!(response.bytes().await.unwrap().as_ref(), &expected);
+        let received = response.bytes().await.unwrap();
+        let sent = fs::read(runtime.dir.join("gzip-sent.bin")).unwrap();
+        assert_eq!(&sent[..2], [0x1f, 0x8b], "the fixture sends gzip");
+        assert_eq!(received.as_ref(), sent.as_slice());
         let snapshot = top_snapshot(&client, &url, &token).await;
         assert!(snapshot["active"].as_array().unwrap().is_empty());
         let row = &snapshot["recent"][0];
