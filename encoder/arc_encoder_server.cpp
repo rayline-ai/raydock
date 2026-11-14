@@ -492,20 +492,43 @@ bool lock_dir(const fs::path & dir) {
 #endif
 }
 
-// Saved sessions hold token ids (the prompt): only their owner may read them. False if the directory cannot be made
-// owner-only.
-bool private_dir(const fs::path & dir) {
+// Trust model: --state-dir is private to the user running the encoder (the daemon passes one under ~/.rayline). It is
+// not a directory shared with other users or processes, so it must be the user's own, not a symlink, and writable by
+// nobody else. Saved sessions hold token ids (the prompt), so their identity subdirectory is also owner-only.
+// `create` makes a missing directory first. On Windows the directory must be under the user's profile (its ACL keeps
+// it private) and no mode check applies.
+bool trusted_dir(const fs::path & dir, bool owner_only, std::string & why) {
     std::error_code ec;
-    fs::create_directories(dir, ec);
-    if (ec) return false;
-#ifndef _WIN32
-    // POSIX: drwx------. On Windows the directory inherits its parent's ACL; keep --state-dir under the user's profile.
-    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
-    if (ec) return false;
-    const auto perms = fs::status(dir, ec).permissions();
-    if (ec || (perms & (fs::perms::group_all | fs::perms::others_all)) != fs::perms::none) return false;
-#endif
+    if (!fs::exists(fs::symlink_status(dir, ec))) {
+        fs::create_directory(dir, ec);
+        if (ec) { why = "cannot create it: " + ec.message(); return false; }
+    }
+#ifdef _WIN32
+    (void) owner_only;
+    const char * profile = std::getenv("USERPROFILE");
+    const auto norm = [](const fs::path & p) {
+        std::error_code e;
+        std::wstring w = fs::weakly_canonical(p, e).wstring();
+        for (auto & c : w) c = (wchar_t) towlower(c);
+        return w;
+    };
+    if (profile == nullptr || norm(dir).rfind(norm(profile), 0) != 0) { why = "it is not under %USERPROFILE%"; return false; }
+    if (fs::is_symlink(fs::symlink_status(dir, ec))) { why = "it is a symlink"; return false; }
     return true;
+#else
+    struct stat st;
+    if (lstat(dir.c_str(), &st) != 0) { why = "cannot stat it"; return false; }
+    if (S_ISLNK(st.st_mode)) { why = "it is a symlink"; return false; }
+    if (!S_ISDIR(st.st_mode)) { why = "it is not a directory"; return false; }
+    if (st.st_uid != getuid()) { why = "another user owns it"; return false; }
+    if (owner_only && (st.st_mode & 077) != 0 && chmod(dir.c_str(), 0700) != 0) { why = "cannot make it owner-only"; return false; }
+    if (lstat(dir.c_str(), &st) != 0) { why = "cannot stat it"; return false; }
+    if ((st.st_mode & (owner_only ? 077 : 022)) != 0) {
+        why = owner_only ? "it is not owner-only" : "other users can write to it";
+        return false;
+    }
+    return true;
+#endif
 }
 
 void refuse(httplib::Response & res, int status, const std::string & code) {
@@ -554,6 +577,14 @@ bool parse_args(int argc, char ** argv, Args & a) {
     return true;
 }
 
+// Whether llama.cpp's Metal backend enabled its tensor-API kernels. That depends on the chip, GGML_METAL_TENSOR_ENABLE
+// / _DISABLE and --no-tensor, and llama.cpp reports the outcome only in its log, so the log is read for it.
+bool g_tensor = false;
+void on_log(ggml_log_level, const char * text, void *) {
+    if (std::strstr(text, "has tensor") && std::strstr(text, "= true")) g_tensor = true;
+    std::fputs(text, stderr);
+}
+
 httplib::Server * g_http = nullptr;
 void on_signal(int) { if (g_http) g_http->stop(); }
 
@@ -567,6 +598,7 @@ int main(int argc, char ** argv) {
     // llama.cpp uses the Metal tensor API on M5 and later, or when GGML_METAL_TENSOR_ENABLE is set (a launcher sets
     // it on M4, where this model's flash attention is faster with it); --no-tensor turns it off everywhere.
     if (!a.tensor) setenv("GGML_METAL_TENSOR_DISABLE", "1", 1);
+    llama_log_set(on_log, nullptr);
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
     mp.n_gpu_layers = 999;
@@ -590,7 +622,7 @@ int main(int argc, char ** argv) {
     s.ctx = llama_init_from_model(s.model, cp);
     if (s.ctx == nullptr) { std::fprintf(stderr, "failed to create the context\n"); return 1; }
     s.seq_used.assign(a.sessions, false);
-    s.engine = "llamacpp@b11669-arc+" + backend_name() + "+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + (a.tensor && std::getenv("GGML_METAL_TENSOR_ENABLE") ? "+tensor" : "") +
+    s.engine = "llamacpp@b11669-arc+" + backend_name() + "+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + (g_tensor ? "+tensor" : "") +
                a.engine_suffix;
     if (!s.args.state_dir.empty()) {
 #ifndef _WIN32
@@ -599,9 +631,14 @@ int main(int argc, char ** argv) {
         const std::string config = s.engine + " budget=" + std::to_string(a.budget) + " ubatch=" + std::to_string(a.ubatch);
         const fs::path root = s.args.state_dir;
         const fs::path dir = root / state_identity(a.model, config);
+        std::string why;
+        if (!trusted_dir(root, false, why)) {
+            std::fprintf(stderr, "refusing --state-dir %s: %s\n", root.string().c_str(), why.c_str());
+            return 1;
+        }
         // Only the identity subdirectory is made owner-only: --state-dir itself may be a directory the user shares.
-        if (!private_dir(dir)) {
-            std::fprintf(stderr, "cannot make %s owner-only\n", dir.string().c_str());
+        if (!trusted_dir(dir, true, why)) {
+            std::fprintf(stderr, "refusing %s: %s\n", dir.string().c_str(), why.c_str());
             return 1;
         }
         if (lock_dir(dir)) {
@@ -688,6 +725,15 @@ int main(int argc, char ** argv) {
         Session * session = nullptr;
         Session scratch_session;  // an unretained encode's view of a restored prefix
         const std::string id = retained ? body["session"].get<std::string>() : "";
+        // Refuse what cannot be served before changing anything: a refused request must leave every session as it was.
+        if (!retained && base != 0) return refuse(res, 422, "invalid_retain");
+        if (retained && base > 0) {
+            const auto held_it = s.sessions.find(id);
+            const bool held = held_it != s.sessions.end() && held_it->second.n_past == base;
+            bool saved = false;
+            for (const auto & e : s.entries) saved = saved || (e.session == id && (int32_t) e.tokens.size() == base);
+            if (!held && !saved) return refuse(res, 409, "unknown_session");
+        }
         // Free KV space first: a restore below needs it as much as a decode does.
         s.make_room(id, base + (int64_t) tokens.size());
         if (retained) {

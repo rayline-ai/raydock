@@ -89,12 +89,15 @@ fit beside the sessions held evicts the least recently used ones (saving them, w
 
 With `--state-dir DIR` (and `--persist-min`, default 16,384 tokens; `--state-max-gb`, default 32), a retained session
 is saved when it is evicted, closed, or the server stops: its sequence state, its tokens and the rows it returned.
-Saved sessions hold token ids, which encode the prompt, so they are private to the user:
+Trust model: `--state-dir` is private to the user who runs the encoder; it is never a shared directory (`rayline`
+passes one under `~/.rayline`). Saved sessions hold token ids, which encode the prompt:
+- **Checks at start:** on POSIX, `--state-dir` must be the user's own directory, not a symlink, and not writable by
+  group or others, or the encoder refuses to start. On Windows it must be under `%USERPROFILE%` (no mode check).
 - **Location:** they live in a subdirectory of `--state-dir` named by the model file (its size, mtime and first and
-  last 4 MB) and the encode configuration (backend, KV type, flash attention, tensor kernels, `--budget`,
-  `--ubatch`), so another model or configuration never restores them.
-- **Permissions:** on POSIX that subdirectory is `0700` (checked at start; the server refuses to start otherwise), and
-  every file in it is `0600`. On Windows it inherits its parent's ACL, so keep `--state-dir` under the user's profile.
+  last 4 MB) and the encode configuration (backend, KV type, flash attention, whether the tensor kernels are
+  actually on, `--budget`, `--ubatch`), so another model or configuration never restores them.
+- **Permissions:** on POSIX that subdirectory must also be the user's own and not a symlink, and is made `0700`
+  (checked at start). Every file in it is `0600`. On Windows it inherits the profile's ACL.
 - **Atomic saves:** each save writes its state and rows under new file names, then publishes its index (`.json`) with
   an atomic rename. An interrupted save leaves only unpublished files, which the next start removes.
 - **Restore checks:** an entry whose files are missing, malformed, the wrong size, or hold other tokens is skipped
@@ -105,7 +108,8 @@ Saved sessions hold token ids, which encode the prompt, so they are private to t
   still reuse it as a prefix.
 - **One owner per directory:** one encoder holds an exclusive lock on the directory (`flock`; `LockFileEx` on Windows).
   A second encoder started with the same `--state-dir` and configuration logs a warning and runs without saved
-  sessions. An
+  sessions.
+- **Refusals change nothing:** a refused request (unknown session, bad `base`) leaves every session as it was. An
 append to a session the process does not hold resumes the saved state that ends at its `base`; a full encode whose
 tokens start with a saved entry's tokens restores the longest such entry and encodes only the rest. The recurrent
 state cannot be truncated, so an entry only resumes from its exact end. A process killed without a signal loses

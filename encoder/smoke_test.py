@@ -50,6 +50,14 @@ def stop(server):
     check(server.wait(timeout=60) == 0, "stops when its stdin closes")
 
 
+def refused_state_dir(binary, model, directory, why):
+    result = subprocess.run(
+        [binary, "--model", model, "--port", "0", "--ctx", "256", "--budget", "64", "--ubatch", "64",
+         "--state-dir", directory],
+        stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    check(result.returncode != 0 and result.stdout == "" and "refusing" in result.stderr, f"--state-dir {why} is refused")
+
+
 def saved_sessions(binary, model):
     """--state-dir: owner-only files, restore across restarts, and no restore under another configuration."""
     with tempfile.TemporaryDirectory() as root:
@@ -113,6 +121,15 @@ def saved_sessions(binary, model):
             check(sorted(os.listdir(subdir.path)) == files, "the second encoder neither saves nor cleans up there")
         finally:
             stop(server)
+
+        if os.name == "posix":
+            link = os.path.join(root, "link")
+            os.symlink(subdir.path, link)
+            refused_state_dir(binary, model, link, "that is a symlink")
+            shared = os.path.join(root, "shared")
+            os.mkdir(shared)
+            os.chmod(shared, 0o777)
+            refused_state_dir(binary, model, shared, "that others can write to")
 
         server, port = start(binary, model, *state, "--ubatch", "32")
         try:
@@ -196,6 +213,14 @@ def main():
         check(status == 422, "a non-string owner is refused")
         status, _, refused = post(port, "/encode", {"base": 0, "tokens": tokens, "offsets": [8], "retain": False})
         check(status == 422 and json.loads(refused)["error"] == "offsets_out_of_range", "an offset past the input 422")
+
+        # A refused append changes nothing: it must not evict a held session to make room first.
+        status, _, _ = post(port, "/encode", {"base": 0, "tokens": [3] * 40, "offsets": [39], "session": "held"})
+        check(status == 200, "session 'held' encodes")
+        status, _, _ = post(port, "/encode", {"base": 5, "tokens": [4] * 230, "offsets": [5], "session": "unknown2"})
+        check(status == 409, "an append to an unknown session that would need eviction answers 409")
+        status, _, _ = post(port, "/encode", {"base": 40, "tokens": [5], "offsets": [40], "session": "held"})
+        check(status == 200, "the refused append left session 'held' in place")
 
         # Sessions share one KV cache of --ctx tokens: a session that does not fit evicts the least recently used.
         status, _, _ = post(port, "/encode", {"base": 0, "tokens": [5] * 100, "offsets": [99], "session": "t"})
