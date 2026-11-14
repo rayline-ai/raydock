@@ -164,7 +164,7 @@ fn a_runtime_release_decides_as_its_full_release() {
     to_full.insert(runtime.name.clone(), full.name.clone());
 
     let goldens = std::fs::read_to_string(full_dir.join("goldens.jsonl")).expect("goldens");
-    let (mut cases, mut same, mut refused_alike) = (0, 0, 0);
+    let (mut cases, mut same, mut refused_alike, mut not_cached) = (0, 0, 0, 0);
     let mut failures = Vec::new();
     for line in goldens.lines().filter(|l| !l.trim().is_empty()) {
         let golden: Golden = serde_json::from_str(line).expect("a golden line");
@@ -181,10 +181,16 @@ fn a_runtime_release_decides_as_its_full_release() {
             }
         }
         cases += 1;
-        match (
+        let uncached = |result: &Result<_, rayline_arc_decide::DecideError>| matches!(result, Err(rayline_arc_decide::DecideError::Readouts(e)) if e.contains("not cached"));
+        let (full_decision, runtime_decision) = (
             decide(&full, &full_input, &source),
             decide(&runtime, &runtime_input, &source),
-        ) {
+        );
+        if uncached(&full_decision) || uncached(&runtime_decision) {
+            not_cached += 1;
+            continue;
+        }
+        match (full_decision, runtime_decision) {
             (Ok(a), Ok(b)) => {
                 let a = serde_json::to_value(&a).expect("json");
                 let b = rename(&serde_json::to_value(&b).expect("json"), &to_full);
@@ -215,6 +221,7 @@ fn a_runtime_release_decides_as_its_full_release() {
         }
     }
     println!("runtime vs full: {same}/{cases} identical ({refused_alike} refused alike)");
+    println!("{not_cached} readouts not cached");
     for failure in failures.iter().take(20) {
         println!("  {failure}");
     }
@@ -224,4 +231,5 @@ fn a_runtime_release_decides_as_its_full_release() {
         "none of {cases} goldens was decided and compared"
     );
     assert!(failures.is_empty(), "{} of {cases} differ", failures.len());
+    assert_eq!(not_cached, 0, "{not_cached} readouts not cached");
 }
