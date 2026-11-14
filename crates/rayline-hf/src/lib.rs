@@ -92,7 +92,7 @@ pub fn repo_to_folder_name(repo: &str) -> String {
 
 /// Latest commit hash for a repo via the HF API.
 pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
-    let url = format!("https://huggingface.co/api/models/{repo}");
+    let url = format!("{}/api/models/{repo}", hf_endpoint()?);
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
@@ -102,7 +102,7 @@ pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
         .get(&url)
         .header("User-Agent", "rayline")
         .send()
-        .map_err(|e| format!("HF API request failed: {e}"))?;
+        .map_err(|e| format!("HF API request failed: {}", request_error(e)))?;
 
     if !response.status().is_success() {
         return Err(format!("HF API returned status {}", response.status()));
@@ -110,7 +110,7 @@ pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
 
     let body = response
         .text()
-        .map_err(|e| format!("Failed to read HF API response: {e}"))?;
+        .map_err(|e| format!("Failed to read HF API response: {}", request_error(e)))?;
     let info: HfModelInfo =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse HF API response: {e}"))?;
 
@@ -169,16 +169,140 @@ pub fn download_to_hf_cache(
     filename: &str,
     commit: &str,
 ) -> Result<PathBuf, String> {
-    download_to_hf_cache_at(hub, "https://huggingface.co", repo, filename, commit)
+    download_to_hf_cache_at(
+        hub,
+        &hf_endpoint()?,
+        Download::default(),
+        repo,
+        filename,
+        commit,
+    )
 }
 
-fn download_to_hf_cache_at(
+/// How [`download_to_hf_cache_at`] downloads a file.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Download<'a> {
+    /// Sent as a bearer token to the Hub only: over https, or over http to
+    /// a loopback address.
+    pub token: Option<&'a str>,
+    /// A download that grows past this many bytes is stopped and refused.
+    pub max_bytes: Option<u64>,
+    /// The commit is a pin, not the repo's `main`: `refs/main` is left as
+    /// it is.
+    pub pinned: bool,
+}
+
+/// Whether a bearer token may go to `base_url`: https, or http to a
+/// loopback address.
+fn may_carry_token(base_url: &str) -> bool {
+    match reqwest::Url::parse(base_url) {
+        Ok(url) if url.scheme() == "https" => true,
+        Ok(url) if url.scheme() == "http" => url.host_str().is_some_and(|host| {
+            host == "localhost"
+                || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        }),
+        _ => false,
+    }
+}
+
+/// The Hub token for private repos: `HF_TOKEN`, else the token file
+/// `huggingface-cli login` writes (`$HF_HOME/token`, else
+/// `<home>/.cache/huggingface/token`), else none. A set but empty or
+/// non-unicode `HF_TOKEN` is an error naming it. The token itself never
+/// appears in a log or an error.
+pub fn hf_token(home: &Path) -> Result<Option<String>, String> {
+    hf_token_from(home, |name| std::env::var_os(name))
+}
+
+fn hf_token_from(
+    home: &Path,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Result<Option<String>, String> {
+    if let Some(value) = var("HF_TOKEN") {
+        return match value.into_string() {
+            Ok(value) if value.trim().is_empty() => Err("HF_TOKEN is set but empty".to_owned()),
+            Ok(value) => Ok(Some(value.trim().to_owned())),
+            Err(_) => Err("HF_TOKEN is not valid unicode".to_owned()),
+        };
+    }
+    let hf_home = match var("HF_HOME").map(OsString::into_string) {
+        Some(Ok(dir)) if !dir.is_empty() => PathBuf::from(dir),
+        Some(_) => return Err("HF_HOME is set but empty or not valid unicode".to_owned()),
+        None => home.join(".cache").join("huggingface"),
+    };
+    let file = hf_home.join("token");
+    match fs::read_to_string(&file) {
+        Ok(token) if token.trim().is_empty() => Ok(None),
+        Ok(token) => Ok(Some(token.trim().to_owned())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!(
+            "cannot read the Hugging Face token file {}: {e}",
+            file.display()
+        )),
+    }
+}
+
+/// The Hub's address: `HF_ENDPOINT`, else `https://huggingface.co`. A set
+/// value must be an absolute `http` or `https` URL; anything else is an error
+/// naming the var.
+pub fn hf_endpoint() -> Result<String, String> {
+    hf_endpoint_from(std::env::var_os("HF_ENDPOINT"))
+}
+
+fn hf_endpoint_from(value: Option<OsString>) -> Result<String, String> {
+    let Some(value) = value else {
+        return Ok("https://huggingface.co".to_owned());
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| "HF_ENDPOINT is not valid unicode".to_owned())?;
+    let url = reqwest::Url::parse(&value)
+        .ok()
+        // The parser reads `https:///x` as host `x`; a host must follow `//`.
+        .filter(|url| {
+            matches!(url.scheme(), "http" | "https")
+                && url.has_host()
+                && !value[url.scheme().len()..].starts_with(":///")
+        })
+        .ok_or_else(|| "HF_ENDPOINT is not an absolute http or https URL".to_owned())?;
+    // A user name or password in the URL would reach logs and cache files.
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(
+            "HF_ENDPOINT carries a user name or password; give the Hub's address only".to_owned(),
+        );
+    }
+    // Repo paths are appended to it.
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err("HF_ENDPOINT has a query or fragment; give the Hub's address only".to_owned());
+    }
+    Ok(value.trim_end_matches('/').to_owned())
+}
+
+/// Download a file from the Hub at `hf_base_url` into the HF cache at
+/// `cache`, as [`download_to_hf_cache`] does.
+///
+/// With a token, every request to `hf_base_url` carries it as a bearer
+/// token, and a plain-http `hf_base_url` that isn't loopback is refused, as
+/// is any redirect to such a URL. A redirect to another host drops it (the
+/// HTTP client removes `Authorization` on a cross-host redirect).
+pub fn download_to_hf_cache_at(
     cache: &Path,
     hf_base_url: &str,
+    download: Download<'_>,
     repo: &str,
     filename: &str,
     commit: &str,
 ) -> Result<PathBuf, String> {
+    let token = download.token;
+    if token.is_some() && !may_carry_token(hf_base_url) {
+        return Err(format!(
+            "HF_ENDPOINT {hf_base_url} is plain http: the Hugging Face token is sent only over https (or to a loopback address)"
+        ));
+    }
     let repo_dir = cache.join(repo_to_folder_name(repo));
     let refs_dir = repo_dir.join("refs");
     let blobs_dir = repo_dir.join("blobs");
@@ -237,28 +361,34 @@ fn download_to_hf_cache_at(
         download_url, tmp_path
     );
 
-    download_file_to_path(&download_url, &tmp_path)?;
+    download_file_to_path(&download_url, token, download.max_bytes, &tmp_path)?;
 
     info!("[HfCache] Computing SHA256 for {:?}", tmp_path);
     let sha256 = compute_sha256(&tmp_path)?;
     let blob_name = sha256_blob_name(&sha256);
     let blob_path = blobs_dir.join(&blob_name);
 
-    if blob_path.exists() {
+    // An existing blob is kept only when its bytes still hash to its name;
+    // a corrupt one is replaced by the fresh download.
+    if blob_path.exists() && compute_sha256(&blob_path).is_ok_and(|sha| sha == sha256) {
         let _ = fs::remove_file(&tmp_path);
         info!("[HfCache] Blob already exists: {:?}", blob_path);
     } else {
+        // Windows doesn't rename over an existing file.
+        let _ = fs::remove_file(&blob_path);
         fs::rename(&tmp_path, &blob_path).map_err(|e| format!("Failed to rename blob: {e}"))?;
         info!("[HfCache] Blob created: {:?}", blob_path);
     }
 
     let _ = fs::remove_file(&tmp_url_path);
 
-    let refs_main = refs_dir.join("main");
-    let mut f =
-        fs::File::create(&refs_main).map_err(|e| format!("Failed to create refs/main: {e}"))?;
-    f.write_all(commit.as_bytes())
-        .map_err(|e| format!("Failed to write refs/main: {e}"))?;
+    if !download.pinned {
+        let refs_main = refs_dir.join("main");
+        let mut f =
+            fs::File::create(&refs_main).map_err(|e| format!("Failed to create refs/main: {e}"))?;
+        f.write_all(commit.as_bytes())
+            .map_err(|e| format!("Failed to write refs/main: {e}"))?;
+    }
 
     let symlink_target = snapshot_symlink_target(filename, &blob_name);
 
@@ -323,14 +453,67 @@ fn create_symlink_or_copy(
     Ok(())
 }
 
-fn download_file_to_path(url: &str, dest_path: &Path) -> Result<u64, String> {
+/// A request error as text with no URL in it: a redirect's URL can be
+/// presigned, with credentials in its query.
+fn request_error(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    without_urls(&text)
+}
+
+/// `text` with every `http://` or `https://` URL replaced by `<url>`.
+fn without_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = ["http://", "https://"]
+        .iter()
+        .filter_map(|scheme| rest.find(scheme))
+        .min()
+    {
+        out.push_str(&rest[..start]);
+        out.push_str("<url>");
+        let url = &rest[start..];
+        let end = url
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '"' | '\'' | '>'))
+            .unwrap_or(url.len());
+        rest = &url[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn download_file_to_path(
+    url: &str,
+    token: Option<&str>,
+    max_bytes: Option<u64>,
+    dest_path: &Path,
+) -> Result<u64, String> {
     info!("[HfCache] Downloading {} -> {:?}", url, dest_path);
 
     if let Some(parent) = dest_path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 
+    // With a token, no redirect may lead to plain http: the client keeps
+    // `Authorization` when a redirect stays on the same host and port.
+    let carries_token = token.is_some();
+    let redirects = reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() >= 10 {
+            attempt.error("too many redirects")
+        } else if carries_token && !may_carry_token(attempt.url().as_str()) {
+            attempt.error("a redirect to plain http, where the Hugging Face token isn't sent")
+        } else {
+            attempt.follow()
+        }
+    });
     let client = reqwest::blocking::Client::builder()
+        .redirect(redirects)
         .timeout(Duration::from_secs(3600))
         .connect_timeout(Duration::from_secs(30))
         .tcp_keepalive(Duration::from_secs(30))
@@ -345,7 +528,7 @@ fn download_file_to_path(url: &str, dest_path: &Path) -> Result<u64, String> {
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
-        match attempt_download(url, dest_path, &client) {
+        match attempt_download(url, token, max_bytes, dest_path, &client) {
             Ok(bytes) => return Ok(bytes),
             Err(DownloadAttemptError::Fatal(msg)) => {
                 let _ = fs::remove_file(dest_path);
@@ -369,6 +552,8 @@ fn download_file_to_path(url: &str, dest_path: &Path) -> Result<u64, String> {
 
 fn attempt_download(
     url: &str,
+    token: Option<&str>,
+    max_bytes: Option<u64>,
     dest_path: &Path,
     client: &reqwest::blocking::Client,
 ) -> Result<u64, DownloadAttemptError> {
@@ -378,6 +563,9 @@ fn attempt_download(
     let existing_bytes = fs::metadata(dest_path).map(|m| m.len()).unwrap_or(0);
 
     let mut request = client.get(url).header("User-Agent", "rayline");
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
     if existing_bytes > 0 {
         request = request.header("Range", format!("bytes={existing_bytes}-"));
     }
@@ -385,8 +573,9 @@ fn attempt_download(
     let response = match request.send() {
         Ok(r) => r,
         Err(e) => {
-            let msg = format!("Download request failed: {e}");
-            return if is_retryable_reqwest_error(&e) {
+            let retryable = is_retryable_reqwest_error(&e);
+            let msg = format!("Download request failed: {}", request_error(e));
+            return if retryable {
                 Err(DownloadAttemptError::Retryable(msg))
             } else {
                 Err(DownloadAttemptError::Fatal(msg))
@@ -404,6 +593,16 @@ fn attempt_download(
             let _ = fs::remove_file(dest_path);
             return Err(DownloadAttemptError::Retryable(format!(
                 "Server reported partial file out of range ({existing_bytes} bytes); restarting from zero"
+            )));
+        }
+        if matches!(status.as_u16(), 401 | 403) {
+            let auth = if token.is_some() {
+                "the Hugging Face token (HF_TOKEN, or the token file) has no access to it"
+            } else {
+                "the repo is private or gated: set HF_TOKEN to a token with access"
+            };
+            return Err(DownloadAttemptError::Fatal(format!(
+                "Download failed with status {status}: {auth}"
             )));
         }
         let msg = format!("Download failed with status {status}");
@@ -452,7 +651,10 @@ fn attempt_download(
             Ok(n) => n,
             Err(e) => {
                 drop(file);
-                let msg = format!("Read error during download: {e}");
+                let msg = format!(
+                    "Read error during download: {}",
+                    without_urls(&e.to_string())
+                );
                 return if is_retryable_io_error(&e) {
                     Err(DownloadAttemptError::Retryable(msg))
                 } else {
@@ -470,6 +672,13 @@ fn attempt_download(
             )));
         }
         bytes_downloaded += n as u64;
+        if max_bytes.is_some_and(|max| bytes_downloaded > max) {
+            drop(file);
+            return Err(DownloadAttemptError::Fatal(format!(
+                "the download is larger than the {} bytes expected",
+                max_bytes.unwrap_or_default()
+            )));
+        }
     }
 
     drop(file);
@@ -536,6 +745,42 @@ mod tests {
     }
 
     #[test]
+    fn the_token_is_hf_token_else_the_token_file() {
+        let home = unique_test_dir("token");
+        let none = |_: &str| None;
+        assert_eq!(hf_token_from(&home, none).unwrap(), None);
+        let file = home.join(".cache").join("huggingface");
+        fs::create_dir_all(&file).unwrap();
+        fs::write(file.join("token"), "hf_file\n").unwrap();
+        assert_eq!(
+            hf_token_from(&home, none).unwrap().as_deref(),
+            Some("hf_file")
+        );
+        let env = |name: &str| (name == "HF_TOKEN").then(|| OsString::from("hf_env"));
+        assert_eq!(
+            hf_token_from(&home, env).unwrap().as_deref(),
+            Some("hf_env")
+        );
+        let empty = |name: &str| (name == "HF_TOKEN").then(|| OsString::from(" "));
+        let error = hf_token_from(&home, empty).unwrap_err();
+        assert!(error.contains("HF_TOKEN"), "{error}");
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn the_hub_address_is_hf_endpoint_else_huggingface() {
+        assert_eq!(hf_endpoint_from(None).unwrap(), "https://huggingface.co");
+        assert_eq!(
+            hf_endpoint_from(Some("http://127.0.0.1:9/".into())).unwrap(),
+            "http://127.0.0.1:9"
+        );
+        for bad in ["", "huggingface.co", "ftp://x", "https://", "https:///x"] {
+            let error = hf_endpoint_from(Some(bad.into())).unwrap_err();
+            assert!(error.contains("HF_ENDPOINT"), "{bad}: {error}");
+        }
+    }
+
+    #[test]
     fn a_non_unicode_hf_var_is_an_error_naming_it() {
         #[cfg(unix)]
         let bad = {
@@ -592,7 +837,7 @@ mod tests {
             }
         });
 
-        let downloaded = download_file_to_path(&url, &dest_path).unwrap();
+        let downloaded = download_file_to_path(&url, None, None, &dest_path).unwrap();
 
         server.join().unwrap();
         let recorded = requests.lock().unwrap();
@@ -640,6 +885,7 @@ mod tests {
         let path = download_to_hf_cache_at(
             &cache_dir,
             &base_url,
+            Download::default(),
             "org/repo",
             "tokenizer.json",
             "abc123",
@@ -716,5 +962,176 @@ mod tests {
         )
         .unwrap();
         stream.write_all(body).unwrap();
+    }
+
+    #[test]
+    fn a_token_goes_only_over_https_or_to_loopback() {
+        assert!(may_carry_token("https://huggingface.co"));
+        assert!(may_carry_token("http://127.0.0.1:8080"));
+        assert!(may_carry_token("http://localhost:8080"));
+        assert!(may_carry_token("http://[::1]:8080"));
+        assert!(!may_carry_token("http://hub.example.com"));
+        assert!(!may_carry_token("http://10.0.0.1"));
+        let cache_dir = std::env::temp_dir().join(format!("hf-plain-{}", std::process::id()));
+        let error = download_to_hf_cache_at(
+            &cache_dir,
+            "http://hub.example.com",
+            Download {
+                token: Some("hf_test"),
+                ..Download::default()
+            },
+            "org/repo",
+            "tokenizer.json",
+            "abc123",
+        )
+        .unwrap_err();
+        assert!(error.contains("plain http"), "{error}");
+        assert!(!error.contains("hf_test"), "{error}");
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn hf_endpoint_refuses_credentials_without_echoing_them() {
+        for value in [
+            "https://user:secret@hub.example",
+            "http://secret@127.0.0.1:8080/x",
+        ] {
+            let error = hf_endpoint_from(Some(value.into())).unwrap_err();
+            assert!(error.contains("user name or password"), "{error}");
+            assert!(!error.contains("secret"), "{error}");
+        }
+        for value in ["https://hub.example/path?a=b@c", "https://hub.example/#x"] {
+            let error = hf_endpoint_from(Some(value.into())).unwrap_err();
+            assert!(error.contains("query or fragment"), "{error}");
+        }
+        assert_eq!(
+            hf_endpoint_from(Some("https://hub.example/mirror/".into())).unwrap(),
+            "https://hub.example/mirror"
+        );
+        let error = hf_endpoint_from(Some("ftp://secret".into())).unwrap_err();
+        assert!(!error.contains("secret"), "{error}");
+    }
+
+    #[test]
+    fn a_presigned_redirect_url_never_reaches_an_error() {
+        let cache_dir = std::env::temp_dir().join(format!("hf-presign-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cache_dir);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let location =
+            format!("{base_url}/blob?X-Amz-Signature=sig-secret&X-Amz-Credential=cred-secret");
+        // Redirects to itself until the client gives up.
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let _ = read_http_request(&mut stream);
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        let error = download_to_hf_cache_at(
+            &cache_dir,
+            &base_url,
+            Download::default(),
+            "org/repo",
+            "f.bin",
+            "abc123",
+        )
+        .unwrap_err();
+        assert!(error.contains("redirect"), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+        assert!(!error.contains("X-Amz"), "{error}");
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn without_urls_cuts_each_url_to_its_end() {
+        assert_eq!(
+            without_urls("failed (https://a.b/c?sig=x) then http://d/e f"),
+            "failed (<url>) then <url> f"
+        );
+    }
+
+    #[test]
+    fn a_token_never_follows_a_redirect_to_plain_http() {
+        let cache_dir = std::env::temp_dir().join(format!("hf-redirect-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cache_dir);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            let _ = stream.write_all(
+                b"HTTP/1.1 302 Found\r\nLocation: http://hub.example.com/f.bin\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let error = download_to_hf_cache_at(
+            &cache_dir,
+            &base_url,
+            Download {
+                token: Some("hf_test"),
+                ..Download::default()
+            },
+            "org/repo",
+            "f.bin",
+            "abc123",
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(error.contains("plain http"), "{error}");
+        assert!(!error.contains("hf_test"), "{error}");
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn a_pinned_download_past_its_size_is_refused_and_leaves_refs_main() {
+        let cache_dir = std::env::temp_dir().join(format!("hf-max-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cache_dir);
+        let serve = |body: &'static [u8]| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_http_request(&mut stream);
+                write_http_response(&mut stream, body);
+            });
+            (base_url, server)
+        };
+        let pinned = |max_bytes| Download {
+            max_bytes: Some(max_bytes),
+            pinned: true,
+            ..Download::default()
+        };
+        let (base_url, server) = serve(b"0123456789");
+        let error = download_to_hf_cache_at(
+            &cache_dir,
+            &base_url,
+            pinned(4),
+            "org/repo",
+            "f.bin",
+            "abc123",
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(
+            error.contains("larger than the 4 bytes expected"),
+            "{error}"
+        );
+
+        let (base_url, server) = serve(b"0123456789");
+        download_to_hf_cache_at(
+            &cache_dir,
+            &base_url,
+            pinned(10),
+            "org/repo",
+            "f.bin",
+            "abc123",
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert!(!cache_dir.join("models--org--repo/refs/main").exists());
+        let _ = fs::remove_dir_all(&cache_dir);
     }
 }

@@ -66,6 +66,67 @@ struct Supervisor {
     config: PathBuf,
     /// The `--env` it was started with. `None` is prod.
     env: Option<String>,
+    /// Where it gets its decisions. Absent in a record from a Rayline that
+    /// didn't record them: such a process serves no run, and `rayline local
+    /// stop` still stops it.
+    #[serde(default)]
+    decisions: Option<DecisionsSource>,
+}
+
+/// `routing.decisions`, and for `local` the ARC release with the built-in
+/// pin resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum DecisionsSource {
+    Hosted,
+    Local {
+        repo: String,
+        revision: String,
+        manifest_sha256: String,
+        dir: Option<String>,
+    },
+}
+
+impl DecisionsSource {
+    fn of(settings: &Settings) -> Self {
+        let Some(routing) = settings
+            .routing
+            .as_ref()
+            .filter(|routing| routing.decisions == crate::config::Decisions::Local)
+        else {
+            return Self::Hosted;
+        };
+        let release = routing
+            .arc_release
+            .clone()
+            .unwrap_or_else(crate::arc_release::built_in);
+        Self::Local {
+            repo: release.repo,
+            revision: release.revision,
+            manifest_sha256: release.manifest_sha256,
+            dir: release.dir,
+        }
+    }
+}
+
+impl std::fmt::Display for DecisionsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hosted => f.write_str("hosted decisions"),
+            Self::Local {
+                repo,
+                revision,
+                manifest_sha256,
+                dir,
+            } => {
+                write!(f, "local decisions from {repo} at {revision}")?;
+                if let Some(dir) = dir {
+                    write!(f, " in {dir}")?;
+                }
+                write!(f, " (manifest sha256 {manifest_sha256})")
+            }
+        }
+    }
 }
 
 impl Supervisor {
@@ -87,6 +148,17 @@ impl Supervisor {
                 self.pid,
                 env_words(self.env.as_deref()),
                 env_words(settings.env.as_deref())
+            )));
+        }
+        let decisions = DecisionsSource::of(settings);
+        if self.decisions.as_ref() != Some(&decisions) {
+            let started = self.decisions.as_ref().map_or_else(
+                || "decisions it didn't record (an earlier Rayline started it)".to_owned(),
+                ToString::to_string,
+            );
+            return Err(io::Error::other(format!(
+                "the local process (pid {}) was started with {started}, and this run has {decisions}; stop it with `rayline local stop` first",
+                self.pid
             )));
         }
         Ok(())
@@ -246,6 +318,12 @@ async fn run_harness(
     args: &[OsString],
 ) -> io::Result<ExitCode> {
     require_local_args(harness, args)?;
+    if local_decisions(settings) && !reads_anthropic_messages(harness) {
+        return Err(io::Error::other(format!(
+            "local ARC decisions read only Claude Code, OpenCode, Pi and omp turns, not \
+             {harness}'s; set `routing.decisions` to `hosted` to run {harness}"
+        )));
+    }
     let (home, paths) = local_paths()?;
     {
         let _lock = acquire_lock(&paths.lock())?;
@@ -342,17 +420,9 @@ async fn launch(
     let hosted = crate::status::hosted_environment(settings);
     let config =
         crate::hybrid_profile::core_config(settings, &hosted.base_url).map_err(io::Error::other)?;
-    // Local ARC (prototype): with `RAYLINE_ARC_MODEL` or `RAYLINE_ARC_LOCAL`,
-    // the local process decides each turn itself and points the core at its
-    // loopback routes service; the config keeps the router, which the
-    // classifier still uses. The encoder download is blocking HTTP, which
-    // may not run on the async runtime.
-    let local_arc = {
-        let home = home.to_path_buf();
-        tokio::task::spawn_blocking(move || local_arc(&home))
-            .await
-            .map_err(io::Error::other)??
-    };
+    // With `routing.decisions` `local`, the local process runs the ARC
+    // encoder and a loopback routes service, and points the core's Decisions
+    // at it; the config keeps the router, which the classifier still uses.
     // The local process refuses Decisions anywhere but this router or a
     // loopback address; refuse a router it would refuse here, by name.
     rayline_local_router::decisions_url::check_config(&config, [hosted.base_url.as_str()])
@@ -369,6 +439,13 @@ async fn launch(
     let router_key = crate::status::router_key(&hosted, home)
         .await
         .map_err(|error| io::Error::other(error.to_string()))?;
+    // The downloads are blocking HTTP, which may not run on the async runtime.
+    let local_arc = {
+        let (home, routing) = (home.to_path_buf(), routing.clone());
+        tokio::task::spawn_blocking(move || local_arc(&home, &routing))
+            .await
+            .map_err(io::Error::other)??
+    };
     clear_state(paths)?;
     // One counter per tokenizer, named for each deployment of its model.
     let mut token_counters = Vec::new();
@@ -399,9 +476,9 @@ async fn launch(
     }
     write_private_json(&paths.core_config(), &config, true)?;
     match &local_arc {
-        Some(_) => say(format!(
-            "Decisions: {} on this machine (local ARC)",
-            routing.decisions_model
+        Some(arc) => say(format!(
+            "Decisions: {} by local ARC, {}",
+            routing.decisions_model, arc.source
         )),
         None => say(format!(
             "Decisions: {} via {}",
@@ -459,8 +536,6 @@ async fn launch(
             .arg(&arc.encoder)
             .arg("--arc-model")
             .arg(&arc.model)
-            .arg("--arc-package")
-            .arg(&arc.package)
             .arg("--arc-release")
             .arg(&arc.release);
     }
@@ -474,6 +549,7 @@ async fn launch(
             pid: child.id(),
             config: config_file,
             env: settings.env.clone(),
+            decisions: Some(DecisionsSource::of(settings)),
         };
         write_private_json(
             &paths.supervisor(),
@@ -495,6 +571,9 @@ async fn launch(
                     return Err(io::Error::other("local process startup identity mismatch"));
                 }
                 health(&client, paths, &state).await?;
+                for line in skipped_models(&state) {
+                    say(line);
+                }
                 say(format!(
                     "Local process ready at {}\nLogs: {}",
                     url(&state)?,
@@ -664,13 +743,12 @@ fn current_exe() -> io::Result<PathBuf> {
     fs::canonicalize(std::env::current_exe()?)
 }
 
-/// The local ARC files, when `RAYLINE_ARC_MODEL` names the encoder weights
-/// or `RAYLINE_ARC_LOCAL` asks for the pinned ones (prototype; settings and
-/// a download replace it).
+/// The local ARC files of `routing.decisions` `local`.
 struct LocalArc {
+    /// Where the decisions come from, for the start report.
+    source: String,
     encoder: PathBuf,
     model: PathBuf,
-    package: PathBuf,
     release: PathBuf,
 }
 
@@ -679,61 +757,80 @@ struct LocalArc {
 const ARC_REPO: &str = "rayline-ai/ARC-1.0";
 const ARC_COMMIT: &str = "9e69b28174c07adc6ba76c1258e21526e2f3e7af";
 const ARC_ENCODER_FILE: &str = "gguf/arc-1.0-20261111-encoder-bf16.gguf";
+/// The size of [`ARC_ENCODER_FILE`].
+const ARC_ENCODER_BYTES: u64 = 1_018_125_184;
 const ARC_ENCODER_SHA256: &str = "6aa526ff86148c34977781117a7cf80987583f6797290ee7ea33c4a0fa7a8bb0";
-
-/// The lowercase hex SHA-256 of the file at `path`, read in chunks.
-fn file_sha256(path: &Path) -> io::Result<String> {
-    use sha2::Digest as _;
-    let mut hasher = sha2::Sha256::new();
-    io::copy(&mut fs::File::open(path)?, &mut hasher)?;
-    Ok(format!("{:x}", hasher.finalize()))
-}
 
 /// The pinned encoder weights in the Hugging Face cache, downloaded on first
 /// use and checked against [`ARC_ENCODER_SHA256`].
 fn arc_encoder_weights(home: &Path) -> io::Result<PathBuf> {
     let hub = rayline_hf::hf_cache_dir(home).map_err(io::Error::other)?;
-    let path = match rayline_hf::cached_hf_file(&hub, ARC_REPO, ARC_ENCODER_FILE, ARC_COMMIT) {
-        Some(path) => path,
-        None => rayline_hf::download_to_hf_cache(&hub, ARC_REPO, ARC_ENCODER_FILE, ARC_COMMIT)
-            .map_err(|error| {
-                io::Error::other(format!(
-                    "cannot download the ARC encoder from {ARC_REPO}: {error}"
-                ))
-            })?,
+    let hub_url = rayline_hf::hf_endpoint().map_err(io::Error::other)?;
+    let weights = crate::arc_release::Pinned {
+        repo: ARC_REPO,
+        revision: ARC_COMMIT,
+        path: ARC_ENCODER_FILE.to_owned(),
+        max_bytes: ARC_ENCODER_BYTES,
+        sha256: ARC_ENCODER_SHA256.to_owned(),
     };
-    // Hashed on every start: the blob's name alone doesn't prove its bytes.
-    let blob = fs::canonicalize(&path)?;
-    if file_sha256(&blob)? != ARC_ENCODER_SHA256 {
-        return Err(io::Error::other(format!(
-            "the cached ARC encoder {} is not the pinned file (sha256 {ARC_ENCODER_SHA256}); delete it to download it again",
-            blob.display()
-        )));
-    }
-    Ok(blob)
+    let path = crate::arc_release::fetch_file(&hub, &hub_url, None, &weights)
+        .map_err(|error| io::Error::other(format!("cannot load the ARC encoder: {error}")))?;
+    fs::canonicalize(path)
 }
 
-fn local_arc(home: &Path) -> io::Result<Option<LocalArc>> {
+fn local_arc(home: &Path, routing: &crate::config::Routing) -> io::Result<Option<LocalArc>> {
+    if routing.decisions == crate::config::Decisions::Hosted {
+        return Ok(None);
+    }
+    // Development overrides: `RAYLINE_ARC_MODEL` and `RAYLINE_ARC_ENCODER`
+    // name the encoder weights and binary, `RAYLINE_ARC_RELEASE` a release
+    // directory. Without them, the
+    // pinned encoder and release are downloaded.
+    let (release, source) = match std::env::var_os("RAYLINE_ARC_RELEASE") {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            let source = format!("release directory {}", dir.display());
+            (dir, source)
+        }
+        None => {
+            let pin = routing
+                .arc_release
+                .clone()
+                .unwrap_or_else(crate::arc_release::built_in);
+            let hub = rayline_hf::hf_cache_dir(home).map_err(io::Error::other)?;
+            let hub_url = rayline_hf::hf_endpoint().map_err(io::Error::other)?;
+            let token = rayline_hf::hf_token(home).map_err(io::Error::other)?;
+            let dir = crate::arc_release::fetch(&hub, &hub_url, token.as_deref(), &pin).map_err(
+                |error| io::Error::other(format!("cannot load the ARC release: {error}")),
+            )?;
+            let source = format!("release {} at {}", pin.repo, pin.revision);
+            (dir, source)
+        }
+    };
+    // The encoder weights download after the release, which is small and
+    // refuses a pin it cannot meet first.
     let model = match std::env::var_os("RAYLINE_ARC_MODEL") {
         Some(model) => PathBuf::from(model),
-        None if std::env::var_os("RAYLINE_ARC_LOCAL").is_some() => arc_encoder_weights(home)?,
-        None => return Ok(None),
+        None => arc_encoder_weights(home)?,
     };
     let encoder = match std::env::var_os("RAYLINE_ARC_ENCODER") {
         Some(path) => PathBuf::from(path),
-        None => installed_binary("rayline-arc-encoder")?,
+        None => installed_binary("rayline-arc-encoder").map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "`local` decisions need the ARC encoder `rayline-arc-encoder` beside `rayline`, \
+                     and Rayline releases don't ship it yet; set `routing.decisions` to `hosted` \
+                     ({error})"
+                ),
+            )
+        })?,
     };
-    let release = std::env::var_os("RAYLINE_ARC_RELEASE")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("local ARC needs RAYLINE_ARC_RELEASE"))?;
-    // The package manifest sits in the release directory unless named.
-    let package = std::env::var_os("RAYLINE_ARC_PACKAGE")
-        .map_or_else(|| release.join("package.json"), PathBuf::from);
     Ok(Some(LocalArc {
+        source,
         encoder,
         model,
         // Beside the local process's state, which each start clears.
-        package,
         release,
     }))
 }
@@ -754,6 +851,27 @@ fn installed_binary(name: &str) -> io::Result<PathBuf> {
             ),
         )
     })
+}
+
+/// A warning for each `models` entry the local process's ARC decisions
+/// skip, from its ready file.
+fn skipped_models(state: &Value) -> Vec<String> {
+    let Some(skipped) = state.get("skipped_models").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    skipped
+        .iter()
+        .filter_map(|model| {
+            let id = model.get("id")?.as_str()?;
+            let why = match model.get("reason")?.as_str()? {
+                "not_in_release" => "isn't in the ARC release's catalog",
+                _ => "has no price in its `models` entry or the ARC release",
+            };
+            Some(format!(
+                "Warning: models entry {id} {why}; ARC won't route to it"
+            ))
+        })
+        .collect()
 }
 
 fn ready(paths: &Paths) -> io::Result<Value> {
@@ -1002,6 +1120,25 @@ fn harness_command(
 }
 
 /// Refuse a command line local mode can't run, before anything starts.
+/// Whether `routing.decisions` is `local`.
+fn local_decisions(settings: &Settings) -> bool {
+    settings
+        .routing
+        .as_ref()
+        .is_some_and(|routing| routing.decisions == crate::config::Decisions::Local)
+}
+
+/// Whether the harness speaks Anthropic Messages, the one request format
+/// local ARC decisions read.
+fn reads_anthropic_messages(harness: &str) -> bool {
+    use crate::harness::Harness;
+    match Harness::from_command(harness) {
+        Some(Harness::Hermes | Harness::OpenClaw) => false,
+        Some(Harness::OpenCode | Harness::Pi | Harness::Omp) => true,
+        None => harness != "codex",
+    }
+}
+
 fn require_local_args(harness: &str, args: &[OsString]) -> io::Result<()> {
     require_fresh_session(harness, args)?;
     match crate::harness::Harness::from_command(harness) {
@@ -1070,16 +1207,28 @@ fn running(paths: &Paths) -> io::Result<Option<Supervisor>> {
         }
         Err(error) => return Err(error),
     };
-    let supervisor: Supervisor = serde_json::from_slice(&bytes)
-        .map_err(|error| io::Error::other(format!("{}: {error}", paths.supervisor().display())))?;
-    let pid = i32::try_from(supervisor.pid).map_err(|_| {
-        io::Error::other(format!(
-            "{}: invalid pid {}",
-            paths.supervisor().display(),
-            supervisor.pid
-        ))
-    })?;
-    Ok(process_exists(pid)?.then_some(supervisor))
+    let invalid =
+        |error: String| io::Error::other(format!("{}: {error}", paths.supervisor().display()));
+    // Liveness first: a record of a process that has exited is stale
+    // whatever else it holds.
+    let record: Value =
+        serde_json::from_slice(&bytes).map_err(|error| invalid(error.to_string()))?;
+    let pid = record
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| i32::try_from(pid).ok())
+        .ok_or_else(|| {
+            invalid(format!(
+                "invalid pid {}",
+                record.get("pid").unwrap_or(&Value::Null)
+            ))
+        })?;
+    if !process_exists(pid)? {
+        return Ok(None);
+    }
+    serde_json::from_value(record)
+        .map(Some)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 /// Remove what a local process that is no longer running left behind.
@@ -1421,6 +1570,22 @@ fn acquire_lock(lock_path: &Path) -> io::Result<std::fs::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ready_file_s_skipped_models_become_one_warning_each() {
+        let state = json!({"skipped_models": [
+            {"id": "x/other", "reason": "not_in_release"},
+            {"id": "x/known", "reason": "no_price"},
+        ]});
+        assert_eq!(
+            skipped_models(&state),
+            vec![
+                "Warning: models entry x/other isn't in the ARC release's catalog; ARC won't route to it",
+                "Warning: models entry x/known has no price in its `models` entry or the ARC release; ARC won't route to it",
+            ]
+        );
+        assert!(skipped_models(&json!({"ready": true})).is_empty());
+    }
 
     #[test]
     fn a_missing_installed_binary_is_an_error_naming_its_path() {
@@ -2032,6 +2197,33 @@ mod tests {
     }
 
     #[test]
+    fn local_decisions_read_only_anthropic_messages_harnesses() {
+        for harness in ["claude", "opencode", "pi", "omp"] {
+            assert!(reads_anthropic_messages(harness), "{harness}");
+        }
+        for harness in ["codex", "hermes", "openclaw"] {
+            assert!(!reads_anthropic_messages(harness), "{harness}");
+        }
+    }
+
+    #[tokio::test]
+    async fn local_decisions_refuse_an_openai_format_harness_before_anything_starts() {
+        let dir = temp_dir("openai-local");
+        let mut settings = local_settings(&dir, "a.json", None);
+        if let Some(routing) = settings.routing.as_mut() {
+            routing.decisions = crate::config::Decisions::Local;
+        }
+        for harness in ["codex", "hermes", "openclaw"] {
+            let error = run_harness(&settings, harness, &[])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("`routing.decisions` to `hosted`"), "{error}");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_run_on_another_config_or_env_is_refused() {
         let dir = temp_dir("serves");
         let started = local_settings(&dir, "a.json", None);
@@ -2039,8 +2231,50 @@ mod tests {
             pid: 7,
             config: fs::canonicalize(&started.file).unwrap(),
             env: None,
+            decisions: Some(DecisionsSource::of(&started)),
         };
         supervisor.check_serves(&started).unwrap();
+        assert_eq!(supervisor.decisions, Some(DecisionsSource::Hosted));
+
+        // A record from a Rayline that didn't record decisions serves no run.
+        let earlier: Supervisor =
+            serde_json::from_str(r#"{"pid": 7, "config": "/c.json", "env": null}"#).unwrap();
+        assert_eq!(earlier.decisions, None);
+        let earlier = Supervisor {
+            config: supervisor.config.clone(),
+            ..earlier
+        };
+        assert!(
+            earlier
+                .check_serves(&started)
+                .unwrap_err()
+                .to_string()
+                .contains("decisions it didn't record")
+        );
+
+        let mut local = local_settings(&dir, "a.json", None);
+        if let Some(routing) = local.routing.as_mut() {
+            routing.decisions = crate::config::Decisions::Local;
+        }
+        let built_in = crate::arc_release::built_in();
+        assert_eq!(
+            supervisor.check_serves(&local).unwrap_err().to_string(),
+            format!(
+                "the local process (pid 7) was started with hosted decisions, and this run has \
+                 local decisions from {} at {} in runtime (manifest sha256 {}); stop it with \
+                 `rayline local stop` first",
+                built_in.repo, built_in.revision, built_in.manifest_sha256
+            )
+        );
+        // Another release is another process.
+        let mut pinned = local.clone();
+        if let Some(routing) = pinned.routing.as_mut() {
+            routing.arc_release = Some(crate::config::ArcRelease {
+                revision: "1".repeat(40),
+                ..built_in
+            });
+        }
+        assert_ne!(DecisionsSource::of(&pinned), DecisionsSource::of(&local));
 
         let other = local_settings(&dir, "b.json", None);
         let error = supervisor.check_serves(&other).unwrap_err().to_string();
@@ -2075,7 +2309,9 @@ mod tests {
         let record = |pid: u64| {
             fs::write(
                 paths.supervisor(),
-                json!({"pid": pid, "config": "/c.json", "env": "dev"}).to_string(),
+                json!({"pid": pid, "config": "/c.json", "env": "dev",
+                       "decisions": {"mode": "hosted"}})
+                .to_string(),
             )
             .unwrap();
             running(&paths)
@@ -2086,6 +2322,7 @@ mod tests {
                 pid: std::process::id(),
                 config: PathBuf::from("/c.json"),
                 env: Some("dev".to_owned()),
+                decisions: Some(DecisionsSource::Hosted),
             })
         );
         let error = record(u64::from(u32::MAX)).unwrap_err().to_string();
@@ -2097,9 +2334,11 @@ mod tests {
             assert_eq!(record(u64::from(child.id())).unwrap(), None);
         }
 
+        // A live process's record with an unknown field is an error.
         fs::write(
             paths.supervisor(),
-            r#"{"pid": 1, "config": "/c.json", "env": null, "port": 9}"#,
+            json!({"pid": std::process::id(), "config": "/c.json", "env": null, "port": 9})
+                .to_string(),
         )
         .unwrap();
         let error = running(&paths).unwrap_err().to_string();

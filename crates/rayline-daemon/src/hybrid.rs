@@ -84,15 +84,11 @@ pub struct Args {
     token_counters: Vec<String>,
     /// Local ARC: the encoder binary. With the other `--arc-*` flags,
     /// routing decisions are made on this machine.
-    #[arg(long, requires_all = ["arc_model", "arc_package", "arc_release"])]
+    #[arg(long, requires_all = ["arc_model", "arc_release"])]
     arc_encoder: Option<PathBuf>,
     /// Local ARC: the encoder weights (GGUF).
     #[arg(long)]
     arc_model: Option<PathBuf>,
-    /// Local ARC: the policy package manifest (`package.json`) the routes
-    /// service decides with.
-    #[arg(long)]
-    arc_package: Option<PathBuf>,
     /// Local ARC: the package's alias as the decide service knows it.
     #[arg(long, default_value = "rayline/arc-1.0-20261107")]
     arc_alias: String,
@@ -117,6 +113,9 @@ struct Ready {
     core_pid: u32,
     instance_id: String,
     capabilities: ModelCapabilities,
+    /// `models` entries local ARC decisions don't route to.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    skipped_models: Vec<crate::hybrid_arc::SkippedModel>,
 }
 
 struct Gateway {
@@ -192,27 +191,31 @@ pub async fn run(args: Args) -> Result<()> {
     let mut arc_encoder = None;
     let mut arc_routes = None;
     let mut arc_routes_token: Option<String> = None;
-    if let (Some(binary), Some(model), Some(package), Some(release)) = (
-        &args.arc_encoder,
-        &args.arc_model,
-        &args.arc_package,
-        &args.arc_release,
-    ) {
+    let mut skipped_models = Vec::new();
+    if let (Some(binary), Some(model), Some(release_dir)) =
+        (&args.arc_encoder, &args.arc_model, &args.arc_release)
+    {
+        // Loaded before anything starts, so a release that can't decide
+        // fails first.
+        let dir = release_dir.clone();
+        let release = std::sync::Arc::new(
+            tokio::task::spawn_blocking(move || crate::hybrid_arc::load_release(&dir)).await??,
+        );
         let files = crate::hybrid_arc::EncoderFiles {
             binary: binary.clone(),
             model: model.clone(),
         };
         // The encoder must chunk as the release's stage one was fit.
-        let budget = rayline_arc_decide::stage_one_chunk_tokens(release)
-            .with_context(|| format!("read the ARC release in {}", release.display()))?;
-        let encoder = crate::hybrid_arc::Encoder::start(&files, budget, startup_timeout).await?;
+        let encoder =
+            crate::hybrid_arc::Encoder::start(&files, release.chunk_tokens, startup_timeout)
+                .await?;
         tracing::info!(url = %encoder.url, pid = ?encoder.pid(), "local ARC encoder ready");
         let access = crate::hybrid_arc::RoutesAccess::for_core(&core_config)?;
         arc_routes_token = Some(access.token.clone());
         let (routes_url, task) = crate::hybrid_arc::serve_routes(
-            package,
+            release_dir,
             &args.arc_alias,
-            release,
+            release.clone(),
             &encoder,
             &args.router_url,
             access,
@@ -220,10 +223,11 @@ pub async fn run(args: Args) -> Result<()> {
         .await?;
         arc_routes = Some(task);
         let local = args.ready_file.with_extension("arc-core.json");
-        crate::hybrid_arc::with_local_decisions(
+        skipped_models = crate::hybrid_arc::with_local_decisions(
             &core_config,
             &routes_url,
             Some(crate::hybrid_arc::ROUTES_TOKEN_ENV),
+            Some(&*release),
             &local,
         )?;
         // The rewritten Decisions URL gets the same check as the config's:
@@ -292,6 +296,7 @@ pub async fn run(args: Args) -> Result<()> {
             core_pid: handshake.pid,
             instance_id,
             capabilities,
+            skipped_models,
         };
         write_private_new(&args.ready_file, &serde_json::to_vec(&ready)?)?;
         cleanup.ready = Some(args.ready_file.clone());

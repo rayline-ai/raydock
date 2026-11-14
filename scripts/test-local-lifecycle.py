@@ -85,7 +85,10 @@ def main():
             },
             "routing": {"decisions_model": "arc-swift-1.0",
                         "classifier_model": "anthropic/claude-haiku-5.5",
-                        "policy": {"preset": "arc-policy.prefer-local.v1"}},
+                        "policy": {"preset": "arc-policy.prefer-local.v1"},
+                        # The fixture router decides: this checks supervision,
+                        # not local ARC, which needs the encoder.
+                        "decisions": "hosted"},
         }))
 
         def rayline_cmd(*args, success=True):

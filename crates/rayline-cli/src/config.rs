@@ -92,12 +92,54 @@ pub struct Policy {
     pub overrides: Option<Map<String, Value>>,
 }
 
+/// `routing.decisions`: where the local process gets its routing decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decisions {
+    /// ARC runs in the local process, from the release it downloads.
+    Local,
+    /// The environment's Rayline router decides.
+    Hosted,
+}
+
+impl Decisions {
+    pub const ALL: [Decisions; 2] = [Decisions::Local, Decisions::Hosted];
+
+    /// The name used in `settings.json` and `RAYLINE_ROUTING_DECISIONS`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Decisions::Local => "local",
+            Decisions::Hosted => "hosted",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|d| d.as_str() == value)
+    }
+}
+
+/// `routing.arc_release`: the Hugging Face repo, commit and manifest digest
+/// of the ARC runtime release local decisions download instead of the
+/// built-in one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArcRelease {
+    /// `<owner>/<name>`.
+    pub repo: String,
+    /// A full commit id: 40 lowercase hex digits.
+    pub revision: String,
+    /// The sha256 of the release's `manifest.json`: 64 lowercase hex digits.
+    pub manifest_sha256: String,
+    /// The repo directory that holds the release; `None` is the repo root.
+    pub dir: Option<String>,
+}
+
 /// `routing`: present exactly when the config is for local mode.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Routing {
     pub decisions_model: String,
     pub classifier_model: String,
     pub policy: Policy,
+    pub decisions: Decisions,
+    pub arc_release: Option<ArcRelease>,
 }
 
 /// `environments.<name>`: an internal environment selected with `--env`.
@@ -235,6 +277,7 @@ const ROUTING_CLASSIFIER_MODEL: (&str, &str) = (
 );
 const ROUTING_POLICY_PRESET: (&str, &str) =
     ("RAYLINE_ROUTING_POLICY_PRESET", "routing.policy.preset");
+const ROUTING_DECISIONS: (&str, &str) = ("RAYLINE_ROUTING_DECISIONS", "routing.decisions");
 const UPDATE_CHANNEL: (&str, &str) = ("RAYLINE_UPDATE_CHANNEL", "update.channel");
 
 /// Loads the config. Precedence, lowest to highest: built-in defaults, the
@@ -412,6 +455,8 @@ struct RawRouting {
     classifier_model: Option<String>,
     preset: Option<String>,
     overrides: Option<Map<String, Value>>,
+    decisions: Option<Decisions>,
+    arc_release: Option<ArcRelease>,
 }
 
 fn apply_routing_overrides(
@@ -421,11 +466,13 @@ fn apply_routing_overrides(
     let decisions_model = env_string(env, ROUTING_DECISIONS_MODEL)?;
     let classifier_model = env_string(env, ROUTING_CLASSIFIER_MODEL)?;
     let preset = env_string(env, ROUTING_POLICY_PRESET)?;
+    let decisions = env_string(env, ROUTING_DECISIONS)?;
     let Some(mut routing) = routing else {
         let set = [
             (ROUTING_DECISIONS_MODEL, &decisions_model),
             (ROUTING_CLASSIFIER_MODEL, &classifier_model),
             (ROUTING_POLICY_PRESET, &preset),
+            (ROUTING_DECISIONS, &decisions),
         ]
         .into_iter()
         .find(|(_, value)| value.is_some());
@@ -446,6 +493,14 @@ fn apply_routing_overrides(
     }
     if let Some(value) = preset {
         routing.preset = Some(value);
+    }
+    if let Some(value) = decisions {
+        let (var, key) = ROUTING_DECISIONS;
+        routing.decisions = Some(Decisions::parse(&value).ok_or_else(|| ConfigError::Env {
+            var,
+            key,
+            problem: one_of(Decisions::ALL.map(Decisions::as_str)),
+        })?);
     }
     Ok(Some(routing))
 }
@@ -651,11 +706,32 @@ impl<'a> Doc<'a> {
         self.known_keys(
             routing,
             key,
-            &["decisions_model", "classifier_model", "policy"],
+            &[
+                "decisions_model",
+                "classifier_model",
+                "policy",
+                "decisions",
+                "arc_release",
+            ],
         )?;
         let mut raw = RawRouting {
             decisions_model: self.optional_string(routing, key, "decisions_model")?,
             classifier_model: self.optional_string(routing, key, "classifier_model")?,
+            decisions: routing
+                .get("decisions")
+                .map(|value| {
+                    value.as_str().and_then(Decisions::parse).ok_or_else(|| {
+                        self.err(
+                            "routing.decisions",
+                            one_of(Decisions::ALL.map(Decisions::as_str)),
+                        )
+                    })
+                })
+                .transpose()?,
+            arc_release: routing
+                .get("arc_release")
+                .map(|value| self.arc_release(value))
+                .transpose()?,
             ..RawRouting::default()
         };
         if let Some(value) = routing.get("policy") {
@@ -669,6 +745,72 @@ impl<'a> Doc<'a> {
                 .transpose()?;
         }
         Ok(raw)
+    }
+
+    fn arc_release(&self, value: &Value) -> Result<ArcRelease, ConfigError> {
+        let key = "routing.arc_release";
+        let release = self.object(value, key)?;
+        self.known_keys(
+            release,
+            key,
+            &["repo", "revision", "manifest_sha256", "dir"],
+        )?;
+        let field = |name: &str| -> Result<String, ConfigError> {
+            self.string(self.required(release, key, name)?, &child(key, name))
+        };
+        let hex = |name: &str, digits: usize| -> Result<String, ConfigError> {
+            let value = field(name)?;
+            if value.len() != digits
+                || !value
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+            {
+                return Err(self.err(
+                    child(key, name),
+                    format!("must be {digits} lowercase hex digits"),
+                ));
+            }
+            Ok(value)
+        };
+        let repo = field("repo")?;
+        let valid_repo = repo.split_once('/').is_some_and(|(owner, name)| {
+            let part = |part: &str| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                    && part != "."
+                    && part != ".."
+            };
+            part(owner) && part(name)
+        });
+        if !valid_repo {
+            return Err(self.err(
+                child(key, "repo"),
+                "must be a Hugging Face repo `<owner>/<name>`",
+            ));
+        }
+        let dir = self.optional_string(release, key, "dir")?;
+        let plain = |part: &str| {
+            !part.is_empty()
+                && part != "."
+                && part != ".."
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        };
+        if dir.as_deref().is_some_and(|dir| !dir.split('/').all(plain)) {
+            return Err(self.err(
+                child(key, "dir"),
+                "must be a relative path of plain names joined by `/`",
+            ));
+        }
+        Ok(ArcRelease {
+            repo,
+            revision: hex("revision", 40)?,
+            manifest_sha256: hex("manifest_sha256", 64)?,
+            dir,
+        })
     }
 
     /// `routing` with its required keys present.
@@ -685,6 +827,8 @@ impl<'a> Doc<'a> {
                 preset: required(routing.preset, "routing.policy.preset")?,
                 overrides: routing.overrides,
             },
+            decisions: routing.decisions.unwrap_or(Decisions::Hosted),
+            arc_release: routing.arc_release,
         }))
     }
 
@@ -1913,6 +2057,109 @@ mod tests {
     }
 
     #[test]
+    fn routing_decisions_default_to_hosted_and_name_their_release() {
+        let routing = |extra: Value| {
+            let mut doc = example();
+            for (key, value) in extra.as_object().expect("object") {
+                doc["routing"][key] = value.clone();
+            }
+            load_doc(&doc).map(|settings| settings.routing.expect("routing"))
+        };
+        let plain = routing(json!({})).expect("load");
+        assert_eq!(plain.decisions, Decisions::Hosted);
+        assert_eq!(plain.arc_release, None);
+        let local = routing(json!({"decisions": "local"})).expect("load");
+        assert_eq!(local.decisions, Decisions::Local);
+        assert_eq!(
+            key_error(routing(json!({"decisions": "router"}))),
+            (
+                "routing.decisions".to_owned(),
+                "must be one of `local`, `hosted`".to_owned()
+            )
+        );
+
+        let release = json!({"repo": "org/arc", "revision": "a".repeat(40),
+                             "manifest_sha256": "b".repeat(64)});
+        let pinned = routing(json!({"arc_release": release})).expect("load");
+        assert_eq!(
+            pinned.arc_release,
+            Some(ArcRelease {
+                repo: "org/arc".to_owned(),
+                revision: "a".repeat(40),
+                manifest_sha256: "b".repeat(64),
+                dir: None,
+            })
+        );
+        let mut in_dir = release.clone();
+        in_dir["dir"] = json!("releases/runtime");
+        let in_dir = routing(json!({"arc_release": in_dir})).expect("load");
+        assert_eq!(
+            in_dir.arc_release.and_then(|r| r.dir).as_deref(),
+            Some("releases/runtime")
+        );
+        let with = |key: &str, value: Value| {
+            let mut release = release.clone();
+            release[key] = value;
+            key_error(routing(json!({"arc_release": release})))
+        };
+        for repo in ["arc", "org/", "/arc", "org/../x", "org/a b"] {
+            assert_eq!(with("repo", json!(repo)).0, "routing.arc_release.repo");
+        }
+        assert_eq!(
+            with("revision", json!("main")),
+            (
+                "routing.arc_release.revision".to_owned(),
+                "must be 40 lowercase hex digits".to_owned()
+            )
+        );
+        assert_eq!(
+            with("manifest_sha256", json!("B".repeat(64))).0,
+            "routing.arc_release.manifest_sha256"
+        );
+        for dir in ["", "/abs", "a/../b", "a//b", "a b"] {
+            assert_eq!(with("dir", json!(dir)).0, "routing.arc_release.dir");
+        }
+        assert_eq!(
+            with("path", json!("runtime")),
+            (
+                "routing.arc_release.path".to_owned(),
+                "is not a known key".to_owned()
+            )
+        );
+        let mut missing = release.clone();
+        missing.as_object_mut().expect("object").remove("revision");
+        assert_eq!(
+            key_error(routing(json!({"arc_release": missing}))),
+            (
+                "routing.arc_release.revision".to_owned(),
+                "is required".to_owned()
+            )
+        );
+    }
+
+    #[test]
+    fn the_decisions_override_is_validated_like_the_file() {
+        let home = temp_home();
+        write_default(&home, &example());
+        let decisions = |value| {
+            load_env(
+                &home,
+                opts(Mode::Cloud),
+                &[("RAYLINE_ROUTING_DECISIONS", value)],
+            )
+        };
+        let routing = decisions("local").expect("load").routing.expect("routing");
+        assert_eq!(routing.decisions, Decisions::Local);
+        assert_eq!(
+            env_error(decisions("cloud")),
+            (
+                "RAYLINE_ROUTING_DECISIONS",
+                "must be one of `local`, `hosted`".to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn env_overrides_replace_file_values() {
         let home = temp_home();
         write_default(&home, &example());
@@ -2056,10 +2303,11 @@ mod tests {
     }
 
     /// The section 5.7 table, in the order the loader reads it.
-    const OVERRIDES: [(&str, &str); 4] = [
+    const OVERRIDES: [(&str, &str); 5] = [
         ROUTING_DECISIONS_MODEL,
         ROUTING_CLASSIFIER_MODEL,
         ROUTING_POLICY_PRESET,
+        ROUTING_DECISIONS,
         UPDATE_CHANNEL,
     ];
 
@@ -2074,6 +2322,7 @@ mod tests {
                     "routing.classifier_model"
                 ),
                 ("RAYLINE_ROUTING_POLICY_PRESET", "routing.policy.preset"),
+                ("RAYLINE_ROUTING_DECISIONS", "routing.decisions"),
                 ("RAYLINE_UPDATE_CHANNEL", "update.channel"),
             ]
         );
@@ -2131,6 +2380,7 @@ mod tests {
             "RAYLINE_ROUTING_DECISIONS_MODEL",
             "RAYLINE_ROUTING_CLASSIFIER_MODEL",
             "RAYLINE_ROUTING_POLICY_PRESET",
+            "RAYLINE_ROUTING_DECISIONS",
         ] {
             for mode in [Mode::Cloud, Mode::File(&file)] {
                 assert_eq!(

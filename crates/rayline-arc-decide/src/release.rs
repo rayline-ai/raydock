@@ -186,6 +186,11 @@ pub struct Release {
     pub(crate) stage_two_cost_weight: f64,
     /// Whether a request's prices change decisions.
     pub(crate) live_prices: bool,
+    /// The tokens per encoder decode call its readouts were made with.
+    pub chunk_tokens: u32,
+    /// A runtime release's routes catalog; a full release's is its
+    /// `package.json`.
+    pub runtime_catalog: Option<crate::RuntimeCatalog>,
 }
 
 impl fmt::Debug for Release {
@@ -339,19 +344,6 @@ fn require_recipe(recipe: &Value) -> Result<f64, ReleaseError> {
     Ok(weight)
 }
 
-/// The stage-one encoder's chunk size in the release in `directory`
-/// (`arc.serving.stage_one.encoder.chunk_tokens`): the tokens per encoder
-/// decode call its readouts were made with.
-pub fn stage_one_chunk_tokens(directory: &Path) -> Result<u32, ReleaseError> {
-    let path = ReleaseFiles::in_dir(directory).config;
-    let config = json(&path, &read(&path)?)?;
-    config["arc"]["serving"]["stage_one"]["encoder"]["chunk_tokens"]
-        .as_u64()
-        .and_then(|tokens| u32::try_from(tokens).ok())
-        .filter(|tokens| *tokens > 0)
-        .ok_or_else(|| malformed("config.json names no stage-one encoder chunk_tokens"))
-}
-
 impl Release {
     /// Whether a caller price row keyed `key` prices one of this release's
     /// models: its price id, or `<id>@<endpoint>` for its endpoint.
@@ -362,7 +354,11 @@ impl Release {
     }
 
     /// Loads the release in `directory`.
+    /// A directory with `arc-runtime.json` is read as a runtime release.
     pub fn load(directory: &Path) -> Result<Self, ReleaseError> {
+        if crate::runtime::is_runtime_release(directory) {
+            return Self::from_runtime(directory);
+        }
         Self::from_files(&ReleaseFiles::in_dir(directory))
     }
 
@@ -570,6 +566,11 @@ impl Release {
             .collect();
 
         let body = &serving["stage_one"];
+        let chunk_tokens = body["encoder"]["chunk_tokens"]
+            .as_u64()
+            .and_then(|tokens| u32::try_from(tokens).ok())
+            .filter(|tokens| *tokens > 0)
+            .ok_or_else(|| malformed("config.json names no stage-one encoder chunk_tokens"))?;
         let settings_record = &body["config"];
         if !settings_record.is_object() {
             return Err(ReleaseError::NoServingRecord);
@@ -741,6 +742,8 @@ impl Release {
             stage_two_cost_weight,
             live_prices: package["pricing"].get("live_prices_affect_decisions")
                 == Some(&Value::Bool(true)),
+            chunk_tokens,
+            runtime_catalog: None,
         };
         if let Some(prices) = serving.get("prices").filter(|p| p.is_object()) {
             release.set_prices(prices)?;
@@ -764,6 +767,43 @@ impl Release {
         self
     }
 
+    /// Whether the release has rates of its own (from its package, a price
+    /// scenario or a per-model card) that fully price at least one arm.
+    /// Without them it prices no model, and a decision that weighs cost
+    /// cannot be made.
+    pub fn has_prices(&self) -> bool {
+        self.package_rates
+            .iter()
+            .flatten()
+            .any(|rates| rates.iter().all(Option::is_some))
+    }
+
+    /// Whether the release takes a caller's own prices into its decisions.
+    /// A release that doesn't refuses a request that carries them.
+    pub fn accepts_caller_prices(&self) -> bool {
+        self.live_prices
+    }
+
+    /// Whether an arm of the release is the model a price table names `id`.
+    pub fn knows_model(&self, id: &str) -> bool {
+        self.arms.iter().any(|arm| arm.model_id == id)
+    }
+
+    /// Whether the release's own rates fully price every arm of the model a
+    /// price table names `id`.
+    pub fn prices_model(&self, id: &str) -> bool {
+        let Some(rates) = &self.package_rates else {
+            return false;
+        };
+        let mut arms = self
+            .arms
+            .iter()
+            .zip(rates)
+            .filter(|(arm, _)| arm.model_id == id)
+            .peekable();
+        arms.peek().is_some() && arms.all(|(_, rates)| rates.iter().all(Option::is_some))
+    }
+
     pub fn with_prices(mut self, path: &Path) -> Result<Self, ReleaseError> {
         let scenario = json(path, &read(path)?)?;
         self.set_prices(&scenario)?;
@@ -776,8 +816,11 @@ impl Release {
     /// price-table id or its policy name, gets that model's rates. Arms of
     /// unlisted models stay unpriced. A request's `routing_prices` are read
     /// over these.
-    pub fn with_model_prices(mut self, path: &Path) -> Result<Self, ReleaseError> {
-        let card = json(path, &read(path)?)?;
+    pub fn with_model_prices(self, path: &Path) -> Result<Self, ReleaseError> {
+        self.with_price_card(&json(path, &read(path)?)?)
+    }
+
+    pub(crate) fn with_price_card(mut self, card: &Value) -> Result<Self, ReleaseError> {
         let models = card["models"]
             .as_object()
             .ok_or_else(|| malformed("the price card has no models"))?;
@@ -851,19 +894,5 @@ mod tests {
         assert!(!prices_arm("vendor/m@e", "vendor/m", None));
         assert!(!prices_arm("vendor/other", "vendor/m", Some("e")));
         assert!(!prices_arm("m", "vendor/m", None));
-    }
-
-    #[test]
-    fn the_stage_one_chunk_is_read_from_the_serving_record() {
-        let dir = std::env::temp_dir().join(format!("arc-chunk-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let write = |config: &str| std::fs::write(dir.join("config.json"), config).expect("write");
-        write(r#"{"arc": {"serving": {"stage_one": {"encoder": {"chunk_tokens": 8192}}}}}"#);
-        assert_eq!(stage_one_chunk_tokens(&dir).expect("a chunk size"), 8192);
-        write(r#"{"arc": {"serving": {"stage_one": {"encoder": {"chunk_tokens": 0}}}}}"#);
-        assert!(stage_one_chunk_tokens(&dir).is_err());
-        write(r#"{"arc": {}}"#);
-        assert!(stage_one_chunk_tokens(&dir).is_err());
-        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }

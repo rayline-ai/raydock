@@ -41,6 +41,7 @@ mod encoder;
 mod error;
 mod prices;
 mod release;
+mod runtime;
 mod stage_one;
 mod stage_two;
 mod tensors;
@@ -51,6 +52,10 @@ pub use encoder::{EncodeStats, LocalEncoder};
 pub use error::DecideError;
 pub use release::{
     Action, Arm, PRICE_LEGS, Rates, Release, ReleaseError, ReleaseFiles, StageOneSettings,
-    Thinking, ToolFree, stage_one_chunk_tokens,
+    Thinking, ToolFree,
+};
+pub use runtime::{
+    ManifestFile, RUNTIME_FILE, RUNTIME_SCHEMA, RuntimeAction, RuntimeCatalog, is_runtime_release,
+    manifest_files, runtime_catalog,
 };
 pub use wire::*;
