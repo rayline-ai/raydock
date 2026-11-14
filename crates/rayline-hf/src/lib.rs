@@ -102,7 +102,7 @@ pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
         .get(&url)
         .header("User-Agent", "rayline")
         .send()
-        .map_err(|e| format!("HF API request failed: {e}"))?;
+        .map_err(|e| format!("HF API request failed: {}", request_error(e)))?;
 
     if !response.status().is_success() {
         return Err(format!("HF API returned status {}", response.status()));
@@ -110,7 +110,7 @@ pub fn hf_api_get_commit(repo: &str) -> Result<String, String> {
 
     let body = response
         .text()
-        .map_err(|e| format!("Failed to read HF API response: {e}"))?;
+        .map_err(|e| format!("Failed to read HF API response: {}", request_error(e)))?;
     let info: HfModelInfo =
         serde_json::from_str(&body).map_err(|e| format!("Failed to parse HF API response: {e}"))?;
 
@@ -453,6 +453,41 @@ fn create_symlink_or_copy(
     Ok(())
 }
 
+/// A request error as text with no URL in it: a redirect's URL can be
+/// presigned, with credentials in its query.
+fn request_error(error: reqwest::Error) -> String {
+    let error = error.without_url();
+    let mut text = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    without_urls(&text)
+}
+
+/// `text` with every `http://` or `https://` URL replaced by `<url>`.
+fn without_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = ["http://", "https://"]
+        .iter()
+        .filter_map(|scheme| rest.find(scheme))
+        .min()
+    {
+        out.push_str(&rest[..start]);
+        out.push_str("<url>");
+        let url = &rest[start..];
+        let end = url
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | '"' | '\'' | '>'))
+            .unwrap_or(url.len());
+        rest = &url[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn download_file_to_path(
     url: &str,
     token: Option<&str>,
@@ -538,13 +573,9 @@ fn attempt_download(
     let response = match request.send() {
         Ok(r) => r,
         Err(e) => {
-            let msg = match std::error::Error::source(&e) {
-                Some(reason) if e.is_redirect() => {
-                    format!("Download request failed: {e}: {reason}")
-                }
-                _ => format!("Download request failed: {e}"),
-            };
-            return if is_retryable_reqwest_error(&e) {
+            let retryable = is_retryable_reqwest_error(&e);
+            let msg = format!("Download request failed: {}", request_error(e));
+            return if retryable {
                 Err(DownloadAttemptError::Retryable(msg))
             } else {
                 Err(DownloadAttemptError::Fatal(msg))
@@ -620,7 +651,10 @@ fn attempt_download(
             Ok(n) => n,
             Err(e) => {
                 drop(file);
-                let msg = format!("Read error during download: {e}");
+                let msg = format!(
+                    "Read error during download: {}",
+                    without_urls(&e.to_string())
+                );
                 return if is_retryable_io_error(&e) {
                     Err(DownloadAttemptError::Retryable(msg))
                 } else {
@@ -976,6 +1010,48 @@ mod tests {
         );
         let error = hf_endpoint_from(Some("ftp://secret".into())).unwrap_err();
         assert!(!error.contains("secret"), "{error}");
+    }
+
+    #[test]
+    fn a_presigned_redirect_url_never_reaches_an_error() {
+        let cache_dir = std::env::temp_dir().join(format!("hf-presign-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&cache_dir);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let location =
+            format!("{base_url}/blob?X-Amz-Signature=sig-secret&X-Amz-Credential=cred-secret");
+        // Redirects to itself until the client gives up.
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let _ = read_http_request(&mut stream);
+                let _ = stream.write_all(
+                    format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                );
+            }
+        });
+        let error = download_to_hf_cache_at(
+            &cache_dir,
+            &base_url,
+            Download::default(),
+            "org/repo",
+            "f.bin",
+            "abc123",
+        )
+        .unwrap_err();
+        assert!(error.contains("redirect"), "{error}");
+        assert!(!error.contains("secret"), "{error}");
+        assert!(!error.contains("X-Amz"), "{error}");
+        let _ = fs::remove_dir_all(&cache_dir);
+    }
+
+    #[test]
+    fn without_urls_cuts_each_url_to_its_end() {
+        assert_eq!(
+            without_urls("failed (https://a.b/c?sig=x) then http://d/e f"),
+            "failed (<url>) then <url> f"
+        );
     }
 
     #[test]

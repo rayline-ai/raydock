@@ -318,6 +318,12 @@ async fn run_harness(
     args: &[OsString],
 ) -> io::Result<ExitCode> {
     require_local_args(harness, args)?;
+    if local_decisions(settings) && !reads_anthropic_messages(harness) {
+        return Err(io::Error::other(format!(
+            "local ARC decisions read only Claude Code, OpenCode, Pi and omp turns, not \
+             {harness}'s; set `routing.decisions` to `hosted` to run {harness}"
+        )));
+    }
     let (home, paths) = local_paths()?;
     {
         let _lock = acquire_lock(&paths.lock())?;
@@ -326,12 +332,6 @@ async fn run_harness(
             // Progress goes to stderr: the harness owns stdout.
             None => launch(&home, &paths, settings, &|line| eprintln!("{line}")).await?,
         }
-    }
-    if local_decisions(settings) && !reads_anthropic_messages(harness) {
-        eprintln!(
-            "Warning: local ARC decisions read Claude Code, OpenCode, Pi and omp turns; \
-             {harness} turns get no decision and fail"
-        );
     }
     let client = gateway_client()?;
     let state = ready(&paths)?;
@@ -2204,6 +2204,23 @@ mod tests {
         for harness in ["codex", "hermes", "openclaw"] {
             assert!(!reads_anthropic_messages(harness), "{harness}");
         }
+    }
+
+    #[tokio::test]
+    async fn local_decisions_refuse_an_openai_format_harness_before_anything_starts() {
+        let dir = temp_dir("openai-local");
+        let mut settings = local_settings(&dir, "a.json", None);
+        if let Some(routing) = settings.routing.as_mut() {
+            routing.decisions = crate::config::Decisions::Local;
+        }
+        for harness in ["codex", "hermes", "openclaw"] {
+            let error = run_harness(&settings, harness, &[])
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("`routing.decisions` to `hosted`"), "{error}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
