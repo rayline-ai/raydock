@@ -134,6 +134,9 @@ pub struct HttpDecider {
     url: String,
 }
 
+/// The largest answer read from an external decide service.
+const MAX_DECIDE_ANSWER_BYTES: usize = 1 << 20;
+
 impl HttpDecider {
     pub fn new(base: &str) -> Result<Self, RouterError> {
         let client = reqwest::Client::builder()
@@ -193,7 +196,16 @@ impl HttpDecider {
                 .await
                 .map_err(unreachable)?;
             let status = response.status();
-            let bytes = response.bytes().await.map_err(unreachable)?;
+            // Read up to MAX_DECIDE_ANSWER_BYTES; a longer answer is an
+            // upstream failure, routed by fallback.
+            let mut response = response;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
+                if bytes.len() + chunk.len() > MAX_DECIDE_ANSWER_BYTES {
+                    return Err(Refusal::upstream("the decide answer is too large."));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
             if status.is_success() {
                 return serde_json::from_slice(&bytes)
                     .map_err(|_| Refusal::upstream("the decide answer is not JSON."));
@@ -699,6 +711,31 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_external_decide_answer_past_its_cap_is_an_upstream_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut chunk = [0u8; 4096];
+            let _ = socket.read(&mut chunk).await;
+            let size = MAX_DECIDE_ANSWER_BYTES + 1;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {size}\r\nconnection: close\r\n\r\n"
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(&vec![b' '; size]).await;
+        });
+        let decider = HttpDecider::new(&format!("http://{address}")).unwrap();
+        let refusal = decider
+            .decide(&serde_json::json!({}))
+            .await
+            .expect_err("too large");
+        assert_eq!(refusal.code, "inconsistent_upstream");
+        assert!(crate::fallback::unavailable(&refusal), "{refusal:?}");
+    }
 
     #[tokio::test]
     async fn the_http_decider_sends_the_request_text_as_the_harness_sent_it() {

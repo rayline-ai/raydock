@@ -186,11 +186,13 @@ pub(crate) async fn stop() -> ExitCode {
             {
                 return Err(io::Error::other("local process shutdown identity mismatch"));
             }
-            let deadline = Instant::now() + Duration::from_secs(10);
+            // The local process stops its core, then lets the ARC encoder
+            // save its sessions for up to 15 seconds.
+            let deadline = Instant::now() + Duration::from_secs(30);
             while paths.ready().exists() {
                 if Instant::now() >= deadline {
                     return Err(io::Error::other(format!(
-                        "the local process did not stop within 10s; see {}",
+                        "the local process did not stop within 30s; see {}",
                         paths.log().display()
                     )));
                 }

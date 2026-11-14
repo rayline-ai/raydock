@@ -40,7 +40,10 @@ const FULL_CONTEXT_TOKENS: u32 = 270_336;
 /// Tokens per encode chunk when no release names one (a decide service).
 pub const DEFAULT_BUDGET_TOKENS: u32 = 8_192;
 /// How long a stopping encoder may take to save its sessions.
-const SAVE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a stopping encoder may take to save its sessions (about 0.2 s
+/// per 21k-token session) before it is killed. `rayline local stop` waits
+/// for this and the core's stop.
+const SAVE_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long a turn waits for its local decision. A first encode of a long
 /// conversation takes the longest; this leaves room for the largest
 /// context on a slow machine.
@@ -305,6 +308,27 @@ impl LocalDecider {
         request: Option<&str>,
     ) -> Result<serde_json::Value, rayline_arc_routes::Refusal> {
         let refuse = |code: &str, message: String| rayline_arc_routes::Refusal::new(code, message);
+        // Only Anthropic Messages requests are projected; others (OpenAI
+        // Responses and Chat) route by fallback, as when the decider is out.
+        let format = body
+            .get("request_format")
+            .and_then(serde_json::Value::as_str);
+        if !matches!(format, None | Some("anthropic_messages")) {
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    format = format.unwrap_or_default(),
+                    "local ARC decisions read only Anthropic Messages requests; \
+                     these turns route by fallback"
+                );
+            }
+            return Err(rayline_arc_routes::Refusal::with_status(
+                503,
+                "request_format_unsupported",
+                "local ARC decisions read only Anthropic Messages requests",
+            ));
+        }
         let text = rayline_arc_routes::decide_body_text(body, request)?;
         let mut input: rayline_arc_decide::DecideInput = serde_json::from_str(&text)
             .map_err(|error| refuse("invalid_request", format!("decide body: {error}")))?;

@@ -32,6 +32,12 @@ struct Held {
 /// fewer and saves the rest to disk.
 const MAX_EPISODES: usize = 32;
 
+/// Drops the idle episodes from a full table. One a request holds (its
+/// `Arc` is shared) keeps its lock, so its encode stays serialized.
+fn evict_idle(held: &mut HashMap<String, Arc<Mutex<Held>>>) {
+    held.retain(|_, state| Arc::strong_count(state) > 1);
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalEncoder {
     /// `host:port`, shared by every clone so a restarted encoder on a new
@@ -313,7 +319,7 @@ impl Readouts for LocalEncoder {
                 .lock()
                 .map_err(|_| "the encoder session table is poisoned".to_owned())?;
             if !held.contains_key(episode) && held.len() >= MAX_EPISODES {
-                held.clear();
+                evict_idle(&mut held);
             }
             held.entry(episode.to_owned()).or_default().clone()
         };
@@ -374,6 +380,17 @@ impl Readouts for LocalEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_table_drops_only_idle_episodes() {
+        let mut held: HashMap<String, Arc<Mutex<Held>>> = (0..MAX_EPISODES)
+            .map(|index| (format!("e{index}"), Arc::default()))
+            .collect();
+        let busy = held["e3"].clone();
+        evict_idle(&mut held);
+        assert_eq!(held.keys().collect::<Vec<_>>(), ["e3"]);
+        assert!(Arc::ptr_eq(&held["e3"], &busy));
+    }
     use std::net::TcpListener;
 
     #[test]
