@@ -37,9 +37,6 @@ pub struct EncoderFiles {
 const CONTEXT_TOKENS: u32 = 131_072;
 /// The longest context, in tokens, the encoder holds for one conversation.
 const FULL_CONTEXT_TOKENS: u32 = 270_336;
-/// Tokens per encode chunk when no release names one (a decide service).
-pub const DEFAULT_BUDGET_TOKENS: u32 = 8_192;
-/// How long a stopping encoder may take to save its sessions.
 /// How long a stopping encoder may take to save its sessions (about 0.2 s
 /// per 21k-token session) before it is killed. `rayline local stop` waits
 /// for this and the core's stop.
@@ -49,6 +46,15 @@ const SAVE_TIMEOUT: Duration = Duration::from_secs(15);
 /// seconds and fails the turn, so this ends well inside that: a hung
 /// encoder costs the turn its decision, not the turn.
 const DECISION_DEADLINE: Duration = Duration::from_secs(60);
+/// The most decisions computed at once. A decision past its deadline keeps
+/// its worker until it finishes; beyond this many, a turn routes by
+/// fallback at once, so stuck work never piles up.
+const MAX_DECISIONS_IN_FLIGHT: usize = 2;
+/// The most times the encoder is restarted after exiting within
+/// [`RESTART_WINDOW`]; past it, decisions route by fallback until the local
+/// process restarts.
+const MAX_RESTARTS: usize = 3;
+const RESTART_WINDOW: Duration = Duration::from_secs(600);
 
 /// A running encoder. Dropping it kills the process.
 pub struct Encoder {
@@ -193,16 +199,50 @@ impl Encoder {
         self.child.id()
     }
 
-    /// Run until the encoder exits. The first time it refuses an input as
-    /// longer than its context, it is restarted once at the full context:
-    /// it saves its sessions as it stops, and the client resumes them.
-    /// Decisions asked during the restart fail as `backend_unavailable`.
-    pub async fn supervise(&mut self) -> Result<std::process::ExitStatus> {
+    /// Keep the encoder running; never returns. The first time it refuses
+    /// an input as longer than its context, it is restarted once at the
+    /// full context: it saves its sessions as it stops, and the client
+    /// resumes them. One that exits is restarted after a backoff, at most
+    /// [`MAX_RESTARTS`] times in [`RESTART_WINDOW`]. Decisions asked while
+    /// it is down fail as `backend_unavailable` and route by fallback.
+    pub async fn supervise(&mut self) {
+        let mut exits: std::collections::VecDeque<tokio::time::Instant> = Default::default();
         loop {
-            tokio::select! {
-                status = self.child.wait() => return Ok(status?),
-                () = self.full.notified(), if self.context < self.full_context() => {
-                    self.restart(self.full_context()).await?;
+            let grow = tokio::select! {
+                status = self.child.wait() => {
+                    let code = status.ok().and_then(|status| status.code());
+                    tracing::warn!(?code, "local ARC encoder exited; decisions route by fallback");
+                    false
+                }
+                () = self.full.notified(), if self.context < self.full_context() => true,
+            };
+            let context = if grow {
+                self.full_context()
+            } else {
+                self.context
+            };
+            let mut attempt = if grow { Ok(()) } else { Err(()) };
+            loop {
+                if attempt.is_err() {
+                    let now = tokio::time::Instant::now();
+                    exits.retain(|at| now.duration_since(*at) < RESTART_WINDOW);
+                    if exits.len() == MAX_RESTARTS {
+                        tracing::error!(
+                            restarts = MAX_RESTARTS,
+                            "local ARC encoder keeps failing; decisions route by fallback \
+                             until the local process restarts"
+                        );
+                        return std::future::pending().await;
+                    }
+                    exits.push_back(now);
+                    tokio::time::sleep(Duration::from_secs(1 << exits.len())).await;
+                }
+                match self.restart(context).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        tracing::warn!(%error, "local ARC encoder restart failed");
+                        attempt = Err(());
+                    }
                 }
             }
         }
@@ -243,8 +283,8 @@ impl Encoder {
     }
 }
 
-/// Supervise the encoder until it exits; never resolves without one.
-pub async fn wait_encoder(encoder: &mut Option<Encoder>) -> Result<std::process::ExitStatus> {
+/// Supervise the encoder; never resolves.
+pub async fn supervise_encoder(encoder: &mut Option<Encoder>) {
     match encoder {
         Some(encoder) => encoder.supervise().await,
         None => std::future::pending().await,
@@ -282,22 +322,23 @@ impl RoutesAccess {
     }
 }
 
-/// Where the routes service gets each decision.
-pub enum DecideWith {
-    /// In this process: the release in this directory, with readouts from
-    /// the local encoder this client reaches.
-    Release {
-        dir: PathBuf,
-        encoder: rayline_arc_decide::LocalEncoder,
-    },
-    /// An external decide service (development).
-    Service(String),
-}
-
 /// Decides in this process with a loaded release and the local encoder.
 struct LocalDecider {
-    release: std::sync::Arc<rayline_arc_decide::Release>,
+    release: Arc<rayline_arc_decide::Release>,
     encoder: rayline_arc_decide::LocalEncoder,
+    /// [`MAX_DECISIONS_IN_FLIGHT`] permits; a decision holds one until its
+    /// work ends, also past its deadline.
+    in_flight: Arc<tokio::sync::Semaphore>,
+}
+
+/// The refusal for a decision that failed: one the turn routes by fallback
+/// (503) unless the request is malformed or the policy declines it.
+fn refusal(error: &rayline_arc_decide::DecideError) -> rayline_arc_routes::Refusal {
+    if error.routes_by_fallback() {
+        rayline_arc_routes::Refusal::with_status(503, error.code(), error.to_string())
+    } else {
+        rayline_arc_routes::Refusal::new(error.code(), error.to_string())
+    }
 }
 
 impl LocalDecider {
@@ -315,46 +356,28 @@ impl LocalDecider {
         (!prices.rates.is_empty()).then_some(prices)
     }
 
-    /// Decide `body`, its `request` member replaced by `request` when given
-    /// (the text as sent: the encoder input depends on its key order).
-    async fn decide_text(
+    async fn decide_body(
         &self,
-        body: &serde_json::Value,
-        request: Option<&str>,
+        body: &str,
     ) -> Result<serde_json::Value, rayline_arc_routes::Refusal> {
-        let refuse = |code: &str, message: String| rayline_arc_routes::Refusal::new(code, message);
-        // Only Anthropic Messages requests are projected; others (OpenAI
-        // Responses and Chat) route by fallback, as when the decider is out.
-        let format = body
-            .get("request_format")
-            .and_then(serde_json::Value::as_str);
-        if !matches!(format, None | Some("anthropic_messages")) {
-            static WARNED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                tracing::warn!(
-                    format = format.unwrap_or_default(),
-                    "local ARC decisions read only Anthropic Messages requests; \
-                     these turns route by fallback"
-                );
-            }
-            return Err(rayline_arc_routes::Refusal::with_status(
-                503,
-                "request_format_unsupported",
-                "local ARC decisions read only Anthropic Messages requests",
-            ));
-        }
-        let text = rayline_arc_routes::decide_body_text(body, request)?;
-        let mut input: rayline_arc_decide::DecideInput = serde_json::from_str(&text)
-            .map_err(|error| refuse("invalid_request", format!("decide body: {error}")))?;
-        let release = self.release.clone();
+        let unavailable = |code: &str, message: &str| {
+            rayline_arc_routes::Refusal::with_status(503, code, message)
+        };
+        let mut input: rayline_arc_decide::DecideInput = serde_json::from_str(body)
+            .map_err(|_| rayline_arc_routes::Refusal::new("invalid_request", "decide body"))?;
         input.routing_prices = self.read_prices(input.routing_prices.take());
-        let encoder = self.encoder.clone();
+        let permit = self
+            .in_flight
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| unavailable("busy", "local decisions are all in use"))?;
+        let (release, encoder) = (self.release.clone(), self.encoder.clone());
         // The decision encodes and scores on the CPU and blocks on the
         // encoder; keep it off the async workers. Past the deadline its
         // answer is not waited for: the turn routes by fallback, and the
-        // work, bounded by the projection's input caps, finishes unread.
+        // work finishes unread, holding its permit until then.
         let task = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             rayline_arc_decide::decide(&release, &input, &encoder)
         });
         let output = tokio::time::timeout(DECISION_DEADLINE, task)
@@ -366,95 +389,102 @@ impl LocalDecider {
                     "the local decision did not finish in time",
                 )
             })?
-            .map_err(|error| refuse("internal_error", format!("decide task: {error}")))?
-            .map_err(|error| match error {
-                // The encoder is down or restarting, or the request is more
-                // than the decider reads: the turn routes by fallback, as
-                // when the policy service is out, not as a bad request.
-                rayline_arc_decide::DecideError::Readouts(_)
-                | rayline_arc_decide::DecideError::TooLarge(_)
-                | rayline_arc_decide::DecideError::NotEncodable(_) => {
-                    rayline_arc_routes::Refusal::with_status(503, error.code(), error.to_string())
-                }
-                error => refuse(error.code(), error.to_string()),
-            })?;
+            .map_err(|_| unavailable("internal_error", "the local decision failed"))?
+            .map_err(|error| refusal(&error))?;
         serde_json::to_value(output)
-            .map_err(|error| refuse("internal_error", format!("decide answer: {error}")))
+            .map_err(|_| unavailable("internal_error", "the local decision's answer"))
     }
 }
 
 impl rayline_arc_routes::Decider for LocalDecider {
-    fn decide<'a>(&'a self, body: &'a serde_json::Value) -> rayline_arc_routes::DecideFuture<'a> {
-        Box::pin(self.decide_text(body, None))
+    fn decide<'a>(&'a self, body: &'a str) -> rayline_arc_routes::DecideFuture<'a> {
+        Box::pin(self.decide_body(body))
     }
 
-    fn decide_with_text<'a>(
-        &'a self,
-        body: &'a serde_json::Value,
-        request: &'a str,
-    ) -> rayline_arc_routes::DecideFuture<'a> {
-        Box::pin(self.decide_text(body, Some(request)))
-    }
-
-    fn action_prices(&self, routing_prices: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
-        let prices: Option<rayline_arc_decide::RoutingPrices> =
-            serde_json::from_value(routing_prices.clone()).ok()?;
-        let rows =
+    fn action_prices(
+        &self,
+        routing_prices: Option<&rayline_arc_routes::RoutingPrices>,
+    ) -> Vec<serde_json::Value> {
+        // The routes service's caller table, as the decider reads it.
+        let prices = routing_prices
+            .and_then(|prices| serde_json::to_value(prices).ok())
+            .and_then(|prices| serde_json::from_value(prices).ok());
+        let Ok(rows) =
             rayline_arc_decide::action_prices(&self.release, self.read_prices(prices).as_ref())
-                .ok()?;
-        Some(
-            rows.into_iter()
-                .filter_map(|(action_id, legs)| {
-                    let legs = serde_json::json!({
-                        "input": legs.input?, "cache_read": legs.cache_read?,
-                        "cache_write": legs.cache_write?, "output": legs.output?,
-                    });
-                    Some(serde_json::json!({"action_id": action_id, "price_per_mtok": legs}))
-                })
-                .collect(),
-        )
+        else {
+            return Vec::new();
+        };
+        rows.into_iter()
+            .filter_map(|(action_id, legs, price_key)| {
+                let legs = serde_json::json!({
+                    "input": legs.input?, "cache_read": legs.cache_read?,
+                    "cache_write": legs.cache_write?, "output": legs.output?,
+                });
+                Some(serde_json::json!({
+                    "action_id": action_id, "price_per_mtok": legs, "price_key": price_key,
+                }))
+            })
+            .collect()
     }
 }
 
+/// The salt every episode hash is mixed with, kept in `state_dir` so a
+/// conversation names the same encoder session after a restart, and its
+/// saved state resumes. Made once, owner-only.
+fn session_salt(state_dir: &Path) -> Result<String> {
+    let path = state_dir.join("episode-salt");
+    match std::fs::read_to_string(&path) {
+        Ok(salt) if salt.len() == 32 && salt.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            return Ok(salt);
+        }
+        Ok(_) => bail!("{} is not a salt; remove it", path.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
+    }
+    std::fs::create_dir_all(state_dir)
+        .with_context(|| format!("create {}", state_dir.display()))?;
+    let salt = format!("{:032x}", rand::random::<u128>());
+    crate::hybrid::write_private_new(&path, salt.as_bytes())?;
+    Ok(salt)
+}
+
 /// Serve the Routes API for the core on a free loopback port, deciding with
-/// `package` as `decide` says; any other path goes to `upstream` (the
-/// environment's router). Returns its `/v1/routes` URL.
+/// `package` and the release in `release_dir` through `encoder`; any other
+/// path goes to `upstream` (the environment's router). Returns its
+/// `/v1/routes` URL.
 pub async fn serve_routes(
     package: &Path,
     alias: &str,
-    decide: DecideWith,
+    release_dir: &Path,
+    encoder: &Encoder,
     upstream: &str,
     access: RoutesAccess,
 ) -> Result<(String, tokio::task::JoinHandle<Result<()>>)> {
-    use std::sync::Arc;
     let manifest = std::fs::read(package).with_context(|| format!("read {}", package.display()))?;
     let catalog = rayline_arc_routes::Catalog::from_manifest(&manifest, alias)?;
     let mut config = rayline_arc_routes::RouterConfig::new(catalog, upstream);
-    config.salt = format!("{:032x}", rand::random::<u128>());
+    config.salt = session_salt(&encoder.files.state_dir)?;
     config.access_token = Some(access.token);
     config.upstream_authorization = access.upstream_authorization;
-    let decider: Arc<dyn rayline_arc_routes::Decider> = match decide {
-        DecideWith::Service(url) => Arc::new(rayline_arc_routes::HttpDecider::new(&url)?),
-        DecideWith::Release { dir, encoder } => {
-            let release = tokio::task::spawn_blocking(move || {
-                let release = rayline_arc_decide::Release::load(&dir)
-                    .with_context(|| format!("load the ARC release in {}", dir.display()))?;
-                // A public release carries no prices: its per-model card, if any.
-                let card = dir.join("prices.json");
-                if card.is_file() {
-                    return release
-                        .with_model_prices(&card)
-                        .with_context(|| format!("load the price card {}", card.display()));
-                }
-                anyhow::Ok(release)
-            })
-            .await??;
-            Arc::new(LocalDecider {
-                release: Arc::new(release),
-                encoder,
-            })
+    let dir = release_dir.to_path_buf();
+    let release = tokio::task::spawn_blocking(move || {
+        let release = rayline_arc_decide::Release::load(&dir)
+            .with_context(|| format!("load the ARC release in {}", dir.display()))?;
+        // A public release carries no prices: its per-model card, if any.
+        let card = dir.join("prices.json");
+        if card.is_file() {
+            return release
+                .with_model_prices(&card)
+                .with_context(|| format!("load the price card {}", card.display()));
         }
-    };
+        anyhow::Ok(release)
+    })
+    .await??;
+    let decider = Arc::new(LocalDecider {
+        release: Arc::new(release),
+        encoder: encoder.client(),
+        in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_DECISIONS_IN_FLIGHT)),
+    });
     let router = Arc::new(rayline_arc_routes::Router::new(config, decider)?);
     let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
@@ -503,6 +533,8 @@ pub fn with_local_decisions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DEFAULT_BUDGET_TOKENS: u32 = 8_192;
 
     /// Needs the encoder binary and weights:
     /// `ARC_ENCODER_BIN=... ARC_ENCODER_MODEL=... cargo test -p rayline-daemon
@@ -560,7 +592,7 @@ mod tests {
 
         let grown = tokio::time::timeout(Duration::from_secs(300), async {
             tokio::select! {
-                status = encoder.supervise() => panic!("the encoder stopped: {status:?}"),
+                () = encoder.supervise() => panic!("supervision ended"),
                 rows = async {
                     loop {
                         if let Ok(rows) = read(client.clone(), second).await.expect("join") {
@@ -620,6 +652,55 @@ mod tests {
         );
         drop(encoder);
         let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn only_a_bad_request_or_a_declining_policy_refuses_the_turn() {
+        use rayline_arc_decide::DecideError;
+        let falls_back = |error: DecideError| {
+            let refusal = refusal(&error);
+            matches!(refusal.status, 502..=504)
+        };
+        for error in [
+            DecideError::Unsupported {
+                reason: "request_format_unsupported",
+            },
+            DecideError::Projection("tokenizer".into()),
+            DecideError::TooLarge("text".into()),
+            DecideError::NotEncodable("image".into()),
+            DecideError::Readouts("down".into()),
+            DecideError::Internal("shape".into()),
+        ] {
+            assert!(falls_back(error.clone()), "{error:?}");
+        }
+        let declined = refusal(&DecideError::Refused {
+            reason: "held_action_unavailable",
+        });
+        assert_eq!(
+            (declined.status, declined.code.as_str()),
+            (400, "held_action_unavailable")
+        );
+        assert!(!falls_back(DecideError::Invalid { field: "selection" }));
+    }
+
+    #[test]
+    fn the_episode_salt_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("arc-salt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = session_salt(&dir).expect("made");
+        assert_eq!(session_salt(&dir).expect("read"), first);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("episode-salt"))
+                .expect("salt file")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        std::fs::write(dir.join("episode-salt"), "not a salt").expect("overwrite");
+        assert!(session_salt(&dir).is_err());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

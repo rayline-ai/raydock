@@ -1,12 +1,11 @@
 //! The loopback router: `/v1/routes` answered through a [`Decider`], every
 //! other path forwarded to the upstream.
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -25,85 +24,29 @@ use tokio::task::JoinSet;
 use crate::catalog::Catalog;
 use crate::error::Refusal;
 use crate::fallback::{self, Fallback};
-use crate::parse::{DecideInput, ParseContext, RequestHeaders, parse};
+use crate::parse::{ParseContext, RequestHeaders, RoutingPrices, parse};
 use crate::shape::shape;
 
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
 
-const DECIDE_PATH: &str = "/v1/rayline/arc/policy/decide";
 const ROUTE_ID_HEADER: &str = "x-rayline-route-id";
 const CELL_HEADER: &str = "x-rayline-cell";
 
 pub type DecideFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, Refusal>> + Send + 'a>>;
 
 /// The policy: one decide body in, one decide answer out. The body is a
-/// serialized [`DecideInput`]; the answer carries `decision.tier_picks`,
-/// `decision.receipt`, `actions[]` and `encoding.token_count`.
+/// [`crate::DecideInput`] as JSON, its request members as the harness sent them;
+/// the answer carries `decision.tier_picks`, `decision.receipt`, `actions[]`
+/// and `encoding.token_count`. A refusal at 502 to 504 means no decision
+/// could be made, and the turn routes by fallback; any other refuses it.
 pub trait Decider: Send + Sync {
-    fn decide<'a>(&'a self, body: &'a Value) -> DecideFuture<'a>;
-
-    /// As [`Decider::decide`], with `request` (the body's `request` member)
-    /// also given as the text the harness sent, keys in their sent order. A
-    /// decider whose input depends on that order reads this one.
-    fn decide_with_text<'a>(&'a self, body: &'a Value, request: &'a str) -> DecideFuture<'a> {
-        let _ = request;
-        self.decide(body)
-    }
+    fn decide<'a>(&'a self, body: &'a str) -> DecideFuture<'a>;
 
     /// For a route made without a decision: each action's
-    /// `{"action_id", "price_per_mtok"}` row at `routing_prices` (the decide
-    /// body's member, or null), as a decision would report it, so the
-    /// route's price table is a decision's. `None` when the decider can't
-    /// price without deciding.
-    fn action_prices(&self, routing_prices: &Value) -> Option<Vec<Value>> {
-        let _ = routing_prices;
-        None
-    }
-}
-
-/// The decide body as JSON text, with `request` (when given) spliced in as
-/// the text the harness sent, so its keys keep their sent order.
-pub fn decide_body_text(body: &Value, request: Option<&str>) -> Result<String, Refusal> {
-    let internal = |error: serde_json::Error| {
-        Refusal::with_status(500, "internal_error", format!("decide body: {error}"))
-    };
-    let (Some(request), Some(rest)) = (request, body.as_object()) else {
-        return serde_json::to_string(body).map_err(internal);
-    };
-    let mut rest = rest.clone();
-    rest.remove("request");
-    let rest = serde_json::to_string(&rest).map_err(internal)?;
-    // `rest` is a JSON object: splice the request in as its first member.
-    Ok(match rest.strip_prefix('{') {
-        Some("}") => format!("{{\"request\":{request}}}"),
-        Some(members) => format!("{{\"request\":{request},{members}"),
-        None => rest,
-    })
-}
-
-/// The Anthropic Messages members of a decide request (`system`, `tools`,
-/// `messages`, nulls left out) as the text the harness sent them in.
-fn messages_request_text(raw: &[u8]) -> Option<String> {
-    use serde_json::value::RawValue;
-    #[derive(serde::Deserialize)]
-    struct Members<'a> {
-        #[serde(borrow, default)]
-        system: Option<&'a RawValue>,
-        #[serde(borrow, default)]
-        tools: Option<&'a RawValue>,
-        #[serde(borrow, default)]
-        messages: Option<&'a RawValue>,
-    }
-    let members: Members<'_> = serde_json::from_slice(raw).ok()?;
-    let parts: Vec<String> = [
-        ("system", members.system),
-        ("tools", members.tools),
-        ("messages", members.messages),
-    ]
-    .into_iter()
-    .filter_map(|(key, value)| value.map(|value| format!("\"{key}\":{}", value.get())))
-    .collect();
-    Some(format!("{{{}}}", parts.join(",")))
+    /// `{"action_id", "price_per_mtok", "price_key"}` row at
+    /// `routing_prices`, as a decision reports it, so the route's price
+    /// table is a decision's.
+    fn action_prices(&self, routing_prices: Option<&RoutingPrices>) -> Vec<Value>;
 }
 
 #[derive(Debug)]
@@ -136,107 +79,6 @@ fn origin(url: &str, what: &str) -> Result<String, RouterError> {
         )));
     }
     Ok(parsed.origin().ascii_serialization())
-}
-
-/// A decide service over HTTP: `POST <base>/v1/rayline/arc/policy/decide`.
-pub struct HttpDecider {
-    client: reqwest::Client,
-    url: String,
-}
-
-/// The largest answer read from an external decide service.
-const MAX_DECIDE_ANSWER_BYTES: usize = 1 << 20;
-
-impl HttpDecider {
-    pub fn new(base: &str) -> Result<Self, RouterError> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(600))
-            .build()
-            .map_err(|_| RouterError("the decide client could not be built".to_owned()))?;
-        Ok(Self {
-            client,
-            url: format!("{}{DECIDE_PATH}", origin(base, "the decide service")?),
-        })
-    }
-}
-
-/// The code a decide refusal names: its `detail.reason`, else its `code`.
-/// Only a code-shaped value is passed on; the refusal's text never is.
-fn refusal_code(body: &[u8]) -> String {
-    let detail: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-    let error = match detail.get("error") {
-        Some(error) if error.is_object() => error,
-        _ => &detail,
-    };
-    let reason = error.get("detail").and_then(|detail| detail.get("reason"));
-    reason
-        .into_iter()
-        .chain(error.get("code"))
-        .filter_map(Value::as_str)
-        .find(|code| {
-            (1..=64).contains(&code.len())
-                && code
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        })
-        .unwrap_or("unavailable")
-        .to_owned()
-}
-
-impl HttpDecider {
-    async fn post(&self, body: &Value, request: Option<&str>) -> Result<Value, Refusal> {
-        let text = decide_body_text(body, request)?;
-        {
-            let unreachable = |error: reqwest::Error| {
-                if error.is_timeout() {
-                    Refusal::new("timeout", "the decide service did not answer in time.")
-                } else {
-                    Refusal::new("unavailable", "the decide service could not be reached.")
-                }
-            };
-            let response = self
-                .client
-                .post(&self.url)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .body(text)
-                .send()
-                .await
-                .map_err(unreachable)?;
-            let status = response.status();
-            // Read up to MAX_DECIDE_ANSWER_BYTES; a longer answer is an
-            // upstream failure, routed by fallback.
-            let mut response = response;
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
-                if bytes.len() + chunk.len() > MAX_DECIDE_ANSWER_BYTES {
-                    return Err(Refusal::upstream("the decide answer is too large."));
-                }
-                bytes.extend_from_slice(&chunk);
-            }
-            if status.is_success() {
-                return serde_json::from_slice(&bytes)
-                    .map_err(|_| Refusal::upstream("the decide answer is not JSON."));
-            }
-            Err(Refusal::with_status(
-                status.as_u16(),
-                &refusal_code(&bytes),
-                "the decide service refused the request.",
-            ))
-        }
-    }
-}
-
-impl Decider for HttpDecider {
-    fn decide<'a>(&'a self, body: &'a Value) -> DecideFuture<'a> {
-        Box::pin(self.post(body, None))
-    }
-
-    fn decide_with_text<'a>(&'a self, body: &'a Value, request: &'a str) -> DecideFuture<'a> {
-        Box::pin(self.post(body, Some(request)))
-    }
 }
 
 pub struct RouterConfig {
@@ -272,38 +114,6 @@ impl RouterConfig {
     }
 }
 
-type Episodes = Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>;
-
-/// One caller's place in an episode's queue. Dropping it forgets the episode
-/// once nobody else is waiting on it, also when the request is cancelled.
-struct Episode<'a> {
-    episodes: &'a Episodes,
-    key: String,
-    lock: Arc<tokio::sync::Mutex<()>>,
-}
-
-impl<'a> Episode<'a> {
-    fn enter(episodes: &'a Episodes, key: &str) -> Self {
-        let mut map = episodes.lock().unwrap_or_else(PoisonError::into_inner);
-        let lock = map.entry(key.to_owned()).or_default().clone();
-        Self {
-            episodes,
-            key: key.to_owned(),
-            lock,
-        }
-    }
-}
-
-impl Drop for Episode<'_> {
-    fn drop(&mut self) {
-        let mut map = self.episodes.lock().unwrap_or_else(PoisonError::into_inner);
-        // The map's reference and this one: no other request holds the episode.
-        if Arc::strong_count(&self.lock) == 2 {
-            map.remove(&self.key);
-        }
-    }
-}
-
 pub struct Router {
     catalog: Catalog,
     decider: Arc<dyn Decider>,
@@ -311,7 +121,6 @@ pub struct Router {
     client: reqwest::Client,
     salt: String,
     max_body_bytes: usize,
-    episodes: Episodes,
     access_token: Option<String>,
     upstream_authorization: Option<HeaderValue>,
 }
@@ -386,7 +195,6 @@ impl Router {
             client,
             salt: config.salt,
             max_body_bytes: config.max_body_bytes,
-            episodes: Mutex::new(HashMap::new()),
             access_token: config.access_token.filter(|token| !token.is_empty()),
             upstream_authorization: match config.upstream_authorization {
                 Some(value) => Some(HeaderValue::from_str(&value).map_err(|_| {
@@ -397,77 +205,21 @@ impl Router {
         })
     }
 
-    /// One decide per episode at a time. A strict decide extends the
-    /// episode's retained session; one the service refuses (a busy or
-    /// mismatched session, a history the episode cannot follow) is asked
-    /// again relaxed, which depends on the request alone, so a turn is never
-    /// lost to session state.
-    async fn decide(
-        &self,
-        mut decide: DecideInput,
-        request_text: Option<&str>,
-    ) -> Result<Value, Refusal> {
-        // The request members are the bulk of the body: moved, not copied.
-        let request = std::mem::take(&mut decide.request);
-        let mut body = serde_json::to_value(&decide)
-            .map_err(|_| Refusal::new("unavailable", "the decide request could not be built."))?;
-        body["request"] = request;
-        let episode = Episode::enter(&self.episodes, &decide.episode_id_hash);
-        let _turn = episode.lock.lock().await;
-        let ask = |body: &Value| {
-            let body = body.clone();
-            async move {
-                match request_text {
-                    Some(text) => self.decider.decide_with_text(&body, text).await,
-                    None => self.decider.decide(&body).await,
-                }
-            }
-        };
-        match ask(&body).await {
-            Err(refusal) if refusal.status < 500 => {
-                tracing::info!(
-                    status = refusal.status,
-                    code = %refusal.code,
-                    "strict decide refused; asking relaxed"
-                );
-                body["episode_mode"] = json!("relaxed");
-                ask(&body).await
-            }
-            answer => answer,
-        }
-    }
-
-    /// One `/v1/routes` lookup: the parsed JSON body and its headers into the
+    /// One `/v1/routes` lookup: the body as sent and its headers into the
     /// V1 answer, or the refusal.
-    pub async fn route(&self, body: Value, headers: &RequestHeaders) -> Result<Value, Refusal> {
-        self.route_sent(body, None, headers).await
-    }
-
-    /// As [`Router::route`], with the body's bytes as sent, so the request
-    /// members reach the decider in their sent key order.
-    pub async fn route_sent(
-        &self,
-        body: Value,
-        sent: Option<&[u8]>,
-        headers: &RequestHeaders,
-    ) -> Result<Value, Refusal> {
+    pub async fn route(&self, sent: &[u8], headers: &RequestHeaders) -> Result<Value, Refusal> {
         let started = Instant::now();
         let elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let result: Result<(Value, Option<String>), Refusal> = async {
-            let parsed = parse(&self.catalog, body, headers, &ParseContext::now(&self.salt))?;
-            let kind = parsed.decide.event.kind.clone();
-            let request_text = sent
-                .filter(|_| parsed.decide.request_format == "anthropic_messages")
-                .and_then(messages_request_text);
-            let fallback = Fallback::of(&parsed.decide, &self.catalog);
-            let routing_prices =
-                serde_json::to_value(&parsed.decide.routing_prices).unwrap_or(Value::Null);
-            let answer = match self.decide(parsed.decide, request_text.as_deref()).await {
+            let parsed = parse(&self.catalog, sent, headers, &ParseContext::now(&self.salt))?;
+            let decide = &parsed.decide;
+            let body = serde_json::to_string(decide).map_err(|_| {
+                Refusal::new("unavailable", "the decide request could not be built.")
+            })?;
+            let answer = match self.decider.decide(&body).await {
                 Err(refusal) if fallback::unavailable(&refusal) => {
-                    let rows = self
-                        .decider
-                        .action_prices(&routing_prices)
-                        .unwrap_or_default();
+                    let rows = self.decider.action_prices(decide.routing_prices.as_ref());
+                    let fallback = Fallback::of(decide, &self.catalog, &rows);
                     let answer = fallback.answer(rows).ok_or(refusal.clone())?;
                     tracing::warn!(
                         status = refusal.status,
@@ -487,7 +239,7 @@ impl Router {
                 &route_id,
                 elapsed(),
             )?;
-            Ok((out, kind))
+            Ok((out, decide.event.kind.clone()))
         }
         .await;
         match result {
@@ -532,13 +284,7 @@ impl Router {
             .collect()
             .await
         {
-            Ok(body) => {
-                let bytes = body.to_bytes();
-                match serde_json::from_slice(&bytes) {
-                    Ok(body) => self.route_sent(body, Some(&bytes), &headers).await,
-                    Err(_) => Err(invalid()),
-                }
-            }
+            Ok(body) => self.route(&body.to_bytes(), &headers).await,
             Err(error) if error.is::<http_body_util::LengthLimitError>() => Err(
                 Refusal::with_status(413, "invalid_body", "The request body is too large."),
             ),
@@ -728,68 +474,6 @@ impl Router {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn an_external_decide_answer_past_its_cap_is_an_upstream_failure() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut chunk = [0u8; 4096];
-            let _ = socket.read(&mut chunk).await;
-            let size = MAX_DECIDE_ANSWER_BYTES + 1;
-            let head = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {size}\r\nconnection: close\r\n\r\n"
-            );
-            let _ = socket.write_all(head.as_bytes()).await;
-            let _ = socket.write_all(&vec![b' '; size]).await;
-        });
-        let decider = HttpDecider::new(&format!("http://{address}")).unwrap();
-        let refusal = decider
-            .decide(&serde_json::json!({}))
-            .await
-            .expect_err("too large");
-        assert_eq!(refusal.code, "inconsistent_upstream");
-        assert!(crate::fallback::unavailable(&refusal), "{refusal:?}");
-    }
-
-    #[tokio::test]
-    async fn the_http_decider_sends_the_request_text_as_the_harness_sent_it() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let served = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut seen = Vec::new();
-            let mut chunk = [0u8; 4096];
-            while !seen.ends_with(b"}") {
-                let read = socket.read(&mut chunk).await.unwrap();
-                if read == 0 {
-                    break;
-                }
-                seen.extend_from_slice(&chunk[..read]);
-            }
-            let answer = b"{}";
-            let head = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                answer.len()
-            );
-            socket.write_all(head.as_bytes()).await.unwrap();
-            socket.write_all(answer).await.unwrap();
-            String::from_utf8(seen).unwrap()
-        });
-        let decider = HttpDecider::new(&format!("http://{address}")).unwrap();
-        let sent = r#"{"system":"s","tools":[{"name":"t","input_schema":{"z":1,"a":2}}]}"#;
-        let body = serde_json::json!({"schema_version": "v", "request": serde_json::from_str::<Value>(sent).unwrap()});
-        decider.decide_with_text(&body, sent).await.unwrap();
-        let seen = served.await.unwrap();
-        let text = seen.split("\r\n\r\n").nth(1).unwrap();
-        assert_eq!(
-            text,
-            format!(r#"{{"request":{sent},"schema_version":"v"}}"#)
-        );
-    }
-
     #[test]
     fn loopback_hosts_with_or_without_a_port() {
         for host in [
@@ -840,36 +524,5 @@ mod tests {
         ] {
             assert!(origin(refused, "x").is_err(), "{refused}");
         }
-    }
-
-    #[test]
-    fn a_decide_refusal_passes_on_a_code_and_no_text() {
-        let code = |body: &str| refusal_code(body.as_bytes());
-        assert_eq!(
-            code(r#"{"error": {"code": "bad_request", "detail": {"reason": "session_busy"}}}"#),
-            "session_busy"
-        );
-        assert_eq!(
-            code(r#"{"error": {"code": "policy_invalid"}}"#),
-            "policy_invalid"
-        );
-        assert_eq!(code(r#"{"code": "plain"}"#), "plain");
-        assert_eq!(
-            code(r#"{"error": {"code": "Some prose, not a code"}}"#),
-            "unavailable"
-        );
-        assert_eq!(code("not json"), "unavailable");
-    }
-
-    #[test]
-    fn an_episode_is_forgotten_when_its_last_request_leaves() {
-        let episodes: Episodes = Mutex::new(HashMap::new());
-        let first = Episode::enter(&episodes, "e");
-        let second = Episode::enter(&episodes, "e");
-        assert!(Arc::ptr_eq(&first.lock, &second.lock));
-        drop(first);
-        assert_eq!(episodes.lock().unwrap().len(), 1);
-        drop(second);
-        assert!(episodes.lock().unwrap().is_empty());
     }
 }

@@ -33,13 +33,11 @@ pub use execution::{
     ActionCache, Attribution, CapacityFact, Compaction, Event, PinStatus, Pinned, Turn,
 };
 pub use parse::{
-    CacheContext, DecideInput, EpisodeMode, Legs, OperatingPoint, PackageRef, ParseContext, Parsed,
-    RequestHeaders, Restate, RoutingPrices, Selection, Tier, parse,
+    CacheContext, DecideInput, Legs, OperatingPoint, PackageRef, ParseContext, Parsed,
+    RequestHeaders, RequestText, Restate, RoutingPrices, Selection, Tier, parse,
 };
 pub use policy::{Overrides, Policy, Schedule, Selection as SelectionThresholds};
-pub use server::{
-    DecideFuture, Decider, HttpDecider, Router, RouterConfig, RouterError, decide_body_text,
-};
+pub use server::{DecideFuture, Decider, Router, RouterConfig, RouterError};
 pub use shape::shape;
 
 /// The price legs of one model, in USD per million tokens, in contract order.

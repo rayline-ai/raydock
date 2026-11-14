@@ -82,9 +82,9 @@ pub struct Args {
     /// core. Once per deployment with a `tokenizer`.
     #[arg(long = "token-counter-dir", num_args = 2, value_names = ["DEPLOYMENT", "DIR"])]
     token_counters: Vec<String>,
-    /// Local ARC: the encoder binary. With `--arc-model` and
-    /// `--arc-state-dir`, routing decisions are made on this machine.
-    #[arg(long, requires_all = ["arc_model", "arc_state_dir"])]
+    /// Local ARC: the encoder binary. With the other `--arc-*` flags,
+    /// routing decisions are made on this machine.
+    #[arg(long, requires_all = ["arc_model", "arc_state_dir", "arc_package", "arc_release"])]
     arc_encoder: Option<PathBuf>,
     /// Local ARC: the encoder weights (GGUF).
     #[arg(long)]
@@ -92,22 +92,14 @@ pub struct Args {
     /// Local ARC: where conversation states are saved between runs.
     #[arg(long)]
     arc_state_dir: Option<PathBuf>,
-    /// Local ARC: an external loopback routes service the core asks instead
-    /// of the in-process one (development).
-    #[arg(long)]
-    arc_routes_url: Option<String>,
-    /// Local ARC: the policy package manifest (`package.json`) the in-process
-    /// routes service decides with.
+    /// Local ARC: the policy package manifest (`package.json`) the routes
+    /// service decides with.
     #[arg(long)]
     arc_package: Option<PathBuf>,
     /// Local ARC: the package's alias as the decide service knows it.
     #[arg(long, default_value = "rayline/arc-1.0-20261107")]
     arc_alias: String,
-    /// Local ARC: an external decide service the in-process routes service
-    /// asks instead of deciding in-process (development).
-    #[arg(long, conflicts_with = "arc_release")]
-    arc_decide_url: Option<String>,
-    /// Local ARC: the release directory decisions are made with in-process.
+    /// Local ARC: the release directory decisions are made with.
     #[arg(long)]
     arc_release: Option<PathBuf>,
 }
@@ -203,55 +195,42 @@ pub async fn run(args: Args) -> Result<()> {
     let mut arc_encoder = None;
     let mut arc_routes = None;
     let mut arc_routes_token: Option<String> = None;
-    if let (Some(binary), Some(model), Some(state_dir)) =
-        (&args.arc_encoder, &args.arc_model, &args.arc_state_dir)
-    {
+    if let (Some(binary), Some(model), Some(state_dir), Some(package), Some(release)) = (
+        &args.arc_encoder,
+        &args.arc_model,
+        &args.arc_state_dir,
+        &args.arc_package,
+        &args.arc_release,
+    ) {
         let files = crate::hybrid_arc::EncoderFiles {
             binary: binary.clone(),
             model: model.clone(),
             state_dir: state_dir.clone(),
         };
         // The encoder must chunk as the release's stage one was fit.
-        let budget = match &args.arc_release {
-            Some(dir) => rayline_arc_decide::stage_one_chunk_tokens(dir)
-                .with_context(|| format!("read the ARC release in {}", dir.display()))?,
-            None => crate::hybrid_arc::DEFAULT_BUDGET_TOKENS,
-        };
+        let budget = rayline_arc_decide::stage_one_chunk_tokens(release)
+            .with_context(|| format!("read the ARC release in {}", release.display()))?;
         let encoder = crate::hybrid_arc::Encoder::start(&files, budget, startup_timeout).await?;
         tracing::info!(url = %encoder.url, pid = ?encoder.pid(), "local ARC encoder ready");
-        let decide = match (&args.arc_decide_url, &args.arc_release) {
-            (Some(url), _) => Some(crate::hybrid_arc::DecideWith::Service(url.clone())),
-            (None, Some(dir)) => Some(crate::hybrid_arc::DecideWith::Release {
-                dir: dir.clone(),
-                encoder: encoder.client(),
-            }),
-            (None, None) => None,
-        };
-        let routes_url = match (&args.arc_routes_url, &args.arc_package, decide) {
-            (Some(url), _, _) => url.clone(),
-            (None, Some(package), Some(decide)) => {
-                let access = crate::hybrid_arc::RoutesAccess::for_core(&core_config)?;
-                arc_routes_token = Some(access.token.clone());
-                let (url, task) = crate::hybrid_arc::serve_routes(
-                    package,
-                    &args.arc_alias,
-                    decide,
-                    &args.router_url,
-                    access,
-                )
-                .await?;
-                arc_routes = Some(task);
-                url
-            }
-            _ => bail!(
-                "local ARC needs --arc-package with --arc-release (or --arc-decide-url), or --arc-routes-url"
-            ),
-        };
+        let access = crate::hybrid_arc::RoutesAccess::for_core(&core_config)?;
+        arc_routes_token = Some(access.token.clone());
+        let (routes_url, task) = crate::hybrid_arc::serve_routes(
+            package,
+            &args.arc_alias,
+            release,
+            &encoder,
+            &args.router_url,
+            access,
+        )
+        .await?;
+        arc_routes = Some(task);
         let local = args.ready_file.with_extension("arc-core.json");
-        let auth_env = arc_routes_token
-            .is_some()
-            .then_some(crate::hybrid_arc::ROUTES_TOKEN_ENV);
-        crate::hybrid_arc::with_local_decisions(&core_config, &routes_url, auth_env, &local)?;
+        crate::hybrid_arc::with_local_decisions(
+            &core_config,
+            &routes_url,
+            Some(crate::hybrid_arc::ROUTES_TOKEN_ENV),
+            &local,
+        )?;
         // The rewritten Decisions URL gets the same check as the config's:
         // only the router or a loopback address.
         rayline_local_router::decisions_url::check_config_bytes(
@@ -329,8 +308,8 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::select! {
             result = serve(listener, state) => result,
             status = child.wait() => bail!("execution core exited: {}", status?),
-            status = crate::hybrid_arc::wait_encoder(&mut arc_encoder) => {
-                bail!("local ARC encoder exited: {}", status?)
+            () = crate::hybrid_arc::supervise_encoder(&mut arc_encoder) => {
+                bail!("local ARC encoder supervision ended")
             }
             result = crate::hybrid_arc::wait_routes(&mut arc_routes) => {
                 bail!("local ARC routes service stopped: {result:?}")

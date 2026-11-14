@@ -28,7 +28,7 @@ fn ms(since: Instant) -> f64 {
 
 #[derive(Debug, Default, Clone)]
 struct Phases {
-    splice_ms: f64,
+    parse_ms: f64,
     project_ms: f64,
     tokenize_ms: f64,
     blocks: usize,
@@ -62,27 +62,13 @@ struct Bench {
 }
 
 impl Bench {
-    fn run(&self, body: &Value, request: Option<&str>) -> Result<Value, Refusal> {
+    fn run(&self, body: &str) -> Result<Value, Refusal> {
         let started = Instant::now();
         let refuse = |code: &str, message: String| Refusal::new(code, message);
-        // As the daemon's in-process decider does.
-        let mut text = serde_json::to_string(body)
-            .map_err(|error| refuse("internal_error", format!("decide body: {error}")))?;
-        if let (Some(request), Some(rest)) = (request, body.as_object()) {
-            let mut rest = rest.clone();
-            rest.remove("request");
-            let rest = serde_json::to_string(&rest)
-                .map_err(|error| refuse("internal_error", format!("decide body: {error}")))?;
-            text = match rest.strip_prefix('{') {
-                Some("}") => format!("{{\"request\":{request}}}"),
-                Some(members) => format!("{{\"request\":{request},{members}"),
-                None => text,
-            };
-        }
-        let input: rayline_arc_decide::DecideInput = serde_json::from_str(&text)
+        let input: rayline_arc_decide::DecideInput = serde_json::from_str(body)
             .map_err(|error| refuse("invalid_request", format!("decide body: {error}")))?;
         let mut phases = Phases {
-            splice_ms: ms(started),
+            parse_ms: ms(started),
             ..Phases::default()
         };
 
@@ -135,12 +121,12 @@ impl Bench {
 }
 
 impl Decider for Bench {
-    fn decide<'a>(&'a self, body: &'a Value) -> DecideFuture<'a> {
-        Box::pin(async move { self.run(body, None) })
+    fn decide<'a>(&'a self, body: &'a str) -> DecideFuture<'a> {
+        Box::pin(async move { self.run(body) })
     }
 
-    fn decide_with_text<'a>(&'a self, body: &'a Value, request: &'a str) -> DecideFuture<'a> {
-        Box::pin(async move { self.run(body, Some(request)) })
+    fn action_prices(&self, _: Option<&rayline_arc_routes::RoutingPrices>) -> Vec<Value> {
+        Vec::new()
     }
 }
 
@@ -199,7 +185,7 @@ async fn main() -> Result<()> {
     let router = Router::new(config, bench.clone())?;
 
     println!(
-        "turn,rep,tokens,blocks,route_ms,router_ms,splice_ms,project_ms,tokenize_ms,decide_ms,readouts_ms,\
+        "turn,rep,tokens,blocks,route_ms,router_ms,parse_ms,project_ms,tokenize_ms,decide_ms,readouts_ms,\
          enc_tokens,enc_req_kb,enc_resp_kb,enc_serialize_ms,enc_http_ms,enc_server_ms,enc_parse_ms,restored,\
          model,thinking,match"
     );
@@ -216,10 +202,9 @@ async fn main() -> Result<()> {
                 wire_format: header("x-rayline-wire-format"),
                 cell: None,
             };
-            let body: Value = serde_json::from_slice(&raw)?;
             let at = Instant::now();
             let out = router
-                .route_sent(body, Some(&raw), &headers)
+                .route(&raw, &headers)
                 .await
                 .map_err(|refusal| anyhow::anyhow!("{}: {}", refusal.code, refusal.message))?;
             let route_ms = ms(at);
@@ -238,7 +223,7 @@ async fn main() -> Result<()> {
                 p.tokens,
                 p.blocks,
                 route_ms - p.decider_ms,
-                p.splice_ms,
+                p.parse_ms,
                 p.project_ms,
                 p.tokenize_ms,
                 p.decide_ms,

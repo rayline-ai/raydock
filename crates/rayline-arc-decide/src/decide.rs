@@ -1130,8 +1130,11 @@ pub fn decide(
             available_arms = release.actions[held].arms.clone();
         }
     }
-    let ResolvedPrices { rates, excluded } =
-        prices::resolve(release, input.routing_prices.as_ref())?;
+    let ResolvedPrices {
+        rates,
+        excluded,
+        keys,
+    } = prices::resolve(release, input.routing_prices.as_ref())?;
     if excluded.iter().any(|e| *e) {
         available_arms.retain(|arm| !excluded[*arm]);
         available_actions.retain(|action| {
@@ -1369,6 +1372,7 @@ pub fn decide(
                     cache_write: rates[best][2],
                     output: rates[best][3],
                 },
+                price_key: keys[best].clone(),
                 thinking: record.thinking.clone(),
             }
         })
@@ -1445,16 +1449,21 @@ pub fn decide(
     })
 }
 
-/// Each action's rates per million tokens at `routing` prices, as a
-/// decision would report them without scoring: its first arm the prices
-/// don't exclude that all four legs price, else its first arm they don't
-/// exclude. An action every arm of which is excluded is left out. For a
-/// route made without a decision, so its price table is a decision's.
+/// Each action's rates per million tokens at `routing` prices, and the
+/// caller key that priced them, as a decision would report them without
+/// scoring: its first arm the prices don't exclude that all four legs
+/// price, else its first arm they don't exclude. An action every arm of
+/// which is excluded is left out. For a route made without a decision, so
+/// its price table is a decision's.
 pub fn action_prices(
     release: &Release,
     routing: Option<&crate::RoutingPrices>,
-) -> Result<Vec<(String, PricePerMtok)>, DecideError> {
-    let ResolvedPrices { rates, excluded } = prices::resolve(release, routing)?;
+) -> Result<Vec<(String, PricePerMtok, Option<String>)>, DecideError> {
+    let ResolvedPrices {
+        rates,
+        excluded,
+        keys,
+    } = prices::resolve(release, routing)?;
     Ok(release
         .actions
         .iter()
@@ -1474,6 +1483,7 @@ pub fn action_prices(
                     cache_write,
                     output,
                 },
+                keys[arm].clone(),
             ))
         })
         .collect())

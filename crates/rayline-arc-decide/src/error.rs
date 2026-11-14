@@ -26,11 +26,18 @@ pub enum DecideError {
 }
 
 impl DecideError {
-    /// The service's error code for this refusal.
+    /// Whether the turn should be routed without a decision: true for
+    /// everything but a malformed request and a policy that declines, which
+    /// refuse the turn.
+    pub fn routes_by_fallback(&self) -> bool {
+        !matches!(self, Self::Invalid { .. } | Self::Refused { .. })
+    }
+
+    /// The error code for this refusal: a declined selection's own reason.
     pub fn code(&self) -> &'static str {
         match self {
             Self::Invalid { .. } => "invalid_request",
-            Self::Refused { .. } => "selection_refused",
+            Self::Refused { reason } => reason,
             Self::Unsupported { .. } | Self::Projection(_) => "unsupported_request",
             Self::TooLarge(_) => "input_too_large",
             Self::NotEncodable(_) => "unsupported_request",

@@ -1,5 +1,5 @@
-//! A route for when the decider cannot answer (the local encoder is down or
-//! restarting).
+//! A route for when the decider cannot answer: the local encoder is down,
+//! restarting or slow, or the request is one it doesn't read.
 //!
 //! The execution core does not fall back on its own: a lookup it cannot get
 //! fails the harness turn. So an unavailable decider is answered here with
@@ -12,7 +12,9 @@ use crate::catalog::Catalog;
 use crate::error::Refusal;
 use crate::parse::DecideInput;
 
-/// `decided_by` on a route made without the decider.
+/// The receipt `basis` of every route made without a decision, whatever
+/// the reason (encoder down or slow, a request too large, a format or
+/// content the decider doesn't read). The route log names the reason.
 pub const ENCODER_UNAVAILABLE: &str = "encoder_unavailable";
 
 /// What a fallback is chosen from, kept before the decide input is spent.
@@ -20,7 +22,7 @@ pub const ENCODER_UNAVAILABLE: &str = "encoder_unavailable";
 pub struct Fallback {
     /// Most preferred first: the held action, the last served one, the
     /// latest attributed one, the package's fallback action, then every
-    /// offered action from the cheapest at the caller's prices (a first turn
+    /// offered action from the cheapest at the request's prices (a first turn
     /// whose package fallback is not offered still gets a route).
     preference: Vec<String>,
     /// How many leading `preference` entries come from the conversation.
@@ -35,7 +37,8 @@ pub struct Fallback {
 }
 
 impl Fallback {
-    pub fn of(decide: &DecideInput, catalog: &Catalog) -> Self {
+    /// `rows` are the decider's [`crate::Decider::action_prices`].
+    pub fn of(decide: &DecideInput, catalog: &Catalog, rows: &[Value]) -> Self {
         let selection = &decide.selection;
         let latest_attributed = decide
             .attribution
@@ -52,7 +55,7 @@ impl Fallback {
         .collect();
         let conversation = preference.len();
         preference.extend(catalog.fallback_action_id.clone());
-        preference.extend(cheapest_first(decide, catalog));
+        preference.extend(cheapest_first(decide, rows));
         let mut tiers: Vec<&'static str> = selection
             .tier_points
             .iter()
@@ -157,17 +160,16 @@ impl Fallback {
     }
 }
 
-/// The offered actions, cheapest first at the caller's prices (input plus
-/// output per token); unpriced actions after priced ones, then by id.
-fn cheapest_first(decide: &DecideInput, catalog: &Catalog) -> Vec<String> {
+/// The offered actions, cheapest first at the rates the decider prices
+/// them at (input plus output per token); unpriced actions after priced
+/// ones, then by id.
+fn cheapest_first(decide: &DecideInput, rows: &[Value]) -> Vec<String> {
     let price = |action_id: &str| -> Option<f64> {
-        let rates = &decide.routing_prices.as_ref()?.rates;
-        let model = &catalog.actions.get(action_id)?.model;
-        let public = catalog.public_ids.get(model).unwrap_or(model);
-        rates
-            .get(public)
-            .or_else(|| rates.get(model))
-            .map(|legs| legs.input + legs.output)
+        let legs = rows
+            .iter()
+            .find(|row| row["action_id"] == action_id)?
+            .get("price_per_mtok")?;
+        Some(legs.get("input")?.as_f64()? + legs.get("output")?.as_f64()?)
     };
     let mut offered: Vec<(Option<f64>, String)> = decide
         .selection

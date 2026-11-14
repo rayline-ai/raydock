@@ -2,10 +2,8 @@
 
 mod common;
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -18,7 +16,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use rayline_arc_routes::{DecideFuture, Decider, HttpDecider, Refusal, Router, RouterConfig};
+use rayline_arc_routes::{DecideFuture, Decider, Refusal, Router, RouterConfig, RoutingPrices};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc};
@@ -26,41 +24,39 @@ use tokio::sync::{Notify, mpsc};
 type TestBody = http_body_util::combinators::UnsyncBoxBody<Bytes, Infallible>;
 
 /// A policy that answers the fixture, counting what runs at once.
+/// Answers [`answer`], or refuses with `refusal`; keeps every decide body.
 #[derive(Default)]
 struct FakeDecider {
-    delay: Duration,
-    /// The refusal a strict decide gets, when one is scripted.
-    strict_refusal: Option<Refusal>,
-    bodies: Mutex<Vec<Value>>,
-    running: Mutex<HashMap<String, usize>>,
-    most_per_episode: AtomicUsize,
-    most_at_once: AtomicUsize,
+    refusal: Option<Refusal>,
+    bodies: Mutex<Vec<String>>,
 }
 
-impl Decider for FakeDecider {
-    fn decide<'a>(&'a self, body: &'a Value) -> DecideFuture<'a> {
-        Box::pin(async move {
-            self.bodies.lock().unwrap().push(body.clone());
-            let episode = body["episode_id_hash"].as_str().unwrap().to_owned();
-            {
-                let mut running = self.running.lock().unwrap();
-                *running.entry(episode.clone()).or_default() += 1;
-                self.most_per_episode
-                    .fetch_max(running[&episode], Ordering::SeqCst);
-                self.most_at_once
-                    .fetch_max(running.values().sum(), Ordering::SeqCst);
-            }
-            tokio::time::sleep(self.delay).await;
-            *self.running.lock().unwrap().get_mut(&episode).unwrap() -= 1;
-            match &self.strict_refusal {
-                Some(refusal) if body["episode_mode"] == "strict" => Err(refusal.clone()),
-                _ => Ok(answer()),
-            }
-        })
+impl FakeDecider {
+    fn bodies(&self) -> Vec<Value> {
+        let bodies = self.bodies.lock().unwrap();
+        bodies
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect()
     }
 }
 
-/// What a fake upstream saw of one request.
+impl Decider for FakeDecider {
+    fn decide<'a>(&'a self, body: &'a str) -> DecideFuture<'a> {
+        Box::pin(async move {
+            self.bodies.lock().unwrap().push(body.to_owned());
+            match &self.refusal {
+                Some(refusal) => Err(refusal.clone()),
+                None => Ok(answer()),
+            }
+        })
+    }
+
+    fn action_prices(&self, _: Option<&RoutingPrices>) -> Vec<Value> {
+        answer()["actions"].as_array().cloned().unwrap_or_default()
+    }
+}
+
 #[derive(Debug)]
 struct Seen {
     method: String,
@@ -208,11 +204,31 @@ async fn routes_is_answered_here_with_its_route_id_and_cell() {
     assert_eq!(body["routing"]["execution"]["status"], "applied");
 
     // The policy was handed the harness body's own members, and nothing went upstream.
-    let bodies = harness.decider.bodies.lock().unwrap();
+    let bodies = harness.decider.bodies();
     assert_eq!(bodies.len(), 1);
     assert_eq!(bodies[0]["request"]["messages"], request()["messages"]);
-    assert_eq!(bodies[0]["episode_mode"], "strict");
     assert!(harness.seen.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn the_decider_gets_the_request_members_as_the_harness_sent_them() {
+    let harness = harness(FakeDecider::default()).await;
+    let mut sent = request();
+    sent["tools"] = json!([{"name": "t", "input_schema": {"type": "object"}}]);
+    // Keys out of sorted order, as a harness may send them.
+    let text = sent
+        .to_string()
+        .replace(r#"{"type":"object"}"#, r#"{"z":1,"a":2}"#);
+    let response = harness
+        .routes("conversation")
+        .header("content-type", "application/json")
+        .body(text)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = harness.decider.bodies.lock().unwrap()[0].clone();
+    assert!(body.contains(r#""input_schema":{"z":1,"a":2}"#), "{body}");
 }
 
 #[tokio::test]
@@ -330,47 +346,9 @@ async fn an_unreachable_upstream_is_a_502() {
     );
 }
 
-#[tokio::test]
-async fn one_decide_is_in_flight_per_conversation_and_branch() {
-    let harness = harness(FakeDecider {
-        delay: Duration::from_millis(40),
-        ..FakeDecider::default()
-    })
-    .await;
-    let lookups = ["one", "one", "one", "one", "two", "two"]
-        .map(|conversation| harness.routes(conversation).send());
-    for response in futures::future::join_all(lookups).await {
-        assert_eq!(response.unwrap().status(), 200);
-    }
-    assert_eq!(harness.decider.bodies.lock().unwrap().len(), 6);
-    assert_eq!(harness.decider.most_per_episode.load(Ordering::SeqCst), 1);
-    // Different conversations do not wait on each other.
-    assert_eq!(harness.decider.most_at_once.load(Ordering::SeqCst), 2);
-}
-
-#[tokio::test]
-async fn a_refused_strict_decide_is_asked_again_relaxed() {
-    let harness = harness(FakeDecider {
-        strict_refusal: Some(Refusal::with_status(409, "session_busy", "busy")),
-        ..FakeDecider::default()
-    })
-    .await;
-    let response = harness.routes("conversation").send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    let modes: Vec<Value> = harness
-        .decider
-        .bodies
-        .lock()
-        .unwrap()
-        .iter()
-        .map(|body| body["episode_mode"].clone())
-        .collect();
-    assert_eq!(modes, [json!("strict"), json!("relaxed")]);
-}
-
 fn unavailable() -> FakeDecider {
     FakeDecider {
-        strict_refusal: Some(Refusal::new("unavailable", "down")),
+        refusal: Some(Refusal::new("unavailable", "down")),
         ..FakeDecider::default()
     }
 }
@@ -399,7 +377,7 @@ async fn an_unavailable_decider_keeps_the_held_model_and_is_not_asked_again() {
         body["presets"]["sage"]["policy_action_id"],
         json!(common::id('a'))
     );
-    assert_eq!(harness.decider.bodies.lock().unwrap().len(), 1);
+    assert_eq!(harness.decider.bodies().len(), 1);
 }
 
 #[tokio::test]
@@ -487,57 +465,6 @@ async fn an_unavailable_decider_without_a_package_fallback_still_routes() {
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["receipt"]["decided_by"]["model"], "utility_fallback");
     assert!(body["model"].is_string());
-}
-
-#[tokio::test]
-async fn a_decide_service_over_http_answers_or_refuses_with_its_code() {
-    let service = serve_with(|request: Request<Incoming>| async move {
-        assert_eq!(request.uri().path(), "/v1/rayline/arc/policy/decide");
-        let body: Value =
-            serde_json::from_slice(&request.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        let (status, answer) = match body["episode_mode"].as_str() {
-            Some("strict") => (
-                409,
-                json!({"error": {"code": "conflict", "message": "private text",
-                                                      "detail": {"reason": "session_busy"}}}),
-            ),
-            _ => (200, json!({"echo": body["turn_key"]})),
-        };
-        Response::builder()
-            .status(status)
-            .body(http_body_util::Full::new(Bytes::from(answer.to_string())).boxed_unsync())
-            .unwrap()
-    })
-    .await;
-    let decider = HttpDecider::new(&format!("http://{service}")).unwrap();
-    let refusal = decider
-        .decide(&json!({"episode_mode": "strict"}))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        (refusal.status, refusal.code.as_str()),
-        (409, "session_busy")
-    );
-    assert!(!refusal.message.contains("private"));
-    let answer = decider
-        .decide(&json!({"episode_mode": "relaxed", "turn_key": "k"}))
-        .await
-        .unwrap();
-    assert_eq!(answer, json!({"echo": "k"}));
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let closed = listener.local_addr().unwrap();
-    drop(listener);
-    let refusal = HttpDecider::new(&format!("http://{closed}"))
-        .unwrap()
-        .decide(&json!({}))
-        .await
-        .unwrap_err();
-    assert_eq!(
-        (refusal.status, refusal.code.as_str()),
-        (503, "unavailable")
-    );
 }
 
 #[tokio::test]

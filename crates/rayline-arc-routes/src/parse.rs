@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -123,13 +124,24 @@ pub struct PackageRef {
     pub package_sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EpisodeMode {
-    /// Extends the episode's retained session with the new tokens only.
-    Strict,
-    /// Depends on the request alone.
-    Relaxed,
+/// The model request members (`system`, `tools`, `messages`, or the
+/// Responses ones) as JSON text. For Anthropic Messages it is the text the
+/// harness sent, keys in their sent order: the encoder input depends on the
+/// key order of the system prompt and the tool definitions.
+#[derive(Debug, Clone, Serialize)]
+#[serde(transparent)]
+pub struct RequestText(Box<RawValue>);
+
+impl RequestText {
+    pub fn get(&self) -> &str {
+        self.0.get()
+    }
+}
+
+impl PartialEq for RequestText {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -181,17 +193,16 @@ pub struct RoutingPrices {
     pub rates: BTreeMap<String, Legs>,
 }
 
-/// The policy's decide request. It serializes to the decide body.
+/// The policy's decide request. It serializes to the decide body, its
+/// request members as sent.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DecideInput {
     pub schema_version: &'static str,
     pub package: PackageRef,
     pub episode_id_hash: String,
-    pub episode_mode: EpisodeMode,
     pub context_epoch: String,
     pub request_format: &'static str,
-    /// The harness body's own members, unchanged.
-    pub request: Value,
+    pub request: RequestText,
     pub attribution: Vec<Attribution>,
     pub selection: Selection,
     pub response_fields: [&'static str; 2],
@@ -481,11 +492,38 @@ fn truthy(value: &Value) -> bool {
     }
 }
 
-/// The wire format the decide request names and the body members it reads.
+/// The Anthropic Messages members of a request (`system`, `tools`,
+/// `messages`, nulls left out) as the text the harness sent them in.
+fn messages_text(sent: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Members<'a> {
+        #[serde(borrow, default)]
+        system: Option<&'a RawValue>,
+        #[serde(borrow, default)]
+        tools: Option<&'a RawValue>,
+        #[serde(borrow, default)]
+        messages: Option<&'a RawValue>,
+    }
+    let members: Members<'_> = serde_json::from_slice(sent).ok()?;
+    let parts: Vec<String> = [
+        ("system", members.system),
+        ("tools", members.tools),
+        ("messages", members.messages),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| value.map(|value| format!("\"{key}\":{}", value.get())))
+    .collect();
+    Some(format!("{{{}}}", parts.join(",")))
+}
+
+/// The wire format the decide request names and the body members it reads,
+/// taken out of `body`; Anthropic Messages members as `sent`.
 fn request_members(
     body: &mut Map<String, Value>,
+    sent: &[u8],
     wire_format: Option<&str>,
-) -> (&'static str, Value) {
+) -> Result<(&'static str, RequestText), Refusal> {
+    let invalid = || Refusal::new("invalid_body", "The request body must be a JSON object.");
     let format = match wire_format {
         Some("anthropic.messages.v1") => "anthropic_messages",
         Some("openai.chat.v1") => "openai_chat",
@@ -505,12 +543,14 @@ fn request_members(
         );
     } else {
         for key in ["system", "tools", "messages"] {
-            if let Some(value) = body.remove(key).filter(|value| !value.is_null()) {
-                request.insert(key.to_owned(), value);
-            }
+            body.remove(key);
         }
+        let text = messages_text(sent).ok_or_else(invalid)?;
+        let raw = RawValue::from_string(text).map_err(|_| invalid())?;
+        return Ok((format, RequestText(raw)));
     }
-    (format, Value::Object(request))
+    let raw = serde_json::value::to_raw_value(&request).map_err(|_| invalid())?;
+    Ok((format, RequestText(raw)))
 }
 
 /// Targets the package does not hold are left out of the offer and named in
@@ -550,11 +590,11 @@ fn drop_unknown_targets(body: &mut Map<String, Value>, catalog: &Catalog) -> Vec
 /// the envelope against the serving package (catalog, pins, hold).
 pub fn parse(
     catalog: &Catalog,
-    body: Value,
+    sent: &[u8],
     headers: &RequestHeaders,
     context: &ParseContext,
 ) -> Result<Parsed, Refusal> {
-    let Value::Object(mut body) = body else {
+    let Ok(Value::Object(mut body)) = serde_json::from_slice(sent) else {
         return Err(Refusal::new(
             "invalid_body",
             "The request body must be a JSON object.",
@@ -611,7 +651,8 @@ pub fn parse(
         ));
     };
     let pinned = execution::bind(&execution, catalog)?;
-    let (request_format, request) = request_members(&mut body, headers.wire_format.as_deref());
+    let (request_format, request) =
+        request_members(&mut body, sent, headers.wire_format.as_deref())?;
     let routing_prices = sent_prices.as_ref().map(|rates| RoutingPrices {
         schema: ROUTING_PRICES_SCHEMA,
         basis: "caller",
@@ -678,7 +719,7 @@ fn decide_input(
     execution: &ExecutionContext,
     policy: Policy,
     primary: Tier,
-    (request_format, request): (&'static str, Value),
+    (request_format, request): (&'static str, RequestText),
     routing_prices: Option<RoutingPrices>,
     episode_id_hash: String,
 ) -> DecideInput {
@@ -702,7 +743,6 @@ fn decide_input(
             package_sha256: catalog.package_sha256.clone(),
         },
         episode_id_hash,
-        episode_mode: EpisodeMode::Strict,
         context_epoch: execution.turn.epoch.clone(),
         request_format,
         request,

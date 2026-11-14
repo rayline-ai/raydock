@@ -637,6 +637,17 @@ mod tests {
             within("2M nulls", &tool_use),
             Err(ProjectionError::TooLarge(reason)) if reason.contains("JSON values")
         ));
+        // Spaces around a `workspace_path:` value: the reference pattern
+        // backtracks without bound on these; the budget stops it.
+        let spaces = " ".repeat(20_000);
+        let system = format!("workspace_path:{spaces}x{spaces}\ny");
+        let crafted =
+            serde_json::json!({"system": system, "messages": [{"role": "user", "content": "hi"}]})
+                .to_string();
+        assert!(matches!(
+            within("backtracking", &crafted),
+            Err(ProjectionError::TooLarge(reason)) if reason.contains("backtracking")
+        ));
         // Too many tools.
         let tools: Vec<String> = (0..=MAX_TOOLS)
             .map(|index| format!(r#"{{"name": "t{index}", "input_schema": {{}}}}"#))

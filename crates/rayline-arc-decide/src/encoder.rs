@@ -2,9 +2,9 @@
 //!
 //! The server answers `POST /encode` with the encoder's final-layer state
 //! at each requested token offset, as raw little-endian float32 rows
-//! (`x-rows` by `x-dim`). Each call here is a one-shot encode that keeps no
-//! session on the server. The client speaks plain HTTP/1.1 to a host and
-//! port and is meant for a server on this machine.
+//! (`x-rows` by `x-dim`). A call naming an episode extends that episode's
+//! session on the server with its new tokens only. The client speaks plain
+//! HTTP/1.1 to a host and port and is meant for a server on this machine.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -116,7 +116,9 @@ impl LocalEncoder {
     pub fn new(url: &str) -> Result<Self, String> {
         Ok(Self {
             authority: Arc::new(RwLock::new(authority_of(url)?)),
-            timeout: Duration::from_secs(600),
+            // As long as a turn waits for its decision: an encode it no
+            // longer waits for stops being read here.
+            timeout: Duration::from_secs(60),
             on_context_full: None,
             held: Arc::default(),
             stats: None,

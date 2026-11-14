@@ -283,6 +283,10 @@ pub struct ActionScore {
     pub predicted_quality: Option<f32>,
     pub predicted_cost_usd: Option<f32>,
     pub price_per_mtok: PricePerMtok,
+    /// The caller's price key that `price_per_mtok` is, if a caller row
+    /// priced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_key: Option<String>,
     pub thinking: Thinking,
 }
 

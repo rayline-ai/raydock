@@ -4,7 +4,9 @@
 mod common;
 
 use common::{answer, assert_core_accepts, catalog, request};
-use rayline_arc_routes::{DecideFuture, Decider, Refusal, RequestHeaders, Router, RouterConfig};
+use rayline_arc_routes::{
+    DecideFuture, Decider, Refusal, RequestHeaders, Router, RouterConfig, RoutingPrices,
+};
 use serde_json::Value;
 
 /// A decider that answers, or refuses as the local decider does for one
@@ -12,7 +14,7 @@ use serde_json::Value;
 struct Kind(Option<Refusal>);
 
 impl Decider for Kind {
-    fn decide<'a>(&'a self, _body: &'a Value) -> DecideFuture<'a> {
+    fn decide<'a>(&'a self, _body: &'a str) -> DecideFuture<'a> {
         Box::pin(async move {
             match &self.0 {
                 Some(refusal) => Err(refusal.clone()),
@@ -21,8 +23,8 @@ impl Decider for Kind {
         })
     }
 
-    fn action_prices(&self, _routing_prices: &Value) -> Option<Vec<Value>> {
-        answer()["actions"].as_array().cloned()
+    fn action_prices(&self, _: Option<&RoutingPrices>) -> Vec<Value> {
+        answer()["actions"].as_array().cloned().unwrap_or_default()
     }
 }
 
@@ -61,7 +63,7 @@ async fn every_answer_kind_passes_the_core_checks() {
         };
         let sent = request();
         let shaped = router
-            .route(sent.clone(), &headers)
+            .route(&serde_json::to_vec(&sent).unwrap(), &headers)
             .await
             .unwrap_or_else(|refusal| panic!("{kind}: refused {refusal:?}"));
         assert_core_accepts(&shaped, &sent);

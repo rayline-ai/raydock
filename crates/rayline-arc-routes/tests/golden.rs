@@ -83,7 +83,12 @@ fn recorded_requests_parse_and_shape_as_the_reference_does() {
             as_of: String::new(),
             nonce: String::new(),
         };
-        let parsed = match parse(&catalog, line["request"].clone(), &headers, &context) {
+        let parsed = match parse(
+            &catalog,
+            &serde_json::to_vec(&line["request"]).unwrap(),
+            &headers,
+            &context,
+        ) {
             Ok(parsed) => parsed,
             Err(refusal) => {
                 failures.push(format!("line {index}: refused {}", refusal.code));

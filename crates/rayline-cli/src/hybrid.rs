@@ -340,25 +340,19 @@ async fn launch(
         .as_ref()
         .expect("a local-mode load has routing");
     let hosted = crate::status::hosted_environment(settings);
-    let mut config =
+    let config =
         crate::hybrid_profile::core_config(settings, &hosted.base_url).map_err(io::Error::other)?;
-    // Local ARC (prototype): with `RAYLINE_ARC_MODEL`, the local process runs
-    // the ARC encoder itself and points the core at the loopback routes
-    // service `RAYLINE_DECISIONS_URL`; the config keeps the router, which the
-    // classifier still uses. Without it, `RAYLINE_DECISIONS_URL` alone sends
-    // Decisions to that loopback service. The check below admits only a
-    // loopback address besides the environment's router.
-    // The encoder download is blocking HTTP, which may not run on the async
-    // runtime.
+    // Local ARC (prototype): with `RAYLINE_ARC_MODEL` or `RAYLINE_ARC_LOCAL`,
+    // the local process decides each turn itself and points the core at its
+    // loopback routes service; the config keeps the router, which the
+    // classifier still uses. The encoder download is blocking HTTP, which
+    // may not run on the async runtime.
     let local_arc = {
         let (home, dir) = (home.to_path_buf(), paths.dir.clone());
         tokio::task::spawn_blocking(move || local_arc(&home, &Paths { dir }))
             .await
             .map_err(io::Error::other)??
     };
-    if let (None, Some(url)) = (&local_arc, std::env::var_os("RAYLINE_DECISIONS_URL")) {
-        config["decisions"]["url"] = json!(url.to_string_lossy());
-    }
     // The local process refuses Decisions anywhere but this router or a
     // loopback address; refuse a router it would refuse here, by name.
     rayline_local_router::decisions_url::check_config(&config, [hosted.base_url.as_str()])
@@ -404,13 +398,19 @@ async fn launch(
         }
     }
     write_private_json(&paths.core_config(), &config, true)?;
-    say(format!(
-        "Decisions: {} via {}",
-        routing.decisions_model,
-        config["decisions"]["url"]
-            .as_str()
-            .unwrap_or(&hosted.base_url)
-    ));
+    match &local_arc {
+        Some(_) => say(format!(
+            "Decisions: {} on this machine (local ARC)",
+            routing.decisions_model
+        )),
+        None => say(format!(
+            "Decisions: {} via {}",
+            routing.decisions_model,
+            config["decisions"]["url"]
+                .as_str()
+                .unwrap_or(&hosted.base_url)
+        )),
+    }
     say(format!("Routing policy: {}", routing.policy.preset));
     for (id, model) in &settings.models {
         say(format!(
@@ -424,8 +424,11 @@ async fn launch(
     ));
     say(format!("Rayline key: the saved key for {}", hosted.name()));
     // One Decisions call before reporting ready: a refused key or an
-    // unreachable router fails here, not on the harness's first turn.
-    probe_decisions(&config, &router_key, settings.env.as_deref(), say).await?;
+    // unreachable router fails here, not on the harness's first turn. Local
+    // decisions never ask the router, so its outage must not stop them.
+    if local_arc.is_none() {
+        probe_decisions(&config, &router_key, settings.env.as_deref(), say).await?;
+    }
     let log = private_log(&paths.log())?;
     let mut command = Command::new(current_exe()?);
     command
@@ -457,22 +460,11 @@ async fn launch(
             .arg("--arc-model")
             .arg(&arc.model)
             .arg("--arc-state-dir")
-            .arg(&arc.state_dir);
-        if let Some(url) = &arc.routes_url {
-            command.arg("--arc-routes-url").arg(url);
-        }
-        if let Some(package) = &arc.package {
-            command.arg("--arc-package").arg(package);
-        }
-        match (&arc.decide_url, &arc.release) {
-            (Some(url), _) => {
-                command.arg("--arc-decide-url").arg(url);
-            }
-            (None, Some(dir)) => {
-                command.arg("--arc-release").arg(dir);
-            }
-            (None, None) => {}
-        }
+            .arg(&arc.state_dir)
+            .arg("--arc-package")
+            .arg(&arc.package)
+            .arg("--arc-release")
+            .arg(&arc.release);
     }
     for (deployment, dir) in &token_counters {
         command.arg("--token-counter-dir").arg(deployment).arg(dir);
@@ -674,17 +666,15 @@ fn current_exe() -> io::Result<PathBuf> {
     fs::canonicalize(std::env::current_exe()?)
 }
 
-/// `name`, installed beside [`current_exe`].
-/// The local ARC files and routes service, when `RAYLINE_ARC_MODEL` names
-/// the encoder weights (prototype; settings and a download replace it).
+/// The local ARC files, when `RAYLINE_ARC_MODEL` names the encoder weights
+/// or `RAYLINE_ARC_LOCAL` asks for the pinned ones (prototype; settings and
+/// a download replace it).
 struct LocalArc {
     encoder: PathBuf,
     model: PathBuf,
     state_dir: PathBuf,
-    routes_url: Option<String>,
-    package: Option<PathBuf>,
-    decide_url: Option<String>,
-    release: Option<PathBuf>,
+    package: PathBuf,
+    release: PathBuf,
 }
 
 /// The ARC encoder weights `rayline` downloads: the public release's text
@@ -694,8 +684,6 @@ const ARC_COMMIT: &str = "9e69b28174c07adc6ba76c1258e21526e2f3e7af";
 const ARC_ENCODER_FILE: &str = "gguf/arc-1.0-20261111-encoder-bf16.gguf";
 const ARC_ENCODER_SHA256: &str = "6aa526ff86148c34977781117a7cf80987583f6797290ee7ea33c4a0fa7a8bb0";
 
-/// The pinned encoder weights in the Hugging Face cache, downloaded on first
-/// use and checked against [`ARC_ENCODER_SHA256`].
 /// The lowercase hex SHA-256 of the file at `path`, read in chunks.
 fn file_sha256(path: &Path) -> io::Result<String> {
     use sha2::Digest as _;
@@ -704,6 +692,8 @@ fn file_sha256(path: &Path) -> io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// The pinned encoder weights in the Hugging Face cache, downloaded on first
+/// use and checked against [`ARC_ENCODER_SHA256`].
 fn arc_encoder_weights(home: &Path) -> io::Result<PathBuf> {
     let hub = rayline_hf::hf_cache_dir(home).map_err(io::Error::other)?;
     let path = match rayline_hf::cached_hf_file(&hub, ARC_REPO, ARC_ENCODER_FILE, ARC_COMMIT) {
@@ -736,32 +726,23 @@ fn local_arc(home: &Path, paths: &Paths) -> io::Result<Option<LocalArc>> {
         Some(path) => PathBuf::from(path),
         None => installed_binary("rayline-arc-encoder")?,
     };
-    // The in-process routes service decides with RAYLINE_ARC_PACKAGE through
-    // RAYLINE_ARC_DECIDE_URL (prototype); RAYLINE_DECISIONS_URL instead names
-    // an external loopback routes service.
-    let routes_url = std::env::var("RAYLINE_DECISIONS_URL").ok();
-    let package = std::env::var_os("RAYLINE_ARC_PACKAGE").map(PathBuf::from);
-    let decide_url = std::env::var("RAYLINE_ARC_DECIDE_URL").ok();
-    let release = std::env::var_os("RAYLINE_ARC_RELEASE").map(PathBuf::from);
+    let release = std::env::var_os("RAYLINE_ARC_RELEASE")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("local ARC needs RAYLINE_ARC_RELEASE"))?;
     // The package manifest sits in the release directory unless named.
-    let package = package.or_else(|| release.as_ref().map(|dir| dir.join("package.json")));
-    if routes_url.is_none() && (package.is_none() || (decide_url.is_none() && release.is_none())) {
-        return Err(io::Error::other(
-            "local ARC needs RAYLINE_ARC_RELEASE (or RAYLINE_ARC_PACKAGE with RAYLINE_ARC_DECIDE_URL), or RAYLINE_DECISIONS_URL",
-        ));
-    }
+    let package = std::env::var_os("RAYLINE_ARC_PACKAGE")
+        .map_or_else(|| release.join("package.json"), PathBuf::from);
     Ok(Some(LocalArc {
         encoder,
         model,
         // Beside the local process's state, which each start clears.
         state_dir: paths.dir.with_file_name("arc-sessions"),
-        routes_url,
         package,
-        decide_url,
         release,
     }))
 }
 
+/// `name`, installed beside [`current_exe`].
 fn installed_binary(name: &str) -> io::Result<PathBuf> {
     let executable = current_exe()?;
     let directory = executable

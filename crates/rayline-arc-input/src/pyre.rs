@@ -79,11 +79,30 @@ pub fn translate(pattern: &str, dot_all: bool) -> String {
     out
 }
 
-/// Compiles a translated pattern without the engine's default backtracking
-/// budget: Python has none, and a lazy scan over a long prompt would spend it.
+/// The most backtracking steps one match may take. Python has no limit; the
+/// engine's default (a million) is spent by a lazy scan over a long prompt,
+/// while a pattern backtracking without bound on crafted text (spaces around
+/// a `workspace_path:` value, say) would hold a worker for minutes. A match
+/// that hits it fails as [`budget_spent`]: no input the reference encodes
+/// within the projection's caps comes near it.
+pub const BACKTRACK_LIMIT: usize = 10_000_000;
+
+/// Whether `error` is a match that spent [`BACKTRACK_LIMIT`] or the
+/// engine's stack.
+pub fn budget_spent(error: &fancy_regex::Error) -> bool {
+    matches!(
+        error,
+        fancy_regex::Error::RuntimeError(
+            fancy_regex::RuntimeError::BacktrackLimitExceeded
+                | fancy_regex::RuntimeError::StackOverflow
+        )
+    )
+}
+
+/// Compiles a translated pattern with [`BACKTRACK_LIMIT`].
 pub fn compile(pattern: &str) -> Result<Regex, String> {
     RegexBuilder::new(pattern)
-        .backtrack_limit(usize::MAX)
+        .backtrack_limit(BACKTRACK_LIMIT)
         .build()
         .map_err(|error| format!("pattern {pattern:?}: {error}"))
 }
@@ -100,14 +119,14 @@ pub fn sub(
     text: &str,
     limit: usize,
     mut replace: impl FnMut(&Captures<'_>, &mut String),
-) -> Result<String, String> {
+) -> Result<String, fancy_regex::Error> {
     let mut out = String::new();
     let mut cursor = 0;
     for (count, found) in regex.captures_iter(text).enumerate() {
         if limit != 0 && count == limit {
             break;
         }
-        let captures = found.map_err(|error| error.to_string())?;
+        let captures = found?;
         let Some(whole) = captures.get(0) else {
             continue;
         };

@@ -26,6 +26,8 @@ pub struct ResolvedPrices {
     pub rates: Vec<Rates>,
     /// Arms a caller's exclusive table left unpriced.
     pub excluded: Vec<bool>,
+    /// The caller's key that priced each arm, if one did.
+    pub keys: Vec<Option<String>>,
 }
 
 fn leg(value: &Value) -> Option<f64> {
@@ -166,6 +168,7 @@ pub fn resolve(
         return Ok(ResolvedPrices {
             rates: package,
             excluded: vec![false; count],
+            keys: vec![None; count],
         });
     };
     match routing.basis.as_deref() {
@@ -215,9 +218,13 @@ fn caller(
     }
     let mut rates = package;
     let mut excluded = vec![false; count];
+    let mut priced_by = vec![None; count];
     for arm in 0..count {
         match table.get(keys[arm].as_str()) {
-            Some(legs) => rates[arm] = *legs,
+            Some(legs) => {
+                rates[arm] = *legs;
+                priced_by[arm] = Some(keys[arm].clone());
+            }
             None => excluded[arm] = exclusive,
         }
     }
@@ -229,7 +236,11 @@ fn caller(
             }
         }
     }
-    Ok(ResolvedPrices { rates, excluded })
+    Ok(ResolvedPrices {
+        rates,
+        excluded,
+        keys: priced_by,
+    })
 }
 
 fn feed(
@@ -246,6 +257,7 @@ fn feed(
     let none = ResolvedPrices {
         rates: package.clone(),
         excluded: vec![false; count],
+        keys: vec![None; count],
     };
     if !release.live_prices {
         return Ok(none);
@@ -296,6 +308,7 @@ fn feed(
     Ok(ResolvedPrices {
         rates,
         excluded: none.excluded,
+        keys: none.keys,
     })
 }
 

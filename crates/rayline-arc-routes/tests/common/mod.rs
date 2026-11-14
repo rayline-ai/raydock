@@ -103,7 +103,8 @@ pub fn answer() -> Value {
         "actions": [
             {"action_id": id('a'), "available": true, "score": 0.5, "price_per_mtok": legs(1.0, 5.0)},
             {"action_id": id('b'), "available": true, "score": 0.75, "price_per_mtok": legs(5.0, 25.0)},
-            {"action_id": id('c'), "available": false, "score": null, "price_per_mtok": legs(0.0, 0.25)},
+            {"action_id": id('c'), "available": false, "score": null, "price_per_mtok": legs(0.0, 0.25),
+             "price_key": "qwen/qwen3.8-27b"},
         ],
         "encoding": {"token_count": 1234},
     })

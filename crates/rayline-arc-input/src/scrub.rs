@@ -298,7 +298,7 @@ impl Ruleset {
                 matched = self
                     .context_section
                     .find(text)
-                    .map_err(|error| internal(error.to_string()))?
+                    .map_err(regex_error)?
                     .map(|whole| whole.end());
             }
             match matched {
@@ -328,6 +328,16 @@ fn ruleset() -> Result<&'static Ruleset, ProjectionError> {
 
 fn internal(error: String) -> ProjectionError {
     ProjectionError::Internal(error)
+}
+
+/// A match that spent the backtracking budget is input too large to read,
+/// like one past the projection's caps; any other failure is internal.
+fn regex_error(error: fancy_regex::Error) -> ProjectionError {
+    if pyre::budget_spent(&error) {
+        ProjectionError::TooLarge("a pattern's backtracking budget".to_owned())
+    } else {
+        ProjectionError::Internal(error.to_string())
+    }
 }
 
 /// One conversation's scrub: the ruleset plus this conversation's working
@@ -383,7 +393,7 @@ impl Scrubber {
     fn scrub_text(&self, text: &str) -> Result<String, ProjectionError> {
         let mut text = text.to_owned();
         for cwd in &self.cwds {
-            text = pyre::sub(cwd, &text, 0, |_, out| out.push_str("<CWD>")).map_err(internal)?;
+            text = pyre::sub(cwd, &text, 0, |_, out| out.push_str("<CWD>")).map_err(regex_error)?;
         }
         for pattern in &self.rules.cwd {
             text = pyre::sub(pattern, &text, 0, |captures, out| {
@@ -395,13 +405,13 @@ impl Scrubber {
                     _ => out.push_str(whole),
                 }
             })
-            .map_err(internal)?;
+            .map_err(regex_error)?;
         }
         for (pattern, template) in &self.rules.rules {
             text = pyre::sub(pattern, &text, 0, |captures, out| {
                 template.expand(captures, out);
             })
-            .map_err(internal)?;
+            .map_err(regex_error)?;
         }
         Ok(text)
     }
@@ -411,7 +421,7 @@ impl Scrubber {
         let stamped = pyre::sub(&self.rules.turn_stamp, text, 1, |_, out| {
             out.push_str("[<DATE>] ");
         })
-        .map_err(internal)?;
+        .map_err(regex_error)?;
         let mut scrubbed = String::with_capacity(stamped.len());
         let mut cursor = 0;
         for section in self.rules.sections(&stamped)? {
@@ -483,7 +493,7 @@ pub fn scrub_environment(
     for text in &texts {
         for pattern in &rules.cwd {
             for captures in pattern.captures_iter(text) {
-                let captures = captures.map_err(|error| internal(error.to_string()))?;
+                let captures = captures.map_err(regex_error)?;
                 let value = pyre::strip(captures.get(1).map_or("", |found| found.as_str()));
                 if value.chars().count() >= 2 && seen.insert(value.to_owned()) {
                     // Each directory is a pattern run over every text.

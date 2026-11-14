@@ -109,24 +109,12 @@ impl Catalog {
         })
     }
 
-    /// The id an answer names a policy model by: the caller's own price key
-    /// when it names the model (exactly, or after its last `/`), else the
-    /// public id, else the bare name.
-    pub fn public_id<'a>(
-        &'a self,
-        model: &'a str,
-        priced: impl Iterator<Item = &'a String> + Clone,
-    ) -> &'a str {
-        if let Some(key) = priced.clone().find(|key| key.as_str() == model) {
-            return key;
-        }
-        if let Some(key) = priced
-            .into_iter()
-            .find(|key| key.rsplit('/').next() == Some(model))
-        {
-            return key;
-        }
-        self.public_ids.get(model).map_or(model, String::as_str)
+    /// The id an answer names a policy model by when no caller price key
+    /// priced it: its public id, else the bare name.
+    pub fn public_id(&self, model: &str) -> String {
+        self.public_ids
+            .get(model)
+            .map_or_else(|| model.to_owned(), String::clone)
     }
 }
 
@@ -149,15 +137,9 @@ mod tests {
     }
 
     #[test]
-    fn a_model_is_named_by_the_callers_key_first() {
+    fn a_model_is_named_by_its_public_id_else_its_name() {
         let catalog = Catalog::from_manifest(br#"{"actions": []}"#, "p").unwrap();
-        let priced = ["mine/glm-5.3".to_owned(), "other".to_owned()];
-        assert_eq!(catalog.public_id("glm-5.3", priced.iter()), "mine/glm-5.3");
-        assert_eq!(catalog.public_id("other", priced.iter()), "other");
-        assert_eq!(
-            catalog.public_id("kimi-k3", priced.iter()),
-            "moonshotai/kimi-k3"
-        );
-        assert_eq!(catalog.public_id("unlisted", priced.iter()), "unlisted");
+        assert_eq!(catalog.public_id("kimi-k3"), "moonshotai/kimi-k3");
+        assert_eq!(catalog.public_id("unlisted"), "unlisted");
     }
 }

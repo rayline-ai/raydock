@@ -31,7 +31,12 @@ fn context() -> ParseContext {
 }
 
 fn parsed(body: Value) -> Result<Parsed, Refusal> {
-    parse(&catalog(), body, &headers(), &context())
+    parse(
+        &catalog(),
+        &serde_json::to_vec(&body).unwrap(),
+        &headers(),
+        &context(),
+    )
 }
 
 /// The fixture request with the member at a JSON pointer set.
@@ -61,7 +66,6 @@ fn a_request_becomes_the_decide_body() {
         "schema_version": "rayline.arc.policy-decision-request.v1",
         "package": {"alias": ALIAS, "package_sha256": sha256_hex(&manifest())},
         "episode_id_hash": sha256_hex(b"local-routes\0salt\0conversation-1\0branch-1\0"),
-        "episode_mode": "strict",
         "context_epoch": "epoch:0",
         "request_format": "anthropic_messages",
         "request": {"system": sent["system"], "tools": sent["tools"], "messages": sent["messages"]},
@@ -164,7 +168,13 @@ fn the_wire_format_is_the_headers_else_the_bodys() {
             wire_format: header.map(str::to_owned),
             ..headers()
         };
-        let parsed = parse(&catalog(), body, &headers, &context()).unwrap();
+        let parsed = parse(
+            &catalog(),
+            &serde_json::to_vec(&body).unwrap(),
+            &headers,
+            &context(),
+        )
+        .unwrap();
         serde_json::to_value(parsed.decide).unwrap()
     };
     for header in [Some("openai.responses.v1"), None, Some("something.else")] {
@@ -181,9 +191,14 @@ fn the_wire_format_is_the_headers_else_the_bodys() {
         ..headers()
     };
     let decide = serde_json::to_value(
-        parse(&catalog(), chat, &headers, &context())
-            .unwrap()
-            .decide,
+        parse(
+            &catalog(),
+            &serde_json::to_vec(&chat).unwrap(),
+            &headers,
+            &context(),
+        )
+        .unwrap()
+        .decide,
     )
     .unwrap();
     assert_eq!(decide["request_format"], "openai_chat");
@@ -193,10 +208,15 @@ fn the_wire_format_is_the_headers_else_the_bodys() {
 #[test]
 fn an_episode_is_a_conversation_and_branch_under_a_salt() {
     let episode = |headers: &RequestHeaders, context: &ParseContext| {
-        parse(&catalog(), request(), headers, context)
-            .unwrap()
-            .decide
-            .episode_id_hash
+        parse(
+            &catalog(),
+            &serde_json::to_vec(&request()).unwrap(),
+            headers,
+            context,
+        )
+        .unwrap()
+        .decide
+        .episode_id_hash
     };
     let base = episode(&headers(), &context());
     assert_eq!(
@@ -640,16 +660,41 @@ fn the_answer_is_one_the_core_validates() {
 #[test]
 fn a_caller_row_the_decision_did_not_use_is_unused_not_applied() {
     let mut sent = request();
-    // The decision priced this model at other legs: it didn't read the row.
     sent["routing"]["prices"][LOCAL_MODEL] =
         json!({"input": 9, "cache_read": 9, "cache_write": 9, "output": 9});
-    let parsed = parsed(sent).unwrap();
-    let shaped = shape(&catalog(), &parsed.restate, &answer(), "rt_test", 1).unwrap();
+    let parsed = parsed(sent.clone()).unwrap();
+    // The decider priced this model at its catalog rate: no caller key.
+    let mut answer = answer();
+    answer["actions"][2]
+        .as_object_mut()
+        .unwrap()
+        .remove("price_key");
+    let shaped = shape(&catalog(), &parsed.restate, &answer, "rt_test", 1).unwrap();
     let prices = &shaped["routing"]["prices"];
     assert_eq!(prices["unused"], json!([LOCAL_MODEL]));
     let row = &prices["models"][LOCAL_MODEL];
     assert_eq!(row["output"], 0.25);
     assert_eq!(row["source"]["output"], "catalog");
+    // With no caller row applied, every result's prices are the catalog's.
+    assert_eq!(shaped["identity"]["prices"]["basis"], "catalog");
+    assert_core_accepts(&shaped, &sent);
+}
+
+#[test]
+fn an_unused_caller_alias_never_renames_a_model() {
+    let mut sent = request();
+    // A caller key that names the selected model under another vendor; the
+    // decider didn't price by it.
+    sent["routing"]["prices"]["other/claude-haiku-5.5"] =
+        json!({"input": 7, "cache_read": 7, "cache_write": 7, "output": 7});
+    let parsed = parsed(sent.clone()).unwrap();
+    let shaped = shape(&catalog(), &parsed.restate, &answer(), "rt_test", 1).unwrap();
+    assert_eq!(shaped["model"], "anthropic/claude-haiku-5.5");
+    let prices = &shaped["routing"]["prices"];
+    assert!(prices["models"]["anthropic/claude-haiku-5.5"].is_object());
+    assert_eq!(prices["unused"], json!(["other/claude-haiku-5.5"]));
+    assert_eq!(shaped["selected_pricing"]["input"], 1.0);
+    assert_core_accepts(&shaped, &sent);
 }
 
 #[test]
