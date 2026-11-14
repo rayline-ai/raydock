@@ -163,12 +163,19 @@ A new platform (for example Windows) ships only after all seven steps below pass
 7. **End to end.** Run real `claude -p` and Pi turns in local mode through the sibling binary, with no
    `RAYLINE_ARC_ENCODER`. Then restart offline, from the cache.
 
-Windows notes:
-- **Hugging Face cache symlinks.** The cache needs Developer Mode for symlinks, or a fallback that copies files.
-- **Long paths.** Cache and state-dir paths can exceed `MAX_PATH`.
-- **State-dir permissions.** `--state-dir` must sit under the user's profile, so its ACL keeps saved sessions private;
-  the POSIX `0700`/`0600` check does not apply on Windows.
-- **SmartScreen.** An unsigned `.exe` triggers a SmartScreen warning.
+### Windows (not yet shipped)
+
+Follow upstream llama.cpp's Windows builds ([release.yml](https://github.com/ggml-org/llama.cpp/blob/master/.github/workflows/release.yml), [docs/build.md](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)):
+- **Build:** MSVC for CUDA, clang-cl for CPU variants, Ninja; `GGML_NATIVE=OFF`, `GGML_OPENMP=OFF`, static CRT (`/MT`).
+- **CUDA:** install the toolkit from NVIDIA's redist zips ([windows-setup-cuda](https://github.com/ggml-org/llama.cpp/blob/master/.github/actions/windows-setup-cuda/action.yml)) and set an explicit `CMAKE_CUDA_ARCHITECTURES` list.
+- **cuBLAS:** Windows has no static cuBLAS, so ship `cublas` and `cublasLt` DLLs beside the `.exe`.
+- **Drivers:** CUDA 12 builds need driver ≥ 525, CUDA 13 builds ≥ 580 ([release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/)).
+- **Unicode paths:** use a UTF-8 argv (`wmain`/`GetCommandLineW`) or a UTF-8 `activeCodePage` manifest ([#18571](https://github.com/ggml-org/llama.cpp/issues/18571)). Expect long paths too.
+- **Process:** the parent puts the encoder in a Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; closing stdin (`--parent-pipe`) gives the graceful exit, since there is no SIGTERM.
+- **State dir:** `--state-dir` must be under `%USERPROFILE%`; its ACL keeps saved sessions private, and no mode check applies.
+- **Model cache:** Hugging Face cache symlinks need Developer Mode, or a fallback that copies files.
+- **Signing:** Authenticode-sign the `.exe` and the DLLs, with a timestamp. EV certificates no longer bypass SmartScreen ([Microsoft Learn](https://learn.microsoft.com/windows/apps/package-and-deploy/smartscreen-reputation)).
+- **Later:** Vulkan and Windows arm64 are phase 2.
 
 ### Validated platforms
 

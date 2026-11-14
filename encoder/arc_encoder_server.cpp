@@ -56,7 +56,10 @@
 #include <thread>
 #include <vector>
 #ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <cwctype>
 #else
 #include <fcntl.h>
 #include <sys/file.h>
@@ -578,11 +581,35 @@ bool parse_args(int argc, char ** argv, Args & a) {
 }
 
 // Whether llama.cpp's Metal backend enabled its tensor-API kernels. That depends on the chip, GGML_METAL_TENSOR_ENABLE
-// / _DISABLE and --no-tensor, and llama.cpp reports the outcome only in its log, so the log is read for it.
+// / _DISABLE, --no-tensor and a runtime compile check. The pinned llama.cpp has no API for the outcome (it reports it
+// only in its log, "has tensor = true|false"), so the log is read for it. If that line is missing (a log change), the
+// state is unknown: the engine string, and so the saved-state identity, says so instead of guessing.
+bool g_tensor_seen = false;
 bool g_tensor = false;
 void on_log(ggml_log_level, const char * text, void *) {
-    if (std::strstr(text, "has tensor") && std::strstr(text, "= true")) g_tensor = true;
+    if (std::strstr(text, "has tensor") != nullptr) {
+        g_tensor_seen = true;
+        g_tensor = std::strstr(text, "= true") != nullptr;
+    }
     std::fputs(text, stderr);
+}
+
+std::string tensor_tag(const std::string & backend) {
+    if (backend != "metal") return "";
+    if (!g_tensor_seen) {
+        std::fprintf(stderr, "warning: cannot tell whether the Metal tensor kernels are on; saved sessions use their own "
+                             "identity\n");
+        return "+tensor-unknown";
+    }
+    return g_tensor ? "+tensor" : "";
+}
+
+void set_env(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
 }
 
 httplib::Server * g_http = nullptr;
@@ -597,7 +624,7 @@ int main(int argc, char ** argv) {
 
     // llama.cpp uses the Metal tensor API on M5 and later, or when GGML_METAL_TENSOR_ENABLE is set (a launcher sets
     // it on M4, where this model's flash attention is faster with it); --no-tensor turns it off everywhere.
-    if (!a.tensor) setenv("GGML_METAL_TENSOR_DISABLE", "1", 1);
+    if (!a.tensor) set_env("GGML_METAL_TENSOR_DISABLE", "1");
     llama_log_set(on_log, nullptr);
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
@@ -622,7 +649,8 @@ int main(int argc, char ** argv) {
     s.ctx = llama_init_from_model(s.model, cp);
     if (s.ctx == nullptr) { std::fprintf(stderr, "failed to create the context\n"); return 1; }
     s.seq_used.assign(a.sessions, false);
-    s.engine = "llamacpp@b11669-arc+" + backend_name() + "+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + (g_tensor ? "+tensor" : "") +
+    const std::string backend = backend_name();
+    s.engine = "llamacpp@b11669-arc+" + backend + "+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + tensor_tag(backend) +
                a.engine_suffix;
     if (!s.args.state_dir.empty()) {
 #ifndef _WIN32
