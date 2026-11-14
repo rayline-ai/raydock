@@ -44,10 +44,11 @@ pub const DEFAULT_BUDGET_TOKENS: u32 = 8_192;
 /// per 21k-token session) before it is killed. `rayline local stop` waits
 /// for this and the core's stop.
 const SAVE_TIMEOUT: Duration = Duration::from_secs(15);
-/// How long a turn waits for its local decision. A first encode of a long
-/// conversation takes the longest; this leaves room for the largest
-/// context on a slow machine.
-const DECISION_DEADLINE: Duration = Duration::from_secs(90);
+/// How long a turn waits for its local decision before it routes by
+/// fallback. The core gives up on a Decisions request after about 90
+/// seconds and fails the turn, so this ends well inside that: a hung
+/// encoder costs the turn its decision, not the turn.
+const DECISION_DEADLINE: Duration = Duration::from_secs(60);
 
 /// A running encoder. Dropping it kills the process.
 pub struct Encoder {
