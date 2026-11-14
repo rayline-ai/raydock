@@ -1,16 +1,11 @@
-//! Every answer the routes service can give, a decision or a fallback for
-//! each reason the decider gives none, passes the core's checks.
+//! A decision passes the core's checks; a decider's refusal is the route's.
 
 mod common;
 
 use common::{answer, assert_core_accepts, catalog, request};
-use rayline_arc_routes::{
-    DecideFuture, Decider, Refusal, RequestHeaders, Router, RouterConfig, RoutingPrices,
-};
-use serde_json::Value;
+use rayline_arc_routes::{DecideFuture, Decider, Refusal, RequestHeaders, Router, RouterConfig};
 
-/// A decider that answers, or refuses as the local decider does for one
-/// reason, and prices actions as the local decider does.
+/// A decider that answers, or refuses with `refusal`.
 struct Kind(Option<Refusal>);
 
 impl Decider for Kind {
@@ -22,53 +17,28 @@ impl Decider for Kind {
             }
         })
     }
+}
 
-    fn action_prices(&self, _: Option<&RoutingPrices>) -> Vec<Value> {
-        answer()["actions"].as_array().cloned().unwrap_or_default()
-    }
+async fn route(decider: Kind) -> Result<serde_json::Value, Refusal> {
+    let router = Router::new(
+        RouterConfig::new(catalog(), "http://127.0.0.1:9"),
+        std::sync::Arc::new(decider),
+    )
+    .unwrap();
+    let headers = RequestHeaders {
+        conversation_id: Some("c1".to_owned()),
+        ..RequestHeaders::default()
+    };
+    router
+        .route(&serde_json::to_vec(&request()).unwrap(), &headers)
+        .await
 }
 
 #[tokio::test]
-async fn every_answer_kind_passes_the_core_checks() {
-    let kinds = [
-        ("decision", None),
-        (
-            "oversize",
-            Some(Refusal::with_status(503, "input_too_large", "x")),
-        ),
-        ("timeout", Some(Refusal::with_status(504, "timeout", "x"))),
-        (
-            "unsupported format",
-            Some(Refusal::with_status(503, "request_format_unsupported", "x")),
-        ),
-        (
-            "unsupported media",
-            Some(Refusal::with_status(503, "unsupported_request", "x")),
-        ),
-        (
-            "encoder down",
-            Some(Refusal::with_status(503, "backend_unavailable", "x")),
-        ),
-    ];
-    for (kind, refusal) in kinds {
-        let fallback = refusal.is_some();
-        let router = Router::new(
-            RouterConfig::new(catalog(), "http://127.0.0.1:9"),
-            std::sync::Arc::new(Kind(refusal)),
-        )
-        .unwrap();
-        let headers = RequestHeaders {
-            conversation_id: Some("c1".to_owned()),
-            ..RequestHeaders::default()
-        };
-        let sent = request();
-        let shaped = router
-            .route(&serde_json::to_vec(&sent).unwrap(), &headers)
-            .await
-            .unwrap_or_else(|refusal| panic!("{kind}: refused {refusal:?}"));
-        assert_core_accepts(&shaped, &sent);
-        if fallback {
-            assert_eq!(shaped["receipt"]["basis"], "encoder_unavailable", "{kind}");
-        }
-    }
+async fn a_decision_passes_the_core_checks_and_a_refusal_is_returned() {
+    let shaped = route(Kind(None)).await.expect("a decision");
+    assert_core_accepts(&shaped, &request());
+
+    let down = Refusal::with_status(503, "backend_unavailable", "x");
+    assert_eq!(route(Kind(Some(down.clone()))).await.unwrap_err(), down);
 }

@@ -20,7 +20,6 @@ mod check;
 mod digest;
 mod error;
 mod execution;
-mod fallback;
 mod parse;
 mod policy;
 mod server;

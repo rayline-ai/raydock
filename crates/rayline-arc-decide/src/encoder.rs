@@ -116,9 +116,7 @@ impl LocalEncoder {
     pub fn new(url: &str) -> Result<Self, String> {
         Ok(Self {
             authority: Arc::new(RwLock::new(authority_of(url)?)),
-            // As long as a turn waits for its decision: an encode it no
-            // longer waits for stops being read here.
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(600),
             on_context_full: None,
             held: Arc::default(),
             stats: None,

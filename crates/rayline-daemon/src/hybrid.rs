@@ -84,14 +84,11 @@ pub struct Args {
     token_counters: Vec<String>,
     /// Local ARC: the encoder binary. With the other `--arc-*` flags,
     /// routing decisions are made on this machine.
-    #[arg(long, requires_all = ["arc_model", "arc_state_dir", "arc_package", "arc_release"])]
+    #[arg(long, requires_all = ["arc_model", "arc_package", "arc_release"])]
     arc_encoder: Option<PathBuf>,
     /// Local ARC: the encoder weights (GGUF).
     #[arg(long)]
     arc_model: Option<PathBuf>,
-    /// Local ARC: where conversation states are saved between runs.
-    #[arg(long)]
-    arc_state_dir: Option<PathBuf>,
     /// Local ARC: the policy package manifest (`package.json`) the routes
     /// service decides with.
     #[arg(long)]
@@ -195,17 +192,15 @@ pub async fn run(args: Args) -> Result<()> {
     let mut arc_encoder = None;
     let mut arc_routes = None;
     let mut arc_routes_token: Option<String> = None;
-    if let (Some(binary), Some(model), Some(state_dir), Some(package), Some(release)) = (
+    if let (Some(binary), Some(model), Some(package), Some(release)) = (
         &args.arc_encoder,
         &args.arc_model,
-        &args.arc_state_dir,
         &args.arc_package,
         &args.arc_release,
     ) {
         let files = crate::hybrid_arc::EncoderFiles {
             binary: binary.clone(),
             model: model.clone(),
-            state_dir: state_dir.clone(),
         };
         // The encoder must chunk as the release's stage one was fit.
         let budget = rayline_arc_decide::stage_one_chunk_tokens(release)
@@ -323,8 +318,6 @@ pub async fn run(args: Args) -> Result<()> {
     stop_child(&mut child, &mut parent_pipe)
         .await
         .context("stop execution core")?;
-    // The encoder saves its sessions as it stops, so a resumed conversation
-    // isn't encoded again.
     if let Some(encoder) = arc_encoder.as_mut() {
         encoder.stop().await.context("stop the local ARC encoder")?;
     }

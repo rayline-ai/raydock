@@ -124,10 +124,6 @@ impl Decider for Bench {
     fn decide<'a>(&'a self, body: &'a str) -> DecideFuture<'a> {
         Box::pin(async move { self.run(body) })
     }
-
-    fn action_prices(&self, _: Option<&rayline_arc_routes::RoutingPrices>) -> Vec<Value> {
-        Vec::new()
-    }
 }
 
 struct Args {

@@ -23,8 +23,7 @@ use tokio::task::JoinSet;
 
 use crate::catalog::Catalog;
 use crate::error::Refusal;
-use crate::fallback::{self, Fallback};
-use crate::parse::{ParseContext, RequestHeaders, RoutingPrices, parse};
+use crate::parse::{ParseContext, RequestHeaders, parse};
 use crate::shape::shape;
 
 type Body = http_body_util::combinators::BoxBody<Bytes, io::Error>;
@@ -37,16 +36,9 @@ pub type DecideFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, Refusal>> 
 /// The policy: one decide body in, one decide answer out. The body is a
 /// [`crate::DecideInput`] as JSON, its request members as the harness sent them;
 /// the answer carries `decision.tier_picks`, `decision.receipt`, `actions[]`
-/// and `encoding.token_count`. A refusal at 502 to 504 means no decision
-/// could be made, and the turn routes by fallback; any other refuses it.
+/// and `encoding.token_count`. A refusal is the route's.
 pub trait Decider: Send + Sync {
     fn decide<'a>(&'a self, body: &'a str) -> DecideFuture<'a>;
-
-    /// For a route made without a decision: each action's
-    /// `{"action_id", "price_per_mtok", "price_key"}` row at
-    /// `routing_prices`, as a decision reports it, so the route's price
-    /// table is a decision's.
-    fn action_prices(&self, routing_prices: Option<&RoutingPrices>) -> Vec<Value>;
 }
 
 #[derive(Debug)]
@@ -216,21 +208,7 @@ impl Router {
             let body = serde_json::to_string(decide).map_err(|_| {
                 Refusal::new("unavailable", "the decide request could not be built.")
             })?;
-            let answer = match self.decider.decide(&body).await {
-                Err(refusal) if fallback::unavailable(&refusal) => {
-                    let rows = self.decider.action_prices(decide.routing_prices.as_ref());
-                    let fallback = Fallback::of(decide, &self.catalog, &rows);
-                    let answer = fallback.answer(rows).ok_or(refusal.clone())?;
-                    tracing::warn!(
-                        status = refusal.status,
-                        code = %refusal.code,
-                        action = fallback.action(),
-                        "decider unavailable; routing by fallback"
-                    );
-                    answer
-                }
-                answer => answer?,
-            };
+            let answer = self.decider.decide(&body).await?;
             let route_id = format!("rt_{:032x}", rand::random::<u128>());
             let out = shape(
                 &self.catalog,

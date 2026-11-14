@@ -186,13 +186,13 @@ pub(crate) async fn stop() -> ExitCode {
             {
                 return Err(io::Error::other("local process shutdown identity mismatch"));
             }
-            // The local process stops its core, then lets the ARC encoder
-            // save its sessions for up to 15 seconds.
-            let deadline = Instant::now() + Duration::from_secs(30);
+            // The local process gives its core up to 5 seconds to stop,
+            // then the ARC encoder up to 3.
+            let deadline = Instant::now() + Duration::from_secs(10);
             while paths.ready().exists() {
                 if Instant::now() >= deadline {
                     return Err(io::Error::other(format!(
-                        "the local process did not stop within 30s; see {}",
+                        "the local process did not stop within 10s; see {}",
                         paths.log().display()
                     )));
                 }
@@ -348,8 +348,8 @@ async fn launch(
     // classifier still uses. The encoder download is blocking HTTP, which
     // may not run on the async runtime.
     let local_arc = {
-        let (home, dir) = (home.to_path_buf(), paths.dir.clone());
-        tokio::task::spawn_blocking(move || local_arc(&home, &Paths { dir }))
+        let home = home.to_path_buf();
+        tokio::task::spawn_blocking(move || local_arc(&home))
             .await
             .map_err(io::Error::other)??
     };
@@ -459,8 +459,6 @@ async fn launch(
             .arg(&arc.encoder)
             .arg("--arc-model")
             .arg(&arc.model)
-            .arg("--arc-state-dir")
-            .arg(&arc.state_dir)
             .arg("--arc-package")
             .arg(&arc.package)
             .arg("--arc-release")
@@ -672,7 +670,6 @@ fn current_exe() -> io::Result<PathBuf> {
 struct LocalArc {
     encoder: PathBuf,
     model: PathBuf,
-    state_dir: PathBuf,
     package: PathBuf,
     release: PathBuf,
 }
@@ -716,7 +713,7 @@ fn arc_encoder_weights(home: &Path) -> io::Result<PathBuf> {
     Ok(blob)
 }
 
-fn local_arc(home: &Path, paths: &Paths) -> io::Result<Option<LocalArc>> {
+fn local_arc(home: &Path) -> io::Result<Option<LocalArc>> {
     let model = match std::env::var_os("RAYLINE_ARC_MODEL") {
         Some(model) => PathBuf::from(model),
         None if std::env::var_os("RAYLINE_ARC_LOCAL").is_some() => arc_encoder_weights(home)?,
@@ -736,7 +733,6 @@ fn local_arc(home: &Path, paths: &Paths) -> io::Result<Option<LocalArc>> {
         encoder,
         model,
         // Beside the local process's state, which each start clears.
-        state_dir: paths.dir.with_file_name("arc-sessions"),
         package,
         release,
     }))

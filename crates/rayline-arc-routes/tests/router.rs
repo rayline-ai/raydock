@@ -16,7 +16,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use rayline_arc_routes::{DecideFuture, Decider, Refusal, Router, RouterConfig, RoutingPrices};
+use rayline_arc_routes::{DecideFuture, Decider, Refusal, Router, RouterConfig};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, mpsc};
@@ -50,10 +50,6 @@ impl Decider for FakeDecider {
                 None => Ok(answer()),
             }
         })
-    }
-
-    fn action_prices(&self, _: Option<&RoutingPrices>) -> Vec<Value> {
-        answer()["actions"].as_array().cloned().unwrap_or_default()
     }
 }
 
@@ -344,127 +340,6 @@ async fn an_unreachable_upstream_is_a_502() {
         health["package"]["package_sha256"],
         json!(catalog().package_sha256)
     );
-}
-
-fn unavailable() -> FakeDecider {
-    FakeDecider {
-        refusal: Some(Refusal::new("unavailable", "down")),
-        ..FakeDecider::default()
-    }
-}
-
-/// [`request`] as a conversation's first turn: no model served yet.
-fn first_turn() -> Value {
-    let mut first = request();
-    let execution = &mut first["routing"]["execution"];
-    execution["last_served"] = Value::Null;
-    execution["history"] = json!([]);
-    first["messages"] = json!([{"role": "user", "content": "first"}]);
-    first
-}
-
-#[tokio::test]
-async fn an_unavailable_decider_keeps_the_held_model_and_is_not_asked_again() {
-    let harness = harness(unavailable()).await;
-    let response = harness.routes("conversation").send().await.unwrap();
-    assert_eq!(response.status(), 200);
-    let body: Value = response.json().await.unwrap();
-    // The turn before was served by `a`.
-    assert_eq!(body["model"], "anthropic/claude-haiku-5.5");
-    assert_eq!(body["policy_action_id"], json!(common::id('a')));
-    assert_eq!(body["receipt"]["decided_by"]["model"], "held");
-    assert_eq!(
-        body["presets"]["sage"]["policy_action_id"],
-        json!(common::id('a'))
-    );
-    assert_eq!(harness.decider.bodies().len(), 1);
-}
-
-#[tokio::test]
-async fn an_unavailable_decider_with_no_history_serves_the_package_fallback() {
-    let mut manifest: Value = serde_json::from_slice(&common::manifest()).unwrap();
-    manifest["decision"] = json!({"fallback_action_id": common::id('b')});
-    let catalog =
-        rayline_arc_routes::Catalog::from_manifest(manifest.to_string().as_bytes(), common::ALIAS)
-            .unwrap();
-    let harness = harness_with(unavailable(), catalog, |_| {}).await;
-    let response = harness
-        .routes("conversation")
-        .json(&first_turn())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(body["model"], "anthropic/claude-opus-5.5");
-    assert_eq!(body["receipt"]["decided_by"]["model"], "utility_fallback");
-}
-
-#[tokio::test]
-async fn an_unavailable_decider_never_falls_back_to_a_target_that_does_not_fit() {
-    // `c` is the package fallback, but the request marks it not to fit.
-    let mut manifest: Value = serde_json::from_slice(&common::manifest()).unwrap();
-    manifest["decision"] = json!({"fallback_action_id": common::id('c')});
-    let catalog =
-        rayline_arc_routes::Catalog::from_manifest(manifest.to_string().as_bytes(), common::ALIAS)
-            .unwrap();
-    let harness = harness_with(unavailable(), catalog, |_| {}).await;
-    // Marked not to fit, then (a local target) with its fit unknown.
-    let mut unknown = first_turn();
-    unknown["routing"]["execution"]["targets"][2]["capacity"] = Value::Null;
-    assert_eq!(
-        unknown["routing"]["execution"]["targets"][2]["action_id"],
-        json!(common::id('c'))
-    );
-    for request in [first_turn(), unknown] {
-        let response = harness
-            .routes("conversation")
-            .json(&request)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), 200);
-        let body: Value = response.json().await.unwrap();
-        assert_eq!(body["receipt"]["decided_by"]["model"], "utility_fallback");
-        assert_ne!(body["policy_action_id"], json!(common::id('c')));
-    }
-}
-
-#[tokio::test]
-async fn an_unavailable_decider_keeps_a_held_local_target_whose_fit_is_unknown() {
-    let harness = harness(unavailable()).await;
-    let mut request = request();
-    let execution = &mut request["routing"]["execution"];
-    execution["targets"][2]["capacity"] = Value::Null;
-    execution["hold"] = json!({"scope": "action", "action_id": common::id('c')});
-    let response = harness
-        .routes("conversation")
-        .json(&request)
-        .send()
-        .await
-        .unwrap();
-    let status = response.status();
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(status, 200, "{body}");
-    assert_eq!(body["policy_action_id"], json!(common::id('c')));
-    assert_eq!(body["receipt"]["decided_by"]["model"], "held");
-}
-
-#[tokio::test]
-async fn an_unavailable_decider_without_a_package_fallback_still_routes() {
-    // The fixture package names no fallback action, and the turn has no
-    // history: an offered action is served rather than failing the turn.
-    let harness = harness(unavailable()).await;
-    let response = harness
-        .routes("conversation")
-        .json(&first_turn())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(body["receipt"]["decided_by"]["model"], "utility_fallback");
-    assert!(body["model"].is_string());
 }
 
 #[tokio::test]

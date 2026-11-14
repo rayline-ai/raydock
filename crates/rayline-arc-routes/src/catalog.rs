@@ -46,9 +46,6 @@ pub struct Catalog {
     pub actions: BTreeMap<String, Action>,
     /// Policy model name to public model id.
     pub public_ids: BTreeMap<String, String>,
-    /// `decision.fallback_action_id`: what a route serves when the decider
-    /// is unavailable and the conversation holds no model.
-    pub fallback_action_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -67,14 +64,6 @@ struct Manifest {
     #[serde(default)]
     thinking_controls_sha256: Option<String>,
     actions: Vec<ManifestAction>,
-    #[serde(default)]
-    decision: Option<ManifestDecision>,
-}
-
-#[derive(Deserialize)]
-struct ManifestDecision {
-    #[serde(default)]
-    fallback_action_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -103,9 +92,6 @@ impl Catalog {
                 .iter()
                 .map(|(name, id)| ((*name).to_owned(), (*id).to_owned()))
                 .collect(),
-            fallback_action_id: manifest
-                .decision
-                .and_then(|decision| decision.fallback_action_id),
         })
     }
 

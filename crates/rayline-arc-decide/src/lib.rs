@@ -46,7 +46,7 @@ mod stage_two;
 mod tensors;
 mod wire;
 
-pub use decide::{ReadoutRequest, Readouts, action_prices, decide};
+pub use decide::{ReadoutRequest, Readouts, decide};
 pub use encoder::{EncodeStats, LocalEncoder};
 pub use error::DecideError;
 pub use release::{
