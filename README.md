@@ -13,18 +13,18 @@ A harness runs in one of two modes:
 ## Install
 
 Release assets are published on
-[GitHub Releases](https://github.com/rayline-ai/raydock/releases).
+[GitHub Releases](https://github.com/rayline-ai/rayline-cli/releases).
 
 macOS and Linux:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.sh | sh
+curl -fsSL https://raw.githubusercontent.com/rayline-ai/rayline-cli/main/scripts/install-rayline.sh | sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/rayline-ai/raydock/main/scripts/install-rayline.ps1 | iex
+irm https://raw.githubusercontent.com/rayline-ai/rayline-cli/main/scripts/install-rayline.ps1 | iex
 ```
 
 The installers place `rayline`, `rayline-core` and `rayline-core-LICENSE` in

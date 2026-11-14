@@ -30,6 +30,6 @@ brew upgrade rayline
 ```
 
 Set `__RELEASE_BASE_URL__` to
-`https://github.com/rayline-ai/raydock/releases/download/v<version>` for public
+`https://github.com/rayline-ai/rayline-cli/releases/download/v<version>` for public
 GitHub releases, or the verified mirror archive directory when rendering a
 mirrored formula. The core needs macOS 13+ or Linux.
