@@ -82,6 +82,34 @@ pub struct Args {
     /// core. Once per deployment with a `tokenizer`.
     #[arg(long = "token-counter-dir", num_args = 2, value_names = ["DEPLOYMENT", "DIR"])]
     token_counters: Vec<String>,
+    /// Local ARC: the encoder binary. With `--arc-model` and
+    /// `--arc-state-dir`, routing decisions are made on this machine.
+    #[arg(long, requires_all = ["arc_model", "arc_state_dir"])]
+    arc_encoder: Option<PathBuf>,
+    /// Local ARC: the encoder weights (GGUF).
+    #[arg(long)]
+    arc_model: Option<PathBuf>,
+    /// Local ARC: where conversation states are saved between runs.
+    #[arg(long)]
+    arc_state_dir: Option<PathBuf>,
+    /// Local ARC: an external loopback routes service the core asks instead
+    /// of the in-process one (development).
+    #[arg(long)]
+    arc_routes_url: Option<String>,
+    /// Local ARC: the policy package manifest (`package.json`) the in-process
+    /// routes service decides with.
+    #[arg(long)]
+    arc_package: Option<PathBuf>,
+    /// Local ARC: the package's alias as the decide service knows it.
+    #[arg(long, default_value = "rayline/arc-1.0-20261107")]
+    arc_alias: String,
+    /// Local ARC: an external decide service the in-process routes service
+    /// asks instead of deciding in-process (development).
+    #[arg(long, conflicts_with = "arc_release")]
+    arc_decide_url: Option<String>,
+    /// Local ARC: the release directory decisions are made with in-process.
+    #[arg(long)]
+    arc_release: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -169,8 +197,71 @@ pub async fn run(args: Args) -> Result<()> {
                 )));
         }
     }
-    let (mut child, mut parent_pipe) =
-        spawn_core(&args.core, &core_config, &core_token, &counter_token)?;
+    // Local ARC: start the encoder and point the core's Decisions at the
+    // loopback routes service. The classifier route above was taken from the
+    // original config, so it still goes to the router.
+    let mut arc_encoder = None;
+    let mut arc_routes = None;
+    let mut arc_routes_token: Option<String> = None;
+    if let (Some(binary), Some(model), Some(state_dir)) =
+        (&args.arc_encoder, &args.arc_model, &args.arc_state_dir)
+    {
+        let files = crate::hybrid_arc::EncoderFiles {
+            binary: binary.clone(),
+            model: model.clone(),
+            state_dir: state_dir.clone(),
+        };
+        // The encoder must chunk as the release's stage one was fit.
+        let budget = match &args.arc_release {
+            Some(dir) => rayline_arc_decide::stage_one_chunk_tokens(dir)
+                .with_context(|| format!("read the ARC release in {}", dir.display()))?,
+            None => crate::hybrid_arc::DEFAULT_BUDGET_TOKENS,
+        };
+        let encoder = crate::hybrid_arc::Encoder::start(&files, budget, startup_timeout).await?;
+        tracing::info!(url = %encoder.url, pid = ?encoder.pid(), "local ARC encoder ready");
+        let decide = match (&args.arc_decide_url, &args.arc_release) {
+            (Some(url), _) => Some(crate::hybrid_arc::DecideWith::Service(url.clone())),
+            (None, Some(dir)) => Some(crate::hybrid_arc::DecideWith::Release {
+                dir: dir.clone(),
+                encoder: encoder.client(),
+            }),
+            (None, None) => None,
+        };
+        let routes_url = match (&args.arc_routes_url, &args.arc_package, decide) {
+            (Some(url), _, _) => url.clone(),
+            (None, Some(package), Some(decide)) => {
+                let access = crate::hybrid_arc::RoutesAccess::for_core(&core_config)?;
+                arc_routes_token = Some(access.token.clone());
+                let (url, task) = crate::hybrid_arc::serve_routes(
+                    package,
+                    &args.arc_alias,
+                    decide,
+                    &args.router_url,
+                    access,
+                )
+                .await?;
+                arc_routes = Some(task);
+                url
+            }
+            _ => bail!(
+                "local ARC needs --arc-package with --arc-release (or --arc-decide-url), or --arc-routes-url"
+            ),
+        };
+        let local = args.ready_file.with_extension("arc-core.json");
+        let auth_env = arc_routes_token
+            .is_some()
+            .then_some(crate::hybrid_arc::ROUTES_TOKEN_ENV);
+        crate::hybrid_arc::with_local_decisions(&core_config, &routes_url, auth_env, &local)?;
+        core_config = local;
+        arc_encoder = Some(encoder);
+    }
+    let (mut child, mut parent_pipe) = spawn_core(
+        &args.core,
+        &core_config,
+        &core_token,
+        &counter_token,
+        arc_routes_token.as_deref(),
+    )?;
     let handshake = tokio::select! {
         result = tokio::time::timeout_at(startup_deadline, read_handshake(&mut child)) => {
             result.context("execution core startup timed out")??
@@ -231,6 +322,12 @@ pub async fn run(args: Args) -> Result<()> {
         tokio::select! {
             result = serve(listener, state) => result,
             status = child.wait() => bail!("execution core exited: {}", status?),
+            status = crate::hybrid_arc::wait_encoder(&mut arc_encoder) => {
+                bail!("local ARC encoder exited: {}", status?)
+            }
+            result = crate::hybrid_arc::wait_routes(&mut arc_routes) => {
+                bail!("local ARC routes service stopped: {result:?}")
+            }
             result = &mut signals => result,
             _ = shutdown_rx.recv() => Ok(()),
         }
@@ -1115,8 +1212,13 @@ fn spawn_core(
     config: &Path,
     core_token: &str,
     counter_token: &str,
+    arc_routes_token: Option<&str>,
 ) -> Result<(Child, Option<tokio::process::ChildStdin>)> {
-    let mut child = Command::new(core)
+    let mut command = Command::new(core);
+    if let Some(token) = arc_routes_token {
+        command.env(crate::hybrid_arc::ROUTES_TOKEN_ENV, token);
+    }
+    let mut child = command
         .arg("--config")
         .arg(config)
         .args(["--listen", "127.0.0.1:0"])

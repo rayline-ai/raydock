@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::Parser;
 
 mod hybrid;
+mod hybrid_arc;
 mod hybrid_classifier;
 mod hybrid_counter;
 mod hybrid_metrics;

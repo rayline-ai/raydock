@@ -1,0 +1,22 @@
+[package]
+name = "rayline-arc-decide"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The ARC router's decision step: picks a model and thinking control from encoder readouts"
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rayline-arc-input = { path = "../rayline-arc-input" }
+serde.workspace = true
+# `raw_value` keeps the request text as sent: the projection reads the key
+# order of the system prompt and tool definitions.
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = "0.10"
