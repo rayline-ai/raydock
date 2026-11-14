@@ -138,7 +138,8 @@ session_args() {
   local harness=$1 turn=$2 dir=$3 id
   case $harness in
     claude)
-      [ -f "$dir/session-id" ] || python3 -c 'import uuid; print(uuid.uuid4())' >"$dir/session-id"
+      # A new id per run: Claude Code refuses --session-id for a session that exists.
+      [ "$turn" = 1 ] && python3 -c 'import uuid; print(uuid.uuid4())' >"$dir/session-id"
       id=$(cat "$dir/session-id")
       [ "$turn" = 1 ] && args=(--session-id "$id") || args=(--resume "$id")
       ;;
@@ -245,8 +246,9 @@ run_turn() {
   status=${PIPESTATUS[0]}
   printf '%s\n' "$out" >"$log"
   if [ "$mode" = local ]; then
+    # Only records with an executed_model: sidecalls complete without one.
     executed=$(tail -n +"$((offset + 1))" "$RUNTIME_LOG" | grep -F '"execution completed"' |
-      sed -E 's/.*"executed_model":"([^"]*)".*/\1/' | sort -u | paste -sd, -)
+      sed -n -E 's/.*"executed_model":"([^"]*)".*/\1/p' | sort -u | paste -sd, -)
   fi
 }
 
