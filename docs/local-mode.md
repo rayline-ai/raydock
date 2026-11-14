@@ -134,9 +134,11 @@ Every entry works the same way. No setting marks a model as local.
 encoder binary `rayline-arc-encoder` beside `rayline`; neither the built-in
 release nor the encoder is published yet. On first use, start downloads the
 release and about 1 GB of encoder weights into the Hugging Face cache and
-checks them against their pins. Only Anthropic Messages harnesses (Claude
-Code, OpenCode, Pi, omp) are decided locally; Codex, Hermes and OpenClaw
-turns route without a decision, and `rayline run` warns of it. A `models`
+checks them against their pins. Local mode always routes by a local ARC
+decision, with no fallback: a turn ARC can't decide fails. Only Anthropic
+Messages harnesses (Claude Code, OpenCode, Pi, omp) are decided locally;
+Codex, Hermes and OpenClaw turns fail, and `rayline run` warns of it. So
+do turns with images or documents. A `models`
 entry the release can't route to is skipped with a warning. Section 5.4 of
 the [spec](spec.md) has the details.
 
@@ -240,10 +242,6 @@ The local process keeps its state in `~/.rayline/local/`:
 | `runtime.log` | The local process's log. |
 | `ready.arc-core.json` | With `local` decisions: the core config pointed at the local routes service. |
 | `harness/<name>/` | The files Rayline generates for each harness in local mode: `pi`, `hermes`, `omp`, `opencode` and `openclaw`. Cloud mode uses `~/.rayline/harness/<name>/` instead. |
-
-With `local` decisions, `~/.rayline/arc-sessions/` holds the encoder's
-saved conversation states and `episode-salt`, kept across starts so
-sessions resume.
 
 If a local-mode run fails, check `rayline local status` and
 `~/.rayline/local/runtime.log` first.
