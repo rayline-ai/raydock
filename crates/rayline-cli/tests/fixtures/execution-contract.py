@@ -134,9 +134,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(deep)
             return
         if self.path == "/v1/messages" and json.loads(body).get("fixture_gzip"):
-            # Fixed mtime makes the encoded wire bytes independently assertable.
-            encoded = bytearray(gzip.compress(b'{"usage":{"input_tokens":7,"output_tokens":3}}', mtime=0))
-            encoded[9] = 255  # Portable gzip OS marker.
+            encoded = gzip.compress(b'{"usage":{"input_tokens":7,"output_tokens":3}}')
+            # The test compares the response with exactly these bytes: the
+            # encoder's output varies with the Python and zlib versions.
+            (events.parent / "gzip-sent.bin").write_bytes(encoded)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Encoding", "gzip")
