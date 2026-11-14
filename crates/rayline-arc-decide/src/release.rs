@@ -445,7 +445,7 @@ impl Release {
             // Also the check that this crate derives arm ids as the release does.
             return Err(malformed(format!(
                 "worker {} names no arm of the catalog",
-                &stray[..stray.len().min(12)]
+                stray.chars().take(12).collect::<String>()
             )));
         }
         let mut actions = Vec::new();

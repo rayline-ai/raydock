@@ -431,16 +431,25 @@ async fn an_unavailable_decider_never_falls_back_to_a_target_that_does_not_fit()
         rayline_arc_routes::Catalog::from_manifest(manifest.to_string().as_bytes(), common::ALIAS)
             .unwrap();
     let harness = harness_with(unavailable(), catalog, |_| {}).await;
-    let response = harness
-        .routes("conversation")
-        .json(&first_turn())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), 200);
-    let body: Value = response.json().await.unwrap();
-    assert_eq!(body["receipt"]["decided_by"]["model"], "utility_fallback");
-    assert_ne!(body["policy_action_id"], json!(common::id('c')));
+    // Marked not to fit, then (a local target) with its fit unknown.
+    let mut unknown = first_turn();
+    unknown["routing"]["execution"]["targets"][2]["capacity"] = Value::Null;
+    assert_eq!(
+        unknown["routing"]["execution"]["targets"][2]["action_id"],
+        json!(common::id('c'))
+    );
+    for request in [first_turn(), unknown] {
+        let response = harness
+            .routes("conversation")
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["receipt"]["decided_by"]["model"], "utility_fallback");
+        assert_ne!(body["policy_action_id"], json!(common::id('c')));
+    }
 }
 
 #[tokio::test]

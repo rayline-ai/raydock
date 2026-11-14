@@ -687,6 +687,14 @@ const ARC_ENCODER_SHA256: &str = "6aa526ff86148c34977781117a7cf80987583f6797290e
 
 /// The pinned encoder weights in the Hugging Face cache, downloaded on first
 /// use and checked against [`ARC_ENCODER_SHA256`].
+/// The lowercase hex SHA-256 of the file at `path`, read in chunks.
+fn file_sha256(path: &Path) -> io::Result<String> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    io::copy(&mut fs::File::open(path)?, &mut hasher)?;
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn arc_encoder_weights(home: &Path) -> io::Result<PathBuf> {
     let hub = rayline_hf::hf_cache_dir(home).map_err(io::Error::other)?;
     let path = match rayline_hf::cached_hf_file(&hub, ARC_REPO, ARC_ENCODER_FILE, ARC_COMMIT) {
@@ -698,14 +706,16 @@ fn arc_encoder_weights(home: &Path) -> io::Result<PathBuf> {
                 ))
             })?,
     };
-    // The cache names each blob by its SHA-256, so the resolved name proves
-    // the content without hashing a gigabyte on every start.
+    // The cache names each blob by its SHA-256, so a resolved link's name
+    // proves the content without hashing a gigabyte on every start. A
+    // snapshot that is a copy (no symlinks, as on Windows) is hashed.
     let blob = fs::canonicalize(&path)?;
     let name = blob
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or_default();
-    if name != format!("sha256-{ARC_ENCODER_SHA256}") && name != ARC_ENCODER_SHA256 {
+    let named = name == format!("sha256-{ARC_ENCODER_SHA256}") || name == ARC_ENCODER_SHA256;
+    if !named && file_sha256(&blob)? != ARC_ENCODER_SHA256 {
         return Err(io::Error::other(format!(
             "the cached ARC encoder {} is not the pinned file (sha256 {ARC_ENCODER_SHA256})",
             blob.display()

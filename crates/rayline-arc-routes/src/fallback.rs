@@ -59,16 +59,21 @@ impl Fallback {
         Self {
             preference,
             conversation,
-            // A target the request's own capacity facts say does not fit is
-            // never a fallback.
+            // A fallback is only a target known to fit: never one the
+            // request's capacity facts say does not, nor a local one whose
+            // fit is unknown (as the policy's own admission).
             offered: selection
                 .available_action_ids
                 .iter()
                 .filter(|action| {
-                    !decide
+                    decide
                         .capacity
                         .iter()
-                        .any(|fact| &fact.action_id == *action && fact.fits == Some(false))
+                        .filter(|fact| &fact.action_id == *action)
+                        .all(|fact| match fact.fits {
+                            Some(fits) => fits,
+                            None => fact.placement != "local",
+                        })
                 })
                 .cloned()
                 .collect(),
