@@ -137,9 +137,8 @@ release and about 1 GB of encoder weights into the Hugging Face cache and
 checks them against their pins. Local mode always routes by a local ARC
 decision, with no fallback: a turn ARC can't decide fails. Only Anthropic
 Messages harnesses (Claude Code, OpenCode, Pi, omp) are decided locally;
-Codex, Hermes and OpenClaw turns fail, and `rayline run` warns of it. So
-do turns with images or documents. A `models`
-entry the release can't route to is skipped with a warning. Section 5.4 of
+`rayline run` refuses Codex, Hermes and OpenClaw. Turns with images or
+documents fail. A `models` entry the release can't route to is skipped with a warning. Section 5.4 of
 the [spec](spec.md) has the details.
 
 The [ARC routing policies](https://docs.rayline.ai/arc/routes/hybrid)
