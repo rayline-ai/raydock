@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO="rayline-ai/raydock"
+REPO="rayline-ai/rayline-cli"
 VERSION=""
 VERSION_GIVEN=false
 INSTALL_DIR="$HOME/.rayline/bin"

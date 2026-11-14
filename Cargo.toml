@@ -16,7 +16,7 @@ rust-version = "1.88"
 license = "Apache-2.0"
 authors = ["Atlas Futures, Inc."]
 homepage = "https://rayline.ai"
-repository = "https://github.com/rayline-ai/raydock"
+repository = "https://github.com/rayline-ai/rayline-cli"
 publish = false
 
 [workspace.lints.rust]
