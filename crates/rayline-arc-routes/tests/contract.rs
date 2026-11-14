@@ -4,7 +4,9 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{ALIAS, LOCAL_MODEL, PRESET, answer, catalog, id, manifest, request, turn};
+use common::{
+    ALIAS, LOCAL_MODEL, PRESET, answer, assert_core_accepts, catalog, id, manifest, request, turn,
+};
 use rayline_arc_routes::{
     ParseContext, Parsed, Refusal, RequestHeaders, offer_sha256, parse, price_sha256, sha256_hex,
     shape,
@@ -523,57 +525,6 @@ fn members_this_router_does_not_apply_are_named_unapplied() {
 }
 
 /// The checks the execution core runs on an answer before acting on it.
-fn assert_core_accepts(shaped: &Value, sent: &Value) {
-    assert!(shaped["route_id"].as_str().is_some_and(|id| !id.is_empty()));
-    let fits_false: Vec<(&str, &str)> = sent["routing"]["execution"]["targets"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|target| target["capacity"]["fits"] == false)
-        .map(|target| {
-            (
-                target["action_id"].as_str().unwrap(),
-                target["capacity"]["reason"].as_str().unwrap(),
-            )
-        })
-        .collect();
-    for name in ["swift", "sage"] {
-        let result = &shaped["presets"][name];
-        let identity = &result["identity"];
-        assert_eq!(identity["action_id"], identity["policy_action_id"]);
-        assert_eq!(result["policy_action_id"], identity["action_id"]);
-        let action = &catalog().actions[identity["action_id"].as_str().unwrap()];
-        assert_eq!(identity["control_id"], json!(action.control_id));
-        assert_eq!(identity["package_sha256"], json!(catalog().package_sha256));
-        let receipt = &result["receipt"];
-        assert_eq!(receipt["action_id"], identity["action_id"]);
-        assert_eq!(receipt["control_id"], identity["control_id"]);
-        assert_eq!(receipt["policy"], PRESET);
-        assert!(receipt["decided_by"]["thinking"].is_string());
-        for (action_id, reason) in &fits_false {
-            assert_ne!(identity["action_id"], *action_id);
-            assert!(
-                receipt["excluded"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!({"action_id": action_id, "reason": reason}))
-            );
-        }
-    }
-    let routing = &shaped["routing"];
-    assert_eq!(routing["execution"]["status"], "applied");
-    assert_eq!(routing["execution"]["version"], "arc-execution-context.v2");
-    assert_eq!(
-        routing["execution"]["turn"],
-        sent["routing"]["execution"]["turn"]
-    );
-    assert_eq!(
-        routing["policy"],
-        json!({"status": "applied", "preset": PRESET})
-    );
-    assert_eq!(routing["unapplied_keys"], json!([]));
-}
-
 #[test]
 fn the_answer_is_one_the_core_validates() {
     let sent = request();

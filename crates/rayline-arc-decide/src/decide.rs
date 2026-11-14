@@ -1105,6 +1105,9 @@ pub fn decide(
     };
     let blocks = project_request(input.request.get(), attributed).map_err(|e| match e {
         rayline_arc_input::ProjectionError::TooLarge(reason) => DecideError::TooLarge(reason),
+        rayline_arc_input::ProjectionError::Unsupported(reason) => {
+            DecideError::NotEncodable(reason)
+        }
         e => DecideError::Projection(e.to_string()),
     })?;
     let encoded = release
@@ -1185,10 +1188,12 @@ pub fn decide(
         .candidate_arms
         .iter()
         .map(|arms| {
-            let Some(first) = arms.first() else {
+            // An arm an exclusive caller table left out has no rate here.
+            let mut surviving = arms.iter().filter(|arm| !excluded[**arm]);
+            let Some(first) = surviving.next() else {
                 return Ok([f64::NAN; LEGS]);
             };
-            if arms.iter().any(|arm| rates[*arm] != rates[*first]) {
+            if surviving.any(|arm| rates[*arm] != rates[*first]) {
                 return Err(());
             }
             Ok(rates[*first].map(|rate| rate.unwrap_or(f64::NAN)))
@@ -1438,4 +1443,38 @@ pub fn decide(
         },
         stage_one: outcome.evidence,
     })
+}
+
+/// Each action's rates per million tokens at `routing` prices, as a
+/// decision would report them without scoring: its first arm the prices
+/// don't exclude that all four legs price, else its first arm they don't
+/// exclude. An action every arm of which is excluded is left out. For a
+/// route made without a decision, so its price table is a decision's.
+pub fn action_prices(
+    release: &Release,
+    routing: Option<&crate::RoutingPrices>,
+) -> Result<Vec<(String, PricePerMtok)>, DecideError> {
+    let ResolvedPrices { rates, excluded } = prices::resolve(release, routing)?;
+    Ok(release
+        .actions
+        .iter()
+        .filter_map(|action| {
+            let mut arms = action.arms.iter().filter(|arm| !excluded[**arm]);
+            let first = *arms.clone().next()?;
+            let arm = arms
+                .find(|arm| rates[**arm].iter().all(Option::is_some))
+                .copied()
+                .unwrap_or(first);
+            let [input, cache_read, cache_write, output] = rates[arm];
+            Some((
+                action.id.clone(),
+                PricePerMtok {
+                    input,
+                    cache_read,
+                    cache_write,
+                    output,
+                },
+            ))
+        })
+        .collect())
 }

@@ -49,6 +49,16 @@ pub trait Decider: Send + Sync {
         let _ = request;
         self.decide(body)
     }
+
+    /// For a route made without a decision: each action's
+    /// `{"action_id", "price_per_mtok"}` row at `routing_prices` (the decide
+    /// body's member, or null), as a decision would report it, so the
+    /// route's price table is a decision's. `None` when the decider can't
+    /// price without deciding.
+    fn action_prices(&self, routing_prices: &Value) -> Option<Vec<Value>> {
+        let _ = routing_prices;
+        None
+    }
 }
 
 /// The decide body as JSON text, with `request` (when given) spliced in as
@@ -450,9 +460,15 @@ impl Router {
                 .filter(|_| parsed.decide.request_format == "anthropic_messages")
                 .and_then(messages_request_text);
             let fallback = Fallback::of(&parsed.decide, &self.catalog);
+            let routing_prices =
+                serde_json::to_value(&parsed.decide.routing_prices).unwrap_or(Value::Null);
             let answer = match self.decide(parsed.decide, request_text.as_deref()).await {
                 Err(refusal) if fallback::unavailable(&refusal) => {
-                    let answer = fallback.answer().ok_or(refusal.clone())?;
+                    let rows = self
+                        .decider
+                        .action_prices(&routing_prices)
+                        .unwrap_or_default();
+                    let answer = fallback.answer(rows).ok_or(refusal.clone())?;
                     tracing::warn!(
                         status = refusal.status,
                         code = %refusal.code,

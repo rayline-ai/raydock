@@ -108,3 +108,93 @@ pub fn answer() -> Value {
         "encoding": {"token_count": 1234},
     })
 }
+
+/// The checks the pinned core makes of a `/v1/routes` answer to `sent`
+/// before it runs a turn: the receipt names each target that doesn't fit
+/// and never selects one, every result carries the package identity, and
+/// with caller prices the price table is acknowledged (applied, non-empty,
+/// holding the selected model, under the digest every result names).
+pub fn assert_core_accepts(shaped: &Value, sent: &Value) {
+    assert!(shaped["route_id"].as_str().is_some_and(|id| !id.is_empty()));
+    let fits_false: Vec<(&str, &str)> = sent["routing"]["execution"]["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|target| target["capacity"]["fits"] == false)
+        .map(|target| {
+            (
+                target["action_id"].as_str().unwrap(),
+                target["capacity"]["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    for name in ["swift", "sage"] {
+        let result = &shaped["presets"][name];
+        let identity = &result["identity"];
+        assert_eq!(identity["action_id"], identity["policy_action_id"]);
+        assert_eq!(result["policy_action_id"], identity["action_id"]);
+        let action = &catalog().actions[identity["action_id"].as_str().unwrap()];
+        assert_eq!(identity["control_id"], json!(action.control_id));
+        assert_eq!(identity["package_sha256"], json!(catalog().package_sha256));
+        let receipt = &result["receipt"];
+        assert_eq!(receipt["action_id"], identity["action_id"]);
+        assert_eq!(receipt["control_id"], identity["control_id"]);
+        assert_eq!(receipt["policy"], PRESET);
+        assert!(receipt["decided_by"]["thinking"].is_string());
+        for (action_id, reason) in &fits_false {
+            assert_ne!(identity["action_id"], *action_id);
+            assert!(
+                receipt["excluded"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({"action_id": action_id, "reason": reason}))
+            );
+        }
+    }
+    let routing = &shaped["routing"];
+    assert_eq!(routing["execution"]["status"], "applied");
+    assert_eq!(routing["execution"]["version"], "arc-execution-context.v2");
+    assert_eq!(
+        routing["execution"]["turn"],
+        sent["routing"]["execution"]["turn"]
+    );
+    assert_eq!(
+        routing["policy"],
+        json!({"status": "applied", "preset": PRESET})
+    );
+    assert_eq!(routing["unapplied_keys"], json!([]));
+    if sent["routing"]["prices"]
+        .as_object()
+        .is_some_and(|prices| !prices.is_empty())
+    {
+        let prices = &routing["prices"];
+        assert_eq!(prices["status"], "applied");
+        let models = prices["models"].as_object().expect("a price table");
+        assert!(!models.is_empty(), "an empty price table");
+        assert!(
+            models.contains_key(shaped["model"].as_str().unwrap()),
+            "the table lacks the selected model"
+        );
+        let table: std::collections::BTreeMap<String, [f64; 4]> = models
+            .iter()
+            .map(|(model, row)| {
+                let leg = |name: &str| row[name].as_f64().expect("a priced leg");
+                (
+                    model.clone(),
+                    [
+                        leg("input"),
+                        leg("cache_read"),
+                        leg("cache_write"),
+                        leg("output"),
+                    ],
+                )
+            })
+            .collect();
+        let digest = rayline_arc_routes::price_sha256(&table).unwrap();
+        assert_eq!(prices["price_sha256"], json!(digest));
+        for result in std::iter::once(shaped).chain(shaped["presets"].as_object().unwrap().values())
+        {
+            assert_eq!(result["identity"]["prices"]["price_sha256"], json!(digest));
+        }
+    }
+}

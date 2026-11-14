@@ -68,6 +68,9 @@ const OMITTED_NAMELESS_TOOLS: [&str; 1] = ["web_search"];
 /// than text ever takes per token. Above it the request is refused before
 /// the scrub and tokenizer read it, so their work stays bounded.
 pub const MAX_TEXT_BYTES: usize = 270_336 * 16;
+/// The most JSON values a request body may hold. Checked as soon as it is
+/// parsed, before anything is copied.
+pub const MAX_NODES: usize = 1_000_000;
 /// The most tool definitions a request may carry.
 pub const MAX_TOOLS: usize = 1_024;
 
@@ -148,7 +151,14 @@ pub fn project_request(
     attribution: &[Option<String>],
 ) -> Result<Vec<RoleBlock>, ProjectionError> {
     let body = match json::loads(body) {
-        Ok(Json::Object(body)) => body,
+        Ok(Json::Object(body)) => {
+            if body.iter().map(|(_, value)| value.nodes()).sum::<usize>() > MAX_NODES {
+                return Err(ProjectionError::TooLarge(format!(
+                    "more than {MAX_NODES} JSON values"
+                )));
+            }
+            body
+        }
         Ok(_) => return Err(refused("the request body is not an object")),
         Err(ParseError::Syntax(reason)) => return Err(ProjectionError::Json(reason)),
         Err(ParseError::Unsupported(reason)) => return Err(ProjectionError::Unsupported(reason)),
@@ -617,6 +627,16 @@ mod tests {
         // project in linear time.
         let user = "<system-reminder>x<|vision_start|>".repeat(100_000);
         assert!(within("unclosed sections", &body("s", &user)).is_ok());
+        // Two million nulls in a tool input: over the value cap, refused
+        // before anything is copied.
+        let nulls = vec!["null"; 2_000_000].join(",");
+        let tool_use = format!(
+            r#"{{"messages": [{{"role": "user", "content": "hi"}}, {{"role": "assistant", "content": [{{"type": "tool_use", "id": "t", "name": "n", "input": {{"a": [{nulls}]}}}}]}}]}}"#
+        );
+        assert!(matches!(
+            within("2M nulls", &tool_use),
+            Err(ProjectionError::TooLarge(reason)) if reason.contains("JSON values")
+        ));
         // Too many tools.
         let tools: Vec<String> = (0..=MAX_TOOLS)
             .map(|index| format!(r#"{{"name": "t{index}", "input_schema": {{}}}}"#))

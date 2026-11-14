@@ -300,6 +300,20 @@ struct LocalDecider {
 }
 
 impl LocalDecider {
+    /// The caller price rows this release reads. Rows for models it doesn't
+    /// know are reported unused in the answer, not sent to the decision,
+    /// which refuses them.
+    fn read_prices(
+        &self,
+        prices: Option<rayline_arc_decide::RoutingPrices>,
+    ) -> Option<rayline_arc_decide::RoutingPrices> {
+        let mut prices = prices?;
+        prices
+            .rates
+            .retain(|key, _| self.release.reads_price_key(key));
+        (!prices.rates.is_empty()).then_some(prices)
+    }
+
     /// Decide `body`, its `request` member replaced by `request` when given
     /// (the text as sent: the encoder input depends on its key order).
     async fn decide_text(
@@ -333,15 +347,7 @@ impl LocalDecider {
         let mut input: rayline_arc_decide::DecideInput = serde_json::from_str(&text)
             .map_err(|error| refuse("invalid_request", format!("decide body: {error}")))?;
         let release = self.release.clone();
-        // Caller price rows for models this release doesn't know are
-        // reported unused in the answer, not sent to the decision, which
-        // refuses them.
-        if let Some(prices) = input.routing_prices.as_mut() {
-            prices.rates.retain(|key, _| release.reads_price_key(key));
-            if prices.rates.is_empty() {
-                input.routing_prices = None;
-            }
-        }
+        input.routing_prices = self.read_prices(input.routing_prices.take());
         let encoder = self.encoder.clone();
         // The decision encodes and scores on the CPU and blocks on the
         // encoder; keep it off the async workers. Past the deadline its
@@ -365,7 +371,8 @@ impl LocalDecider {
                 // than the decider reads: the turn routes by fallback, as
                 // when the policy service is out, not as a bad request.
                 rayline_arc_decide::DecideError::Readouts(_)
-                | rayline_arc_decide::DecideError::TooLarge(_) => {
+                | rayline_arc_decide::DecideError::TooLarge(_)
+                | rayline_arc_decide::DecideError::NotEncodable(_) => {
                     rayline_arc_routes::Refusal::with_status(503, error.code(), error.to_string())
                 }
                 error => refuse(error.code(), error.to_string()),
@@ -386,6 +393,25 @@ impl rayline_arc_routes::Decider for LocalDecider {
         request: &'a str,
     ) -> rayline_arc_routes::DecideFuture<'a> {
         Box::pin(self.decide_text(body, Some(request)))
+    }
+
+    fn action_prices(&self, routing_prices: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+        let prices: Option<rayline_arc_decide::RoutingPrices> =
+            serde_json::from_value(routing_prices.clone()).ok()?;
+        let rows =
+            rayline_arc_decide::action_prices(&self.release, self.read_prices(prices).as_ref())
+                .ok()?;
+        Some(
+            rows.into_iter()
+                .filter_map(|(action_id, legs)| {
+                    let legs = serde_json::json!({
+                        "input": legs.input?, "cache_read": legs.cache_read?,
+                        "cache_write": legs.cache_write?, "output": legs.output?,
+                    });
+                    Some(serde_json::json!({"action_id": action_id, "price_per_mtok": legs}))
+                })
+                .collect(),
+        )
     }
 }
 

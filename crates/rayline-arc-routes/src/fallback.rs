@@ -27,6 +27,11 @@ pub struct Fallback {
     conversation: usize,
     offered: Vec<String>,
     tiers: Vec<&'static str>,
+    /// The targets the request says don't fit, with its reason: a receipt
+    /// names each, as a decision's does.
+    excluded: Vec<Value>,
+    /// The policy preset the request applies, which every receipt names.
+    preset: String,
 }
 
 impl Fallback {
@@ -80,6 +85,26 @@ impl Fallback {
                 .cloned()
                 .collect(),
             tiers,
+            preset: decide.policy.preset.clone(),
+            excluded: {
+                let mut excluded: Vec<(String, String)> = decide
+                    .capacity
+                    .iter()
+                    .filter(|fact| fact.fits == Some(false))
+                    .map(|fact| {
+                        (
+                            fact.action_id.clone(),
+                            fact.reason.clone().unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                excluded.sort();
+                excluded.dedup();
+                excluded
+                    .into_iter()
+                    .map(|(action_id, reason)| json!({"action_id": action_id, "reason": reason}))
+                    .collect()
+            },
         }
     }
 
@@ -98,8 +123,10 @@ impl Fallback {
     }
 
     /// A decide answer naming [`Self::action`] for every tier, or `None`
-    /// when no candidate is offered.
-    pub fn answer(&self) -> Option<Value> {
+    /// when no candidate is offered. `rows` are the decider's
+    /// [`crate::Decider::action_prices`], so the route's price table and
+    /// receipt are what a decision's would be; only the selection differs.
+    pub fn answer(&self, rows: Vec<Value>) -> Option<Value> {
         let (action, own) = self.pick()?;
         // The core accepts only the receipt reasons it knows: a model the
         // conversation already had is `held`, anything else the policy's
@@ -118,11 +145,13 @@ impl Fallback {
             "decision": {
                 "tier_picks": picks,
                 "receipt": {
+                    "policy": self.preset,
                     "decided_by": {"model": model, "thinking": thinking},
                     "basis": ENCODER_UNAVAILABLE,
+                    "excluded": self.excluded,
                 },
             },
-            "actions": [],
+            "actions": rows,
             "encoding": {"token_count": null},
         }))
     }

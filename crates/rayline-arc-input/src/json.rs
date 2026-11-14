@@ -102,14 +102,25 @@ impl FromIterator<(String, Json)> for Object {
 }
 
 impl Json {
-    /// The bytes of every string, key and number in the value: how much
-    /// text the projection works through.
+    /// About the bytes of the value as compact JSON (each node's text, and
+    /// one byte for each node's separator): how much text the projection
+    /// works through. A `null` counts as much as it takes to write.
     pub fn text_len(&self) -> usize {
-        match self {
-            Json::Null | Json::Bool(_) => 0,
+        1 + match self {
+            Json::Null => 4,
+            Json::Bool(_) => 5,
             Json::Number(text) | Json::String(text) => text.len(),
             Json::Array(items) => items.iter().map(Json::text_len).sum(),
             Json::Object(object) => object.text_len(),
+        }
+    }
+
+    /// The values in this value, itself included.
+    pub fn nodes(&self) -> usize {
+        1 + match self {
+            Json::Array(items) => items.iter().map(Json::nodes).sum(),
+            Json::Object(object) => object.iter().map(|(_, value)| value.nodes()).sum(),
+            _ => 0,
         }
     }
 
