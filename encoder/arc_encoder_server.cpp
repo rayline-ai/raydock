@@ -55,6 +55,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 using json = nlohmann::json;
 
@@ -120,13 +123,24 @@ struct Server {
 
     llama_seq_id scratch() const { return args.sessions; }
 
-    static std::string stem_for(const std::string & session, int32_t n) {
-        return std::to_string(std::hash<std::string>{}(session)) + "-" + std::to_string(n);
+    uint64_t generation = 0;
+    // Every save gets its own file names: a save never overwrites the files of an entry that is still published.
+    std::string stem_for(const std::string & session, int32_t n) {
+        const auto now = std::chrono::system_clock::now().time_since_epoch().count();
+        return std::to_string(std::hash<std::string>{}(session)) + "-" + std::to_string(n) + "-" +
+               std::to_string((uint64_t) now) + "-" + std::to_string(++generation);
     }
 
     void load_index() {
         if (args.state_dir.empty()) return;
-        fs::create_directories(args.state_dir);
+        // Files no published index (.json) names are leftovers of an interrupted save: remove them.
+        for (const auto & f : fs::directory_iterator(args.state_dir)) {
+            const fs::path path = f.path();
+            const fs::path stem = path.parent_path() / path.stem();
+            const bool tmp = path.extension() == ".tmp";
+            const bool orphan = (path.extension() == ".state" || path.extension() == ".rows") && !fs::exists(stem.string() + ".json");
+            if (tmp || orphan) { std::error_code ec; fs::remove(path, ec); }
+        }
         for (const auto & f : fs::directory_iterator(args.state_dir)) {
             if (f.path().extension() != ".json") continue;
             // A damaged or partial entry is skipped, never fatal.
@@ -187,21 +201,20 @@ struct Server {
         const auto t0 = std::chrono::steady_clock::now();
         const std::string stem = stem_for(id, s.n_past);
         const fs::path base = fs::path(args.state_dir) / stem;
-        // Write each file under a temporary name and rename it into place, the index (.json) last, so a failed or
-        // interrupted save never leaves an entry whose files are partial.
-        const std::string tmp = ".tmp";
+        // The state and rows go under this save's own stem; the index (.json) is then published by an atomic rename. An
+        // interrupted save leaves only unpublished files, which load_index() removes.
         auto discard = [&]() {
-            for (const char * ext : {".state", ".rows", ".json"}) { std::error_code ec; fs::remove(base.string() + ext + tmp, ec); }
+            for (const char * ext : {".state", ".rows", ".json.tmp"}) { std::error_code ec; fs::remove(base.string() + ext, ec); }
             std::fprintf(stderr, "persist %s failed\n", id.c_str());
         };
-        if (llama_state_seq_save_file(ctx, (base.string() + ".state" + tmp).c_str(), s.seq, s.tokens.data(), s.tokens.size()) == 0)
+        if (llama_state_seq_save_file(ctx, (base.string() + ".state").c_str(), s.seq, s.tokens.data(), s.tokens.size()) == 0)
             return discard();
         Entry e;
         e.stem = stem;
         e.session = id;
         e.tokens = s.tokens;
         {
-            std::ofstream rows(base.string() + ".rows" + tmp, std::ios::binary);
+            std::ofstream rows(base.string() + ".rows", std::ios::binary);
             for (const auto & [off, row] : s.rows) {
                 e.offsets.push_back(off);
                 rows.write(reinterpret_cast<const char *>(row.data()), (std::streamsize) (row.size() * sizeof(float)));
@@ -211,23 +224,19 @@ struct Server {
         }
         e.mtime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         {
-            std::ofstream meta(base.string() + ".json" + tmp);
+            std::ofstream meta(base.string() + ".json.tmp");
             meta << json{{"session", id}, {"tokens", e.tokens}, {"offsets", e.offsets}, {"saved", e.mtime}}.dump();
             meta.close();
             if (!meta) return discard();
         }
-        for (const char * ext : {".state", ".rows", ".json"}) {
+        {
             std::error_code ec;
-            fs::rename(base.string() + ext + tmp, base.string() + ext, ec);
+            fs::rename(base.string() + ".json.tmp", base.string() + ".json", ec);
             if (ec) return discard();
         }
         e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
         // drop older entries of this session (a session only grows), then enforce the disk budget, oldest first
-        for (size_t i = entries.size(); i-- > 0;) {
-            if (entries[i].session != id) continue;
-            if (entries[i].stem == stem) entries.erase(entries.begin() + (long) i);  // overwritten above
-            else remove_entry(i);
-        }
+        for (size_t i = entries.size(); i-- > 0;) if (entries[i].session == id) remove_entry(i);
         entries.push_back(std::move(e));
         uint64_t total = 0;
         for (const auto & x : entries) total += x.bytes;
@@ -242,15 +251,16 @@ struct Server {
         std::fprintf(stderr, "persisted %s: %d tokens in %.0f ms\n", id.c_str(), s.n_past, ms);
     }
 
-    // Restore entry `e` into `seq`, filling the session's tokens and rows. False if llama.cpp refuses the state.
-    bool restore(const Entry & e, llama_seq_id seq, Session & s) {
+    // Restore entry `e` into `seq` for session `id` (empty: unretained), filling the session's tokens and rows. False if
+    // llama.cpp refuses the state or its files do not match the index.
+    bool restore(const Entry & e, llama_seq_id seq, Session & s, const std::string & id) {
         const auto t0 = std::chrono::steady_clock::now();
         const fs::path base = fs::path(args.state_dir) / e.stem;
         llama_memory_seq_rm(llama_get_memory(ctx), seq, -1, -1);
         std::vector<llama_token> toks(e.tokens.size());
         size_t n = 0;
         if (llama_state_seq_load_file(ctx, (base.string() + ".state").c_str(), seq, toks.data(), toks.size(), &n) == 0 ||
-            n != e.tokens.size()) {
+            n != e.tokens.size() || toks != e.tokens) {
             llama_memory_seq_rm(llama_get_memory(ctx), seq, -1, -1);
             std::fprintf(stderr, "restore %s failed\n", e.stem.c_str());
             return false;
@@ -271,7 +281,8 @@ struct Server {
         s.rows = std::move(restored);
         s.tokens = e.tokens;
         s.n_past = (int32_t) e.tokens.size();
-        s.saved_at = s.n_past;
+        // Saved only if the entry is this session's own; a session restored from another's entry is saved under its id.
+        s.saved_at = e.session == id ? s.n_past : 0;
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "restored %s: %d tokens in %.0f ms\n", e.stem.c_str(), s.n_past, ms);
         return true;
@@ -407,6 +418,52 @@ bool int_array(const json & j, int64_t max, std::vector<int32_t> & out) {
     return true;
 }
 
+// What saved state depends on: the model file and the encode configuration. The model is identified by its size, mtime
+// and first and last 4 MB (the GGUF header and tensor data), which is cheap at every start; saved sessions live in a
+// subdirectory named by this identity, so another model or configuration never restores them.
+std::string state_identity(const std::string & model, const std::string & config) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](const void * data, size_t n) {
+        const auto * p = static_cast<const unsigned char *>(data);
+        for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+    };
+    std::error_code ec;
+    const uint64_t size = fs::file_size(model, ec);
+    const auto mtime = fs::last_write_time(model, ec).time_since_epoch().count();
+    mix(&size, sizeof size);
+    mix(&mtime, sizeof mtime);
+    std::ifstream in(model, std::ios::binary);
+    std::vector<char> buf(4 << 20);
+    in.read(buf.data(), (std::streamsize) buf.size());
+    mix(buf.data(), (size_t) in.gcount());
+    if (size > buf.size()) {
+        in.clear();
+        in.seekg((std::streamoff) (size - buf.size()));
+        in.read(buf.data(), (std::streamsize) buf.size());
+        mix(buf.data(), (size_t) in.gcount());
+    }
+    mix(config.data(), config.size());
+    char hex[17];
+    std::snprintf(hex, sizeof hex, "%016llx", (unsigned long long) h);
+    return hex;
+}
+
+// Saved sessions hold token ids (the prompt): only their owner may read them. False if the directory cannot be made
+// owner-only.
+bool private_dir(const fs::path & dir) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) return false;
+#ifndef _WIN32
+    // POSIX: drwx------. On Windows the directory inherits its parent's ACL; keep --state-dir under the user's profile.
+    fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, ec);
+    if (ec) return false;
+    const auto perms = fs::status(dir, ec).permissions();
+    if (ec || (perms & (fs::perms::group_all | fs::perms::others_all)) != fs::perms::none) return false;
+#endif
+    return true;
+}
+
 void refuse(httplib::Response & res, int status, const std::string & code) {
     res.status = status;
     res.set_content(json{{"error", code}}.dump(), "application/json");
@@ -491,6 +548,20 @@ int main(int argc, char ** argv) {
     s.seq_used.assign(a.sessions, false);
     s.engine = "llamacpp@b11669-arc+" + backend_name() + "+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + (a.tensor && std::getenv("GGML_METAL_TENSOR_ENABLE") ? "+tensor" : "") +
                a.engine_suffix;
+    if (!s.args.state_dir.empty()) {
+#ifndef _WIN32
+        umask(077);  // every saved file is created owner-only (0600)
+#endif
+        const std::string config = s.engine + " budget=" + std::to_string(a.budget) + " ubatch=" + std::to_string(a.ubatch);
+        const fs::path root = s.args.state_dir;
+        const fs::path dir = root / state_identity(a.model, config);
+        // Only the identity subdirectory is made owner-only: --state-dir itself may be a directory the user shares.
+        if (!private_dir(dir)) {
+            std::fprintf(stderr, "cannot make %s owner-only\n", dir.string().c_str());
+            return 1;
+        }
+        s.args.state_dir = dir.string();
+    }
     s.load_index();
 
     httplib::Server http;
@@ -589,7 +660,7 @@ int main(int argc, char ** argv) {
                 Session fresh;
                 fresh.seq = s.take_seq();
                 fresh.owner = owner;
-                if (!s.restore(*saved, fresh.seq, fresh)) { s.seq_used[fresh.seq] = false; return refuse(res, 409, "unknown_session"); }
+                if (!s.restore(*saved, fresh.seq, fresh, id)) { s.seq_used[fresh.seq] = false; return refuse(res, 409, "unknown_session"); }
                 session = &(s.sessions[id] = std::move(fresh));
             }
             seq = session->seq;
@@ -605,7 +676,7 @@ int main(int argc, char ** argv) {
         int32_t start = base;
         if (base == 0) {
             if (const Entry * e = s.best_prefix(tokens, offsets)) {
-                if (s.restore(*e, seq, held)) start = held.n_past;
+                if (s.restore(*e, seq, held, id)) start = held.n_past;
             }
         }
 

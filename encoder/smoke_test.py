@@ -5,13 +5,17 @@
 
 Without a model it checks the usage text and that a missing model fails. With a model (any small GGUF works) it
 also starts the server on a free port, checks /health, a one-shot and a retained /encode, a 409 for an unknown
-session, and that the server stops when its stdin closes (--parent-pipe).
+session, request validation, KV-space eviction, that the server stops when its stdin closes (--parent-pipe), and
+saved sessions (--state-dir).
 """
 
 import json
+import os
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 
@@ -27,6 +31,62 @@ def post(port, path, body):
             return response.status, dict(response.headers), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict(error.headers), error.read()
+
+
+def start(binary, model, *extra):
+    server = subprocess.Popen(
+        [binary, "--model", model, "--port", "0", "--ctx", "256", "--budget", "64", "--ubatch", "64", "--parent-pipe",
+         *extra],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return server, json.loads(server.stdout.readline())["listening"]
+
+
+def stop(server):
+    server.stdin.close()
+    check(server.wait(timeout=60) == 0, "stops when its stdin closes")
+
+
+def saved_sessions(binary, model):
+    """--state-dir: owner-only files, restore across restarts, and no restore under another configuration."""
+    with tempfile.TemporaryDirectory() as root:
+        state = ["--state-dir", root, "--persist-min", "1"]
+        tokens = list(range(10, 50))
+        server, port = start(binary, model, *state)
+        try:
+            check(post(port, "/encode", {"base": 0, "tokens": tokens, "offsets": [39], "session": "A", "owner": "a"})[0]
+                  == 200, "session A encodes")
+            post(port, "/close", {"owner": "a"})
+            status, headers, _ = post(port, "/encode", {"base": 0, "tokens": tokens, "offsets": [39], "session": "B",
+                                                        "owner": "b"})
+            check(status == 200 and headers.get("x-restored-tokens") == "40", "session B restores A's saved prefix")
+            post(port, "/close", {"owner": "b"})
+        finally:
+            if server.poll() is None:
+                stop(server)
+        (subdir,) = [entry for entry in os.scandir(root) if entry.is_dir()]
+        if os.name == "posix":
+            check(stat.S_IMODE(os.stat(subdir.path).st_mode) == 0o700, "the saved-session directory is owner-only")
+            modes = {stat.S_IMODE(os.stat(f.path).st_mode) for f in os.scandir(subdir.path)}
+            check(modes == {0o600}, f"saved-session files are owner-only {sorted(oct(m) for m in modes)}")
+
+        server, port = start(binary, model, *state)
+        try:
+            for session in ("A", "B"):
+                status, _, _ = post(port, "/encode", {"base": 40, "tokens": [7], "offsets": [40], "session": session})
+                check(status == 200, f"after a restart, session {session} resumes from its own saved state")
+        finally:
+            stop(server)
+
+        server, port = start(binary, model, *state, "--ubatch", "32")
+        try:
+            status, _, _ = post(port, "/encode", {"base": 41, "tokens": [8], "offsets": [41], "session": "A"})
+            check(status == 409, "another encode configuration does not restore those sessions")
+        finally:
+            stop(server)
 
 
 def check(condition, message):
@@ -115,6 +175,7 @@ def main():
     finally:
         if server.poll() is None:
             server.kill()
+    saved_sessions(binary, model)
 
 
 if __name__ == "__main__":
