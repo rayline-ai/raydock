@@ -148,6 +148,8 @@ def main():
             check(False, "a non-JSON request is refused")
         except urllib.error.HTTPError as error:
             check(error.code == 415, "a non-JSON request is refused with 415")
+        status, _, refused = post(port, "/encode", {"base": 4, "tokens": [9], "offsets": [4], "retain": False})
+        check(status == 422 and json.loads(refused)["error"] == "invalid_retain", "a one-shot encode with base > 0 422")
         status, _, _ = post(port, "/encode", {"base": 0, "tokens": [1.5], "offsets": [0], "retain": False})
         check(status == 422, "a non-integer token is refused")
         rebound = urllib.request.Request(

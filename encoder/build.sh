@@ -83,8 +83,9 @@ fi
 head="$(git -C "$src" rev-parse HEAD)"
 [ "$head" = "$commit" ] || { echo "$src is at $head, pinned $commit" >&2; exit 1; }
 
-# Untracked files would be compiled too (llama.cpp globs its sources): refuse them.
-untracked="$(git -C "$src" ls-files --others --exclude-standard)"
+# Untracked files would be compiled too (llama.cpp globs its sources): refuse them, gitignored ones included. Only
+# this script's own build directories (build-metal/, build-cuda/, build-cpu/) may exist.
+untracked="$(git -C "$src" ls-files --others --directory | grep -v -E '^build-(metal|cuda|cpu)/$' || true)"
 [ -z "$untracked" ] || { echo "$src has untracked files:" >&2; echo "$untracked" >&2; exit 1; }
 # A clean checkout gets the patches; one that holds exactly the patches (an earlier run) is reused.
 if git -C "$src" diff --quiet HEAD && [ -z "$(git -C "$src" status --porcelain --untracked-files=no)" ]; then

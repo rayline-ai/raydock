@@ -389,6 +389,7 @@ int main(int argc, char ** argv) {
         }
         // Refuse what cannot be served before changing anything: a refused request must leave every session as it was.
         const std::string id = retained ? body["session"].get<std::string>() : "";
+        if (!retained && base != 0) return refuse(res, 422, "invalid_retain");  // a one-shot encode holds nothing to extend
         if (retained && base > 0) {
             const auto it = s.sessions.find(id);
             if (it == s.sessions.end() || it->second.n_past != base) return refuse(res, 409, "unknown_session");
