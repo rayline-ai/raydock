@@ -175,6 +175,11 @@ def main():
         return
     model = sys.argv[2]
 
+    # Without authentication, the encoder binds only loopback.
+    remote = subprocess.run([binary, "--model", model, "--port", "0", "--host", "0.0.0.0", "--parent-pipe"],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+    check(remote.returncode != 0 and remote.stdout == "", "a non-loopback --host is refused")
+
     # A decode chunk (--budget) larger than the context is refused at start, not aborted on the first long request.
     too_big = subprocess.run(
         [binary, "--model", model, "--port", "0", "--ctx", "200", "--budget", "256", "--parent-pipe"],

@@ -19,6 +19,10 @@
 //                    503 {"error":"decode_failed"}.
 //   POST /close   {"owner"} -> {"closed": n}: drop (and save, with --state-dir) that owner's sessions.
 //
+// The server has no authentication, so it binds only loopback (--host 127.0.0.1, ::1 or localhost). A POST without
+// Content-Type: application/json gets 415 (no CORS preflight is ever answered), and a request with an Origin or a Host
+// other than the bound loopback address gets 403 (DNS rebinding). /health never waits for an encode in progress.
+//
 // With --port 0 the server binds a free port and prints {"listening": PORT} as its first stdout line. With
 // --parent-pipe it stops when its stdin closes, so it never outlives the process that started it.
 //
@@ -50,6 +54,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <atomic>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -123,6 +128,7 @@ struct Server {
     int dim = 0;
     std::mutex mu;
     std::map<std::string, Session> sessions;
+    std::atomic<int> held{0};  // sessions.size() as of the last request, for /health without the lock
     std::vector<bool> seq_used;
     uint64_t clock = 0;
     std::string engine;
@@ -597,6 +603,11 @@ bool parse_args(int argc, char ** argv, Args & a) {
         else if (k == "--help") { usage(); return false; }
         else { std::fprintf(stderr, "unknown argument %s\n", k.c_str()); usage(); return false; }
     }
+    // No authentication: the encoder serves only this machine.
+    if (a.host != "127.0.0.1" && a.host != "::1" && a.host != "localhost") {
+        std::fprintf(stderr, "--host must be a loopback address (127.0.0.1, ::1 or localhost)\n");
+        return false;
+    }
     if (a.model.empty() || a.budget <= 0 || a.sessions <= 0 || a.n_ctx <= 0 || a.budget > a.n_ctx || a.checkpoint < 0 ||
         a.checkpoint % a.budget != 0 || (a.checkpoint > 0 && a.state_dir.empty())) {
         usage();
@@ -636,6 +647,12 @@ void set_env(const char * name, const char * value) {
     setenv(name, value, 1);
 #endif
 }
+
+// Publishes the session count for /health when a request handler leaves, still under the lock.
+struct PublishCount {
+    Server & s;
+    ~PublishCount() { s.held.store((int) s.sessions.size()); }
+};
 
 httplib::Server * g_http = nullptr;
 void on_signal(int) { if (g_http) g_http->stop(); }
@@ -728,14 +745,16 @@ int main(int argc, char ** argv) {
         return httplib::Server::HandlerResponse::Handled;
     });
 
+    // /health never waits for an encode in progress (that can take minutes at long context): everything but the
+    // session count is fixed at start, and the count is published after each request.
+    const json health = {{"engine", s.engine}, {"depth", llama_model_n_layer(s.model)}, {"budget", a.budget},
+                         {"rope", "yarn-f4"}, {"max_model_len", (int) llama_n_ctx(s.ctx)}, {"dim", s.dim},
+                         {"layer", "block_" + std::to_string(llama_model_n_layer(s.model) - 1)},
+                         // Optional flags this build accepts, so a supervisor passes only those.
+                         {"capabilities", json::array({"checkpoint"})}, {"checkpoint", a.checkpoint}};
     http.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
-        std::lock_guard<std::mutex> lock(s.mu);
-        json h = {{"engine", s.engine}, {"depth", llama_model_n_layer(s.model)}, {"budget", a.budget},
-                  {"rope", "yarn-f4"}, {"max_model_len", (int) llama_n_ctx(s.ctx)}, {"dim", s.dim},
-                  {"layer", "block_" + std::to_string(llama_model_n_layer(s.model) - 1)},
-                  {"sessions", (int) s.sessions.size()},
-                  // Optional flags this build accepts, so a supervisor passes only those.
-                  {"capabilities", json::array({"checkpoint"})}, {"checkpoint", a.checkpoint}};
+        json h = health;
+        h["sessions"] = s.held.load();
         res.set_content(h.dump(), "application/json");
     });
 
@@ -773,6 +792,7 @@ int main(int argc, char ** argv) {
         if (!retained && retain) return refuse(res, 422, "invalid_retain");
 
         std::lock_guard<std::mutex> lock(s.mu);
+        const PublishCount publish{s};
         if (base + (int64_t) tokens.size() > (int64_t) llama_n_ctx(s.ctx)) {
             res.status = 422;
             res.set_content(json{{"error", "exceeds_kv_budget"}, {"tokens", base + (int) tokens.size()}}.dump(),
@@ -918,6 +938,7 @@ int main(int argc, char ** argv) {
         const std::string owner =
             body.is_object() && body.contains("owner") && body["owner"].is_string() ? body["owner"].get<std::string>() : "";
         std::lock_guard<std::mutex> lock(s.mu);
+        const PublishCount publish{s};
         int closed = 0;
         for (auto it = s.sessions.begin(); it != s.sessions.end();) {
             if (!owner.empty() && it->second.owner == owner) {
