@@ -255,7 +255,7 @@ Required for local mode. Its presence in a `--config` file selects local mode.
 | `classifier_model` | string | yes | The model that serves Claude Code's auto-mode safety classifier calls, sent to Rayline cloud. No default in code. |
 | `policy.preset` | non-empty string | yes | ARC's preset id (`arc-policy.package-default.v1`, `arc-policy.hybrid-default.v1` or `arc-policy.prefer-local.v1`). Sent to ARC unchanged; no short names. |
 | `policy.overrides` | object | no | ARC's own `routing.policy.overrides` shape, sent to ARC unchanged. ARC validates it. |
-| `decisions` | `local` or `hosted` | no, default `local` | Where the local process gets its decisions. `local`: ARC runs inside the local process from the ARC release (item 1); no decision goes to Rayline cloud. `hosted`: the environment's Rayline router decides. |
+| `decisions` | `local` or `hosted` | no, default `hosted` | Where the local process gets its decisions. `hosted`: the environment's Rayline router decides. Set `local` to decide on this machine: ARC runs inside the local process from the ARC release (item 1); no decision goes to Rayline cloud. |
 | `arc_release.repo` | string `<owner>/<name>` | with `arc_release` | The Hugging Face repo of the ARC release `local` decisions download instead of the built-in one. |
 | `arc_release.revision` | 40 lowercase hex digits | with `arc_release` | The repo's commit. |
 | `arc_release.manifest_sha256` | 64 lowercase hex digits | with `arc_release` | The sha256 of the release's `manifest.json`. |
