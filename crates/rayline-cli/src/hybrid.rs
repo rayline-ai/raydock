@@ -346,7 +346,14 @@ async fn launch(
     // classifier still uses. Without it, `RAYLINE_DECISIONS_URL` alone sends
     // Decisions to that loopback service. The check below admits only a
     // loopback address besides the environment's router.
-    let local_arc = local_arc(home, paths)?;
+    // The encoder download is blocking HTTP, which may not run on the async
+    // runtime.
+    let local_arc = {
+        let (home, dir) = (home.to_path_buf(), paths.dir.clone());
+        tokio::task::spawn_blocking(move || local_arc(&home, &Paths { dir }))
+            .await
+            .map_err(io::Error::other)??
+    };
     if let (None, Some(url)) = (&local_arc, std::env::var_os("RAYLINE_DECISIONS_URL")) {
         config["decisions"]["url"] = json!(url.to_string_lossy());
     }

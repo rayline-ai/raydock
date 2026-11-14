@@ -41,8 +41,9 @@ pub struct LocalEncoder {
     /// Called when the encoder refuses an input longer than its context.
     on_context_full: Option<Hook>,
     /// Per episode, so a request that extends the last one appends only the
-    /// new tokens to the encoder's retained session.
-    held: Arc<Mutex<HashMap<String, Held>>>,
+    /// new tokens to the encoder's retained session. Each episode has its own
+    /// lock, so one episode's encode never waits on another's.
+    held: Arc<Mutex<HashMap<String, Arc<Mutex<Held>>>>>,
     /// Timings of each `/encode` call, kept only after [`Self::with_stats`].
     stats: Option<Arc<Mutex<Vec<EncodeStats>>>>,
 }
@@ -303,16 +304,22 @@ impl Readouts for LocalEncoder {
                 .encode(None, 0, tokens, offsets)?
                 .map_err(|status| format!("the encoder answered {status}"));
         };
-        // Requests within one episode are serialized by the caller; the lock
-        // is held across the encode so a concurrent one cannot interleave.
-        let mut held = self
-            .held
+        // The table's lock is held only to find the episode. The episode's
+        // own lock is held across its encode, so a concurrent request for
+        // the same episode cannot interleave.
+        let episode_state = {
+            let mut held = self
+                .held
+                .lock()
+                .map_err(|_| "the encoder session table is poisoned".to_owned())?;
+            if !held.contains_key(episode) && held.len() >= MAX_EPISODES {
+                held.clear();
+            }
+            held.entry(episode.to_owned()).or_default().clone()
+        };
+        let mut state = episode_state
             .lock()
-            .map_err(|_| "the encoder session table is poisoned".to_owned())?;
-        if !held.contains_key(episode) && held.len() >= MAX_EPISODES {
-            held.clear();
-        }
-        let state = held.entry(episode.to_owned()).or_default();
+            .map_err(|_| "the encoder session is poisoned".to_owned())?;
         let base = state.tokens.len();
         // The same input again (a retry, or another decision on one turn):
         // its rows are already here.

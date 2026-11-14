@@ -68,33 +68,14 @@ struct Listening {
 /// How every start of one encoder is configured.
 #[derive(Debug, Clone, Copy)]
 struct Launch {
-    /// Tokens per encode chunk.
+    /// Tokens per encode chunk; the encoder also saves a shared-prefix
+    /// state at this many tokens (`--checkpoint`).
     budget: u32,
-    /// Save a shared-prefix state at `budget` tokens (`--checkpoint`): only
-    /// when the binary accepts the flag.
-    checkpoint: bool,
 }
 
 /// `tokens` rounded up to a multiple of `chunk`.
 fn whole_chunks(tokens: u32, chunk: u32) -> u32 {
     tokens.div_ceil(chunk).saturating_mul(chunk)
-}
-
-/// Whether the encoder binary accepts `--checkpoint`: its usage text, which
-/// it prints for an argument it does not know, names the flags it takes.
-/// An older build without it then still starts, without the flag.
-async fn supports_checkpoint(binary: &Path) -> bool {
-    let probe = Command::new(binary)
-        .arg("--help")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(Duration::from_secs(10), probe).await {
-        Ok(Ok(output)) => String::from_utf8_lossy(&output.stderr).contains("--checkpoint"),
-        _ => false,
-    }
 }
 
 /// Start the encoder process at `context` and wait until it answers
@@ -108,9 +89,7 @@ async fn spawn(
     std::fs::create_dir_all(&files.state_dir)
         .with_context(|| format!("create {}", files.state_dir.display()))?;
     let mut command = Command::new(&files.binary);
-    if launch.checkpoint {
-        command.args(["--checkpoint", &launch.budget.to_string()]);
-    }
+    command.args(["--checkpoint", &launch.budget.to_string()]);
     let mut child = command
         .arg("--model")
         .arg(&files.model)
@@ -170,15 +149,8 @@ impl Encoder {
         context: u32,
     ) -> Result<Self> {
         anyhow::ensure!(budget > 0, "the encode chunk must hold at least one token");
-        let launch = Launch {
-            budget,
-            checkpoint: supports_checkpoint(&files.binary).await,
-        };
-        tracing::info!(
-            budget,
-            checkpoint = launch.checkpoint,
-            "starting the local ARC encoder"
-        );
+        let launch = Launch { budget };
+        tracing::info!(budget, "starting the local ARC encoder");
         let (child, parent_pipe, url) = spawn(files, launch, context, timeout).await?;
         let full = Arc::new(Notify::new());
         let raise = full.clone();
@@ -485,19 +457,14 @@ mod tests {
         .await
         .expect("the encoder starts");
         let first_pid = encoder.pid();
-        // A build that takes --checkpoint runs with it, at the chunk size.
+        // The encoder runs with --checkpoint at the chunk size.
         let health: serde_json::Value = reqwest::get(format!("{}/health", encoder.url))
             .await
             .expect("health")
             .json()
             .await
             .expect("health JSON");
-        if encoder.launch.checkpoint {
-            assert_eq!(health["checkpoint"], DEFAULT_BUDGET_TOKENS);
-        } else {
-            assert!(health["checkpoint"].as_u64().unwrap_or(0) == 0);
-        }
-        eprintln!("checkpoint: {}", encoder.launch.checkpoint);
+        assert_eq!(health["checkpoint"], DEFAULT_BUDGET_TOKENS);
         let client = encoder.client().with_stats();
         let tokens: Arc<Vec<u32>> =
             Arc::new((0..32_000u32).map(|i| 1_000 + i * 7 % 90_000).collect());
@@ -552,30 +519,6 @@ mod tests {
         assert_eq!(whole_chunks(131_072, 8_192), 131_072);
         assert_eq!(whole_chunks(270_336, 8_192), 270_336);
         assert_eq!(whole_chunks(131_072, 10_000), 140_000);
-    }
-
-    /// A stand-in encoder binary that prints `usage` to stderr and exits 1,
-    /// as the encoder does for `--help`.
-    #[cfg(unix)]
-    fn fake_binary(name: &str, usage: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("arc-probe-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let path = dir.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\necho '{usage}' >&2\nexit 1\n"))
-            .expect("write the script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        path
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn checkpoint_is_passed_only_to_a_binary_that_takes_it() {
-        let new = fake_binary("new", "usage: x [--state-dir DIR] [--checkpoint N]");
-        let old = fake_binary("old", "usage: x [--state-dir DIR]");
-        assert!(supports_checkpoint(&new).await);
-        assert!(!supports_checkpoint(&old).await);
-        assert!(!supports_checkpoint(Path::new("/nonexistent/encoder")).await);
     }
 
     #[test]
