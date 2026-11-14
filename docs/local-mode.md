@@ -134,8 +134,9 @@ With `local` decisions, `rayline local start` downloads the ARC release
 (about 100 MB) and its encoder weights from Hugging Face on first use, into
 the Hugging Face cache. It checks every release file against the pinned
 release, and the encoder weights against their pinned sha256. Later starts
-use the cached copy without contacting Hugging Face. Start still needs
-Rayline cloud, as with `hosted` decisions.
+use the cached copy and don't download it again. Start still needs
+Rayline cloud, as with `hosted` decisions, and still checks each model's
+`tokenizer` on Hugging Face.
 
 With `local` decisions, ARC can route only to models its release knows and
 prices. A `models` entry it doesn't know, or that neither the entry's
