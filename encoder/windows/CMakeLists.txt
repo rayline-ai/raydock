@@ -1,0 +1,20 @@
+# Windows build of rayline-arc-encoder: the pinned, patched llama.cpp (static) plus the server, in one CMake project.
+# Configure it through build.ps1, which verifies the pin and the patches first.
+cmake_minimum_required(VERSION 3.21)
+project(rayline_arc_encoder C CXX)
+set(LLAMA_SRC "" CACHE PATH "patched llama.cpp checkout")
+set(ENCODER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.." CACHE PATH "rayline encoder/ directory")
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+foreach(o LLAMA_CURL LLAMA_OPENSSL LLAMA_BUILD_TESTS LLAMA_BUILD_EXAMPLES LLAMA_BUILD_TOOLS LLAMA_BUILD_SERVER)
+  set(${o} OFF CACHE BOOL "" FORCE)
+endforeach()
+add_subdirectory(${LLAMA_SRC} llama EXCLUDE_FROM_ALL)
+add_executable(rayline-arc-encoder ${ENCODER_DIR}/arc_encoder_server.cpp ${LLAMA_SRC}/vendor/cpp-httplib/httplib.cpp)
+# UTF-8 active code page + longPathAware: needed for non-ASCII and long --model / --state-dir paths.
+option(ARC_MANIFEST "embed the UTF-8 / longPathAware manifest" ON)
+if(ARC_MANIFEST)
+  target_sources(rayline-arc-encoder PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/rayline-arc-encoder.manifest)
+endif()
+target_include_directories(rayline-arc-encoder PRIVATE ${LLAMA_SRC}/vendor/cpp-httplib ${LLAMA_SRC}/vendor)
+target_compile_features(rayline-arc-encoder PRIVATE cxx_std_17)
+target_link_libraries(rayline-arc-encoder PRIVATE llama ws2_32)

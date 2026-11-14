@@ -173,7 +173,7 @@ struct Server {
                 e.mtime = j.value("saved", (int64_t) 0);
                 entries.push_back(std::move(e));
             } catch (const std::exception & ex) {
-                std::fprintf(stderr, "skipping saved session %s: %s\n", f.path().filename().c_str(), ex.what());
+                std::fprintf(stderr, "skipping saved session %s: %s\n", f.path().filename().string().c_str(), ex.what());
             }
         }
         std::fprintf(stderr, "rayline-arc-encoder: %zu saved sessions in %s\n", entries.size(), args.state_dir.c_str());
