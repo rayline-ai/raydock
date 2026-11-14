@@ -5,6 +5,10 @@ instead of to Rayline cloud. For every request, ARC picks the model, and the
 local process sends the request to one of your own inference servers listed in
 `settings.json`, or to Rayline cloud for any other model.
 
+Local mode controls where inference runs; `routing.decisions` controls
+where routing decisions are made (default `hosted`: the request is sent to
+the Rayline Routes API).
+
 Cloud mode, the default, needs none of this. See
 [Getting started](getting-started.md).
 
@@ -127,27 +131,42 @@ Every entry works the same way. No setting marks a model as local.
 | `classifier_model` | string | yes | The model that serves Claude Code's auto-mode safety classifier calls. These calls go to Rayline cloud. |
 | `policy.preset` | non-empty string | yes | The id of an ARC preset: `arc-policy.package-default.v1`, `arc-policy.hybrid-default.v1` or `arc-policy.prefer-local.v1`. It is sent to ARC unchanged. |
 | `policy.overrides` | object | no | Overrides in ARC's own `routing.policy.overrides` shape, sent to ARC unchanged. ARC validates them. |
+| `decisions` | `local` or `hosted` | no, default `hosted` | `hosted`: Rayline cloud's ARC decides. Set `local` to decide on this machine: ARC runs inside the local process, and no routing decision goes to Rayline cloud. |
+| `arc_release` | object with `repo`, `revision`, `manifest_sha256`, and optionally `dir` | no | A different ARC release for `local` decisions: a Hugging Face repo, a full commit id, the sha256 of the release's `manifest.json`, and the repo directory it is in (default the repo root). For a private repo, set `HF_TOKEN` or sign in with `huggingface-cli login`. |
+
+`local` decisions are a preview. They need `arc_release` and the ARC
+encoder binary `rayline-arc-encoder` beside `rayline`; neither the built-in
+release nor the encoder is published yet. On first use, start downloads the
+release and about 1 GB of encoder weights into the Hugging Face cache and
+checks them against their pins. With `routing.decisions: "local"`, every
+turn routes by a local ARC decision, with no fallback: a turn ARC can't
+decide fails. Only Anthropic Messages harnesses (Claude Code, OpenCode, Pi,
+omp) are decided locally, so `rayline run` refuses Codex, Hermes and
+OpenClaw; turns with images or documents fail; and a `models` entry the
+release can't route to is skipped with a warning. Section 5.4 of the
+[spec](spec.md) has the details.
 
 The [ARC routing policies](https://docs.rayline.ai/arc/routes/hybrid)
 page describes how ARC applies each preset and which overrides it accepts.
 
 ### Env overrides
 
-Three `routing` keys can be set from the environment:
+Four `routing` keys can be set from the environment:
 
 | Key | Env var |
 |---|---|
 | `routing.decisions_model` | `RAYLINE_ROUTING_DECISIONS_MODEL` |
 | `routing.classifier_model` | `RAYLINE_ROUTING_CLASSIFIER_MODEL` |
 | `routing.policy.preset` | `RAYLINE_ROUTING_POLICY_PRESET` |
+| `routing.decisions` | `RAYLINE_ROUTING_DECISIONS` |
 
 - From lowest to highest precedence: built-in defaults, the config file, env
   overrides, then flags.
 - An override is validated the same way as the file value.
 - An override only changes a value. The config file still has to have a
   `routing` section, because the file decides the mode.
-- `endpoints`, `models` and `policy.overrides` can't be set from the
-  environment. Put them in a file and pass it with `--config`.
+- `endpoints`, `models`, `arc_release` and `policy.overrides` can't be set
+  from the environment. Put them in a file and pass it with `--config`.
 
 ## Start and run
 
@@ -225,6 +244,7 @@ The local process keeps its state in `~/.rayline/local/`:
 | `supervisor.json` | What is running. |
 | `runtime.lock` | The lock that keeps it to one local process. |
 | `runtime.log` | The local process's log. |
+| `ready.arc-core.json` | With `local` decisions: the core config pointed at the local routes service. |
 | `harness/<name>/` | The files Rayline generates for each harness in local mode: `pi`, `hermes`, `omp`, `opencode` and `openclaw`. Cloud mode uses `~/.rayline/harness/<name>/` instead. |
 
 If a local-mode run fails, check `rayline local status` and
