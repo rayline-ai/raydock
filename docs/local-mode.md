@@ -131,9 +131,12 @@ Every entry works the same way. No setting marks a model as local.
 | `arc_release` | object with `repo`, `revision`, `manifest_sha256`, and optionally `dir` | no | A different ARC release for `local` decisions: a Hugging Face repo, a full commit id, the sha256 of the release's `manifest.json`, and the repo directory it is in (default the repo root). For a private repo, set `HF_TOKEN` or sign in with `huggingface-cli login`. |
 
 With `local` decisions, `rayline local start` downloads the ARC release
-(about 100 MB) and its encoder weights from Hugging Face on first use, into
-the Hugging Face cache. It checks every release file against the pinned
-release, and the encoder weights against their pinned sha256. Later starts
+(about 100 MB) and the ARC encoder weights (about 1 GB) from Hugging Face on
+first use, into the Hugging Face cache. It checks every release file against
+the pinned release, and the encoder weights against their pinned sha256.
+The encoder weights always come from `rayline-ai/ARC-1.0` at a commit built
+into Rayline, whatever `arc_release` names, and are downloaded without a
+token. Later starts
 use the cached copy and don't download it again. Start still needs
 Rayline cloud, as with `hosted` decisions, and still checks each model's
 `tokenizer` on Hugging Face.
@@ -151,7 +154,7 @@ and turns route among the other models. If every `models` entry is
 skipped, `rayline local start` fails and names them.
 
 Local decisions also need the ARC encoder binary, `rayline-arc-encoder`,
-installed beside `rayline`. It will ship with the Rayline release. The
+installed beside `rayline`. Rayline releases don't ship it yet. The
 built-in ARC release isn't published yet either, so for now `local`
 decisions need `arc_release`; without it, start fails with an error that
 says so.
