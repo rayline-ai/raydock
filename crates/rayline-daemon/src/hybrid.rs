@@ -252,6 +252,13 @@ pub async fn run(args: Args) -> Result<()> {
             .is_some()
             .then_some(crate::hybrid_arc::ROUTES_TOKEN_ENV);
         crate::hybrid_arc::with_local_decisions(&core_config, &routes_url, auth_env, &local)?;
+        // The rewritten Decisions URL gets the same check as the config's:
+        // only the router or a loopback address.
+        rayline_local_router::decisions_url::check_config_bytes(
+            &std::fs::read(&local).with_context(|| format!("read {}", local.display()))?,
+            [args.router_url.as_str()],
+        )
+        .map_err(|error| anyhow::anyhow!("local ARC Decisions URL: {error}"))?;
         core_config = local;
         arc_encoder = Some(encoder);
     }

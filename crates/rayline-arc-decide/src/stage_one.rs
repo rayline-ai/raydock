@@ -158,6 +158,14 @@ fn order_ratio(glm: f64, net: f64, pool_glm: &[f64], pool_net: &[f64], n: i64, a
     (top / bottom).powf(alpha)
 }
 
+/// The length of a tensor that must be one-dimensional.
+fn one_dimensional(shape: &[usize]) -> Result<usize, TensorError> {
+    match shape {
+        [length] => Ok(*length),
+        _ => Err(TensorError("ens_point is not one-dimensional".into())),
+    }
+}
+
 /// `numpy.interp` of `x` on `xp[..n]` / `fp[..n]`, constant beyond the end
 /// knots.
 fn interp(x: f64, xp: &[f64], fp: &[f64], n: i64) -> f64 {
@@ -166,7 +174,8 @@ fn interp(x: f64, xp: &[f64], fp: &[f64], n: i64) -> f64 {
         return first;
     }
     let last = (n - 1) as usize;
-    let right = upper_bound(xp, x);
+    // Only the first `n` knots: the rest of the row is padding.
+    let right = upper_bound(&xp[..(last + 1).min(xp.len())], x);
     let j = right.saturating_sub(1).min(last - 1);
     let j1 = (j + 1).min(last);
     let (x0, x1, f0, f1) = (xp[j], xp[j1], fp[j], fp[j1]);
@@ -250,7 +259,10 @@ impl StageOneHead {
         }
         let (m, c, l) = (members, candidates, LEGS);
         let ens_point: Vec<usize> = tensors
-            .i64("ens_point", &[tensors.shape("ens_point")?[0]])?
+            .i64(
+                "ens_point",
+                &[one_dimensional(tensors.shape("ens_point")?)?],
+            )?
             .into_iter()
             .map(|index| usize::try_from(index).ok().filter(|i| *i < m))
             .collect::<Option<_>>()
@@ -548,6 +560,13 @@ mod tests {
         assert_eq!(interp(4.0, &xp, &fp, 3), 40.0);
         assert_eq!(interp(9.0, &xp, &fp, 3), 40.0);
         assert_eq!(interp(9.0, &xp, &fp, 1), 10.0);
+        // Padding after the `n` knots is never searched.
+        let (xp, fp) = (
+            [1.0, 2.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [10.0, 20.0, 100.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        assert_eq!(interp(1.5, &xp, &fp, 3), 15.0);
+        assert_eq!(interp(3.0, &xp, &fp, 3), 60.0);
     }
 
     #[test]

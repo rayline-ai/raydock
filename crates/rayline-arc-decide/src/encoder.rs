@@ -254,12 +254,15 @@ impl LocalEncoder {
                 .ok_or_else(|| format!("the encoder's response has no {name}"))
         };
         let (rows, dim) = (count("x-rows")?, count("x-dim")?);
-        if dim == 0 || rows != offsets.len() || rows.checked_mul(dim * 4) != Some(payload.len()) {
+        let stride = dim.checked_mul(4).filter(|stride| *stride > 0);
+        let Some(stride) = stride.filter(|stride| {
+            rows == offsets.len() && rows.checked_mul(*stride) == Some(payload.len())
+        }) else {
             return Err("the encoder's rows do not match the request".into());
-        }
+        };
         let parsed = std::time::Instant::now();
         let rows: Vec<Vec<f32>> = payload
-            .chunks_exact(dim * 4)
+            .chunks_exact(stride)
             .map(|row| {
                 row.chunks_exact(4)
                     .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))

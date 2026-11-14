@@ -423,6 +423,27 @@ async fn an_unavailable_decider_with_no_history_serves_the_package_fallback() {
 }
 
 #[tokio::test]
+async fn an_unavailable_decider_never_falls_back_to_a_target_that_does_not_fit() {
+    // `c` is the package fallback, but the request marks it not to fit.
+    let mut manifest: Value = serde_json::from_slice(&common::manifest()).unwrap();
+    manifest["decision"] = json!({"fallback_action_id": common::id('c')});
+    let catalog =
+        rayline_arc_routes::Catalog::from_manifest(manifest.to_string().as_bytes(), common::ALIAS)
+            .unwrap();
+    let harness = harness_with(unavailable(), catalog, |_| {}).await;
+    let response = harness
+        .routes("conversation")
+        .json(&first_turn())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["receipt"]["decided_by"]["model"], "utility_fallback");
+    assert_ne!(body["policy_action_id"], json!(common::id('c')));
+}
+
+#[tokio::test]
 async fn an_unavailable_decider_without_a_package_fallback_still_routes() {
     // The fixture package names no fallback action, and the turn has no
     // history: an offered action is served rather than failing the turn.

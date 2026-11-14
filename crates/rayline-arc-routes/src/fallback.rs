@@ -59,7 +59,19 @@ impl Fallback {
         Self {
             preference,
             conversation,
-            offered: selection.available_action_ids.clone(),
+            // A target the request's own capacity facts say does not fit is
+            // never a fallback.
+            offered: selection
+                .available_action_ids
+                .iter()
+                .filter(|action| {
+                    !decide
+                        .capacity
+                        .iter()
+                        .any(|fact| &fact.action_id == *action && fact.fits == Some(false))
+                })
+                .cloned()
+                .collect(),
             tiers,
         }
     }
