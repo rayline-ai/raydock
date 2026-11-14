@@ -127,27 +127,40 @@ Every entry works the same way. No setting marks a model as local.
 | `classifier_model` | string | yes | The model that serves Claude Code's auto-mode safety classifier calls. These calls go to Rayline cloud. |
 | `policy.preset` | non-empty string | yes | The id of an ARC preset: `arc-policy.package-default.v1`, `arc-policy.hybrid-default.v1` or `arc-policy.prefer-local.v1`. It is sent to ARC unchanged. |
 | `policy.overrides` | object | no | Overrides in ARC's own `routing.policy.overrides` shape, sent to ARC unchanged. ARC validates them. |
+| `decisions` | `local` or `hosted` | no, default `local` | `local`: ARC runs on your machine, inside the local process, and no routing decision goes to Rayline cloud. `hosted`: Rayline cloud's ARC decides. |
+| `arc_release` | object with `repo`, `revision`, `manifest_sha256`, and optionally `dir` | no | A different ARC release for `local` decisions: a Hugging Face repo, a full commit id, the sha256 of the release's `manifest.json`, and the repo directory it is in (default the repo root). For a private repo, set `HF_TOKEN` or sign in with `huggingface-cli login`. |
+
+With `local` decisions, `rayline local start` downloads the ARC release
+(about 100 MB) and its encoder weights from Hugging Face on first use, into
+the Hugging Face cache, and checks every file against the pinned release.
+Later starts use the cached copy and work offline.
+
+Local decisions also need the ARC encoder binary, `rayline-arc-encoder`,
+installed beside `rayline`. It will ship with the Rayline release; until it
+does, use `"decisions": "hosted"`. The default ARC release is not published
+yet either, so `local` decisions need `arc_release` for now.
 
 The [ARC routing policies](https://docs.rayline.ai/arc/routes/hybrid)
 page describes how ARC applies each preset and which overrides it accepts.
 
 ### Env overrides
 
-Three `routing` keys can be set from the environment:
+Four `routing` keys can be set from the environment:
 
 | Key | Env var |
 |---|---|
 | `routing.decisions_model` | `RAYLINE_ROUTING_DECISIONS_MODEL` |
 | `routing.classifier_model` | `RAYLINE_ROUTING_CLASSIFIER_MODEL` |
 | `routing.policy.preset` | `RAYLINE_ROUTING_POLICY_PRESET` |
+| `routing.decisions` | `RAYLINE_ROUTING_DECISIONS` |
 
 - From lowest to highest precedence: built-in defaults, the config file, env
   overrides, then flags.
 - An override is validated the same way as the file value.
 - An override only changes a value. The config file still has to have a
   `routing` section, because the file decides the mode.
-- `endpoints`, `models` and `policy.overrides` can't be set from the
-  environment. Put them in a file and pass it with `--config`.
+- `endpoints`, `models`, `arc_release` and `policy.overrides` can't be set
+  from the environment. Put them in a file and pass it with `--config`.
 
 ## Start and run
 

@@ -255,6 +255,13 @@ Required for local mode. Its presence in a `--config` file selects local mode.
 | `classifier_model` | string | yes | The model that serves Claude Code's auto-mode safety classifier calls, sent to Rayline cloud. No default in code. |
 | `policy.preset` | non-empty string | yes | ARC's preset id (`arc-policy.package-default.v1`, `arc-policy.hybrid-default.v1` or `arc-policy.prefer-local.v1`). Sent to ARC unchanged; no short names. |
 | `policy.overrides` | object | no | ARC's own `routing.policy.overrides` shape, sent to ARC unchanged. ARC validates it. |
+| `decisions` | `local` or `hosted` | no, default `local` | Where the local process gets its decisions. `local`: ARC runs inside the local process from the ARC release (item 1); no decision goes to Rayline cloud. `hosted`: the environment's Rayline router decides. |
+| `arc_release.repo` | string `<owner>/<name>` | with `arc_release` | The Hugging Face repo of the ARC release `local` decisions download instead of the built-in one. |
+| `arc_release.revision` | 40 lowercase hex digits | with `arc_release` | The repo's commit. |
+| `arc_release.manifest_sha256` | 64 lowercase hex digits | with `arc_release` | The sha256 of the release's `manifest.json`. |
+| `arc_release.dir` | relative path of plain names joined by `/` | no, default the repo root | The repo directory that holds the release. |
+
+1. With `decisions` `local`, starting the local process loads the ARC runtime release (`manifest.json` and every file it lists) at a pinned commit: the built-in one, `rayline-ai/ARC-1.0` at a commit, directory and manifest sha256 compiled into Rayline, or `arc_release`. A private repo needs a Hugging Face token (section 7.1 item 6); without one, start fails with an error that says to set `HF_TOKEN`. Files already in the Hugging Face cache (section 8) at that commit are not downloaded again, so a complete cache starts offline. Rayline checks `manifest.json` against the pinned sha256 and every file against the size and sha256 the manifest lists. A cached file that doesn't match is downloaded again; a downloaded file that doesn't match is removed from the cache, and start fails with an error naming it. A file that can't be downloaded fails start with an error naming it. A release that carries no prices and lists no `prices.json` fails start with an error saying so, rather than refusing every turn. The release's encoder weights are downloaded the same way, pinned by commit and sha256.
 
 ### 5.5 Internal: `environments`
 
@@ -299,11 +306,12 @@ Each scalar key Rayline defines can be overridden by one env var named `RAYLINE_
 | `routing.decisions_model` | `RAYLINE_ROUTING_DECISIONS_MODEL` |
 | `routing.classifier_model` | `RAYLINE_ROUTING_CLASSIFIER_MODEL` |
 | `routing.policy.preset` | `RAYLINE_ROUTING_POLICY_PRESET` |
+| `routing.decisions` | `RAYLINE_ROUTING_DECISIONS` |
 | `update.channel` | `RAYLINE_UPDATE_CHANNEL` |
 
 1. Precedence, lowest to highest: built-in defaults, the config file, env overrides, flags.
 2. An override value is validated like the file value; an invalid one is a load error.
-3. Whole entries (`endpoints.*`, `models.*`, `environments.*`) and ARC's `policy.overrides` have no env override. Put them in a file and pass it with `--config`.
+3. Whole entries (`endpoints.*`, `models.*`, `environments.*`, `routing.arc_release`) and ARC's `policy.overrides` have no env override. Put them in a file and pass it with `--config`.
 4. No other `RAYLINE_*` env var changes Rayline's behaviour (section 7).
 
 ### 5.8 Load errors
@@ -383,7 +391,7 @@ One file: `~/.config/rayline/credentials.json`. `rayline auth login` writes `ses
 
      When the answer is to stop it, Rayline runs `claude daemon stop --any` with `CLAUDE_CONFIG_DIR` set to the checked folder, and goes on when it succeeds. When it exits non-zero, the launch fails with ``` `claude daemon stop --any` exited with code <code>. Stop the daemon manually and re-run. ```, where `<code>` is `-1` when the process has no exit code. When it can't be run, the launch fails with ``` Could not run `claude daemon stop --any`: <error>. Stop the daemon manually and re-run. ```
    - Each cloud launch adds its record to `daemon-launches.json`. It drops each existing record that has no `ts` or is 24 hours old or older, except that it keeps, whatever their age, every record whose `pid` is a `spawnedBy.pid` that a check read from a live daemon's `daemon.lock`, before that check's prompt. That is the check of the launch's config folder or, when the user chose isolated at the prompt, both the default folder's check and the isolated folder's, since the default folder's daemon keeps running. A record stays kept when the user then stops its daemon at the prompt. A missing `daemon-launches.json` holds no records, and recording the launch creates it. One that exists but can't be read, or isn't a JSON array of objects, is an error. So is failing to write it: creating its folder, writing the temporary file, or renaming that into place. Each of these fails the launch.
-6. Shared Hugging Face cache: `HF_HOME`, `HF_HUB_CACHE`.
+6. Shared Hugging Face cache: `HF_HOME`, `HF_HUB_CACHE`, and the Hub's address `HF_ENDPOINT` (default `https://huggingface.co`; a value that isn't an absolute `http` or `https` URL is an error naming it). The ARC release download reads a token for private repos from `HF_TOKEN`, else the file `$HF_HOME/token` (else `<home>/.cache/huggingface/token`). It sends the token only to the Hub's address, never to a host a download redirects to, and never prints it. A set but empty `HF_TOKEN` is an error naming it.
 
 ### 7.2 Set by Rayline for a harness
 
@@ -447,7 +455,7 @@ Each mode has its own harness folder because each writes its own endpoint, key a
 
 Rayline writes nothing else under `~/.rayline` or `~/.config/rayline`. Outside them it writes only:
 - the harness's own files named in 9.4;
-- tokenizer files in the Hugging Face cache: `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `<home>/.cache/huggingface/hub`;
+- tokenizer files, and the ARC release and encoder weights of local decisions, in the Hugging Face cache: `$HF_HUB_CACHE`, else `$HF_HOME/hub`, else `<home>/.cache/huggingface/hub`;
 - with `rayline run codex configure` (9.4), `rayline.config.toml` in the user's Codex home (`CODEX_HOME`, else `~/.codex`, Codex's own default);
 - with `rayline run claude --isolated` (9.3), in the user's Claude config folder (`CLAUDE_CONFIG_DIR`, else `~/.claude`): the folders `projects/`, `sessions/`, `plans/` and `paste-cache/` and an empty `history.jsonl`, each only if missing, which the isolated folder links to.
 
