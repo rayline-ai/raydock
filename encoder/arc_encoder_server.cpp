@@ -14,7 +14,7 @@
 //                    409 {"error":"unknown_session"}: an append to a session not held at that base;
 //                    422 {"error": code}: invalid_body, offsets_out_of_range, invalid_retain, images_not_served,
 //                    exceeds_kv_budget (input longer than --ctx);
-//                    503 {"error":"decode_failed"}.
+//                    503 {"error":"decode_failed"} or {"error":"shutting_down"}.
 //   POST /close   {"owner"} -> {"closed": n}: drop that owner's sessions.
 //
 // The server has no authentication, so it binds only loopback (--host 127.0.0.1, ::1 or localhost). A POST without
@@ -22,7 +22,9 @@
 // other than the bound loopback address gets 403 (DNS rebinding). /health never waits for an encode in progress.
 //
 // With --port 0 the server binds a free port and prints {"listening": PORT} as its first stdout line. With
-// --parent-pipe it stops when its stdin closes, so it never outlives the process that started it.
+// --parent-pipe it stops when its stdin closes, so it never outlives the process that started it. Stopping (stdin
+// closing, SIGINT or SIGTERM) also aborts a decode in progress and refuses new encodes, so a long encode never keeps
+// the process, or the GPU, busy after its parent is gone.
 //
 // Readouts are llama.cpp's per-token embeddings with pooling NONE: the final norm's output, read at each requested
 // absolute offset. A retained session is one llama sequence id holding both the full-attention KV and the
@@ -265,7 +267,13 @@ struct PublishCount {
 };
 
 httplib::Server * g_http = nullptr;
-void on_signal(int) { if (g_http) g_http->stop(); }
+std::atomic<bool> g_stopping{false};
+bool abort_decode(void *) { return g_stopping.load(); }
+void stop_server() {
+    g_stopping.store(true);
+    if (g_http) g_http->stop();
+}
+void on_signal(int) { stop_server(); }
 
 }  // namespace
 
@@ -299,6 +307,7 @@ int main(int argc, char ** argv) {
     if (a.threads > 0) { cp.n_threads = a.threads; cp.n_threads_batch = a.threads; }
     s.ctx = llama_init_from_model(s.model, cp);
     if (s.ctx == nullptr) { std::fprintf(stderr, "failed to create the context\n"); return 1; }
+    llama_set_abort_callback(s.ctx, abort_decode, nullptr);
     // llama.cpp clamps n_batch to the context; a decode call larger than n_batch aborts. Serve exactly --budget or refuse.
     if ((int) llama_n_batch(s.ctx) != a.budget) {
         std::fprintf(stderr, "--budget %d does not fit the context (n_batch %u); use --budget <= --ctx\n", a.budget,
@@ -371,6 +380,7 @@ int main(int argc, char ** argv) {
 
         std::lock_guard<std::mutex> lock(s.mu);
         const PublishCount publish{s};
+        if (g_stopping.load()) return refuse(res, 503, "shutting_down");
         if (base + (int64_t) tokens.size() > (int64_t) llama_n_ctx(s.ctx)) {
             res.status = 422;
             res.set_content(json{{"error", "exceeds_kv_budget"}, {"tokens", base + (int) tokens.size()}}.dump(),
@@ -459,7 +469,7 @@ int main(int argc, char ** argv) {
         std::thread([] {
             char buf[64];
             while (std::fread(buf, 1, sizeof buf, stdin) > 0) {}
-            if (g_http) g_http->stop();
+            stop_server();
         }).detach();
     }
     http.listen_after_bind();

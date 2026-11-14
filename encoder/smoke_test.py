@@ -13,6 +13,8 @@ import os
 import struct
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -71,6 +73,27 @@ def main():
     if len(sys.argv) == 2:
         return
     model = sys.argv[2]
+
+    # The parent going away (stdin closing) aborts a long encode in progress instead of finishing it.
+    server, port = start(binary, model, "--ctx", "65536", "--budget", "64")
+    try:
+        result = {}
+        def long_encode():
+            result["status"] = post(port, "/encode", {"base": 0, "tokens": [5] * 65000, "offsets": [64999],
+                                                      "retain": False})[0]
+        encoding = threading.Thread(target=long_encode)
+        encoding.start()
+        time.sleep(0.5)
+        closed = time.monotonic()
+        server.stdin.close()
+        server.wait(timeout=60)
+        took = time.monotonic() - closed
+        encoding.join(timeout=60)
+        check(took < 2 and result.get("status") != 200,
+              f"closing stdin during a long encode stops within {took:.2f} s and aborts it ({result.get('status')})")
+    finally:
+        if server.poll() is None:
+            server.kill()
 
     # Without authentication, the encoder binds only loopback.
     remote = subprocess.run([binary, "--model", model, "--port", "0", "--host", "0.0.0.0", "--parent-pipe"],
