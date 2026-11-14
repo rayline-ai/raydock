@@ -687,6 +687,21 @@ fn the_answer_is_one_the_core_validates() {
 }
 
 #[test]
+fn a_caller_row_the_decision_did_not_use_is_unused_not_applied() {
+    let mut sent = request();
+    // The decision priced this model at other legs: it didn't read the row.
+    sent["routing"]["prices"][LOCAL_MODEL] =
+        json!({"input": 9, "cache_read": 9, "cache_write": 9, "output": 9});
+    let parsed = parsed(sent).unwrap();
+    let shaped = shape(&catalog(), &parsed.restate, &answer(), "rt_test", 1).unwrap();
+    let prices = &shaped["routing"]["prices"];
+    assert_eq!(prices["unused"], json!([LOCAL_MODEL]));
+    let row = &prices["models"][LOCAL_MODEL];
+    assert_eq!(row["output"], 0.25);
+    assert_eq!(row["source"]["output"], "catalog");
+}
+
+#[test]
 fn without_caller_prices_the_answer_is_in_the_catalog_price_world() {
     let mut sent = request();
     sent["routing"].as_object_mut().unwrap().remove("prices");

@@ -106,39 +106,55 @@ fn price_table(
             .actions
             .get(action_id)
             .ok_or_else(|| Refusal::upstream("an offered action is outside the package."))?;
-        let id = catalog.public_id(&action.model, restate.prices.keys());
-        if let Some(legs) = restate.prices.get(id) {
-            let mut row = serde_json::to_value(legs)
-                .ok()
-                .and_then(|row| match row {
-                    Value::Object(row) => Some(row),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            row.insert("source".to_owned(), source("caller"));
-            table.insert(id.to_owned(), Value::Object(row));
-            resolved.insert(id.to_owned(), legs.array());
-            continue;
-        }
-        let legs = rows
+        // The rate the decision used for this action, if it priced it.
+        let used = rows
             .get(action_id.as_str())
             .and_then(|row| row.get("price_per_mtok"))
             .filter(|legs| !legs.is_null());
-        let Some(legs) = legs else { continue };
+        let used = match used {
+            Some(legs) => {
+                let mut prices = [0.0; 4];
+                for (leg, price) in PRICE_LEGS.iter().zip(&mut prices) {
+                    *price = legs.get(leg).and_then(Value::as_f64).ok_or_else(|| {
+                        Refusal::upstream("the decision priced an action without all four legs.")
+                    })?;
+                }
+                Some((legs, prices))
+            }
+            None => None,
+        };
+        // A caller row counts as applied only when the decision priced the
+        // action at exactly its legs: a row the decision didn't read is
+        // reported unused, never as a price the selection used.
+        let id = catalog.public_id(&action.model, restate.prices.keys());
+        if let Some(legs) = restate.prices.get(id) {
+            if used
+                .as_ref()
+                .is_some_and(|(_, prices)| *prices == legs.array())
+            {
+                let mut row = serde_json::to_value(legs)
+                    .ok()
+                    .and_then(|row| match row {
+                        Value::Object(row) => Some(row),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                row.insert("source".to_owned(), source("caller"));
+                table.insert(id.to_owned(), Value::Object(row));
+                resolved.insert(id.to_owned(), legs.array());
+                continue;
+            }
+        }
+        let Some((legs, prices)) = used else { continue };
+        let id = catalog.public_id(&action.model, std::iter::empty());
         if table.contains_key(id) {
             continue;
         }
         let mut row = Map::new();
-        let mut prices = [0.0; 4];
-        for (leg, price) in PRICE_LEGS.iter().zip(&mut prices) {
-            let value = legs.get(leg).filter(|value| value.is_number());
-            let (Some(value), Some(number)) = (value, value.and_then(Value::as_f64)) else {
-                return Err(Refusal::upstream(
-                    "the decision priced an action without all four legs.",
-                ));
-            };
-            *price = number;
-            row.insert((*leg).to_owned(), value.clone());
+        for leg in PRICE_LEGS {
+            if let Some(value) = legs.get(leg) {
+                row.insert(leg.to_owned(), value.clone());
+            }
         }
         row.insert("source".to_owned(), source("catalog"));
         table.insert(id.to_owned(), Value::Object(row));
@@ -290,7 +306,14 @@ pub fn shape(
         let unused: Vec<&String> = restate
             .prices
             .keys()
-            .filter(|model| !shaper.table.contains_key(*model))
+            .filter(|model| {
+                // Unused unless the table holds it as the caller's row.
+                shaper
+                    .table
+                    .get(*model)
+                    .and_then(|row| row.pointer("/source/input"))
+                    != Some(&json!("caller"))
+            })
             .collect();
         routing["prices"] = json!({
             "status": "applied", "models": shaper.table, "unused": unused, "price_sha256": digest});

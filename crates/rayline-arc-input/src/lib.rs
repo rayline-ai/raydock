@@ -521,14 +521,22 @@ fn added_tokens(tokenizer_config_json: &str) -> Result<Vec<(u32, AddedToken)>, P
 fn text_pieces(text: &str) -> Vec<&str> {
     let mut pieces = Vec::new();
     let mut cursor = 0;
-    while let Some((start, token)) = VISION_TOKENS
-        .iter()
-        .filter_map(|token| text[cursor..].find(token).map(|at| (cursor + at, token)))
-        .min_by_key(|(start, _)| *start)
-    {
-        pieces.extend([&text[cursor..start], &text[start..start + 2]]);
-        cursor = start + token.len();
-        pieces.push(&text[start + 2..cursor]);
+    // Every literal opens with `<|`: one left-to-right pass over those.
+    let mut from = 0;
+    while let Some(at) = text[from..].find("<|") {
+        let start = from + at;
+        match VISION_TOKENS
+            .iter()
+            .find(|token| text[start..].starts_with(*token))
+        {
+            Some(token) => {
+                pieces.extend([&text[cursor..start], &text[start..start + 2]]);
+                cursor = start + token.len();
+                pieces.push(&text[start + 2..cursor]);
+                from = cursor;
+            }
+            None => from = start + 1,
+        }
     }
     pieces.push(&text[cursor..]);
     pieces.retain(|piece| !piece.is_empty());
@@ -538,6 +546,19 @@ fn text_pieces(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vision_literals_are_cut_in_one_pass() {
+        assert_eq!(
+            text_pieces("a<|vision_start|>b<|x<|image_pad|>"),
+            ["a", "<|", "vision_start|>", "b<|x", "<|", "image_pad|>"]
+        );
+        assert_eq!(text_pieces("plain"), ["plain"]);
+        let many = "<|vision_start|>".repeat(200_000);
+        let started = std::time::Instant::now();
+        assert_eq!(text_pieces(&many).len(), 400_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
 
     fn contents(body: &str) -> Vec<(&'static str, String)> {
         project_request(body, &[])

@@ -76,11 +76,20 @@ impl Object {
 
 impl FromIterator<(String, Json)> for Object {
     fn from_iter<T: IntoIterator<Item = (String, Json)>>(iter: T) -> Self {
-        let mut object = Object::new();
+        // As `insert` per entry, with an index so a large object builds in
+        // linear time.
+        let mut entries: Vec<(String, Json)> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
         for (key, value) in iter {
-            object.insert(&key, value);
+            match seen.get(&key) {
+                Some(&index) => entries[index].1 = value,
+                None => {
+                    seen.insert(key.clone(), entries.len());
+                    entries.push((key, value));
+                }
+            }
         }
-        object
+        Object(entries)
     }
 }
 
@@ -625,6 +634,23 @@ mod tests {
             loads(r#""\ud83d""#),
             Err(ParseError::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn an_object_collects_in_order_last_value_wins_and_in_linear_time() {
+        let object: Object = [("b", 1), ("a", 2), ("b", 3)]
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), Json::Number(value.to_string())))
+            .collect();
+        let keys: Vec<&str> = object.iter().map(|(key, _)| key).collect();
+        assert_eq!(keys, ["b", "a"]);
+        assert_eq!(object.get("b"), Some(&Json::Number("3".to_owned())));
+        let started = std::time::Instant::now();
+        let large: Object = (0..200_000)
+            .map(|index| (format!("k{index}"), Json::Null))
+            .collect();
+        assert_eq!(large.iter().count(), 200_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]
