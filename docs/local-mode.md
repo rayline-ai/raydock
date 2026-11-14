@@ -130,41 +130,15 @@ Every entry works the same way. No setting marks a model as local.
 | `decisions` | `local` or `hosted` | no, default `hosted` | `hosted`: Rayline cloud's ARC decides. Set `local` to decide on this machine: ARC runs inside the local process, and no routing decision goes to Rayline cloud. |
 | `arc_release` | object with `repo`, `revision`, `manifest_sha256`, and optionally `dir` | no | A different ARC release for `local` decisions: a Hugging Face repo, a full commit id, the sha256 of the release's `manifest.json`, and the repo directory it is in (default the repo root). For a private repo, set `HF_TOKEN` or sign in with `huggingface-cli login`. |
 
-With `local` decisions, `rayline local start` downloads the ARC release
-(about 100 MB) and the ARC encoder weights (about 1 GB) from Hugging Face on
-first use, into the Hugging Face cache. It checks every release file against
-the pinned release, and the encoder weights against their pinned sha256.
-The encoder weights always come from `rayline-ai/ARC-1.0` at a commit built
-into Rayline, whatever `arc_release` names, and are downloaded without a
-token. Later starts
-use the cached copy and don't download it again; each start hashes the
-encoder weights again to check them. Start still needs
-Rayline cloud, as with `hosted` decisions, and still checks each model's
-`tokenizer` on Hugging Face.
-
-With `local` decisions, ARC can route only to models its release knows and
-prices. A `models` entry it doesn't know, or that neither the entry's
-`price` nor the release prices, is skipped: `rayline local start` prints a
-warning naming it, for example
-
-```text
-Warning: models entry example/my-model isn't in the ARC release's catalog; ARC won't route to it
-```
-
-and turns route among the other models. If every `models` entry is
-skipped, `rayline local start` fails and names them.
-
-Local decisions read Claude Code, OpenCode, Pi and omp turns (Anthropic
-Messages requests). Codex, Hermes and OpenClaw turns aren't decided
-locally: they keep the model the conversation holds (or, on a first turn,
-the release's fallback model), and `rayline run` warns of it. Use `hosted`
-decisions for those harnesses.
-
-Local decisions also need the ARC encoder binary, `rayline-arc-encoder`,
-installed beside `rayline`. Rayline releases don't ship it yet. The
-built-in ARC release isn't published yet either, so for now `local`
-decisions need `arc_release`; without it, start fails with an error that
-says so.
+`local` decisions are a preview. They need `arc_release` and the ARC
+encoder binary `rayline-arc-encoder` beside `rayline`; neither the built-in
+release nor the encoder is published yet. On first use, start downloads the
+release and about 1 GB of encoder weights into the Hugging Face cache and
+checks them against their pins. Only Anthropic Messages harnesses (Claude
+Code, OpenCode, Pi, omp) are decided locally; Codex, Hermes and OpenClaw
+turns route without a decision, and `rayline run` warns of it. A `models`
+entry the release can't route to is skipped with a warning. Section 5.4 of
+the [spec](spec.md) has the details.
 
 The [ARC routing policies](https://docs.rayline.ai/arc/routes/hybrid)
 page describes how ARC applies each preset and which overrides it accepts.
@@ -264,7 +238,12 @@ The local process keeps its state in `~/.rayline/local/`:
 | `supervisor.json` | What is running. |
 | `runtime.lock` | The lock that keeps it to one local process. |
 | `runtime.log` | The local process's log. |
+| `ready.arc-core.json` | With `local` decisions: the core config pointed at the local routes service. |
 | `harness/<name>/` | The files Rayline generates for each harness in local mode: `pi`, `hermes`, `omp`, `opencode` and `openclaw`. Cloud mode uses `~/.rayline/harness/<name>/` instead. |
+
+With `local` decisions, `~/.rayline/arc-sessions/` holds the encoder's
+saved conversation states and `episode-salt`, kept across starts so
+sessions resume.
 
 If a local-mode run fails, check `rayline local status` and
 `~/.rayline/local/runtime.log` first.
