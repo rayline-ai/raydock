@@ -55,7 +55,9 @@ already. `--no-tensor` turns them off everywhere.
 
 All requests and errors are JSON; a successful `/encode` answers raw rows. A `POST` without
 `Content-Type: application/json` is refused with 415, so a web page cannot reach the loopback port without a CORS
-preflight (which the server never answers).
+preflight (which the server never answers). Requests whose `Host` is not the bound loopback address and port, or
+that carry an `Origin`, are refused with 403 (DNS rebinding). Bodies are capped near `--ctx` × 32 bytes, and token
+ids, offsets and `base` must be in-range integers (422 `invalid_body` otherwise).
 
 `GET /health` answers `{"engine" (llama.cpp tag, backend such as `metal`, `cuda` or `cpu`, and options), "depth", "budget", "rope", "max_model_len", "layer", "dim", "sessions",
 "capabilities", "checkpoint"}`.
@@ -86,7 +88,9 @@ fit beside the sessions held evicts the least recently used ones (saving them, w
 ### Saved sessions
 
 With `--state-dir DIR` (and `--persist-min`, default 16,384 tokens; `--state-max-gb`, default 32), a retained session
-is saved when it is evicted, closed, or the server stops: its sequence state, its tokens and the rows it returned. An
+is saved when it is evicted, closed, or the server stops: its sequence state, its tokens and the rows it returned.
+Each file is written under a temporary name and renamed into place; an entry whose files are missing, malformed or
+the wrong size is skipped (re-encoded), never restored. File names are derived from hashes, never from request text. An
 append to a session the process does not hold resumes the saved state that ends at its `base`; a full encode whose
 tokens start with a saved entry's tokens restores the longest such entry and encodes only the rest. The recurrent
 state cannot be truncated, so an entry only resumes from its exact end. A process killed without a signal loses

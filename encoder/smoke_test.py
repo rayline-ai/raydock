@@ -89,6 +89,16 @@ def main():
             check(False, "a non-JSON request is refused")
         except urllib.error.HTTPError as error:
             check(error.code == 415, "a non-JSON request is refused with 415")
+        status, _, _ = post(port, "/encode", {"base": 0, "tokens": [1.5], "offsets": [0], "retain": False})
+        check(status == 422, "a non-integer token is refused")
+        rebound = urllib.request.Request(
+            f"http://127.0.0.1:{port}/encode", data=b"{}",
+            headers={"Content-Type": "application/json", "Host": f"rebound.example:{port}"})
+        try:
+            urllib.request.urlopen(rebound, timeout=30)
+            check(False, "a foreign Host is refused")
+        except urllib.error.HTTPError as error:
+            check(error.code == 403, "a foreign Host is refused with 403")
         status, _, refused = post(port, "/encode", {"base": 0, "tokens": [1], "offsets": [0], "session": "x", "owner": 1})
         check(status == 422, "a non-string owner is refused")
         status, _, refused = post(port, "/encode", {"base": 0, "tokens": tokens, "offsets": [8], "retain": False})

@@ -129,20 +129,33 @@ struct Server {
         fs::create_directories(args.state_dir);
         for (const auto & f : fs::directory_iterator(args.state_dir)) {
             if (f.path().extension() != ".json") continue;
-            std::ifstream in(f.path());
-            json j = json::parse(in, nullptr, false);
-            const fs::path base = f.path().parent_path() / f.path().stem();
-            if (j.is_discarded() || !fs::exists(base.string() + ".state") || !fs::exists(base.string() + ".rows")) continue;
-            Entry e;
-            e.stem = f.path().stem().string();
-            e.session = j.value("session", "");
-            e.tokens = j["tokens"].get<std::vector<llama_token>>();
-            e.offsets = j["offsets"].get<std::vector<int32_t>>();
-            e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
-            e.mtime = j.value("saved", (int64_t) 0);
-            entries.push_back(std::move(e));
+            // A damaged or partial entry is skipped, never fatal.
+            try {
+                std::ifstream in(f.path());
+                json j = json::parse(in, nullptr, false);
+                const fs::path base = f.path().parent_path() / f.path().stem();
+                if (j.is_discarded() || !fs::exists(base.string() + ".state") || !fs::exists(base.string() + ".rows")) continue;
+                Entry e;
+                e.stem = f.path().stem().string();
+                e.session = j.at("session").get<std::string>();
+                e.tokens = j.at("tokens").get<std::vector<llama_token>>();
+                e.offsets = j.at("offsets").get<std::vector<int32_t>>();
+                if (!rows_file_ok(base.string() + ".rows", e.offsets.size())) continue;
+                e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
+                e.mtime = j.value("saved", (int64_t) 0);
+                entries.push_back(std::move(e));
+            } catch (const std::exception & ex) {
+                std::fprintf(stderr, "skipping saved session %s: %s\n", f.path().filename().c_str(), ex.what());
+            }
         }
         std::fprintf(stderr, "rayline-arc-encoder: %zu saved sessions in %s\n", entries.size(), args.state_dir.c_str());
+    }
+
+    // A rows file holds exactly one dim-wide float32 row per saved offset.
+    bool rows_file_ok(const std::string & path, size_t n) const {
+        std::error_code ec;
+        const auto size = fs::file_size(path, ec);
+        return !ec && size == n * (size_t) dim * sizeof(float);
     }
 
     void remove_entry(size_t i) {
@@ -174,25 +187,39 @@ struct Server {
         const auto t0 = std::chrono::steady_clock::now();
         const std::string stem = stem_for(id, s.n_past);
         const fs::path base = fs::path(args.state_dir) / stem;
-        if (llama_state_seq_save_file(ctx, (base.string() + ".state").c_str(), s.seq, s.tokens.data(), s.tokens.size()) == 0) {
+        // Write each file under a temporary name and rename it into place, the index (.json) last, so a failed or
+        // interrupted save never leaves an entry whose files are partial.
+        const std::string tmp = ".tmp";
+        auto discard = [&]() {
+            for (const char * ext : {".state", ".rows", ".json"}) { std::error_code ec; fs::remove(base.string() + ext + tmp, ec); }
             std::fprintf(stderr, "persist %s failed\n", id.c_str());
-            return;
-        }
+        };
+        if (llama_state_seq_save_file(ctx, (base.string() + ".state" + tmp).c_str(), s.seq, s.tokens.data(), s.tokens.size()) == 0)
+            return discard();
         Entry e;
         e.stem = stem;
         e.session = id;
         e.tokens = s.tokens;
         {
-            std::ofstream rows(base.string() + ".rows", std::ios::binary);
+            std::ofstream rows(base.string() + ".rows" + tmp, std::ios::binary);
             for (const auto & [off, row] : s.rows) {
                 e.offsets.push_back(off);
                 rows.write(reinterpret_cast<const char *>(row.data()), (std::streamsize) (row.size() * sizeof(float)));
             }
+            rows.close();
+            if (!rows) return discard();
         }
         e.mtime = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
         {
-            std::ofstream meta(base.string() + ".json");
+            std::ofstream meta(base.string() + ".json" + tmp);
             meta << json{{"session", id}, {"tokens", e.tokens}, {"offsets", e.offsets}, {"saved", e.mtime}}.dump();
+            meta.close();
+            if (!meta) return discard();
+        }
+        for (const char * ext : {".state", ".rows", ".json"}) {
+            std::error_code ec;
+            fs::rename(base.string() + ext + tmp, base.string() + ext, ec);
+            if (ec) return discard();
         }
         e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
         // drop older entries of this session (a session only grows), then enforce the disk budget, oldest first
@@ -228,13 +255,20 @@ struct Server {
             std::fprintf(stderr, "restore %s failed\n", e.stem.c_str());
             return false;
         }
+        std::map<int32_t, std::vector<float>> restored;
         std::ifstream rows(base.string() + ".rows", std::ios::binary);
-        s.rows.clear();
-        for (int32_t off : e.offsets) {
+        bool ok = rows_file_ok(base.string() + ".rows", e.offsets.size());
+        for (size_t i = 0; ok && i < e.offsets.size(); ++i) {
             std::vector<float> row(dim);
-            rows.read(reinterpret_cast<char *>(row.data()), (std::streamsize) (dim * sizeof(float)));
-            s.rows[off] = std::move(row);
+            ok = (bool) rows.read(reinterpret_cast<char *>(row.data()), (std::streamsize) (dim * sizeof(float)));
+            restored[e.offsets[i]] = std::move(row);
         }
+        if (!ok) {
+            llama_memory_seq_rm(llama_get_memory(ctx), seq, -1, -1);
+            std::fprintf(stderr, "restore %s failed: its rows file is damaged\n", e.stem.c_str());
+            return false;
+        }
+        s.rows = std::move(restored);
         s.tokens = e.tokens;
         s.n_past = (int32_t) e.tokens.size();
         s.saved_at = s.n_past;
@@ -353,6 +387,26 @@ std::string backend_name() {
     return "cpu";
 }
 
+// `j` as an array of integers in [0, max]: false for anything else (floats, negatives, values that would wrap).
+bool int_array(const json & j, int64_t max, std::vector<int32_t> & out) {
+    if (!j.is_array()) return false;
+    out.clear();
+    out.reserve(j.size());
+    for (const auto & v : j) {
+        if (v.is_number_unsigned()) {
+            if (v.get<uint64_t>() > (uint64_t) max) return false;
+            out.push_back((int32_t) v.get<uint64_t>());
+        } else if (v.is_number_integer()) {
+            const int64_t x = v.get<int64_t>();
+            if (x < 0 || x > max) return false;
+            out.push_back((int32_t) x);
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
 void refuse(httplib::Response & res, int status, const std::string & code) {
     res.status = status;
     res.set_content(json{{"error", code}}.dump(), "application/json");
@@ -440,6 +494,22 @@ int main(int argc, char ** argv) {
     s.load_index();
 
     httplib::Server http;
+    const int64_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(s.model));
+    // A request carries at most --ctx tokens and --ctx offsets, each a short decimal: cap the body near that, so a huge
+    // array is refused before it is parsed.
+    http.set_payload_max_length((size_t) llama_n_ctx(s.ctx) * 32 + 65536);
+    // Only this machine's clients, by name: a Host other than the bound address (DNS rebinding) or any Origin (a web
+    // page) is refused before routing.
+    int port = 0;
+    http.set_pre_routing_handler([&](const httplib::Request & req, httplib::Response & res) {
+        const std::string host = req.get_header_value("Host");
+        const std::string p = ":" + std::to_string(port);
+        const bool local_host = host == "127.0.0.1" + p || host == "localhost" + p || host == "[::1]" + p ||
+                                host == a.host + p;
+        if (local_host && !req.has_header("Origin")) return httplib::Server::HandlerResponse::Unhandled;
+        refuse(res, 403, "forbidden_origin");
+        return httplib::Server::HandlerResponse::Handled;
+    });
 
     http.Get("/health", [&](const httplib::Request &, httplib::Response & res) {
         std::lock_guard<std::mutex> lock(s.mu);
@@ -463,22 +533,26 @@ int main(int argc, char ** argv) {
         int32_t base = 0;
         std::string owner;
         bool retain = true;
+        const int64_t n_ctx = llama_n_ctx(s.ctx);
+        std::vector<int32_t> base_v;
+        if (!int_array(body["tokens"], n_vocab - 1, tokens) || !int_array(body["offsets"], n_ctx, offsets) ||
+            !int_array(json::array({body.value("base", json(0))}), n_ctx, base_v))
+            return refuse(res, 422, "invalid_body");
+        base = base_v[0];
         try {
-            tokens = body["tokens"].get<std::vector<llama_token>>();
-            offsets = body["offsets"].get<std::vector<int32_t>>();
-            base = body.value("base", 0);
             owner = body.value("owner", "");
             retain = body.value("retain", true);
         } catch (const std::exception &) {
             return refuse(res, 422, "invalid_body");
         }
-        if (tokens.empty() || offsets.empty() || base < 0) return refuse(res, 422, "invalid_body");
+        if (tokens.empty() || offsets.empty()) return refuse(res, 422, "invalid_body");
         const int64_t end = (int64_t) base + (int64_t) tokens.size();
         for (size_t i = 0; i < offsets.size(); ++i) {
             if (offsets[i] < base || offsets[i] >= end || (i && offsets[i] <= offsets[i - 1]))
                 return refuse(res, 422, "offsets_out_of_range");
         }
         const bool retained = body.contains("session") && body["session"].is_string();
+        if (retained && body["session"].get<std::string>().empty()) return refuse(res, 422, "invalid_body");
         if (!retained && retain) return refuse(res, 422, "invalid_retain");
 
         std::lock_guard<std::mutex> lock(s.mu);
@@ -493,6 +567,8 @@ int main(int argc, char ** argv) {
         Session * session = nullptr;
         Session scratch_session;  // an unretained encode's view of a restored prefix
         const std::string id = retained ? body["session"].get<std::string>() : "";
+        // Free KV space first: a restore below needs it as much as a decode does.
+        s.make_room(id, base + (int64_t) tokens.size());
         if (retained) {
             auto it = s.sessions.find(id);
             if (base == 0) {
@@ -524,8 +600,6 @@ int main(int argc, char ** argv) {
             scratch_session.seq = seq;
         }
         Session & held = session != nullptr ? *session : scratch_session;
-
-        s.make_room(id, base + (int64_t) tokens.size());
 
         // a full encode may start from a saved prefix
         int32_t start = base;
@@ -631,7 +705,7 @@ int main(int argc, char ** argv) {
     });
 
     // --port 0 binds a free port; the bound port is the first stdout line, for a supervising parent.
-    const int port = a.port == 0 ? http.bind_to_any_port(a.host) : (http.bind_to_port(a.host, a.port) ? a.port : -1);
+    port = a.port == 0 ? http.bind_to_any_port(a.host) : (http.bind_to_port(a.host, a.port) ? a.port : -1);
     if (port <= 0) { std::fprintf(stderr, "cannot bind %s:%d\n", a.host.c_str(), a.port); return 1; }
     std::fprintf(stderr, "rayline-arc-encoder: %s dim=%d ctx=%u on %s:%d\n", s.engine.c_str(), s.dim,
                  llama_n_ctx(s.ctx), a.host.c_str(), port);
