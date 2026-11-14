@@ -137,7 +137,8 @@ the pinned release, and the encoder weights against their pinned sha256.
 The encoder weights always come from `rayline-ai/ARC-1.0` at a commit built
 into Rayline, whatever `arc_release` names, and are downloaded without a
 token. Later starts
-use the cached copy and don't download it again. Start still needs
+use the cached copy and don't download it again; each start hashes the
+encoder weights again to check them. Start still needs
 Rayline cloud, as with `hosted` decisions, and still checks each model's
 `tokenizer` on Hugging Face.
 
