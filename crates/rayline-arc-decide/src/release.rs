@@ -198,6 +198,16 @@ impl fmt::Debug for Release {
     }
 }
 
+/// Whether price key `key` names the arm with this price id and endpoint.
+fn prices_arm(key: &str, model_id: &str, endpoint_tag: Option<&str>) -> bool {
+    key == model_id
+        || endpoint_tag.is_some_and(|tag| {
+            key.strip_prefix(model_id)
+                .and_then(|rest| rest.strip_prefix('@'))
+                == Some(tag)
+        })
+}
+
 fn read(path: &Path) -> Result<Vec<u8>, ReleaseError> {
     std::fs::read(path).map_err(|e| ReleaseError::Read(format!("{}: {e}", path.display())))
 }
@@ -343,6 +353,14 @@ pub fn stage_one_chunk_tokens(directory: &Path) -> Result<u32, ReleaseError> {
 }
 
 impl Release {
+    /// Whether a caller price row keyed `key` prices one of this release's
+    /// models: its price id, or `<id>@<endpoint>` for its endpoint.
+    pub fn reads_price_key(&self, key: &str) -> bool {
+        self.arms
+            .iter()
+            .any(|arm| prices_arm(key, &arm.model_id, arm.endpoint_tag.as_deref()))
+    }
+
     /// Loads the release in `directory`.
     pub fn load(directory: &Path) -> Result<Self, ReleaseError> {
         Self::from_files(&ReleaseFiles::in_dir(directory))
@@ -823,6 +841,17 @@ impl Release {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_price_key_names_an_arm_by_its_id_or_its_endpoint() {
+        assert!(prices_arm("vendor/m", "vendor/m", None));
+        assert!(prices_arm("vendor/m", "vendor/m", Some("e")));
+        assert!(prices_arm("vendor/m@e", "vendor/m", Some("e")));
+        assert!(!prices_arm("vendor/m@f", "vendor/m", Some("e")));
+        assert!(!prices_arm("vendor/m@e", "vendor/m", None));
+        assert!(!prices_arm("vendor/other", "vendor/m", Some("e")));
+        assert!(!prices_arm("m", "vendor/m", None));
+    }
 
     #[test]
     fn the_stage_one_chunk_is_read_from_the_serving_record() {

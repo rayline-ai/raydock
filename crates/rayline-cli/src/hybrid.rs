@@ -713,18 +713,11 @@ fn arc_encoder_weights(home: &Path) -> io::Result<PathBuf> {
                 ))
             })?,
     };
-    // The cache names each blob by its SHA-256, so a resolved link's name
-    // proves the content without hashing a gigabyte on every start. A
-    // snapshot that is a copy (no symlinks, as on Windows) is hashed.
+    // Hashed on every start: the blob's name alone doesn't prove its bytes.
     let blob = fs::canonicalize(&path)?;
-    let name = blob
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    let named = name == format!("sha256-{ARC_ENCODER_SHA256}") || name == ARC_ENCODER_SHA256;
-    if !named && file_sha256(&blob)? != ARC_ENCODER_SHA256 {
+    if file_sha256(&blob)? != ARC_ENCODER_SHA256 {
         return Err(io::Error::other(format!(
-            "the cached ARC encoder {} is not the pinned file (sha256 {ARC_ENCODER_SHA256})",
+            "the cached ARC encoder {} is not the pinned file (sha256 {ARC_ENCODER_SHA256}); delete it to download it again",
             blob.display()
         )));
     }

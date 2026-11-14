@@ -200,13 +200,26 @@ const RULES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Harness sections inside user text (dot matches newline): tags only
-/// harnesses inject, plus a leading `<context>` block opening with a date line.
-const SECTIONS: &str = concat!(
-    r"<(system-reminder|system_information|environment_details|environment_context|environment_info|",
-    r"session_context|turn-context|workspace_info|user_information|current-time|working-directory)>.*?</\1>",
-    r"|\A\s*<context>[ \t]*\nThe current date is [^\n]*\n.*?</context>"
-);
+/// Harness sections inside user text: a block in one of these tags, which
+/// only harnesses inject, from `<tag>` to the first `</tag>` after it (the
+/// reference's `<(tag|...)>.*?</\1>`, dot matching newline).
+const SECTION_TAGS: [&str; 11] = [
+    "system-reminder",
+    "system_information",
+    "environment_details",
+    "environment_context",
+    "environment_info",
+    "session_context",
+    "turn-context",
+    "workspace_info",
+    "user_information",
+    "current-time",
+    "working-directory",
+];
+
+/// The other harness section: a leading `<context>` block opening with a
+/// date line. It is tried only at the start, after a tag section.
+const CONTEXT_SECTION: &str = r"\A\s*<context>[ \t]*\nThe current date is [^\n]*\n.*?</context>";
 
 /// A harness time stamp opening a user text block, such as
 /// `[Thu 2026-01-01 00:00 UTC] `: a weekday, then a date and/or a clock time
@@ -228,7 +241,7 @@ fn turn_stamp() -> String {
 struct Ruleset {
     cwd: Vec<Regex>,
     rules: Vec<(Regex, Template)>,
-    sections: Regex,
+    context_section: Regex,
     turn_stamp: Regex,
 }
 
@@ -242,10 +255,67 @@ static RULESET: LazyLock<Result<Ruleset, String>> = LazyLock::new(|| {
             .iter()
             .map(|(pattern, template)| Ok((pyre::python(pattern, false)?, Template::new(template))))
             .collect::<Result<_, String>>()?,
-        sections: pyre::python(SECTIONS, true)?,
+        context_section: pyre::python(CONTEXT_SECTION, true)?,
         turn_stamp: pyre::python(&turn_stamp(), false)?,
     })
 });
+
+impl Ruleset {
+    /// The harness sections of `text` as byte ranges, left to right and not
+    /// overlapping: what the reference's section pattern matches, found in
+    /// linear time. A tag with no closing tag after one position has none
+    /// after any later one, so each tag's closing tag is searched for past a
+    /// given point at most once.
+    fn sections(&self, text: &str) -> Result<Vec<std::ops::Range<usize>>, ProjectionError> {
+        let mut found = Vec::new();
+        // Per tag, a position from which there is no closing tag.
+        let mut unclosed: [Option<usize>; SECTION_TAGS.len()] = [None; SECTION_TAGS.len()];
+        let mut at = 0;
+        while at < text.len() {
+            let rest = &text[at..];
+            let tag = SECTION_TAGS.iter().enumerate().find_map(|(index, tag)| {
+                let open_len = tag.len() + 2;
+                (rest.starts_with('<')
+                    && rest[1..].starts_with(tag)
+                    && rest[1 + tag.len()..].starts_with('>'))
+                .then_some((index, *tag, open_len))
+            });
+            let mut matched = None;
+            if let Some((index, tag, open_len)) = tag {
+                let from = at + open_len;
+                if unclosed[index].is_none_or(|none_from| from < none_from) {
+                    let close = format!("</{tag}>");
+                    match text[from..].find(&close) {
+                        Some(offset) => matched = Some(from + offset + close.len()),
+                        None => unclosed[index] = Some(from),
+                    }
+                }
+            }
+            if matched.is_none() && at == 0 {
+                matched = self
+                    .context_section
+                    .find(text)
+                    .map_err(|error| internal(error.to_string()))?
+                    .map(|whole| whole.end());
+            }
+            match matched {
+                Some(end) => {
+                    found.push(at..end);
+                    at = end;
+                }
+                None => {
+                    // The next place a section can start: a `<`, or never.
+                    let next = at + rest.chars().next().map_or(1, char::len_utf8);
+                    at = match text[next..].find('<') {
+                        Some(offset) => next + offset,
+                        None => text.len(),
+                    };
+                }
+            }
+        }
+        Ok(found)
+    }
+}
 
 fn ruleset() -> Result<&'static Ruleset, ProjectionError> {
     RULESET
@@ -339,19 +409,15 @@ impl Scrubber {
             out.push_str("[<DATE>] ");
         })
         .map_err(internal)?;
-        let mut failure = None;
-        let scrubbed = pyre::sub(&self.rules.sections, &stamped, 0, |captures, out| {
-            let section = captures.get(0).map_or("", |found| found.as_str());
-            match self.scrub(section) {
-                Ok(text) => out.push_str(&text),
-                Err(error) => failure = Some(error),
-            }
-        })
-        .map_err(internal)?;
-        match failure {
-            Some(error) => Err(error),
-            None => Ok(scrubbed),
+        let mut scrubbed = String::with_capacity(stamped.len());
+        let mut cursor = 0;
+        for section in self.rules.sections(&stamped)? {
+            scrubbed.push_str(&stamped[cursor..section.start]);
+            scrubbed.push_str(&self.scrub(&stamped[section.clone()])?);
+            cursor = section.end;
         }
+        scrubbed.push_str(&stamped[cursor..]);
+        Ok(scrubbed)
     }
 
     fn strings(&self, value: &Json) -> Result<Json, ProjectionError> {
@@ -401,9 +467,9 @@ pub fn scrub_environment(
     }
     for message in messages.iter().filter(|message| message.role == "user") {
         for block in message.content.iter().filter(|block| is_text(block)) {
-            for found in rules.sections.find_iter(block_text(block)?) {
-                let found = found.map_err(|error| internal(error.to_string()))?;
-                texts.push(found.as_str().to_owned());
+            let text = block_text(block)?;
+            for section in rules.sections(text)? {
+                texts.push(text[section].to_owned());
             }
         }
     }
@@ -558,6 +624,45 @@ mod tests {
              Assistant knowledge cutoff is <MODEL_CUTOFF>.\nToday's date is <DATE>.\n\
              Read <CWD>/src and <HOME>/code/application."
         );
+    }
+
+    #[test]
+    fn sections_match_the_reference_pattern_and_stay_linear_on_unclosed_tags() {
+        // The reference's pattern, run by the backtracking engine.
+        let reference = pyre::python(
+            concat!(
+                r"<(system-reminder|system_information|environment_details|environment_context|environment_info|",
+                r"session_context|turn-context|workspace_info|user_information|current-time|working-directory)>.*?</\1>",
+                r"|\A\s*<context>[ \t]*\nThe current date is [^\n]*\n.*?</context>"
+            ),
+            true,
+        )
+        .unwrap();
+        let rules = ruleset().unwrap();
+        for text in [
+            "",
+            "plain",
+            "<system-reminder>a</system-reminder>",
+            "x<system-reminder>a\nb</system-reminder>y<current-time>t</current-time>",
+            "<system-reminder>open <system-reminder>inner</system-reminder> tail</system-reminder>",
+            "<system-reminder>never closed <current-time>t</current-time>",
+            "<current-time>a</system-reminder></current-time>",
+            "  <context>\nThe current date is today\nbody</context> rest",
+            "<context>\nThe current date is today\nbody</context><system-reminder>s</system-reminder>",
+            "<system-reminder>s</system-reminder><context>\nThe current date is d\n</context>",
+            "<<system-reminder>>x</system-reminder>>",
+            "é<working-directory>/tmp</working-directory>ü",
+        ] {
+            let expected: Vec<std::ops::Range<usize>> = reference
+                .find_iter(text)
+                .map(|found| found.unwrap().range())
+                .collect();
+            assert_eq!(rules.sections(text).unwrap(), expected, "{text:?}");
+        }
+        let hostile = "<system-reminder>x".repeat(200_000);
+        let started = std::time::Instant::now();
+        assert!(rules.sections(&hostile).unwrap().is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
     }
 
     #[test]

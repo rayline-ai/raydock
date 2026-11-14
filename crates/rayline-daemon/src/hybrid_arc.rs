@@ -294,23 +294,19 @@ impl LocalDecider {
         request: Option<&str>,
     ) -> Result<serde_json::Value, rayline_arc_routes::Refusal> {
         let refuse = |code: &str, message: String| rayline_arc_routes::Refusal::new(code, message);
-        let mut text = serde_json::to_string(body)
-            .map_err(|error| refuse("internal_error", format!("decide body: {error}")))?;
-        if let (Some(request), Some(rest)) = (request, body.as_object()) {
-            let mut rest = rest.clone();
-            rest.remove("request");
-            let rest = serde_json::to_string(&rest)
-                .map_err(|error| refuse("internal_error", format!("decide body: {error}")))?;
-            // `rest` is a JSON object: splice the request in as its first member.
-            text = match rest.strip_prefix('{') {
-                Some("}") => format!("{{\"request\":{request}}}"),
-                Some(members) => format!("{{\"request\":{request},{members}"),
-                None => text,
-            };
-        }
-        let input: rayline_arc_decide::DecideInput = serde_json::from_str(&text)
+        let text = rayline_arc_routes::decide_body_text(body, request)?;
+        let mut input: rayline_arc_decide::DecideInput = serde_json::from_str(&text)
             .map_err(|error| refuse("invalid_request", format!("decide body: {error}")))?;
         let release = self.release.clone();
+        // Caller price rows for models this release doesn't know are
+        // reported unused in the answer, not sent to the decision, which
+        // refuses them.
+        if let Some(prices) = input.routing_prices.as_mut() {
+            prices.rates.retain(|key, _| release.reads_price_key(key));
+            if prices.rates.is_empty() {
+                input.routing_prices = None;
+            }
+        }
         let encoder = self.encoder.clone();
         // The decision encodes and scores on the CPU and blocks on the
         // encoder; keep it off the async workers.

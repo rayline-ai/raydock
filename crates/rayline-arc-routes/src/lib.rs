@@ -37,7 +37,9 @@ pub use parse::{
     RequestHeaders, Restate, RoutingPrices, Selection, Tier, parse,
 };
 pub use policy::{Overrides, Policy, Schedule, Selection as SelectionThresholds};
-pub use server::{DecideFuture, Decider, HttpDecider, Router, RouterConfig, RouterError};
+pub use server::{
+    DecideFuture, Decider, HttpDecider, Router, RouterConfig, RouterError, decide_body_text,
+};
 pub use shape::shape;
 
 /// The price legs of one model, in USD per million tokens, in contract order.

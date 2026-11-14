@@ -51,6 +51,26 @@ pub trait Decider: Send + Sync {
     }
 }
 
+/// The decide body as JSON text, with `request` (when given) spliced in as
+/// the text the harness sent, so its keys keep their sent order.
+pub fn decide_body_text(body: &Value, request: Option<&str>) -> Result<String, Refusal> {
+    let internal = |error: serde_json::Error| {
+        Refusal::with_status(500, "internal_error", format!("decide body: {error}"))
+    };
+    let (Some(request), Some(rest)) = (request, body.as_object()) else {
+        return serde_json::to_string(body).map_err(internal);
+    };
+    let mut rest = rest.clone();
+    rest.remove("request");
+    let rest = serde_json::to_string(&rest).map_err(internal)?;
+    // `rest` is a JSON object: splice the request in as its first member.
+    Ok(match rest.strip_prefix('{') {
+        Some("}") => format!("{{\"request\":{request}}}"),
+        Some(members) => format!("{{\"request\":{request},{members}"),
+        None => rest,
+    })
+}
+
 /// The Anthropic Messages members of a decide request (`system`, `tools`,
 /// `messages`, nulls left out) as the text the harness sent them in.
 fn messages_request_text(raw: &[u8]) -> Option<String> {
@@ -153,9 +173,10 @@ fn refusal_code(body: &[u8]) -> String {
         .to_owned()
 }
 
-impl Decider for HttpDecider {
-    fn decide<'a>(&'a self, body: &'a Value) -> DecideFuture<'a> {
-        Box::pin(async move {
+impl HttpDecider {
+    async fn post(&self, body: &Value, request: Option<&str>) -> Result<Value, Refusal> {
+        let text = decide_body_text(body, request)?;
+        {
             let unreachable = |error: reqwest::Error| {
                 if error.is_timeout() {
                     Refusal::new("timeout", "the decide service did not answer in time.")
@@ -166,7 +187,8 @@ impl Decider for HttpDecider {
             let response = self
                 .client
                 .post(&self.url)
-                .json(body)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(text)
                 .send()
                 .await
                 .map_err(unreachable)?;
@@ -181,7 +203,17 @@ impl Decider for HttpDecider {
                 &refusal_code(&bytes),
                 "the decide service refused the request.",
             ))
-        })
+        }
+    }
+}
+
+impl Decider for HttpDecider {
+    fn decide<'a>(&'a self, body: &'a Value) -> DecideFuture<'a> {
+        Box::pin(self.post(body, None))
+    }
+
+    fn decide_with_text<'a>(&'a self, body: &'a Value, request: &'a str) -> DecideFuture<'a> {
+        Box::pin(self.post(body, Some(request)))
     }
 }
 
@@ -667,6 +699,43 @@ impl Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn the_http_decider_sends_the_request_text_as_the_harness_sent_it() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let served = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut seen = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !seen.ends_with(b"}") {
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                seen.extend_from_slice(&chunk[..read]);
+            }
+            let answer = b"{}";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                answer.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(answer).await.unwrap();
+            String::from_utf8(seen).unwrap()
+        });
+        let decider = HttpDecider::new(&format!("http://{address}")).unwrap();
+        let sent = r#"{"system":"s","tools":[{"name":"t","input_schema":{"z":1,"a":2}}]}"#;
+        let body = serde_json::json!({"schema_version": "v", "request": serde_json::from_str::<Value>(sent).unwrap()});
+        decider.decide_with_text(&body, sent).await.unwrap();
+        let seen = served.await.unwrap();
+        let text = seen.split("\r\n\r\n").nth(1).unwrap();
+        assert_eq!(
+            text,
+            format!(r#"{{"request":{sent},"schema_version":"v"}}"#)
+        );
+    }
 
     #[test]
     fn loopback_hosts_with_or_without_a_port() {
