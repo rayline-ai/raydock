@@ -95,6 +95,26 @@ impl Catalog {
         })
     }
 
+    /// A catalog from its parts, for a release whose manifest is not a
+    /// package (`package_sha256` is then the digest of what it is).
+    pub fn from_parts(
+        alias: &str,
+        package_sha256: String,
+        thinking_controls_sha256: Option<String>,
+        actions: impl IntoIterator<Item = (String, Action)>,
+    ) -> Self {
+        Self {
+            alias: alias.to_owned(),
+            package_sha256,
+            thinking_controls_sha256,
+            actions: actions.into_iter().collect(),
+            public_ids: PUBLIC_IDS
+                .iter()
+                .map(|(name, id)| ((*name).to_owned(), (*id).to_owned()))
+                .collect(),
+        }
+    }
+
     /// The id an answer names a policy model by when no caller price key
     /// priced it: its public id, else the bare name.
     pub fn public_id(&self, model: &str) -> String {

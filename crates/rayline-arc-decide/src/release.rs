@@ -343,6 +343,9 @@ fn require_recipe(recipe: &Value) -> Result<f64, ReleaseError> {
 /// (`arc.serving.stage_one.encoder.chunk_tokens`): the tokens per encoder
 /// decode call its readouts were made with.
 pub fn stage_one_chunk_tokens(directory: &Path) -> Result<u32, ReleaseError> {
+    if crate::runtime::is_runtime_release(directory) {
+        return crate::runtime::chunk_tokens(directory);
+    }
     let path = ReleaseFiles::in_dir(directory).config;
     let config = json(&path, &read(&path)?)?;
     config["arc"]["serving"]["stage_one"]["encoder"]["chunk_tokens"]
@@ -362,7 +365,11 @@ impl Release {
     }
 
     /// Loads the release in `directory`.
+    /// A directory with `arc-runtime.json` is read as a runtime release.
     pub fn load(directory: &Path) -> Result<Self, ReleaseError> {
+        if crate::runtime::is_runtime_release(directory) {
+            return Self::from_runtime(directory);
+        }
         Self::from_files(&ReleaseFiles::in_dir(directory))
     }
 
@@ -762,6 +769,43 @@ impl Release {
     pub fn with_local_placement_exemption(mut self, exempt: bool) -> Self {
         self.local_placement_exempt = exempt;
         self
+    }
+
+    /// Whether the release has rates of its own (from its package, a price
+    /// scenario or a per-model card) that fully price at least one arm.
+    /// Without them it prices no model, and a decision that weighs cost
+    /// cannot be made.
+    pub fn has_prices(&self) -> bool {
+        self.package_rates
+            .iter()
+            .flatten()
+            .any(|rates| rates.iter().all(Option::is_some))
+    }
+
+    /// Whether the release takes a caller's own prices into its decisions.
+    /// A release that doesn't refuses a request that carries them.
+    pub fn accepts_caller_prices(&self) -> bool {
+        self.live_prices
+    }
+
+    /// Whether an arm of the release is the model a price table names `id`.
+    pub fn knows_model(&self, id: &str) -> bool {
+        self.arms.iter().any(|arm| arm.model_id == id)
+    }
+
+    /// Whether the release's own rates fully price every arm of the model a
+    /// price table names `id`.
+    pub fn prices_model(&self, id: &str) -> bool {
+        let Some(rates) = &self.package_rates else {
+            return false;
+        };
+        let mut arms = self
+            .arms
+            .iter()
+            .zip(rates)
+            .filter(|(arm, _)| arm.model_id == id)
+            .peekable();
+        arms.peek().is_some() && arms.all(|(_, rates)| rates.iter().all(Option::is_some))
     }
 
     pub fn with_prices(mut self, path: &Path) -> Result<Self, ReleaseError> {

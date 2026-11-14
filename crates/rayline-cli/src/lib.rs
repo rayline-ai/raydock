@@ -4,6 +4,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
+pub(crate) mod arc_release;
 pub(crate) mod auth_callback_page;
 pub mod claude;
 pub(crate) mod claude_daemon;

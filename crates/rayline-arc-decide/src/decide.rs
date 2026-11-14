@@ -292,20 +292,38 @@ impl OneContext<'_> {
                 continue;
             }
             log_latency[candidate] = 0.0;
-            let weighable = policy.cost_weight == 0.0
-                || (release.usage_known[candidate]
-                    && self.candidate_rates[candidate]
-                        .is_ok_and(|r| r.iter().all(|r| r.is_finite())));
-            if release.withheld[candidate] == Some(Withheld::NoLatencyFactor)
-                && !release.unmapped[candidate]
-                && weighable
-            {
+            if reoffered_locally(
+                release.withheld[candidate],
+                release.unmapped[candidate],
+                release.usage_known[candidate],
+                self.candidate_rates[candidate],
+                policy.cost_weight,
+            ) {
                 policy.offered[candidate] = true;
             }
         }
         policy
     }
+}
 
+/// Whether a candidate the caller runs locally is offered although the
+/// release withheld it. Only a mapped candidate withheld for having no
+/// latency factor is, and only when its cost can be weighed: with a cost
+/// weight, its usage must be known and every one of its rates finite. A
+/// missing price is `NaN` in its rates, so it stays withheld.
+fn reoffered_locally(
+    withheld: Option<Withheld>,
+    unmapped: bool,
+    usage_known: bool,
+    rates: Result<[f64; LEGS], ()>,
+    cost_weight: f64,
+) -> bool {
+    let weighable =
+        cost_weight == 0.0 || (usage_known && rates.is_ok_and(|r| r.iter().all(|r| r.is_finite())));
+    withheld == Some(Withheld::NoLatencyFactor) && !unmapped && weighable
+}
+
+impl OneContext<'_> {
     /// Scores every candidate at a boundary and chooses: the best offered
     /// one at a start, the held one elsewhere.
     fn decide_boundary(
@@ -1447,4 +1465,43 @@ pub fn decide(
         },
         stage_one: outcome.evidence,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRICED: [f64; LEGS] = [1.0, 2.0, 0.1, 1.25];
+
+    #[test]
+    fn a_local_candidate_without_prices_stays_withheld_when_cost_is_weighed() {
+        let no_factor = Some(Withheld::NoLatencyFactor);
+        // Priced and with known usage: offered at any cost weight.
+        assert!(reoffered_locally(no_factor, false, true, Ok(PRICED), 1.0));
+        // A missing price (`NaN`) or usage the release does not know keeps it
+        // withheld while cost is weighed, and so do arms priced apart.
+        let mut missing = PRICED;
+        missing[2] = f64::NAN;
+        assert!(!reoffered_locally(no_factor, false, true, Ok(missing), 1.0));
+        assert!(!reoffered_locally(no_factor, false, false, Ok(PRICED), 1.0));
+        assert!(!reoffered_locally(no_factor, false, true, Err(()), 1.0));
+        // Without a cost weight, its prices do not enter the score.
+        assert!(reoffered_locally(no_factor, false, false, Ok(missing), 0.0));
+        // Only a mapped candidate withheld for its latency factor returns.
+        assert!(!reoffered_locally(no_factor, true, true, Ok(PRICED), 1.0));
+        for other in [
+            Withheld::BySelector,
+            Withheld::Excluded,
+            Withheld::Unsupported,
+            Withheld::UserTrafficOnly,
+        ] {
+            assert!(!reoffered_locally(
+                Some(other),
+                false,
+                true,
+                Ok(PRICED),
+                0.0
+            ));
+        }
+    }
 }

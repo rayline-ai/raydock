@@ -246,7 +246,7 @@ fn a_signed_out_local_start_fails_before_it_clears_state_or_downloads() {
     let state = home.0.join(".rayline").join("local");
     fs::create_dir_all(&state).expect("state dir");
     let supervisor = format!(
-        r#"{{"pid": {}, "config": "/c.json", "env": null}}"#,
+        r#"{{"pid": {}, "config": "/c.json", "env": null, "decisions": "hosted decisions"}}"#,
         exited.id()
     );
     fs::write(state.join("supervisor.json"), &supervisor).expect("supervisor");
