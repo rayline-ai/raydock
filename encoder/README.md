@@ -2,7 +2,8 @@
 
 The local ARC encoder. Rayline's local routing starts it to read the ARC encoder's final-layer state at chosen token
 offsets, on this Mac, instead of asking a hosted router. It is a small HTTP server on llama.cpp (`libllama`, static,
-Metal) that runs the public ARC encoder GGUF (`rayline-ai/ARC-1.0`). It ships for macOS arm64 only.
+Metal) that runs the public ARC encoder GGUF (`rayline-ai/ARC-1.0`). Releases ship it for macOS arm64 only;
+`build.sh` also builds it on Linux (CUDA or CPU) for development.
 
 - `arc_encoder_server.cpp`: the server.
 - `patches/`: changes to the pinned llama.cpp (below).
@@ -20,8 +21,18 @@ python3 encoder/smoke_test.py encoder/build/dist/rayline-arc-encoder [model.gguf
 ```
 
 `build.sh` refuses a checkout at another commit, local changes other than the pinned patches, and any patch whose
-sha256 is not the pinned one. The binary links only system frameworks (Metal, Foundation, Accelerate), has the Metal
+sha256 is not the pinned one, and untracked files in the checkout. The binary links only system frameworks (Metal, Foundation, Accelerate), has the Metal
 shaders embedded, and needs macOS 13 or later. It is built without curl or OpenSSL: it never downloads anything.
+
+On Linux (not shipped in releases):
+
+```bash
+encoder/build.sh --backend cuda --cuda-arch "89;121"   # explicit CMAKE_CUDA_ARCHITECTURES; needs the CUDA toolkit
+encoder/build.sh --backend cpu                         # pass --threads at run time (libllama defaults to 4)
+```
+
+The CUDA build links the CUDA runtime and cuBLAS statically, so it needs only the NVIDIA driver at run time (and is
+large, ~700 MB).
 
 ## Running it
 
@@ -32,7 +43,7 @@ rayline-arc-encoder --model arc-encoder-bf16.gguf --port 0 --budget 8192 --ctx 1
 
 `--port 0` binds a free loopback port and prints `{"listening": PORT}` as the first stdout line. `--parent-pipe` stops
 the server (saving its sessions) when its stdin closes. `--budget` is the tokens per decode call and must equal the
-encoder release's chunk size (8192 for ARC 1.0). `--help` lists every flag.
+encoder release's chunk size (8192 for ARC 1.0). `--threads N` sets the CPU threads. `--help` lists every flag.
 
 `rayline` finds the encoder beside its own executable; `RAYLINE_ARC_ENCODER` names another binary.
 
@@ -42,9 +53,11 @@ already. `--no-tensor` turns them off everywhere.
 
 ## Protocol
 
-All requests and errors are JSON; a successful `/encode` answers raw rows.
+All requests and errors are JSON; a successful `/encode` answers raw rows. A `POST` without
+`Content-Type: application/json` is refused with 415, so a web page cannot reach the loopback port without a CORS
+preflight (which the server never answers).
 
-`GET /health` answers `{"engine", "depth", "budget", "rope", "max_model_len", "layer", "dim", "sessions",
+`GET /health` answers `{"engine" (llama.cpp tag, backend such as `metal`, `cuda` or `cpu`, and options), "depth", "budget", "rope", "max_model_len", "layer", "dim", "sessions",
 "capabilities", "checkpoint"}`.
 
 `POST /encode`:
@@ -67,7 +80,8 @@ and `x-restored-tokens`), `409 {"error": "unknown_session"}` for an append to a 
 
 Readouts are llama.cpp's per-token embeddings with pooling `NONE`: the final norm's output at each offset. A retained
 session is one llama sequence holding the full-attention KV cache and the GatedDeltaNet recurrent state, so an append
-continues it.
+continues it. Sessions share one KV cache of `--ctx` tokens: besides the `--sessions` limit, a request that would not
+fit beside the sessions held evicts the least recently used ones (saving them, with `--state-dir`) first.
 
 ### Saved sessions
 

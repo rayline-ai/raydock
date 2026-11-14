@@ -37,9 +37,11 @@
 // cleared afterwards. Text only: images are refused (images_not_served).
 
 #include "llama.h"
+#include "ggml-backend.h"
 #include "httplib.h"
 #include "nlohmann/json.hpp"
 
+#include <cctype>
 #include <chrono>
 #include <csignal>
 #include <filesystem>
@@ -95,6 +97,7 @@ struct Args {
     int persist_min = 16384;     // smallest session worth saving
     double state_max_gb = 32.0;  // disk budget; the oldest entries go first
     bool parent_pipe = false;    // exit when stdin closes (a supervising parent went away)
+    int threads = 0;             // CPU threads; 0: libllama's default (4)
     bool tensor = true;          // false: never use Metal tensor-API kernels (GGML_METAL_TENSOR_DISABLE)
     // > 0: a full encode longer than this many tokens saves its state at this length (a shared
     // prefix: an agent's system prompt and tools), so other sessions with the same first tokens restore it.
@@ -161,7 +164,8 @@ struct Server {
     bool has_checkpoint(const std::vector<llama_token> & tokens, int32_t n) const {
         const std::string id = checkpoint_id(tokens, n);
         for (const auto & e : entries)
-            if (e.session == id && std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) return true;
+            if (e.session == id && (int32_t) e.tokens.size() == n &&
+                std::equal(e.tokens.begin(), e.tokens.end(), tokens.begin())) return true;
         return false;
     }
 
@@ -192,7 +196,11 @@ struct Server {
         }
         e.bytes = fs::file_size(base.string() + ".state") + fs::file_size(base.string() + ".rows");
         // drop older entries of this session (a session only grows), then enforce the disk budget, oldest first
-        for (size_t i = entries.size(); i-- > 0;) if (entries[i].session == id) remove_entry(i);
+        for (size_t i = entries.size(); i-- > 0;) {
+            if (entries[i].session != id) continue;
+            if (entries[i].stem == stem) entries.erase(entries.begin() + (long) i);  // overwritten above
+            else remove_entry(i);
+        }
         entries.push_back(std::move(e));
         uint64_t total = 0;
         for (const auto & x : entries) total += x.bytes;
@@ -254,6 +262,26 @@ struct Server {
 
     void drop(const Session & s) { llama_memory_seq_rm(llama_get_memory(ctx), s.seq, -1, -1); seq_used[s.seq] = false; }
 
+    // The KV cache is shared by every sequence, so a session count alone does not bound it: before decoding up to
+    // `total` tokens for `keep` (empty: the unretained scratch), evict least recently used sessions until the
+    // tokens held fit in the context.
+    void make_room(const std::string & keep, int64_t total) {
+        for (;;) {
+            int64_t held = total;
+            auto lru = sessions.end();
+            for (auto it = sessions.begin(); it != sessions.end(); ++it) {
+                if (it->first == keep) continue;
+                held += it->second.n_past;
+                if (lru == sessions.end() || it->second.last_used < lru->second.last_used) lru = it;
+            }
+            if (held <= (int64_t) llama_n_ctx(ctx) || lru == sessions.end()) return;
+            std::fprintf(stderr, "evicting %s (%d tokens) for KV space\n", lru->first.c_str(), lru->second.n_past);
+            persist(lru->first, lru->second);
+            drop(lru->second);
+            sessions.erase(lru);
+        }
+    }
+
     // A free sequence id for a new retained session, evicting the least recently used one when all are taken.
     llama_seq_id take_seq() {
         for (int i = 0; i < args.sessions; ++i) {
@@ -306,6 +334,25 @@ struct Server {
     }
 };
 
+// Requests must say they are JSON: a web page cannot send that content type to this loopback port without a CORS
+// preflight, which this server never answers.
+bool is_json(const httplib::Request & req) {
+    return req.get_header_value("Content-Type").rfind("application/json", 0) == 0;
+}
+
+// The backend that runs the model: the first GPU device's backend ("metal", "cuda", ...), else "cpu".
+std::string backend_name() {
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        const auto type = ggml_backend_dev_type(dev);
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) continue;
+        std::string name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev));
+        for (auto & c : name) c = (char) std::tolower((unsigned char) c);
+        return name == "mtl" ? "metal" : name;
+    }
+    return "cpu";
+}
+
 void refuse(httplib::Response & res, int status, const std::string & code) {
     res.status = status;
     res.set_content(json{{"error", code}}.dump(), "application/json");
@@ -315,6 +362,7 @@ void refuse(httplib::Response & res, int status, const std::string & code) {
 void usage() {
     std::fprintf(stderr, "usage: rayline-arc-encoder --model F.gguf [--port P] [--ctx N] [--budget N] "
                          "[--ubatch N] [--sessions N] [--kv-type f16|bf16|f32] [--no-flash-attn] [--no-tensor]\n"
+                         "       [--threads N] [--host H]\n"
                          "       [--state-dir DIR] [--persist-min N] [--state-max-gb G] [--parent-pipe]\n"
                          "       [--checkpoint N (a multiple of --budget; needs --state-dir)]\n");
 }
@@ -337,6 +385,7 @@ bool parse_args(int argc, char ** argv, Args & a) {
         else if (k == "--persist-min") a.persist_min = std::atoi(val().c_str());
         else if (k == "--state-max-gb") a.state_max_gb = std::atof(val().c_str());
         else if (k == "--no-tensor") a.tensor = false;
+        else if (k == "--threads") a.threads = std::atoi(val().c_str());
         else if (k == "--parent-pipe") a.parent_pipe = true;
         else if (k == "--checkpoint") a.checkpoint = std::atoi(val().c_str());
         else if (k == "--help") { usage(); return false; }
@@ -382,10 +431,11 @@ int main(int argc, char ** argv) {
     const ggml_type kv = a.kv_type == "bf16" ? GGML_TYPE_BF16 : a.kv_type == "f32" ? GGML_TYPE_F32 : GGML_TYPE_F16;
     cp.type_k = kv;
     cp.type_v = kv;
+    if (a.threads > 0) { cp.n_threads = a.threads; cp.n_threads_batch = a.threads; }
     s.ctx = llama_init_from_model(s.model, cp);
     if (s.ctx == nullptr) { std::fprintf(stderr, "failed to create the context\n"); return 1; }
     s.seq_used.assign(a.sessions, false);
-    s.engine = "llamacpp@b11669-arc+metal+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + (a.tensor && std::getenv("GGML_METAL_TENSOR_ENABLE") ? "+tensor" : "") +
+    s.engine = "llamacpp@b11669-arc+" + backend_name() + "+kv-" + a.kv_type + (a.flash_attn ? "+fa" : "") + (a.tensor && std::getenv("GGML_METAL_TENSOR_ENABLE") ? "+tensor" : "") +
                a.engine_suffix;
     s.load_index();
 
@@ -403,6 +453,7 @@ int main(int argc, char ** argv) {
     });
 
     http.Post("/encode", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!is_json(req)) return refuse(res, 415, "json_required");
         json body = json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object() || !body.contains("tokens") || !body.contains("offsets"))
             return refuse(res, 422, "invalid_body");
@@ -410,20 +461,25 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> tokens;
         std::vector<int32_t> offsets;
         int32_t base = 0;
+        std::string owner;
+        bool retain = true;
         try {
             tokens = body["tokens"].get<std::vector<llama_token>>();
             offsets = body["offsets"].get<std::vector<int32_t>>();
             base = body.value("base", 0);
+            owner = body.value("owner", "");
+            retain = body.value("retain", true);
         } catch (const std::exception &) {
             return refuse(res, 422, "invalid_body");
         }
-        if (tokens.empty() || offsets.empty()) return refuse(res, 422, "invalid_body");
+        if (tokens.empty() || offsets.empty() || base < 0) return refuse(res, 422, "invalid_body");
+        const int64_t end = (int64_t) base + (int64_t) tokens.size();
         for (size_t i = 0; i < offsets.size(); ++i) {
-            if (offsets[i] < base || offsets[i] >= base + (int32_t) tokens.size() || (i && offsets[i] <= offsets[i - 1]))
+            if (offsets[i] < base || offsets[i] >= end || (i && offsets[i] <= offsets[i - 1]))
                 return refuse(res, 422, "offsets_out_of_range");
         }
         const bool retained = body.contains("session") && body["session"].is_string();
-        if (!retained && body.value("retain", true)) return refuse(res, 422, "invalid_retain");
+        if (!retained && retain) return refuse(res, 422, "invalid_retain");
 
         std::lock_guard<std::mutex> lock(s.mu);
         if (base + (int64_t) tokens.size() > (int64_t) llama_n_ctx(s.ctx)) {
@@ -443,19 +499,20 @@ int main(int argc, char ** argv) {
                 if (it != s.sessions.end()) { s.drop(it->second); s.sessions.erase(it); }
                 Session fresh;
                 fresh.seq = s.take_seq();
-                fresh.owner = body.value("owner", "");
+                fresh.owner = owner;
                 session = &(s.sessions[id] = fresh);
             } else if (it != s.sessions.end() && it->second.n_past == base) {
                 session = &it->second;
             } else {
                 // not held (or held at another length): resume a saved state of this session that ends at base
-                const Entry * saved = nullptr;
-                for (const auto & e : s.entries) if (e.session == id && (int32_t) e.tokens.size() == base) saved = &e;
-                if (saved == nullptr) return refuse(res, 409, "unknown_session");
+                // a copy: take_seq() may save an evicted session, which changes `entries`
+                std::optional<Entry> saved;
+                for (const auto & e : s.entries) if (e.session == id && (int32_t) e.tokens.size() == base) saved = e;
+                if (!saved) return refuse(res, 409, "unknown_session");
                 if (it != s.sessions.end()) { s.drop(it->second); s.sessions.erase(it); }
                 Session fresh;
                 fresh.seq = s.take_seq();
-                fresh.owner = body.value("owner", "");
+                fresh.owner = owner;
                 if (!s.restore(*saved, fresh.seq, fresh)) { s.seq_used[fresh.seq] = false; return refuse(res, 409, "unknown_session"); }
                 session = &(s.sessions[id] = std::move(fresh));
             }
@@ -467,6 +524,8 @@ int main(int argc, char ** argv) {
             scratch_session.seq = seq;
         }
         Session & held = session != nullptr ? *session : scratch_session;
+
+        s.make_room(id, base + (int64_t) tokens.size());
 
         // a full encode may start from a saved prefix
         int32_t start = base;
@@ -553,8 +612,10 @@ int main(int argc, char ** argv) {
     });
 
     http.Post("/close", [&](const httplib::Request & req, httplib::Response & res) {
+        if (!is_json(req)) return refuse(res, 415, "json_required");
         json body = json::parse(req.body, nullptr, false);
-        const std::string owner = body.is_object() ? body.value("owner", "") : "";
+        const std::string owner =
+            body.is_object() && body.contains("owner") && body["owner"].is_string() ? body["owner"].get<std::string>() : "";
         std::lock_guard<std::mutex> lock(s.mu);
         int closed = 0;
         for (auto it = s.sessions.begin(); it != s.sessions.end();) {

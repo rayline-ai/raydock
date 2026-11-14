@@ -83,8 +83,22 @@ def main():
         check(status == 200 and len(appended) == dim * 4, "an append to the session answers one row")
         status, _, _ = post(port, "/encode", {"base": 4, "tokens": [9], "offsets": [4], "session": "unknown"})
         check(status == 409, "an append to an unknown session answers 409")
+        form = urllib.request.Request(f"http://127.0.0.1:{port}/encode", data=b"tokens=1")
+        try:
+            urllib.request.urlopen(form, timeout=30)
+            check(False, "a non-JSON request is refused")
+        except urllib.error.HTTPError as error:
+            check(error.code == 415, "a non-JSON request is refused with 415")
+        status, _, refused = post(port, "/encode", {"base": 0, "tokens": [1], "offsets": [0], "session": "x", "owner": 1})
+        check(status == 422, "a non-string owner is refused")
         status, _, refused = post(port, "/encode", {"base": 0, "tokens": tokens, "offsets": [8], "retain": False})
         check(status == 422 and json.loads(refused)["error"] == "offsets_out_of_range", "an offset past the input 422")
+
+        # Sessions share one KV cache of --ctx tokens: a session that does not fit evicts the least recently used.
+        status, _, _ = post(port, "/encode", {"base": 0, "tokens": [5] * 100, "offsets": [99], "session": "t"})
+        check(status == 200, "a second session fits")
+        status, _, _ = post(port, "/encode", {"base": 0, "tokens": [6] * 200, "offsets": [199], "session": "u"})
+        check(status == 200, "a session too big for the free KV space evicts older ones")
 
         server.stdin.close()
         check(server.wait(timeout=60) == 0, "stops when its stdin closes")

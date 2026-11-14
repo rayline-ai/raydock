@@ -162,13 +162,14 @@ done
 )
 
 mkdir -p "$INSTALL_DIR"
-install -m 0644 "$tmp_dir/rayline-core-LICENSE" "$INSTALL_DIR/rayline-core-LICENSE"
-install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/rayline"
-install -m 0755 "$tmp_dir/$core_asset" "$INSTALL_DIR/rayline-core"
+# The encoder goes first, so a failed copy never leaves a new rayline without it.
 if $encoder; then
   install -m 0644 "$tmp_dir/rayline-arc-encoder-LICENSE" "$INSTALL_DIR/rayline-arc-encoder-LICENSE"
   install -m 0755 "$tmp_dir/$encoder_asset" "$INSTALL_DIR/rayline-arc-encoder"
 fi
+install -m 0644 "$tmp_dir/rayline-core-LICENSE" "$INSTALL_DIR/rayline-core-LICENSE"
+install -m 0755 "$tmp_dir/$rayline_asset" "$INSTALL_DIR/rayline"
+install -m 0755 "$tmp_dir/$core_asset" "$INSTALL_DIR/rayline-core"
 
 echo "Installed Rayline CLI to $INSTALL_DIR"
 if ! command -v rayline >/dev/null 2>&1; then
