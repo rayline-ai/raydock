@@ -404,6 +404,25 @@ mod tests {
     }
 
     #[test]
+    fn a_corrupt_blob_behind_a_copied_snapshot_is_replaced() {
+        // Where links aren't available the snapshot is a copy of its blob,
+        // so removing the snapshot leaves the blob.
+        let hub = scratch("copied");
+        let (served, pin) = release(&FILES);
+        let fake = fake_hub(served);
+        let dir = fetch(&hub, &fake.url, None, &pin).expect("fetches");
+        let snapshot = dir.join("heads.safetensors");
+        let blob = fs::canonicalize(&snapshot).expect("blob");
+        fs::write(&blob, b"changed").expect("tamper");
+        fs::remove_file(&snapshot).expect("unlink");
+        fs::write(&snapshot, b"changed").expect("copy");
+        fetch(&hub, &fake.url, None, &pin).expect("repaired");
+        assert_eq!(fs::read(&blob).expect("blob"), b"heads");
+        assert_eq!(fs::read(&snapshot).expect("snapshot"), b"heads");
+        let _ = fs::remove_dir_all(hub);
+    }
+
+    #[test]
     fn a_missing_file_names_it() {
         let hub = scratch("missing");
         let (mut served, pin) = release(&FILES);

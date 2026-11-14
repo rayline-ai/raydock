@@ -368,10 +368,14 @@ pub fn download_to_hf_cache_at(
     let blob_name = sha256_blob_name(&sha256);
     let blob_path = blobs_dir.join(&blob_name);
 
-    if blob_path.exists() {
+    // An existing blob is kept only when its bytes still hash to its name;
+    // a corrupt one is replaced by the fresh download.
+    if blob_path.exists() && compute_sha256(&blob_path).is_ok_and(|sha| sha == sha256) {
         let _ = fs::remove_file(&tmp_path);
         info!("[HfCache] Blob already exists: {:?}", blob_path);
     } else {
+        // Windows doesn't rename over an existing file.
+        let _ = fs::remove_file(&blob_path);
         fs::rename(&tmp_path, &blob_path).map_err(|e| format!("Failed to rename blob: {e}"))?;
         info!("[HfCache] Blob created: {:?}", blob_path);
     }
