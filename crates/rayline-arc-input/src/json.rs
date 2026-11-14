@@ -68,6 +68,14 @@ impl Object {
         self.0.is_empty()
     }
 
+    /// As [`Json::text_len`].
+    pub fn text_len(&self) -> usize {
+        self.0
+            .iter()
+            .map(|(key, value)| key.len() + value.text_len())
+            .sum()
+    }
+
     /// The string under `key`, when there is one.
     pub fn str(&self, key: &str) -> Option<&str> {
         self.get(key).and_then(Json::as_str)
@@ -94,6 +102,17 @@ impl FromIterator<(String, Json)> for Object {
 }
 
 impl Json {
+    /// The bytes of every string, key and number in the value: how much
+    /// text the projection works through.
+    pub fn text_len(&self) -> usize {
+        match self {
+            Json::Null | Json::Bool(_) => 0,
+            Json::Number(text) | Json::String(text) => text.len(),
+            Json::Array(items) => items.iter().map(Json::text_len).sum(),
+            Json::Object(object) => object.text_len(),
+        }
+    }
+
     pub fn str(text: &str) -> Json {
         Json::String(text.to_owned())
     }

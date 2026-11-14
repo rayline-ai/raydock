@@ -62,6 +62,15 @@ const IMAGE_SENTINEL: &str = "\"\\u0000arc-image:";
 /// rather than refused.
 const OMITTED_NAMELESS_TOOLS: [&str; 1] = ["web_search"];
 
+/// The most text (bytes of strings, keys and numbers, images not counted)
+/// a request's conversation and tool definitions may hold: 16 bytes for
+/// each token of the encoder's largest context (270,336 tokens), far more
+/// than text ever takes per token. Above it the request is refused before
+/// the scrub and tokenizer read it, so their work stays bounded.
+pub const MAX_TEXT_BYTES: usize = 270_336 * 16;
+/// The most tool definitions a request may carry.
+pub const MAX_TOOLS: usize = 1_024;
+
 /// Why a request has no encoder input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectionError {
@@ -73,6 +82,9 @@ pub enum ProjectionError {
     Unsupported(String),
     /// The tokenizer failed or is not the ARC encoder's.
     Tokenizer(String),
+    /// The request holds more than the projection reads ([`MAX_TEXT_BYTES`],
+    /// [`MAX_TOOLS`], or the working directories it names).
+    TooLarge(String),
     /// A built-in rule failed to compile or run.
     Internal(String),
 }
@@ -84,6 +96,7 @@ impl fmt::Display for ProjectionError {
             Self::Refused(reason) => write!(f, "request cannot be projected: {reason}"),
             Self::Unsupported(reason) => write!(f, "not supported yet: {reason}"),
             Self::Tokenizer(reason) => write!(f, "tokenizer: {reason}"),
+            Self::TooLarge(reason) => write!(f, "request too large to project: {reason}"),
             Self::Internal(reason) => write!(f, "projection rule failed: {reason}"),
         }
     }
@@ -204,8 +217,24 @@ pub fn project_request(
         _ => Vec::new(),
     };
     let has_tools = !tools.is_empty();
+    if tools.len() > MAX_TOOLS {
+        return Err(ProjectionError::TooLarge(format!(
+            "more than {MAX_TOOLS} tool definitions"
+        )));
+    }
     let mut definitions = canonical::canonical_tool_definitions(&tools)?;
     let mut conversation = canonical::canonical_conversation(&messages, &groups)?;
+    let text: usize = definitions.iter().map(Json::text_len).sum::<usize>()
+        + conversation
+            .iter()
+            .flat_map(|message| &message.content)
+            .map(Object::text_len)
+            .sum::<usize>();
+    if text > MAX_TEXT_BYTES {
+        return Err(ProjectionError::TooLarge(format!(
+            "more than {MAX_TEXT_BYTES} bytes of text"
+        )));
+    }
     scrub::scrub_environment(&mut conversation, &mut definitions)?;
 
     let mut blocks = Vec::new();
@@ -546,6 +575,61 @@ fn text_pieces(text: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pathological requests of a few MB are refused, or projected, within
+    /// a bounded time: the caps are checked before the scrub's work.
+    #[test]
+    fn pathological_inputs_are_bounded() {
+        use std::time::{Duration, Instant};
+        let body = |system: &str, user: &str| {
+            format!(
+                r#"{{"system": "{system}", "messages": [{{"role": "user", "content": "{user}"}}]}}"#
+            )
+        };
+        let within = |what: &str, body: &str| {
+            let started = Instant::now();
+            let result = project_request(body, &[]);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{what} took {:?}",
+                started.elapsed()
+            );
+            result
+        };
+        // 5 MB of distinct working directories: over the text cap.
+        let dirs = |count: usize| {
+            (0..count)
+                .map(|index| format!("<cwd>/d{index:07}</cwd>"))
+                .collect::<String>()
+        };
+        let big = body(&dirs(5 * 1024 * 1024 / 20), "hi");
+        assert!(big.len() >= 5 * 1024 * 1024);
+        assert!(matches!(
+            within("5 MB of directories", &big),
+            Err(ProjectionError::TooLarge(reason)) if reason.contains("bytes of text")
+        ));
+        // Under the text cap, 100k distinct directories: over the directory cap.
+        assert!(matches!(
+            within("100k directories", &body(&dirs(100_000), "hi")),
+            Err(ProjectionError::TooLarge(reason)) if reason.contains("working directories")
+        ));
+        // Under every cap, repeated unclosed sections and vision literals
+        // project in linear time.
+        let user = "<system-reminder>x<|vision_start|>".repeat(100_000);
+        assert!(within("unclosed sections", &body("s", &user)).is_ok());
+        // Too many tools.
+        let tools: Vec<String> = (0..=MAX_TOOLS)
+            .map(|index| format!(r#"{{"name": "t{index}", "input_schema": {{}}}}"#))
+            .collect();
+        let with_tools = format!(
+            r#"{{"tools": [{}], "messages": [{{"role": "user", "content": "hi"}}]}}"#,
+            tools.join(",")
+        );
+        assert!(matches!(
+            within("too many tools", &with_tools),
+            Err(ProjectionError::TooLarge(reason)) if reason.contains("tool definitions")
+        ));
+    }
 
     #[test]
     fn vision_literals_are_cut_in_one_pass() {

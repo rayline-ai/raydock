@@ -117,6 +117,7 @@ fn compare(
                     ProjectionError::Refused(_) => "refused",
                     ProjectionError::Unsupported(_) => "unsupported",
                     ProjectionError::Tokenizer(_) => "tokenizer",
+                    ProjectionError::TooLarge(_) => "too large",
                     ProjectionError::Internal(_) => "internal",
                 };
                 outcome

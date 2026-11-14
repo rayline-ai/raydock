@@ -12,6 +12,9 @@ pub enum DecideError {
     Unsupported { reason: &'static str },
     /// The request could not be turned into encoder input.
     Projection(String),
+    /// The request holds more than the projection reads; it is refused
+    /// before the expensive work.
+    TooLarge(String),
     /// The readout source failed or answered with the wrong shape.
     Readouts(String),
     /// The release's tensors did not fit the computation.
@@ -25,6 +28,7 @@ impl DecideError {
             Self::Invalid { .. } => "invalid_request",
             Self::Refused { .. } => "selection_refused",
             Self::Unsupported { .. } | Self::Projection(_) => "unsupported_request",
+            Self::TooLarge(_) => "input_too_large",
             Self::Readouts(_) => "backend_unavailable",
             Self::Internal(_) => "internal_error",
         }
@@ -38,6 +42,7 @@ impl fmt::Display for DecideError {
             Self::Refused { reason } => write!(f, "selection refused: {reason}"),
             Self::Unsupported { reason } => write!(f, "unsupported request: {reason}"),
             Self::Projection(reason) => write!(f, "request not encodable: {reason}"),
+            Self::TooLarge(reason) => write!(f, "request too large: {reason}"),
             Self::Readouts(reason) => write!(f, "readouts unavailable: {reason}"),
             Self::Internal(reason) => write!(f, "decision failed: {reason}"),
         }

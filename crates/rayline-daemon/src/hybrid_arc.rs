@@ -41,6 +41,10 @@ const FULL_CONTEXT_TOKENS: u32 = 270_336;
 pub const DEFAULT_BUDGET_TOKENS: u32 = 8_192;
 /// How long a stopping encoder may take to save its sessions.
 const SAVE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a turn waits for its local decision. A first encode of a long
+/// conversation takes the longest; this leaves room for the largest
+/// context on a slow machine.
+const DECISION_DEADLINE: Duration = Duration::from_secs(90);
 
 /// A running encoder. Dropping it kills the process.
 pub struct Encoder {
@@ -316,20 +320,32 @@ impl LocalDecider {
         }
         let encoder = self.encoder.clone();
         // The decision encodes and scores on the CPU and blocks on the
-        // encoder; keep it off the async workers.
-        let output = tokio::task::spawn_blocking(move || {
+        // encoder; keep it off the async workers. Past the deadline its
+        // answer is not waited for: the turn routes by fallback, and the
+        // work, bounded by the projection's input caps, finishes unread.
+        let task = tokio::task::spawn_blocking(move || {
             rayline_arc_decide::decide(&release, &input, &encoder)
-        })
-        .await
-        .map_err(|error| refuse("internal_error", format!("decide task: {error}")))?
-        .map_err(|error| match error {
-            // The encoder is down or restarting: a server-side outage, as
-            // the policy service answers it, not a bad request.
-            rayline_arc_decide::DecideError::Readouts(_) => {
-                rayline_arc_routes::Refusal::with_status(503, error.code(), error.to_string())
-            }
-            error => refuse(error.code(), error.to_string()),
-        })?;
+        });
+        let output = tokio::time::timeout(DECISION_DEADLINE, task)
+            .await
+            .map_err(|_| {
+                rayline_arc_routes::Refusal::with_status(
+                    504,
+                    "timeout",
+                    "the local decision did not finish in time",
+                )
+            })?
+            .map_err(|error| refuse("internal_error", format!("decide task: {error}")))?
+            .map_err(|error| match error {
+                // The encoder is down or restarting, or the request is more
+                // than the decider reads: the turn routes by fallback, as
+                // when the policy service is out, not as a bad request.
+                rayline_arc_decide::DecideError::Readouts(_)
+                | rayline_arc_decide::DecideError::TooLarge(_) => {
+                    rayline_arc_routes::Refusal::with_status(503, error.code(), error.to_string())
+                }
+                error => refuse(error.code(), error.to_string()),
+            })?;
         serde_json::to_value(output)
             .map_err(|error| refuse("internal_error", format!("decide answer: {error}")))
     }

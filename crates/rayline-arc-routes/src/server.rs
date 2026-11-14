@@ -478,12 +478,12 @@ impl Router {
                 Ok(out)
             }
             Err(refusal) => {
+                // Status and code only: a refusal's message can quote the
+                // request (an unknown key, say), which never goes to a log.
                 tracing::info!(
                     ms = elapsed(),
                     status = refusal.status,
                     code = %refusal.code,
-                    // Refusal messages are this crate's own text, never request content.
-                    message = %refusal.message,
                     "route refused"
                 );
                 Err(refusal)

@@ -36,6 +36,9 @@ const CWD: &[&str] = &[
     r#"\"?workspace_path\"?\s*[:=]\s*\"?([^\"\n]+?)\"?\s*$"#,
 ];
 
+/// The most distinct working directories one conversation may name.
+const MAX_DIRECTORIES: usize = 64;
+
 const MONTH: &str = "(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)";
 
 /// `(pattern, replacement)` pairs applied in order to in-scope text.
@@ -476,12 +479,19 @@ pub fn scrub_environment(
     let tools_text = Json::Array(tools.to_vec()).dumps(false);
     texts.push(tools_text);
     let mut values: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for text in &texts {
         for pattern in &rules.cwd {
             for captures in pattern.captures_iter(text) {
                 let captures = captures.map_err(|error| internal(error.to_string()))?;
                 let value = pyre::strip(captures.get(1).map_or("", |found| found.as_str()));
-                if value.chars().count() >= 2 && !values.iter().any(|known| known == value) {
+                if value.chars().count() >= 2 && seen.insert(value.to_owned()) {
+                    // Each directory is a pattern run over every text.
+                    if values.len() == MAX_DIRECTORIES {
+                        return Err(ProjectionError::TooLarge(format!(
+                            "more than {MAX_DIRECTORIES} working directories"
+                        )));
+                    }
                     values.push(value.to_owned());
                 }
             }

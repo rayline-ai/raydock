@@ -1103,8 +1103,10 @@ pub fn decide(
     } else {
         &sources[..]
     };
-    let blocks = project_request(input.request.get(), attributed)
-        .map_err(|e| DecideError::Projection(e.to_string()))?;
+    let blocks = project_request(input.request.get(), attributed).map_err(|e| match e {
+        rayline_arc_input::ProjectionError::TooLarge(reason) => DecideError::TooLarge(reason),
+        e => DecideError::Projection(e.to_string()),
+    })?;
     let encoded = release
         .tokenizer
         .encode(&blocks)
