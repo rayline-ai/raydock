@@ -214,7 +214,14 @@ impl Encoder {
                     tracing::warn!(?code, "local ARC encoder exited; decisions route by fallback");
                     false
                 }
-                () = self.full.notified(), if self.context < self.full_context() => true,
+                () = self.full.notified(), if self.context < self.full_context() => {
+                    tracing::info!(
+                        from = self.context,
+                        to = self.full_context(),
+                        "local ARC encoder context full; restarting it"
+                    );
+                    true
+                }
             };
             let context = if grow {
                 self.full_context()
@@ -264,11 +271,6 @@ impl Encoder {
     }
 
     async fn restart(&mut self, context: u32) -> Result<()> {
-        tracing::info!(
-            from = self.context,
-            to = context,
-            "local ARC encoder context full; restarting it"
-        );
         self.stop().await?;
         let (child, parent_pipe, url) =
             spawn(&self.files, self.launch, context, self.timeout).await?;
