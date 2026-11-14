@@ -88,12 +88,12 @@ The answer never appears in the prompt: the sum and the MCP value change every r
 | Harness | Turn | Model and reasoning | Session (`multi`) | MCP server (`heavy`) |
 |---|---|---|---|---|
 | claude | `-p "<prompt>"` with `MAX_THINKING_TOKENS=8000` | `--model <id>` | `--session-id <uuid>`, then `--resume <uuid>` | skipped: Claude Code drops tools with top-level `oneOf`/`anyOf`/`allOf` before any request |
-| codex | `exec --skip-git-repo-check "<prompt>"` | `-m <id> -c model_reasoning_effort=high` | `session id:` from turn 1, then `exec ... resume <id>` | `-c mcp_servers.acceptance.command/args` |
+| codex | `exec --skip-git-repo-check "<prompt>"` | `-m <id> -c model_reasoning_effort=high` | `session id:` from turn 1, then `exec resume <id> ...` | `-c mcp_servers.acceptance.command/args` |
 | opencode | `run "<prompt>"` | `-m rayline/<id> --thinking`, models declared in a project `opencode.json` the script writes (no limits: the router and the local process enforce their own) | `-s ses_<id>` on both turns | skipped: OpenCode wraps MCP tools in its Code Mode `execute` tool, so their schemas never leave the harness |
 | pi | `-p "<prompt>"` | `--model rayline/<id> --thinking high` | `--session-id <id>` on both turns | `.pi/mcp.json` in the working directory with `"exposure": "direct"` (the default, codemode, keeps the schemas inside Pi), `--approve` |
 | omp | `-p "<prompt>"` | none: omp runs only the models in its catalog, so it runs once per case as `default` | `-c` on turn 2 | skipped: persistent config only |
 | hermes | `chat -q "<prompt>"` | `-m <id> --reasoning high` (turn 1 only: Hermes refuses them on resume) | `Session:` from turn 1, then `--resume <id>` | skipped: persistent config only |
-| openclaw | `agent -m "<prompt>"` | `--model rayline/<id> --thinking high` | `--session-id <id>` on both turns | skipped: persistent config only |
+| openclaw | `agent -m "<prompt>"` | `--model rayline/<id> --thinking high`; in local mode `--thinking high` only, once per case as `default`: Rayline declares one model there, and OpenClaw sends the session header the local process keys the episode on only for a model its config declares | `--session-id <id>` on every turn of every case: without it OpenClaw continues its one persistent agent session | skipped: persistent config only |
 
 In local mode the local process decides which model runs, so the requested model is a request, not a pin. Each local cell line ends with `(executed <models>)`, the `executed_model` values the local process logged in `~/.rayline/local/runtime.log` during the turn.
 

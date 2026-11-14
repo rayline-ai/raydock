@@ -73,7 +73,9 @@ harness_cmd() {
   case $harness in
     # Prompt first: --mcp-config and --allowedTools take several values.
     claude) cmd=(-p "$prompt" "$@") ;;
-    codex) cmd=(exec --skip-git-repo-check "$@" "$prompt") ;;
+    # Flags after the args: a resumed turn's `resume <id>` must follow `exec`
+    # directly, where Codex and `rayline run --local` both look for it.
+    codex) cmd=(exec "$@" --skip-git-repo-check "$prompt") ;;
     opencode) cmd=(run "$@" "$prompt") ;;
     pi | omp) cmd=(-p "$@" "$prompt") ;;
     # Not -Q: quiet mode hides the "Session:" line the multi case resumes.
@@ -100,7 +102,17 @@ model_args() {
     pi) args=(--model "rayline/$model" --thinking high) ;;
     omp) return 1 ;; # omp only runs models in its catalog, which Rayline writes
     hermes) args=(-m "$model" --reasoning high) ;;
-    openclaw) args=(--model "rayline/$model" --thinking high) ;;
+    openclaw)
+      # OpenClaw sends the session header the local process keys the episode
+      # on only for a model its config declares, and in local mode Rayline
+      # declares one, the local process's own, so a cell runs on it as `default`.
+      if [ "$mode" = local ]; then
+        [ "$model" = default ] || return 1
+        args=(--thinking high)
+      else
+        args=(--model "rayline/$model" --thinking high)
+      fi
+      ;;
   esac
 }
 
@@ -153,7 +165,8 @@ session_args() {
       fi
       ;;
     opencode) args=(-s "ses_acceptance$RUN_TOKEN$turn_tag") ;;
-    pi | openclaw) args=(--session-id "acceptance-$RUN_TOKEN$turn_tag") ;;
+    pi) args=(--session-id "acceptance-$RUN_TOKEN$turn_tag") ;;
+    openclaw) args=() ;; # the cell's session, from cell_flags
     omp) [ "$turn" = 1 ] && args=() || args=(-c) ;;
     hermes)
       if [ "$turn" = 1 ]; then
@@ -237,7 +250,9 @@ with_timeout() {
 run_turn() {
   local harness=$1 cwd=$2 log=$3 prompt=$4 offset=0
   shift 4
-  harness_cmd "$harness" "$prompt" ${model_flags[@]+"${model_flags[@]}"} "$@"
+  # Session args before model flags: Codex's `resume <id>` comes first.
+  harness_cmd "$harness" "$prompt" "$@" ${cell_flags[@]+"${cell_flags[@]}"} \
+    ${model_flags[@]+"${model_flags[@]}"}
   harness_env "$harness"
   [ "$mode" = local ] && offset=$(wc -l <"$RUNTIME_LOG")
   out=$(cd "$cwd" && with_timeout "$TIMEOUT" env ${turn_env[@]+"${turn_env[@]}"} \
@@ -305,6 +320,11 @@ run_cell() {
   cwd=$dir/work
   mkdir -p "$cwd"
   executed=
+  cell_flags=()
+  # OpenClaw continues its one persistent agent session unless told which to
+  # use; a session per cell keeps cells independent (the local process refuses
+  # a session with history it did not record).
+  [ "$harness" = openclaw ] && cell_flags=(--session-id "acceptance-$RUN_TOKEN-$RANDOM")
   model_flags=()
   if ! model_args "$harness" "$model"; then
     [ "$model" = default ] || { report_skip "$harness has no model flag"; return; }
