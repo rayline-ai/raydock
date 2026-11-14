@@ -55,8 +55,13 @@
 #include <string>
 #include <thread>
 #include <vector>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 using json = nlohmann::json;
@@ -170,6 +175,27 @@ struct Server {
         std::error_code ec;
         const auto size = fs::file_size(path, ec);
         return !ec && size == n * (size_t) dim * sizeof(float);
+    }
+
+    // A session id restarted at base 0 holds new content: its saved entries no longer describe it. Re-publish them under
+    // an id no request can name, so an append to the id never resumes the old content, while a full encode whose
+    // tokens match can still reuse them as a prefix.
+    void disown(const std::string & id) {
+        for (auto & e : entries) {
+            if (e.session != id) continue;
+            const fs::path base = fs::path(args.state_dir) / e.stem;
+            const std::string anonymous = "replaced-" + e.stem;
+            std::error_code ec;
+            {
+                std::ofstream meta(base.string() + ".json.tmp");
+                meta << json{{"session", anonymous}, {"tokens", e.tokens}, {"offsets", e.offsets}, {"saved", e.mtime}}.dump();
+                meta.close();
+                if (!meta) { fs::remove(base.string() + ".json.tmp", ec); fs::remove(base.string() + ".json", ec); }
+                else fs::rename(base.string() + ".json.tmp", base.string() + ".json", ec);
+            }
+            if (ec) fs::remove(base.string() + ".json", ec);  // cannot re-publish: unpublish instead
+            e.session = anonymous;
+        }
     }
 
     void remove_entry(size_t i) {
@@ -448,6 +474,24 @@ std::string state_identity(const std::string & model, const std::string & config
     return hex;
 }
 
+// One process owns a saved-session directory at a time: start-up cleanup and saves would otherwise race with another
+// encoder's. The lock is held until the process exits. False if another process holds it.
+bool lock_dir(const fs::path & dir) {
+    const fs::path path = dir / "lock";
+#ifdef _WIN32
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    OVERLAPPED overlapped = {};
+    return LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &overlapped) != 0;
+#else
+    const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) return false;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) { close(fd); return false; }
+    return true;  // the descriptor stays open, holding the lock
+#endif
+}
+
 // Saved sessions hold token ids (the prompt): only their owner may read them. False if the directory cannot be made
 // owner-only.
 bool private_dir(const fs::path & dir) {
@@ -560,7 +604,13 @@ int main(int argc, char ** argv) {
             std::fprintf(stderr, "cannot make %s owner-only\n", dir.string().c_str());
             return 1;
         }
-        s.args.state_dir = dir.string();
+        if (lock_dir(dir)) {
+            s.args.state_dir = dir.string();
+        } else {
+            std::fprintf(stderr, "warning: another encoder is using %s; running without saved sessions\n",
+                         dir.string().c_str());
+            s.args.state_dir.clear();
+        }
     }
     s.load_index();
 
@@ -643,6 +693,7 @@ int main(int argc, char ** argv) {
         if (retained) {
             auto it = s.sessions.find(id);
             if (base == 0) {
+                s.disown(id);
                 if (it != s.sessions.end()) { s.drop(it->second); s.sessions.erase(it); }
                 Session fresh;
                 fresh.seq = s.take_seq();

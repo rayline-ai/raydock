@@ -81,6 +81,39 @@ def saved_sessions(binary, model):
         finally:
             stop(server)
 
+        # A session restarted with new content and then lost (killed before a save) never resumes its old content.
+        server, port = start(binary, model, *state)
+        try:
+            new = list(range(60, 100))
+            check(post(port, "/encode", {"base": 0, "tokens": new, "offsets": [39], "session": "A"})[0] == 200,
+                  "session A restarts with new content")
+        finally:
+            server.kill()
+            server.wait(timeout=60)
+        server, port = start(binary, model, *state)
+        try:
+            # A's old content was saved at 41 tokens: an append there must not resume it.
+            status, _, _ = post(port, "/encode", {"base": 41, "tokens": [7], "offsets": [41], "session": "A"})
+            check(status == 409, "an append after the lost restart does not resume A's old content")
+            # (A and B were saved at 41 tokens, tokens + [7], by the restart above.)
+            status, headers, _ = post(port, "/encode", {"base": 0, "tokens": tokens + [7, 8], "offsets": [41],
+                                                        "retain": False})
+            check(status == 200 and headers.get("x-restored-tokens") == "41", "the old content still serves as a prefix")
+
+            # A second encoder on the same directory runs without saved sessions instead of racing the first.
+            files = sorted(os.listdir(subdir.path))
+            second, second_port = start(binary, model, *state)
+            try:
+                status, _, _ = post(second_port, "/encode", {"base": 0, "tokens": list(range(100, 140)),
+                                                             "offsets": [39], "session": "C", "owner": "c"})
+                post(second_port, "/close", {"owner": "c"})
+                check(status == 200, "a second encoder on the same state dir still encodes")
+            finally:
+                stop(second)
+            check(sorted(os.listdir(subdir.path)) == files, "the second encoder neither saves nor cleans up there")
+        finally:
+            stop(server)
+
         server, port = start(binary, model, *state, "--ubatch", "32")
         try:
             status, _, _ = post(port, "/encode", {"base": 41, "tokens": [8], "offsets": [41], "session": "A"})

@@ -99,7 +99,13 @@ Saved sessions hold token ids, which encode the prompt, so they are private to t
   an atomic rename. An interrupted save leaves only unpublished files, which the next start removes.
 - **Restore checks:** an entry whose files are missing, malformed, the wrong size, or hold other tokens is skipped
   and re-encoded, never restored.
-- **File names:** they come from hashes, never from request text. An
+- **File names:** they come from hashes, never from request text.
+- **Restarted sessions:** restarting a session id at `base` 0 re-publishes its saved entries under an anonymous id.
+  A later append to that id therefore never resumes the old content, though a full encode whose tokens match can
+  still reuse it as a prefix.
+- **One owner per directory:** one encoder holds an exclusive lock on the directory (`flock`; `LockFileEx` on Windows).
+  A second encoder started with the same `--state-dir` and configuration logs a warning and runs without saved
+  sessions. An
 append to a session the process does not hold resumes the saved state that ends at its `base`; a full encode whose
 tokens start with a saved entry's tokens restores the longest such entry and encodes only the rest. The recurrent
 state cannot be truncated, so an entry only resumes from its exact end. A process killed without a signal loses
